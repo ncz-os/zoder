@@ -20,6 +20,9 @@ only for backward compatibility with old channels that predate the trio). Target
 Pin/automate: set `ZODER_CHANNEL=YYYY-MM-DD` or pass `--channel YYYY-MM-DD`.
 Full options, manual, and source builds are [below](#install--build-targets).
 
+For Linux processors without AVX2, see the [legacy x86-64-v2 build download
+and verification instructions](docs/LEGACY-BUILDS.md).
+
 **Quick usage:**
 
 ```bash
