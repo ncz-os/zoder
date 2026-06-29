@@ -870,6 +870,17 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
             None => Cell::dim("—"),
         }
     };
+    // Curated per-workflow suitability `single-pass/grind` (— when the model is
+    // not in the known-good SWE list). Drives `--tier single-pass|grind`.
+    let wf_cell = |m: &ModelEntry| -> Cell {
+        match m.workflows.as_ref() {
+            Some(w) => {
+                let f = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "—".into());
+                Cell::new(format!("{}/{}", f(w.single_pass), f(w.grind)))
+            }
+            None => Cell::dim("—"),
+        }
+    };
 
     if show_free {
         let mut free_m: Vec<_> = eng.corpus.models.iter().filter(|m| !m.paid).collect();
@@ -896,6 +907,7 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
                 ("code", Al::R),
                 ("arena", Al::R),
                 ("agentic", Al::R),
+                ("sp/grind", Al::R),
             ],
         );
         for m in &free_m {
@@ -909,6 +921,7 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
                 code_cap(m),
                 arena(m),
                 agentic(m.agentic_score),
+                wf_cell(m),
             ]);
         }
         t.print();
@@ -944,6 +957,7 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
                 ("code", Al::R),
                 ("arena", Al::R),
                 ("agentic", Al::R),
+                ("sp/grind", Al::R),
             ],
         );
         for m in &paid_m {
@@ -966,6 +980,7 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
                 code_cap(m),
                 arena(m),
                 agentic(m.agentic_score),
+                wf_cell(m),
             ]);
         }
         t.print();

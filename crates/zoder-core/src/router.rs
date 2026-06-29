@@ -12,6 +12,13 @@ pub enum Tier {
     Strong,
     /// Balanced default: the composite agentic score.
     Auto,
+    /// One-shot agentic authoring (`zoder oneshot`/`exec`): prefer models the
+    /// known-good list rates well for single-pass code generation.
+    SinglePass,
+    /// Adversarial grind-until-green loop (`zoder loop`): prefer models proven to
+    /// CONVERGE on iterative runtime-failure debugging — single-pass quality does
+    /// not imply it (a strong author can still stall in a grind).
+    Grind,
 }
 
 impl Tier {
@@ -19,6 +26,8 @@ impl Tier {
         match s.to_ascii_lowercase().as_str() {
             "fast" => Tier::Fast,
             "strong" | "codex" => Tier::Strong,
+            "single-pass" | "singlepass" | "single" | "oneshot" => Tier::SinglePass,
+            "grind" | "loop" => Tier::Grind,
             _ => Tier::Auto,
         }
     }
@@ -64,6 +73,27 @@ impl<'a> Router<'a> {
                 (Some(c), Some(l)) => 1.0 + 0.6 * c + 0.4 * l,
                 (Some(c), None) => 1.0 + c,
                 (None, _) => m.agentic_score.or(m.w_swe).unwrap_or(0.0),
+            },
+            // Workflow-first: a model the known-good list rates for THIS workflow
+            // (top band) outranks one with only a measured capability, which
+            // outranks one with only an inferred weight.
+            Tier::SinglePass => {
+                Self::workflow_rank(m, m.workflows.as_ref().and_then(|w| w.single_pass), cap)
+            }
+            Tier::Grind => {
+                Self::workflow_rank(m, m.workflows.as_ref().and_then(|w| w.grind), cap)
+            }
+        }
+    }
+
+    /// Banded rank for the workflow tiers: curated workflow score (2.0+) beats a
+    /// measured capability (1.0+) beats an inferred agentic/arena weight.
+    fn workflow_rank(m: &ModelEntry, wf: Option<f64>, cap: Option<f64>) -> f64 {
+        match wf {
+            Some(w) => 2.0 + w,
+            None => match cap {
+                Some(c) => 1.0 + c,
+                None => m.agentic_score.or(m.w_swe).unwrap_or(0.0),
             },
         }
     }

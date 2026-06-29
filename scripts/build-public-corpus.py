@@ -25,8 +25,12 @@ Writes corpus/ and pricing/ under --out-dir (default: repo root).
 import argparse
 import datetime
 import json
+import os
 import sys
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from corpus_match import canon_key  # noqa: E402
 
 LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
@@ -52,6 +56,23 @@ def split_id(model_id):
 # Substrings that mark a LiteLLM key as an enterprise SKU / placeholder / region
 # variant rather than a routable model id. These pollute a naive zero-cost pool.
 _SKU_MARKERS = ("commitment", "*", "/container", "sample_spec", "predibase")
+
+
+# Closed-weight commercial vendors with no $0 public API. A zero price for these
+# in the public feed is a placeholder/region row, never a real free tier. The
+# open-weight gpt-oss family is intentionally NOT here (it can legitimately be $0).
+_COMMERCIAL_PAID_ONLY = (
+    "anthropic", "claude-", "/claude", ".claude",
+    "openai/o", "/o1", "/o3", "/o4", "-o3-", "gpt-4", "gpt-5",
+    "gemini", "google/", "/palm",
+)
+
+
+def _is_commercial_paid_only(mid):
+    low = mid.lower()
+    if "gpt-oss" in low:
+        return False
+    return any(mark in low for mark in _COMMERCIAL_PAID_ONLY)
 
 
 def _is_sku_noise(mid):
@@ -114,11 +135,66 @@ def overlay_openrouter(econ):
     return econ
 
 
-def build_corpus(econ, generated, bench=None):
-    """Project economics (+ optional bench) into the ModelEntry corpus shape."""
+def load_known_good(out_dir):
+    """Read the curated high-SWE allow-list (bench/known-good-swe.json).
+
+    This is the corpus's only QUALITY dimension: the public pricing feeds carry
+    no capability score, so without it every model ranks 0 and the router has
+    nothing to sort on. Returns the ordered pattern list (first match wins), [].
+    """
+    import os
+
+    path = os.path.join(out_dir, "bench", "known-good-swe.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        pats = data.get("patterns", [])
+        print(f"  known-good overlay: {len(pats)} patterns from {path}", file=sys.stderr)
+        return pats
+    except FileNotFoundError:
+        print("  known-good overlay: none (bench/known-good-swe.json absent)", file=sys.stderr)
+        return []
+    except Exception as e:  # noqa: BLE001
+        print(f"  known-good overlay: skipped ({e})", file=sys.stderr)
+        return []
+
+
+def match_known_good(mid, patterns):
+    """First pattern (ordered most-specific first) any of whose `match`
+    substrings appear in `mid` (case-insensitive). Returns the capability +
+    workflow fields to merge into the ModelEntry, or None. Applies to free AND
+    paid models alike: a paid known-good model stays non-routed but carries a
+    score so a `--strong`/`--allow-paid` escalation can rank it."""
+    low = mid.lower()
+    for p in patterns:
+        if any(sub.lower() in low for sub in p.get("match", [])):
+            swe = p["swe"]
+            return {
+                "agentic_score": round(swe / 100.0, 3),
+                "w_swe": round(swe / 100.0, 3),
+                "capability": {
+                    "swe_verified": {
+                        "acc": float(swe),
+                        "source": "ncz-known-good",
+                        "harness": "curated",
+                    }
+                },
+                "workflows": {
+                    "single_pass": p["single_pass"],
+                    "grind": p["grind"],
+                },
+            }
+    return None
+
+
+def build_corpus(econ, generated, bench=None, known_good=None):
+    """Project economics (+ optional bench + curated known-good) into the
+    ModelEntry corpus shape."""
     bench = bench or {}
+    known_good = known_good or []
     models = []
     routable = 0
+    scored = 0
     for mid, e in sorted(econ.items()):
         host, leaf, family = split_id(mid)
         explicit_zero = e.get("_explicit_zero", False)
@@ -126,9 +202,15 @@ def build_corpus(econ, generated, bench=None):
         # Strip internal helper keys before publishing the economics block so it
         # deserializes cleanly into zoder-core Economics.
         econ_pub = {k: v for k, v in e.items() if not k.startswith("_")}
-        free = explicit_zero
+        # A closed-weight commercial vendor (Anthropic/OpenAI/Gemini) has no $0
+        # public API; a zero price in the feed is a placeholder, not a free tier,
+        # so it must never be auto-routed as "free". Open-weight gpt-oss is exempt.
+        commercial_zero = explicit_zero and _is_commercial_paid_only(mid)
+        free = explicit_zero and not commercial_zero
         route_candidate = free  # free chat models route out-of-box; refresh narrows to served
-        if route_candidate:
+        if commercial_zero:
+            gated = "listed $0 in public feed but vendor is paid-only — not auto-routed"
+        elif route_candidate:
             gated = None
         elif not priced:
             gated = "unpriced in public feed — not auto-routed (run a local classify/refresh)"
@@ -146,20 +228,32 @@ def build_corpus(econ, generated, bench=None):
             "gated_reason": gated,
             "economics": econ_pub,
         }
-        # Optional bench overlay (capability / preference / elo) — never gates routing.
-        b = bench.get(mid)
+        # Curated known-good is applied FIRST as a fallback: its `workflows`
+        # tags (which no benchmark provides) survive, while the measured bench
+        # overlay below OVERRIDES any curated capability/agentic_score with real
+        # leaderboard data when a model is name-matched there.
+        kg = match_known_good(mid, known_good)
+        if kg:
+            entry.update(kg)
+        # Bench overlay (capability / preference / elo), matched by canonical key
+        # so every provider/region variant inherits it. Never gates routing.
+        b = bench.get(canon_key(mid))
         if b:
             entry.update(b)
+        if kg or b:
+            scored += 1
         if route_candidate:
             routable += 1
         models.append(entry)
     return {
         "source": "public: litellm+openrouter pricing"
-        + (" + public bench overlay" if bench else ""),
+        + (" + public bench overlay" if bench else "")
+        + (" + ncz known-good swe overlay" if known_good else ""),
         "arena_date": generated,
         "generated": generated,
         "count": len(models),
         "routable": routable,
+        "scored": scored,
         "models": models,
     }
 
@@ -201,8 +295,12 @@ def main():
         # (capability is optional per zoder-core ModelEntry).
         bench = load_bench_overlay(args.out_dir)
 
+    # Curated known-good SWE overlay is the corpus quality dimension; always
+    # applied (it is a committed file, not a heavy fetch, so --no-bench keeps it).
+    known_good = load_known_good(args.out_dir)
+
     import os
-    corpus = build_corpus(econ, generated, bench)
+    corpus = build_corpus(econ, generated, bench, known_good)
     pricing = build_pricing(econ, generated)
 
     cdir = os.path.join(args.out_dir, "corpus")

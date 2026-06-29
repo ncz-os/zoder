@@ -1,0 +1,2636 @@
+{
+ "chatgpt-4o": {
+  "agentic_score": 0.453,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 45.3,
+    "date": "2025-03-29",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.726
+ },
+ "claude-3-5-haiku": {
+  "agentic_score": 0.28,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 28.0,
+    "date": "2024-12-21",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.64
+ },
+ "claude-3-5-sonnet": {
+  "agentic_score": 0.516,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 51.6,
+    "date": "2025-01-17",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.758
+ },
+ "claude-3-7-sonnet": {
+  "agentic_score": 0.649,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 64.9,
+    "date": "2025-02-24",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.825
+ },
+ "claude-4-5-sonnet": {
+  "agentic_score": 0.427,
+  "capability": {
+   "terminal_bench": {
+    "acc": 42.7,
+    "date": "2026-01-04",
+    "harness": "MAYA-V2",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.714
+ },
+ "claude-4-6-opus": {
+  "agentic_score": 0.721,
+  "capability": {
+   "terminal_bench": {
+    "acc": 72.08,
+    "date": "2026-03-12",
+    "harness": "MAYA-V2",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.86
+ },
+ "claude-fable-5": {
+  "agentic_score": 0.939,
+  "arena_coding_elo": 1653.9,
+  "arena_webdev_elo": 1653.9,
+  "capability": {
+   "swe_verified": {
+    "acc": 95.0,
+    "cost_per_test": 2.0467,
+    "latency_s": 356.2,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 1,
+    "score": 0.1627,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 1,
+    "rating": 1653.9,
+    "source": "arena.ai",
+    "votes": 2095
+   }
+  },
+  "w_swe": 0.975
+ },
+ "claude-haiku-4-5": {
+  "agentic_score": 0.566,
+  "arena_coding_elo": 1325.5,
+  "arena_webdev_elo": 1325.5,
+  "capability": {
+   "swe_verified": {
+    "acc": 66.6,
+    "cost_per_test": 0.3662,
+    "latency_s": 242.2,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 61.24,
+    "date": "2025-12-12",
+    "harness": "Warp",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 68,
+    "rating": 1325.5,
+    "source": "arena.ai",
+    "votes": 22687
+   }
+  },
+  "w_swe": 0.82
+ },
+ "claude-opus-4": {
+  "agentic_score": 0.72,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 72.0,
+    "date": "2025-05-25",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.86
+ },
+ "claude-opus-4-1": {
+  "agentic_score": 0.407,
+  "arena_coding_elo": 1386.0,
+  "arena_webdev_elo": 1386.0,
+  "capability": {
+   "terminal_bench": {
+    "acc": 37.98,
+    "date": "2025-10-31",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 48,
+    "rating": 1386.0,
+    "source": "arena.ai",
+    "votes": 8568
+   }
+  },
+  "w_swe": 0.738
+ },
+ "claude-opus-4-5": {
+  "agentic_score": 0.685,
+  "arena_coding_elo": 1490.2,
+  "arena_webdev_elo": 1490.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 76.4,
+    "cost_per_test": 1.0548,
+    "latency_s": 320.5,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 63.15,
+    "date": "2025-12-11",
+    "harness": "Droid",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 17,
+    "rating": 1490.2,
+    "source": "arena.ai",
+    "votes": 13059
+   }
+  },
+  "w_swe": 0.849
+ },
+ "claude-opus-4-6": {
+  "agentic_score": 0.715,
+  "arena_coding_elo": 1542.2,
+  "arena_webdev_elo": 1542.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 78.2,
+    "cost_per_test": 1.2165,
+    "latency_s": 350.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 76.4,
+    "date": "2026-05-14",
+    "harness": "Meta-Harness",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 8,
+    "score": 0.0511,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 7,
+    "rating": 1542.2,
+    "source": "arena.ai",
+    "votes": 10294
+   }
+  },
+  "w_swe": 0.887
+ },
+ "claude-opus-4-7": {
+  "agentic_score": 0.754,
+  "arena_coding_elo": 1563.4,
+  "arena_webdev_elo": 1563.4,
+  "capability": {
+   "swe_verified": {
+    "acc": 82.0,
+    "cost_per_test": 2.4234,
+    "latency_s": 442.0,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 82.19,
+    "date": "2026-05-14",
+    "harness": "Polaris",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 9,
+    "score": 0.05,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 4,
+    "rating": 1563.4,
+    "source": "arena.ai",
+    "votes": 7823
+   }
+  },
+  "w_swe": 0.91
+ },
+ "claude-opus-4-8": {
+  "agentic_score": 0.829,
+  "arena_coding_elo": 1565.2,
+  "arena_webdev_elo": 1565.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 88.6,
+    "cost_per_test": 1.9232,
+    "latency_s": 566.9,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 2,
+    "score": 0.1065,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 3,
+    "rating": 1565.2,
+    "source": "arena.ai",
+    "votes": 3005
+   }
+  },
+  "w_swe": 0.943
+ },
+ "claude-sonnet-4": {
+  "agentic_score": 0.613,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 61.3,
+    "date": "2025-05-24",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.806
+ },
+ "claude-sonnet-4-5": {
+  "agentic_score": 0.554,
+  "arena_coding_elo": 1388.2,
+  "arena_webdev_elo": 1388.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 70.0,
+    "cost_per_test": 0.8072,
+    "latency_s": 360.6,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 46.52,
+    "date": "2025-12-24",
+    "harness": "CAMEL-AI",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 46,
+    "rating": 1388.2,
+    "source": "arena.ai",
+    "votes": 15741
+   }
+  },
+  "w_swe": 0.791
+ },
+ "claude-sonnet-4-6": {
+  "agentic_score": 0.609,
+  "arena_coding_elo": 1521.0,
+  "arena_webdev_elo": 1521.0,
+  "capability": {
+   "swe_verified": {
+    "acc": 77.4,
+    "cost_per_test": 1.3039,
+    "latency_s": 511.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 53.43,
+    "date": "2026-05-14",
+    "harness": "Simplai Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 15,
+    "score": 0.0146,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 12,
+    "rating": 1521.0,
+    "source": "arena.ai",
+    "votes": 13612
+   }
+  },
+  "w_swe": 0.851
+ },
+ "codestral-25-01": {
+  "agentic_score": 0.111,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 11.1,
+    "date": "2025-01-13",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.555
+ },
+ "command-a-03": {
+  "agentic_score": 0.078,
+  "capability": {
+   "swe_verified": {
+    "acc": 7.8,
+    "cost_per_test": 0.2102,
+    "latency_s": 227.5,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.539
+ },
+ "command-a-03-2025-quality": {
+  "agentic_score": 0.12,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 12.0,
+    "date": "2025-03-14",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.56
+ },
+ "composer-2-5": {
+  "agentic_score": 0.796,
+  "capability": {
+   "swe_verified": {
+    "acc": 79.6,
+    "latency_s": 0.0,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.898
+ },
+ "deepseek-chat-v2-5": {
+  "agentic_score": 0.178,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 17.8,
+    "date": "2024-12-21",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.589
+ },
+ "deepseek-chat-v3": {
+  "agentic_score": 0.484,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 48.4,
+    "date": "2024-12-25",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.742
+ },
+ "deepseek-r1": {
+  "agentic_score": 0.714,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 71.4,
+    "date": "2025-06-06",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.857
+ },
+ "deepseek-r1-claude-3-5-sonnet": {
+  "agentic_score": 0.64,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 64.0,
+    "date": "2025-01-23",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.82
+ },
+ "deepseek-v3": {
+  "agentic_score": 0.551,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 55.1,
+    "date": "2025-03-24",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.776
+ },
+ "deepseek-v3-2": {
+  "agentic_score": 0.535,
+  "arena_coding_elo": 1368.1,
+  "arena_webdev_elo": 1368.1,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 74.2,
+    "date": "2025-10-03",
+    "source": "aider"
+   },
+   "terminal_bench": {
+    "acc": 39.55,
+    "date": "2026-02-10",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 54,
+    "rating": 1368.1,
+    "source": "arena.ai",
+    "votes": 7911
+   }
+  },
+  "w_swe": 0.784
+ },
+ "deepseek-v3p2": {
+  "agentic_score": 0.676,
+  "capability": {
+   "swe_verified": {
+    "acc": 67.6,
+    "cost_per_test": 0.6728,
+    "latency_s": 533.0,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.838
+ },
+ "deepseek-v4": {
+  "agentic_score": 0.489,
+  "arena_coding_elo": 1458.2,
+  "arena_webdev_elo": 1458.2,
+  "capability": {
+   "scale_seal": {
+    "acc": 27.15,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 77.4,
+    "cost_per_test": 0.4368,
+    "latency_s": 634.6,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 19,
+    "score": -0.0075,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 24,
+    "rating": 1458.2,
+    "source": "arena.ai",
+    "votes": 6256
+   }
+  },
+  "w_swe": 0.798
+ },
+ "deepseek-v4-flash": {
+  "agentic_score": 0.242,
+  "preference": {
+   "arena_agent": {
+    "rank": 11,
+    "score": 0.0435,
+    "source": "arena.ai"
+   }
+  },
+  "w_swe": 0.621
+ },
+ "devstral": {
+  "agentic_score": 0.454,
+  "arena_coding_elo": 1091.8,
+  "arena_webdev_elo": 1091.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 62.8,
+    "cost_per_test": 0.7472,
+    "latency_s": 243.5,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 90,
+    "rating": 1091.8,
+    "source": "arena.ai",
+    "votes": 992
+   }
+  },
+  "w_swe": 0.814
+ },
+ "devstral-2": {
+  "agentic_score": 0.165,
+  "arena_coding_elo": 1199.2,
+  "arena_webdev_elo": 1199.2,
+  "preference": {
+   "arena_webdev": {
+    "rank": 86,
+    "rating": 1199.2,
+    "source": "arena.ai",
+    "votes": 1585
+   }
+  },
+  "w_swe": 0.583
+ },
+ "fable-5": {
+  "agentic_score": 0.566,
+  "capability": {
+   "scale_seal": {
+    "acc": 56.64,
+    "source": "scale-seal"
+   }
+  },
+  "w_swe": 0.783
+ },
+ "gemini": {
+  "agentic_score": 0.382,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 38.2,
+    "date": "2024-12-22",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.691
+ },
+ "gemini-2-0-flash": {
+  "agentic_score": 0.222,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 22.2,
+    "date": "2024-12-22",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.611
+ },
+ "gemini-2-0-flash-thinking-exp-01-21": {
+  "agentic_score": 0.182,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 18.2,
+    "date": "2025-01-21",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.591
+ },
+ "gemini-2-0-pro-exp-02-05": {
+  "agentic_score": 0.356,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 35.6,
+    "date": "2025-02-25",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.678
+ },
+ "gemini-2-5": {
+  "agentic_score": 0.363,
+  "arena_coding_elo": 1204.3,
+  "arena_webdev_elo": 1204.3,
+  "capability": {
+   "swe_verified": {
+    "acc": 54.4,
+    "cost_per_test": 0.3516,
+    "latency_s": 207.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 32.64,
+    "date": "2025-10-31",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 84,
+    "rating": 1204.3,
+    "source": "arena.ai",
+    "votes": 3300
+   }
+  },
+  "w_swe": 0.718
+ },
+ "gemini-2-5-flash": {
+  "agentic_score": 0.171,
+  "capability": {
+   "terminal_bench": {
+    "acc": 17.08,
+    "date": "2025-11-03",
+    "harness": "Mini-SWE-Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.585
+ },
+ "gemini-2-5-flash-preview-04-17": {
+  "agentic_score": 0.471,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 47.1,
+    "date": "2025-04-20",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.736
+ },
+ "gemini-2-5-flash-preview-05-20": {
+  "agentic_score": 0.551,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 55.1,
+    "date": "2025-05-25",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.776
+ },
+ "gemini-2-5-pro-preview-03-25": {
+  "agentic_score": 0.729,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 72.9,
+    "date": "2025-04-12",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.865
+ },
+ "gemini-2-5-pro-preview-05-06": {
+  "agentic_score": 0.769,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 76.9,
+    "date": "2025-05-07",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.885
+ },
+ "gemini-2-5-pro-preview-06-05": {
+  "agentic_score": 0.831,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 83.1,
+    "date": "2025-06-06",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.915
+ },
+ "gemini-3": {
+  "agentic_score": 0.683,
+  "arena_coding_elo": 1438.8,
+  "arena_webdev_elo": 1438.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 76.4,
+    "cost_per_test": 0.7715,
+    "latency_s": 394.5,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 69.43,
+    "date": "2026-01-06",
+    "harness": "Ante",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 29,
+    "rating": 1438.8,
+    "source": "arena.ai",
+    "votes": 17158
+   }
+  },
+  "w_swe": 0.865
+ },
+ "gemini-3-1": {
+  "agentic_score": 0.573,
+  "arena_coding_elo": 1447.0,
+  "arena_webdev_elo": 1447.0,
+  "capability": {
+   "scale_seal": {
+    "acc": 33.81,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 78.8,
+    "cost_per_test": 0.7834,
+    "latency_s": 312.3,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 84.49,
+    "date": "2026-05-14",
+    "harness": "LemonHarness",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 16,
+    "score": 0.0026,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 27,
+    "rating": 1447.0,
+    "source": "arena.ai",
+    "votes": 12948
+   }
+  },
+  "w_swe": 0.829
+ },
+ "gemini-3-1-flash-lite": {
+  "agentic_score": 0.523,
+  "arena_coding_elo": 1249.4,
+  "arena_webdev_elo": 1249.4,
+  "capability": {
+   "swe_verified": {
+    "acc": 62.8,
+    "cost_per_test": 0.1054,
+    "latency_s": 132.9,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 77,
+    "rating": 1249.4,
+    "source": "arena.ai",
+    "votes": 11736
+   }
+  },
+  "w_swe": 0.814
+ },
+ "gemini-3-5-flash": {
+  "agentic_score": 0.681,
+  "arena_coding_elo": 1505.5,
+  "arena_webdev_elo": 1505.5,
+  "capability": {
+   "swe_verified": {
+    "acc": 78.8,
+    "cost_per_test": 0.9539,
+    "latency_s": 254.1,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 20,
+    "score": -0.0106,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 14,
+    "rating": 1505.5,
+    "source": "arena.ai",
+    "votes": 2217
+   }
+  },
+  "w_swe": 0.894
+ },
+ "gemini-3-flash": {
+  "agentic_score": 0.508,
+  "arena_coding_elo": 1437.1,
+  "arena_webdev_elo": 1437.1,
+  "capability": {
+   "scale_seal": {
+    "acc": 30.3,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 75.0,
+    "cost_per_test": 0.2802,
+    "latency_s": 285.2,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 64.27,
+    "date": "2025-12-23",
+    "harness": "Junie CLI",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 26,
+    "score": -0.1132,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 31,
+    "rating": 1437.1,
+    "source": "arena.ai",
+    "votes": 13277
+   }
+  },
+  "w_swe": 0.783
+ },
+ "gemma-3-27b": {
+  "agentic_score": 0.049,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 4.9,
+    "date": "2025-03-15",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.524
+ },
+ "gemma-4-26b-a4b": {
+  "agentic_score": 0.432,
+  "arena_coding_elo": 1359.3,
+  "arena_webdev_elo": 1359.3,
+  "preference": {
+   "arena_webdev": {
+    "rank": 58,
+    "rating": 1359.3,
+    "source": "arena.ai",
+    "votes": 1505
+   }
+  },
+  "w_swe": 0.716
+ },
+ "gemma-4-31b": {
+  "agentic_score": 0.326,
+  "arena_coding_elo": 1373.9,
+  "arena_webdev_elo": 1373.9,
+  "preference": {
+   "arena_agent": {
+    "rank": 23,
+    "score": -0.0555,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 52,
+    "rating": 1373.9,
+    "source": "arena.ai",
+    "votes": 4802
+   }
+  },
+  "w_swe": 0.728
+ },
+ "glm-4-6": {
+  "agentic_score": 0.426,
+  "arena_coding_elo": 1355.4,
+  "arena_webdev_elo": 1355.4,
+  "preference": {
+   "arena_webdev": {
+    "rank": 60,
+    "rating": 1355.4,
+    "source": "arena.ai",
+    "votes": 8350
+   }
+  },
+  "w_swe": 0.713
+ },
+ "glm-4-7": {
+  "agentic_score": 0.529,
+  "arena_coding_elo": 1440.0,
+  "arena_webdev_elo": 1440.0,
+  "capability": {
+   "swe_verified": {
+    "acc": 69.4,
+    "cost_per_test": 0.2037,
+    "latency_s": 365.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 33.39,
+    "date": "2026-01-28",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 28,
+    "rating": 1440.0,
+    "source": "arena.ai",
+    "votes": 4883
+   }
+  },
+  "w_swe": 0.783
+ },
+ "glm-4p6": {
+  "agentic_score": 0.245,
+  "capability": {
+   "terminal_bench": {
+    "acc": 24.53,
+    "date": "2025-11-01",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.623
+ },
+ "glm-5": {
+  "agentic_score": 0.522,
+  "arena_coding_elo": 1434.5,
+  "arena_webdev_elo": 1434.5,
+  "capability": {
+   "scale_seal": {
+    "acc": 28.74,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 71.4,
+    "cost_per_test": 0.4489,
+    "latency_s": 513.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 52.42,
+    "date": "2026-02-23",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 32,
+    "rating": 1434.5,
+    "source": "arena.ai",
+    "votes": 6715
+   }
+  },
+  "w_swe": 0.779
+ },
+ "glm-5-1": {
+  "agentic_score": 0.694,
+  "arena_coding_elo": 1529.2,
+  "arena_webdev_elo": 1529.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 76.4,
+    "cost_per_test": 0.4566,
+    "latency_s": 527.1,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 13,
+    "score": 0.033,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 11,
+    "rating": 1529.2,
+    "source": "arena.ai",
+    "votes": 3760
+   }
+  },
+  "w_swe": 0.882
+ },
+ "glm-5-2": {
+  "agentic_score": 0.673,
+  "arena_coding_elo": 1593.2,
+  "arena_webdev_elo": 1593.2,
+  "capability": {
+   "scale_seal": {
+    "acc": 43.99,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 82.8,
+    "cost_per_test": 0.71,
+    "latency_s": 669.7,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 3,
+    "score": 0.0996,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 2,
+    "rating": 1593.2,
+    "source": "arena.ai",
+    "votes": 1994
+   }
+  },
+  "w_swe": 0.911
+ },
+ "gpt-4-1": {
+  "agentic_score": 0.524,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 52.4,
+    "date": "2025-04-14",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.762
+ },
+ "gpt-4-1-nano": {
+  "agentic_score": 0.089,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 8.9,
+    "date": "2025-04-14",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.544
+ },
+ "gpt-4-5": {
+  "agentic_score": 0.449,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 44.9,
+    "date": "2025-02-27",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.725
+ },
+ "gpt-4o-2024-08-06": {
+  "agentic_score": 0.231,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 23.1,
+    "date": "2024-12-30",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.616
+ },
+ "gpt-4o-2024-11-20": {
+  "agentic_score": 0.182,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 18.2,
+    "date": "2024-12-30",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.591
+ },
+ "gpt-4o-mini-2024-07-18": {
+  "agentic_score": 0.036,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 3.6,
+    "date": "2024-12-21",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.518
+ },
+ "gpt-5": {
+  "agentic_score": 0.633,
+  "arena_coding_elo": 1394.4,
+  "arena_webdev_elo": 1394.4,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 88.0,
+    "date": "2025-08-23",
+    "source": "aider"
+   },
+   "terminal_bench": {
+    "acc": 49.61,
+    "date": "2025-11-04",
+    "harness": "Codex CLI",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 43,
+    "rating": 1394.4,
+    "source": "arena.ai",
+    "votes": 3755
+   }
+  },
+  "w_swe": 0.844
+ },
+ "gpt-5-1": {
+  "agentic_score": 0.58,
+  "arena_coding_elo": 1391.5,
+  "arena_webdev_elo": 1391.5,
+  "capability": {
+   "terminal_bench": {
+    "acc": 61.57,
+    "date": "2026-05-14",
+    "harness": "hookele",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 45,
+    "rating": 1391.5,
+    "source": "arena.ai",
+    "votes": 6119
+   }
+  },
+  "w_swe": 0.808
+ },
+ "gpt-5-1-2025-11-13": {
+  "agentic_score": 0.698,
+  "capability": {
+   "swe_verified": {
+    "acc": 69.8,
+    "cost_per_test": 0.7134,
+    "latency_s": 500.7,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.849
+ },
+ "gpt-5-2": {
+  "agentic_score": 0.643,
+  "arena_coding_elo": 1405.0,
+  "arena_webdev_elo": 1405.0,
+  "capability": {
+   "swe_verified": {
+    "acc": 72.4,
+    "cost_per_test": 0.3115,
+    "latency_s": 188.4,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 66.52,
+    "date": "2026-02-12",
+    "harness": "Deep Agents",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 39,
+    "rating": 1405.0,
+    "source": "arena.ai",
+    "votes": 1457
+   }
+  },
+  "w_swe": 0.847
+ },
+ "gpt-5-2-2025-12-11": {
+  "agentic_score": 0.758,
+  "capability": {
+   "swe_verified": {
+    "acc": 75.8,
+    "cost_per_test": 1.4534,
+    "latency_s": 640.5,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.879
+ },
+ "gpt-5-2025-08-07": {
+  "agentic_score": 0.69,
+  "capability": {
+   "swe_verified": {
+    "acc": 69.0,
+    "cost_per_test": 0.2703,
+    "latency_s": 232.8,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.845
+ },
+ "gpt-5-3": {
+  "agentic_score": 0.61,
+  "arena_coding_elo": 1406.6,
+  "arena_webdev_elo": 1406.6,
+  "capability": {
+   "scale_seal": {
+    "acc": 37.99,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 78.0,
+    "cost_per_test": 0.4554,
+    "latency_s": 246.5,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 78.43,
+    "date": "2026-03-13",
+    "harness": "SageAgent",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 38,
+    "rating": 1406.6,
+    "source": "arena.ai",
+    "votes": 2965
+   }
+  },
+  "w_swe": 0.824
+ },
+ "gpt-5-4": {
+  "agentic_score": 0.468,
+  "arena_coding_elo": 1456.9,
+  "arena_webdev_elo": 1456.9,
+  "capability": {
+   "scale_seal": {
+    "acc": 44.36,
+    "source": "scale-seal"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 5,
+    "score": 0.0561,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 25,
+    "rating": 1456.9,
+    "source": "arena.ai",
+    "votes": 1482
+   }
+  },
+  "w_swe": 0.797
+ },
+ "gpt-5-4-2026-03-05": {
+  "agentic_score": 0.782,
+  "capability": {
+   "swe_verified": {
+    "acc": 78.2,
+    "cost_per_test": 0.8011,
+    "latency_s": 307.1,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.891
+ },
+ "gpt-5-4-mini-2026-03-17": {
+  "agentic_score": 0.73,
+  "capability": {
+   "swe_verified": {
+    "acc": 73.0,
+    "cost_per_test": 0.5111,
+    "latency_s": 326.5,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.865
+ },
+ "gpt-5-4-nano-2026-03-17": {
+  "agentic_score": 0.698,
+  "capability": {
+   "swe_verified": {
+    "acc": 69.8,
+    "cost_per_test": 0.0977,
+    "latency_s": 262.6,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.849
+ },
+ "gpt-5-5": {
+  "agentic_score": 0.664,
+  "arena_coding_elo": 1502.4,
+  "arena_webdev_elo": 1502.4,
+  "capability": {
+   "scale_seal": {
+    "acc": 45.43,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 82.6,
+    "cost_per_test": 1.3618,
+    "latency_s": 426.4,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 84.72,
+    "date": "2026-05-14",
+    "harness": "NexAU-AHE",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 4,
+    "score": 0.0633,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 16,
+    "rating": 1502.4,
+    "source": "arena.ai",
+    "votes": 6535
+   }
+  },
+  "w_swe": 0.855
+ },
+ "gpt-5-5-factory": {
+  "agentic_score": 0.762,
+  "capability": {
+   "swe_verified": {
+    "acc": 76.2,
+    "cost_per_test": 1.1293,
+    "latency_s": 410.1,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.881
+ },
+ "gpt-5-mini-2025-08-07": {
+  "agentic_score": 0.608,
+  "capability": {
+   "swe_verified": {
+    "acc": 60.8,
+    "cost_per_test": 0.0504,
+    "latency_s": 187.1,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.804
+ },
+ "gpt-5-nano": {
+  "agentic_score": 0.218,
+  "capability": {
+   "terminal_bench": {
+    "acc": 21.8,
+    "date": "2026-05-15",
+    "harness": "spoox-o-m",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.609
+ },
+ "gpt-oss-120b": {
+  "agentic_score": 0.314,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 41.8,
+    "date": "2025-08-06",
+    "source": "aider"
+   },
+   "swe_verified": {
+    "acc": 33.6,
+    "cost_per_test": 0.1716,
+    "latency_s": 256.5,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 18.69,
+    "date": "2025-11-01",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.657
+ },
+ "gpt-oss-20b": {
+  "agentic_score": 0.034,
+  "capability": {
+   "terminal_bench": {
+    "acc": 3.37,
+    "date": "2025-11-03",
+    "harness": "Mini-SWE-Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.517
+ },
+ "gpt-oss-20b-rl": {
+  "agentic_score": 0.17,
+  "capability": {
+   "terminal_bench": {
+    "acc": 17.02,
+    "date": "2026-03-31",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.585
+ },
+ "granite-4-1-8b": {
+  "agentic_score": 0.169,
+  "arena_coding_elo": 1201.3,
+  "arena_webdev_elo": 1201.3,
+  "preference": {
+   "arena_webdev": {
+    "rank": 85,
+    "rating": 1201.3,
+    "source": "arena.ai",
+    "votes": 1728
+   }
+  },
+  "w_swe": 0.584
+ },
+ "grok-3": {
+  "agentic_score": 0.533,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 53.3,
+    "date": "2025-04-10",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.766
+ },
+ "grok-4": {
+  "agentic_score": 0.549,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 79.6,
+    "date": "2025-07-11",
+    "source": "aider"
+   },
+   "swe_verified": {
+    "acc": 57.8,
+    "cost_per_test": 1.4152,
+    "latency_s": 587.9,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 27.19,
+    "date": "2025-11-02",
+    "harness": "OpenHands",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.774
+ },
+ "grok-4-1": {
+  "agentic_score": 0.182,
+  "arena_coding_elo": 1208.9,
+  "arena_webdev_elo": 1208.9,
+  "preference": {
+   "arena_webdev": {
+    "rank": 83,
+    "rating": 1208.9,
+    "source": "arena.ai",
+    "votes": 1209
+   }
+  },
+  "w_swe": 0.591
+ },
+ "grok-4-1-fast-reasoning": {
+  "agentic_score": 0.361,
+  "arena_coding_elo": 1233.8,
+  "arena_webdev_elo": 1233.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 41.4,
+    "cost_per_test": 0.0275,
+    "latency_s": 138.4,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 81,
+    "rating": 1233.8,
+    "source": "arena.ai",
+    "votes": 6911
+   }
+  },
+  "w_swe": 0.707
+ },
+ "grok-4-20-0309-reasoning": {
+  "agentic_score": 0.647,
+  "capability": {
+   "swe_verified": {
+    "acc": 72.2,
+    "cost_per_test": 0.5159,
+    "latency_s": 134.8,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 57.3,
+    "date": "2026-04-02",
+    "harness": "Grok CLI",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.824
+ },
+ "grok-4-20-beta-0309-reasoning": {
+  "agentic_score": 0.474,
+  "arena_coding_elo": 1384.6,
+  "arena_webdev_elo": 1384.6,
+  "preference": {
+   "arena_webdev": {
+    "rank": 50,
+    "rating": 1384.6,
+    "source": "arena.ai",
+    "votes": 9535
+   }
+  },
+  "w_swe": 0.737
+ },
+ "grok-4-3": {
+  "agentic_score": 0.574,
+  "arena_coding_elo": 1364.0,
+  "arena_webdev_elo": 1364.0,
+  "capability": {
+   "swe_verified": {
+    "acc": 71.4,
+    "cost_per_test": 0.2226,
+    "latency_s": 117.8,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 25,
+    "score": -0.0897,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 56,
+    "rating": 1364.0,
+    "source": "arena.ai",
+    "votes": 5821
+   }
+  },
+  "w_swe": 0.857
+ },
+ "grok-4-fast-reasoning": {
+  "agentic_score": 0.351,
+  "arena_coding_elo": 1150.4,
+  "arena_webdev_elo": 1150.4,
+  "capability": {
+   "swe_verified": {
+    "acc": 45.4,
+    "cost_per_test": 0.0508,
+    "latency_s": 125.8,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 88,
+    "rating": 1150.4,
+    "source": "arena.ai",
+    "votes": 934
+   }
+  },
+  "w_swe": 0.727
+ },
+ "grok-build-0-1": {
+  "agentic_score": 0.0,
+  "preference": {
+   "arena_agent": {
+    "rank": 24,
+    "score": -0.0685,
+    "source": "arena.ai"
+   }
+  },
+  "w_swe": 0.5
+ },
+ "grok-code-fast-1": {
+  "agentic_score": 0.205,
+  "arena_coding_elo": 1140.1,
+  "arena_webdev_elo": 1140.1,
+  "capability": {
+   "terminal_bench": {
+    "acc": 25.84,
+    "date": "2025-11-03",
+    "harness": "Mini-SWE-Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 89,
+    "rating": 1140.1,
+    "source": "arena.ai",
+    "votes": 982
+   }
+  },
+  "w_swe": 0.629
+ },
+ "hunyuan-hy3": {
+  "agentic_score": 0.438,
+  "arena_coding_elo": 1363.0,
+  "arena_webdev_elo": 1363.0,
+  "preference": {
+   "arena_webdev": {
+    "rank": 57,
+    "rating": 1363.0,
+    "source": "arena.ai",
+    "votes": 1352
+   }
+  },
+  "w_swe": 0.719
+ },
+ "kat-coder-pro-v1": {
+  "agentic_score": 0.265,
+  "arena_coding_elo": 1258.9,
+  "arena_webdev_elo": 1258.9,
+  "preference": {
+   "arena_webdev": {
+    "rank": 75,
+    "rating": 1258.9,
+    "source": "arena.ai",
+    "votes": 1881
+   }
+  },
+  "w_swe": 0.632
+ },
+ "kimi-k2": {
+  "agentic_score": 0.479,
+  "arena_coding_elo": 1329.4,
+  "arena_webdev_elo": 1329.4,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 59.1,
+    "date": "2025-07-17",
+    "source": "aider"
+   },
+   "swe_verified": {
+    "acc": 60.2,
+    "cost_per_test": 0.366,
+    "latency_s": 1632.2,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 35.73,
+    "date": "2025-11-11",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 67,
+    "rating": 1329.4,
+    "source": "arena.ai",
+    "votes": 15346
+   }
+  },
+  "w_swe": 0.758
+ },
+ "kimi-k2-5": {
+  "agentic_score": 0.488,
+  "arena_coding_elo": 1430.7,
+  "arena_webdev_elo": 1430.7,
+  "capability": {
+   "scale_seal": {
+    "acc": 25.77,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 70.0,
+    "cost_per_test": 0.1677,
+    "latency_s": 339.2,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 43.2,
+    "date": "2026-02-04",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 35,
+    "rating": 1430.7,
+    "source": "arena.ai",
+    "votes": 12739
+   }
+  },
+  "w_swe": 0.776
+ },
+ "kimi-k2-5-instant": {
+  "agentic_score": 0.513,
+  "arena_coding_elo": 1407.7,
+  "arena_webdev_elo": 1407.7,
+  "preference": {
+   "arena_webdev": {
+    "rank": 37,
+    "rating": 1407.7,
+    "source": "arena.ai",
+    "votes": 3610
+   }
+  },
+  "w_swe": 0.756
+ },
+ "kimi-k2-6": {
+  "agentic_score": 0.668,
+  "arena_coding_elo": 1513.5,
+  "arena_webdev_elo": 1513.5,
+  "capability": {
+   "swe_verified": {
+    "acc": 76.2,
+    "cost_per_test": 0.2747,
+    "latency_s": 519.8,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 17,
+    "score": -0.0043,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 13,
+    "rating": 1513.5,
+    "source": "arena.ai",
+    "votes": 5953
+   }
+  },
+  "w_swe": 0.881
+ },
+ "kimi-k2-7-code": {
+  "agentic_score": 0.684,
+  "arena_coding_elo": 1479.2,
+  "arena_webdev_elo": 1479.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 78.2,
+    "cost_per_test": 0.2653,
+    "latency_s": 896.7,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 14,
+    "score": 0.0322,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 20,
+    "rating": 1479.2,
+    "source": "arena.ai",
+    "votes": 2281
+   }
+  },
+  "w_swe": 0.891
+ },
+ "laguna-m-1": {
+  "agentic_score": 0.583,
+  "arena_coding_elo": 1351.2,
+  "arena_webdev_elo": 1351.2,
+  "capability": {
+   "swe_verified": {
+    "acc": 64.6,
+    "cost_per_test": 0.0,
+    "latency_s": 1424.6,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 61,
+    "rating": 1351.2,
+    "source": "arena.ai",
+    "votes": 1905
+   }
+  },
+  "w_swe": 0.823
+ },
+ "laguna-xs-2": {
+  "agentic_score": 0.554,
+  "arena_coding_elo": 1298.8,
+  "arena_webdev_elo": 1298.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 64.0,
+    "cost_per_test": 0.0,
+    "latency_s": 759.4,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 71,
+    "rating": 1298.8,
+    "source": "arena.ai",
+    "votes": 2350
+   }
+  },
+  "w_swe": 0.82
+ },
+ "llama-4-maverick": {
+  "agentic_score": 0.156,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 15.6,
+    "date": "2025-04-06",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.578
+ },
+ "mercury-2": {
+  "agentic_score": 0.108,
+  "arena_coding_elo": 1164.8,
+  "arena_webdev_elo": 1164.8,
+  "preference": {
+   "arena_webdev": {
+    "rank": 87,
+    "rating": 1164.8,
+    "source": "arena.ai",
+    "votes": 948
+   }
+  },
+  "w_swe": 0.554
+ },
+ "mimo-v2": {
+  "agentic_score": 0.554,
+  "arena_coding_elo": 1432.2,
+  "arena_webdev_elo": 1432.2,
+  "preference": {
+   "arena_webdev": {
+    "rank": 33,
+    "rating": 1432.2,
+    "source": "arena.ai",
+    "votes": 6787
+   }
+  },
+  "w_swe": 0.777
+ },
+ "mimo-v2-5": {
+  "agentic_score": 0.706,
+  "arena_coding_elo": 1471.3,
+  "arena_webdev_elo": 1471.3,
+  "capability": {
+   "swe_verified": {
+    "acc": 74.0,
+    "cost_per_test": 0.023,
+    "latency_s": 470.8,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 21,
+    "rating": 1471.3,
+    "source": "arena.ai",
+    "votes": 6887
+   }
+  },
+  "w_swe": 0.87
+ },
+ "mimo-v2-flash": {
+  "agentic_score": 0.395,
+  "arena_coding_elo": 1336.8,
+  "arena_webdev_elo": 1336.8,
+  "preference": {
+   "arena_webdev": {
+    "rank": 63,
+    "rating": 1336.8,
+    "source": "arena.ai",
+    "votes": 6727
+   }
+  },
+  "w_swe": 0.697
+ },
+ "minimax-m2": {
+  "agentic_score": 0.312,
+  "arena_coding_elo": 1304.7,
+  "arena_webdev_elo": 1304.7,
+  "capability": {
+   "terminal_bench": {
+    "acc": 30.04,
+    "date": "2025-11-01",
+    "harness": "Terminus 2",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 69,
+    "rating": 1304.7,
+    "source": "arena.ai",
+    "votes": 8402
+   }
+  },
+  "w_swe": 0.671
+ },
+ "minimax-m2-1": {
+  "agentic_score": 0.537,
+  "arena_coding_elo": 1391.8,
+  "arena_webdev_elo": 1391.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 74.8,
+    "cost_per_test": 0.439,
+    "latency_s": 386.3,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 36.63,
+    "date": "2025-12-22",
+    "harness": "Crux",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 44,
+    "rating": 1391.8,
+    "source": "arena.ai",
+    "votes": 9273
+   }
+  },
+  "w_swe": 0.779
+ },
+ "minimax-m2-5": {
+  "agentic_score": 0.459,
+  "arena_coding_elo": 1382.0,
+  "arena_webdev_elo": 1382.0,
+  "capability": {
+   "scale_seal": {
+    "acc": 19.52,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 74.2,
+    "cost_per_test": 0.4569,
+    "latency_s": 402.9,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 42.7,
+    "date": "2026-03-30",
+    "harness": "cchuter",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 51,
+    "rating": 1382.0,
+    "source": "arena.ai",
+    "votes": 7838
+   }
+  },
+  "w_swe": 0.735
+ },
+ "minimax-m2-7": {
+  "agentic_score": 0.509,
+  "arena_coding_elo": 1395.1,
+  "arena_webdev_elo": 1395.1,
+  "capability": {
+   "swe_verified": {
+    "acc": 73.8,
+    "cost_per_test": 0.4661,
+    "latency_s": 885.7,
+    "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 45.06,
+    "date": "2026-05-14",
+    "harness": "IndusAGI Coding Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 27,
+    "score": -0.1251,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 41,
+    "rating": 1395.1,
+    "source": "arena.ai",
+    "votes": 8265
+   }
+  },
+  "w_swe": 0.797
+ },
+ "minimax-m2-7-highspeed": {
+  "agentic_score": 0.429,
+  "capability": {
+   "terminal_bench": {
+    "acc": 42.92,
+    "date": "2026-05-14",
+    "harness": "Harness Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.715
+ },
+ "minimax-m3": {
+  "agentic_score": 0.656,
+  "arena_coding_elo": 1504.9,
+  "arena_webdev_elo": 1504.9,
+  "capability": {
+   "swe_verified": {
+    "acc": 75.0,
+    "cost_per_test": 0.4164,
+    "latency_s": 726.0,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_agent": {
+    "rank": 21,
+    "score": -0.0117,
+    "source": "arena.ai"
+   },
+   "arena_webdev": {
+    "rank": 15,
+    "rating": 1504.9,
+    "source": "arena.ai",
+    "votes": 3236
+   }
+  },
+  "w_swe": 0.875
+ },
+ "mistral-large": {
+  "agentic_score": 0.414,
+  "capability": {
+   "swe_verified": {
+    "acc": 41.4,
+    "cost_per_test": 0.3217,
+    "latency_s": 187.0,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.707
+ },
+ "mistral-large-3": {
+  "agentic_score": 0.205,
+  "arena_coding_elo": 1223.2,
+  "arena_webdev_elo": 1223.2,
+  "preference": {
+   "arena_webdev": {
+    "rank": 82,
+    "rating": 1223.2,
+    "source": "arena.ai",
+    "votes": 1032
+   }
+  },
+  "w_swe": 0.603
+ },
+ "mistral-medium-3-5": {
+  "agentic_score": 0.558,
+  "arena_coding_elo": 1268.5,
+  "arena_webdev_elo": 1268.5,
+  "capability": {
+   "swe_verified": {
+    "acc": 66.4,
+    "cost_per_test": 4.0046,
+    "latency_s": 1143.7,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 74,
+    "rating": 1268.5,
+    "source": "arena.ai",
+    "votes": 2022
+   }
+  },
+  "w_swe": 0.832
+ },
+ "muse-spark": {
+  "agentic_score": 0.51,
+  "capability": {
+   "scale_seal": {
+    "acc": 27.66,
+    "source": "scale-seal"
+   },
+   "swe_verified": {
+    "acc": 74.4,
+    "cost_per_test": 0.4445,
+    "latency_s": 495.3,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.755
+ },
+ "nemotron-3-ultra": {
+  "agentic_score": 0.0,
+  "preference": {
+   "arena_agent": {
+    "rank": 22,
+    "score": -0.0554,
+    "source": "arena.ai"
+   }
+  },
+  "w_swe": 0.5
+ },
+ "nemotron-3-ultra-550b-a55b": {
+  "agentic_score": 0.69,
+  "capability": {
+   "swe_verified": {
+    "acc": 69.0,
+    "latency_s": 283.1,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.845
+ },
+ "o1-2024-12-17": {
+  "agentic_score": 0.617,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 61.7,
+    "date": "2024-12-21",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.808
+ },
+ "o1-mini-2024-09-12": {
+  "agentic_score": 0.329,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 32.9,
+    "date": "2024-12-22",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.664
+ },
+ "o3": {
+  "agentic_score": 0.849,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 84.9,
+    "date": "2025-06-28",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.925
+ },
+ "o3-gpt-4-1": {
+  "agentic_score": 0.782,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 78.2,
+    "date": "2025-06-27",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.891
+ },
+ "o4": {
+  "agentic_score": 0.72,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 72.0,
+    "date": "2025-04-16",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.86
+ },
+ "openhands-lm-32b-v0-1": {
+  "agentic_score": 0.102,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 10.2,
+    "date": "2025-04-19",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.551
+ },
+ "optimus-alpha": {
+  "agentic_score": 0.529,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 52.9,
+    "date": "2025-04-10",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.764
+ },
+ "opus-4-6": {
+  "agentic_score": 0.361,
+  "capability": {
+   "scale_seal": {
+    "acc": 36.12,
+    "source": "scale-seal"
+   }
+  },
+  "w_swe": 0.681
+ },
+ "opus-4-7": {
+  "agentic_score": 0.486,
+  "capability": {
+   "scale_seal": {
+    "acc": 48.57,
+    "source": "scale-seal"
+   }
+  },
+  "w_swe": 0.743
+ },
+ "opus-4-8": {
+  "agentic_score": 0.472,
+  "capability": {
+   "scale_seal": {
+    "acc": 47.17,
+    "source": "scale-seal"
+   }
+  },
+  "w_swe": 0.736
+ },
+ "quasar-alpha": {
+  "agentic_score": 0.547,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 54.7,
+    "date": "2025-04-04",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.774
+ },
+ "qwen-3-6-plus": {
+  "agentic_score": 0.0,
+  "preference": {
+   "arena_agent": {
+    "rank": 18,
+    "score": -0.0056,
+    "source": "arena.ai"
+   }
+  },
+  "w_swe": 0.5
+ },
+ "qwen-max-2025-01-25": {
+  "agentic_score": 0.218,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 21.8,
+    "date": "2025-01-28",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.609
+ },
+ "qwen2-5-coder-32b": {
+  "agentic_score": 0.164,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 16.4,
+    "date": "2024-12-26",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.582
+ },
+ "qwen3-235b-a22b-diff-no-think-alibaba-api": {
+  "agentic_score": 0.596,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 59.6,
+    "date": "2025-05-09",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.798
+ },
+ "qwen3-32b": {
+  "agentic_score": 0.4,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 40.0,
+    "date": "2025-05-08",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.7
+ },
+ "qwen3-5-122b-a10b": {
+  "agentic_score": 0.44,
+  "arena_coding_elo": 1364.2,
+  "arena_webdev_elo": 1364.2,
+  "preference": {
+   "arena_webdev": {
+    "rank": 55,
+    "rating": 1364.2,
+    "source": "arena.ai",
+    "votes": 8152
+   }
+  },
+  "w_swe": 0.72
+ },
+ "qwen3-5-27b": {
+  "agentic_score": 0.428,
+  "arena_coding_elo": 1356.9,
+  "arena_webdev_elo": 1356.9,
+  "preference": {
+   "arena_webdev": {
+    "rank": 59,
+    "rating": 1356.9,
+    "source": "arena.ai",
+    "votes": 7662
+   }
+  },
+  "w_swe": 0.714
+ },
+ "qwen3-5-35b-a3b": {
+  "agentic_score": 0.249,
+  "arena_coding_elo": 1249.5,
+  "arena_webdev_elo": 1249.5,
+  "preference": {
+   "arena_webdev": {
+    "rank": 76,
+    "rating": 1249.5,
+    "source": "arena.ai",
+    "votes": 1814
+   }
+  },
+  "w_swe": 0.625
+ },
+ "qwen3-5-397b-a17b": {
+  "agentic_score": 0.491,
+  "arena_coding_elo": 1394.5,
+  "arena_webdev_elo": 1394.5,
+  "preference": {
+   "arena_webdev": {
+    "rank": 42,
+    "rating": 1394.5,
+    "source": "arena.ai",
+    "votes": 11997
+   }
+  },
+  "w_swe": 0.745
+ },
+ "qwen3-5-9b": {
+  "agentic_score": 0.092,
+  "capability": {
+   "terminal_bench": {
+    "acc": 9.21,
+    "date": "2026-05-14",
+    "harness": "little-coder",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.546
+ },
+ "qwen3-5-flash": {
+  "agentic_score": 0.529,
+  "arena_coding_elo": 1237.8,
+  "arena_webdev_elo": 1237.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 64.4,
+    "cost_per_test": 0.2632,
+    "latency_s": 363.1,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 80,
+    "rating": 1237.8,
+    "source": "arena.ai",
+    "votes": 1563
+   }
+  },
+  "w_swe": 0.822
+ },
+ "qwen3-5-plus": {
+  "agentic_score": 0.712,
+  "capability": {
+   "swe_verified": {
+    "acc": 71.2,
+    "cost_per_test": 0.9636,
+    "latency_s": 496.2,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.856
+ },
+ "qwen3-6": {
+  "agentic_score": 0.703,
+  "arena_coding_elo": 1482.8,
+  "arena_webdev_elo": 1482.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 72.8,
+    "cost_per_test": 1.5651,
+    "latency_s": 1079.2,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 19,
+    "rating": 1482.8,
+    "source": "arena.ai",
+    "votes": 2507
+   }
+  },
+  "w_swe": 0.864
+ },
+ "qwen3-6-27b": {
+  "agentic_score": 0.7,
+  "capability": {
+   "swe_verified": {
+    "acc": 70.0,
+    "cost_per_test": 0.9141,
+    "latency_s": 1028.7,
+    "source": "vals.ai"
+   }
+  },
+  "w_swe": 0.85
+ },
+ "qwen3-6-35b-a3b": {
+  "agentic_score": 0.246,
+  "capability": {
+   "terminal_bench": {
+    "acc": 24.63,
+    "date": "2026-05-14",
+    "harness": "little-coder",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.623
+ },
+ "qwen3-6-plus": {
+  "agentic_score": 0.698,
+  "arena_coding_elo": 1461.9,
+  "arena_webdev_elo": 1461.9,
+  "capability": {
+   "swe_verified": {
+    "acc": 73.4,
+    "cost_per_test": 0.8692,
+    "latency_s": 424.2,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 23,
+    "rating": 1461.9,
+    "source": "arena.ai",
+    "votes": 8408
+   }
+  },
+  "w_swe": 0.867
+ },
+ "qwen3-7": {
+  "agentic_score": 0.696,
+  "arena_coding_elo": 1529.8,
+  "arena_webdev_elo": 1529.8,
+  "capability": {
+   "swe_verified": {
+    "acc": 68.8,
+    "cost_per_test": 3.2272,
+    "latency_s": 976.1,
+    "source": "vals.ai"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 10,
+    "rating": 1529.8,
+    "source": "arena.ai",
+    "votes": 3713
+   }
+  },
+  "w_swe": 0.858
+ },
+ "qwen3-coder-480b-a35b": {
+  "agentic_score": 0.28,
+  "arena_coding_elo": 1281.7,
+  "arena_webdev_elo": 1281.7,
+  "capability": {
+   "terminal_bench": {
+    "acc": 27.19,
+    "date": "2025-12-28",
+    "harness": "Dakou Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "preference": {
+   "arena_webdev": {
+    "rank": 73,
+    "rating": 1281.7,
+    "source": "arena.ai",
+    "votes": 15211
+   }
+  },
+  "w_swe": 0.651
+ },
+ "qwq-32b": {
+  "agentic_score": 0.209,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 20.9,
+    "date": "2025-03-06",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.605
+ },
+ "qwq-32b-qwen-2-5-coder": {
+  "agentic_score": 0.262,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 26.2,
+    "date": "2025-03-07",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.631
+ },
+ "seed-2-1": {
+  "agentic_score": 0.732,
+  "arena_coding_elo": 1538.9,
+  "arena_webdev_elo": 1538.9,
+  "preference": {
+   "arena_webdev": {
+    "rank": 8,
+    "rating": 1538.9,
+    "source": "arena.ai",
+    "votes": 1640
+   }
+  },
+  "w_swe": 0.866
+ },
+ "sonnet-4-6": {
+  "agentic_score": 0.32,
+  "capability": {
+   "scale_seal": {
+    "acc": 31.98,
+    "source": "scale-seal"
+   }
+  },
+  "w_swe": 0.66
+ },
+ "termigen-32b": {
+  "agentic_score": 0.193,
+  "capability": {
+   "terminal_bench": {
+    "acc": 19.33,
+    "date": "2026-05-14",
+    "harness": "Bash Agent",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.597
+ },
+ "trinity-large": {
+  "agentic_score": 0.24,
+  "arena_coding_elo": 1244.3,
+  "arena_webdev_elo": 1244.3,
+  "preference": {
+   "arena_webdev": {
+    "rank": 78,
+    "rating": 1244.3,
+    "source": "arena.ai",
+    "votes": 1310
+   }
+  },
+  "w_swe": 0.62
+ },
+ "yi-lightning": {
+  "agentic_score": 0.129,
+  "capability": {
+   "aider_polyglot": {
+    "acc": 12.9,
+    "date": "2024-12-23",
+    "source": "aider"
+   }
+  },
+  "w_swe": 0.565
+ }
+}

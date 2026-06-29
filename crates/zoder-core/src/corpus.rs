@@ -67,6 +67,11 @@ pub struct ModelEntry {
     /// Per-token economics, the source of truth projected into `pricing.json`.
     #[serde(default)]
     pub economics: Option<Economics>,
+    /// Curated per-workflow suitability (single-pass authoring vs grind-loop
+    /// convergence) from the known-good SWE list. No benchmark provides this, so
+    /// it is the routing authority for `--tier single-pass|grind`.
+    #[serde(default)]
+    pub workflows: Option<Workflows>,
 }
 
 impl ModelEntry {
@@ -272,6 +277,19 @@ pub struct Preference {
     /// arena.ai agent win-rate (0..1).
     #[serde(default)]
     pub arena_agent: Option<PrefScore>,
+}
+
+/// Curated per-workflow suitability scores (0..1) from the known-good SWE list.
+/// `single_pass` = one-shot agentic authoring quality; `grind` = adversarial
+/// loop convergence (multi-step runtime-failure debugging). The two are distinct
+/// by design: a strong single-pass author can still stall in a grind loop when a
+/// check fails on runtime behavior it must iteratively debug (observed: Kimi-K2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Workflows {
+    #[serde(default)]
+    pub single_pass: Option<f64>,
+    #[serde(default)]
+    pub grind: Option<f64>,
 }
 
 /// Per-token economics for a model (per 1M tokens). Source of truth that the

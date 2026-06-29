@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "kind": "ncz-known-good-swe",
+  "description": "Curated allow-list of high-SWE models proven good for agentic coding, with per-workflow suitability. The public pricing corpus has no quality dimension, so this overlay is the source of capability + workflow routing. Entries are matched against a model id by `match` substrings (case-insensitive); the FIRST pattern in this ordered list that matches wins, so most-specific patterns come first. Fields: swe = approx SWE-bench Verified solve-rate (0..100, used as the corpus capability score); single_pass = suitability for one-shot agentic authoring (zoder oneshot / exec), 0..1; grind = suitability for the adversarial 'grind until green' loop (zoder loop), 0..1. grind weights multi-step RUNTIME-failure convergence, not one-shot quality: a model can author well yet stall when a check fails on runtime behavior it must debug iteratively.",
+  "evidence": "single_pass ranks one-shot code quality; grind ranks loop convergence. Empirical (ncz-os, 2026-06): Claude (Opus/Sonnet) and DeepSeek-R1-class reasoners converge on runtime-debug grinds (e.g. the ncz-persist M2 sqlx backends, fixed first-pass by a Claude agent after the open-weight loop stalled). Kimi-K2 authored compiling backends but could NOT debug the runtime conformance failure — it spun a non-progressing 1-line diff until the no-progress guard stopped it; so Kimi is high single_pass / low grind. gpt-oss is similar (good cheap author, weak grind). Compile-gated grinds (clear localized errors) converge for far more models than runtime-gated ones.",
+  "patterns": [
+    { "match": ["claude-opus", "claude-4-opus", "opus-4"], "swe": 80, "single_pass": 0.98, "grind": 0.98, "note": "frontier; strongest runtime-debug convergence" },
+    { "match": ["claude-sonnet", "sonnet-4"], "swe": 77, "single_pass": 0.96, "grind": 0.96, "note": "near-Opus convergence, cheaper; default strong grinder" },
+    { "match": ["claude"], "swe": 74, "single_pass": 0.94, "grind": 0.93, "note": "Claude family fallback" },
+    { "match": ["gpt-5-codex", "gpt-5.5-codex", "codex"], "swe": 76, "single_pass": 0.95, "grind": 0.94, "note": "OpenAI codex; strong agentic + convergence" },
+    { "match": ["gpt-5"], "swe": 74, "single_pass": 0.94, "grind": 0.90, "note": "strong author, good grind" },
+    { "match": ["deepseek-r1", "deepseek-reasoner"], "swe": 71, "single_pass": 0.88, "grind": 0.90, "note": "reasoning model; strong multi-step runtime-debug grind" },
+    { "match": ["deepseek-v3", "deepseek-chat", "deepseek-v4"], "swe": 70, "single_pass": 0.90, "grind": 0.85, "note": "strong + cheap author; solid grind" },
+    { "match": ["deepseek"], "swe": 68, "single_pass": 0.87, "grind": 0.83, "note": "DeepSeek family fallback" },
+    { "match": ["qwen3-coder-480b", "qwen-3-coder-480b", "qwen3-coder-plus"], "swe": 69, "single_pass": 0.89, "grind": 0.82, "note": "strongest open coder; decent grind" },
+    { "match": ["qwen3-coder", "qwen-3-coder", "qwen2.5-coder"], "swe": 65, "single_pass": 0.85, "grind": 0.76, "note": "Qwen coder family (32B etc.)" },
+    { "match": ["qwen3", "qwen-3", "qwq"], "swe": 60, "single_pass": 0.78, "grind": 0.66, "note": "general Qwen3" },
+    { "match": ["kimi-k2", "kimi-k2.5", "kimi-k2.6"], "swe": 65, "single_pass": 0.86, "grind": 0.55, "note": "strong SINGLE-PASS; weak runtime-debug grind (ncz-persist M2 stall, 2026-06)" },
+    { "match": ["kimi"], "swe": 60, "single_pass": 0.80, "grind": 0.52, "note": "Moonshot Kimi fallback; prefer for single-pass not grind" },
+    { "match": ["glm-4.6", "glm-4.5"], "swe": 64, "single_pass": 0.83, "grind": 0.72, "note": "Zhipu GLM; good author, moderate grind" },
+    { "match": ["glm"], "swe": 58, "single_pass": 0.76, "grind": 0.62, "note": "GLM family fallback" },
+    { "match": ["grok-code", "grok-4-code"], "swe": 67, "single_pass": 0.86, "grind": 0.72, "note": "xAI grok-code-fast; strong fast author" },
+    { "match": ["grok"], "swe": 60, "single_pass": 0.78, "grind": 0.62, "note": "Grok family fallback" },
+    { "match": ["minimax-m2", "minimax-text"], "swe": 61, "single_pass": 0.80, "grind": 0.64, "note": "zoder default author; cheap; moderate grind" },
+    { "match": ["minimax"], "swe": 56, "single_pass": 0.74, "grind": 0.58, "note": "MiniMax family fallback" },
+    { "match": ["nemotron"], "swe": 58, "single_pass": 0.74, "grind": 0.56, "note": "NVIDIA Nemotron (EIH); solid author, moderate grind" },
+    { "match": ["codestral"], "swe": 56, "single_pass": 0.74, "grind": 0.52, "note": "Mistral code model; fast author" },
+    { "match": ["gpt-oss-120b"], "swe": 55, "single_pass": 0.72, "grind": 0.46, "note": "free via groq; good cheap author, weak grind" },
+    { "match": ["gpt-oss"], "swe": 50, "single_pass": 0.66, "grind": 0.42, "note": "gpt-oss small; single-pass only" },
+    { "match": ["llama-4", "llama4"], "swe": 48, "single_pass": 0.62, "grind": 0.40, "note": "Llama 4; light tasks only" },
+    { "match": ["mistral-large", "mistral-medium"], "swe": 52, "single_pass": 0.66, "grind": 0.48, "note": "Mistral general; single-pass leaning" }
+  ]
+}

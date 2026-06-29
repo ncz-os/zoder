@@ -10080,7 +10080,7 @@
       "output_usd_per_mtok": 3.08
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.95,
+      "input_usd_per_mtok": 0.94,
       "output_usd_per_mtok": 3.0
     },
     "z-ai/glm-5v-turbo": {
