@@ -3294,13 +3294,25 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
         );
         if let (BillingMode::Subscription, Some(plan)) = (p.billing, &p.subscription) {
             for w in plan_usage(&entries, &p.id, plan) {
+                let reset = w
+                    .next_reset_utc
+                    .as_deref()
+                    .map(|r| format!("; next reset {r}"))
+                    .unwrap_or_default();
+                let warn = if w.approaching {
+                    "  ⚠ approaching cap"
+                } else {
+                    ""
+                };
                 println!(
-                    "             {:>7} window: {:.0}/{:.0} {} ({:.0}% of cap)",
+                    "             {:>7} window: {:.0}/{:.0} {} ({:.0}% of cap){}{}",
                     w.name,
                     w.used,
                     w.cap,
                     w.unit,
-                    w.pct * 100.0
+                    w.pct * 100.0,
+                    reset,
+                    warn
                 );
             }
             let amort = amortized_per_call(&entries, &p.id, plan);

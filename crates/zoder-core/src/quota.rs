@@ -9,8 +9,11 @@
 
 use crate::config::{QuotaUnit, QuotaWindow, SubscriptionPlan};
 use crate::ledger::Entry;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
+
+/// pct at/above which a window is flagged as approaching its cap.
+pub const APPROACHING_THRESHOLD: f64 = 0.8;
 
 /// Consumption of one rolling window for a provider.
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +25,12 @@ pub struct WindowUsage {
     pub cap: f64,
     /// Fraction of the cap consumed (0..=1; can exceed 1 when over cap).
     pub pct: f64,
+    /// When the next relief arrives in this rolling window: the oldest in-window
+    /// call ages out at `oldest_ts + hours`, freeing its share of the cap. `None`
+    /// when the window is empty (already at full capacity). RFC3339 UTC.
+    pub next_reset_utc: Option<String>,
+    /// True when usage is at/above [`APPROACHING_THRESHOLD`] of the cap.
+    pub approaching: bool,
 }
 
 fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
@@ -36,12 +45,17 @@ fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
 pub fn window_usage(entries: &[Entry], provider_id: &str, w: &QuotaWindow) -> WindowUsage {
     let now = Utc::now();
     let since = now - Duration::hours(w.hours as i64);
-    let used: f64 = entries
+    let mut used = 0.0;
+    let mut oldest: Option<DateTime<Utc>> = None;
+    for e in entries
         .iter()
         .filter(|e| e.provider == provider_id && e.ts_utc >= since && e.ts_utc <= now)
-        .map(|e| unit_amount(e, w.unit))
-        .sum();
+    {
+        used += unit_amount(e, w.unit);
+        oldest = Some(oldest.map_or(e.ts_utc, |o| o.min(e.ts_utc)));
+    }
     let pct = if w.cap > 0.0 { used / w.cap } else { 0.0 };
+    let next_reset_utc = oldest.map(|o| (o + Duration::hours(w.hours as i64)).to_rfc3339());
     WindowUsage {
         name: w.name.clone(),
         hours: w.hours,
@@ -49,6 +63,8 @@ pub fn window_usage(entries: &[Entry], provider_id: &str, w: &QuotaWindow) -> Wi
         used,
         cap: w.cap,
         pct,
+        next_reset_utc,
+        approaching: pct >= APPROACHING_THRESHOLD,
     }
 }
 
