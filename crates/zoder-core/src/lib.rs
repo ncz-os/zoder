@@ -20,6 +20,7 @@ pub mod reconcile;
 pub mod report;
 pub mod router;
 pub mod session;
+pub mod update;
 
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use config::{

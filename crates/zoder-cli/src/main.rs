@@ -145,6 +145,13 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Check for a newer zoder release and update to it. Without `--check`,
+    /// re-runs the official installer to self-replace this binary.
+    Update {
+        /// Only report whether a newer release exists; do not install.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show the routing decision for a task without executing it.
     Route { prompt: Option<String> },
     /// Spend report (local ledger) by period.
@@ -536,8 +543,9 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    match &cli.cmd {
+    let result = match &cli.cmd {
         Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
+        Some(Cmd::Update { check }) => cmd_update(*check).await,
         Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()),
         Some(Cmd::Spend {
             period,
@@ -678,6 +686,76 @@ async fn run() -> anyhow::Result<()> {
             let p = cli.prompt.clone();
             cmd_exec(&cli, p).await
         }
+    };
+    // Best-effort, throttled "a new release is available" hint (stderr). Never fatal.
+    maybe_notify_update(&cli).await;
+    result
+}
+
+/// Print a one-line "new release available" hint at most once a day, unless the
+/// invocation wants clean machine output (`--json`) or it is the `update`
+/// command itself. Cached + opt-out via `ZODER_NO_UPDATE_CHECK=1`; any failure
+/// (offline, etc.) is silently ignored.
+async fn maybe_notify_update(cli: &Cli) {
+    if cli.json || matches!(cli.cmd, Some(Cmd::Update { .. })) {
+        return;
+    }
+    let home = Config::home();
+    if let Some(st) =
+        zoder_core::update::check_cached(&home, std::time::Duration::from_secs(86_400)).await
+    {
+        if st.newer {
+            let p = Pal::new();
+            eprintln!(
+                "{}",
+                p.dim(&format!(
+                    "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
+                    st.current,
+                    st.latest,
+                    zoder_core::update::release_url()
+                ))
+            );
+        }
+    }
+}
+
+/// `zoder update [--check]`: report whether a newer release exists; without
+/// `--check`, re-run the official installer (platform detect + SHA256 verify +
+/// atomic install) to self-replace this binary.
+async fn cmd_update(check_only: bool) -> anyhow::Result<()> {
+    let p = Pal::new();
+    let st = zoder_core::update::check().await?;
+    if !st.newer {
+        println!(
+            "{}",
+            p.green_b(&format!("zoder {} is the latest release.", st.current))
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        p.amber(&format!(
+            "A new zoder release is available: v{} (you have {}).",
+            st.latest, st.current
+        ))
+    );
+    println!("  release notes: {}", zoder_core::update::release_url());
+    if check_only {
+        println!("  update:        {}", zoder_core::update::install_command());
+        return Ok(());
+    }
+    let cmd = zoder_core::update::install_command();
+    println!("{}", p.dim(&format!("updating via: {cmd}")));
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to launch installer: {e}"))?;
+    if status.success() {
+        println!("{}", p.green_b("zoder updated to the latest release."));
+        Ok(())
+    } else {
+        anyhow::bail!("installer exited unsuccessfully ({status}); run manually: {cmd}")
     }
 }
 
