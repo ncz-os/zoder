@@ -226,55 +226,48 @@ avoided-spend headline over that slice**, so the headline numbers are the
 vendor's story, not the whole mixed fleet:
 
 ```
-$ zoder report --days 200 --vendor enterprise
-ZODER usage report  last 200 days  vendor=enterprise  2025-12-11 -> 2026-06-29  (200 days)
-filtered to providers:  enterprise-gateway
+$ zoder report --days 200 --vendor frontier
+ZODER usage report  last 200 days  vendor=frontier  2025-12-11 -> 2026-06-29  (200 days)
+filtered to providers:  ai-tools
 
 By day
-  day         cost($)  tokens(M)  calls
-  ─────────────────────────────────────
-  2026-06-22     0.00        0.0     40
-  2026-06-24     0.00        0.0     20
-  2026-06-25     0.00      199.9   8960
-  2026-06-26     0.00     1824.7    370
-  2026-06-27     0.00     1888.2    590
+  day           cost($)  tokens(M)  calls
+  ───────────────────────────────────────
+  2026-03-15   50613.12    77281.0   773K
+  2026-04-15  118097.29   180322.4   1.8M
+  2026-05-15   84355.21   128801.7   1.3M
+  2026-06-15   84355.21   128801.7   1.3M
 
 Paid models  billed cloud usage — real $ (input/output per Mtok)
-  (none — all usage ran on free models)
+  model                            cost($)  in $/Mtok  out $/Mtok  tokens(M)  calls  tok%
+  ───────────────────────────────────────────────────────────────────────────────────────
+  anthropic/claude-opus-4.8      253219.28       5.00       25.00   346682.5   3.5M   80%
+  anthropic/claude-sonnet-4.6     49965.80       3.00       15.00    48313.8   483K   11%
+  openai/gpt-5.5                  27428.43       5.00       30.00    31550.6   316K    7%
+  google/gemini-3.1-pro-preview    6807.32       2.00       12.00     8417.2    84K    2%
 
 Free models  $0 chargeback
-  model                             tokens(M)  calls  tok%  share           
-  ──────────────────────────────────────────────────────────────────────────
-  deepseek/deepseek-v4-pro             2254.8    280   58%  ████████████████
-  qwen/qwen3-5-397b-a17b               1496.5    170   38%  ███████████░░░░░
-  qwen/qwen-235b                        146.4   4420    4%  █░░░░░░░░░░░░░░░
-  openai/gpt-oss-120b                     7.1    390    0%  █░░░░░░░░░░░░░░░
-  qwen/qwen3-next-80b-a3b-instruct        5.5   4530    0%  █░░░░░░░░░░░░░░░
-  moonshot/kimi-k2.6                      1.7     20    0%  █░░░░░░░░░░░░░░░
-  zai/glm-5.1                             0.6     50    0%  █░░░░░░░░░░░░░░░
-  minimax/MiniMax-M2.7-highspeed          0.2     20    0%  █░░░░░░░░░░░░░░░
-  qwen/qwen3.6-27b                        0.0     10    0%  █░░░░░░░░░░░░░░░
-  meta/llama-3.1-8b-instruct              0.0     30    0%  █░░░░░░░░░░░░░░░
-  … 2 more free (use --top 0)
+  model                         tokens(M)  calls  tok%  share           
+  ──────────────────────────────────────────────────────────────────────
+  openai/gpt-5-codex              78506.9   785K   98%  ████████████████
+  enterprise-gateway/megamodel     1735.8    17K    2%  █░░░░░░░░░░░░░░░
 
 By host  model publisher, summed across all providers
-  host      cost($)  tokens(M)  calls  tok%
-  ─────────────────────────────────────────
-  deepseek     0.00     2254.8    280   58%
-  qwen         0.00     1648.3   9170   42%
-  openai       0.00        7.1    390    0%
-  moonshot     0.00        1.7     20    0%
-  zai          0.00        0.6     50    0%
-  minimax      0.00        0.2     20    0%
-  meta         0.00        0.0     50    0%
+  host                  cost($)  tokens(M)  calls  tok%
+  ─────────────────────────────────────────────────────
+  anthropic           303185.08   394996.2   3.9M   77%
+  openai               27428.43   110057.5   1.1M   21%
+  google                6807.32     8417.2    84K    2%
+  enterprise-gateway       0.00     1735.8    17K    0%
 
 Summary
-  On claude-opus-4.8 this would cost $86082.35; you paid $0.00.
-  free models saved you $86082.35  (all free)
-  free token share    : 100%  (3912.8M of 3912.8M tokens ran $0)
-  external chargeback : $0.00
-  free tokens     : 3912.8M  ($0 chargeback)
-  avoided spend       : $86082.35  (3912.8M free tok @ claude-opus-4.8 = $22.00/M)
+  On claude-opus-4.8 this would cost $11334549.56; you paid $337420.83.
+  free models saved you $10997128.73  (34x cheaper)
+  free token share    : 16%  (80242.8M of 515206.8M tokens ran $0)
+  top cost driver     : anthropic/claude-opus-4.8  75% of spend ($253219.28)
+  external chargeback : $337420.83
+  free tokens     : 80242.8M  ($0 chargeback)
+  avoided spend       : $1765340.55  (80242.8M free tok @ claude-opus-4.8 = $22.00/M)
 ```
 
 `--vendor` is invalid unless `~/.zoder/config.<name>.toml` is present and
