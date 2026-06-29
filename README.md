@@ -3,6 +3,30 @@
 **The full-stack developer's AI pair-coding and headless coding-dispatch system —
 free-first, cost-governed, MNEMOS-first.**
 
+## TL;DR — install in one line
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh | sh
+```
+
+Detects your OS/arch, verifies the SHA-256 checksum, and installs the
+version-matched trio — `zoder` (CLI), `zerocode` (TUI), `zeroclaw` (engine) — to
+`~/.local/bin`. Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
+Pin/automate: `… | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR=~/.local/bin sh`. Full
+options, manual, and source builds are [below](#install--build-targets).
+
+**Quick usage:**
+
+```bash
+zoder "refactor this for readability" < src/foo.rs   # run a task on the best FREE model
+zerocode                                             # interactive pair-coding TUI
+zoder review        # multi-model code review → consensus verdict
+zoder fix           # review → fix in place → re-review, until it passes
+zoder report        # spend + what the free path saved you, in dollars
+```
+
+---
+
 zoder is to [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) what Ubuntu is
 to Debian: a curated, opinionated distribution built on the same engine, aimed at
 a specific audience. ZeroClaw is the general-purpose agent framework; zoder is the
@@ -42,7 +66,7 @@ of scattered local files.
 
 ---
 
-## TL;DR
+## Commands
 
 ```bash
 # Run a coding task — zoder picks the best FREE model automatically.
