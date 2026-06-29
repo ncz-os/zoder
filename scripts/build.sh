@@ -48,7 +48,8 @@ build_tui() { # $1 = rust target triple, $2 = dist suffix (may be empty)
   local tgt="$1" sfx="$2" zc=".zeroclaw-src"
   if [ ! -d "$zc/.git" ]; then git clone --depth 1 -b "$ZEROCLAW_REF" "$ZEROCLAW_REPO" "$zc"; fi
   ( cd "$zc" && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
-  ( cd "$zc" && cargo build --release --bin zerocode --bin zeroclaw --target "$tgt" )
+  ( cd "$zc" && cargo build --release -p zerocode --bin zerocode --target "$tgt" )
+  ( cd "$zc" && cargo build --release --bin zeroclaw --target "$tgt" )
   cp "$zc/target/$tgt/release/zerocode" "dist/zerocode${sfx}"
   cp "$zc/target/$tgt/release/zeroclaw" "dist/zeroclaw${sfx}"
 }
