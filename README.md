@@ -291,13 +291,30 @@ the by-model table.
 
 ## Install / build targets
 
-### Download — prebuilt trio (zoder + zerocode + zeroclaw)
+### Install — one line (prebuilt trio: zoder + zerocode + zeroclaw)
 
-Each release ships a version-matched tarball with all three binaries — `zoder`
-(the CLI), `zerocode` (the TUI), and `zeroclaw` (the engine) — plus `INSTALL.txt`
-and `LICENSE`. Grab the tarball for your platform from the releases page —
+```bash
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh | sh
+```
+
+Detects your OS/arch, downloads the version-matched trio for your platform,
+verifies the SHA-256 checksum, and installs `zoder` (CLI), `zerocode` (TUI), and
+`zeroclaw` (engine) to `~/.local/bin`.
+
+**Agent / non-interactive** (no prompts; pin the version + dir, fails with a
+machine-readable `zoder-install:` message on error):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh \
+  | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR="$HOME/.local/bin" sh
+```
+
+Knobs: `ZODER_VERSION` (default `latest`), `ZODER_BIN_DIR` (default
+`~/.local/bin`), `ZODER_REPO`, `ZODER_NO_VERIFY=1` (skip checksum).
+
+**Manual:** grab the tarball for your platform from the releases page —
 GitLab <https://gitlab.com/ncz-os/zoder/-/releases> or GitHub
-<https://github.com/ncz-os/zoder/releases> — then:
+<https://github.com/ncz-os/zoder/releases> — verify against `SHA256SUMS`, then:
 
 ```bash
 tar -xzf zoder-<ver>-<target>.tar.gz
@@ -306,9 +323,7 @@ zoder --help          # the trio is now on your PATH
 ```
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`aarch64-apple-darwin`, `x86_64-apple-darwin`. An `install.sh` (download + verify
-+ install the trio) is attached to each release. Each tarball is accompanied by a
-`.sha256` you can verify with `sha256sum -c`.
+`aarch64-apple-darwin` (Apple Silicon). Windows → use WSL.
 
 ### Build from source
 
