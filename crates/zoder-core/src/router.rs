@@ -80,9 +80,7 @@ impl<'a> Router<'a> {
             Tier::SinglePass => {
                 Self::workflow_rank(m, m.workflows.as_ref().and_then(|w| w.single_pass), cap)
             }
-            Tier::Grind => {
-                Self::workflow_rank(m, m.workflows.as_ref().and_then(|w| w.grind), cap)
-            }
+            Tier::Grind => Self::workflow_rank(m, m.workflows.as_ref().and_then(|w| w.grind), cap),
         }
     }
 
