@@ -1,0 +1,21 @@
+{
+  "name": "zoder",
+  "owner": {
+    "name": "ncz-os contributors"
+  },
+  "metadata": {
+    "description": "Zoder plugins for Claude Code: delegate agentic tasks and run code reviews on open-source models via the zeroclaw engine, with cost accounting.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "zoder",
+      "description": "Use zoder/zoder from Claude Code to review code or delegate tasks to open-source models.",
+      "version": "0.1.0",
+      "author": {
+        "name": "ncz-os contributors"
+      },
+      "source": "./plugins/zoder"
+    }
+  ]
+}

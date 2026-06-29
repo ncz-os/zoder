@@ -1,0 +1,6 @@
+# nextest profile for the ncz-os quality gate. Small retry budget absorbs
+# load-sensitive flakes (timing/probe tests) without masking real failures —
+# a genuine failure fails all attempts.
+[profile.default]
+retries = 2
+fail-fast = false

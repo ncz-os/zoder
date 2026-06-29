@@ -1,0 +1,103 @@
+# zerocode pre-submission gate — FORGE ADAPTER CATALOG (declarative)
+#
+# Implements the "git-provider idempotent" layer of the RFC. The gate logic is
+# forge-agnostic; only this layer differs. Each adapter maps the common verbs
+# {open, update, template, labels, request_review, read_review, status} onto the
+# forge's CLI/API, and declares where that forge's CI definition lives so the
+# gate can derive the exact command set (gate.toml) and, optionally, run the real
+# CI locally.
+
+version: 1
+
+forges:
+
+  github:
+    detect:
+      remote_host_any_of: ["github.com"]
+    cli: gh
+    ci_sources: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
+    local_ci_runner: "act"            # act runs GitHub Actions locally
+    verbs:
+      open:           "gh pr create"
+      update:         "gh pr edit"
+      template:       ".github/pull_request_template.md"
+      labels:         "gh pr edit --add-label"
+      request_review: "gh pr edit --add-reviewer"
+      read_review:    "gh pr view --json reviews,statusCheckRollup"
+      status:         "gh pr checks"
+
+  gitlab:
+    detect:
+      remote_host_any_of: ["gitlab.com"]
+      remote_host_contains: ["gitlab"]
+    cli: glab
+    ci_sources: [".gitlab-ci.yml"]
+    local_ci_runner: "gitlab-runner exec"
+    verbs:
+      open:           "glab mr create"
+      update:         "glab mr update"
+      template:       ".gitlab/merge_request_templates/"
+      labels:         "glab mr update --label"
+      request_review: "glab mr update --reviewer"
+      read_review:    "glab mr view"
+      status:         "glab ci status"
+
+  codeberg:
+    detect:
+      remote_host_any_of: ["codeberg.org"]
+    cli: tea                          # Gitea/Forgejo CLI
+    ci_sources: [".woodpecker.yml", ".woodpecker/*.yml", ".forgejo/workflows/*.yml", ".gitea/workflows/*.yml"]
+    local_ci_runner: "woodpecker-cli exec"
+    verbs:
+      open:           "tea pr create"
+      update:         "tea pr edit"
+      template:       ".gitea/PULL_REQUEST_TEMPLATE.md"
+      labels:         "tea pr edit --add-labels"
+      request_review: "tea pr edit --add-reviewers"
+      read_review:    "tea pr view"
+      status:         "tea pr status"
+
+  gitea:
+    detect:
+      remote_host_contains: ["gitea"]
+    cli: tea
+    ci_sources: [".gitea/workflows/*.yml", ".forgejo/workflows/*.yml", ".woodpecker.yml"]
+    local_ci_runner: "act"
+    verbs:
+      open:           "tea pr create"
+      update:         "tea pr edit"
+      template:       ".gitea/PULL_REQUEST_TEMPLATE.md"
+      labels:         "tea pr edit --add-labels"
+      request_review: "tea pr edit --add-reviewers"
+      read_review:    "tea pr view"
+      status:         "tea pr status"
+
+  bitbucket:
+    detect:
+      remote_host_any_of: ["bitbucket.org"]
+    cli: "api"                         # no first-class CLI; REST API
+    ci_sources: ["bitbucket-pipelines.yml"]
+    local_ci_runner: null
+    verbs:
+      open:           "POST /2.0/repositories/{ws}/{repo}/pullrequests"
+      update:         "PUT /2.0/repositories/{ws}/{repo}/pullrequests/{id}"
+      template:       null
+      labels:         null
+      request_review: "PUT ... reviewers[]"
+      read_review:    "GET ... /pullrequests/{id}"
+      status:         "GET ... /commit/{sha}/statuses"
+
+  plain_git:
+    detect:
+      fallback: true                   # any remote not matched above
+    cli: git
+    ci_sources: [".ci/*", "Makefile"]
+    local_ci_runner: null
+    verbs:
+      open:           "git format-patch + send-email / bundle"
+      update:         "git format-patch -v{n}"
+      template:       null
+      labels:         null
+      request_review: null
+      read_review:    null
+      status:         null

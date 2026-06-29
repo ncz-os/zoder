@@ -1,0 +1,13 @@
+[toolchain]
+# Pin the toolchain so fmt/clippy output is reproducible across developer
+# machines, CI runners, and mirrors. The gitlab.com CI image rust:1.94
+# pulls the latest 1.94.x patch which has drifted from 1.94.1; pinning
+# to 1.94.1 eliminates that drift (rustfmt 1.94.0-stable+e408947bfd
+# and clippy 0.1.94+e408947bfd).
+#
+# Bump this in a separate commit when intentionally upgrading the
+# toolchain; expect a follow-up "style: cargo fmt --all" commit each
+# time, since rustfmt between minor patches can change wrapping rules.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

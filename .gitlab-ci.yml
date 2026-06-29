@@ -1,0 +1,102 @@
+# ncz-os Rust quality gate (GitLab). gitlab.com is the canonical CI/dev home for
+# ncz-os; github.com/ncz-os/zoder is a mirror with the matching GitHub gate.
+# GitLab CI is free under the ncz-os OSS license, so this linux gate runs the full
+# zeroclaw-shape battery (fmt, clippy -D warnings, check all/no-default, nextest,
+# cargo-deny). The OS matrix lives in the GitHub gate (gitlab.com shared runners
+# are linux-only). nextest + cargo-deny are installed as PREBUILT binaries so the
+# gate works on MSRV-pinned toolchains (cargo-install-from-source needs rustc>=1.91).
+# Toolchain pinned to 1.94.1.
+default:
+  image: rust:1.94
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths: [.cargo/, target/]
+  before_script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - mkdir -p "$CARGO_HOME/bin"
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+stages: [check, test, security, package, release]
+
+fmt:
+  stage: check
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: check
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+check:
+  stage: check
+  script:
+    - cargo check --workspace --locked --all-features
+    - cargo check --workspace --locked --no-default-features
+
+test:
+  stage: test
+  script:
+    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$CARGO_HOME/bin"
+    - cargo nextest run --workspace --locked --all-features
+    - cargo test --workspace --locked --all-features --doc
+
+security:
+  stage: security
+  script:
+    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    - cargo binstall -y cargo-deny
+    - cargo deny check
+    - cargo fetch --locked
+
+# ── package: version-matched trio (zoder + zerocode + zeroclaw) per arch ─────────
+# Each fleet runner builds its NATIVE target via scripts/package.sh.
+.trio: &trio
+  stage: package
+  rules:
+    - if: '$CI_COMMIT_TAG'      # tag push → full release build
+    - when: manual              # otherwise on-demand (don't burn runners every push)
+  variables:
+    ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
+    ZEROCLAW_REF: "zoder-integration"
+    CARGO_PROFILE_RELEASE_DEBUG: "0"
+  script:
+    - rm -rf .zeroclaw-src dist
+    - scripts/package.sh
+  artifacts:
+    name: "zoder-trio-$CI_COMMIT_REF_SLUG"
+    paths: [dist/]
+    expire_in: 90 days
+
+trio:x86-linux:    { <<: *trio, tags: [fleet-x86] }          # TYPHON  → x86_64-unknown-linux-gnu
+trio:macos-arm64:  { <<: *trio, tags: [fleet-macos-arm64] }  # ULTRA   → aarch64-apple-darwin
+trio:linux-arm64:  { <<: *trio, tags: [fleet-linux-arm64] }  # ULTRA   → aarch64-unknown-linux-gnu (arm64 rust container)
+
+# ── release: publish the per-arch trio tarballs to the project Releases page ─────
+release:trio:
+  stage: release
+  rules: [{ if: '$CI_COMMIT_TAG' }]
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: ["trio:x86-linux", "trio:macos-arm64", "trio:linux-arm64"]
+  variables: { GIT_STRATEGY: none }
+  script:
+    - |
+      for f in dist/*.tar.gz; do
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/$(basename "$f")"
+      done
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    description: "zoder trio (zoder + zerocode + zeroclaw) — multi-arch binaries built by fleet CI."
+    assets:
+      links:
+        - { name: "x86_64-linux",   url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-x86_64-unknown-linux-gnu.tar.gz" }
+        - { name: "aarch64-darwin", url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-apple-darwin.tar.gz" }
+        - { name: "aarch64-linux",  url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz" }

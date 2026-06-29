@@ -1,0 +1,74 @@
+# config.oracle.toml — Oracle Cloud Infrastructure (OCI) Generative AI vendor
+# profile for `zoder` (TEMPLATE).
+#
+# This file is a copy-paste starter. Nothing is enabled until you uncomment a
+# block below AND set the relevant API key environment variable. Drop the
+# uncommented file into `~/.zoder/` (or your $ZODER_HOME) and
+# `zoder report --vendor oracle` will restrict the report — totals,
+# counterfactual, and avoided-spend headline — to calls served by the
+# providers below. Every entry has a `provider.id` stamped into the local
+# ledger on each routed call, so the filter is exact.
+#
+# OCI Generative AI is a "bill-by-token" target; the entries below are explicit
+# `paid = true` / `billing = "metered"` so the policy gate treats them as paid
+# fallbacks (no free-tier optimism).
+#
+# AUTH — IMPORTANT: native OCI Generative AI authenticates with OCI *request
+# signing* (an API signing key + key-id over the request), NOT a static bearer
+# token or a single header. `zoder` speaks OpenAI-compatible HTTP, so point it
+# at an endpoint that accepts a header credential:
+#   (a) an OpenAI-compatible gateway / API-gateway in front of OCI GenAI that
+#       re-emits a header credential — use `api_key_header` (below), or
+#   (b) a LiteLLM proxy fronting OCI that re-emits `Authorization: Bearer` —
+#       use `auth = { type = "env", var = "..." }` against the proxy URL.
+# Raw `inference.generativeai.<region>.oci.oraclecloud.com` with OCI signing is
+# not directly reachable by the OpenAI-compatible client and is intentionally
+# left commented.
+
+# ---------------------------------------------------------------------------
+# OCI Generative AI via an OpenAI-compatible gateway. Replace <region> and the
+# gateway host with your deployment. The `api-key` header name is whatever your
+# gateway expects (`api-key`, `x-api-key`, etc.); set it to match.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "oci-genai-cohere-command"      # any unique id; this is what hits the ledger
+# base_url = "https://YOUR_OCI_GATEWAY/v1"
+# kind = "openai-chat"
+# auth = { type = "api_key_header", header = "api-key", var = "OCI_GENAI_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# A second OCI GenAI model (e.g. a Llama or Cohere embeddings deployment).
+# Same gateway, different `id`; `--vendor oracle` aggregates them all.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "oci-genai-llama"
+# base_url = "https://YOUR_OCI_GATEWAY/v1"
+# kind = "openai-chat"
+# auth = { type = "api_key_header", header = "api-key", var = "OCI_GENAI_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# LiteLLM/bearer-proxy variant (if your gateway re-emits Authorization: Bearer
+# instead of an api-key header), point base_url at the proxy and use env auth.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "oci-genai-via-litellm"
+# base_url = "https://YOUR_LITELLM_PROXY/v1"
+# kind = "openai-chat"
+# auth = { type = "env", var = "OCI_GENAI_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# Profile metadata. Omit `[profile]` entirely to leave config.json's
+# default_provider as the active default. Set `default = true` to make this
+# overlay the active default (e.g. a dedicated Oracle deployment). At most one
+# overlay across all config.<vendor>.toml files may set `default = true`.
+# ---------------------------------------------------------------------------
+[profile]
+name = "oracle"
+# default = false
+# default_provider = "oci-genai-cohere-command"

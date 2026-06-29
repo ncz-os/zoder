@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# zerocode pre-submission gate — pre-push enforcement backstop (RFC §6).
+#
+# Git invokes pre-push on EVERY push regardless of caller (git_operations tool,
+# the shell tool running `git push`, or a human), so this is the chokepoint that
+# blocks a doomed submission below every tool surface. The authoritative floor is
+# still the destination repo's required CI checks + branch protection; this hook
+# is the cheap local backstop that keeps the PR clean by default.
+#
+# Install:  ln -sf ../../gate/hooks/pre-push .git/hooks/pre-push
+# Bypass:   human-only, on your own machine, via `git push --no-verify`.
+set -euo pipefail
+
+GATE_DIR="$(git rev-parse --show-toplevel)/gate"
+RUNNER="${ZEROCODE_GATE:-$GATE_DIR/zerocode-gate.py}"
+TIER="${ZEROCODE_GATE_TIER:-medium}"
+
+if [ ! -f "$RUNNER" ]; then
+  echo "[pre-push] no zerocode gate runner found ($RUNNER); skipping." >&2
+  exit 0
+fi
+
+echo "[pre-push] running zerocode pre-submission gate (tier=$TIER)…"
+if python3 "$RUNNER" --repo "$(git rev-parse --show-toplevel)" --tier "$TIER" \
+     --evidence "$(git rev-parse --show-toplevel)/.git/zerocode-gate-evidence.json"; then
+  echo "[pre-push] gate GREEN — push allowed."
+  exit 0
+else
+  echo "[pre-push] gate BLOCKED — push refused. Fix findings, or (human only) --no-verify." >&2
+  exit 1
+fi

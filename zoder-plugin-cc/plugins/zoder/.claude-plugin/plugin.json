@@ -1,0 +1,8 @@
+{
+  "name": "zoder",
+  "version": "0.1.0",
+  "description": "Use zoder/zoder from Claude Code to review code or delegate agentic tasks to open-source models, with cost accounting via the zeroclaw engine.",
+  "author": {
+    "name": "ncz-os contributors"
+  }
+}

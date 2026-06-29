@@ -1,0 +1,38 @@
+# config.enterprise.toml — generic Enterprise gateway profile for `zoder` (TEMPLATE).
+#
+# Drop a filled copy into `~/.zoder/` (or your `$ZODER_HOME`). `zoder report
+# --vendor enterprise` then scopes the report — totals, counterfactual, and
+# avoided-spend headline — to the providers below. Copy this file to
+# `config.<org>.toml` to add more orgs; each contributes `[[providers]]` plus an
+# optional `[profile]` / `[theme]`. Org config files define enterprise gateway
+# connectivity + auth + report colours. Secrets are referenced by env-var name,
+# never inlined.
+
+# --- Enterprise gateway (OpenAI-compatible). Fill in your endpoint + auth. ---
+# [[providers]]
+# id = "enterprise-gateway"
+# base_url = "https://YOUR_ENTERPRISE_GATEWAY/v1"
+# kind = "openai-chat"
+# auth = { type = "env", var = "ENTERPRISE_API_KEY" }            # bearer token
+# # — or, for gateways that authenticate with an `api-key` request header
+# #   (e.g. Azure OpenAI, some OCI gateways) rather than a bearer token:
+# # auth = { type = "api_key_header", header = "api-key", var = "ENTERPRISE_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# --- Profile metadata + optional report theme (named palette). ---
+[profile]
+name = "enterprise"
+# default = false                      # leave config.json's default_provider alone
+# default_provider = "enterprise-gateway"
+
+# When this overlay is the active/default one, these colours brand every
+# `zoder report` / `zoder finops` table. Omitted fields fall back to the
+# built-in default; colour is suppressed when stdout isn't a TTY or NO_COLOR is set.
+# [theme]
+# header    = "1;38;2;0;120;212"   # bold accent — section headers/headlines
+# accent    = "38;2;0;120;212"     # totals / emphasis
+# ok        = "38;2;0;160;120"     # free / $0 emphasis
+# warn      = "38;2;240;240;240"   # billed/paid cash
+# violation = "38;2;220;80;80"     # policy violations
+# dim       = "2"                  # muted secondary text
