@@ -25,8 +25,16 @@ REPO="${ZODER_REPO:-ncz-os/zoder}"
 VERSION="${ZODER_VERSION:-latest}"
 BIN_DIR="${ZODER_BIN_DIR:-$HOME/.local/bin}"
 NO_VERIFY="${ZODER_NO_VERIFY:-0}"
+ZODER_HOME="${ZODER_HOME:-$HOME/.zoder}"
+NO_CORPUS="${ZODER_NO_CORPUS:-0}"
 DRY_RUN=false
 BINS="zoder zerocode zeroclaw"
+
+# Public, self-serve corpus + pricing (rebuilt daily from public price data;
+# raw-fetched from the repo's main branch). Seeding these at install means a
+# fresh zoder routes immediately instead of failing on a missing corpus, and it
+# never depends on any private corpus-build process.
+CORPUS_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
 # ── Output helpers (terminal-aware) ──────────────────────────────
 
@@ -58,6 +66,7 @@ Options:
   --bin-dir <dir>   Install directory (default: \$HOME/.local/bin)
   --repo <owner/r>  Source repository (default: ncz-os/zoder)
   --no-verify       Skip SHA256 checksum verification (not recommended)
+  --no-corpus       Don't seed the routing corpus + pricing catalog
   --dry-run         Print what would happen, install nothing
   --help            Show this help
 
@@ -75,6 +84,7 @@ while [ $# -gt 0 ]; do
   --bin-dir) BIN_DIR="${2:?--bin-dir needs a dir}"; shift 2 ;;
   --repo) REPO="${2:?--repo needs owner/repo}"; shift 2 ;;
   --no-verify) NO_VERIFY=1; shift ;;
+  --no-corpus) NO_CORPUS=1; shift ;;
   --dry-run) DRY_RUN=true; shift ;;
   -h | --help) usage; exit 0 ;;
   *) die "unknown option: $1 (try --help)" ;;
@@ -184,6 +194,7 @@ if [ "$DRY_RUN" = true ]; then
   info "[dry-run] would download ${base}/${asset}"
   info "[dry-run] would verify against ${base}/SHA256SUMS"
   info "[dry-run] would install ${BINS} to ${BIN_DIR}"
+  [ "$NO_CORPUS" = "1" ] || info "[dry-run] would seed corpus + pricing from ${CORPUS_BASE} into ${ZODER_HOME}"
   exit 0
 fi
 
@@ -236,6 +247,34 @@ for b in $BINS; do
 done
 [ "$n" -gt 0 ] || die "no binaries found in ${asset}"
 info "Installed $n binar$([ "$n" = 1 ] && echo y || echo ies) to ${BIN_DIR}"
+
+# ── Seed the public corpus + pricing ──────────────────────────────
+# Best-effort: a failed fetch (offline/proxy) never fails the install — zoder
+# also self-heals these on first run. Existing files are left in place so a
+# local `zoder refresh` / `zoder pricing sync` is never clobbered.
+seed_corpus() {
+  [ "$NO_CORPUS" = "1" ] && { warn "corpus seeding skipped (--no-corpus / ZODER_NO_CORPUS=1)"; return 0; }
+  mkdir -p "$ZODER_HOME/data"
+  if [ ! -f "$ZODER_HOME/model_corpus.json" ]; then
+    if dl "${CORPUS_BASE}/corpus/model_corpus.json" "$ZODER_HOME/model_corpus.json" 2>/dev/null; then
+      info "Seeded routing corpus → $ZODER_HOME/model_corpus.json"
+    else
+      warn "could not fetch corpus (zoder will self-heal on first run)"
+    fi
+  else
+    info "Corpus already present at $ZODER_HOME/model_corpus.json (left as-is)"
+  fi
+  if [ ! -f "$ZODER_HOME/data/pricing.json" ]; then
+    if dl "${CORPUS_BASE}/pricing/catalog.json" "$ZODER_HOME/data/pricing.json" 2>/dev/null; then
+      info "Seeded pricing catalog → $ZODER_HOME/data/pricing.json"
+    else
+      warn "could not fetch pricing catalog (run 'zoder pricing sync' later)"
+    fi
+  else
+    info "Pricing catalog already present (left as-is)"
+  fi
+}
+seed_corpus
 
 # ── PATH hint ─────────────────────────────────────────────────────
 
