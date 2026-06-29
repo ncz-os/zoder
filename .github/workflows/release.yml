@@ -20,8 +20,6 @@ jobs:
           - { name: macos-x86_64,  runner: macos-13,         target: x86_64-apple-darwin,         artifact: zoder-macos-x86_64,  ext: "" }
           - { name: linux-x86_64,  runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,    artifact: zoder-linux-x86_64,  ext: "" }
           - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu,   artifact: zoder-linux-arm64,   ext: "" }
-          - { name: windows-x86_64,runner: windows-latest,   target: x86_64-pc-windows-msvc,      artifact: zoder-windows-x86_64,ext: ".exe" }
-          - { name: windows-arm64, runner: windows-11-arm,   target: aarch64-pc-windows-msvc,     artifact: zoder-windows-arm64, ext: ".exe" }
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
