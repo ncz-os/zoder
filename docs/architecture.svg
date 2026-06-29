@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="640" viewBox="0 0 980 640" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5a8c00"/>
+    </marker>
+    <style>
+      .title { font-size: 25px; font-weight: 700; fill: #1a1a1a; }
+      .sub   { font-size: 13px; fill: #6b6b6b; }
+      .hdr   { font-size: 18px; font-weight: 700; }
+      .lbl   { font-size: 12.5px; fill: #2b2b2b; }
+      .lblw  { font-size: 12.5px; fill: #e8f3d4; }
+      .chip  { font-size: 11.5px; font-weight: 700; fill: #5a8c00; }
+      .chipw { font-size: 11.5px; font-weight: 700; fill: #9bd11a; }
+      .tag   { font-size: 11px; font-weight: 700; letter-spacing: .5px; }
+      .cap   { font-size: 12px; fill: #6b6b6b; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="980" height="640" fill="#ffffff"/>
+  <text x="60" y="44" class="title">zoder &#8212; systems architecture</text>
+  <text x="60" y="66" class="sub">a free-first coding system on the ZeroClaw / zerocore foundation, with a ledger-backed cost accounting layer</text>
+
+  <rect x="60" y="92" width="860" height="88" rx="12" fill="#f4f6f1" stroke="#76B900" stroke-width="2.5"/>
+  <path d="M60 104 a12 12 0 0 1 12 -12 h836 a12 12 0 0 1 12 12 v16 h-860 z" fill="#76B900"/>
+  <text x="78" y="112" class="tag" fill="#ffffff">PRESENTATION &#183; zerocode terminal UX</text>
+  <text x="78" y="146" class="hdr" fill="#1a1a1a">zoder</text>
+  <text x="78" y="168" class="lbl">codex-compatible CLI &#183; free-first by default &#183; per-turn + session cost surfaced where you decide</text>
+
+  <line x1="270" y1="180" x2="270" y2="210" stroke="#5a8c00" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="710" y1="180" x2="710" y2="210" stroke="#5a8c00" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+  <rect x="60" y="212" width="420" height="178" rx="12" fill="#f4f6f1" stroke="#76B900" stroke-width="2.5"/>
+  <path d="M60 224 a12 12 0 0 1 12 -12 h396 a12 12 0 0 1 12 12 v16 h-420 z" fill="#76B900"/>
+  <text x="78" y="232" class="tag" fill="#ffffff">GOVERNANCE &#183; zoder (contributed to ZeroClaw)</text>
+  <text x="78" y="264" class="hdr" fill="#1a1a1a">zoder</text>
+  <text x="78" y="288" class="lbl">&#183; classified model corpus (free vs paid)</text>
+  <text x="78" y="308" class="lbl">&#183; free-first router + cross-family fallback</text>
+  <text x="78" y="328" class="lbl">&#183; default-deny-paid gate + anti-fallback guard</text>
+  <text x="78" y="348" class="lbl">&#183; per-model health (breaker + latency) &#183; review / fix</text>
+  <text x="78" y="375" class="chip">ranked by LMArena Elo + SWE-bench (synced)</text>
+
+  <rect x="500" y="212" width="420" height="178" rx="12" fill="#fbf6ec" stroke="#FFB000" stroke-width="2.5"/>
+  <path d="M500 224 a12 12 0 0 1 12 -12 h396 a12 12 0 0 1 12 12 v16 h-420 z" fill="#FFB000"/>
+  <text x="518" y="232" class="tag" fill="#3a2a00">COST + REPORTING &#183; ledger-backed</text>
+  <text x="518" y="264" class="hdr" fill="#1a1a1a">cost + report layer</text>
+  <text x="518" y="288" class="lbl">&#183; per-call local spend ledger (free included)</text>
+  <text x="518" y="308" class="lbl">&#183; daily / weekly / by-model rollups</text>
+  <text x="518" y="328" class="lbl">&#183; free-model counterfactual + savings</text>
+  <text x="518" y="348" class="lbl">&#183; refreshable pricing catalog ($0 for free)</text>
+  <text x="518" y="375" class="chip" fill="#c98a00">report: avoided spend + free-token share</text>
+
+  <line x1="270" y1="390" x2="270" y2="420" stroke="#5a8c00" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="710" y1="390" x2="710" y2="420" stroke="#5a8c00" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+  <rect x="60" y="422" width="860" height="98" rx="12" fill="#1a1a1a" stroke="#76B900" stroke-width="2.5"/>
+  <path d="M60 434 a12 12 0 0 1 12 -12 h836 a12 12 0 0 1 12 12 v16 h-860 z" fill="#5a8c00"/>
+  <text x="78" y="442" class="tag" fill="#ffffff">FOUNDATION &#183; ZeroClaw</text>
+  <text x="78" y="476" class="hdr" fill="#76B900">zerocore</text>
+  <text x="78" y="498" class="lblw">agent / turn engine &#183; OpenAI-compatible provider abstraction &#183; streaming &#183; retries &#183; timeouts &#183; sessions</text>
+  <text x="78" y="514" class="chipw">providers: free + open-weight ($0, default) &#183; paid frontier (default-deny, opt-in)</text>
+
+  <text x="60" y="558" class="cap">Flow: a task enters zoder &#8594; zoder routes it to the best free model (ranked by SWE-bench + Elo, health-aware) &#8594; zerocore runs it on</text>
+  <text x="60" y="576" class="cap">the provider &#8594; the policy gate verifies it stayed free &#8594; every call is recorded in the local ledger &#8594; priced from a refreshable catalog.</text>
+
+  <rect x="60" y="598" width="14" height="14" rx="3" fill="#76B900"/>
+  <text x="80" y="610" class="cap" font-weight="700" fill="#5a8c00">free path (default)</text>
+  <rect x="270" y="598" width="14" height="14" rx="3" fill="#FFB000"/>
+  <text x="290" y="610" class="cap" font-weight="700" fill="#c98a00">paid frontier (default-deny, opt-in only)</text>
+</svg>

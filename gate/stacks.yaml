@@ -1,0 +1,279 @@
+# zerocode pre-submission gate — STACK ADAPTER CATALOG (declarative)
+#
+# Implements the "programming-stack idempotent" layer of the pre-submission-gate
+# RFC. Each stack adapter is detected by manifest and exposes the common phases
+# {fmt, lint, typecheck, test, build}. The runner (gate/run-gate.sh) executes the
+# phases selected by the active risk tier, on the toolchain the project pins.
+#
+# This catalog is the DEFAULT bar per language. For a concrete repo it is merged
+# with / overridden by the derived gate.toml (parsed from the project's own CI +
+# CONTRIBUTING/AGENTS.md), so "local gate == destination CI" stays the invariant.
+#
+# Conventions:
+#   detect.any_of  : repo is this stack if ANY listed path glob exists
+#   toolchain      : how to discover/pin the version the project's CI declares
+#   phases.<name>  : ordered command list; a phase fails if any command exits != 0
+#   strict: true   : warnings-as-errors / no-autofix posture (the contributor bar)
+#   when_available : command is skipped (not failed) if the named tool is absent
+#                    (so an unconfigured optional phase never hard-blocks)
+
+version: 1
+
+# Which phases run at each risk tier (RFC: risk-tiered validation depth).
+risk_tiers:
+  low:    [fmt, lint]                              # docs/chore
+  medium: [fmt, lint, typecheck, build, test]
+  high:   [fmt, lint, typecheck, build, test]      # + beyond-CI layers added by runner
+default_tier: medium
+
+stacks:
+
+  rust:
+    detect:
+      any_of: ["Cargo.toml"]
+    toolchain:
+      # Faithful to the reference CI: pin the toolchain CI declares.
+      from: ["rust-toolchain.toml", "rust-toolchain", ".github/workflows/*.yml"]
+      default: "stable"
+    phases:
+      fmt:
+        - { cmd: "cargo fmt --all -- --check", strict: true }
+      lint:
+        - { cmd: "cargo clippy --workspace --all-targets --all-features -- -D warnings", strict: true }
+      typecheck:
+        - { cmd: "cargo check --workspace --locked --all-targets", strict: true }
+        - { cmd: "cargo check --workspace --no-default-features", strict: true }
+      build:
+        - { cmd: "cargo build --workspace --locked", strict: true }
+      test:
+        - { cmd: "cargo nextest run --workspace --locked", when_available: "cargo-nextest", strict: true }
+        - { cmd: "cargo test --workspace --locked", unless_available: "cargo-nextest", strict: true }
+    notes: "Mirrors zerocode/zeroclaw bar: fmt --check, clippy -D warnings, --locked, nextest."
+
+  python:
+    detect:
+      any_of: ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"]
+    toolchain:
+      from: ["pyproject.toml", ".python-version", ".github/workflows/*.yml"]
+      default: "python3"
+    phases:
+      fmt:
+        - { cmd: "ruff format --check .", when_available: "ruff", strict: true }
+        - { cmd: "black --check .", when_available: "black", unless_available: "ruff", strict: true }
+      lint:
+        - { cmd: "ruff check .", when_available: "ruff", strict: true }
+        - { cmd: "flake8", when_available: "flake8", unless_available: "ruff", strict: true }
+      typecheck:
+        - { cmd: "mypy .", when_available: "mypy", strict: true }
+        - { cmd: "pyright", when_available: "pyright", unless_available: "mypy", strict: true }
+      build:
+        - { cmd: "python -m build", when_available: "build", strict: false }
+      test:
+        - { cmd: "pytest -q", when_available: "pytest", strict: true }
+    notes: "Mirrors mnemos Makefile bar: ruff check + ruff format --check + mypy + pytest."
+
+  node:
+    detect:
+      any_of: ["package.json"]
+    toolchain:
+      from: [".nvmrc", "package.json", ".github/workflows/*.yml"]
+      default: "node"
+    phases:
+      fmt:
+        - { cmd: "npx --no-install prettier -c .", when_available: "prettier", strict: true }
+      lint:
+        - { cmd: "npx --no-install eslint . --max-warnings=0", when_available: "eslint", strict: true }
+      typecheck:
+        - { cmd: "npx --no-install tsc --noEmit", when_available: "tsc", strict: true }
+      build:
+        - { cmd: "npm run build --if-present", strict: true }
+      test:
+        - { cmd: "npm test --if-present", strict: true }
+    notes: "TS/JS: prettier -c, eslint --max-warnings=0, tsc --noEmit, npm build/test."
+
+  go:
+    detect:
+      any_of: ["go.mod"]
+    toolchain:
+      from: ["go.mod", ".github/workflows/*.yml"]
+      default: "go"
+    phases:
+      fmt:
+        # gofmt -l prints unformatted files; non-empty output must fail the gate.
+        - { cmd: "test -z \"$(gofmt -l .)\"", strict: true }
+      lint:
+        - { cmd: "go vet ./...", strict: true }
+        - { cmd: "golangci-lint run", when_available: "golangci-lint", strict: true }
+      typecheck:
+        - { cmd: "go build ./...", strict: true }
+      build:
+        - { cmd: "go build ./...", strict: true }
+      test:
+        - { cmd: "go test ./... -race", strict: true }
+    notes: "gofmt -l (empty), go vet, golangci-lint, go test -race."
+
+  jvm:
+    detect:
+      any_of: ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
+    toolchain:
+      from: [".sdkmanrc", ".java-version", ".github/workflows/*.yml"]
+      default: "java"
+    phases:
+      fmt:
+        - { cmd: "mvn -q spotless:check", when_available: "mvn", uses: "pom.xml", strict: true }
+        - { cmd: "./gradlew spotlessCheck", when_available: "gradle_wrapper", uses: "build.gradle", strict: true }
+      lint:
+        - { cmd: "mvn -q checkstyle:check", when_available: "mvn", uses: "pom.xml", strict: true }
+        - { cmd: "./gradlew detekt", when_available: "gradle_wrapper", uses: "build.gradle", strict: true }
+      build:
+        - { cmd: "mvn -q -DskipTests package", when_available: "mvn", uses: "pom.xml", strict: true }
+        - { cmd: "./gradlew assemble", when_available: "gradle_wrapper", uses: "build.gradle", strict: true }
+      test:
+        - { cmd: "mvn -q test", when_available: "mvn", uses: "pom.xml", strict: true }
+        - { cmd: "./gradlew test", when_available: "gradle_wrapper", uses: "build.gradle", strict: true }
+    notes: "Java/Kotlin/Scala-on-JVM: spotless + checkstyle/detekt + mvn/gradle test."
+
+  dotnet:
+    detect:
+      any_of: ["*.sln", "*.csproj", "*.fsproj"]
+    toolchain:
+      from: ["global.json", ".github/workflows/*.yml"]
+      default: "dotnet"
+    phases:
+      fmt:
+        - { cmd: "dotnet format --verify-no-changes", strict: true }
+      lint:
+        - { cmd: "dotnet build -warnaserror /clp:ErrorsOnly", strict: true }
+      build:
+        - { cmd: "dotnet build -c Release", strict: true }
+      test:
+        - { cmd: "dotnet test -c Release", strict: true }
+    notes: "C#/F#: dotnet format --verify-no-changes, -warnaserror, dotnet test."
+
+  c_cpp:
+    detect:
+      any_of: ["CMakeLists.txt", "meson.build"]
+    toolchain:
+      from: [".github/workflows/*.yml"]
+      default: "cc"
+    phases:
+      fmt:
+        - { cmd: "git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs -r clang-format --dry-run --Werror", when_available: "clang-format", strict: true }
+      lint:
+        - { cmd: "clang-tidy --warnings-as-errors='*' $(git ls-files '*.c' '*.cc' '*.cpp')", when_available: "clang-tidy", strict: true }
+      build:
+        - { cmd: "cmake -B build && cmake --build build", when_available: "cmake", uses: "CMakeLists.txt", strict: true }
+      test:
+        - { cmd: "ctest --test-dir build --output-on-failure", when_available: "ctest", uses: "CMakeLists.txt", strict: true }
+    notes: "clang-format --Werror, clang-tidy -warnings-as-errors, cmake + ctest."
+
+  ruby:
+    detect:
+      any_of: ["Gemfile", "*.gemspec"]
+    toolchain:
+      from: [".ruby-version", ".github/workflows/*.yml"]
+      default: "ruby"
+    phases:
+      lint:
+        - { cmd: "bundle exec rubocop", when_available: "rubocop", strict: true }
+      typecheck:
+        - { cmd: "bundle exec srb tc", when_available: "srb", strict: true }
+      test:
+        - { cmd: "bundle exec rspec", when_available: "rspec", strict: true }
+    notes: "rubocop, sorbet (srb tc), rspec."
+
+  php:
+    detect:
+      any_of: ["composer.json"]
+    toolchain:
+      from: ["composer.json", ".github/workflows/*.yml"]
+      default: "php"
+    phases:
+      fmt:
+        - { cmd: "vendor/bin/php-cs-fixer fix --dry-run --diff", when_available: "php-cs-fixer", strict: true }
+      lint:
+        - { cmd: "vendor/bin/phpstan analyse", when_available: "phpstan", strict: true }
+      test:
+        - { cmd: "vendor/bin/phpunit", when_available: "phpunit", strict: true }
+    notes: "php-cs-fixer --dry-run, phpstan, phpunit."
+
+  swift:
+    detect:
+      any_of: ["Package.swift"]
+    toolchain:
+      default: "swift"
+    phases:
+      fmt:
+        - { cmd: "swiftformat --lint .", when_available: "swiftformat", strict: true }
+      lint:
+        - { cmd: "swiftlint --strict", when_available: "swiftlint", strict: true }
+      build:
+        - { cmd: "swift build", strict: true }
+      test:
+        - { cmd: "swift test", strict: true }
+    notes: "swiftformat --lint, swiftlint --strict, swift build/test."
+
+  elixir:
+    detect:
+      any_of: ["mix.exs"]
+    toolchain:
+      from: [".tool-versions", ".github/workflows/*.yml"]
+      default: "elixir"
+    phases:
+      fmt:
+        - { cmd: "mix format --check-formatted", strict: true }
+      lint:
+        - { cmd: "mix credo --strict", when_available: "mix-credo", strict: true }
+      typecheck:
+        - { cmd: "mix dialyzer", when_available: "mix-dialyzer", strict: true }
+      test:
+        - { cmd: "mix test", strict: true }
+    notes: "mix format --check-formatted, credo --strict, dialyzer, mix test."
+
+  dart:
+    detect:
+      any_of: ["pubspec.yaml"]
+    toolchain:
+      default: "dart"
+    phases:
+      fmt:
+        - { cmd: "dart format --output=none --set-exit-if-changed .", strict: true }
+      lint:
+        - { cmd: "dart analyze --fatal-infos", strict: true }
+      test:
+        - { cmd: "dart test", strict: true }
+    notes: "dart format --set-exit-if-changed, dart analyze --fatal-infos, dart test."
+
+  haskell:
+    detect:
+      any_of: ["stack.yaml", "*.cabal"]
+    toolchain:
+      default: "ghc"
+    phases:
+      fmt:
+        - { cmd: "fourmolu --mode check $(git ls-files '*.hs')", when_available: "fourmolu", strict: true }
+      lint:
+        - { cmd: "hlint .", when_available: "hlint", strict: true }
+      build:
+        - { cmd: "stack build --pedantic", when_available: "stack", uses: "stack.yaml", strict: true }
+      test:
+        - { cmd: "stack test", when_available: "stack", uses: "stack.yaml", strict: true }
+    notes: "fourmolu --mode check, hlint, stack build --pedantic, stack test."
+
+  shell:
+    detect:
+      any_of: ["*.sh", "*.bash"]
+    toolchain:
+      default: "sh"
+    phases:
+      fmt:
+        - { cmd: "shfmt -d $(git ls-files '*.sh' '*.bash')", when_available: "shfmt", strict: true }
+      lint:
+        - { cmd: "shellcheck $(git ls-files '*.sh' '*.bash')", when_available: "shellcheck", strict: true }
+    notes: "shfmt -d, shellcheck."
+
+# Unknown stacks: the runner falls back to the command set parsed from the repo's
+# own CI workflow (gate.toml derivation), per the RFC.
+fallback:
+  strategy: ci_derived
+  sources: [".github/workflows", ".gitlab-ci.yml", ".woodpecker.yml", ".woodpecker/", ".drone.yml", "Jenkinsfile", ".circleci/config.yml", "azure-pipelines.yml"]

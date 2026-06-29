@@ -1,0 +1,16 @@
+{
+  "description": "Zoder session lifecycle notice (best-effort binary check).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-hook.mjs\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

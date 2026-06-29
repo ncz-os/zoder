@@ -1,0 +1,28 @@
+# Per-project derived gate spec (RFC §1). zerocode SYNTHESIZES this from the
+# destination repo's CI workflow + CONTRIBUTING/AGENTS.md so the local gate is
+# byte-identical to the destination CI. Commit it to override the stacks.yaml
+# defaults; everything here is contributor-overridable.
+
+[gate]
+tier = "medium"            # low | medium | high (risk-tiered depth)
+stacks = ["rust"]          # auto-detected if omitted
+forge = "github"           # auto-detected from origin if omitted
+
+# Pin EXACTLY what the destination CI declares (the anti-"local-green/CI-red" rule).
+[toolchain]
+rust = "1.93.0"
+
+# Override / replace catalog phases with the project's EXACT CI commands.
+# These should be copied verbatim from ci.yml so local == CI.
+[phases.rust]
+fmt       = ["cargo +1.93.0 fmt --all -- --check"]
+lint      = ["cargo +1.93.0 clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings"]
+typecheck = ["cargo +1.93.0 check --locked --features ci-all --all-targets",
+             "cargo +1.93.0 check --locked --no-default-features"]
+test      = ["cargo +1.93.0 nextest run --locked --workspace --exclude zeroclaw-desktop --retries 2"]
+
+# Beyond-CI layers the RFC adds on top of the derived CI bar (runner-enforced).
+[beyond_ci]
+adversarial_review = true   # independent cross-family review must reach no-blocker
+runtime_exercise   = true   # actually run the change
+regression_proof   = true   # issue-closers need fail-on-old/pass-on-new test

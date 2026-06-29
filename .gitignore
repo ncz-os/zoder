@@ -1,0 +1,21 @@
+/target
+**/target
+# Local data, benchmarks, and anything containing tokens/spend/proofs — never commit.
+/data
+*.parquet
+*.log
+.DS_Store
+tools/data/
+# Python caches
+**/__pycache__/
+*.pyc
+# Generated catalog snapshots (rebuilt daily by catalog/refresh.sh)
+catalog/model_index*.json
+catalog/model_index*.csv
+# GitOps: never commit rendered secrets or per-host secret material; build output
+gitops/secrets/
+/dist
+gitops/dist/
+# Argonas / merge artifacts — never commit
+.merge-out/
+.zeroclaw-src/

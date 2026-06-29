@@ -1,0 +1,56 @@
+# config.ibm.toml — IBM watsonx.ai vendor profile for `zoder` (TEMPLATE).
+#
+# This file is a copy-paste starter. Nothing is enabled until you uncomment
+# the blocks below AND populate the relevant API key environment variable.
+# Drop the uncommented file into `~/.zoder/` and `zoder report --vendor ibm`
+# will restrict the report to calls served by IBM's endpoints.
+#
+# See `config.enterprise.toml` for the same shape with real (non-template)
+# entries; the schema and merge semantics are identical.
+
+# ---------------------------------------------------------------------------
+# IBM watsonx.ai — text-generation endpoint. The base URL is region-specific
+# (us-south, eu-de, au-syd, jp-tok, etc.); pick the one matching your
+# watsonx project. Authentication is IAM-style: exchange an IBM Cloud API
+# key for a short-lived bearer at `iam.cloud.ibm.com` and pass that as the
+# bearer header. The `Auth::Env` form here assumes you've already done the
+# exchange and stashed the short-lived bearer in env `IBM_WATSONX_BEARER`.
+# For long-lived flows, switch to `auth = { type = "bearer", token = "..." }`
+# or use the engine's own `ZODER_AUTH_PROXY=...` shim that does the IAM
+# exchange on your behalf.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "ibm-watsonx-us-south"
+# base_url = "https://us-south.ml.cloud.ibm.com/ml/v1/text/chat"
+# kind = "openai-chat"            # watsonx.ai exposes an OpenAI-compatible route
+# auth = { type = "env", var = "IBM_WATSONX_BEARER" }
+# # watsonx.ai is token-billed (input + output per 1k tokens). Marginal cost
+# # is non-zero; `paid = true` so the policy gate treats it as a paid fallback.
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# IBM Granite OSS via the watsonx.ai foundation-models endpoint. Same
+# base URL as above but a different `model` parameter on each call; from
+# `zoder`'s perspective it's just another provider, so we point a second
+# `[[providers]]` entry at the same base URL with a distinct id (so the
+# ledger records the right provider and `--vendor ibm` aggregates both).
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "ibm-granite"
+# base_url = "https://us-south.ml.cloud.ibm.com/ml/v1/text/chat"
+# kind = "openai-chat"
+# auth = { type = "env", var = "IBM_WATSONX_BEARER" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# Profile metadata. To make IBM the active default_provider (e.g. on a
+# IBM-only deployment), uncomment `default = true` and set
+# `default_provider` to the provider id you want as the routed default.
+# At most one overlay may set `default = true` across all `config.*.toml`.
+# ---------------------------------------------------------------------------
+[profile]
+name = "ibm"
+# default = false
+# default_provider = "ibm-watsonx-us-south"

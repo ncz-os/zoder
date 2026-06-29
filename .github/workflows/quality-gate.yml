@@ -1,0 +1,143 @@
+name: Quality Gate
+
+# ncz-os Rust quality gate — same shape as zeroclaw-labs/zeroclaw CI, parameterized
+# for this repo. GitLab (.gitlab-ci.yml) mirrors the comprehensive linux gate.
+# Toolchain pinned to 1.94.1 (matches rust-toolchain.toml where present) so
+# rustfmt/clippy behavior is reproducible. OS matrix: linux, macos.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: Lint
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  build:
+    name: ${{ matrix.label }} ${{ matrix.target }}
+    needs: [fmt]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cmd: build, label: Build }
+          - { os: macos-14,       target: aarch64-apple-darwin,     cmd: check, label: Check }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: ${{ matrix.label }}
+        run: cargo ${{ matrix.cmd }} --workspace --locked --all-features --target ${{ matrix.target }}
+
+  check:
+    name: Check (${{ matrix.name }})
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: all features,        args: "--all-features" }
+          - { name: no default features, args: "--no-default-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo check --workspace --locked ${{ matrix.args }}
+
+  test:
+    name: Test
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --locked --all-features
+      - name: Doctests
+        run: cargo test --workspace --locked --all-features --doc
+
+  security:
+    name: Security
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+      - name: Lockfile integrity
+        run: cargo fetch --locked
+
+  gate:
+    name: CI Required Gate
+    if: always()
+    needs: [fmt, lint, build, check, test, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more CI jobs failed or were cancelled"
+            exit 1
+          fi

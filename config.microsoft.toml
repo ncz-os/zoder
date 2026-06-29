@@ -1,0 +1,72 @@
+# config.microsoft.toml — Microsoft Azure OpenAI vendor profile for `zoder`
+# (TEMPLATE).
+#
+# This file is a copy-paste starter. Nothing is enabled until you uncomment
+# the blocks below AND set the relevant API key environment variable.
+# Drop the uncommented file into `~/.zoder/` and
+# `zoder report --vendor microsoft` will restrict the report to calls
+# served by your Azure OpenAI deployments.
+#
+# Azure OpenAI is one of the most common "bill-by-token" targets; the
+# entries below are explicit `paid = true` / `billing = "metered"` so the
+# policy gate treats them as paid fallbacks (no free-tier optimism).
+#
+# AUTH: raw Azure OpenAI authenticates with an `api-key` REQUEST HEADER, not an
+# `Authorization: Bearer` token. Use `auth = { type = "api_key_header", header
+# = "api-key", var = "AZURE_OPENAI_API_KEY" }` (shown below). If you instead
+# front Azure with a LiteLLM/gateway proxy that re-emits bearer auth, use
+# `auth = { type = "env", var = "..." }` against the proxy URL.
+
+# ---------------------------------------------------------------------------
+# Azure OpenAI — one `[[providers]]` per deployment. Each Azure deployment
+# has its own URL of the form
+#   https://{resource}.openai.azure.com/openai/deployments/{deployment}
+# and its own model name (gpt-4o, gpt-4.1, text-embedding-3-large, etc.).
+# From `zoder`'s perspective each deployment is a distinct provider so
+# `--vendor microsoft` aggregates them all and the ledger records which
+# one served each call. Fill in `resource` and `deployment` per your
+# Azure portal.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "azure-openai-gpt4o"        # any unique id; this is what hits the ledger
+# base_url = "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT"
+# # Azure OpenAI's wire format is OpenAI-compatible, but the chat route is
+# # `/chat/completions?api-version=...`; the engine appends the api-version
+# # automatically when `kind = "azure-openai"`.
+# kind = "azure-openai"
+# auth = { type = "api_key_header", header = "api-key", var = "AZURE_OPENAI_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# A second deployment, e.g. an embeddings-only deployment. Same resource,
+# different deployment, different `id`. The vendor filter aggregates them.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "azure-openai-embeddings"
+# base_url = "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_EMBED_DEPLOYMENT"
+# kind = "azure-openai"
+# auth = { type = "api_key_header", header = "api-key", var = "AZURE_OPENAI_API_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# Azure AI Foundry (formerly Azure AI Studio) — hosts OSS models like
+# Llama, Mistral, Phi-3 with a per-token metered bill. Same auth domain
+# as Azure OpenAI but a different base URL host.
+# ---------------------------------------------------------------------------
+# [[providers]]
+# id = "azure-ai-foundry-llama"
+# base_url = "https://YOUR_RESOURCE.services.ai.azure.com/models/chat/completions"
+# kind = "openai-chat"
+# auth = { type = "env", var = "AZURE_AI_FOUNDRY_KEY" }
+# paid = true
+# billing = "metered"
+
+# ---------------------------------------------------------------------------
+# Profile metadata.
+# ---------------------------------------------------------------------------
+[profile]
+name = "microsoft"
+# default = false
+# default_provider = "azure-openai-gpt4o"
