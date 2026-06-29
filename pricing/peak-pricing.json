@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "kind": "ncz-peak-pricing",
+  "description": "Time-of-day (peak / off-peak) pricing overlay. The public price feeds (LiteLLM/OpenRouter) list only the standard daytime rate; some providers (notably DeepSeek) bill a steep discount during a fixed off-peak UTC window. This curated overlay records the window + a discount multiplier per matched model; build-public-corpus.py applies the multiplier to the base input/output rates and writes an absolute `off_peak` block into pricing/catalog.json. Consumers (zoder, tokenomics) charge the off_peak rate when a call's UTC time falls in the window. Matched by `match` substrings against the catalog model id (case-insensitive); first match wins.",
+  "windows": [
+    {
+      "match": ["deepseek-reasoner", "deepseek-r1"],
+      "window_utc": ["16:30", "00:30"],
+      "input_mult": 0.25,
+      "output_mult": 0.25,
+      "note": "DeepSeek reasoner off-peak ~75% off (UTC 16:30-00:30)"
+    },
+    {
+      "match": ["deepseek-chat", "deepseek-v3", "deepseek-v4"],
+      "window_utc": ["16:30", "00:30"],
+      "input_mult": 0.5,
+      "output_mult": 0.5,
+      "note": "DeepSeek chat off-peak 50% off (UTC 16:30-00:30)"
+    }
+  ]
+}

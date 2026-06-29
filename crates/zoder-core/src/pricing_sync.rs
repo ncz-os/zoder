@@ -91,6 +91,7 @@ fn merge_litellm(models: &mut HashMap<String, ModelPrice>, body: &str) -> anyhow
             cache_write_usd_per_mtok: num(m, "cache_creation_input_token_cost") * PER_TOK_TO_MTOK,
             reasoning_usd_per_mtok: num(m, "output_cost_per_reasoning_token") * PER_TOK_TO_MTOK,
             source: "litellm".into(),
+            off_peak: None,
         };
         models.insert(id.to_ascii_lowercase(), price);
         n += 1;
@@ -128,6 +129,7 @@ fn merge_openrouter(
             cache_write_usd_per_mtok: strnum(pricing, "input_cache_write") * PER_TOK_TO_MTOK,
             reasoning_usd_per_mtok: strnum(pricing, "internal_reasoning") * PER_TOK_TO_MTOK,
             source: "openrouter".into(),
+            off_peak: None,
         };
         models.insert(key, price);
         n += 1;

@@ -35,6 +35,38 @@ pub struct ModelPrice {
     pub reasoning_usd_per_mtok: f64,
     #[serde(default)]
     pub source: String,
+    /// Optional off-peak (time-of-day) rates + the UTC window they apply in
+    /// (e.g. DeepSeek's discounted off-peak window). When present and the call's
+    /// UTC time is inside the window, the off-peak rate bills instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_peak: Option<OffPeak>,
+}
+
+/// Off-peak (time-of-day) rates + the UTC window they apply in. Minutes are
+/// minutes-of-day UTC in `[0, 1440)`; a window may wrap midnight (`start > end`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffPeak {
+    #[serde(default)]
+    pub input_usd_per_mtok: f64,
+    #[serde(default)]
+    pub output_usd_per_mtok: f64,
+    #[serde(default)]
+    pub window_start_utc_min: u32,
+    #[serde(default)]
+    pub window_end_utc_min: u32,
+}
+
+impl OffPeak {
+    /// True when `utc_min` (minutes-of-day UTC) falls in the off-peak window,
+    /// handling a window that wraps past midnight.
+    pub fn active_at(&self, utc_min: u32) -> bool {
+        let (s, e) = (self.window_start_utc_min, self.window_end_utc_min);
+        if s <= e {
+            utc_min >= s && utc_min < e
+        } else {
+            utc_min >= s || utc_min < e
+        }
+    }
 }
 
 impl ModelPrice {
@@ -53,6 +85,21 @@ impl ModelPrice {
         } else {
             self.usd_per_mtok * (tokens_in + tokens_out) as f64 / 1_000_000.0
         }
+    }
+
+    /// Cost for an input/output split at a given UTC minute-of-day, charging the
+    /// off-peak rate when its window is active, else the standard `cost_io`.
+    pub fn cost_io_at(&self, tokens_in: u64, tokens_out: u64, utc_min: u32) -> f64 {
+        if let Some(op) = &self.off_peak {
+            if op.active_at(utc_min)
+                && (op.input_usd_per_mtok > 0.0 || op.output_usd_per_mtok > 0.0)
+            {
+                return (tokens_in as f64 * op.input_usd_per_mtok
+                    + tokens_out as f64 * op.output_usd_per_mtok)
+                    / 1_000_000.0;
+            }
+        }
+        self.cost_io(tokens_in, tokens_out)
     }
 }
 
@@ -132,6 +179,17 @@ fn validate_model_price(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Optional off-peak (time-of-day) block; absent/malformed → no off-peak.
+    if let Some(op) = obj.get("off_peak").and_then(|v| v.as_object()) {
+        let num = |k: &str| op.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        let umin = |k: &str| (op.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32).min(1439);
+        price.off_peak = Some(OffPeak {
+            input_usd_per_mtok: num("input_usd_per_mtok"),
+            output_usd_per_mtok: num("output_usd_per_mtok"),
+            window_start_utc_min: umin("window_start_utc_min"),
+            window_end_utc_min: umin("window_end_utc_min"),
+        });
+    }
     Some(price)
 }
 
@@ -295,5 +353,52 @@ impl PricingCatalog {
     /// "if these free tokens had run on a paid frontier model" estimate.
     pub fn avoided(&self, tokens: u64) -> f64 {
         self.baseline_usd_per_mtok * (tokens as f64 / 1_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deepseek_chat() -> ModelPrice {
+        ModelPrice {
+            input_usd_per_mtok: 0.28,
+            output_usd_per_mtok: 0.42,
+            off_peak: Some(OffPeak {
+                input_usd_per_mtok: 0.14,
+                output_usd_per_mtok: 0.21,
+                window_start_utc_min: 990, // 16:30 UTC
+                window_end_utc_min: 30,    // 00:30 UTC (wraps midnight)
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn off_peak_window_wraps_midnight() {
+        let op = deepseek_chat().off_peak.unwrap();
+        assert!(op.active_at(990)); // 16:30 start, inclusive
+        assert!(op.active_at(1200)); // 20:00, inside
+        assert!(op.active_at(0)); // 00:00, past midnight, inside
+        assert!(op.active_at(29)); // 00:29, inside
+        assert!(!op.active_at(30)); // 00:30 end, exclusive
+        assert!(!op.active_at(600)); // 10:00, daytime peak
+        assert!(!op.active_at(989)); // 16:29, just before window
+    }
+
+    #[test]
+    fn cost_io_at_charges_off_peak_in_window_else_standard() {
+        let p = deepseek_chat();
+        // 1M in + 1M out: standard = 0.28 + 0.42 = 0.70; off-peak = 0.14 + 0.21 = 0.35.
+        let std = p.cost_io_at(1_000_000, 1_000_000, 600);
+        let off = p.cost_io_at(1_000_000, 1_000_000, 1200);
+        assert!((std - 0.70).abs() < 1e-9, "peak {std}");
+        assert!((off - 0.35).abs() < 1e-9, "off-peak {off}");
+        // No off_peak block → always standard.
+        let flat = ModelPrice {
+            input_usd_per_mtok: 1.0,
+            ..Default::default()
+        };
+        assert!((flat.cost_io_at(1_000_000, 0, 1200) - 1.0).abs() < 1e-9);
     }
 }

@@ -258,18 +258,58 @@ def build_corpus(econ, generated, bench=None, known_good=None):
     }
 
 
-def build_pricing(econ, generated):
+def _hhmm_to_min(s):
+    h, m = s.split(":")
+    return (int(h) * 60 + int(m)) % 1440
+
+
+def load_peak_pricing(out_dir):
+    """Curated time-of-day (off-peak) pricing windows (pricing/peak-pricing.json)."""
+    path = os.path.join(out_dir, "pricing", "peak-pricing.json")
+    try:
+        with open(path) as f:
+            wins = json.load(f).get("windows", [])
+        print(f"  peak-pricing overlay: {len(wins)} windows from {path}", file=sys.stderr)
+        return wins
+    except FileNotFoundError:
+        return []
+    except Exception as e:  # noqa: BLE001
+        print(f"  peak-pricing overlay: skipped ({e})", file=sys.stderr)
+        return []
+
+
+def _match_peak(mid, windows):
+    low = mid.lower()
+    for w in windows:
+        if any(sub.lower() in low for sub in w.get("match", [])):
+            return w
+    return None
+
+
+def build_pricing(econ, generated, peak=None):
+    peak = peak or []
+    models = {}
+    for mid, e in sorted(econ.items()):
+        inp = e["input_usd_per_mtok"]
+        out = e["output_usd_per_mtok"]
+        entry = {"input_usd_per_mtok": inp, "output_usd_per_mtok": out}
+        # Off-peak overlay: apply the curated discount to the base rates and record
+        # the UTC window so consumers can charge the cheaper rate inside it.
+        w = _match_peak(mid, peak)
+        if w and (inp > 0 or out > 0):
+            start, end = w["window_utc"]
+            entry["off_peak"] = {
+                "input_usd_per_mtok": round(inp * w.get("input_mult", 1.0), 6),
+                "output_usd_per_mtok": round(out * w.get("output_mult", 1.0), 6),
+                "window_start_utc_min": _hhmm_to_min(start),
+                "window_end_utc_min": _hhmm_to_min(end),
+            }
+        models[mid] = entry
     return {
         "version": 1,
         "generated": generated,
-        "source": "litellm+openrouter (public)",
-        "models": {
-            mid: {
-                "input_usd_per_mtok": e["input_usd_per_mtok"],
-                "output_usd_per_mtok": e["output_usd_per_mtok"],
-            }
-            for mid, e in sorted(econ.items())
-        },
+        "source": "litellm+openrouter (public)" + (" + ncz peak-pricing overlay" if peak else ""),
+        "models": models,
     }
 
 
@@ -301,7 +341,7 @@ def main():
 
     import os
     corpus = build_corpus(econ, generated, bench, known_good)
-    pricing = build_pricing(econ, generated)
+    pricing = build_pricing(econ, generated, load_peak_pricing(args.out_dir))
 
     cdir = os.path.join(args.out_dir, "corpus")
     pdir = os.path.join(args.out_dir, "pricing")
