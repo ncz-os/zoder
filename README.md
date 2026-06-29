@@ -57,12 +57,19 @@ engine + `zerocode` UI from the fork and ships them next to the `zoder` binary.
 
 ### Part of the ncz-os family — MNEMOS-first
 
-zoder belongs to the **ncz-os** family and is **MNEMOS-first** for memory and
-data: when a MNEMOS datastore is configured, memories and sessions are logged
-directly to it. zoder ships **database-backed session persistence**
-(PostgreSQL / MySQL / Oracle / Db2, feature-gated) as the durable backend for
-that history — so a hive of headless workers shares one system of record instead
-of scattered local files.
+zoder belongs to the **ncz-os** family and is **MNEMOS-first** for memory.
+**[MNEMOS](https://github.com/ncz-os/mnemos)** is ncz-os's open-source agent
+memory system: a versioned, queryable store (REST + an MCP server) for
+long-lived memories and session history, with semantic + full-text search and
+pluggable vector backends. It's the system of record that lets a fleet of
+agents share context across runs and hosts instead of each keeping scattered
+local files.
+
+When a MNEMOS datastore is configured, zoder logs memories and recall there. For
+durable session history zoder also ships **database-backed session persistence**
+(PostgreSQL / MySQL / Oracle / Db2, feature-gated) — so a hive of headless
+workers shares one system of record. See **[Enterprise memory & persistence](#enterprise-memory--persistence)**
+for the two wiring paths (MCP-per-agent recall vs. direct DB logging).
 
 ---
 
@@ -477,6 +484,108 @@ private while the public code stays vendor-neutral.
 An overlay's `[theme]` table sets the named color palette `zoder report` uses for
 that vendor's reports, so a chargeback view can match an org's brand without any
 code change.
+
+---
+
+## Corpus & pricing sync
+
+zoder routes off two data files in `$ZODER_HOME` (`~/.zoder`):
+
+- **`model_corpus.json`** — the classified routing corpus (which models exist,
+  which are free/paid, capability/latency signals).
+- **`data/pricing.json`** — per-token rates, the cost source for `zoder report`
+  / `spend` / `finops`.
+
+Both are **public, self-serve, and rebuilt daily from public price data** — they
+do **not** depend on any private/internal build process:
+
+- **Source of truth:** [`corpus/model_corpus.json`](corpus/model_corpus.json) +
+  [`pricing/catalog.json`](pricing/catalog.json) in this repo, regenerated daily
+  by [`scripts/build-public-corpus.py`](scripts/build-public-corpus.py) from the
+  public **LiteLLM** + **OpenRouter** price lists (plus an optional public coding-
+  benchmark overlay for tier ranking). A model is marked free/routable only on an
+  **explicit** zero public price — unpriced placeholders and enterprise SKUs are
+  filtered out.
+- **Pulled from:** `https://raw.githubusercontent.com/ncz-os/zoder/main/{corpus/model_corpus.json,pricing/catalog.json}`.
+
+### Keeping it current
+
+| You want… | Run |
+|---|---|
+| Seed on first install | the installer does it automatically (`--no-corpus` to skip) |
+| Refresh rates from public price lists | `zoder pricing sync` |
+| Re-pull the latest public corpus | `curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/corpus/model_corpus.json -o ~/.zoder/model_corpus.json` |
+| Reconcile the corpus against **your own** endpoint's served models | `zoder refresh` |
+
+The installer seeds both files and leaves any existing copy untouched, so your
+own `zoder refresh` / `zoder pricing sync` edits are never clobbered. The same
+public artifacts back the tokenomics plugins' pricing, so they stay current on
+the same cadence without any shared private dependency. (A built-in TTL
+self-heal — auto re-pull when the file is missing or stale — is on the roadmap;
+until then use the commands above or re-run the installer.)
+
+> Note: the public corpus marks models free **only** when their *public* price is
+> zero. Your working providers (a self-hosted endpoint, a free-tier key, etc.)
+> may be free for *you* though they carry a list price — `zoder refresh` against
+> your own endpoint, plus local config, is what marks those routable for you.
+
+---
+
+## Enterprise memory & persistence
+
+zoder has two complementary ways to give agents durable, shared memory backed by
+your own infrastructure. Use either or both.
+
+### 1. MCP recall via MNEMOS (per-agent chat memory)
+
+Point an agent at a [MNEMOS](https://github.com/ncz-os/mnemos) server as an MCP
+tool source — the agent gains `save`/`search` memory tools and recalls across
+runs. MNEMOS itself is backed by your enterprise database (PostgreSQL, Oracle,
+Db2, MySQL/MariaDB), so this is the path to those engines. MCP grants are
+**bundle-scoped and secure-by-default** (omission is not a grant):
+
+```toml
+# 1) Declare the MNEMOS MCP server.
+[[mcp.servers]]
+name = "mnemos"
+transport = "http"                       # or stdio (command/args) for the local bridge
+url = "https://mnemos.internal/mcp"
+headers = { Authorization = "Bearer ${MNEMOS_TOKEN}" }   # secret; sourced from env
+
+# 2) Put it in a bundle.
+[mcp_bundles.memory]
+servers = ["mnemos"]
+
+# 3) Grant that bundle to the agent(s) that should recall.
+[agents.coder]
+mcp_bundles = ["memory"]
+```
+
+### 2. Direct memory persistence to an enterprise database
+
+Write the engine's memory subsystem straight to a database via the
+`[storage.*]` layer, then point `[memory]` (globally) or a single agent at it.
+Engine-native backends: **postgres**, **sqlite**, **qdrant**, **markdown**,
+**lucid**.
+
+```toml
+# Define a Postgres storage instance.
+[storage.postgres.work]
+url = "postgres://zoder:${PGPASSWORD}@db.internal:5432/zoder_memory"
+
+# Use it for all memory…
+[memory]
+backend = "postgres.work"
+
+# …or scope it to one agent (per-agent overrides the global default).
+[agents.coder.memory]
+backend = "postgres.work"
+```
+
+A hive of headless workers pointed at the same instance shares one system of
+record instead of scattered local files. For enterprise engines beyond Postgres
+(Oracle / Db2 / MySQL / MariaDB), use **path 1** — MNEMOS provides those backends
+and zoder reaches them over MCP.
 
 ---
 
