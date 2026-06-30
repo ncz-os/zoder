@@ -10,6 +10,7 @@ description = "Core engine for zoder: cost-aware free-first model routing, healt
 
 [dependencies]
 acp-client = { path = "../acp-client" }
+model-health = { path = "../model-health" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

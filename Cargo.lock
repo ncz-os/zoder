@@ -827,6 +827,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-health"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2281,6 +2291,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures-util",
+ "model-health",
  "rand 0.8.6",
  "reqwest",
  "serde",
