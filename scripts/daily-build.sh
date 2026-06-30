@@ -34,11 +34,20 @@ PUB_ROOT="/mnt/datapool/zoder-releases"
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+# Role selects which target(s) to build. Prefer an explicit ZODER_BUILD_ROLE
+# (set in ~/.zoder-build.env) since hostnames are not reliable (ULTRA's host
+# name is "MacBookPersonal"); fall back to a hostname guess.
 host_short="$(hostname -s 2>/dev/null || hostname)"
-case "$host_short" in
-  ULTRA|ultra*|Ultra*)  MODE="ultra" ;;
-  HYDRA|hydra*|Hydra*)  MODE="hydra" ;;
-  *) log "ERROR: host '$host_short' has no daily-build role"; exit 2 ;;
+MODE="${ZODER_BUILD_ROLE:-}"
+if [ -z "$MODE" ]; then
+  case "$host_short" in
+    ULTRA|ultra*|Ultra*|MacBook*|macbook*)  MODE="ultra" ;;
+    HYDRA|hydra*|Hydra*)                     MODE="hydra" ;;
+  esac
+fi
+case "$MODE" in
+  ultra|hydra) ;;
+  *) log "ERROR: no daily-build role for host '$host_short' (set ZODER_BUILD_ROLE=ultra|hydra in ~/.zoder-build.env)"; exit 2 ;;
 esac
 
 mkdir -p "$WORK"
