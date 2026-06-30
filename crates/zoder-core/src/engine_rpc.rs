@@ -25,6 +25,155 @@ use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Child;
+
+/// How to reach the ACP engine. Today: an already-running daemon over its
+/// Unix socket. Future: spawn a child process (e.g. `goose acp`) and speak
+/// ACP over its stdio. The JSON-RPC layer is identical in both cases — only
+/// the transport half-acquisition differs.
+#[derive(Debug, Clone)]
+pub enum EngineTransport {
+    /// Connect to an existing daemon over a Unix-domain socket.
+    UnixSocket(PathBuf),
+    /// Spawn `command args…` and speak ACP over its stdio. `env` is appended
+    /// to the inherited environment (extra vars override on key clash).
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+}
+
+/// A live, connected ACP transport: a byte-stream reader + writer. For
+/// [`EngineTransport::Stdio`] the [`Child`] handle is retained so the spawned
+/// process is NOT killed when this struct is dropped; for [`EngineTransport::UnixSocket`]
+/// it's `None`. The reader/writer halves are exposed by value and are the only
+/// handles the JSON-RPC layer ever touches.
+pub struct ConnectedTransport {
+    pub reader: TransportReader,
+    pub writer: TransportWriter,
+    /// Retained so a spawned stdio engine isn't reaped mid-turn. Never read.
+    _child: Option<Child>,
+}
+
+/// Read-half of a connected ACP transport (works for either a Unix socket or a
+/// spawned child's stdout).
+pub enum TransportReader {
+    Unix(tokio::io::ReadHalf<UnixStream>),
+    ChildStdout(tokio::process::ChildStdout),
+}
+
+/// Write-half of a connected ACP transport (works for either a Unix socket or a
+/// spawned child's stdin).
+pub enum TransportWriter {
+    Unix(tokio::io::WriteHalf<UnixStream>),
+    ChildStdin(tokio::process::ChildStdin),
+}
+
+impl tokio::io::AsyncRead for TransportReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            TransportReader::Unix(r) => std::pin::Pin::new(r).poll_read(cx, buf),
+            TransportReader::ChildStdout(r) => std::pin::Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for TransportWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            TransportWriter::Unix(w) => std::pin::Pin::new(w).poll_write(cx, buf),
+            TransportWriter::ChildStdin(w) => std::pin::Pin::new(w).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            TransportWriter::Unix(w) => std::pin::Pin::new(w).poll_flush(cx),
+            TransportWriter::ChildStdin(w) => std::pin::Pin::new(w).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            TransportWriter::Unix(w) => std::pin::Pin::new(w).poll_shutdown(cx),
+            TransportWriter::ChildStdin(w) => std::pin::Pin::new(w).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Open the configured transport and return a connected reader/writer pair.
+///
+/// - [`EngineTransport::UnixSocket`] mirrors today's behavior byte-for-byte:
+///   `UnixStream::connect` then `tokio::io::split`.
+/// - [`EngineTransport::Stdio`] spawns `command args…` with piped
+///   stdin/stdout and returns those halves; the [`Child`] is retained on the
+///   returned [`ConnectedTransport`] so it isn't dropped (and the process
+///   killed) when the JSON-RPC code only holds the halves.
+pub async fn connect_transport(
+    transport: &EngineTransport,
+) -> anyhow::Result<ConnectedTransport> {
+    match transport {
+        EngineTransport::UnixSocket(path) => {
+            let stream = UnixStream::connect(path)
+                .await
+                .with_context(|| format!("connecting to engine at {}", path.display()))?;
+            let (reader, writer) = tokio::io::split(stream);
+            Ok(ConnectedTransport {
+                reader: TransportReader::Unix(reader),
+                writer: TransportWriter::Unix(writer),
+                _child: None,
+            })
+        }
+        EngineTransport::Stdio {
+            command,
+            args,
+            env,
+        } => {
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(false);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd
+                .spawn()
+                .with_context(|| format!("spawning ACP engine `{command}`"))?;
+            // `.take()` detaches the half from the Child so dropping Child
+            // doesn't auto-close them — and conversely dropping the half
+            // doesn't signal the child (the Child owns the death semantics).
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("child had no piped stdin"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("child had no piped stdout"))?;
+            Ok(ConnectedTransport {
+                reader: TransportReader::ChildStdout(stdout),
+                writer: TransportWriter::ChildStdin(stdin),
+                // Retain the Child so the spawned engine isn't reaped mid-turn.
+                _child: Some(child),
+            })
+        }
+    }
+}
 
 /// ACP protocol version the daemon's `initialize` expects (matches
 /// `zeroclaw_api::jsonrpc` and `engine_cost.rs`).
@@ -164,11 +313,9 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
 /// Create a fresh engine session bound to `cwd` and return its id (without
 /// prompting). Used by `transfer` to hand off a resumable thread.
 pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow::Result<String> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connecting to engine at {}", socket.display()))?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
+    let conn = connect_transport(&EngineTransport::UnixSocket(socket.to_path_buf())).await?;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
     write_frame(
         &mut write_half,
         &json!({
@@ -232,11 +379,9 @@ async fn drive<F: FnMut(AgentEvent)>(
     // this instant and returns whatever has accumulated (outcome="timeout"),
     // rather than the caller dropping the future and losing all partial work.
     let deadline = tokio::time::Instant::now() + opts.timeout;
-    let stream = UnixStream::connect(&opts.socket)
-        .await
-        .with_context(|| format!("connecting to engine at {}", opts.socket.display()))?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
+    let conn = connect_transport(&EngineTransport::UnixSocket(opts.socket.clone())).await?;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
 
     // 1. initialize (must be first; no env forwarded -> daemon uses its own
     //    provider config, avoiding API-key clashes).
