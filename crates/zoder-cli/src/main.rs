@@ -9,11 +9,11 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
-    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, run_agent,
+    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, run_agent_dispatch,
     sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, Entry, Gran, HealthStore,
-    Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
-    ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
+    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, Entry, EngineKind, Gran,
+    HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
+    PricingSource, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
 };
 
 #[derive(Parser, Clone)]
@@ -85,6 +85,11 @@ struct Cli {
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
+    /// Which agentic engine to drive the loop with: zeroclaw | goose
+    /// (default zeroclaw — current behavior). Goose is a stub in this step
+    /// and returns a clear "not yet implemented" error.
+    #[arg(long, global = true, value_name = "ENGINE", default_value = "zeroclaw")]
+    engine: String,
 
     // ---- reliability ----
     /// Per-model transient-failure retries (timeouts/429/5xx) before fallback.
@@ -1653,6 +1658,7 @@ pub(crate) struct TurnResult {
 /// does NOT print the final summary — the caller owns presentation.
 pub(crate) async fn agentic_turn(
     cli: &Cli,
+    engine_kind: EngineKind,
     prompt: String,
     session_override: Option<String>,
     stream_output: bool,
@@ -1727,7 +1733,10 @@ pub(crate) async fn agentic_turn(
 
     let started = std::time::Instant::now();
     let start_ts = chrono::Utc::now();
-    let run = run_agent(&opts, |ev| {
+    // `engine_kind` is parsed and validated by the caller (cmd_exec_agentic),
+    // before any daemon setup, so a Goose request never starts zeroclaw and an
+    // unknown value surfaces as a parse error up front.
+    let run = run_agent_dispatch(engine_kind, &opts, |ev| {
         if !stream_output {
             return;
         }
@@ -1835,8 +1844,15 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         return Ok(());
     }
 
+    // Parse --engine EARLY, before any zeroclaw socket/daemon setup. An unknown
+    // value must surface as a parse error here (not get swallowed), and a Goose
+    // request must NOT spawn the zeroclaw daemon — the daemon-unavailable ->
+    // oneshot fallback would otherwise mask the goose path and produce a
+    // confusing socket/transport failure instead of the real diagnostic.
+    let engine_kind = resolve_engine_kind(cli)?;
+
     let prompt = read_prompt(prompt)?;
-    let t = agentic_turn(cli, prompt, None, !cli.json).await?;
+    let t = agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
 
     if cli.json {
         println!(
@@ -1881,6 +1897,21 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         anyhow::bail!("agentic turn ended: {}", t.run.outcome);
     }
     Ok(())
+}
+
+/// Parse `--engine` and bail early on Goose (which would otherwise start the
+/// zeroclaw daemon and have the daemon-unavailable -> oneshot fallback mask
+/// the goose path). Must be called BEFORE any zeroclaw socket/daemon setup.
+/// Unknown values surface as a parse error here so they aren't swallowed.
+fn resolve_engine_kind(cli: &Cli) -> anyhow::Result<EngineKind> {
+    let kind: EngineKind = cli
+        .engine
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --engine: {e}"))?;
+    if kind == EngineKind::Goose {
+        anyhow::bail!("goose engine not yet implemented (step 2b)");
+    }
+    Ok(kind)
 }
 
 /// L5: surface a warning instead of silently dropping a persistence failure.

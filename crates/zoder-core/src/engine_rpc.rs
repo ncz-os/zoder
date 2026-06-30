@@ -70,6 +70,34 @@ pub enum TransportWriter {
     ChildStdin(tokio::process::ChildStdin),
 }
 
+/// Selects which agentic engine `run_agent_dispatch` drives. Today: the local
+/// zeroclaw daemon over its Unix socket (or spawned stdio). Future: other ACP
+/// engines (goose, etc.) — the dispatcher picks the right transport and RPC
+/// surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineKind {
+    /// The local zeroclaw daemon (default; current behavior).
+    #[default]
+    Zeroclaw,
+    /// Block's Goose ACP engine. Stub for now — real implementation lands in
+    /// step 2b; calls return a clear "not yet implemented" error.
+    Goose,
+}
+
+impl std::str::FromStr for EngineKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "zeroclaw" => Ok(EngineKind::Zeroclaw),
+            "goose" => Ok(EngineKind::Goose),
+            other => Err(anyhow!(
+                "unknown engine {other:?} (expected: zeroclaw | goose)"
+            )),
+        }
+    }
+}
+
 impl tokio::io::AsyncRead for TransportReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -346,6 +374,24 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("session/new returned no session_id"))
+}
+
+/// Dispatch a single agentic turn to the selected engine. Today this is a
+/// thin wrapper: Zeroclaw falls through to the existing [`run_agent`]; the
+/// Goose branch is a stub that surfaces a clear "not yet implemented" error so
+/// callers (CLI `--engine goose`) get a sane diagnostic instead of a confusing
+/// socket/transport failure.
+pub async fn run_agent_dispatch<F: FnMut(AgentEvent)>(
+    kind: EngineKind,
+    opts: &AgentOptions,
+    on_event: F,
+) -> anyhow::Result<AgentRun> {
+    match kind {
+        EngineKind::Zeroclaw => run_agent(opts, on_event).await,
+        EngineKind::Goose => {
+            anyhow::bail!("goose engine not yet implemented (step 2b)")
+        }
+    }
 }
 
 /// Drive one agentic turn to completion, invoking `on_event` for each streamed
@@ -692,5 +738,19 @@ mod tests {
         assert!(decide_approval(ApprovalPolicy::All, "shell"));
         assert!(decide_approval(ApprovalPolicy::All, "anything_at_all"));
         assert!(!decide_approval(ApprovalPolicy::None, "read"));
+    }
+
+    #[test]
+    fn engine_kind_from_str_lowercase() {
+        assert_eq!("zeroclaw".parse::<EngineKind>().unwrap(), EngineKind::Zeroclaw);
+        assert_eq!("ZEROCLAW".parse::<EngineKind>().unwrap(), EngineKind::Zeroclaw);
+        assert_eq!("goose".parse::<EngineKind>().unwrap(), EngineKind::Goose);
+    }
+
+    #[test]
+    fn engine_kind_from_str_rejects_empty_and_unknown() {
+        assert!("".parse::<EngineKind>().is_err());
+        assert!("   ".parse::<EngineKind>().is_err());
+        assert!("bogus".parse::<EngineKind>().is_err());
     }
 }

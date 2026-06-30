@@ -507,7 +507,8 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // also capture the streamed transcript and a resumable session id. This is
     // the fix for the DB2 field test where `rescue` timed out at 600s with
     // nothing to show for it.
-    let t = crate::agentic_turn(cli, prompt, None, !cli.json).await?;
+    let engine_kind = crate::resolve_engine_kind(cli)?;
+    let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
 
     let ok = t.run.succeeded();
     let timed_out = t.run.outcome == "timeout";
@@ -733,7 +734,8 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // disk as tool calls run, so partial work survives; we still validate,
         // review, and feed the failure back so the next iteration can finish it.
         let mut author_err: Option<String> = None;
-        let turn = match crate::agentic_turn(cli, author_prompt, session.clone(), false).await {
+        let engine_kind = crate::resolve_engine_kind(cli)?;
+        let turn = match crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false).await {
             Ok(t) => {
                 session = Some(t.run.session_id.clone());
                 total_cost += t.cost_usd;
