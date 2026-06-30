@@ -1324,6 +1324,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // (no output emitted) failure we fall back to the next model.
     let started = std::time::Instant::now();
     let mut used_model = String::new();
+    let mut used_provider_id = provider_cfg.id.clone();
     let mut used_latency_ms = 0.0f64;
     let mut outcome: Option<ChatResult> = None;
     let mut last_err: Option<ProviderError> = None;
@@ -1345,6 +1346,32 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             .ok_or_else(|| anyhow::anyhow!("no provider configured for model {model_id}"))?
             .id
             .clone();
+        // Per-link paid gate: with per-model routing a fallback can resolve to a
+        // DIFFERENT provider than the (already-confirmed) primary, so re-run the
+        // policy gate for every fallback link. The primary (i == 0) was gated +
+        // confirmed before the loop. A fallback that would need paid
+        // confirmation is skipped fail-closed (never silently spend mid-chain);
+        // `--allow-paid` makes the gate return Allow, so it still runs then.
+        if i > 0 {
+            let link_provider_paid = eng
+                .cfg
+                .provider(&pid)
+                .map(|p| p.paid || p.billing != BillingMode::Free)
+                .unwrap_or(false);
+            let link_entry = eng.corpus.get(model_id).cloned().unwrap_or_else(|| ModelEntry {
+                id: model_id.clone(),
+                gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
+                ..Default::default()
+            });
+            if let Decision::NeedConfirm(_) = gate.check(&link_entry, link_provider_paid) {
+                if !cli.quiet {
+                    eprintln!(
+                        "[zoder] skipping paid fallback {model_id} via {pid} (pass --allow-paid to use it)"
+                    );
+                }
+                continue;
+            }
+        }
         if !provider_clients.contains_key(&pid) {
             let pcfg = eng
                 .cfg
@@ -1372,6 +1399,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 // policy verify below, so a policy-violating "success" is
                 // recorded as a single failure (not success + failure).
                 used_model = model_id.clone();
+                used_provider_id = pid.clone();
                 used_latency_ms = model_started.elapsed().as_millis() as f64;
                 outcome = Some(res);
                 break;
@@ -1425,7 +1453,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     ledger.record(&Entry {
         ts_utc: chrono::Utc::now(),
-        provider: provider_cfg.id.clone(),
+        provider: used_provider_id.clone(),
         model: used_model.clone(),
         host: zoder_core::ledger::host_of_model(&used_model),
         tokens_in,
@@ -1671,12 +1699,22 @@ pub(crate) async fn agentic_turn(
 
     let socket = ensure_engine_daemon().await?;
 
+    // Force the daemon to use the operator's explicit choice — an `-m` model or
+    // a configured `primary_model` pin — rather than letting the agent alias
+    // fall through to its own default model. Pure-auto routing (no `-m`, no pin)
+    // keeps `None` so the alias picks its default as before.
+    let model_override = if cli.model.is_some() || eng.cfg.primary_model.is_some() {
+        Some(primary.clone())
+    } else {
+        None
+    };
+
     let opts = AgentOptions {
         socket,
         agent_alias: alias.clone(),
         cwd: cwd.clone(),
         prompt,
-        model_override: None,
+        model_override,
         session_id: session_override.or_else(|| cli.session.clone()),
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
@@ -2837,7 +2875,14 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
 
     let mut corpus = eng.corpus;
     // Reconcile against the UNION of every provider's served ids so a free
-    // provider's NIMs are never retired by the default provider's narrower list.
+    // provider's NIMs are never retired by the default provider's narrower
+    // list. Dedup first: `reconcile` snapshots the existing-id set once, so a
+    // duplicate id (default provider also declares `serves`) would otherwise be
+    // inserted as a duplicate corpus entry.
+    {
+        let mut seen = std::collections::HashSet::new();
+        all_served.retain(|id| seen.insert(id.clone()));
+    }
     let report = corpus.reconcile(&all_served);
     let promoted = corpus.ingest_free_chat(&free_ids);
     corpus.save(&eng.cfg.corpus_path)?;

@@ -351,17 +351,28 @@ impl Config {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// Resolve which provider should serve a given model id. Returns the FIRST
-    /// configured provider whose `serves` list contains a prefix of `model_id`
-    /// (config order is preserved through the overlay merge, so a vendor
-    /// overlay's providers are matched after the base providers). Falls back to
-    /// `default_provider` when no provider claims the prefix — preserving the
-    /// historical single-endpoint behavior for unclaimed models. This is what
-    /// lets a single routed fallback chain span providers (MiniMax -> EIH).
+    /// Resolve which provider should serve a given model id. Returns the
+    /// provider with the LONGEST `serves` prefix matching `model_id` (most
+    /// specific wins, so `nvidia/` on one provider and `nvidia/llama-` on
+    /// another route deterministically; config order breaks exact ties). Falls
+    /// back to `default_provider` when no provider claims the prefix —
+    /// preserving the historical single-endpoint behavior for unclaimed models.
+    /// This is what lets a single routed fallback chain span providers
+    /// (MiniMax -> EIH). Empty prefixes are ignored (and rejected by
+    /// `validate()`) so a stray `serves = [""]` can never capture every model.
     pub fn provider_for_model(&self, model_id: &str) -> Option<&Provider> {
         self.providers
             .iter()
-            .find(|p| p.serves.iter().any(|prefix| model_id.starts_with(prefix.as_str())))
+            .filter_map(|p| {
+                p.serves
+                    .iter()
+                    .filter(|prefix| !prefix.is_empty() && model_id.starts_with(prefix.as_str()))
+                    .map(|prefix| prefix.len())
+                    .max()
+                    .map(|len| (len, p))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, p)| p)
             .or_else(|| self.provider(&self.default_provider))
     }
 
@@ -418,6 +429,19 @@ impl Config {
                 ));
             } else if !p.base_url.starts_with("http://") && !p.base_url.starts_with("https://") {
                 errs.push(format!("provider {}: base_url must be http(s)", p.id));
+            }
+            // An empty/whitespace `serves` prefix would match EVERY model id and
+            // silently capture the whole routing pool onto one provider — refuse
+            // it. Prefixes should be delimiter-bounded (e.g. `nvidia/`,
+            // `meta/llama-`, `MiniMax-`) to avoid surprises like `meta` also
+            // matching `metamath/...`; that is advisory, but emptiness is fatal.
+            for prefix in &p.serves {
+                if prefix.trim().is_empty() {
+                    errs.push(format!(
+                        "provider {}: `serves` contains an empty prefix (would match every model)",
+                        p.id
+                    ));
+                }
             }
         }
         if self.provider(&self.default_provider).is_none() {

@@ -413,6 +413,10 @@ impl Corpus {
             // this idempotent: once retired, a later refresh won't re-report it.
             if !served_set.contains(m.id.as_str()) && m.route_candidate {
                 m.route_candidate = false;
+                // Also drop the free flag: a retired model is no longer a
+                // proven free route, so it must not linger as routable-free if
+                // re-added to a different (possibly paid) catalog later.
+                m.free = false;
                 m.gated_reason = Some("retired: not currently served".into());
                 report.retired.push(m.id.clone());
             }
@@ -437,9 +441,20 @@ impl Corpus {
         let mut promoted = 0usize;
         for id in ids {
             if let Some(m) = self.models.iter_mut().find(|m| &m.id == id) {
+                // Never silently flip a model the corpus already classifies as
+                // paid (or with nonzero per-token economics) into free — an
+                // overbroad `serves` prefix must not launder a paid model into
+                // the free pool. Leave such an entry untouched.
+                let priced = m
+                    .economics
+                    .as_ref()
+                    .map(|e| e.input_usd_per_mtok > 0.0 || e.output_usd_per_mtok > 0.0)
+                    .unwrap_or(false);
+                if m.paid || priced {
+                    continue;
+                }
                 let was_routable = m.routable();
                 m.free = true;
-                m.paid = false;
                 m.route_candidate = true;
                 m.kind = "chat".into();
                 m.gated_reason = None;
