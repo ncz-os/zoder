@@ -714,7 +714,9 @@ mod tests {
             "nvidia-eih"
         );
         assert_eq!(
-            cfg.provider_for_model("deepseek-ai/deepseek-r1").unwrap().id,
+            cfg.provider_for_model("deepseek-ai/deepseek-r1")
+                .unwrap()
+                .id,
             "nvidia-eih"
         );
         // No prefix claims it -> falls back to default_provider.

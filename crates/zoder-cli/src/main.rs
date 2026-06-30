@@ -11,7 +11,7 @@ use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, run_agent_dispatch,
     sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, Entry, EngineKind, Gran,
+    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind, Entry, Gran,
     HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
     PricingSource, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
 };
@@ -86,8 +86,10 @@ struct Cli {
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
     /// Which agentic engine to drive the loop with: zeroclaw | goose
-    /// (default zeroclaw — current behavior). Goose is a stub in this step
-    /// and returns a clear "not yet implemented" error.
+    /// (default zeroclaw — current behavior). `goose` spawns a `goose acp`
+    /// child process and drives standard ACP over its stdio; model
+    /// selection is via the spawned process's `GOOSE_PROVIDER` / `GOOSE_MODEL`
+    /// env (see `GOOSE_PROVIDER` to override the default `openai` provider).
     #[arg(long, global = true, value_name = "ENGINE", default_value = "zeroclaw")]
     engine: String,
 
@@ -1363,11 +1365,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 .provider(&pid)
                 .map(|p| p.paid || p.billing != BillingMode::Free)
                 .unwrap_or(false);
-            let link_entry = eng.corpus.get(model_id).cloned().unwrap_or_else(|| ModelEntry {
-                id: model_id.clone(),
-                gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
-                ..Default::default()
-            });
+            let link_entry = eng
+                .corpus
+                .get(model_id)
+                .cloned()
+                .unwrap_or_else(|| ModelEntry {
+                    id: model_id.clone(),
+                    gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
+                    ..Default::default()
+                });
             if let Decision::NeedConfirm(_) = gate.check(&link_entry, link_provider_paid) {
                 if !cli.quiet {
                     eprintln!(
@@ -1707,7 +1713,16 @@ pub(crate) async fn agentic_turn(
     let cwd = agentic_cwd(cli)?;
     let alias = resolve_agent_alias(cli, &primary);
 
-    let socket = ensure_engine_daemon().await?;
+    // The Goose path SPAWNS its own engine process (`goose acp` over stdio)
+    // and does not use `opts.socket`. We must NOT touch the zeroclaw daemon
+    // in that case — starting it would waste a process, fight for the same
+    // port/socket, and pull the runtime into the "engine unavailable" ->
+    // oneshot fallback path that would mask the goose driver with a
+    // confusing socket/transport error. Zeroclaw keeps the existing flow.
+    let socket = match engine_kind {
+        EngineKind::Zeroclaw => Some(ensure_engine_daemon().await?),
+        EngineKind::Goose => None,
+    };
 
     // Force the daemon to use the operator's explicit choice — an `-m` model or
     // a configured `primary_model` pin — rather than letting the agent alias
@@ -1719,12 +1734,22 @@ pub(crate) async fn agentic_turn(
         None
     };
 
+    // `socket` is a dummy path for Goose: the goose driver ignores it and
+    // builds its own Stdio transport, but `AgentOptions` still requires the
+    // field. Use the engine's configured socket path so any logging that
+    // happens to reference it (none on the goose path) is still meaningful.
+    let socket_path = socket.unwrap_or_else(engine_socket_path);
     let opts = AgentOptions {
-        socket,
+        socket: socket_path,
         agent_alias: alias.clone(),
         cwd: cwd.clone(),
         prompt,
         model_override,
+        // The routed model id — the zeroclaw-free model name goose needs in
+        // `GOOSE_MODEL`. ALWAYS pass it when known (we always know: it's
+        // `chain[0]`); the goose driver prefers this over the zeroclaw
+        // agent alias (which goose doesn't understand).
+        model_id: Some(primary.clone()),
         session_id: session_override.or_else(|| cli.session.clone()),
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
@@ -1762,21 +1787,38 @@ pub(crate) async fn agentic_turn(
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
 
-    let socket2 = engine_socket_path();
-    let (cost, tokens_in, tokens_out, model_used) =
-        agentic_cost(&socket2, start_ts, &alias, &primary).await;
+    // Cost reconciliation is zeroclaw-specific (it talks to the daemon's
+    // `cost/query` endpoint over the Unix socket). Goose doesn't expose that,
+    // and we deliberately never started the zeroclaw daemon for the goose
+    // path, so there is no authoritative cost to harvest. Record zeros +
+    // attribute to the routed model so the ledger still gets a row for the
+    // run, but skip the post-verify paid-gate check (the corpus_paid test
+    // also implicitly assumes the daemon reported the actual billed model,
+    // which we don't have here).
+    let (cost, tokens_in, tokens_out, model_used) = match engine_kind {
+        EngineKind::Zeroclaw => {
+            let socket2 = engine_socket_path();
+            agentic_cost(&socket2, start_ts, &alias, &primary).await
+        }
+        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone()),
+    };
 
     // Post-verify: the engine (via the agent alias) may have run a different —
     // possibly paid — model than the one pre-gated above (the daemon resolves
     // the alias). If it billed real money, or the engine-reported model is a
     // known paid model, without --allow-paid, record a policy violation rather
-    // than marking the ledger clean.
+    // than marking the ledger clean. Skipped for goose: we have no engine-
+    // reported cost/model, so the gate above (`gate.check` on the routed
+    // `primary`) is the only signal we can apply.
     let model_used_paid = eng
         .corpus
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    let violation = if !cli.allow_paid && (cost > 0.0 || model_used_paid) {
+    let violation = if !cli.allow_paid
+        && engine_kind == EngineKind::Zeroclaw
+        && (cost > 0.0 || model_used_paid)
+    {
         let v = format!(
             "agentic run (alias {alias}) billed ${cost:.4} on engine model '{model_used}' \
              (corpus_paid={model_used_paid}) without --allow-paid"
@@ -1904,14 +1946,13 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 /// the goose path). Must be called BEFORE any zeroclaw socket/daemon setup.
 /// Unknown values surface as a parse error here so they aren't swallowed.
 fn resolve_engine_kind(cli: &Cli) -> anyhow::Result<EngineKind> {
-    let kind: EngineKind = cli
-        .engine
+    // Parse-only: no engine-specific bail. The Goose driver lives in
+    // `run_goose_agent` (standard ACP, stdio) and the dispatcher routes to
+    // it from `agentic_turn`, which also skips the zeroclaw daemon setup
+    // for Goose so we never end up touching the wrong engine.
+    cli.engine
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --engine: {e}"))?;
-    if kind == EngineKind::Goose {
-        anyhow::bail!("goose engine not yet implemented (step 2b)");
-    }
-    Ok(kind)
+        .map_err(|e| anyhow::anyhow!("invalid --engine: {e}"))
 }
 
 /// L5: surface a warning instead of silently dropping a persistence failure.

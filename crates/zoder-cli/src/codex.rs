@@ -735,7 +735,15 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // review, and feed the failure back so the next iteration can finish it.
         let mut author_err: Option<String> = None;
         let engine_kind = crate::resolve_engine_kind(cli)?;
-        let turn = match crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false).await {
+        let turn = match crate::agentic_turn(
+            cli,
+            engine_kind,
+            author_prompt,
+            session.clone(),
+            false,
+        )
+        .await
+        {
             Ok(t) => {
                 session = Some(t.run.session_id.clone());
                 total_cost += t.cost_usd;

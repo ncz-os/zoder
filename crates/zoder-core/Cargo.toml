@@ -27,3 +27,13 @@ rand.workspace = true
 wiremock.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+# `libc::kill(pid, 0)` is used by `connected_transport_kill_child_reaps_process`
+# to probe a spawned child's liveness. Adding `libc` here (vs. a raw
+# `#[link(name = "c")] extern "C" { fn kill(...) }` declaration) is the
+# cross-platform-correct choice: the libc crate resolves the right
+# `#[link]` attribute per platform (Linux glibc/musl, macOS libSystem,
+# Android bionic, Windows ucrt, BSDs, illumos, etc.), so the test
+# compiles and links on every platform zoder supports — including
+# macOS, where `#[link(name = "c")]` would force a `-lc` link against
+# a library that doesn't exist on strict linkers and break the build.
+libc = "0.2"

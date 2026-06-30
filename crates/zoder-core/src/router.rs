@@ -163,13 +163,11 @@ impl<'a> Router<'a> {
             let pin_entry = self.corpus.get(pin);
             let pin_family = pin_entry.map(|e| e.family.as_str()).unwrap_or("");
             let fallbacks = Self::build_fallbacks(&ranked, pin, pin_family);
-            let cap_str = match pin_entry.and_then(|e| {
-                e.code_capability()
-                    .zip(e.code_capability_source())
-            }) {
-                Some((c, src)) => format!("{c:.1} ({src})"),
-                None => "pinned".to_string(),
-            };
+            let cap_str =
+                match pin_entry.and_then(|e| e.code_capability().zip(e.code_capability_source())) {
+                    Some((c, src)) => format!("{c:.1} ({src})"),
+                    None => "pinned".to_string(),
+                };
             let reason = format!(
                 "tier={tier:?} pick={pin} (PINNED primary; code_cap={cap_str}) then {} ranked free fallback(s)",
                 fallbacks.len()
@@ -281,8 +279,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let router =
-            Router::new(&corpus, &health).with_primary(Some("MiniMax-M3".to_string()));
+        let router = Router::new(&corpus, &health).with_primary(Some("MiniMax-M3".to_string()));
         let route = router.select(Tier::Auto).unwrap();
         assert_eq!(route.primary, "MiniMax-M3");
         // `hi` (higher SWE) leads the fallbacks, proving the rest stay ranked.
