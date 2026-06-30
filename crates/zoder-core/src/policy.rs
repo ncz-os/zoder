@@ -1,7 +1,7 @@
 //! Policy gate: free-first, default-deny paid, plus the anti-paid-fallback
 //! guard that inspects LiteLLM telemetry after every "free" call.
 
-use crate::config::Config;
+use crate::config::{BillingMode, Config};
 use crate::corpus::ModelEntry;
 use crate::provider::CallTelemetry;
 use url::Url;
@@ -47,9 +47,24 @@ pub struct PolicyGate {
 impl PolicyGate {
     /// `strict_free` should typically be `cfg.strict_free && !lenient_flag`.
     pub fn new(cfg: &Config, allow_paid: bool, strict_free: bool) -> Self {
+        let mut free_hosts = cfg.free_api_hosts.clone();
+        // Operator-declared-free providers (billing = free, not paid) are
+        // trusted free backends: fold each one's base_url host into the
+        // free-host set. This is what lets a flat-rate subscription provider
+        // (e.g. MiniMax, declared billing="free") pass the strict free guard —
+        // its calls report no LiteLLM api_base header, so api_base falls back to
+        // the provider base_url, and the host is verified here. Without this an
+        // overlay could never extend the free-host set (it lives on config.json).
+        for p in &cfg.providers {
+            if !p.paid && p.billing == BillingMode::Free {
+                if let Some(host) = host_of(&p.base_url) {
+                    free_hosts.push(host);
+                }
+            }
+        }
         Self {
             allow_paid,
-            free_hosts: cfg.free_api_hosts.clone(),
+            free_hosts,
             strict_free,
         }
     }
@@ -198,5 +213,38 @@ mod tests {
             ..Default::default()
         };
         assert!(g.verify_free(&free_model(), &t_paid).is_err());
+    }
+
+    #[test]
+    fn declared_free_provider_host_passes_strict_guard() {
+        // A flat-rate subscription provider declared billing=free contributes
+        // its base_url host to the free-host set, so a call whose api_base is
+        // that host (the base_url fallback) verifies free under strict mode.
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers.push(crate::config::Provider {
+            id: "minimax".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: crate::config::Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["MiniMax-".into()],
+        });
+        let g = PolicyGate::new(&cfg, false, true);
+        let t = CallTelemetry {
+            api_base: Some("https://api.minimax.io/v1".into()),
+            ..Default::default()
+        };
+        assert!(
+            g.verify_free(&free_model(), &t).is_ok(),
+            "declared-free provider host must pass the strict free guard"
+        );
+        // A host NOT declared free still fails strict mode.
+        let t_bad = CallTelemetry {
+            api_base: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        assert!(g.verify_free(&free_model(), &t_bad).is_err());
     }
 }

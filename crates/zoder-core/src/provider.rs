@@ -447,7 +447,16 @@ impl OpenAiProvider {
             }
         };
         let status = resp.status();
-        let telemetry = telemetry_from_headers(resp.headers());
+        let mut telemetry = telemetry_from_headers(resp.headers());
+        // Direct providers (not fronted by a LiteLLM proxy) don't emit the
+        // `x-litellm-model-api-base` served-backend header. Fall back to this
+        // provider's configured base_url so the served host is still known —
+        // the policy gate verifies it against the free-host set (which includes
+        // operator-declared-free providers), instead of failing strict mode for
+        // lack of any api_base telemetry.
+        if telemetry.api_base.is_none() {
+            telemetry.api_base = Some(self.base_url.clone());
+        }
         if !status.is_success() {
             let code = status.as_u16();
             let retry_after = retry_after_header(resp.headers());
