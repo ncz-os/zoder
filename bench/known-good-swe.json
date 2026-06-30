@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "kind": "ncz-known-good-swe",
   "description": "Curated allow-list of high-SWE models proven good for agentic coding, with per-workflow suitability. The public pricing corpus has no quality dimension, so this overlay is the source of capability + workflow routing. Entries are matched against a model id by `match` substrings (case-insensitive); the FIRST pattern in this ordered list that matches wins, so most-specific patterns come first. Fields: swe = approx SWE-bench Verified solve-rate (0..100, used as the corpus capability score); single_pass = suitability for one-shot agentic authoring (zoder oneshot / exec), 0..1; grind = suitability for the adversarial 'grind until green' loop (zoder loop), 0..1. grind weights multi-step RUNTIME-failure convergence, not one-shot quality: a model can author well yet stall when a check fails on runtime behavior it must debug iteratively.",
   "evidence": "single_pass ranks one-shot code quality; grind ranks loop convergence. Empirical (ncz-os, 2026-06): Claude (Opus/Sonnet) and DeepSeek-R1-class reasoners converge on runtime-debug grinds (e.g. the ncz-persist M2 sqlx backends, fixed first-pass by a Claude agent after the open-weight loop stalled). Kimi-K2 authored compiling backends but could NOT debug the runtime conformance failure \u2014 it spun a non-progressing 1-line diff until the no-progress guard stopped it; so Kimi is high single_pass / low grind. gpt-oss is similar (good cheap author, weak grind). Compile-gated grinds (clear localized errors) converge for far more models than runtime-gated ones.",
@@ -7,7 +7,6 @@
     {
       "match": [
         "claude-opus",
-        "claude-4-opus",
         "opus-4"
       ],
       "swe": 80,
@@ -18,8 +17,7 @@
     },
     {
       "match": [
-        "claude-sonnet",
-        "sonnet-4"
+        "claude-sonnet"
       ],
       "swe": 77,
       "single_pass": 0.96,
@@ -72,8 +70,6 @@
     },
     {
       "match": [
-        "deepseek-v3",
-        "deepseek-chat",
         "deepseek-v4"
       ],
       "swe": 70,
@@ -117,9 +113,7 @@
     },
     {
       "match": [
-        "qwen3-coder",
-        "qwen-3-coder",
-        "qwen2.5-coder"
+        "qwen3-coder"
       ],
       "swe": 65,
       "single_pass": 0.85,
@@ -129,9 +123,7 @@
     },
     {
       "match": [
-        "qwen3",
-        "qwen-3",
-        "qwq"
+        "qwen3"
       ],
       "swe": 60,
       "single_pass": 0.78,
@@ -141,9 +133,8 @@
     },
     {
       "match": [
-        "kimi-k2",
-        "kimi-k2.5",
-        "kimi-k2.6"
+        "kimi-k2.6",
+        "kimi-k2"
       ],
       "swe": 65,
       "single_pass": 0.86,
@@ -173,8 +164,7 @@
     },
     {
       "match": [
-        "glm-4.6",
-        "glm-4.5"
+        "glm-4.6"
       ],
       "swe": 64,
       "single_pass": 0.83,
@@ -215,13 +205,13 @@
     },
     {
       "match": [
-        "minimax-m2",
+        "minimax-m3",
         "minimax-text"
       ],
       "swe": 61,
       "single_pass": 0.8,
       "grind": 0.64,
-      "note": "zoder default author; cheap; moderate grind",
+      "note": "MiniMax M3 (latest; zoder default author, $0 subscription). m2 superseded.",
       "review": 0.62
     },
     {
@@ -311,8 +301,7 @@
     },
     {
       "match": [
-        "llama-4",
-        "llama4"
+        "llama-4"
       ],
       "swe": 48,
       "single_pass": 0.62,
@@ -322,8 +311,7 @@
     },
     {
       "match": [
-        "mistral-large-3",
-        "mistral-large-2"
+        "mistral-large-3"
       ],
       "swe": 66,
       "single_pass": 0.84,
@@ -333,15 +321,15 @@
     },
     {
       "match": [
-        "mistral-large",
-        "mistral-medium"
+        "mistral-large"
       ],
       "swe": 52,
       "single_pass": 0.66,
       "grind": 0.48,
-      "note": "Mistral general; single-pass leaning",
+      "note": "Mistral Large family fallback (prefer mistral-large-3)",
       "review": 0.62
     }
   ],
-  "review_field": "review (0..1) = adversarial-review suitability, DISTINCT from single_pass(authoring)/grind(loop). Reviewer selection should weight review x live response-time health (HealthStore); skip degraded/timeout models. Source: empirical 2026-06-30 zoder goose-ACP protocol bake-off, ground truth = Codex+web+real-goose integration test."
+  "review_field": "review (0..1) = adversarial-review suitability, DISTINCT from single_pass(authoring)/grind(loop). Reviewer selection should weight review x live response-time health (HealthStore); skip degraded/timeout models. Source: empirical 2026-06-30 zoder goose-ACP protocol bake-off, ground truth = Codex+web+real-goose integration test.",
+  "currency_doctrine": "Prefer the LATEST generation that is AVAILABLE + HEALTHY on the target endpoint. Latest-on-paper that is unserved/degraded/timing-out is worse than a healthy prior gen: GLM 5.2 is not on EIH (use 5.1); deepseek-v4-pro times out (use v4-flash); nemotron-3-ultra-550b is intermittently degraded/scope-denied. Bare family tokens (glm/qwen3/deepseek/kimi/minimax/nemotron) remain only as low-scored resilience fallbacks."
 }
