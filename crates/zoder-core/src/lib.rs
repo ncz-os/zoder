@@ -9,7 +9,7 @@ pub mod engine_cost;
 pub use acp_client as engine_rpc;
 pub mod enterprise_cost;
 pub mod finops;
-pub mod health;
+pub use model_health as health;
 pub mod ledger;
 pub mod policy;
 pub mod pricing;
@@ -41,7 +41,7 @@ pub use finops::{
     cli_run as finops_cli, forecast_burn, realized_rate_by_model, spend_by_dimension, AdvisorRow,
     BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, FinOpsTags, ModelRealized, SpendGroup,
 };
-pub use health::{HealthStore, State};
+pub use model_health::{HealthStore, State};
 pub use ledger::{Entry, Ledger, Period, Rollup};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{ModelPrice, PricingCatalog};

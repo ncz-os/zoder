@@ -1,0 +1,15 @@
+[package]
+name = "model-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Per-model health for LLM routing: persisted EWMA latency, circuit breakers, and live availability. Engine/provider-agnostic; no ncz-os/zoder coupling."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/acp-client", "crates/zoder-core", "crates/zoder-cli"]
+members = ["crates/acp-client", "crates/model-health", "crates/zoder-core", "crates/zoder-cli"]
 
 [workspace.package]
 version = "0.2.1"
