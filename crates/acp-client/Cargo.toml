@@ -1,0 +1,20 @@
+[package]
+name = "acp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Generic Agent Client Protocol (ACP) client: transport (Unix socket | spawned-stdio) + JSON-RPC framing + the zeroclaw-extended and standard (goose) ACP dialects. Engine-agnostic; no ncz-os/zoder coupling."
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "process", "io-util", "time", "rt", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "process", "io-util", "time", "rt", "macros", "sync"] }
+# libc::kill(pid,0) liveness probe in the child-reap test; the crate resolves the
+# right per-platform #[link] (macOS libSystem etc.) where a raw -lc would fail.
+libc = "0.2"
