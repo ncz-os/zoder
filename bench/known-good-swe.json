@@ -1,33 +1,347 @@
 {
-  "version": 1,
+  "version": 2,
   "kind": "ncz-known-good-swe",
   "description": "Curated allow-list of high-SWE models proven good for agentic coding, with per-workflow suitability. The public pricing corpus has no quality dimension, so this overlay is the source of capability + workflow routing. Entries are matched against a model id by `match` substrings (case-insensitive); the FIRST pattern in this ordered list that matches wins, so most-specific patterns come first. Fields: swe = approx SWE-bench Verified solve-rate (0..100, used as the corpus capability score); single_pass = suitability for one-shot agentic authoring (zoder oneshot / exec), 0..1; grind = suitability for the adversarial 'grind until green' loop (zoder loop), 0..1. grind weights multi-step RUNTIME-failure convergence, not one-shot quality: a model can author well yet stall when a check fails on runtime behavior it must debug iteratively.",
-  "evidence": "single_pass ranks one-shot code quality; grind ranks loop convergence. Empirical (ncz-os, 2026-06): Claude (Opus/Sonnet) and DeepSeek-R1-class reasoners converge on runtime-debug grinds (e.g. the ncz-persist M2 sqlx backends, fixed first-pass by a Claude agent after the open-weight loop stalled). Kimi-K2 authored compiling backends but could NOT debug the runtime conformance failure — it spun a non-progressing 1-line diff until the no-progress guard stopped it; so Kimi is high single_pass / low grind. gpt-oss is similar (good cheap author, weak grind). Compile-gated grinds (clear localized errors) converge for far more models than runtime-gated ones.",
+  "evidence": "single_pass ranks one-shot code quality; grind ranks loop convergence. Empirical (ncz-os, 2026-06): Claude (Opus/Sonnet) and DeepSeek-R1-class reasoners converge on runtime-debug grinds (e.g. the ncz-persist M2 sqlx backends, fixed first-pass by a Claude agent after the open-weight loop stalled). Kimi-K2 authored compiling backends but could NOT debug the runtime conformance failure \u2014 it spun a non-progressing 1-line diff until the no-progress guard stopped it; so Kimi is high single_pass / low grind. gpt-oss is similar (good cheap author, weak grind). Compile-gated grinds (clear localized errors) converge for far more models than runtime-gated ones.",
   "patterns": [
-    { "match": ["claude-opus", "claude-4-opus", "opus-4"], "swe": 80, "single_pass": 0.98, "grind": 0.98, "note": "frontier; strongest runtime-debug convergence" },
-    { "match": ["claude-sonnet", "sonnet-4"], "swe": 77, "single_pass": 0.96, "grind": 0.96, "note": "near-Opus convergence, cheaper; default strong grinder" },
-    { "match": ["claude"], "swe": 74, "single_pass": 0.94, "grind": 0.93, "note": "Claude family fallback" },
-    { "match": ["gpt-5-codex", "gpt-5.5-codex", "codex"], "swe": 76, "single_pass": 0.95, "grind": 0.94, "note": "OpenAI codex; strong agentic + convergence" },
-    { "match": ["gpt-5"], "swe": 74, "single_pass": 0.94, "grind": 0.90, "note": "strong author, good grind" },
-    { "match": ["deepseek-r1", "deepseek-reasoner"], "swe": 71, "single_pass": 0.88, "grind": 0.90, "note": "reasoning model; strong multi-step runtime-debug grind" },
-    { "match": ["deepseek-v3", "deepseek-chat", "deepseek-v4"], "swe": 70, "single_pass": 0.90, "grind": 0.85, "note": "strong + cheap author; solid grind" },
-    { "match": ["deepseek"], "swe": 68, "single_pass": 0.87, "grind": 0.83, "note": "DeepSeek family fallback" },
-    { "match": ["qwen3-coder-480b", "qwen-3-coder-480b", "qwen3-coder-plus"], "swe": 69, "single_pass": 0.89, "grind": 0.82, "note": "strongest open coder; decent grind" },
-    { "match": ["qwen3-coder", "qwen-3-coder", "qwen2.5-coder"], "swe": 65, "single_pass": 0.85, "grind": 0.76, "note": "Qwen coder family (32B etc.)" },
-    { "match": ["qwen3", "qwen-3", "qwq"], "swe": 60, "single_pass": 0.78, "grind": 0.66, "note": "general Qwen3" },
-    { "match": ["kimi-k2", "kimi-k2.5", "kimi-k2.6"], "swe": 65, "single_pass": 0.86, "grind": 0.55, "note": "strong SINGLE-PASS; weak runtime-debug grind (ncz-persist M2 stall, 2026-06)" },
-    { "match": ["kimi"], "swe": 60, "single_pass": 0.80, "grind": 0.52, "note": "Moonshot Kimi fallback; prefer for single-pass not grind" },
-    { "match": ["glm-4.6", "glm-4.5"], "swe": 64, "single_pass": 0.83, "grind": 0.72, "note": "Zhipu GLM; good author, moderate grind" },
-    { "match": ["glm"], "swe": 58, "single_pass": 0.76, "grind": 0.62, "note": "GLM family fallback" },
-    { "match": ["grok-code", "grok-4-code"], "swe": 67, "single_pass": 0.86, "grind": 0.72, "note": "xAI grok-code-fast; strong fast author" },
-    { "match": ["grok"], "swe": 60, "single_pass": 0.78, "grind": 0.62, "note": "Grok family fallback" },
-    { "match": ["minimax-m2", "minimax-text"], "swe": 61, "single_pass": 0.80, "grind": 0.64, "note": "zoder default author; cheap; moderate grind" },
-    { "match": ["minimax"], "swe": 56, "single_pass": 0.74, "grind": 0.58, "note": "MiniMax family fallback" },
-    { "match": ["nemotron"], "swe": 58, "single_pass": 0.74, "grind": 0.56, "note": "NVIDIA Nemotron (EIH); solid author, moderate grind" },
-    { "match": ["codestral"], "swe": 56, "single_pass": 0.74, "grind": 0.52, "note": "Mistral code model; fast author" },
-    { "match": ["gpt-oss-120b"], "swe": 55, "single_pass": 0.72, "grind": 0.46, "note": "free via groq; good cheap author, weak grind" },
-    { "match": ["gpt-oss"], "swe": 50, "single_pass": 0.66, "grind": 0.42, "note": "gpt-oss small; single-pass only" },
-    { "match": ["llama-4", "llama4"], "swe": 48, "single_pass": 0.62, "grind": 0.40, "note": "Llama 4; light tasks only" },
-    { "match": ["mistral-large", "mistral-medium"], "swe": 52, "single_pass": 0.66, "grind": 0.48, "note": "Mistral general; single-pass leaning" }
-  ]
+    {
+      "match": [
+        "claude-opus",
+        "claude-4-opus",
+        "opus-4"
+      ],
+      "swe": 80,
+      "single_pass": 0.98,
+      "grind": 0.98,
+      "note": "frontier; strongest runtime-debug convergence",
+      "review": 0.96
+    },
+    {
+      "match": [
+        "claude-sonnet",
+        "sonnet-4"
+      ],
+      "swe": 77,
+      "single_pass": 0.96,
+      "grind": 0.96,
+      "note": "near-Opus convergence, cheaper; default strong grinder",
+      "review": 0.95
+    },
+    {
+      "match": [
+        "claude"
+      ],
+      "swe": 74,
+      "single_pass": 0.94,
+      "grind": 0.93,
+      "note": "Claude family fallback",
+      "review": 0.92
+    },
+    {
+      "match": [
+        "gpt-5-codex",
+        "gpt-5.5-codex",
+        "codex"
+      ],
+      "swe": 76,
+      "single_pass": 0.95,
+      "grind": 0.94,
+      "note": "OpenAI codex; strong agentic + convergence",
+      "review": 0.95
+    },
+    {
+      "match": [
+        "gpt-5"
+      ],
+      "swe": 74,
+      "single_pass": 0.94,
+      "grind": 0.9,
+      "note": "strong author, good grind",
+      "review": 0.92
+    },
+    {
+      "match": [
+        "deepseek-r1",
+        "deepseek-reasoner"
+      ],
+      "swe": 71,
+      "single_pass": 0.88,
+      "grind": 0.9,
+      "note": "reasoning model; strong multi-step runtime-debug grind",
+      "review": 0.88
+    },
+    {
+      "match": [
+        "deepseek-v3",
+        "deepseek-chat",
+        "deepseek-v4"
+      ],
+      "swe": 70,
+      "single_pass": 0.9,
+      "grind": 0.85,
+      "note": "strong + cheap author; solid grind | HEALTH: deepseek-v4-pro TIMES OUT on EIH (45s) - health-gate OUT as reviewer",
+      "review": 0.82
+    },
+    {
+      "match": [
+        "deepseek"
+      ],
+      "swe": 68,
+      "single_pass": 0.87,
+      "grind": 0.83,
+      "note": "DeepSeek family fallback",
+      "review": 0.8
+    },
+    {
+      "match": [
+        "qwen3.5",
+        "qwen-3.5"
+      ],
+      "swe": 70,
+      "single_pass": 0.88,
+      "grind": 0.8,
+      "review": 0.86,
+      "note": "Qwen3.5 (EIH qwen3.5-397b); EMPIRICAL 2026-06-30 caught BOTH ACP protocol blockers as reviewer"
+    },
+    {
+      "match": [
+        "qwen3-coder-480b",
+        "qwen-3-coder-480b",
+        "qwen3-coder-plus"
+      ],
+      "swe": 69,
+      "single_pass": 0.89,
+      "grind": 0.82,
+      "note": "strongest open coder; decent grind",
+      "review": 0.78
+    },
+    {
+      "match": [
+        "qwen3-coder",
+        "qwen-3-coder",
+        "qwen2.5-coder"
+      ],
+      "swe": 65,
+      "single_pass": 0.85,
+      "grind": 0.76,
+      "note": "Qwen coder family (32B etc.)",
+      "review": 0.7
+    },
+    {
+      "match": [
+        "qwen3",
+        "qwen-3",
+        "qwq"
+      ],
+      "swe": 60,
+      "single_pass": 0.78,
+      "grind": 0.66,
+      "note": "general Qwen3",
+      "review": 0.62
+    },
+    {
+      "match": [
+        "kimi-k2",
+        "kimi-k2.5",
+        "kimi-k2.6"
+      ],
+      "swe": 65,
+      "single_pass": 0.86,
+      "grind": 0.55,
+      "note": "strong SINGLE-PASS; weak runtime-debug grind (ncz-persist M2 stall, 2026-06) | EMPIRICAL: kimi-k2.6 caught BOTH ACP blockers",
+      "review": 0.85
+    },
+    {
+      "match": [
+        "kimi"
+      ],
+      "swe": 60,
+      "single_pass": 0.8,
+      "grind": 0.52,
+      "note": "Moonshot Kimi fallback; prefer for single-pass not grind",
+      "review": 0.66
+    },
+    {
+      "match": [
+        "glm-5"
+      ],
+      "swe": 68,
+      "single_pass": 0.86,
+      "grind": 0.78,
+      "review": 0.9,
+      "note": "Zhipu GLM-5.x (EIH glm-5.1); EMPIRICAL 2026-06-30 caught BOTH ACP blockers, most precise free reviewer"
+    },
+    {
+      "match": [
+        "glm-4.6",
+        "glm-4.5"
+      ],
+      "swe": 64,
+      "single_pass": 0.83,
+      "grind": 0.72,
+      "note": "Zhipu GLM; good author, moderate grind",
+      "review": 0.72
+    },
+    {
+      "match": [
+        "glm"
+      ],
+      "swe": 58,
+      "single_pass": 0.76,
+      "grind": 0.62,
+      "note": "GLM family fallback",
+      "review": 0.58
+    },
+    {
+      "match": [
+        "grok-code",
+        "grok-4-code"
+      ],
+      "swe": 67,
+      "single_pass": 0.86,
+      "grind": 0.72,
+      "note": "xAI grok-code-fast; strong fast author",
+      "review": 0.74
+    },
+    {
+      "match": [
+        "grok"
+      ],
+      "swe": 60,
+      "single_pass": 0.78,
+      "grind": 0.62,
+      "note": "Grok family fallback",
+      "review": 0.62
+    },
+    {
+      "match": [
+        "minimax-m2",
+        "minimax-text"
+      ],
+      "swe": 61,
+      "single_pass": 0.8,
+      "grind": 0.64,
+      "note": "zoder default author; cheap; moderate grind",
+      "review": 0.62
+    },
+    {
+      "match": [
+        "minimax"
+      ],
+      "swe": 56,
+      "single_pass": 0.74,
+      "grind": 0.58,
+      "note": "MiniMax family fallback",
+      "review": 0.55
+    },
+    {
+      "match": [
+        "nemotron-3-ultra",
+        "nemotron-ultra-253",
+        "llama-3.1-nemotron-ultra"
+      ],
+      "swe": 72,
+      "single_pass": 0.86,
+      "grind": 0.78,
+      "review": 0.74,
+      "note": "NVIDIA Nemotron Ultra (EIH); EMPIRICAL: intuited both ACP blockers but HEDGED (comment); 550b intermittently DEGRADED/scope-denied"
+    },
+    {
+      "match": [
+        "nemotron-3-super",
+        "nemotron-4-340",
+        "nemotron-super"
+      ],
+      "swe": 64,
+      "single_pass": 0.8,
+      "grind": 0.66,
+      "review": 0.58,
+      "note": "NVIDIA Nemotron Super (EIH); EMPIRICAL: MISSED both ACP protocol blockers as reviewer"
+    },
+    {
+      "match": [
+        "nemotron-nano",
+        "nemotron-mini"
+      ],
+      "swe": 50,
+      "single_pass": 0.64,
+      "grind": 0.46,
+      "review": 0.42,
+      "note": "small Nemotron; light tasks"
+    },
+    {
+      "match": [
+        "nemotron"
+      ],
+      "swe": 58,
+      "single_pass": 0.74,
+      "grind": 0.56,
+      "review": 0.55,
+      "note": "NVIDIA Nemotron family fallback (EIH)"
+    },
+    {
+      "match": [
+        "codestral"
+      ],
+      "swe": 56,
+      "single_pass": 0.74,
+      "grind": 0.52,
+      "note": "Mistral code model; fast author",
+      "review": 0.52
+    },
+    {
+      "match": [
+        "gpt-oss-120b"
+      ],
+      "swe": 55,
+      "single_pass": 0.72,
+      "grind": 0.46,
+      "note": "free via groq; good cheap author, weak grind",
+      "review": 0.5
+    },
+    {
+      "match": [
+        "gpt-oss"
+      ],
+      "swe": 50,
+      "single_pass": 0.66,
+      "grind": 0.42,
+      "note": "gpt-oss small; single-pass only",
+      "review": 0.42
+    },
+    {
+      "match": [
+        "llama-4",
+        "llama4"
+      ],
+      "swe": 48,
+      "single_pass": 0.62,
+      "grind": 0.4,
+      "note": "Llama 4; light tasks only",
+      "review": 0.42
+    },
+    {
+      "match": [
+        "mistral-large-3",
+        "mistral-large-2"
+      ],
+      "swe": 66,
+      "single_pass": 0.84,
+      "grind": 0.74,
+      "review": 0.9,
+      "note": "Mistral Large 3 (EIH 675b); EMPIRICAL 2026-06-30 caught BOTH ACP blockers"
+    },
+    {
+      "match": [
+        "mistral-large",
+        "mistral-medium"
+      ],
+      "swe": 52,
+      "single_pass": 0.66,
+      "grind": 0.48,
+      "note": "Mistral general; single-pass leaning",
+      "review": 0.62
+    }
+  ],
+  "review_field": "review (0..1) = adversarial-review suitability, DISTINCT from single_pass(authoring)/grind(loop). Reviewer selection should weight review x live response-time health (HealthStore); skip degraded/timeout models. Source: empirical 2026-06-30 zoder goose-ACP protocol bake-off, ground truth = Codex+web+real-goose integration test."
 }
