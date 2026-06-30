@@ -32,6 +32,10 @@ PUB_HOST="root@192.168.207.101"
 PUB_PW="Gumbo@Kona1b"
 PUB_ROOT="/mnt/datapool/zoder-releases"
 
+# GitHub rolling-nightly prerelease (optional; gated on GH_TOKEN in the env).
+GH_REPO="ncz-os/zoder"
+GH_NIGHTLY_TAG="nightly"
+
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 # Role selects which target(s) to build. Prefer an explicit ZODER_BUILD_ROLE
@@ -113,4 +117,32 @@ for f in dist/*.tar.gz dist/*.sha256 dist/GIT_COMMIT; do
   sshpass -p "$PUB_PW" scp -o StrictHostKeyChecking=no "$f" "$PUB_HOST:$PUB_ROOT/latest/"
 done
 log "published -> ARGONAS:$DEST"
+
+# Rolling `nightly` GitHub prerelease (optional). Each host uploads ONLY the
+# arch tarballs it built, with --clobber, so the single `nightly` release
+# accumulates every arch across ULTRA (darwin-arm64 + linux-arm64) and HYDRA
+# (x86-linux). The git tag is cosmetic for a rolling artifact; the notes + the
+# GIT_COMMIT asset record the actual source SHA. Gated on GH_TOKEN so the build
+# still succeeds (ARGONAS-only) when no GitHub token is configured.
+if [ -n "${GH_TOKEN:-}" ]; then
+  export GH_TOKEN
+  log "publishing rolling nightly prerelease -> github.com/$GH_REPO"
+  if ! gh release view "$GH_NIGHTLY_TAG" -R "$GH_REPO" >/dev/null 2>&1; then
+    gh release create "$GH_NIGHTLY_TAG" -R "$GH_REPO" --prerelease --target main \
+      --title "zoder nightly (rolling)" \
+      --notes "Rolling nightly trio build from main, produced by scripts/daily-build.sh on the fleet build hosts. The git tag is cosmetic; see GIT_COMMIT and the notes for the source SHA." \
+      || log "WARN: nightly release create raced/failed (continuing)"
+  fi
+  gh release edit "$GH_NIGHTLY_TAG" -R "$GH_REPO" \
+    --notes "Rolling nightly trio build from main (scripts/daily-build.sh). Last update: $(date -u +%Y-%m-%dT%H:%MZ) by ${host_short} @ ${SHA} (v${VERSION}). Artifacts accumulate across hosts: darwin-arm64 + linux-arm64 from ULTRA, x86_64-linux from HYDRA." \
+    >/dev/null 2>&1 || true
+  if gh release upload "$GH_NIGHTLY_TAG" -R "$GH_REPO" dist/*.tar.gz dist/*.sha256 --clobber; then
+    log "github nightly updated with $(ls dist/*.tar.gz | wc -l | tr -d ' ') asset(s) from $host_short"
+  else
+    log "WARN: github nightly upload failed (ARGONAS publish still succeeded)"
+  fi
+else
+  log "GH_TOKEN unset; skipping GitHub nightly (ARGONAS-only)"
+fi
+
 log "DONE"
