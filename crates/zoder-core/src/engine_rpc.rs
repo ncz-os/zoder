@@ -161,6 +161,35 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
     }
 }
 
+/// Prove the daemon is actually answering RPC, not merely accepting the socket:
+/// connect and complete an `initialize` handshake within [`SETUP_RPC_TIMEOUT`].
+/// A socket that accepts the connection but never answers `initialize` (a daemon
+/// still starting, wedged, or a stale binding) is NOT ready — readiness checks
+/// that only `connect` would wrongly treat it as up and then fail the first real
+/// turn.
+pub async fn probe_ready(socket: &Path, budget: Duration) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to engine at {}", socket.display()))?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+        }),
+    )
+    .await?;
+    // `budget` bounds the handshake so a socket that accepts but never answers
+    // can't pin a startup poll for the full setup timeout (the caller's own
+    // deadline / child-exit check stays responsive).
+    read_result(&mut reader, "init", budget).await?;
+    Ok(())
+}
+
 /// Create a fresh engine session bound to `cwd` and return its id (without
 /// prompting). Used by `transfer` to hand off a resumable thread.
 pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow::Result<String> {
@@ -342,7 +371,14 @@ async fn drive<F: FnMut(AgentEvent)>(
                 )
                 .await;
             }
-            Ok(r) => r.context("reading from engine")?,
+            // A read error AFTER the prompt was accepted is not a setup failure:
+            // tools/edits may already have run. Convert it to a partial turn
+            // (not an Err) so the caller never re-runs this prompt on another
+            // model (which would duplicate side effects) — `run_agent` only
+            // returns Err during pre-prompt setup, which the agentic fallback
+            // relies on for side-effect safety.
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break "disconnected".to_string(),
         };
         if n == 0 {
             // The engine dropped the socket mid-turn. Do NOT discard the work:
@@ -405,7 +441,10 @@ async fn drive<F: FnMut(AgentEvent)>(
                 .to_string();
             let approved = decide_approval(opts.approval, &tool);
             let decision = if approved { "approve" } else { "deny" };
-            write_frame(
+            // A write failure here is post-side-effect (tools have already run);
+            // preserve the partial turn rather than returning Err (which the
+            // caller would treat as a safe-to-retry setup failure).
+            if write_frame(
                 &mut write_half,
                 &json!({
                     "jsonrpc": "2.0",
@@ -418,7 +457,11 @@ async fn drive<F: FnMut(AgentEvent)>(
                     },
                 }),
             )
-            .await?;
+            .await
+            .is_err()
+            {
+                break "failed".to_string();
+            }
             on_event(AgentEvent::Approval { tool, approved });
             continue;
         }

@@ -32,8 +32,8 @@ pub use engine_cost::{
     ModelStats as EngineModelStats,
 };
 pub use engine_rpc::{
-    new_session, run_agent, wait_for_socket, AgentEvent, AgentOptions, AgentRun, ApprovalPolicy,
-    DEFAULT_AUTO_APPROVE,
+    new_session, probe_ready, run_agent, wait_for_socket, AgentEvent, AgentOptions, AgentRun,
+    ApprovalPolicy, DEFAULT_AUTO_APPROVE,
 };
 pub use enterprise_cost::{CostSnapshot, MonthCost, ScopeStat};
 pub use finops::{

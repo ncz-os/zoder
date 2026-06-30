@@ -122,8 +122,33 @@ async fn complete_once(
         tokens_out,
         cost_usd: cost,
         calls: 1,
-        violation,
+        violation: violation.clone(),
     });
+
+    // Feed the breaker: reviewer/panel calls previously bypassed health entirely,
+    // so a flaky or policy-violating reviewer model was never deprioritized by
+    // the router. Record a violation as a failure, a clean call as a success.
+    let mut health = HealthStore::load(&eng.cfg.health_path);
+    if violation.is_some() {
+        health.record_failure(
+            &model,
+            "reviewer policy violation: paid without --allow-paid",
+        );
+    } else {
+        health.record_success(&model, res.telemetry.duration_ms.unwrap_or(0.0));
+    }
+    if let Err(e) = health.save() {
+        eprintln!("zoder: warning: failed to persist health store: {e}");
+    }
+
+    // A free-policy violation must FAIL the reviewer call, not just print: a
+    // review/fix gate that returns Ok after unverified paid spend lets the loop
+    // proceed on a policy-bad result. `--allow-paid` is the explicit opt-in.
+    if let Some(v) = violation {
+        if !cli.allow_paid {
+            anyhow::bail!("reviewer call violated free policy (use --allow-paid to permit): {v}");
+        }
+    }
 
     Ok(Completion {
         model,

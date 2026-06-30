@@ -1514,9 +1514,18 @@ fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
 /// the co-shipped `zeroclaw` binary) if the socket is absent. Returns the socket.
 async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     let socket = engine_socket_path();
-    if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+    // Readiness is an `initialize` handshake, not a bare connect: a socket that
+    // accepts but never answers is NOT a usable engine.
+    if zoder_core::probe_ready(&socket, std::time::Duration::from_secs(5))
+        .await
+        .is_ok()
+    {
         return Ok(socket);
     }
+    // NOTE: we deliberately do NOT unlink a stale socket here. A failed connect
+    // only proves "no listener at this instant"; another zoder/daemon could bind
+    // between the check and the unlink (TOCTOU) and we'd delete a live socket.
+    // The daemon owns its own stale-socket cleanup on bind.
     let bin = locate_sibling("zeroclaw").ok_or_else(|| {
         anyhow::anyhow!(
             "zeroclaw binary not found (looked next to zoder, on PATH, and in ~/.local/bin); \
@@ -1527,18 +1536,76 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(zeroclaw_data_dir);
+    // Capture daemon stderr to a log instead of discarding it, so a startup
+    // failure (bad config, port/socket clash, missing provider key) is
+    // diagnosable rather than a silent "not ready" timeout.
+    let log_path = zeroclaw_data_dir().join("daemon.log");
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("daemon")
         .arg("--ephemeral")
         .arg("--config-dir")
         .arg(&config_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cmd.spawn()
+        .stdout(std::process::Stdio::null());
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        Err(_) => {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn zeroclaw daemon ({}): {e}", bin.display()))?;
-    zoder_core::wait_for_socket(&socket, std::time::Duration::from_secs(20)).await?;
-    Ok(socket)
+
+    // Poll readiness with the initialize handshake, but bail early if the child
+    // process exits during startup (otherwise we'd wait the full budget for a
+    // socket that will never appear). On failure, surface the daemon log tail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
+                read_log_tail(&log_path)
+            );
+        }
+        // Short per-probe budget so a socket that accepts but never answers
+        // can't block this poll for the full setup timeout — the deadline and
+        // the child-exit check stay responsive.
+        if zoder_core::probe_ready(&socket, std::time::Duration::from_secs(2))
+            .await
+            .is_ok()
+        {
+            return Ok(socket);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Kill AND reap so we don't leave a zombie.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "zeroclaw daemon not ready within 20s; log tail:\n{}",
+                read_log_tail(&log_path)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Best-effort: return the last ~1.5KB of the daemon log for error context.
+/// Tails on a byte boundary safely (logs can contain multibyte UTF-8).
+fn read_log_tail(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(1500);
+            String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+        }
+        Err(_) => "(no daemon log available)".to_string(),
+    }
 }
 
 /// Authoritative per-run cost/tokens from the engine's cost tracker, scoped to
@@ -1625,28 +1692,25 @@ pub(crate) async fn agentic_turn(
 
     // Resolve the model (routing or -m) for alias selection + paid gate.
     let (chain, reason) = resolve_chain(cli, &eng, &health)?;
-    let primary = chain
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no model resolved"))?;
+    // Dedupe (order-preserving): the fallback loop skips candidates by value, so
+    // a duplicate model id in the chain could otherwise be re-selected after
+    // being skipped. A unique chain makes the skip/advance logic unambiguous.
+    let chain: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        chain
+            .into_iter()
+            .filter(|m| seen.insert(m.clone()))
+            .collect()
+    };
+    if chain.is_empty() {
+        anyhow::bail!("no model resolved");
+    }
     if cli.explain {
         eprintln!("[route] {reason}");
     }
 
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
-    let primary_entry = eng
-        .corpus
-        .get(&primary)
-        .cloned()
-        .unwrap_or_else(|| ModelEntry {
-            id: primary.clone(),
-            gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
-            ..Default::default()
-        });
-    if cli.require_free && !primary_entry.free {
-        anyhow::bail!("--require-free set but {primary} is not a known free model");
-    }
     // A paid/metered serving provider (e.g. an org overlay's default route)
     // requires confirmation even when the model id is classified free.
     let provider_paid = eng
@@ -1654,65 +1718,113 @@ pub(crate) async fn agentic_turn(
         .provider(&eng.cfg.default_provider)
         .map(|p| p.paid || p.billing != BillingMode::Free)
         .unwrap_or(false);
-    if let Decision::NeedConfirm(msg) = gate.check(&primary_entry, provider_paid) {
-        if !confirm_paid(&msg)? {
-            anyhow::bail!("paid model use declined");
-        }
-    }
 
     let cwd = agentic_cwd(cli)?;
-    let alias = resolve_agent_alias(cli, &primary);
-
     let socket = ensure_engine_daemon().await?;
-
-    let opts = AgentOptions {
-        socket,
-        agent_alias: alias.clone(),
-        cwd: cwd.clone(),
-        prompt,
-        model_override: None,
-        session_id: session_override.or_else(|| cli.session.clone()),
-        show_reasoning: cli.show_reasoning,
-        approval: parse_approval(cli),
-        timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
-    };
 
     let started = std::time::Instant::now();
     let start_ts = chrono::Utc::now();
-    let run = run_agent(&opts, |ev| {
-        if !stream_output {
-            return;
+
+    // Candidates skipped because they failed the gate or a pre-side-effect run;
+    // the loop always advances to the first chain model not in this set.
+    let mut skipped_models: Vec<String> = Vec::new();
+
+    // Walk the routed chain (primary + fallbacks). The agentic engine applies
+    // file edits and runs tools as the turn proceeds, so a turn that has STARTED
+    // can never be safely re-run on another model. Only a PRE-side-effect
+    // failure (connect / initialize / session setup / prompt-send / an immediate
+    // prompt error) is eligible for fallback: run_agent returns Err exactly in
+    // those pre-streaming cases, while once streaming begins it returns
+    // Ok(AgentRun) with a non-success outcome (which we keep, no fallback). This
+    // lifts agentic reliability from the primary's success rate toward the
+    // chain's, without ever duplicating side effects. Each candidate is
+    // gated independently; only the last candidate failing the gate is fatal.
+    let (run, used_primary, used_alias) = loop {
+        let idx = chain
+            .iter()
+            .position(|m| !skipped_models.contains(m))
+            .unwrap_or(chain.len() - 1);
+        let model = chain[idx].clone();
+        let last = chain[idx + 1..].iter().all(|m| skipped_models.contains(m));
+        let entry = eng
+            .corpus
+            .get(&model)
+            .cloned()
+            .unwrap_or_else(|| ModelEntry {
+                id: model.clone(),
+                gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
+                ..Default::default()
+            });
+        if cli.require_free && !entry.free {
+            if last {
+                anyhow::bail!(
+                    "--require-free set but no chain model is a known free model (last tried {model})"
+                );
+            }
+            skipped_models.push(model);
+            continue;
         }
-        match ev {
-            AgentEvent::Text(t) => {
-                print!("{t}");
-                let _ = std::io::stdout().flush();
+        if let Decision::NeedConfirm(msg) = gate.check(&entry, provider_paid) {
+            if !confirm_paid(&msg)? {
+                if last {
+                    anyhow::bail!("paid model use declined");
+                }
+                skipped_models.push(model);
+                continue;
             }
-            AgentEvent::Thought(t) => {
-                eprint!("{t}");
-            }
-            AgentEvent::ToolCall { name } => {
-                eprintln!("\n[tool] {name}");
-            }
-            AgentEvent::ToolResult { .. } => {}
-            AgentEvent::Approval { tool, approved } => {
-                eprintln!("[approve:{}] {tool}", if approved { "ok" } else { "deny" });
-            }
-            AgentEvent::Usage { .. } => {}
         }
-    })
-    .await;
-    // A setup/prompt failure (`initialize`, `session/new`, `session/configure`,
-    // `session/prompt`, or a hung socket) returns Err here BEFORE the health
-    // accounting below. Without recording it, a broken alias/model stays
-    // "healthy" and the router keeps selecting it. Feed the breaker, then
-    // surface the error.
-    let run = match run {
-        Ok(r) => r,
-        Err(e) => {
-            health.record_failure(&primary, &format!("agentic setup/turn failed: {e}"));
-            save_health(&health);
-            return Err(e);
+        let alias = resolve_agent_alias(cli, &model);
+        let opts = AgentOptions {
+            socket: socket.clone(),
+            agent_alias: alias.clone(),
+            cwd: cwd.clone(),
+            prompt: prompt.clone(),
+            model_override: None,
+            session_id: session_override.clone().or_else(|| cli.session.clone()),
+            show_reasoning: cli.show_reasoning,
+            approval: parse_approval(cli),
+            timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
+        };
+        match run_agent(&opts, |ev| {
+            if !stream_output {
+                return;
+            }
+            match ev {
+                AgentEvent::Text(t) => {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                }
+                AgentEvent::Thought(t) => {
+                    eprint!("{t}");
+                }
+                AgentEvent::ToolCall { name } => {
+                    eprintln!("\n[tool] {name}");
+                }
+                AgentEvent::ToolResult { .. } => {}
+                AgentEvent::Approval { tool, approved } => {
+                    eprintln!("[approve:{}] {tool}", if approved { "ok" } else { "deny" });
+                }
+                AgentEvent::Usage { .. } => {}
+            }
+        })
+        .await
+        {
+            Ok(r) => break (r, model, alias),
+            Err(e) => {
+                // Pre-side-effect failure: feed the breaker so a broken
+                // alias/model is not selected again, then fall back to the next
+                // chain model if one remains.
+                health.record_failure(&model, &format!("agentic setup/turn failed: {e}"));
+                if last {
+                    save_health(&health);
+                    return Err(e);
+                }
+                if stream_output && !cli.quiet {
+                    eprintln!("[zoder] {model} failed before any output; falling back");
+                }
+                skipped_models.push(model);
+                continue;
+            }
         }
     };
 
@@ -1721,10 +1833,10 @@ pub(crate) async fn agentic_turn(
     let socket2 = engine_socket_path();
     // `None` => the engine cost query failed: we CANNOT prove what (or how
     // much) ran. Fail closed under the free policy instead of booking $0.
-    let cost_obs = agentic_cost(&socket2, start_ts, &alias, &primary).await;
+    let cost_obs = agentic_cost(&socket2, start_ts, &used_alias, &used_primary).await;
     let attribution_failed = cost_obs.is_none();
     let (cost, tokens_in, tokens_out, model_used) =
-        cost_obs.unwrap_or_else(|| (0.0, 0, 0, primary.clone()));
+        cost_obs.unwrap_or_else(|| (0.0, 0, 0, used_primary.clone()));
 
     // Post-verify: the engine (via the agent alias) may have run a different —
     // possibly paid — model than the one pre-gated above (the daemon resolves
@@ -1740,12 +1852,12 @@ pub(crate) async fn agentic_turn(
     let violation = if !cli.allow_paid && (cost > 0.0 || model_used_paid || attribution_failed) {
         let v = if attribution_failed {
             format!(
-                "agentic run (alias {alias}) cost/model attribution unavailable \
+                "agentic run (alias {used_alias}) cost/model attribution unavailable \
                  (engine cost/query failed); cannot prove the run was free without --allow-paid"
             )
         } else {
             format!(
-                "agentic run (alias {alias}) billed ${cost:.4} on engine model '{model_used}' \
+                "agentic run (alias {used_alias}) billed ${cost:.4} on engine model '{model_used}' \
                  (corpus_paid={model_used_paid}) without --allow-paid"
             )
         };
@@ -1783,21 +1895,24 @@ pub(crate) async fn agentic_turn(
     // the oneshot path, which records the winning model's health only after the
     // policy verify passes.
     if run.succeeded() && !violated {
-        health.record_success(&primary, elapsed_ms);
+        health.record_success(&used_primary, elapsed_ms);
     } else if violated {
         health.record_failure(
-            &primary,
+            &used_primary,
             "policy violation: paid model without --allow-paid",
         );
     } else {
-        health.record_failure(&primary, &format!("turn did not complete: {}", run.outcome));
+        health.record_failure(
+            &used_primary,
+            &format!("turn did not complete: {}", run.outcome),
+        );
     }
     save_health(&health);
 
     Ok(TurnResult {
         run,
         model: model_used,
-        alias,
+        alias: used_alias,
         cost_usd: cost,
         tokens_in,
         tokens_out,
@@ -2749,6 +2864,22 @@ async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
             .cfg
             .provider(&eng.cfg.default_provider)
             .ok_or_else(|| anyhow::anyhow!("default provider not configured"))?;
+        // Money-safety: even a "free" model id costs real money when the default
+        // provider is metered. Refuse to probe through a paid/metered provider
+        // without an explicit opt-in (previously the probe spent untracked money
+        // and reported the model "healthy").
+        let provider_paid = provider_cfg.paid || provider_cfg.billing != BillingMode::Free;
+        if provider_paid && !cli.allow_paid {
+            anyhow::bail!(
+                "health --probe would send requests through metered provider '{}' (could incur \
+                 cost); pass --allow-paid to probe anyway",
+                provider_cfg.id
+            );
+        }
+        let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
+        let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
+        let ledger = Ledger::new(&eng.cfg.ledger_path);
+        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
         let provider = OpenAiProvider::new(provider_cfg)?;
         let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
         if !cli.quiet {
@@ -2766,11 +2897,49 @@ async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
             };
             let t = std::time::Instant::now();
             match provider.stream_chat(&req, None).await {
-                Ok(_) => {
+                Ok(res) => {
                     let ms = t.elapsed().as_millis() as f64;
-                    health.record_success(id, ms);
-                    if !cli.quiet {
-                        eprintln!("  ok   {id}  {ms:.0}ms");
+                    // Post-verify the probe was actually served free; a metered
+                    // fallback makes a "free" id cost money.
+                    let entry = eng.corpus.get(id).cloned().unwrap_or_default();
+                    let violation = gate.verify_free(&entry, &res.telemetry).err();
+                    let tin = res.prompt_tokens.unwrap_or(0);
+                    let tout = res.completion_tokens.unwrap_or(res.tokens_out);
+                    let cost = res
+                        .telemetry
+                        .cost_usd
+                        .unwrap_or_else(|| pricing.cost(id, tin, tout));
+                    // Ledger any nonzero-cost or policy-violating probe so spend
+                    // is never invisible. Under a metered provider, record EVERY
+                    // probe (even a $0-priced one): a missing cost header on a
+                    // paid provider must not silently drop the row.
+                    if cost > 0.0 || violation.is_some() || provider_paid {
+                        if let Err(e) = ledger.record(&Entry {
+                            ts_utc: chrono::Utc::now(),
+                            provider: eng.cfg.default_provider.clone(),
+                            model: id.clone(),
+                            host: zoder_core::ledger::host_of_model(id),
+                            tokens_in: tin,
+                            tokens_out: tout,
+                            cost_usd: cost,
+                            calls: 1,
+                            violation: violation.clone(),
+                        }) {
+                            eprintln!(
+                                "zoder: warning: failed to record probe ledger entry for {id}: {e}"
+                            );
+                        }
+                    }
+                    if let Some(v) = &violation {
+                        health.record_failure(id, &format!("probe policy violation: {v}"));
+                        if !cli.quiet {
+                            eprintln!("  PAID {id}  {v}");
+                        }
+                    } else {
+                        health.record_success(id, ms);
+                        if !cli.quiet {
+                            eprintln!("  ok   {id}  {ms:.0}ms");
+                        }
                     }
                 }
                 Err(e) => {
