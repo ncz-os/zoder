@@ -43,6 +43,14 @@ ZEROCLAW_SRC_DIR="${ZEROCLAW_SRC_DIR:-}"
 # cargo can build both from the workspace root. Override if upstream renames them.
 ZEROCLAW_BIN_PKG="${ZEROCLAW_BIN_PKG:-zeroclawlabs}"  # owns the `zeroclaw` engine bin
 ZEROCODE_BIN_PKG="${ZEROCODE_BIN_PKG:-zerocode}"      # owns the `zerocode` TUI bin
+# Goose (Block -> Linux Foundation / AAIF) is the SECOND engine: a per-turn
+# `goose acp` subprocess zoder/zodercode drive over stdio. Built CLI-ONLY
+# (-p goose-cli --bin goose), never the Tauri desktop. PINNED ref — bump only
+# when the acp-client real-goose integration test stays green (the contract test).
+GOOSE_REPO="${GOOSE_REPO:-https://github.com/aaif-goose/goose.git}"
+GOOSE_REF="${GOOSE_REF:-v1.39.0}"
+GOOSE_SRC_DIR="${GOOSE_SRC_DIR:-}"
+GOOSE_BIN_PKG="${GOOSE_BIN_PKG:-goose-cli}"  # owns the `goose` CLI bin (has `goose acp`)
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/{print $2}')"
 DIST="dist"
 mkdir -p "$DIST"
@@ -97,6 +105,21 @@ ensure_zeroclaw() {
   echo "$zc"
 }
 
+# Resolve the goose source tree (Block/LF goose) and echo its path. CLI-only
+# build downstream. PINNED GOOSE_REF; honors GOOSE_SRC_DIR to reuse a checkout.
+ensure_goose() {
+  if [ -n "$GOOSE_SRC_DIR" ]; then
+    [ -d "$GOOSE_SRC_DIR" ] || { echo "package.sh: GOOSE_SRC_DIR=$GOOSE_SRC_DIR not found" >&2; return 1; }
+    echo "$GOOSE_SRC_DIR"; return 0
+  fi
+  local gs=".goose-src"
+  if [ ! -d "$gs/.git" ]; then
+    git clone --depth 1 -b "$GOOSE_REF" "$GOOSE_REPO" "$gs" >&2
+  fi
+  ( cd "$gs" && git fetch -q --depth 1 origin "$GOOSE_REF" && git checkout -q FETCH_HEAD ) >&2
+  echo "$gs"
+}
+
 package_target() {
   local tgt="$1"
   local ext=""; [ "$(target_os "$tgt")" = Windows ] && ext=".exe"
@@ -126,6 +149,20 @@ package_target() {
     cp "$zcsrc/$reldir/zeroclaw" "$stage/zeroclaw"
   fi
 
+  # Second engine: goose CLI (goose acp). Heavy from-source build, so NATIVE only
+  # (a cross/Docker build of the goose workspace is unsupported here — each target
+  # builds its own goose on its native runner). Opt out with ZODER_SKIP_GOOSE=1.
+  if [ "${ZODER_SKIP_GOOSE:-0}" != 1 ] && [ "${ZODER_SKIP_TUI:-0}" != 1 ] && [ "$(target_os "$tgt")" != Windows ]; then
+    if [ "$b" = cross ]; then
+      echo ">> [$tgt] skip goose (cross build of the goose workspace unsupported; build natively per-target)" >&2
+    else
+      local gsrc; gsrc="$(ensure_goose)"
+      echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF"
+      ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose ${tflag[@]+"${tflag[@]}"} )
+      cp "$gsrc/$reldir/goose" "$stage/goose"
+    fi
+  fi
+
   cp README.md "$stage/" 2>/dev/null || true
   cp LICENSE "$stage/" 2>/dev/null || true
   cat > "$stage/INSTALL.txt" <<TXT
@@ -134,12 +171,14 @@ ${BIN} ${VERSION} (${tgt})
 Contents:
   ${BIN}     - cost-aware, free-first coding/review CLI
   zerocode   - interactive terminal UI         (launched by: ${BIN} tui)
-  zeroclaw   - agent / turn engine             (auto-started by zerocode)
+  zeroclaw   - agent / turn engine (default)   (auto-started by zerocode)
+  goose      - second engine (\`--engine goose\`), Block/LF goose acp (if present)
 
 Install: copy the binaries into a directory on your PATH, keeping them together
 and version-matched, e.g.
 
   install -m 0755 ${BIN} zerocode zeroclaw /usr/local/bin/
+  [ -f goose ] && install -m 0755 goose /usr/local/bin/
 
 Then:
 
