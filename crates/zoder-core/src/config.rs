@@ -371,7 +371,10 @@ impl Config {
                     .max()
                     .map(|len| (len, p))
             })
-            .max_by_key(|(len, _)| *len)
+            // Keep the FIRST provider on an equal-length tie (config order):
+            // `reduce` retains the accumulator unless a strictly longer prefix
+            // appears, so earlier providers win ties.
+            .reduce(|a, b| if b.0 > a.0 { b } else { a })
             .map(|(_, p)| p)
             .or_else(|| self.provider(&self.default_provider))
     }

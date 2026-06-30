@@ -1777,7 +1777,13 @@ pub(crate) async fn agentic_turn(
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     if let Err(e) = ledger.record(&Entry {
         ts_utc: chrono::Utc::now(),
-        provider: eng.cfg.default_provider.clone(),
+        // Attribute to the provider that serves the model the engine actually
+        // ran (per-model routing), not the default provider.
+        provider: eng
+            .cfg
+            .provider_for_model(&model_used)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| eng.cfg.default_provider.clone()),
         model: model_used.clone(),
         host: zoder_core::ledger::host_of_model(&model_used),
         tokens_in,
