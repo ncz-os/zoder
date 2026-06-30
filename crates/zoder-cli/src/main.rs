@@ -1704,6 +1704,9 @@ pub(crate) async fn agentic_turn(
     } else {
         None
     };
+    // Capture before `violation` is moved into the ledger Entry below; the
+    // health block further down needs to know whether the run violated policy.
+    let violated = violation.is_some();
 
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     if let Err(e) = ledger.record(&Entry {
@@ -1722,9 +1725,20 @@ pub(crate) async fn agentic_turn(
     // A timed-out (or otherwise non-completed) turn still returns a TurnResult so
     // the caller can preserve partial output — but it is NOT a success: record it
     // as a failure so latency/health-aware routing learns this model couldn't
-    // finish in budget (the BUG2 routing follow-up consumes this signal).
-    if run.succeeded() {
+    // finish in budget (the BUG2 routing follow-up consumes this signal). A
+    // policy violation (paid model billed without --allow-paid) is ALSO a
+    // failure for routing purposes even when the turn "completed": recording it
+    // as success would teach the router to keep picking a model the policy gate
+    // just rejected (and would mask the violation in the health view). Mirror
+    // the oneshot path, which records the winning model's health only after the
+    // policy verify passes.
+    if run.succeeded() && !violated {
         health.record_success(&primary, elapsed_ms);
+    } else if violated {
+        health.record_failure(
+            &primary,
+            "policy violation: paid model without --allow-paid",
+        );
     } else {
         health.record_failure(&primary, &format!("turn did not complete: {}", run.outcome));
     }

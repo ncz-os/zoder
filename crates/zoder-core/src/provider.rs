@@ -17,6 +17,10 @@ const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
 /// Max bytes buffered without a line terminator before we bail.
 const MAX_BUFFER_BYTES: usize = 16 << 20; // 16 MiB
+/// Bound on reading an HTTP *error* body before classifying. The status +
+/// Retry-After header already drive retry/fallback, so a stalled error body
+/// must never pin the call.
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn env_secs(var: &str, default: u64) -> u64 {
     std::env::var(var)
@@ -220,6 +224,11 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: Delta,
+    /// Terminal marker for this choice (`stop`, `length`, `tool_calls`, …).
+    /// Its presence means the model signalled completion even if the backend
+    /// never emits a trailing `[DONE]` sentinel.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct Delta {
@@ -456,7 +465,15 @@ impl OpenAiProvider {
                 500..=599 => ErrKind::Server,
                 _ => ErrKind::Http,
             };
-            let body = resp.text().await.unwrap_or_default();
+            // Bound the error-body read: a hostile/stalled backend can send the
+            // failing status + headers and then never finish the body, which
+            // would pin us here forever and starve retry/fallback/breaker
+            // feedback. The status + Retry-After are already enough to classify;
+            // a timed-out body just yields an empty message.
+            let body = match timeout(ERROR_BODY_TIMEOUT, resp.text()).await {
+                Ok(Ok(b)) => b,
+                _ => String::new(),
+            };
             return Err(ProviderError {
                 message: format!("provider HTTP {status}: {}", redact(&body)),
                 kind,
@@ -556,7 +573,12 @@ impl OpenAiProvider {
             retry_after: None,
             emitted,
         };
+        // A clean end-of-turn requires a terminal signal from the backend: the
+        // `[DONE]` sentinel, a `finish_reason` on a choice, or a usage chunk.
+        // Without one, an EOF mid-answer is a TRUNCATION, not success — see the
+        // post-loop guard below.
         let mut done = false;
+        let mut saw_terminal = false;
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -621,6 +643,7 @@ impl OpenAiProvider {
                 let payload = payload.trim();
                 if payload == "[DONE]" {
                     done = true;
+                    saw_terminal = true;
                     break;
                 }
                 let val: serde_json::Value = match serde_json::from_str(payload) {
@@ -641,6 +664,9 @@ impl OpenAiProvider {
                     continue;
                 };
                 if let Some(u) = parsed.usage {
+                    // A usage chunk (stream_options.include_usage) is only sent
+                    // as the final frame -> a valid terminal marker.
+                    saw_terminal = true;
                     if u.prompt_tokens.is_some() {
                         prompt_tokens = u.prompt_tokens;
                     }
@@ -649,6 +675,9 @@ impl OpenAiProvider {
                     }
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
+                    if choice.finish_reason.is_some() {
+                        saw_terminal = true;
+                    }
                     let piece = pick_text(
                         choice.delta.content,
                         choice.delta.reasoning_content,
@@ -671,6 +700,21 @@ impl OpenAiProvider {
             if done {
                 break;
             }
+        }
+        // The outer loop also exits when the body stream yields `None` (EOF). If
+        // we got here WITHOUT any terminal marker, the connection was dropped
+        // mid-answer: the content is truncated and must NOT be reported as a
+        // success (which would suppress retry/fallback and poison health with a
+        // false "this model works"). Classify as a transient Network failure so
+        // the caller can fall back; `emitted` stays accurate so a same-model
+        // retry that would duplicate visible bytes is correctly suppressed.
+        if !saw_terminal {
+            return Err(fail(
+                ErrKind::Network,
+                "stream closed before completion (no [DONE]/finish_reason/usage); response truncated"
+                    .to_string(),
+                emitted,
+            ));
         }
         // Prefer authoritative usage; fall back to the streamed-chunk count.
         let tokens_out = completion_tokens.unwrap_or(chunk_count);

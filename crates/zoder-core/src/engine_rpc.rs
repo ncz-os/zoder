@@ -179,7 +179,7 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         }),
     )
     .await?;
-    read_result(&mut reader, "init").await?;
+    read_result(&mut reader, "init", SETUP_RPC_TIMEOUT).await?;
     write_frame(
         &mut write_half,
         &json!({
@@ -194,7 +194,7 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         }),
     )
     .await?;
-    let res = read_result(&mut reader, "new").await?;
+    let res = read_result(&mut reader, "new", SETUP_RPC_TIMEOUT).await?;
     res.get("session_id")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
@@ -250,7 +250,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    read_result(&mut reader, "init").await?;
+    read_result(&mut reader, "init", SETUP_RPC_TIMEOUT).await?;
 
     // 2. session/new (acp = Code mode: pins cwd, excludes long-term memory tools).
     let mut new_params = serde_json::Map::new();
@@ -270,7 +270,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    let new_res = read_result(&mut reader, "new").await?;
+    let new_res = read_result(&mut reader, "new", SETUP_RPC_TIMEOUT).await?;
     let session_id = new_res
         .get("session_id")
         .and_then(Value::as_str)
@@ -290,7 +290,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         )
         .await?;
         // Best-effort: ignore configure failures (older daemons), keep going.
-        let _ = read_result(&mut reader, "cfg").await;
+        let _ = read_result(&mut reader, "cfg", SETUP_RPC_TIMEOUT).await;
     }
 
     // 4. session/prompt — response is `{}`; real output streams as notifications.
@@ -314,9 +314,12 @@ async fn drive<F: FnMut(AgentEvent)>(
     let outcome: String = loop {
         line.clear();
         let n = match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
-            // Budget exhausted. CANCEL the turn server-side so the engine stops
-            // editing files (otherwise a ghost agent keeps running after we
-            // return + fail the job), then preserve whatever streamed so far.
+            // Budget exhausted. CANCEL the turn server-side and then DRAIN until
+            // the engine confirms it wound the turn down — otherwise a ghost
+            // agent keeps editing files after we return. The drain also parses
+            // any final `turn_complete`/text that races the deadline, so a turn
+            // that finished right at the budget isn't mislabeled `timeout` with
+            // stale content.
             Err(_) => {
                 let _ = write_frame(
                     &mut write_half,
@@ -328,33 +331,60 @@ async fn drive<F: FnMut(AgentEvent)>(
                     }),
                 )
                 .await;
-                // Best-effort: give the engine a moment to ack/wind down the turn.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    reader.read_line(&mut line),
+                break drain_after_cancel(
+                    &mut reader,
+                    opts.show_reasoning,
+                    on_event,
+                    &mut content,
+                    &mut input_tokens,
+                    &mut tool_calls,
+                    &mut line,
                 )
                 .await;
-                break "timeout".to_string();
             }
             Ok(r) => r.context("reading from engine")?,
         };
         if n == 0 {
-            bail!("engine closed the connection before turn completed");
+            // The engine dropped the socket mid-turn. Do NOT discard the work:
+            // the accumulated text, tool count, and session id are real, and any
+            // on-disk edits already applied as tools ran. Return them with a
+            // non-success outcome so the caller preserves partial output, writes
+            // the ledger, and records a HEALTH FAILURE (routing learns this
+            // model/alias didn't finish) — instead of bailing, which threw all
+            // of that away and surfaced as a generic error with no fallback.
+            break "disconnected".to_string();
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        // A JSON-RPC error response on our prompt id is fatal.
-        if frame.get("id").and_then(Value::as_str) == Some("prompt") {
+        // JSON-RPC *responses* (an `id`, no `method`). Previously only a
+        // `prompt`-id error was treated as fatal and every other error response
+        // was silently dropped — so a failed `session/approve` left the engine
+        // blocked on approval and the turn stalled until the deadline. Handle
+        // every error response.
+        if frame.get("method").is_none() {
             if let Some(err) = frame.get("error") {
+                let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
                 let msg = err
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("error");
-                bail!("session/prompt failed: {msg}");
+                if id == "prompt" {
+                    bail!("session/prompt failed: {msg}");
+                }
+                if id.starts_with("approve-") {
+                    // The engine rejected our approval decision: it is still
+                    // waiting and the turn cannot progress. Stop now with a
+                    // non-success outcome and preserve the partial transcript
+                    // rather than hanging until the wall-clock budget.
+                    tracing::warn!(%id, %msg, "approval rejected by engine; ending turn");
+                    break "failed".to_string();
+                }
+                tracing::warn!(%id, %msg, "ignoring non-fatal engine error response");
             }
+            // Responses are never `session/update`; nothing else to do.
             continue;
         }
 
@@ -362,87 +392,45 @@ async fn drive<F: FnMut(AgentEvent)>(
             continue;
         }
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
-        let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-        match kind {
-            "agent_message_chunk" => {
-                if let Some(t) = params.get("text").and_then(Value::as_str) {
-                    content.push_str(t);
-                    on_event(AgentEvent::Text(t.to_string()));
-                }
-            }
-            "agent_thought_chunk" => {
-                if opts.show_reasoning {
-                    if let Some(t) = params.get("text").and_then(Value::as_str) {
-                        on_event(AgentEvent::Thought(t.to_string()));
-                    }
-                }
-            }
-            "tool_call" => {
-                tool_calls += 1;
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                on_event(AgentEvent::ToolCall { name });
-            }
-            "tool_result" => {
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                on_event(AgentEvent::ToolResult { name });
-            }
-            "context_usage" => {
-                if let Some(it) = params.get("input_tokens").and_then(Value::as_u64) {
-                    input_tokens = input_tokens.max(it);
-                    on_event(AgentEvent::Usage { input_tokens: it });
-                }
-            }
-            "approval_request" => {
-                let req_id = params
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let tool = params
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let approved = decide_approval(opts.approval, &tool);
-                let decision = if approved { "approve" } else { "deny" };
-                write_frame(
-                    &mut write_half,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": format!("approve-{req_id}"),
-                        "method": "session/approve",
-                        "params": {
-                            "session_id": session_id,
-                            "request_id": req_id,
-                            "decision": decision,
-                        },
-                    }),
-                )
-                .await?;
-                on_event(AgentEvent::Approval { tool, approved });
-            }
-            "turn_complete" => {
-                let oc = params
-                    .get("outcome")
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed")
-                    .to_string();
-                if let Some(c) = params.get("content").and_then(Value::as_str) {
-                    if !c.is_empty() {
-                        content = c.to_string();
-                    }
-                }
-                break oc;
-            }
-            _ => {}
+        if params.get("type").and_then(Value::as_str) == Some("approval_request") {
+            let req_id = params
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let tool = params
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let approved = decide_approval(opts.approval, &tool);
+            let decision = if approved { "approve" } else { "deny" };
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("approve-{req_id}"),
+                    "method": "session/approve",
+                    "params": {
+                        "session_id": session_id,
+                        "request_id": req_id,
+                        "decision": decision,
+                    },
+                }),
+            )
+            .await?;
+            on_event(AgentEvent::Approval { tool, approved });
+            continue;
+        }
+        if let Some(oc) = apply_update(
+            &params,
+            opts.show_reasoning,
+            on_event,
+            &mut content,
+            &mut input_tokens,
+            &mut tool_calls,
+        ) {
+            break oc;
         }
     };
 
@@ -453,6 +441,130 @@ async fn drive<F: FnMut(AgentEvent)>(
         input_tokens,
         tool_calls,
     })
+}
+
+/// Apply one non-approval `session/update` notification to the running turn
+/// accumulators, emitting live events. Returns `Some(outcome)` when the frame
+/// is `turn_complete` (the turn is over), else `None`. Approval requests need
+/// write access to the socket and are handled by the caller.
+fn apply_update<F: FnMut(AgentEvent)>(
+    params: &Value,
+    show_reasoning: bool,
+    on_event: &mut F,
+    content: &mut String,
+    input_tokens: &mut u64,
+    tool_calls: &mut u32,
+) -> Option<String> {
+    match params.get("type").and_then(Value::as_str).unwrap_or("") {
+        "agent_message_chunk" => {
+            if let Some(t) = params.get("text").and_then(Value::as_str) {
+                content.push_str(t);
+                on_event(AgentEvent::Text(t.to_string()));
+            }
+        }
+        "agent_thought_chunk" => {
+            if show_reasoning {
+                if let Some(t) = params.get("text").and_then(Value::as_str) {
+                    on_event(AgentEvent::Thought(t.to_string()));
+                }
+            }
+        }
+        "tool_call" => {
+            *tool_calls += 1;
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string();
+            on_event(AgentEvent::ToolCall { name });
+        }
+        "tool_result" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string();
+            on_event(AgentEvent::ToolResult { name });
+        }
+        "context_usage" => {
+            if let Some(it) = params.get("input_tokens").and_then(Value::as_u64) {
+                *input_tokens = (*input_tokens).max(it);
+                on_event(AgentEvent::Usage { input_tokens: it });
+            }
+        }
+        "turn_complete" => {
+            let oc = params
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+                .to_string();
+            if let Some(c) = params.get("content").and_then(Value::as_str) {
+                if !c.is_empty() {
+                    *content = c.to_string();
+                }
+            }
+            return Some(oc);
+        }
+        _ => {}
+    }
+    None
+}
+
+/// After sending `session/cancel`, drain notifications within a bounded grace
+/// window so we (a) keep parsing real output that raced the deadline and (b)
+/// wait for the engine to confirm the turn wound down. Returns the turn's
+/// outcome: the engine's own `turn_complete` outcome if it arrives, else
+/// `"timeout"` (cancel requested, not confirmed before the grace window).
+#[allow(clippy::too_many_arguments)]
+async fn drain_after_cancel<F: FnMut(AgentEvent)>(
+    reader: &mut (impl AsyncBufReadExt + Unpin),
+    show_reasoning: bool,
+    on_event: &mut F,
+    content: &mut String,
+    input_tokens: &mut u64,
+    tool_calls: &mut u32,
+    line: &mut String,
+) -> String {
+    const CANCEL_GRACE: Duration = Duration::from_secs(5);
+    let grace_deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+    loop {
+        line.clear();
+        match tokio::time::timeout_at(grace_deadline, reader.read_line(line)).await {
+            // Grace window elapsed without a terminal frame: cancel was
+            // requested but not confirmed. The caller treats a non-`completed`
+            // outcome as a failure and preserves the partial transcript.
+            Err(_) => break "timeout".to_string(),
+            // Socket closed: the engine is gone, so the turn is definitively
+            // over. Whatever streamed so far is preserved.
+            Ok(Ok(0)) | Ok(Err(_)) => break "timeout".to_string(),
+            Ok(Ok(_)) => {}
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            continue;
+        }
+        let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        // Skip late approval requests during cancel (we are tearing down); just
+        // apply real output + watch for the terminal `turn_complete`.
+        if params.get("type").and_then(Value::as_str) == Some("approval_request") {
+            continue;
+        }
+        if let Some(oc) = apply_update(
+            &params,
+            show_reasoning,
+            on_event,
+            content,
+            input_tokens,
+            tool_calls,
+        ) {
+            // The engine confirmed the turn ended (often `cancelled`); use its
+            // real outcome instead of a blanket `timeout`.
+            break oc;
+        }
+    }
 }
 
 fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
@@ -480,19 +592,28 @@ async fn write_frame(
     Ok(())
 }
 
+/// Per-RPC budget for a setup request (`initialize`, `session/new`,
+/// `session/configure`). A daemon that accepts the socket but never answers
+/// must not hang the loop indefinitely — without this the only backstop was the
+/// 900s+ turn guard (and `new_session` had no backstop at all).
+const SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Read NDJSON frames until the response with `want_id` arrives (skipping
-/// notifications and unrelated responses). Returns the `result` value.
+/// notifications and unrelated responses), or `budget` elapses. Returns the
+/// `result` value.
 async fn read_result(
     reader: &mut (impl AsyncBufReadExt + Unpin),
     want_id: &str,
+    budget: Duration,
 ) -> anyhow::Result<Value> {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("reading from engine")?;
+        let n = match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
+            Ok(r) => r.context("reading from engine")?,
+            Err(_) => bail!("engine did not respond to {want_id} within {budget:?}"),
+        };
         if n == 0 {
             bail!("engine closed the connection before responding to {want_id}");
         }

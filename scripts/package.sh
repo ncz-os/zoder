@@ -84,16 +84,50 @@ sha256_of() { # $1 = file -> writes $1.sha256
 # Honors ZEROCLAW_SRC_DIR (an existing checkout, used as-is); otherwise clones
 # ZEROCLAW_REPO@ZEROCLAW_REF into .zeroclaw-src. All progress goes to stderr so
 # the echoed path on stdout stays clean for command substitution.
+# Git invocation hardened for unattended CI runners:
+#   -c credential.helper=         disables ALL credential helpers. On the macOS
+#       fleet runner the osxkeychain helper runs without a GUI session and emits
+#       `fatal: failed to get/store: -25308` (errSecInteractionNotAllowed); the
+#       auth is already in ZEROCLAW_REPO (gitlab-ci-token), so no helper is
+#       needed and an interactive prompt must never be triggered.
+#   GIT_TERMINAL_PROMPT=0          turns a missing credential into an immediate
+#       error instead of a hang waiting on a tty that CI does not have.
+zc_git() { GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.interactive=never "$@"; }
+
 ensure_zeroclaw() {
   if [ -n "$ZEROCLAW_SRC_DIR" ]; then
     [ -d "$ZEROCLAW_SRC_DIR" ] || { echo "package.sh: ZEROCLAW_SRC_DIR=$ZEROCLAW_SRC_DIR not found" >&2; return 1; }
     echo "$ZEROCLAW_SRC_DIR"; return 0
   fi
   local zc=".zeroclaw-src"
+  # Network steps get a small bounded retry: a single transient clone/fetch
+  # blip must not fail the whole release build (this was a recurring source of
+  # red trio jobs).
+  local attempt
   if [ ! -d "$zc/.git" ]; then
-    git clone --depth 1 -b "$ZEROCLAW_REF" "$ZEROCLAW_REPO" "$zc" >&2
+    for attempt in 1 2 3; do
+      if zc_git clone --depth 1 -b "$ZEROCLAW_REF" "$ZEROCLAW_REPO" "$zc" >&2; then
+        break
+      fi
+      echo "package.sh: clone attempt $attempt failed; retrying" >&2
+      rm -rf "$zc"
+      sleep $((attempt * 3))
+    done
+    [ -d "$zc/.git" ] || { echo "package.sh: could not clone $ZEROCLAW_REPO@$ZEROCLAW_REF" >&2; return 1; }
   fi
-  ( cd "$zc" && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD ) >&2
+  # Track fetch success explicitly: the retry loop's last command is `sleep`
+  # (truthy), so a naive `for … && checkout` would `checkout FETCH_HEAD` from a
+  # STALE prior fetch after all three fetches failed. Only checkout on a
+  # confirmed fresh fetch; otherwise fail the build loudly.
+  ( cd "$zc" || exit 1
+    fetched=0
+    for attempt in 1 2 3; do
+      if zc_git fetch -q origin "$ZEROCLAW_REF"; then fetched=1; break; fi
+      echo "package.sh: fetch attempt $attempt failed; retrying" >&2
+      sleep $((attempt * 3))
+    done
+    [ "$fetched" = 1 ] || { echo "package.sh: could not fetch $ZEROCLAW_REF@$ZEROCLAW_REPO" >&2; exit 1; }
+    zc_git checkout -q FETCH_HEAD ) >&2
   echo "$zc"
 }
 

@@ -50,6 +50,48 @@ async fn streaming_sse_is_assembled() {
 }
 
 #[tokio::test]
+async fn streaming_eof_before_terminal_is_truncation_error() {
+    // The backend streams answer chunks and then drops the connection WITHOUT a
+    // `[DONE]` sentinel, a `finish_reason`, or a usage chunk. That is a
+    // truncated answer and MUST surface as an error so the caller can fall back
+    // — not be reported as a successful (partial) completion.
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"tial\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server.uri());
+    let err = p.stream_chat(&req("m", true), None).await.unwrap_err();
+    assert_eq!(err.kind, ErrKind::Network);
+    // Nothing was written to a sink (None), so a same-model retry is safe.
+    assert!(err.retryable());
+}
+
+#[tokio::test]
+async fn streaming_finish_reason_without_done_is_accepted() {
+    // Some OpenAI-compatible backends omit the trailing `[DONE]` line but DO set
+    // a `finish_reason` on the final chunk — that is a valid terminal marker, so
+    // the stream is a clean success.
+    let server = MockServer::start().await;
+    let body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n\
+                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server.uri());
+    let res = p.stream_chat(&req("m", true), None).await.unwrap();
+    assert_eq!(res.content, "done");
+}
+
+#[tokio::test]
 async fn non_streaming_object_is_parsed() {
     let server = MockServer::start().await;
     let body = serde_json::json!({
