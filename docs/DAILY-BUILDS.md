@@ -80,6 +80,19 @@ This is distinct from **tagged** GitHub releases: pushing a `vX.Y.Z` tag trigger
 publishes a versioned Release. That path is independent of the fleet and of this
 cron.
 
+**Mirror requirement (one-time):** `ncz-os/zoder` is a GitLab→GitHub push mirror.
+By default the mirror force-syncs all refs and **deletes** any GitHub-only ref —
+which silently un-tags the `nightly` release (it reverts to a draft) on every
+sync. The mirror must have **`keep_divergent_refs = true`** so the GitHub-side
+`nightly` tag survives:
+
+```sh
+MID=$(glab api projects/ncz-os%2Fzoder/remote_mirrors --jq '.[0].id')
+glab api -X PUT projects/ncz-os%2Fzoder/remote_mirrors/$MID -f keep_divergent_refs=true
+```
+
+The build script additionally forces `--draft=false` each run as a backstop.
+
 ## Relationship to GitLab CI
 
 `.gitlab-ci.yml` still defines `trio:*` package jobs tagged for fleet runners
