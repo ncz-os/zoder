@@ -34,6 +34,9 @@ On **ULTRA** and **HYDRA**:
 cat > ~/.zoder-build.env <<'EOF'
 export ZODER_PAT=glpat-xxxxxxxxxxxxxxxxxxxx
 export ZODER_BUILD_ROLE=ultra
+# Optional: a GitHub token (repo scope) enables the rolling `nightly` prerelease
+# on github.com/ncz-os/zoder. Omit to publish to ARGONAS only.
+export GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
 EOF
 chmod 600 ~/.zoder-build.env
 
@@ -61,6 +64,21 @@ ARGONAS:/mnt/datapool/zoder-releases/
     GIT_COMMIT
   latest/   # newest of each, overwritten daily
 ```
+
+## GitHub nightly prerelease (optional)
+
+When `GH_TOKEN` (repo scope) is present in `~/.zoder-build.env`, each host also
+publishes its arch tarballs to a single **rolling `nightly` prerelease** on
+`github.com/ncz-os/zoder` via `gh release upload --clobber`. Because each host
+clobbers only the assets it built, the `nightly` release accumulates all three
+arches across ULTRA (darwin-arm64 + linux-arm64) and HYDRA (x86-linux). The git
+tag is cosmetic for a rolling artifact; the release notes + the `GIT_COMMIT`
+asset record the actual source SHA.
+
+This is distinct from **tagged** GitHub releases: pushing a `vX.Y.Z` tag triggers
+`.github/workflows/release.yml`, which builds on GitHub-hosted runners and
+publishes a versioned Release. That path is independent of the fleet and of this
+cron.
 
 ## Relationship to GitLab CI
 
