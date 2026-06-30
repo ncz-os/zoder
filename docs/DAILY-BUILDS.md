@@ -28,9 +28,12 @@ the host, pulls the latest `main` of zoder, builds its target(s) via
 On **ULTRA** and **HYDRA**:
 
 ```sh
-# 1. Secret env (NOT committed) — gitlab read token for zoder + zeroclaw clones.
+# 1. Secret env (NOT committed) — gitlab read token + the build role. Set the
+#    role explicitly (hostnames are unreliable; ULTRA reports "MacBookPersonal").
+#    ULTRA: ZODER_BUILD_ROLE=ultra   HYDRA: ZODER_BUILD_ROLE=hydra
 cat > ~/.zoder-build.env <<'EOF'
 export ZODER_PAT=glpat-xxxxxxxxxxxxxxxxxxxx
+export ZODER_BUILD_ROLE=ultra
 EOF
 chmod 600 ~/.zoder-build.env
 
