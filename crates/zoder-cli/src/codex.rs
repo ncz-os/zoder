@@ -594,6 +594,12 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
         );
     }
 
+    // A free-policy violation fails the rescue even on a completed turn: partial
+    // artifacts above are preserved, but we must not exit success after
+    // unverified paid spend without --allow-paid.
+    if let Some(v) = &t.policy_violation {
+        anyhow::bail!("rescue violated free policy (use --allow-paid to permit): {v}");
+    }
     if !ok {
         anyhow::bail!("rescue ended: {}", t.run.outcome);
     }
@@ -758,6 +764,13 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
             Ok(t) => {
                 session = Some(t.run.session_id.clone());
                 total_cost += t.cost_usd;
+                // Stop the loop on a free-policy violation: continuing would keep
+                // spending paid money turn after turn without --allow-paid.
+                if let Some(v) = &t.policy_violation {
+                    anyhow::bail!(
+                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
+                    );
+                }
                 Some(t)
             }
             Err(e) => {

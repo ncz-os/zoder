@@ -1672,6 +1672,12 @@ pub(crate) struct TurnResult {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub elapsed_ms: f64,
+    /// `Some(reason)` when the run violated the free policy (billed, used a paid
+    /// engine model, or had unverifiable attribution) without `--allow-paid`.
+    /// The turn's partial output is still returned for display, but callers MUST
+    /// treat this as a failure (non-zero exit / stop the loop) — recording it in
+    /// the ledger/health is not enough; a violating run must not exit success.
+    pub policy_violation: Option<String>,
 }
 
 /// Drive a single agentic turn against the engine: resolve the model (routing or
@@ -1867,8 +1873,10 @@ pub(crate) async fn agentic_turn(
         None
     };
     // Capture before `violation` is moved into the ledger Entry below; the
-    // health block further down needs to know whether the run violated policy.
+    // health block and the returned TurnResult both need to know whether the
+    // run violated policy (so the caller can fail rather than exit success).
     let violated = violation.is_some();
+    let policy_violation = violation.clone();
 
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     if let Err(e) = ledger.record(&Entry {
@@ -1917,6 +1925,7 @@ pub(crate) async fn agentic_turn(
         tokens_in,
         tokens_out,
         elapsed_ms,
+        policy_violation,
     })
 }
 
@@ -1963,6 +1972,13 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 t.model, t.alias, t.run.tool_calls, t.cost_usd, t.elapsed_ms, t.run.outcome
             );
         }
+    }
+
+    // A free-policy violation must FAIL the command even when the turn itself
+    // "completed": the partial output above is preserved, but exiting success
+    // after unverified paid spend (without --allow-paid) defeats the gate.
+    if let Some(v) = &t.policy_violation {
+        anyhow::bail!("agentic turn violated free policy (use --allow-paid to permit): {v}");
     }
 
     if !t.run.succeeded() {
