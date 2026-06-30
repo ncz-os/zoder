@@ -14,6 +14,7 @@ fn provider(base_url: &str) -> OpenAiProvider {
         paid: false,
         billing: BillingMode::Metered,
         subscription: None,
+        serves: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
 }

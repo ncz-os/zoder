@@ -140,6 +140,16 @@ pub struct Provider {
     /// Subscription terms, when `billing = subscription`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<SubscriptionPlan>,
+    /// Model-id prefixes this provider serves, used for per-model routing
+    /// (`Config::provider_for_model`). A routed model id is sent to the FIRST
+    /// provider whose `serves` prefix it matches, instead of always going to
+    /// `default_provider`. This lets one fallback chain span providers — e.g.
+    /// `MiniMax-M3` -> the `minimax` provider, `nvidia/*` -> the `nvidia-eih`
+    /// provider — in a single `zoder exec`. Empty (the default) means this
+    /// provider claims no models by prefix and is only reached as the
+    /// `default_provider`. Prefixes are matched with `str::starts_with`.
+    #[serde(default)]
+    pub serves: Vec<String>,
 }
 
 fn default_kind() -> String {
@@ -212,6 +222,14 @@ pub struct Config {
     /// built-in blue/white palette.
     #[serde(default)]
     pub theme: Theme,
+    /// Pinned routing primary: a model id the router always tries FIRST,
+    /// ahead of the capability/health-ranked free pool. Set from a vendor
+    /// overlay's `[profile].primary_model` (e.g. the MiniMax subscription
+    /// model). When set and the model is a known free candidate, the router's
+    /// `select()` makes it the primary and ranks everything else as fallbacks.
+    /// `None` keeps the pure capability-first ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
     /// Pre-call spend caps. A paid call whose *estimated* cost would breach a
     /// cap is gated behind the same confirmation as a paid model. Empty by
     /// default (no caps). See [`crate::budget::Budget`].
@@ -314,6 +332,7 @@ impl Config {
                 paid: false,
                 billing: BillingMode::Free,
                 subscription: None,
+                serves: Vec::new(),
             }],
             default_provider: "default".into(),
             corpus_path: home.join("model_corpus.json"),
@@ -323,12 +342,27 @@ impl Config {
             strict_free: default_strict_free(),
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
+            primary_model: None,
             budget: crate::budget::Budget::default(),
         }
     }
 
     pub fn provider(&self, id: &str) -> Option<&Provider> {
         self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Resolve which provider should serve a given model id. Returns the FIRST
+    /// configured provider whose `serves` list contains a prefix of `model_id`
+    /// (config order is preserved through the overlay merge, so a vendor
+    /// overlay's providers are matched after the base providers). Falls back to
+    /// `default_provider` when no provider claims the prefix — preserving the
+    /// historical single-endpoint behavior for unclaimed models. This is what
+    /// lets a single routed fallback chain span providers (MiniMax -> EIH).
+    pub fn provider_for_model(&self, model_id: &str) -> Option<&Provider> {
+        self.providers
+            .iter()
+            .find(|p| p.serves.iter().any(|prefix| model_id.starts_with(prefix.as_str())))
+            .or_else(|| self.provider(&self.default_provider))
     }
 
     /// Provider ids contributed by a given vendor overlay. Returns an empty
@@ -438,6 +472,14 @@ pub struct VendorProfile {
     /// omitted, the first `[[providers]]` id is used.
     #[serde(default)]
     pub default_provider: Option<String>,
+    /// Pinned routing primary: a model id the router tries first, ahead of the
+    /// capability/health-ranked pool. Independent of `default` — an overlay can
+    /// pin the primary model without owning the default provider (e.g. the
+    /// MiniMax overlay pins `MiniMax-M3` while the NVIDIA overlay stays the
+    /// default profile). If several overlays set it, the default-claiming one
+    /// wins, otherwise the alphabetically-last overlay that defines one.
+    #[serde(default)]
+    pub primary_model: Option<String>,
 }
 
 /// Apply every `config.<vendor>.toml` in alphabetical order. Tracks the set of
@@ -478,6 +520,10 @@ fn apply_overlays_filtered(
     // built-in default already on `cfg.theme`.
     let mut default_theme: Option<Theme> = None;
     let mut fallback_theme: Option<Theme> = None;
+    // Pinned primary resolution mirrors theme: the default-claiming overlay's
+    // primary_model wins, else the last (alphabetical) overlay that sets one.
+    let mut default_primary: Option<String> = None;
+    let mut fallback_primary: Option<String> = None;
 
     for (vendor, overlay) in overlays {
         for p in &overlay.providers {
@@ -499,10 +545,16 @@ fn apply_overlays_filtered(
         if overlay.theme.is_some() {
             fallback_theme = overlay.theme.clone();
         }
+        if overlay.profile.primary_model.is_some() {
+            fallback_primary = overlay.profile.primary_model.clone();
+        }
         if overlay.profile.default {
             defaults_count += 1;
             if overlay.theme.is_some() {
                 default_theme = overlay.theme.clone();
+            }
+            if overlay.profile.primary_model.is_some() {
+                default_primary = overlay.profile.primary_model.clone();
             }
             let new_default = overlay
                 .profile
@@ -535,6 +587,10 @@ fn apply_overlays_filtered(
     // Apply the resolved org theme (default-claimer wins, else last defined).
     if let Some(theme) = default_theme.or(fallback_theme) {
         cfg.theme = theme;
+    }
+    // Apply the resolved pinned primary (default-claimer wins, else last set).
+    if let Some(primary) = default_primary.or(fallback_primary) {
+        cfg.primary_model = Some(primary);
     }
     Ok(())
 }
@@ -593,6 +649,53 @@ fn collect_overlays(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_for_model_routes_by_serves_prefix_else_default() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers.push(Provider {
+            id: "minimax".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "nvidia-eih".into(),
+            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec![
+                "nvidia/".into(),
+                "deepseek-ai/".into(),
+                "meta/llama-".into(),
+                "mistralai/".into(),
+            ],
+        });
+        // Prefix match wins, in config order.
+        assert_eq!(cfg.provider_for_model("MiniMax-M3").unwrap().id, "minimax");
+        assert_eq!(
+            cfg.provider_for_model("nvidia/llama-3.3-nemotron-super-49b-v1.5")
+                .unwrap()
+                .id,
+            "nvidia-eih"
+        );
+        assert_eq!(
+            cfg.provider_for_model("deepseek-ai/deepseek-r1").unwrap().id,
+            "nvidia-eih"
+        );
+        // No prefix claims it -> falls back to default_provider.
+        assert_eq!(
+            cfg.provider_for_model("azure/gpt-4o").unwrap().id,
+            cfg.default_provider
+        );
+    }
 
     #[test]
     fn bearer_auth_renders_authorization_header() {

@@ -43,11 +43,25 @@ pub struct Route {
 pub struct Router<'a> {
     corpus: &'a Corpus,
     health: &'a HealthStore,
+    /// Optional operator-pinned primary model id (`Config.primary_model`). When
+    /// set, it always leads the chain and the capability/health-ranked free
+    /// pool becomes the fallback chain behind it.
+    pinned_primary: Option<String>,
 }
 
 impl<'a> Router<'a> {
     pub fn new(corpus: &'a Corpus, health: &'a HealthStore) -> Self {
-        Self { corpus, health }
+        Self {
+            corpus,
+            health,
+            pinned_primary: None,
+        }
+    }
+
+    /// Pin a primary model (from `Config.primary_model`) to lead the chain.
+    pub fn with_primary(mut self, primary: Option<String>) -> Self {
+        self.pinned_primary = primary.filter(|s| !s.trim().is_empty());
+        self
     }
 
     fn rank_key(m: &ModelEntry, tier: Tier) -> f64 {
@@ -111,29 +125,67 @@ impl<'a> Router<'a> {
         keyed.into_iter().map(|(_, m)| m).collect()
     }
 
+    /// Build a fallback chain from the ranked pool, excluding `primary_id`:
+    /// highest-ranked models of a DIFFERENT family first (diversity dodges a
+    /// family-wide outage), then same-family, capped at 4.
+    fn build_fallbacks(
+        ranked: &[&ModelEntry],
+        primary_id: &str,
+        primary_family: &str,
+    ) -> Vec<String> {
+        let mut fallbacks: Vec<String> = Vec::new();
+        for m in ranked.iter().filter(|m| m.id != primary_id) {
+            if m.family != primary_family && fallbacks.len() < 3 {
+                fallbacks.push(m.id.clone());
+            }
+        }
+        for m in ranked.iter().filter(|m| m.id != primary_id) {
+            if fallbacks.len() >= 4 {
+                break;
+            }
+            if m.family == primary_family {
+                fallbacks.push(m.id.clone());
+            }
+        }
+        fallbacks
+    }
+
     /// Pick a primary + a cross-family fallback chain.
     pub fn select(&self, tier: Tier) -> anyhow::Result<Route> {
         let ranked = self.candidates(tier);
+
+        // Operator-pinned primary: it always leads, and the ranked free pool
+        // (capability x latency x live health) becomes the fallback chain
+        // behind it. The pin is honored even when it is not itself in the free
+        // pool (e.g. a flat-rate subscription model the operator wants first),
+        // so an empty pool is not an error in this path.
+        if let Some(pin) = &self.pinned_primary {
+            let pin_entry = self.corpus.get(pin);
+            let pin_family = pin_entry.map(|e| e.family.as_str()).unwrap_or("");
+            let fallbacks = Self::build_fallbacks(&ranked, pin, pin_family);
+            let cap_str = match pin_entry.and_then(|e| {
+                e.code_capability()
+                    .zip(e.code_capability_source())
+            }) {
+                Some((c, src)) => format!("{c:.1} ({src})"),
+                None => "pinned".to_string(),
+            };
+            let reason = format!(
+                "tier={tier:?} pick={pin} (PINNED primary; code_cap={cap_str}) then {} ranked free fallback(s)",
+                fallbacks.len()
+            );
+            return Ok(Route {
+                primary: pin.clone(),
+                fallbacks,
+                reason,
+            });
+        }
+
         let primary = ranked
             .first()
             .ok_or_else(|| anyhow::anyhow!("no healthy free model available for tier {tier:?}"))?;
 
-        // Fallback chain: highest-ranked models of a DIFFERENT family than the
-        // primary (diversity dodges a family-wide outage), then same-family.
-        let mut fallbacks: Vec<String> = Vec::new();
-        for m in ranked.iter().skip(1) {
-            if m.family != primary.family && fallbacks.len() < 3 {
-                fallbacks.push(m.id.clone());
-            }
-        }
-        for m in ranked.iter().skip(1) {
-            if fallbacks.len() >= 4 {
-                break;
-            }
-            if m.family == primary.family {
-                fallbacks.push(m.id.clone());
-            }
-        }
+        let fallbacks = Self::build_fallbacks(&ranked, &primary.id, &primary.family);
 
         let cap_str = match (primary.code_capability(), primary.code_capability_source()) {
             (Some(c), Some(src)) => format!("{c:.1} ({src})"),
@@ -197,6 +249,45 @@ mod tests {
         let hi = benched("hi", 80.0);
         let lo = benched("lo", 50.0);
         assert!(Router::rank_key(&hi, Tier::Strong) > Router::rank_key(&lo, Tier::Strong));
+    }
+
+    #[test]
+    fn pinned_primary_leads_and_ranked_pool_falls_back() {
+        // A pinned primary must lead the chain even though `hi` outranks it in
+        // the free pool; the ranked pool then forms the fallbacks behind it.
+        let health = HealthStore::default();
+        let corpus = Corpus {
+            models: vec![
+                ModelEntry {
+                    family: "minimax".into(),
+                    ..benched("MiniMax-M3", 60.0)
+                },
+                ModelEntry {
+                    family: "alpha".into(),
+                    ..benched("hi", 90.0)
+                },
+                ModelEntry {
+                    family: "beta".into(),
+                    ..benched("lo", 50.0)
+                },
+            ]
+            .into_iter()
+            .map(|mut m| {
+                m.free = true;
+                m.route_candidate = true;
+                m.kind = "chat".into();
+                m
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let router =
+            Router::new(&corpus, &health).with_primary(Some("MiniMax-M3".to_string()));
+        let route = router.select(Tier::Auto).unwrap();
+        assert_eq!(route.primary, "MiniMax-M3");
+        // `hi` (higher SWE) leads the fallbacks, proving the rest stay ranked.
+        assert_eq!(route.fallbacks.first().map(String::as_str), Some("hi"));
+        assert!(!route.fallbacks.contains(&"MiniMax-M3".to_string()));
     }
 
     #[test]

@@ -421,6 +421,50 @@ impl Corpus {
         report
     }
 
+    /// Fold a free provider's live catalog into the routing pool. Each id in
+    /// `ids` (already prefix-filtered to the provider's `serves` allowlist by
+    /// the caller, e.g. NVIDIA EIH's `nvidia/* | deepseek-ai/* | meta/llama-* |
+    /// mistralai/*` open-weight NIMs) is upserted as a free, routable chat
+    /// candidate. Existing entries keep all benchmark/capability/latency scores
+    /// — only the free/route flags are (re)asserted, so re-running a refresh is
+    /// idempotent and never loses bench data. A new (unbenched) entry gets a
+    /// neutral agentic prior so it is selectable as a fallback until the corpus
+    /// builder benches it; a benched entry's real score always wins (the prior
+    /// is only set when no capability/agentic signal exists). Returns the number
+    /// of entries newly promoted into the routing pool.
+    pub fn ingest_free_chat(&mut self, ids: &[String]) -> usize {
+        const UNBENCHED_PRIOR: f64 = 0.5;
+        let mut promoted = 0usize;
+        for id in ids {
+            if let Some(m) = self.models.iter_mut().find(|m| &m.id == id) {
+                let was_routable = m.routable();
+                m.free = true;
+                m.paid = false;
+                m.route_candidate = true;
+                m.kind = "chat".into();
+                m.gated_reason = None;
+                if m.agentic_score.is_none() && m.code_capability().is_none() {
+                    m.agentic_score = Some(UNBENCHED_PRIOR);
+                }
+                if !was_routable {
+                    promoted += 1;
+                }
+            } else {
+                let mut e = ModelEntry::from_served_id(id);
+                e.free = true;
+                e.paid = false;
+                e.route_candidate = true;
+                e.kind = "chat".into();
+                e.gated_reason = None;
+                e.agentic_score = Some(UNBENCHED_PRIOR);
+                self.models.push(e);
+                promoted += 1;
+            }
+        }
+        self.count = self.models.len();
+        promoted
+    }
+
     /// Persist atomically (temp file + rename).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {

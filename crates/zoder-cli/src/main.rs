@@ -1077,7 +1077,7 @@ fn resolve_chain(
     if let Some(m) = &cli.model {
         return Ok((vec![m.clone()], format!("explicit model {m}")));
     }
-    let router = Router::new(&eng.corpus, health);
+    let router = Router::new(&eng.corpus, health).with_primary(eng.cfg.primary_model.clone());
     let route = router.select(Tier::parse(&cli.tier))?;
     let mut chain = vec![route.primary.clone()];
     if !cli.no_fallback {
@@ -1089,7 +1089,7 @@ fn resolve_chain(
 fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let health = HealthStore::load(&eng.cfg.health_path);
-    let router = Router::new(&eng.corpus, &health);
+    let router = Router::new(&eng.corpus, &health).with_primary(eng.cfg.primary_model.clone());
     let route = router.select(Tier::parse(&cli.tier))?;
     // Echo the task so the decision is traceable; routing is currently
     // capability/health based, not prompt-content based (see roadmap).
@@ -1204,10 +1204,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         }
     }
 
+    // Resolve the provider for the PRIMARY model (per-model routing): the
+    // primary may belong to a different provider than `default_provider`
+    // (e.g. a pinned `MiniMax-M3` -> the `minimax` provider). Each link in the
+    // chain is resolved independently in the loop below, so one chain can span
+    // providers (MiniMax -> EIH).
     let provider_cfg = eng
         .cfg
-        .provider(&eng.cfg.default_provider)
-        .ok_or_else(|| anyhow::anyhow!("default provider not configured"))?;
+        .provider_for_model(&primary)
+        .ok_or_else(|| anyhow::anyhow!("no provider configured for model {primary}"))?;
 
     // L2: --dry-run short-circuits before reading stdin and any paid confirm.
     if cli.dry_run {
@@ -1257,10 +1262,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         anyhow::bail!("--require-free set but {primary} is not a known free model");
     }
     // A paid/metered serving provider (e.g. an org overlay's default route)
-    // requires confirmation even when the model id is classified free.
+    // requires confirmation even when the model id is classified free. Checked
+    // against the provider that actually serves the primary, not the default.
     let provider_paid = eng
         .cfg
-        .provider(&eng.cfg.default_provider)
+        .provider_for_model(&primary)
         .map(|p| p.paid || p.billing != BillingMode::Free)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) = gate.check(&primary_entry, provider_paid) {
@@ -1306,7 +1312,13 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     }
     messages.push(Message::new("user", &prompt));
 
-    let provider = OpenAiProvider::new(provider_cfg)?;
+    // Per-model provider clients, built lazily and cached by provider id. A
+    // single fallback chain can span providers (e.g. a pinned `MiniMax-M3` on
+    // the `minimax` provider, then `nvidia/*` EIH NIMs on `nvidia-eih`), so the
+    // serving provider is resolved per link via `provider_for_model` rather
+    // than using one `default_provider` client for the whole chain.
+    let mut provider_clients: std::collections::HashMap<String, OpenAiProvider> =
+        std::collections::HashMap::new();
 
     // Walk the chain: each model gets `--retries` transient retries; on a clean
     // (no output emitted) failure we fall back to the next model.
@@ -1323,6 +1335,24 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 continue;
             }
         }
+        // Resolve (and cache) the provider that serves THIS model. A model with
+        // no provider claiming its prefix falls back to `default_provider`;
+        // `None` only happens when no providers exist at all (validate() bars
+        // that), so it is a hard configuration error.
+        let pid = eng
+            .cfg
+            .provider_for_model(model_id)
+            .ok_or_else(|| anyhow::anyhow!("no provider configured for model {model_id}"))?
+            .id
+            .clone();
+        if !provider_clients.contains_key(&pid) {
+            let pcfg = eng
+                .cfg
+                .provider(&pid)
+                .ok_or_else(|| anyhow::anyhow!("provider {pid} not configured"))?;
+            provider_clients.insert(pid.clone(), OpenAiProvider::new(pcfg)?);
+        }
+        let provider = &provider_clients[&pid];
         let req = ChatRequest {
             model: model_id.clone(),
             messages: messages.clone(),
@@ -1336,7 +1366,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // the chain-wide elapsed time (which would fold in prior models' time
         // plus retry backoff and skew the router's latency EWMA).
         let model_started = std::time::Instant::now();
-        match try_model(&provider, &req, cli.json, cli.retries, cli.quiet).await {
+        match try_model(provider, &req, cli.json, cli.retries, cli.quiet).await {
             Ok(res) => {
                 // Defer the winning model's health recording until after the
                 // policy verify below, so a policy-violating "success" is
@@ -1623,10 +1653,11 @@ pub(crate) async fn agentic_turn(
         anyhow::bail!("--require-free set but {primary} is not a known free model");
     }
     // A paid/metered serving provider (e.g. an org overlay's default route)
-    // requires confirmation even when the model id is classified free.
+    // requires confirmation even when the model id is classified free. Checked
+    // against the provider that actually serves the primary, not the default.
     let provider_paid = eng
         .cfg
-        .provider(&eng.cfg.default_provider)
+        .provider_for_model(&primary)
         .map(|p| p.paid || p.billing != BillingMode::Free)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) = gate.check(&primary_entry, provider_paid) {
@@ -2747,9 +2778,10 @@ async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
 
 async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
     let eng = Engine::load()?;
+    let default_id = eng.cfg.default_provider.clone();
     let provider_cfg = eng
         .cfg
-        .provider(&eng.cfg.default_provider)
+        .provider(&default_id)
         .ok_or_else(|| anyhow::anyhow!("default provider not configured"))?;
     let provider = OpenAiProvider::new(provider_cfg)?;
     let served = provider.list_models().await.map_err(|e| {
@@ -2760,8 +2792,54 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         )
     })?;
 
+    // Free-provider catalog ingestion: every provider that declares `serves`
+    // prefixes and is billed free contributes its live open-weight catalog to
+    // the routing pool. Each provider's returned ids are filtered to its own
+    // `serves` allowlist — so e.g. NVIDIA EIH's azure/aws/oci/gcp/google-hosted
+    // catalog entries are dropped, leaving only the free NIMs (nvidia/* |
+    // deepseek-ai/* | meta/llama-* | mistralai/*). A provider that is down or
+    // missing its key is warned and skipped, never fatal to the refresh.
+    let mut all_served = served.clone();
+    let mut free_ids: Vec<String> = Vec::new();
+    for p in &eng.cfg.providers {
+        if p.serves.is_empty() || p.paid || p.billing != BillingMode::Free {
+            continue;
+        }
+        // Reuse the default provider's already-fetched catalog; query others.
+        let ids = if p.id == default_id {
+            served.clone()
+        } else {
+            match OpenAiProvider::new(p) {
+                Ok(client) => match client.list_models().await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        if !cli.quiet {
+                            eprintln!("[refresh] skip free provider {}: {}", p.id, e.message);
+                        }
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    if !cli.quiet {
+                        eprintln!("[refresh] skip free provider {}: {e}", p.id);
+                    }
+                    continue;
+                }
+            }
+        };
+        let kept: Vec<String> = ids
+            .into_iter()
+            .filter(|id| p.serves.iter().any(|pre| id.starts_with(pre.as_str())))
+            .collect();
+        all_served.extend(kept.iter().cloned());
+        free_ids.extend(kept);
+    }
+
     let mut corpus = eng.corpus;
-    let report = corpus.reconcile(&served);
+    // Reconcile against the UNION of every provider's served ids so a free
+    // provider's NIMs are never retired by the default provider's narrower list.
+    let report = corpus.reconcile(&all_served);
+    let promoted = corpus.ingest_free_chat(&free_ids);
     corpus.save(&eng.cfg.corpus_path)?;
 
     if cli.json {
@@ -2769,6 +2847,8 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
             "{}",
             serde_json::json!({
                 "served": served.len(),
+                "free_ingested": free_ids.len(),
+                "promoted": promoted,
                 "added": report.added,
                 "retired": report.retired,
                 "kept": report.kept,
@@ -2777,12 +2857,14 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         );
     } else {
         println!(
-            "refreshed: {} served, {} new, {} retired, {} kept ({} total)",
+            "refreshed: {} served, {} new, {} retired, {} kept ({} total); {} free-provider NIM(s) ingested, {} promoted into routing",
             served.len(),
             report.added.len(),
             report.retired.len(),
             report.kept,
-            corpus.models.len()
+            corpus.models.len(),
+            free_ids.len(),
+            promoted,
         );
         if !report.added.is_empty() {
             println!("  new (unclassified, run corpus builder to score/bench):");
