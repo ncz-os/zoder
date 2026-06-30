@@ -133,7 +133,11 @@ if [ -n "${GH_TOKEN:-}" ]; then
       --notes "Rolling nightly trio build from main, produced by scripts/daily-build.sh on the fleet build hosts. The git tag is cosmetic; see GIT_COMMIT and the notes for the source SHA." \
       || log "WARN: nightly release create raced/failed (continuing)"
   fi
-  gh release edit "$GH_NIGHTLY_TAG" -R "$GH_REPO" \
+  # Force published + prerelease every run: ncz-os/zoder is a gitlab->github
+  # push-mirror with ref-restricted tags, so a release can end up stuck as a
+  # DRAFT (no `nightly` tag). --draft=false publishes it (which creates the tag)
+  # and is idempotent once published.
+  gh release edit "$GH_NIGHTLY_TAG" -R "$GH_REPO" --draft=false --prerelease \
     --notes "Rolling nightly trio build from main (scripts/daily-build.sh). Last update: $(date -u +%Y-%m-%dT%H:%MZ) by ${host_short} @ ${SHA} (v${VERSION}). Artifacts accumulate across hosts: darwin-arm64 + linux-arm64 from ULTRA, x86_64-linux from HYDRA." \
     >/dev/null 2>&1 || true
   if gh release upload "$GH_NIGHTLY_TAG" -R "$GH_REPO" dist/*.tar.gz dist/*.sha256 --clobber; then
