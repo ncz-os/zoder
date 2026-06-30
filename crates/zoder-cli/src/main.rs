@@ -1545,6 +1545,10 @@ fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
     let m = model.to_ascii_lowercase();
     // (substring in model id) -> alias
     const MAP: &[(&str, &str)] = &[
+        // MiniMax subscription (the pinned primary). Without this the id falls
+        // through to the deepseek default alias, and a forced model_override
+        // then hands the engine a model the deepseek agent can't serve -> hang.
+        ("minimax", "minimax"),
         ("deepseek-v4-pro", "deepseek-v4-pro"),
         ("qwen3-coder", "qwen3-coder-480b"),
         ("qwen-235b", "qwen-235b"),
