@@ -157,6 +157,11 @@ A single `zoder` run is a short, auditable pipeline:
 Paid models are never reached by accident: they are off by default and require
 an explicit opt-in.
 
+To route a subscription model first and fall back to a *different* provider's
+free models (e.g. MiniMax-M3, then NVIDIA EIH's free open-weight NIMs), see
+[docs/PROVIDER-ROUTING.md](docs/PROVIDER-ROUTING.md): per-model `serves` routing,
+a pinned `primary_model`, and free-NIM ingestion via `zoder refresh`.
+
 ---
 
 ## Systems architecture
