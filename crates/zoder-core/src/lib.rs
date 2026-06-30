@@ -6,7 +6,7 @@ pub mod budget;
 pub mod config;
 pub mod corpus;
 pub mod engine_cost;
-pub mod engine_rpc;
+pub use acp_client as engine_rpc;
 pub mod enterprise_cost;
 pub mod finops;
 pub mod health;
@@ -31,7 +31,7 @@ pub use engine_cost::{
     fetch_engine_cost, AgentStats as EngineAgentStats, CostSummary as EngineCostSummary,
     ModelStats as EngineModelStats,
 };
-pub use engine_rpc::{
+pub use acp_client::{
     new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket, AgentEvent,
     AgentOptions, AgentRun, ApprovalPolicy, EngineKind, DEFAULT_AUTO_APPROVE,
 };
