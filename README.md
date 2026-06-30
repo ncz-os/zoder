@@ -164,6 +164,78 @@ a pinned `primary_model`, and free-NIM ingestion via `zoder refresh`.
 
 ---
 
+## Engines: ZeroClaw + Goose (dual-engine)
+
+zoder is an **engine-agnostic governance layer** — the corpus, free-first router,
+policy gate, ledger, and review/fix loop govern *whichever* agent actually runs
+the turn. Engine selection is one flag:
+
+```bash
+zoder exec --engine zeroclaw "…"   # default — the ncz-os fleet engine (daemon)
+zoder exec --engine goose    "…"   # Block / Linux-Foundation Goose (goose acp)
+```
+
+Both are **Rust agentic coding engines** (memory-safe, fast, single-binary) and
+both speak the **Agent Client Protocol (ACP)** — so zoder drives them through one
+transport abstraction (Unix-socket for the resident daemon, spawned stdio for
+`goose acp`). But they embody **different design principles**, which is exactly
+why they complement rather than duplicate each other:
+
+| | **ZeroClaw** (default) | **Goose** |
+|---|---|---|
+| Process model | long-running **daemon** (resident sessions, Unix socket) | **per-turn subprocess** (`goose acp`, stdio) |
+| Built for | the ncz-os **fleet**: cost-ledger-native, configurable agents/aliases, hive/worker orchestration, networked session backends (PG/MySQL/Oracle/Db2/MNEMOS) | broad **single-machine** use: huge **MCP-extension** ecosystem, recipes, and ACP-server interop (Zed / JetBrains / VS Code) |
+| Strength | governance, multi-agent fleet, durable networked sessions | provider/extension **breadth**, maturity, community momentum |
+| Backed by | ncz-os (a friendly ZeroClaw fork) | Block → **Agentic AI Foundation (Linux Foundation)** |
+
+**Why dual-engine is a valid strategy (not fragmentation):**
+
+- **The governance is the moat; the engine is pluggable.** zoder's value —
+  free-first routing, the default-deny-paid gate, the corpus, health-aware
+  selection, the cost ledger, the adversarial review/fix loop — is engine-agnostic.
+  Adding Goose *widens the substrate zoder governs*; it does not split it.
+- **Resilience.** The two engines fail independently. When the resident ZeroClaw
+  daemon is mis/un-configured or non-invokable mid-loop, Goose needs no daemon and
+  is an immediate fallback (and vice-versa).
+- **Engine diversity as a correctness signal.** Two independently-architected
+  engines can author + cross-review the same task — engine diversity catches
+  engine-specific failure modes, the same way cross-*family* model reviewers catch
+  model-specific ones. For the hardest tasks, run both and reconcile.
+- **A standards bet, not a Goose bet.** Because the seam is ACP, zoder is really an
+  **ACP orchestrator**: any future ACP agent (Zed's registry, others) plugs in for
+  free. Goose is simply the first second engine that proves the abstraction.
+
+They are **selectable alternatives, not run simultaneously by default** —
+doubling cost buys little on easy/medium work. Simultaneity is opt-in: a
+resilience fallback when one engine is degraded, or an ensemble for the hardest
+tasks.
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │  zoder — engine-agnostic governance layer      │
+                         │  corpus · free-first router · policy gate ·    │
+                         │  health · cost ledger · review/fix loop        │
+                         └───────────────┬──────────────────────────────┘
+                                         │  one ACP transport abstraction
+                       ┌─────────────────┴──────────────────┐
+                       │ --engine zeroclaw       --engine goose
+                       ▼                                     ▼
+        ┌───────────────────────────┐         ┌───────────────────────────┐
+        │ ZeroClaw engine (daemon)  │         │ Goose (`goose acp`)        │
+        │ ACP over Unix socket      │         │ ACP over stdio subprocess  │
+        │ resident sessions · agents│         │ MCP extensions · recipes   │
+        │ networked session backends│         │ Zed/JetBrains/VSCode interop│
+        └─────────────┬─────────────┘         └─────────────┬─────────────┘
+                      └──────────────┬──────────────────────┘
+                                     ▼
+                 free-first provider pool (MiniMax subscription → NVIDIA EIH NIMs → …)
+```
+
+> The `docs/architecture.svg` asset predates the dual-engine work and still shows
+> a single engine; regenerate it to match the diagram above.
+
+---
+
 ## Systems architecture
 
 zoder is layered on the **ZeroClaw / zerocore** foundation (vendored from the
@@ -172,12 +244,14 @@ complete coding system.
 
 ![zoder systems architecture](docs/architecture.svg)
 
-**zerocore — the foundation.** ZeroClaw's agent/turn engine and its
-OpenAI-compatible provider abstraction. zoder rides on the fork's loop and
-inherits streaming, retries, timeouts, and sessions instead of reimplementing
-them. This is the part that actually talks to models. Durable session history is
-pluggable: a JSONL file by default, or a **networked database backend**
-(PostgreSQL / MySQL / Oracle / Db2) / **MNEMOS** when configured.
+**zerocore — the (pluggable) engine.** ZeroClaw's agent/turn engine and its
+OpenAI-compatible provider abstraction is the **default** engine; zoder rides on
+the fork's loop and inherits streaming, retries, timeouts, and sessions instead
+of reimplementing them. This is the part that actually talks to models. Durable
+session history is pluggable: a JSONL file by default, or a **networked database
+backend** (PostgreSQL / MySQL / Oracle / Db2) / **MNEMOS** when configured. As of
+the dual-engine work the engine itself is pluggable too — `--engine goose` drives
+Block/LF **Goose** over ACP instead (see [Engines: ZeroClaw + Goose](#engines-zeroclaw--goose-dual-engine)); zoder's governance is engine-agnostic.
 
 **zerocode — the terminal UX.** The interactive pair-coding experience. It
 surfaces cost at the point of decision: a free-vs-paid model picker, per-turn and
