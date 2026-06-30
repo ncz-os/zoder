@@ -1579,8 +1579,27 @@ fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
             return (*alias).to_string();
         }
     }
-    // Default coding agent.
-    "deepseek-v4-pro".to_string()
+    // Default coding agent. Was `deepseek-v4-pro`, which dangled / flapped and
+    // made zoder non-invokable mid-loop (field reports 2026-06-30). `minimax`
+    // is the configured default author on the cutover hosts and is stable.
+    "minimax".to_string()
+}
+
+/// Default ADVERSARIAL REVIEWER when none is given: a strong, empirically-validated
+/// (2026-06-30 bake-off) CROSS-FAMILY free model — never the author's own model.
+/// Self-review is weak, and a flat-subscription author (e.g. minimax) uses env-auth
+/// on the review path and 401s while the agentic engine authed fine; a cross-family
+/// EIH reviewer routes to the working-auth provider.
+pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str {
+    let a = author_model.to_ascii_lowercase();
+    if a.contains("glm") || a.contains("z-ai") {
+        "moonshotai/kimi-k2.6"
+    } else if a.contains("kimi") || a.contains("moonshot") {
+        "z-ai/glm-5.1"
+    } else {
+        // minimax / deepseek / qwen / nemotron / etc. authors -> glm-5.1 (top free reviewer)
+        "z-ai/glm-5.1"
+    }
 }
 
 /// Ensure a zeroclaw agent daemon is reachable; spawn an ephemeral one (using

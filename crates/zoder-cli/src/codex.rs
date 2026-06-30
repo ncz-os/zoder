@@ -47,12 +47,15 @@ async fn complete_once(
         None => match &cli.model {
             Some(m) => m.clone(),
             None => {
+                // Default reviewer = a strong CROSS-FAMILY model, NOT the author's
+                // own. Self-review is weak; and routing the review to the author's
+                // flat-subscription provider (env-auth) 401s while the agentic
+                // engine authed fine (field report 2026-06-30). A cross-family EIH
+                // reviewer routes to the working-auth provider.
                 let health = HealthStore::load(&eng.cfg.health_path);
                 let (chain, _) = crate::resolve_chain(cli, &eng, &health)?;
-                chain
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("no reviewer model resolved"))?
+                let author = chain.first().cloned().unwrap_or_default();
+                crate::default_cross_family_reviewer(&author).to_string()
             }
         },
     };
