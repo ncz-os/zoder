@@ -618,8 +618,18 @@ pub fn cli_run(
     argv: &[String],
 ) -> anyhow::Result<i32> {
     let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
-    let since: Option<DateTime<Utc>> = parse_flag(argv, "--since").map(parse_date);
-    let until: Option<DateTime<Utc>> = parse_flag(argv, "--until").map(parse_date);
+    let since: Option<DateTime<Utc>> = match parse_flag(argv, "--since") {
+        Some(s) => Some(parse_date(&s).ok_or_else(|| {
+            anyhow::anyhow!("invalid --since date '{s}' (expected RFC3339 or YYYY-MM-DD)")
+        })?),
+        None => None,
+    };
+    let until: Option<DateTime<Utc>> = match parse_flag(argv, "--until") {
+        Some(s) => Some(parse_date(&s).ok_or_else(|| {
+            anyhow::anyhow!("invalid --until date '{s}' (expected RFC3339 or YYYY-MM-DD)")
+        })?),
+        None => None,
+    };
     let window_days: u32 = parse_flag(argv, "--window-days")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(30);
@@ -719,14 +729,20 @@ fn parse_flag(argv: &[String], key: &str) -> Option<String> {
     None
 }
 
-fn parse_date(s: String) -> DateTime<Utc> {
-    if let Ok(d) = DateTime::parse_from_rfc3339(&s) {
-        return d.with_timezone(&Utc);
+/// Parse `--since`/`--until` as RFC3339 or `YYYY-MM-DD`. Returns `None` on an
+/// unparseable string so the caller can reject it — silently defaulting a typo'd
+/// date to `now` produced misleading empty/partial reports.
+fn parse_date(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Some(d.with_timezone(&Utc));
     }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-        return DateTime::<Utc>::from_naive_utc_and_offset(d.and_hms_opt(0, 0, 0).unwrap(), Utc);
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+            d.and_hms_opt(0, 0, 0).unwrap(),
+            Utc,
+        ));
     }
-    Utc::now()
+    None
 }
 
 #[cfg(test)]

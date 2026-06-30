@@ -1542,31 +1542,56 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Authoritative per-run cost/tokens from the engine's cost tracker, scoped to
-/// `[from, now)` and the agent alias. Falls back to `(0, 0, 0, fallback_model)`
-/// when the engine has no record yet.
+/// `[from, now)` and the agent alias.
+///
+/// Returns `None` when the cost query itself FAILS (the engine is unreachable or
+/// errors) — distinct from a successful query that returns an empty window
+/// ($0, e.g. a genuinely free local model). The caller MUST treat `None` as
+/// "cost/model attribution unavailable" and fail closed under the free policy,
+/// rather than silently booking the run as $0 on the primary (which let a paid
+/// alias/fallback escape the paid gate — the original fail-open bug).
+///
+/// The query is retried a few times with a short backoff to ride out the
+/// engine's cost-tracker flush lag right after a turn completes.
 async fn agentic_cost(
     socket: &std::path::Path,
     from: chrono::DateTime<chrono::Utc>,
     alias: &str,
     fallback_model: &str,
-) -> (f64, u64, u64, String) {
-    match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
-        Ok(sum) => {
-            let cost = sum.window_cost_usd();
-            // Pick the dominant model in the window for attribution.
-            let model = sum
-                .by_model
-                .values()
-                .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens))
-                .map(|m| m.model.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback_model.to_string());
-            let tin: u64 = sum.by_model.values().map(|m| m.input_tokens).sum();
-            let tout: u64 = sum.by_model.values().map(|m| m.output_tokens).sum();
-            (cost, tin, tout, model)
+) -> Option<(f64, u64, u64, String)> {
+    let mut last_err = None;
+    for attempt in 0..3u32 {
+        match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
+            Ok(sum) => {
+                let cost = sum.window_cost_usd();
+                // Pick the dominant model in the window for attribution.
+                let model = sum
+                    .by_model
+                    .values()
+                    .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens))
+                    .map(|m| m.model.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| fallback_model.to_string());
+                let tin: u64 = sum.by_model.values().map(|m| m.input_tokens).sum();
+                let tout: u64 = sum.by_model.values().map(|m| m.output_tokens).sum();
+                return Some((cost, tin, tout, model));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        300 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
         }
-        Err(_) => (0.0, 0, 0, fallback_model.to_string()),
     }
+    tracing::warn!(
+        ?last_err,
+        "engine cost/query failed; cost attribution unavailable"
+    );
+    None
 }
 
 /// Outcome of one agentic turn, with the cost/token figures harvested from the
@@ -1676,29 +1701,54 @@ pub(crate) async fn agentic_turn(
             AgentEvent::Usage { .. } => {}
         }
     })
-    .await?;
+    .await;
+    // A setup/prompt failure (`initialize`, `session/new`, `session/configure`,
+    // `session/prompt`, or a hung socket) returns Err here BEFORE the health
+    // accounting below. Without recording it, a broken alias/model stays
+    // "healthy" and the router keeps selecting it. Feed the breaker, then
+    // surface the error.
+    let run = match run {
+        Ok(r) => r,
+        Err(e) => {
+            health.record_failure(&primary, &format!("agentic setup/turn failed: {e}"));
+            save_health(&health);
+            return Err(e);
+        }
+    };
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
 
     let socket2 = engine_socket_path();
+    // `None` => the engine cost query failed: we CANNOT prove what (or how
+    // much) ran. Fail closed under the free policy instead of booking $0.
+    let cost_obs = agentic_cost(&socket2, start_ts, &alias, &primary).await;
+    let attribution_failed = cost_obs.is_none();
     let (cost, tokens_in, tokens_out, model_used) =
-        agentic_cost(&socket2, start_ts, &alias, &primary).await;
+        cost_obs.unwrap_or_else(|| (0.0, 0, 0, primary.clone()));
 
     // Post-verify: the engine (via the agent alias) may have run a different —
     // possibly paid — model than the one pre-gated above (the daemon resolves
-    // the alias). If it billed real money, or the engine-reported model is a
-    // known paid model, without --allow-paid, record a policy violation rather
-    // than marking the ledger clean.
+    // the alias). If it billed real money, the engine-reported model is a known
+    // paid model, OR we could not verify cost/model at all, record a policy
+    // violation rather than marking the ledger clean (default-deny under the
+    // free guard).
     let model_used_paid = eng
         .corpus
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    let violation = if !cli.allow_paid && (cost > 0.0 || model_used_paid) {
-        let v = format!(
-            "agentic run (alias {alias}) billed ${cost:.4} on engine model '{model_used}' \
-             (corpus_paid={model_used_paid}) without --allow-paid"
-        );
+    let violation = if !cli.allow_paid && (cost > 0.0 || model_used_paid || attribution_failed) {
+        let v = if attribution_failed {
+            format!(
+                "agentic run (alias {alias}) cost/model attribution unavailable \
+                 (engine cost/query failed); cannot prove the run was free without --allow-paid"
+            )
+        } else {
+            format!(
+                "agentic run (alias {alias}) billed ${cost:.4} on engine model '{model_used}' \
+                 (corpus_paid={model_used_paid}) without --allow-paid"
+            )
+        };
         eprintln!("zoder: POLICY VIOLATION: {v}");
         Some(v)
     } else {

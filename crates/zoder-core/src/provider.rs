@@ -387,7 +387,18 @@ impl OpenAiProvider {
                 emitted: false,
             });
         }
-        let body = resp.text().await.map_err(classify_reqwest)?;
+        // Bound the body read like the chat paths do: a provider can return 200
+        // headers and then stall the body, which would hang `zoder refresh`.
+        let body = match timeout(self.request_timeout, resp.text()).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return Err(classify_reqwest(e)),
+            Err(_) => {
+                return Err(ProviderError::new(
+                    ErrKind::Timeout,
+                    format!("models list body stalled after {:?}", self.request_timeout),
+                ))
+            }
+        };
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ProviderError::new(ErrKind::Decode, format!("malformed models list: {e}"))
         })?;
