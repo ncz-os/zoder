@@ -2682,9 +2682,8 @@ mod tests {
         let mut opts = goose_opts(None);
         opts.timeout = std::time::Duration::from_millis(50);
         let res = run_goose_agent_with_conn(&mut conn, &opts, |_| {}).await;
-        let err_msg = res.expect_err(
-            "the inner drive must error out (sleep emits no ACP bytes); got Ok",
-        );
+        let err_msg =
+            res.expect_err("the inner drive must error out (sleep emits no ACP bytes); got Ok");
         let err_text = format!("{err_msg:#}");
         assert!(
             err_text.contains("timed out")
@@ -2737,21 +2736,11 @@ mod tests {
         // borrow). We then reap unconditionally — exactly what the
         // fix does after `tokio::time::timeout(...)` returns.
         let inner = async {
-            let _reader = std::mem::replace(
-                &mut conn2.reader,
-                dummy_reader_for_tests(),
-            );
-            let _writer = std::mem::replace(
-                &mut conn2.writer,
-                dummy_writer_for_tests(),
-            );
+            let _reader = std::mem::replace(&mut conn2.reader, dummy_reader_for_tests());
+            let _writer = std::mem::replace(&mut conn2.writer, dummy_writer_for_tests());
             std::future::pending::<()>().await;
         };
-        let raced = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            inner,
-        )
-        .await;
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(100), inner).await;
         assert!(
             raced.is_err(),
             "wrapper timeout must Elapse (inner future parks forever)"
@@ -3135,7 +3124,10 @@ mod goose_acp_real_turn {
     async fn goose_acp_real_turn_minimax() {
         let key = match std::env::var("MINIMAX_API_KEY") {
             Ok(k) if !k.is_empty() => k,
-            _ => { eprintln!("SKIP: MINIMAX_API_KEY not set"); return; }
+            _ => {
+                eprintln!("SKIP: MINIMAX_API_KEY not set");
+                return;
+            }
         };
         let transport = EngineTransport::Stdio {
             command: "goose".to_string(),
@@ -3144,8 +3136,14 @@ mod goose_acp_real_turn {
                 ("GOOSE_PROVIDER".to_string(), "openai".to_string()),
                 ("GOOSE_MODEL".to_string(), "MiniMax-M3".to_string()),
                 ("OPENAI_API_KEY".to_string(), key.clone()),
-                ("OPENAI_HOST".to_string(), "https://api.minimax.io".to_string()),
-                ("OPENAI_BASE_URL".to_string(), "https://api.minimax.io/v1".to_string()),
+                (
+                    "OPENAI_HOST".to_string(),
+                    "https://api.minimax.io".to_string(),
+                ),
+                (
+                    "OPENAI_BASE_URL".to_string(),
+                    "https://api.minimax.io/v1".to_string(),
+                ),
             ],
         };
         let opts = AgentOptions {
@@ -3160,7 +3158,9 @@ mod goose_acp_real_turn {
             approval: ApprovalPolicy::None,
             timeout: std::time::Duration::from_secs(60),
         };
-        let mut conn = connect_transport(&transport).await.expect("spawn goose acp");
+        let mut conn = connect_transport(&transport)
+            .await
+            .expect("spawn goose acp");
         let res;
         {
             let mut r = tokio::io::BufReader::new(&mut conn.reader);
@@ -3169,8 +3169,17 @@ mod goose_acp_real_turn {
         }
         conn.kill_child().await;
         let run = res.expect("drive_goose_io errored against real goose+minimax");
-        eprintln!("REAL TURN outcome={} content={:?} tools={}", run.outcome, run.content, run.tool_calls);
-        assert_ne!(run.outcome, "failed", "real goose+minimax turn failed outright");
-        assert_ne!(run.outcome, "timeout", "real goose+minimax turn TIMED OUT (possible prompt-write-before-read deadlock!)");
+        eprintln!(
+            "REAL TURN outcome={} content={:?} tools={}",
+            run.outcome, run.content, run.tool_calls
+        );
+        assert_ne!(
+            run.outcome, "failed",
+            "real goose+minimax turn failed outright"
+        );
+        assert_ne!(
+            run.outcome, "timeout",
+            "real goose+minimax turn TIMED OUT (possible prompt-write-before-read deadlock!)"
+        );
     }
 }
