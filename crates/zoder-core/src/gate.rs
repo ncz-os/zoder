@@ -344,6 +344,79 @@ fn vec_strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// Gate execution mode. Strict is the default, fail-closed posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// Fail-closed: a missing REQUIRED tool is a failure (Red), not a silent skip.
+    Strict,
+    /// Fast inner-loop: a missing tool (required or not) is a recorded Skip.
+    LocalIterate,
+}
+
+/// Result of executing one step's command (side-effecting execution lives behind
+/// the `GateEnv` trait so the runner core stays pure and unit-testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepExec {
+    Passed,
+    Failed,
+}
+
+/// The environment the runner needs, injected so tests can fake it (the real
+/// impl — shelling out, checking `PATH` — lives in a later slice).
+pub trait GateEnv {
+    /// Is the step's `tool` available on this machine?
+    fn tool_available(&self, tool: &str) -> bool;
+    /// Run the step's command; report pass/fail.
+    fn run_step(&self, step: &GateStep) -> StepExec;
+}
+
+/// Run a plan and produce per-step results plus the aggregated status.
+///
+/// Rules, per step:
+///  - tool NOT available:
+///      * Strict + step.required  => StepOutcome::Failed  (fail-closed; -> Red)
+///      * Strict + !step.required => StepOutcome::Skipped { reason }  (advisory)
+///      * LocalIterate (either)   => StepOutcome::Skipped { reason }
+///        where `reason` = format!("tool `{}` not available", step.tool).
+///  - tool available: run it; StepExec::Passed => Passed, StepExec::Failed => Failed.
+///
+/// Then call the existing `aggregate(&results)` for the GateStatus. Returns
+/// `(results, status)` with results in plan order. Pure, `unwrap`-free.
+pub fn run_plan(
+    plan: &[GateStep],
+    mode: GateMode,
+    env: &dyn GateEnv,
+) -> (Vec<StepResult>, GateStatus) {
+    let mut results: Vec<StepResult> = Vec::with_capacity(plan.len());
+
+    for step in plan {
+        let outcome = if env.tool_available(&step.tool) {
+            // Tool present: actually run it.
+            match env.run_step(step) {
+                StepExec::Passed => StepOutcome::Passed,
+                StepExec::Failed => StepOutcome::Failed,
+            }
+        } else {
+            // Tool missing: route by mode + required.
+            let reason = format!("tool `{}` not available", step.tool);
+            match (mode, step.required) {
+                (GateMode::Strict, true) => StepOutcome::Failed, // fail-closed
+                (GateMode::Strict, false) => StepOutcome::Skipped { reason },
+                (GateMode::LocalIterate, _) => StepOutcome::Skipped { reason },
+            }
+        };
+
+        results.push(StepResult {
+            step_name: step.name.clone(),
+            required: step.required,
+            outcome,
+        });
+    }
+
+    let status = aggregate(&results);
+    (results, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +718,220 @@ mod tests {
                 failures: vec!["a".to_string(), "c".to_string()],
             },
         );
+    }
+
+    // ----- run_plan (runner core) -----------------------------------------
+
+    use std::collections::{BTreeSet, HashMap};
+
+    /// Test double for `GateEnv`:
+    ///  - `tools`: the set of binaries that are considered available on PATH.
+    ///  - `failures`: step names whose `run_step` should return `Failed`.
+    ///    Everything else passes; tools not in `tools` are "missing".
+    struct FakeEnv {
+        tools: BTreeSet<String>,
+        failures: HashMap<String, StepExec>,
+    }
+
+    impl FakeEnv {
+        fn new(tools: &[&str]) -> Self {
+            Self {
+                tools: tools.iter().map(|t| (*t).to_string()).collect(),
+                failures: HashMap::new(),
+            }
+        }
+
+        fn failing(mut self, name: &str) -> Self {
+            self.failures.insert(name.to_string(), StepExec::Failed);
+            self
+        }
+    }
+
+    impl GateEnv for FakeEnv {
+        fn tool_available(&self, tool: &str) -> bool {
+            self.tools.contains(tool)
+        }
+
+        fn run_step(&self, step: &GateStep) -> StepExec {
+            // Default to Passed; only names explicitly listed fail.
+            self.failures
+                .get(&step.name)
+                .copied()
+                .unwrap_or(StepExec::Passed)
+        }
+    }
+
+    /// Small helper: build a single step with the given name + required flag.
+    fn s(name: &str, required: bool) -> GateStep {
+        GateStep {
+            name: name.to_string(),
+            category: StepCategory::Lint,
+            command: vec!["true".to_string()],
+            tool: name.to_string(), // tool name == step name keeps FakeEnv tidy
+            required,
+        }
+    }
+
+    #[test]
+    fn run_plan_all_tools_present_all_pass_is_green() {
+        let plan = vec![s("fmt", true), s("lint", false), s("test", true)];
+        let env = FakeEnv::new(&["fmt", "lint", "test"]);
+
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+
+        assert_eq!(status, GateStatus::Green);
+        // Every step Passed.
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.outcome, StepOutcome::Passed)));
+    }
+
+    #[test]
+    fn run_plan_strict_required_missing_tool_fails_closed_red() {
+        // `deny` is required and its tool is NOT available; under Strict this
+        // must turn into a Failed (not Skipped) -> Red naming the step.
+        let plan = vec![s("fmt", true), s("deny", true)];
+        let env = FakeEnv::new(&["fmt"]); // "deny" missing
+
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Red {
+                failures: vec!["deny".to_string()],
+            },
+        );
+        let deny = results
+            .iter()
+            .find(|r| r.step_name == "deny")
+            .expect("deny result");
+        assert_eq!(
+            deny.outcome,
+            StepOutcome::Failed,
+            "Strict + required + missing tool must be Failed (fail-closed)",
+        );
+    }
+
+    #[test]
+    fn run_plan_local_iterate_required_missing_tool_is_skipped_yellow() {
+        // Same setup as above but in LocalIterate mode: missing REQUIRED tool
+        // becomes Skipped (not Failed) -> Yellow naming the step.
+        let plan = vec![s("fmt", true), s("deny", true)];
+        let env = FakeEnv::new(&["fmt"]); // "deny" missing
+
+        let (results, status) = run_plan(&plan, GateMode::LocalIterate, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Yellow {
+                skipped: vec!["deny".to_string()],
+            },
+        );
+        let deny = results
+            .iter()
+            .find(|r| r.step_name == "deny")
+            .expect("deny result");
+        match &deny.outcome {
+            StepOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("deny"),
+                    "reason should mention tool: {reason}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_plan_strict_optional_missing_tool_is_skipped_yellow_not_red() {
+        // `audit` is optional; missing tool under Strict => Skipped (advisory),
+        // not Failed. Gate must be Yellow (not Red).
+        let plan = vec![s("fmt", true), s("audit", false)];
+        let env = FakeEnv::new(&["fmt"]); // "audit" missing
+
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Yellow {
+                skipped: vec!["audit".to_string()],
+            },
+        );
+        let audit = results
+            .iter()
+            .find(|r| r.step_name == "audit")
+            .expect("audit result");
+        assert!(
+            matches!(audit.outcome, StepOutcome::Skipped { .. }),
+            "Strict + optional + missing tool must be Skipped, got {:?}",
+            audit.outcome,
+        );
+    }
+
+    #[test]
+    fn run_plan_tool_present_required_command_failure_is_red() {
+        // Tool IS available, but the command itself fails on a REQUIRED step.
+        // This must produce a Red verdict (independent of mode).
+        let plan = vec![s("fmt", true), s("test", true)];
+        let env = FakeEnv::new(&["fmt", "test"]).failing("test");
+
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Red {
+                failures: vec!["test".to_string()],
+            },
+        );
+        let test = results
+            .iter()
+            .find(|r| r.step_name == "test")
+            .expect("test result");
+        assert_eq!(test.outcome, StepOutcome::Failed);
+    }
+
+    #[test]
+    fn run_plan_skipped_reason_contains_tool_name() {
+        // The reason text on a Skipped step must mention the tool that was
+        // missing — that's what shows up in user-facing diagnostics.
+        // Use an OPTIONAL step under Strict, so the missing tool legitimately
+        // routes to Skipped (rather than the fail-closed Failed branch).
+        let plan = vec![s("cargo-audit", false)];
+        let env = FakeEnv::new(&[]); // nothing available
+
+        let (results, _status) = run_plan(&plan, GateMode::Strict, &env);
+        let only = &results[0];
+        match &only.outcome {
+            StepOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("cargo-audit"),
+                    "reason must mention the missing tool name: {reason}",
+                );
+                assert!(
+                    reason.contains("not available"),
+                    "reason should describe the condition: {reason}",
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_plan_results_are_returned_in_plan_order() {
+        // The order of `results` must mirror the order of `plan`, regardless
+        // of which steps pass, fail, or skip.
+        let plan = vec![
+            s("alpha", true),
+            s("bravo", false),
+            s("charlie", true),
+            s("delta", false),
+        ];
+        // "bravo" and "delta" missing -> both skip; "charlie" runs and fails.
+        let env = FakeEnv::new(&["alpha", "charlie"]).failing("charlie");
+
+        let (results, _status) = run_plan(&plan, GateMode::Strict, &env);
+
+        let names: Vec<&str> = results.iter().map(|r| r.step_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie", "delta"]);
     }
 }
