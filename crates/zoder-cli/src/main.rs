@@ -1326,12 +1326,22 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // A paid/metered serving provider (e.g. an org overlay's default route)
     // requires confirmation even when the model id is classified free. Checked
     // against the provider that actually serves the primary, not the default.
+    // A Subscription-or-Free serving provider is $0-marginal — the call is
+    // cost-neutral even if the corpus has the model non-free, so we let it
+    // through (paid must still confirm).
     let provider_paid = eng
         .cfg
         .provider_for_model(&primary)
-        .map(|p| p.paid || p.billing != BillingMode::Free)
+        .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
-    if let Decision::NeedConfirm(msg) = gate.check(&primary_entry, provider_paid) {
+    let provider_cost_neutral = eng
+        .cfg
+        .provider_for_model(&primary)
+        .map(|p| !p.paid && p.billing != BillingMode::Metered)
+        .unwrap_or(false);
+    if let Decision::NeedConfirm(msg) =
+        gate.check(&primary_entry, provider_paid, provider_cost_neutral)
+    {
         if !confirm_paid(&msg)? {
             anyhow::bail!("paid model use declined");
         }
@@ -1414,11 +1424,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // confirmed before the loop. A fallback that would need paid
         // confirmation is skipped fail-closed (never silently spend mid-chain);
         // `--allow-paid` makes the gate return Allow, so it still runs then.
+        // Cost-neutral fallback providers (Free or Subscription) are $0-marginal
+        // and so do not require confirmation either.
         if i > 0 {
             let link_provider_paid = eng
                 .cfg
                 .provider(&pid)
-                .map(|p| p.paid || p.billing != BillingMode::Free)
+                .map(|p| p.paid || p.billing == BillingMode::Metered)
+                .unwrap_or(false);
+            let link_provider_cost_neutral = eng
+                .cfg
+                .provider(&pid)
+                .map(|p| !p.paid && p.billing != BillingMode::Metered)
                 .unwrap_or(false);
             let link_entry = eng
                 .corpus
@@ -1429,7 +1446,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                     gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
                     ..Default::default()
                 });
-            if let Decision::NeedConfirm(_) = gate.check(&link_entry, link_provider_paid) {
+            if let Decision::NeedConfirm(_) =
+                gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
+            {
                 if !cli.quiet {
                     eprintln!(
                         "[zoder] skipping paid fallback {model_id} via {pid} (pass --allow-paid to use it)"
@@ -1773,12 +1792,22 @@ pub(crate) async fn agentic_turn(
     // A paid/metered serving provider (e.g. an org overlay's default route)
     // requires confirmation even when the model id is classified free. Checked
     // against the provider that actually serves the primary, not the default.
+    // A Subscription-or-Free serving provider is $0-marginal — the call is
+    // cost-neutral even if the corpus has the model non-free, so we let it
+    // through (paid must still confirm).
     let provider_paid = eng
         .cfg
         .provider_for_model(&primary)
-        .map(|p| p.paid || p.billing != BillingMode::Free)
+        .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
-    if let Decision::NeedConfirm(msg) = gate.check(&primary_entry, provider_paid) {
+    let provider_cost_neutral = eng
+        .cfg
+        .provider_for_model(&primary)
+        .map(|p| !p.paid && p.billing != BillingMode::Metered)
+        .unwrap_or(false);
+    if let Decision::NeedConfirm(msg) =
+        gate.check(&primary_entry, provider_paid, provider_cost_neutral)
+    {
         if !confirm_paid(&msg)? {
             anyhow::bail!("paid model use declined");
         }

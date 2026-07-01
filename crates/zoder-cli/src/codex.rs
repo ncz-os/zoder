@@ -83,8 +83,11 @@ async fn complete_once(
             gated_reason: Some("unknown reviewer model: not in corpus, cannot verify free".into()),
             ..Default::default()
         });
-    let provider_paid = provider_cfg.paid || provider_cfg.billing != BillingMode::Free;
-    if let Decision::NeedConfirm(why) = gate.check(&model_entry, provider_paid) {
+    let provider_paid = provider_cfg.paid || provider_cfg.billing == BillingMode::Metered;
+    let provider_cost_neutral = !provider_cfg.paid && provider_cfg.billing != BillingMode::Metered;
+    if let Decision::NeedConfirm(why) =
+        gate.check(&model_entry, provider_paid, provider_cost_neutral)
+    {
         anyhow::bail!(
             "reviewer/panel model '{model}' requires paid spend; pass --allow-paid to use it.\n{why}"
         );
