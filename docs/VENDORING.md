@@ -103,6 +103,31 @@ Then add a row to the feature inventory above. Keep the delta a **single commit*
   build cache) — handy for CI and local iteration.
 - Heavy zeroclaw builds run **off the dev Mac** (e.g. ULTRA) per fleet policy.
 
+## Vendoring goose (the second engine)
+
+goose is vendored **differently** from zeroclaw: there is **no source delta at
+all**. We consume Block/LF goose as an upstream binary built from a pinned ref
+with a chosen feature set — pure *feature selection*, no `zoder-integration`-style
+commit.
+
+- `scripts/package.sh` clones `GOOSE_REPO@GOOSE_REF` (pinned tag, default
+  `v1.39.0`) into `.goose-src` (gitignored) and builds **core only**:
+  `cargo build -p goose-cli --bin goose --no-default-features --features "$GOOSE_FEATURES"`
+  (`GOOSE_FEATURES` default `rustls-tls`) with `strip`/`thin-lto`/`opt-level=z` via
+  `--config` — **242 MB → 65 MB**, ~8m → ~3m. `GOOSE_SRC_DIR=<path>` reuses a
+  checkout; `ZODER_SKIP_GOOSE=1` omits goose entirely (lean zeroclaw-only bundle).
+- **Why core, and how to get the full build:** see
+  [Goose is bundled *core*](../README.md#engines-zeroclaw--goose-dual-engine) in
+  the README. Short version: zoder drives goose only as a remote-API `goose acp`
+  agent, so `local-inference`/`aws-providers`/`nostr`/`tui`/`update`/`otel`/
+  `system-keyring` are dead weight. A heavier goose is a **PATH drop-in** (zoder
+  spawns whatever `goose` is on `PATH`); no zoder change needed.
+- **The gate:** `crates/acp-client`'s real-goose integration test does a live
+  handshake + turn against the built binary. Bump `GOOSE_REF` or widen
+  `GOOSE_FEATURES` **only** when that test stays green — it's the contract check
+  that the chosen build still drives a real turn. Verified for `v1.39.0` core:
+  goose's own suite is 1423/1423 lib tests green on the lean features.
+
 ## Rules
 
 - **No upstream PRs.** The delta lives on the fork's `zoder-integration` only.
