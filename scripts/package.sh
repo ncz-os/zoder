@@ -51,6 +51,13 @@ GOOSE_REPO="${GOOSE_REPO:-https://github.com/aaif-goose/goose.git}"
 GOOSE_REF="${GOOSE_REF:-v1.39.0}"
 GOOSE_SRC_DIR="${GOOSE_SRC_DIR:-}"
 GOOSE_BIN_PKG="${GOOSE_BIN_PKG:-goose-cli}"  # owns the `goose` CLI bin (has `goose acp`)
+# LEAN by default: --no-default-features drops goose's local-inference ML runtime
+# (candle/llama), aws-providers, nostr, tui, update(sigstore), otel, telemetry,
+# system-keyring — none of which a remote-API `goose acp` agent uses. Keeping only
+# rustls-tls takes the arm64 bin 242MB -> ~65MB and cuts build time ~60%%. The
+# acp-client real-goose integration test (real MiniMax turn) is the gate that this
+# feature set still drives a live turn; re-verify before widening GOOSE_FEATURES.
+GOOSE_FEATURES="${GOOSE_FEATURES:-rustls-tls}"
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/{print $2}')"
 DIST="dist"
 mkdir -p "$DIST"
@@ -158,7 +165,12 @@ package_target() {
     else
       local gsrc; gsrc="$(ensure_goose)"
       echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF"
-      ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose ${tflag[@]+"${tflag[@]}"} )
+      ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose \
+          --no-default-features --features "$GOOSE_FEATURES" \
+          --config 'profile.release.strip="symbols"' \
+          --config 'profile.release.lto="thin"' \
+          --config 'profile.release.opt-level="z"' \
+          ${tflag[@]+"${tflag[@]}"} )
       cp "$gsrc/$reldir/goose" "$stage/goose"
     fi
   fi
