@@ -358,6 +358,45 @@ are cached, so nothing goes stale in the binary.
 
 ---
 
+## The CI-parity gate — compliance-first
+
+zoder runs a **full, fail-closed CI simulation** on **both** authoring and code
+review. Before a change converges in the `zoder loop` — and before an adversarial
+reviewer can approve it — it must pass the *same* checks the upstream project's CI
+will run, **plus** a baseline of universal open-source hygiene. A change that
+passes zoder's gate shouldn't surprise GitHub / GitLab / Codeberg CI, and should
+already meet the community's norms.
+
+This is deliberate, and it costs authoring speed. The trade is worth it:
+
+- **It's a differentiator.** General-purpose coding agents (Codex, Cursor, …) don't
+  simulate the target repo's full CI before proposing a change. zoder does — so
+  *"it passed my gate"* is an honest, load-bearing claim.
+- **It de-slops the work.** Red CI, a failing license/audit gate, unformatted code,
+  a missing sign-off — those are the fingerprints of careless automation that make
+  maintainers distrust AI contributions. Arriving already green + compliant removes
+  the tells, which is the direct antidote to that friction.
+- **It respects the community.** Good citizenship on GitHub / GitLab / Codeberg
+  means running *their* declared CI and hygiene, not a tool's own "good enough."
+
+The gate = the repo's **own CI** (GitHub Actions / `.gitlab-ci.yml` / Woodpecker,
+so local == upstream) **∪** a **multi-language baseline** (Rust, Node/TS, Python,
+Go, … — format, lint, build, test, supply-chain/security audit, license/SPDX,
+secret scan, conventional-commits + DCO, SBOM on release).
+
+It degrades **honestly** — 🟢 Green (all required ran + passed), 🟡 Yellow (passed
+what could run; skips are reported *with the risk they leave unverified*), 🔴 Red (a
+required check failed). Jobs that genuinely can't run locally (cloud secrets, GPU,
+self-hosted runners) are never silently passed — the claim is *"CI parity within
+local compute/network scope,"* never false total parity. Default mode is `strict`
+(fail-closed; a missing required tool is a hard error, not a silent skip); a fast
+`local-iterate` mode logs every skip and is disabled before push.
+
+**Design of record + roadmap:** [`docs/CI-PARITY-GATE.md`](docs/CI-PARITY-GATE.md).
+Slice 1 (the gate-planning core: ecosystem detection, step model, Green/Yellow/Red
+aggregation, baseline plans) has landed; the CI-file derivation, runner, and
+loop/review wiring are in progress.
+
 ## Example: `zoder report`
 
 An example `zoder report` — a **blended organization view**, enumerated **by
