@@ -4,6 +4,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod consultant;
 pub mod corpus;
 pub mod engine_cost;
 pub use acp_client as engine_rpc;
