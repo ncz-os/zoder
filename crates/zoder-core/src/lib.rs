@@ -23,6 +23,10 @@ pub mod router;
 pub mod session;
 pub mod update;
 
+pub use acp_client::{
+    new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket, AgentEvent,
+    AgentOptions, AgentRun, ApprovalPolicy, EngineKind, DEFAULT_AUTO_APPROVE,
+};
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use config::{
     Auth, BillingMode, Config, Provider, QuotaUnit, QuotaWindow, SubscriptionPlan, Theme,
@@ -32,18 +36,14 @@ pub use engine_cost::{
     fetch_engine_cost, AgentStats as EngineAgentStats, CostSummary as EngineCostSummary,
     ModelStats as EngineModelStats,
 };
-pub use acp_client::{
-    new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket, AgentEvent,
-    AgentOptions, AgentRun, ApprovalPolicy, EngineKind, DEFAULT_AUTO_APPROVE,
-};
 pub use enterprise_cost::{CostSnapshot, MonthCost, ScopeStat};
 pub use finops::{
     build_finops_report, cache_savings_by_model, cheapest_equivalent_advisor,
     cli_run as finops_cli, forecast_burn, realized_rate_by_model, spend_by_dimension, AdvisorRow,
     BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, FinOpsTags, ModelRealized, SpendGroup,
 };
-pub use model_health::{HealthStore, State};
 pub use ledger::{Entry, Ledger, Period, Rollup};
+pub use model_health::{HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{ModelPrice, PricingCatalog};
 pub use pricing_sync::{sync_catalog, Source as PricingSource, SyncStats};
