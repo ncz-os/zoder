@@ -231,6 +231,44 @@ tasks.
                  free-first provider pool (MiniMax subscription → NVIDIA EIH NIMs → …)
 ```
 
+### Goose is bundled *core*, not the kitchen sink
+
+zoder builds and ships goose in a **lean core** configuration —
+`cargo build -p goose-cli --bin goose --no-default-features --features rustls-tls`
+— and nothing else. That declines goose's default feature stack: `local-inference`
+(a full local-model runtime — candle + llama-cpp), `aws-providers` (Bedrock/
+SageMaker), `nostr`, goose's own `tui`, `update` (sigstore self-update),
+`otel`/`telemetry`, and `system-keyring`.
+
+**Why core:**
+
+- **zoder never invokes any of it.** It drives goose purely as a *remote-API ACP
+  agent over stdio*: model calls go to the free-first provider pool (not a local
+  GPU), keys come from zoder's config (not the OS keyring), and zoder governs
+  telemetry/updates itself. Those features are dead weight in this role.
+- **Footprint + build honesty.** Core takes the arm64 binary from **242 MB → 65 MB**
+  (−73%) and the from-source build from ~8m → ~3m. The whole zoder stack
+  (zoder ≈ 8 MB + zeroclaw ≈ 19 MB + zerocode ≈ 33 MB ≈ **60 MB**) is smaller than a
+  single default goose.
+- **Smaller surface.** Fewer dependencies and no bundled ML/crypto self-update path
+  — less to audit, faster reproducible builds.
+- **Still a faithful upstream build.** Core is *feature selection*, not a fork:
+  `GOOSE_REF` stays pinned and we patch nothing, so tracking Block/LF goose releases
+  stays cheap. (goose *core*'s own `default` feature set is already empty — `[]`; it
+  is goose-**cli** that stacks the heavy defaults, and those are what we decline.)
+
+**Want the full goose (local inference, code-mode, AWS, …)? Copy it in.** zoder
+spawns whatever `goose` is on `PATH` (`goose acp`), so a heavier build is a pure
+drop-in: build it yourself (`--features local-inference`, …) or install Block's
+official goose, put it ahead on `PATH`, and zoder drives it identically — no zoder
+change. To widen the *bundled* build instead, set `GOOSE_FEATURES` for
+`scripts/package.sh`, and re-run the `acp-client` real-goose integration test after
+widening (it is the gate that the feature set still drives a live turn).
+
+> Verified: goose core's own test suite passes on the lean feature set (1423/1423
+> library tests, ACP module included); the one feature-conditioned snapshot
+> (`code-mode`) passes once that feature is re-enabled.
+
 > The `docs/architecture.svg` asset predates the dual-engine work and still shows
 > a single engine; regenerate it to match the diagram above.
 
