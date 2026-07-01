@@ -280,6 +280,113 @@ pub fn baseline_plan(eco: Ecosystem) -> Vec<GateStep> {
     }
 }
 
+/// One job extracted from a repo's own CI config (GitHub Actions / GitLab CI /
+/// Woodpecker). A later slice parses YAML into these; this slice only classifies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiJob {
+    pub name: String,
+    pub command: Vec<String>, // argv
+    pub tool: String,
+    pub category: StepCategory,
+    /// References CI secrets (e.g. GitHub `${{ secrets.* }}`) — not runnable locally.
+    pub needs_secrets: bool,
+    /// Needs service containers / external services (Postgres, etc.).
+    pub needs_services: bool,
+    /// Targets a self-hosted or custom runner we can't reproduce locally.
+    pub self_hosted: bool,
+}
+
+/// Honest compatibility breakdown attached to every derived plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompatibilityReport {
+    /// CI job names that WILL run locally.
+    pub runnable: Vec<String>,
+    /// CI jobs that can't run locally, each with the reason + risk left unverified.
+    pub skipped: Vec<(String, String)>,
+    /// Baseline OSS-hygiene step names ADDED because the repo CI didn't cover them.
+    pub added_baseline: Vec<String>,
+}
+
+/// Derive the gate plan from a repo's CI jobs unioned with the baseline hygiene plan.
+/// Returns the runnable plan plus an honest compatibility report.
+///
+/// Rules:
+///  - A CiJob that `needs_secrets` OR `needs_services` OR `self_hosted` is NOT
+///    runnable locally: add it to `report.skipped` as `(name, reason)` and DO NOT
+///    include it as a GateStep. Reason strings, checked in this precedence
+///    (secrets > services > self_hosted):
+///   - needs_secrets  => "requires CI secrets (upstream CI verifies)"
+///   - needs_services => "requires service containers (upstream CI verifies)"
+///   - self_hosted    => "requires a self-hosted runner (upstream CI verifies)"
+///  - Otherwise the CiJob becomes a runnable required GateStep
+///    (name/category/command/tool from the job, `required = true`) and its name is
+///    added to `report.runnable`.
+///  - Then union with `baseline`: for each baseline step whose `category` is NOT
+///    already present among the runnable CI-derived steps, append it to the plan and
+///    record its name in `report.added_baseline`. (Baseline fills gaps; it never
+///    duplicates a category the repo CI already runs.)
+///  - Plan order: runnable CI-derived steps first (input order), then added baseline
+///    steps (baseline order). Report vectors follow the same input order.
+pub fn derive_plan(
+    ci_jobs: &[CiJob],
+    baseline: &[GateStep],
+) -> (Vec<GateStep>, CompatibilityReport) {
+    let mut plan: Vec<GateStep> = Vec::with_capacity(ci_jobs.len() + baseline.len());
+    let mut report = CompatibilityReport::default();
+
+    // Step 1: classify each CiJob in input order.
+    for job in ci_jobs {
+        if let Some(reason) = skip_reason(job) {
+            report.skipped.push((job.name.clone(), reason));
+            continue;
+        }
+        let step = GateStep {
+            name: job.name.clone(),
+            category: job.category,
+            command: job.command.clone(),
+            tool: job.tool.clone(),
+            required: true,
+        };
+        report.runnable.push(job.name.clone());
+        plan.push(step);
+    }
+
+    // Step 2: union baseline. Baseline fills categories the runnable CI steps
+    // don't already cover; it never duplicates a covered category.
+    //
+    // IMPORTANT: track categories present among the RUNNABLE CI-derived steps
+    // (not the CI input as a whole). A skipped CI job leaves its category
+    // uncovered locally — the baseline must fill it. This is the whole point
+    // of honest degradation.
+    let mut covered: Vec<StepCategory> = plan.iter().map(|s| s.category).collect();
+
+    for base in baseline {
+        if covered.contains(&base.category) {
+            continue;
+        }
+        covered.push(base.category);
+        report.added_baseline.push(base.name.clone());
+        plan.push(base.clone());
+    }
+
+    (plan, report)
+}
+
+/// Return the skip reason for a non-runnable job, honoring the precedence
+/// `secrets > services > self_hosted`. Returns `None` when the job is runnable.
+fn skip_reason(job: &CiJob) -> Option<String> {
+    if job.needs_secrets {
+        return Some("requires CI secrets (upstream CI verifies)".to_string());
+    }
+    if job.needs_services {
+        return Some("requires service containers (upstream CI verifies)".to_string());
+    }
+    if job.self_hosted {
+        return Some("requires a self-hosted runner (upstream CI verifies)".to_string());
+    }
+    None
+}
+
 /// Aggregate step results into the honest Green/Yellow/Red status:
 ///  - Red if ANY required step outcome is Failed (failures = names of the
 ///    required steps that Failed, in input order).
@@ -933,5 +1040,394 @@ mod tests {
 
         let names: Vec<&str> = results.iter().map(|r| r.step_name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie", "delta"]);
+    }
+
+    // ----- derive_plan (CI-derivation classifier) --------------------------
+
+    /// Build a CiJob with the runnable defaults (no secrets/services/self-hosted).
+    fn ci(name: &str, cat: StepCategory) -> CiJob {
+        CiJob {
+            name: name.to_string(),
+            command: vec!["tool".to_string(), "run".to_string()],
+            tool: "tool".to_string(),
+            category: cat,
+            needs_secrets: false,
+            needs_services: false,
+            self_hosted: false,
+        }
+    }
+
+    #[test]
+    fn derive_plan_plain_ci_job_becomes_runnable_step() {
+        let jobs = vec![ci("lint", StepCategory::Lint)];
+        let (plan, report) = derive_plan(&jobs, &[]);
+
+        // Step ends up in the plan with `required = true` and original fields.
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].name, "lint");
+        assert_eq!(plan[0].category, StepCategory::Lint);
+        assert_eq!(plan[0].command, vec!["tool", "run"]);
+        assert_eq!(plan[0].tool, "tool");
+        assert!(plan[0].required, "runnable CI jobs must be required");
+
+        // And the report names it as runnable.
+        assert_eq!(report.runnable, vec!["lint".to_string()]);
+        assert!(report.skipped.is_empty());
+        assert!(report.added_baseline.is_empty());
+    }
+
+    #[test]
+    fn derive_plan_needs_secrets_is_skipped_with_secrets_reason() {
+        let mut job = ci("deploy", StepCategory::Build);
+        job.needs_secrets = true;
+
+        let (plan, report) = derive_plan(&[job], &[]);
+
+        assert!(
+            plan.is_empty(),
+            "needs_secrets job must NOT be in the plan, got {plan:?}",
+        );
+        assert_eq!(
+            report.skipped,
+            vec![(
+                "deploy".to_string(),
+                "requires CI secrets (upstream CI verifies)".to_string(),
+            )],
+        );
+        assert!(report.runnable.is_empty());
+    }
+
+    #[test]
+    fn derive_plan_needs_services_and_self_hosted_each_get_their_own_reason() {
+        let mut services_job = ci("integration", StepCategory::Test);
+        services_job.needs_services = true;
+
+        let mut hosted_job = ci("android-arm64", StepCategory::Build);
+        hosted_job.self_hosted = true;
+
+        let (plan, report) = derive_plan(
+            &[services_job, hosted_job],
+            &[], // no baseline; keeps the test focused on skip classification
+        );
+
+        assert!(plan.is_empty(), "both jobs must be skipped, got {plan:?}");
+        assert_eq!(
+            report.skipped,
+            vec![
+                (
+                    "integration".to_string(),
+                    "requires service containers (upstream CI verifies)".to_string(),
+                ),
+                (
+                    "android-arm64".to_string(),
+                    "requires a self-hosted runner (upstream CI verifies)".to_string(),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn derive_plan_skip_reason_precedence_is_secrets_over_self_hosted() {
+        // Both flags set: secrets must win, per the documented precedence
+        // (secrets > services > self_hosted).
+        let mut job = ci("publish", StepCategory::Build);
+        job.needs_secrets = true;
+        job.self_hosted = true;
+
+        let (plan, report) = derive_plan(&[job], &[]);
+
+        assert!(plan.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, "publish");
+        assert_eq!(
+            report.skipped[0].1, "requires CI secrets (upstream CI verifies)",
+            "secrets reason must beat self_hosted reason",
+        );
+    }
+
+    #[test]
+    fn derive_plan_skip_reason_precedence_is_secrets_over_services() {
+        // Belt-and-suspenders: also check secrets > services explicitly.
+        let mut job = ci("release", StepCategory::Build);
+        job.needs_secrets = true;
+        job.needs_services = true;
+
+        let (_plan, report) = derive_plan(&[job], &[]);
+        assert_eq!(
+            report.skipped[0].1,
+            "requires CI secrets (upstream CI verifies)",
+        );
+    }
+
+    #[test]
+    fn derive_plan_skip_reason_precedence_is_services_over_self_hosted() {
+        // services > self_hosted (middle of the precedence chain).
+        let mut job = ci("e2e", StepCategory::Test);
+        job.needs_services = true;
+        job.self_hosted = true;
+
+        let (_plan, report) = derive_plan(&[job], &[]);
+        assert_eq!(
+            report.skipped[0].1,
+            "requires service containers (upstream CI verifies)",
+        );
+    }
+
+    #[test]
+    fn derive_plan_baseline_fills_security_gap_when_ci_does_not_cover_it() {
+        // CI covers Lint + Test, but no Security category. Baseline has a
+        // Format step and a Security step, neither of which is covered by
+        // the runnable CI steps — so both baseline steps get added.
+        let jobs = vec![
+            ci("lint", StepCategory::Lint),
+            ci("test", StepCategory::Test),
+        ];
+        let baseline = vec![
+            GateStep {
+                name: "fmt".to_string(),
+                category: StepCategory::Format,
+                command: vec!["fmt".to_string()],
+                tool: "fmt".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["cargo".to_string(), "deny".to_string()],
+                tool: "cargo-deny".to_string(),
+                required: true,
+            },
+        ];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        // `deny` (Security) must be appended because CI did not cover Security.
+        assert!(
+            plan.iter().any(|s| s.name == "deny"),
+            "Security baseline must be added to fill the gap, got {plan:?}",
+        );
+        // `fmt` (Format) is also not covered by CI, so it is added too.
+        // The point of this test is the Security gap; the Format step being
+        // added as well is the natural consequence of the union rule.
+        assert_eq!(
+            report.added_baseline,
+            vec!["fmt".to_string(), "deny".to_string()],
+        );
+    }
+
+    #[test]
+    fn derive_plan_baseline_does_not_duplicate_a_category_ci_already_covers() {
+        // CI already has a Security job, so the baseline Security step must
+        // be SKIPPED (no duplicate category in the plan, not in added_baseline).
+        let jobs = vec![ci("trivy", StepCategory::Security)];
+        let baseline = vec![
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["cargo".to_string(), "deny".to_string()],
+                tool: "cargo-deny".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "fmt".to_string(),
+                category: StepCategory::Format,
+                command: vec!["fmt".to_string()],
+                tool: "fmt".to_string(),
+                required: true,
+            },
+        ];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        // CI's Security step is the one in the plan.
+        assert!(plan.iter().any(|s| s.name == "trivy"));
+        // The baseline Security step ("deny") must NOT be added.
+        assert!(
+            !plan.iter().any(|s| s.name == "deny"),
+            "baseline Security step must not duplicate CI's Security, got {plan:?}",
+        );
+        // Only the Format baseline step is added.
+        assert_eq!(report.added_baseline, vec!["fmt".to_string()]);
+    }
+
+    #[test]
+    fn derive_plan_baseline_can_fill_a_gap_left_by_a_skipped_ci_job() {
+        // Honest degradation: a SKIPPED CI job leaves its category uncovered
+        // locally, so the baseline MUST fill that gap.
+        let mut skipped = ci("trivy", StepCategory::Security);
+        skipped.needs_services = true; // can't run locally
+        let jobs = vec![skipped];
+
+        let baseline = vec![GateStep {
+            name: "deny".to_string(),
+            category: StepCategory::Security,
+            command: vec!["cargo".to_string(), "deny".to_string()],
+            tool: "cargo-deny".to_string(),
+            required: true,
+        }];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        assert_eq!(
+            report.skipped,
+            vec![(
+                "trivy".to_string(),
+                "requires service containers (upstream CI verifies)".to_string(),
+            )],
+        );
+        // The baseline Security step fills the gap left by the skipped job.
+        assert_eq!(
+            report.added_baseline,
+            vec!["deny".to_string()],
+            "baseline must cover a category the runnable CI didn't run",
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].name, "deny");
+    }
+
+    #[test]
+    fn derive_plan_order_is_ci_first_then_baseline() {
+        // Runnable CI steps come first in input order; added baseline steps
+        // follow in baseline order. Report vectors mirror the plan.
+        let jobs = vec![
+            ci("ci-lint", StepCategory::Lint),
+            ci("ci-build", StepCategory::Build),
+        ];
+        // Baseline introduces new categories (Format, Security, Test) — none
+        // of which are covered by the CI steps above.
+        let baseline = vec![
+            GateStep {
+                name: "fmt".to_string(),
+                category: StepCategory::Format,
+                command: vec!["fmt".to_string()],
+                tool: "fmt".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["deny".to_string()],
+                tool: "deny".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "test".to_string(),
+                category: StepCategory::Test,
+                command: vec!["test".to_string()],
+                tool: "test".to_string(),
+                required: true,
+            },
+        ];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        assert_eq!(
+            plan.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["ci-lint", "ci-build", "fmt", "deny", "test"],
+            "plan order: runnable CI (input order) then added baseline (baseline order)",
+        );
+        assert_eq!(
+            report.runnable,
+            vec!["ci-lint".to_string(), "ci-build".to_string()],
+        );
+        assert_eq!(
+            report.added_baseline,
+            vec!["fmt".to_string(), "deny".to_string(), "test".to_string()],
+        );
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn derive_plan_empty_inputs_yield_empty_outputs() {
+        // No CI jobs, no baseline => nothing in the plan, all report vecs empty.
+        let (plan, report) = derive_plan(&[], &[]);
+        assert!(plan.is_empty());
+        assert!(report.runnable.is_empty());
+        assert!(report.skipped.is_empty());
+        assert!(report.added_baseline.is_empty());
+    }
+
+    #[test]
+    fn derive_plan_all_ci_jobs_skipped_baseline_still_fills_gaps() {
+        // Every CI job is skipped (e.g. repo's CI is fully service-dependent).
+        // The baseline plan must still produce a complete local plan and
+        // record every job in `skipped` for honest accounting.
+        let mut a = ci("integration", StepCategory::Test);
+        a.needs_services = true;
+        let mut b = ci("deploy", StepCategory::Build);
+        b.needs_secrets = true;
+        let jobs = vec![a, b];
+
+        let baseline = vec![
+            GateStep {
+                name: "fmt".to_string(),
+                category: StepCategory::Format,
+                command: vec!["fmt".to_string()],
+                tool: "fmt".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "lint".to_string(),
+                category: StepCategory::Lint,
+                command: vec!["lint".to_string()],
+                tool: "lint".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "build".to_string(),
+                category: StepCategory::Build,
+                command: vec!["build".to_string()],
+                tool: "build".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "test".to_string(),
+                category: StepCategory::Test,
+                command: vec!["test".to_string()],
+                tool: "test".to_string(),
+                required: true,
+            },
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["deny".to_string()],
+                tool: "deny".to_string(),
+                required: true,
+            },
+        ];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        // Nothing from CI made it into the plan.
+        assert!(plan
+            .iter()
+            .all(|s| baseline.iter().any(|b| b.name == s.name)));
+        // Every CI job is accounted for as skipped, in input order.
+        assert_eq!(
+            report.skipped,
+            vec![
+                (
+                    "integration".to_string(),
+                    "requires service containers (upstream CI verifies)".to_string(),
+                ),
+                (
+                    "deploy".to_string(),
+                    "requires CI secrets (upstream CI verifies)".to_string(),
+                ),
+            ],
+        );
+        // Baseline covers every category the CI didn't, so all baseline
+        // steps are added.
+        assert_eq!(
+            report.added_baseline,
+            vec![
+                "fmt".to_string(),
+                "lint".to_string(),
+                "build".to_string(),
+                "test".to_string(),
+                "deny".to_string(),
+            ],
+        );
+        assert!(report.runnable.is_empty());
     }
 }
