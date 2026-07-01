@@ -24,7 +24,7 @@ pub struct ConsultOptions {
 }
 
 /// One row in the consultant advisory. Sorted best-first by [`consult`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Advisory {
     /// 1-based rank, assigned after sorting.
     pub rank: usize,

@@ -161,6 +161,18 @@ enum Cmd {
     },
     /// Show the routing decision for a task without executing it.
     Route { prompt: Option<String> },
+    /// Rank models for a human to pick from: health (circuit-breaker) + coding
+    /// capability + SWE Elo — the same signals the router uses. Use `--json` for
+    /// machine output.
+    Consult {
+        /// Restrict to free/routable models (routable already implies free; this
+        /// is an explicit, visible filter).
+        #[arg(long)]
+        free_only: bool,
+        /// Show at most N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Spend report (local ledger) by period.
     Spend {
         /// day | week | month | year
@@ -554,6 +566,7 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
         Some(Cmd::Update { check }) => cmd_update(*check).await,
         Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()),
+        Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit),
         Some(Cmd::Spend {
             period,
             since,
@@ -1117,6 +1130,48 @@ fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
         }
         println!("{}", route.reason);
         println!("fallbacks: {}", route.fallbacks.join(", "));
+    }
+    Ok(())
+}
+
+/// Print the model-consultant advisory: models ranked by availability, then
+/// coding capability, then SWE Elo (the router's own signals), so a human can
+/// choose deliberately. Text table by default; `--json` emits the `Advisory`
+/// list verbatim.
+fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow::Result<()> {
+    let eng = Engine::load()?;
+    let health = HealthStore::load(&eng.cfg.health_path);
+    let rows = zoder_core::consultant::consult(
+        &eng.corpus,
+        &health,
+        &zoder_core::consultant::ConsultOptions { free_only, limit },
+    );
+    if cli.json {
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no routable models in the corpus (run `zoder refresh`)");
+        return Ok(());
+    }
+    println!(
+        "{:>3}  {:<44} {:<5} {:>7} {:>7}  family",
+        "#", "model", "state", "cap", "swe"
+    );
+    for a in &rows {
+        let state = if a.available { "up" } else { "OPEN" };
+        let cap = a
+            .code_capability
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".to_string());
+        let swe = a
+            .swe_elo
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:>3}  {:<44} {:<5} {:>7} {:>7}  {}",
+            a.rank, a.model_id, state, cap, swe, a.family
+        );
     }
     Ok(())
 }
