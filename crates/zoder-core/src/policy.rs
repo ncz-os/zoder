@@ -48,15 +48,16 @@ impl PolicyGate {
     /// `strict_free` should typically be `cfg.strict_free && !lenient_flag`.
     pub fn new(cfg: &Config, allow_paid: bool, strict_free: bool) -> Self {
         let mut free_hosts = cfg.free_api_hosts.clone();
-        // Operator-declared-free providers (billing = free, not paid) are
-        // trusted free backends: fold each one's base_url host into the
-        // free-host set. This is what lets a flat-rate subscription provider
-        // (e.g. MiniMax, declared billing="free") pass the strict free guard —
-        // its calls report no LiteLLM api_base header, so api_base falls back to
-        // the provider base_url, and the host is verified here. Without this an
-        // overlay could never extend the free-host set (it lives on config.json).
+        // Operator-declared-cost-neutral providers (Free OR Subscription
+        // billing, and not paid) are trusted $0-marginal backends: fold each
+        // one's base_url host into the free-host set. This is what lets a
+        // flat-rate subscription provider (e.g. MiniMax) pass the strict free
+        // guard — its calls report no LiteLLM api_base header, so api_base falls
+        // back to the provider base_url, and the host is verified here. Without
+        // this an overlay could never extend the free-host set (it lives on
+        // config.json).
         for p in &cfg.providers {
-            if !p.paid && p.billing == BillingMode::Free {
+            if !p.paid && p.billing != BillingMode::Metered {
                 if let Some(host) = host_of(&p.base_url) {
                     free_hosts.push(host);
                 }
@@ -74,7 +75,18 @@ impl PolicyGate {
     /// even when the model id is classified free, because an org overlay can
     /// make a paid gateway the default route for a "free"-looking model — the
     /// spend would otherwise only be discovered after the call.
-    pub fn check(&self, model: &ModelEntry, provider_paid: bool) -> Decision {
+    ///
+    /// `provider_cost_neutral` is true when the SERVING provider is declared
+    /// Free or Subscription (and not `paid`). A cost-neutral provider means
+    /// the marginal cost of the call is $0 even if the model id isn't
+    /// classified free in the corpus, so the gate must Allow — otherwise a
+    /// subscription provider would be wrongly gated as paid.
+    pub fn check(
+        &self,
+        model: &ModelEntry,
+        provider_paid: bool,
+        provider_cost_neutral: bool,
+    ) -> Decision {
         if self.allow_paid {
             return Decision::Allow;
         }
@@ -84,7 +96,7 @@ impl PolicyGate {
                 model.id
             ));
         }
-        if model.free {
+        if model.free || provider_cost_neutral {
             Decision::Allow
         } else {
             let why = model
@@ -166,18 +178,63 @@ mod tests {
     fn paid_provider_blocks_even_a_free_model() {
         // free model id, but routed to a paid/metered provider -> confirm.
         assert!(matches!(
-            gate(false, true).check(&free_model(), true),
+            gate(false, true).check(&free_model(), true, false),
             Decision::NeedConfirm(_)
         ));
         // free model + free provider -> allow.
         assert!(matches!(
-            gate(false, true).check(&free_model(), false),
+            gate(false, true).check(&free_model(), false, false),
             Decision::Allow
         ));
         // --allow-paid overrides.
         assert!(matches!(
-            gate(true, true).check(&free_model(), true),
+            gate(true, true).check(&free_model(), true, false),
             Decision::Allow
+        ));
+    }
+
+    fn non_free_model() -> ModelEntry {
+        ModelEntry {
+            id: "gated-m".into(),
+            free: false,
+            gated_reason: Some("not in free corpus".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cost_neutral_provider_allows_non_free_model() {
+        // (a) provider_cost_neutral = true + a NON-free model -> Allow.
+        // The serving provider is $0-marginal (Free or Subscription), so the
+        // gate must not require confirmation even though the corpus has the
+        // model marked non-free (e.g. a subscription provider serves a model
+        // the free corpus does not classify).
+        assert!(matches!(
+            gate(false, true).check(&non_free_model(), false, true),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn paid_provider_dominates_even_if_cost_neutral() {
+        // (b) provider_paid = true still NeedConfirm even if
+        // provider_cost_neutral is true. paid dominates — a gateway that
+        // is explicitly paid never gets bypassed by a coincidental
+        // cost-neutral flag.
+        assert!(matches!(
+            gate(false, true).check(&non_free_model(), true, true),
+            Decision::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn non_free_model_with_no_provider_signal_still_needs_confirm() {
+        // (c) non-free model + both flags false -> NeedConfirm (the
+        // historical behavior: unknown model on an unverified provider
+        // stays gated).
+        assert!(matches!(
+            gate(false, true).check(&non_free_model(), false, false),
+            Decision::NeedConfirm(_)
         ));
     }
 

@@ -25,20 +25,20 @@ fn paid_model() -> ModelEntry {
 #[test]
 fn paid_needs_confirmation_free_allows() {
     let g = PolicyGate::new(&cfg(), false, true);
-    assert_eq!(g.check(&free_model(), false), Decision::Allow);
+    assert_eq!(g.check(&free_model(), false, false), Decision::Allow);
     assert!(matches!(
-        g.check(&paid_model(), false),
+        g.check(&paid_model(), false, false),
         Decision::NeedConfirm(_)
     ));
     // A free model routed to a PAID provider also needs confirmation.
     assert!(matches!(
-        g.check(&free_model(), true),
+        g.check(&free_model(), true, false),
         Decision::NeedConfirm(_)
     ));
 
     // --allow-paid turns paid into Allow.
     let g2 = PolicyGate::new(&cfg(), true, true);
-    assert_eq!(g2.check(&paid_model(), false), Decision::Allow);
+    assert_eq!(g2.check(&paid_model(), false, false), Decision::Allow);
 }
 
 #[test]
