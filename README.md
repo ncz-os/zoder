@@ -296,6 +296,38 @@ surfaces cost at the point of decision: a free-vs-paid model picker, per-turn an
 session cost, and a live savings readout (one color for $0 work, another for real
 paid spend).
 
+**zerocode → zodercode — where the TUI is going (roadmap).** `zerocode` today is a
+**single-engine** (ZeroClaw) TUI with **no model selection** — and that is *by
+design*: choosing the model is the CLI's job (`zoder` auto-routes free-first). The
+dual-engine work opens a gap zerocode was never meant to fill — a terminal user
+who wants to **pick the engine and the model directly**, and to see *why* one over
+another. That is **zodercode**, zoder's own dual-engine TUI:
+
+- **It consumes zerocode; it does not fork it.** zodercode reuses zerocode's ACP
+  chat core (the same client / chat / render layer) and gates the ZeroClaw-specific
+  config panes behind `engine == zeroclaw`. Same posture as `zoder`-the-CLI over
+  zeroclaw: *wrap and extend, don't re-implement.*
+- **Direct engine + direct model choice.** An engine toggle (`zeroclaw` ⇄ `goose`)
+  and an explicit model picker — the deliberate counterpart to the CLI's automatic
+  routing. The CLI stays the "just do the cheap right thing" path; zodercode is the
+  "I know exactly what I want" path.
+- **A model-consultant pane** — the thing neither zerocode nor any upstream agent
+  TUI has: a live view of the corpus zoder already maintains — per-model **health**
+  (circuit-breaker state + measured latency) and **SWE-bench / LMArena** rankings —
+  so a human chooses with the *same signals the router uses*.
+
+Positioning, stated plainly:
+
+| | role | status |
+|---|---|---|
+| `zoder` (CLI) | automatic, free-first, headless / fleet dispatch | **ships today** |
+| `zerocode` (TUI) | single-engine interactive pair-coding UX | **ships today** |
+| `zodercode` (TUI) | dual-engine · direct model choice · model-consultant pane | **roadmap** (skeleton not yet built) |
+
+zodercode **supersedes zerocode as zoder's branded TUI by *containing* it** — the
+same way `zoder`-the-CLI contains the zeroclaw engine. Until zodercode lands,
+`zerocode` is the shipping TUI and nothing here is vaporware-by-omission.
+
 **zoder — the governance + dispatch layer.** The cost- and quality-governance
 brain. It provides the classified model **corpus**, the **free-first router**
 with cross-family fallback, the **default-deny-paid policy gate** with its
