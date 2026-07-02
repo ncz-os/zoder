@@ -1,0 +1,372 @@
+{
+  "id": "ncz-os:agent-descriptor:zoder:v1",
+  "name": "zoder / zeroclaw",
+  "agent_id": "ncz-os/zoder",
+  "version": "0.2.1",
+  "schema_version": 1,
+  "conformance_level": 2,
+  "connection": {
+    "transport": "unix_socket",
+    "endpoint": {
+      "kind": "path",
+      "path": "$ZODER_HOME/run/zoder.sock"
+    },
+    "auth": null
+  },
+  "config_surface": {
+    "source": "toml",
+    "default_path": "$ZODER_HOME/config.toml",
+    "schema": {
+      "$defs": {
+        "auth": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "none"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "env"
+                },
+                "var": {
+                  "$ref": "#/$defs/env_var"
+                }
+              },
+              "required": [
+                "type",
+                "var"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "token": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "bearer"
+                }
+              },
+              "required": [
+                "type",
+                "token"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "header": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "api_key_header"
+                },
+                "var": {
+                  "$ref": "#/$defs/env_var"
+                }
+              },
+              "required": [
+                "type",
+                "header",
+                "var"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "billing": {
+          "enum": [
+            "free",
+            "metered",
+            "subscription"
+          ],
+          "type": "string"
+        },
+        "budget": {
+          "additionalProperties": false,
+          "properties": {
+            "daily_usd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "monthly_usd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "per_request_usd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "env_var": {
+          "pattern": "^[A-Z_][A-Z0-9_]*$",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "additionalProperties": false,
+          "properties": {
+            "auth": {
+              "$ref": "#/$defs/auth"
+            },
+            "base_url": {
+              "format": "uri",
+              "type": "string"
+            },
+            "billing": {
+              "$ref": "#/$defs/billing"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "paid": {
+              "type": "boolean"
+            },
+            "serves": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "subscription": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "base_url",
+            "kind",
+            "auth",
+            "billing",
+            "serves"
+          ],
+          "type": "object"
+        },
+        "theme": {
+          "properties": {
+            "accent": {
+              "type": "string"
+            },
+            "dim": {
+              "type": "string"
+            },
+            "header": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "string"
+            },
+            "violation": {
+              "type": "string"
+            },
+            "warn": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "header",
+            "accent",
+            "ok",
+            "warn",
+            "violation",
+            "dim"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "https://ncz-os.dev/schemas/zoder-core/config.v1.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "User-facing shape of `zoder_core::config::Config`. Drift-tested against the crate's actual serde tags.",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "corpus_path": {
+          "$ref": "#/$defs/path"
+        },
+        "default_provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "free_api_hosts": {
+          "items": {
+            "format": "hostname",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "health_path": {
+          "$ref": "#/$defs/path"
+        },
+        "ledger_path": {
+          "$ref": "#/$defs/path"
+        },
+        "primary_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providers": {
+          "items": {
+            "$ref": "#/$defs/provider"
+          },
+          "type": "array"
+        },
+        "strict_free": {
+          "type": "boolean"
+        },
+        "theme": {
+          "$ref": "#/$defs/theme"
+        },
+        "vendor_provenance": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "providers",
+        "default_provider",
+        "corpus_path",
+        "ledger_path",
+        "health_path"
+      ],
+      "title": "zoder-core Config (v1)",
+      "type": "object"
+    },
+    "knobs": [
+      {
+        "name": "providers",
+        "kind": "array",
+        "required": true,
+        "secret": false,
+        "description": "Provider entries (kind + base_url + auth + free/paid tagging). See each item's `auth` for env-var names referenced as secrets."
+      },
+      {
+        "name": "default_provider",
+        "kind": "string",
+        "required": true,
+        "secret": false,
+        "description": "Provider id used when no override is given. Must match an id in `providers`."
+      },
+      {
+        "name": "corpus_path",
+        "kind": "path",
+        "required": true,
+        "secret": false,
+        "description": "On-disk path to the public-corpus catalog used for capability ranking."
+      },
+      {
+        "name": "ledger_path",
+        "kind": "path",
+        "required": true,
+        "secret": false,
+        "description": "On-disk path to the local spend ledger."
+      },
+      {
+        "name": "health_path",
+        "kind": "path",
+        "required": true,
+        "secret": false,
+        "description": "On-disk path to the live model-health store."
+      },
+      {
+        "name": "free_api_hosts",
+        "kind": "array",
+        "required": false,
+        "default": [
+          "example.com",
+          "free.example.com"
+        ],
+        "secret": false,
+        "description": "Hosts considered free/internal for the anti-paid-fallback guard. Matched by exact host or registrable suffix (never substring)."
+      },
+      {
+        "name": "strict_free",
+        "kind": "boolean",
+        "required": false,
+        "default": true,
+        "secret": false,
+        "description": "Fail closed: a 'free' call with no cost/api_base/fallback telemetry is treated as a policy violation. `--lenient-telemetry` relaxes this."
+      },
+      {
+        "name": "vendor_provenance",
+        "kind": "object",
+        "required": false,
+        "default": {},
+        "secret": false,
+        "description": "Vendor provenance for each provider id (populated from TOML overlays). Providers from `config.json` or the default free-tier config are absent from this map."
+      },
+      {
+        "name": "theme",
+        "kind": "object",
+        "required": false,
+        "secret": false,
+        "description": "Active report colour theme. Falls back to the built-in blue/white palette when no overlay supplies one."
+      },
+      {
+        "name": "primary_model",
+        "kind": "string",
+        "required": false,
+        "secret": false,
+        "description": "Pinned routing primary: a model id the router always tries FIRST, ahead of the capability/health-ranked free pool."
+      },
+      {
+        "name": "budget",
+        "kind": "object",
+        "required": false,
+        "secret": false,
+        "description": "Pre-call spend caps. A paid call whose *estimated* cost would breach a cap is gated behind the same confirmation as a paid model. Empty by default (no caps)."
+      },
+      {
+        "name": "providers_item_auth_var",
+        "kind": "secret_ref",
+        "required": false,
+        "secret": true,
+        "ref": "<per-provider env var name>",
+        "description": "Per-provider env-var name resolved at request time when `auth.kind` is `env` / `bearer` / `api_key_header`. Scoped to each item of the `providers` array: the literal var name lives in the matching provider's `providers[i].auth.var` slot. Marked `secret = true` so client UIs redact it from logs / reports."
+      },
+      {
+        "name": "engine_socket_path",
+        "kind": "path",
+        "required": false,
+        "secret": false,
+        "description": "Filesystem path of the engine's Unix-domain ACP socket. Defaults to a path under `$ZODER_HOME/run/`. Probing this path is the canonical way for a foreign client to discover the live engine before dialing."
+      }
+    ]
+  },
+  "capabilities": {
+    "acp_capable": true
+  }
+}

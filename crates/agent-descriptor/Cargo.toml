@@ -1,0 +1,45 @@
+[package]
+name = "agent-descriptor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Vendor-neutral Agent Descriptor: connection + config-surface, static JSON Schema with stable $id (slice 1 of the agent-descriptor POC; see docs/adr/0001)."
+
+[lib]
+name = "agent_descriptor"
+path = "src/lib.rs"
+
+# lib deps: runtime-light. serde + the JSON-Schema validator. schemars is
+# only needed at codegen time and is declared under [[bin]] below; the
+# lib never pulls it.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Lightweight JSON-Schema validator (Draft 2020-12 subset). Used to confirm
+# that descriptors we read from disk validate against the checked-in schema.
+jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# The codegen binary walks the public re-exports of `zoder_core::config`
+# to emit the checked-in descriptor JSON. It is build-time only - the
+# runtime library never pulls zoder-core.
+[[bin]]
+name = "codegen-zoder"
+path = "src/bin/codegen-zoder.rs"
+required-features = ["codegen"]
+
+[features]
+# Codegen binary dependencies: gated behind a feature so a downstream
+# consumer of `agent_descriptor` doesn't pull zoder-core.
+codegen = ["dep:zoder-core"]
+
+[dependencies.zoder-core]
+path = "../zoder-core"
+version = "0.2.1"
+optional = true
