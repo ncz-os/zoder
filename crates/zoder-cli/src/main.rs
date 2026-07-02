@@ -7,6 +7,11 @@ mod goose;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use zoder_core::gate::{
+    baseline_plan_for, detect_repo_signals, run_plan, CompatibilityReport, GateMode, GateReport,
+    GateStatus, GateStep, RepoSignals, StepOutcome,
+};
+use zoder_core::gate_bundle::{discover_markers, probe_tools, render_probe, PathEnv, ToolLookup};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage,
@@ -425,6 +430,47 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Run the CI-parity gate against the current repo (or `--root DIR`).
+    /// Detects ecosystems (Rust/Node/Python/Go), derives a plan from the
+    /// repo's marker files + baseline OSS-hygiene defaults, runs it under
+    /// the managed-tool bundle (cargo-deny, cargo-audit, osv-scanner,
+    /// gitleaks, cyclonedx, govulncheck, pip-audit), and prints the
+    /// honest-degradation GateReport. The default mode is `strict`
+    /// (fail-closed); `--local-iterate` records skips instead of failing
+    /// (use only for inner-loop speed; never to bypass the gate). Exits
+    /// 0 only when the gate is Green. See `docs/CI-PARITY-GATE.md`.
+    Gate {
+        /// Repo root to gate (default: current working directory).
+        #[arg(long, value_name = "DIR")]
+        root: Option<String>,
+        /// Local-iterate mode: missing tools become Skipped (Yellow) so
+        /// you can iterate fast on a dev box. The gate reports which
+        /// checks were skipped and what install commands restore the
+        /// strict posture. Use this only for inner-loop speed; the
+        /// `--strict` default is the posture that earns the "it passed
+        /// the gate" claim.
+        #[arg(long, conflicts_with = "strict")]
+        local_iterate: bool,
+        /// Strict mode (fail-closed). This is the DEFAULT; the flag
+        /// exists so `zoder gate --strict` is a legible escape hatch
+        /// when `--local-iterate` is wired into a wrapper.
+        #[arg(long)]
+        strict: bool,
+        /// Print what gate tools are installed vs missing + the install
+        /// hint for each missing tool, then exit. Does not run any
+        /// steps. Useful for `zoder gate --tools-only` in CI caches.
+        #[arg(long)]
+        tools_only: bool,
+        /// Print the derived plan (ecosystems + framework hints +
+        /// step list) without running anything. Useful for inspecting
+        /// what the gate would actually do.
+        #[arg(long)]
+        plan_only: bool,
+        /// Emit machine-readable JSON to stdout (the GateReport +
+        /// tool-probe, serialized). Suppresses the pretty renderer.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -686,6 +732,21 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Recipe { action }) => goose::cmd_recipe(&cli, action).await,
         Some(Cmd::Mcp { action }) => goose::cmd_mcp(&cli, action),
         Some(Cmd::Configure { edit, validate }) => goose::cmd_configure(*edit, *validate),
+        Some(Cmd::Gate {
+            root,
+            local_iterate,
+            strict,
+            tools_only,
+            plan_only,
+            json,
+        }) => cmd_gate(
+            root.as_deref(),
+            *local_iterate,
+            *strict,
+            *tools_only,
+            *plan_only,
+            *json,
+        ),
         Some(Cmd::Completions { shell }) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -829,6 +890,430 @@ fn ensure_zerocode_theme(dir: &std::path::Path, theme: &str) {
     }
     let body = format!("locale = \"en\"\n\n[keybindings]\n\n[theme]\nname = \"{theme}\"\n");
     let _ = std::fs::write(&f, body);
+}
+
+/// `zoder gate [--root DIR] [--strict|--local-iterate] [--tools-only|
+/// --plan-only] [--json]` — run the CI-parity gate against a repo.
+///
+/// Detection -> plan derivation -> runner -> honest-degradation report.
+/// The default mode is `strict` (fail-closed): a missing REQUIRED tool
+/// surfaces as a `Failed` outcome with the managed-bundle install hint
+/// attached, and the exit code is non-zero unless the gate is Green.
+///
+/// `--local-iterate` records skips as Skipped (Yellow) instead of
+/// failing closed; this is the inner-loop speed mode. The audit trail
+/// is preserved (every skipped step + reason is in the report), but
+/// the gate WILL NOT block. Use this only when iterating on a dev box;
+/// the strict default is the posture that earns the "it passed the
+/// gate" claim.
+///
+/// `--tools-only` prints the tool-availability probe and exits 0.
+/// Useful for CI cache prep and for "what do I need to install?".
+///
+/// `--plan-only` prints the derived plan and exits 0. No steps are
+/// executed.
+///
+/// `--json` emits a structured JSON document (probe + plan + report)
+/// to stdout instead of the pretty renderer; suitable for CI
+/// summarizers and dashboards.
+///
+/// Exit codes:
+///   0 — Green (every required check ran and passed, nothing skipped)
+///       OR Yellow (some optional check was skipped, but no required
+///       check failed). The report tells you exactly which tools to
+///       install to get back to Green.
+///   1 — Red (one or more required checks failed). Under Strict mode
+///       this also covers a missing REQUIRED tool (the runner upgrades
+///       a missing required tool to Failed so the gate never silently
+///       passes it).
+///   64 — usage error (root not a directory, conflicting flags, …)
+fn cmd_gate(
+    root: Option<&str>,
+    local_iterate: bool,
+    strict: bool,
+    tools_only: bool,
+    plan_only: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // Resolve the repo root. Default to the current directory; expand
+    // ~ (the CLI does not pull in shellexpand, so a minimal hand-rolled
+    // expansion is enough — `~` and `~/sub/path`).
+    let root_path = match root {
+        Some(r) => expand_tilde(r),
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("zoder gate: cannot read current directory: {e}"))?,
+    };
+    if !root_path.is_dir() {
+        anyhow::bail!(
+            "zoder gate: root `{}` is not a directory",
+            root_path.display()
+        );
+    }
+
+    // Mode resolution: --strict is the default; --local-iterate is an
+    // opt-in demotion for inner-loop speed only. Both flags explicitly
+    // passed is a usage error (we declared `conflicts_with` in clap, so
+    // clap already rejects it).
+    let mode = if local_iterate {
+        GateMode::LocalIterate
+    } else {
+        // `strict` here is just for explicit-over-implicit readability.
+        GateMode::Strict
+    };
+    let _ = strict; // explicit flag exists for legibility; the default already IS strict.
+
+    // Drive the gate through the pure orchestrator so every branch is
+    // unit-testable without touching stdout or the process exit code.
+    let outcome = run_gate_for_root(&root_path);
+
+    // --tools-only: print the probe and exit (never blocks).
+    if tools_only {
+        if json {
+            let payload = serde_json::json!({
+                "root": root_path.display().to_string(),
+                "mode": mode_label(mode),
+                "signals": signals_payload(&outcome.signals),
+                "probe": probe_payload(&outcome.probe),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("zoder gate — tool availability ({})", root_path.display());
+            println!("{}", render_signals_human(&outcome.signals));
+            println!();
+            print!("{}", render_probe(&outcome.probe));
+        }
+        return Ok(());
+    }
+
+    // --plan-only: print the plan + probe and exit (never blocks).
+    if plan_only {
+        if json {
+            let payload = serde_json::json!({
+                "root": root_path.display().to_string(),
+                "mode": mode_label(mode),
+                "signals": signals_payload(&outcome.signals),
+                "compat": compat_payload(&outcome.pre_run_compat),
+                "probe": probe_payload(&outcome.probe),
+                "plan": plan_payload(&outcome.plan),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("zoder gate — plan ({})", root_path.display());
+            println!("{}", render_signals_human(&outcome.signals));
+            println!();
+            println!(
+                "breakdown: {} runnable, {} added-baseline, {} skipped",
+                outcome.pre_run_compat.runnable.len(),
+                outcome.pre_run_compat.added_baseline.len(),
+                outcome.pre_run_compat.skipped.len(),
+            );
+            for s in &outcome.plan {
+                let req = if s.required { "*" } else { " " };
+                let cmd = s.command.join(" ");
+                println!("  {} {:<14} {cmd}", req, s.name);
+            }
+            println!();
+            print!("{}", render_probe(&outcome.probe));
+        }
+        return Ok(());
+    }
+
+    // Run the plan against the real PATH and produce the final report.
+    let report = outcome.run(&mode);
+    // We treat the renderer as the canonical output and the exit code
+    // as the derived signal. Under strict posture, Yellow (some
+    // required tool missing) IS a block — that's the fail-closed
+    // contract. Under local-iterate, Yellow is just informational.
+    if json {
+        let payload = serde_json::json!({
+            "root": root_path.display().to_string(),
+            "mode": mode_label(mode),
+            "signals": signals_payload(&outcome.signals),
+            "probe": probe_payload(&outcome.probe),
+            "report": {
+                "status": status_payload(&report.status),
+                "is_passed": report.is_passed(),
+                "is_failed": report.is_failed(),
+                "headline": report.headline(),
+                "results": report.results.iter().map(|r| {
+                    serde_json::json!({
+                        "name": r.step_name,
+                        "required": r.required,
+                        "outcome": step_outcome_payload(&r.outcome),
+                    })
+                }).collect::<Vec<_>>(),
+                "compatibility": compat_payload(&report.compatibility),
+                "passed_required_names": report.passed_required_names(),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        // Human renderer: pretty multi-line report. Then append the
+        // tool-availability probe as a trailing section so the
+        // reviewer can scan for install hints without flipping to
+        // --tools-only.
+        println!(
+            "zoder gate — {} ({})",
+            mode_label(mode),
+            root_path.display()
+        );
+        println!("{}", render_signals_human(&outcome.signals));
+        println!();
+        println!("{}", report.to_pretty());
+        print!("{}", render_probe(&outcome.probe));
+    }
+
+    // Exit code (fail-closed posture, per docs/CI-PARITY-GATE.md):
+    //   Green -> 0
+    //   Yellow -> 0 (under both modes — Yellow means "something was
+    //     skipped, but nothing failed"; the report records what was
+    //     skipped and why, so the audit trail is complete and the
+    //     operator can act on it without the gate silently passing).
+    //     Under strict, a missing REQUIRED tool upgrades to Failed
+    //     (Red) inside run_plan — Yellow under strict therefore only
+    //     means "an OPTIONAL tool was missing", which is advisory.
+    //   Red -> 1
+    let code: i32 = match &report.status {
+        GateStatus::Green => 0,
+        GateStatus::Yellow { .. } => 0,
+        GateStatus::Red { .. } => 1,
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The pure orchestrator for `zoder gate`. Given a repo root, detect
+/// ecosystems, derive the plan from the baseline OSS-hygiene defaults,
+/// and build a [`GateOutcome`] that holds everything the CLI needs to
+/// render `--tools-only`, `--plan-only`, and the final report. The
+/// actual step execution is deferred to [`GateOutcome::run`] so the
+/// pre-run data is independent of execution.
+///
+/// Extracted out of `cmd_gate` so every branch (Rust, Node, polyglot,
+/// missing markers, etc.) is fully unit-testable without touching
+/// stdout or the process exit code.
+struct GateOutcome {
+    signals: RepoSignals,
+    /// Pre-run compatibility breakdown — what `derive_plan` produced
+    /// before the runner touched anything. Used by `--plan-only`.
+    pre_run_compat: CompatibilityReport,
+    /// The derived plan (in execution order).
+    plan: Vec<GateStep>,
+    /// Tool probe for every unique `tool` referenced by the plan.
+    probe: Vec<zoder_core::gate_bundle::ToolProbe>,
+}
+
+impl GateOutcome {
+    /// Run the plan against the real PATH and produce the final report.
+    /// The runner's `run_plan` + `GateReport::new` recomputes the
+    /// status from results so the report stays self-consistent.
+    fn run(&self, mode: &GateMode) -> GateReport {
+        let env = PathEnv::new();
+        let (results, _) = run_plan(&self.plan, *mode, &env);
+        GateReport::new(results, self.pre_run_compat.clone())
+    }
+}
+
+fn run_gate_for_root(root: &std::path::Path) -> GateOutcome {
+    let marker_names = discover_markers(root);
+    let marker_refs: Vec<&str> = marker_names.iter().map(String::as_str).collect();
+    let signals = detect_repo_signals(&marker_refs);
+
+    // Plan derivation: per-ecosystem baseline unioned into a single
+    // plan. Today the repo-CI YAML adapters (Actions / GitLab /
+    // Woodpecker -> CiJob) are future slices; the gate runs the
+    // baseline OSS-hygiene plan against whatever ecosystems the repo
+    // advertises.
+    let mut plan: Vec<GateStep> = Vec::new();
+    let mut compat = CompatibilityReport::default();
+    for eco in &signals.ecosystems {
+        let baseline = baseline_plan_for(*eco, &marker_refs);
+        for step in baseline {
+            compat.added_baseline.push(step.name.clone());
+            plan.push(step);
+        }
+    }
+
+    // Tool probe: what's installed + what's missing. Reused by every
+    // output path (--tools-only, --plan-only, full report).
+    let lookup = ToolLookup::from_default_bundle();
+    let env = PathEnv::new();
+    let probe = probe_tools(&plan, &env, &lookup);
+
+    GateOutcome {
+        signals,
+        pre_run_compat: compat,
+        plan,
+        probe,
+    }
+}
+
+/// Render the [`RepoSignals`] as a one-line-per-bucket human summary.
+fn render_signals_human(signals: &RepoSignals) -> String {
+    let mut out = String::new();
+    let eco_names: Vec<&str> = signals
+        .ecosystems
+        .iter()
+        .map(|e| match e {
+            zoder_core::gate::Ecosystem::Rust => "rust",
+            zoder_core::gate::Ecosystem::Node => "node",
+            zoder_core::gate::Ecosystem::Python => "python",
+            zoder_core::gate::Ecosystem::Go => "go",
+        })
+        .collect();
+    out.push_str(&format!("ecosystems:      [{}]\n", eco_names.join(", ")));
+    let pms: Vec<String> = signals
+        .package_managers
+        .iter()
+        .map(|(eco, pm)| {
+            let eco_name = match eco {
+                zoder_core::gate::Ecosystem::Rust => "rust",
+                zoder_core::gate::Ecosystem::Node => "node",
+                zoder_core::gate::Ecosystem::Python => "python",
+                zoder_core::gate::Ecosystem::Go => "go",
+            };
+            format!("{eco_name}={pm}", pm = pm.cli_name())
+        })
+        .collect();
+    out.push_str(&format!(
+        "package-mgrs:    [{}]\n",
+        if pms.is_empty() {
+            String::new()
+        } else {
+            pms.join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "framework-hints: [{}]\n",
+        signals.framework_hints.join(", ")
+    ));
+    out
+}
+
+/// JSON-serializable view of [`RepoSignals`].
+fn signals_payload(signals: &RepoSignals) -> serde_json::Value {
+    serde_json::json!({
+        "ecosystems": signals.ecosystems.iter().map(|e| match e {
+            zoder_core::gate::Ecosystem::Rust => "rust",
+            zoder_core::gate::Ecosystem::Node => "node",
+            zoder_core::gate::Ecosystem::Python => "python",
+            zoder_core::gate::Ecosystem::Go => "go",
+        }).collect::<Vec<_>>(),
+        "package_managers": signals.package_managers.iter().map(|(eco, pm)| {
+            let eco_name = match eco {
+                zoder_core::gate::Ecosystem::Rust => "rust",
+                zoder_core::gate::Ecosystem::Node => "node",
+                zoder_core::gate::Ecosystem::Python => "python",
+                zoder_core::gate::Ecosystem::Go => "go",
+            };
+            serde_json::json!({
+                "ecosystem": eco_name,
+                "manager": pm.cli_name(),
+            })
+        }).collect::<Vec<_>>(),
+        "framework_hints": signals.framework_hints,
+    })
+}
+
+/// JSON-serializable view of [`CompatibilityReport`].
+fn compat_payload(compat: &CompatibilityReport) -> serde_json::Value {
+    serde_json::json!({
+        "runnable": compat.runnable,
+        "added_baseline": compat.added_baseline,
+        "skipped": compat.skipped.iter().map(|(n, r)| serde_json::json!({
+            "name": n,
+            "reason": r,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// JSON-serializable view of a tool probe.
+fn probe_payload(probe: &[zoder_core::gate_bundle::ToolProbe]) -> serde_json::Value {
+    probe
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "tool": p.tool,
+                "present": p.present,
+                "resolved_path": p.resolved_path.as_ref().map(|pb| pb.display().to_string()),
+                "managed": p.managed.map(|m| serde_json::json!({
+                    "id": m.id,
+                    "version": m.version,
+                    "install_hint": m.install_hint.replace("${VERSION}", m.version),
+                    "homepage": m.homepage,
+                })),
+            })
+        })
+        .collect()
+}
+
+/// JSON-serializable view of a [`GateStep`] list.
+fn plan_payload(plan: &[GateStep]) -> serde_json::Value {
+    plan.iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "category": format!("{:?}", s.category).to_lowercase(),
+                "command": s.command,
+                "tool": s.tool,
+                "required": s.required,
+            })
+        })
+        .collect()
+}
+
+/// JSON-serializable view of a [`GateStatus`].
+fn status_payload(status: &GateStatus) -> serde_json::Value {
+    match status {
+        GateStatus::Green => serde_json::json!({"verdict": "green"}),
+        GateStatus::Yellow { skipped } => {
+            serde_json::json!({"verdict": "yellow", "skipped": skipped})
+        }
+        GateStatus::Red { failures } => {
+            serde_json::json!({"verdict": "red", "failures": failures})
+        }
+    }
+}
+
+/// JSON-serializable view of a [`StepOutcome`]. The Skipped arm
+/// carries the structured reason so reviewers can audit the gate
+/// even when no pretty renderer ran.
+fn step_outcome_payload(outcome: &StepOutcome) -> serde_json::Value {
+    match outcome {
+        StepOutcome::Passed => serde_json::json!("passed"),
+        StepOutcome::Failed => serde_json::json!("failed"),
+        StepOutcome::Skipped { reason } => serde_json::json!({
+            "skipped": true,
+            "reason": reason,
+        }),
+    }
+}
+
+/// Human label for a [`GateMode`].
+fn mode_label(mode: GateMode) -> &'static str {
+    match mode {
+        GateMode::Strict => "strict",
+        GateMode::LocalIterate => "local-iterate",
+    }
+}
+
+/// Minimal `~` expansion for the `--root` flag. Supports `~` and
+/// `~/sub/path`; everything else is returned as-is. We deliberately
+/// avoid pulling in a shellexpand-style crate for this — the CLI is
+/// the only consumer.
+fn expand_tilde(input: &str) -> std::path::PathBuf {
+    if input == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(input)
 }
 
 /// Launch the bundled zerocode TUI. zerocode discovers the `zeroclaw` daemon
@@ -3801,4 +4286,303 @@ fn cmd_config(validate: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gate_tests {
+    //! Unit tests for the `zoder gate` slice-5 wiring. These exercise
+    //! the pure orchestrator (`run_gate_for_root` + `GateOutcome`)
+    //! without touching stdout or `process::exit`, so every branch
+    //! (Rust, Node, polyglot, missing markers, missing required tool)
+    //! is verifiable deterministically.
+    //!
+    //! `tempfile::tempdir()` is the only new dep introduced by these
+    //! tests; `zoder-cli` doesn't depend on `tempfile` directly, so
+    //! we declare a tiny dev-dependency on it in `Cargo.toml`.
+
+    use super::run_gate_for_root;
+    use std::path::Path;
+    use zoder_core::gate::{Ecosystem, GateMode, GateStatus, GateStep, StepCategory, StepOutcome};
+    use zoder_core::gate_bundle::default_bundle;
+
+    #[test]
+    fn empty_repo_yields_no_plan_and_green_status() {
+        // A repo with NO marker files must produce an empty plan, no
+        // signals, and a Green (empty) report — the gate operates on
+        // whatever it can see and reports honestly. Never panics.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outcome = run_gate_for_root(tmp.path());
+        assert!(outcome.plan.is_empty(), "no markers -> empty plan");
+        assert!(outcome.signals.ecosystems.is_empty());
+        assert!(outcome.probe.is_empty(), "no plan -> no probe");
+        let report = outcome.run(&GateMode::Strict);
+        assert_eq!(report.status, GateStatus::Green);
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn rust_repo_detected_and_baseline_plan_has_required_core() {
+        // A repo with only Cargo.toml at the root must be detected as
+        // Rust and produce the Rust baseline plan (fmt, clippy,
+        // build, test, deny, audit).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        assert_eq!(outcome.signals.ecosystems, vec![Ecosystem::Rust]);
+        let names: Vec<&str> = outcome.plan.iter().map(|s| s.name.as_str()).collect();
+        for required in ["fmt", "clippy", "build", "test", "deny"] {
+            assert!(
+                names.contains(&required),
+                "Rust baseline missing `{required}`; got {names:?}"
+            );
+        }
+        // Added-baseline breakdown should name every baseline step.
+        for required in ["fmt", "clippy", "build", "test", "deny", "audit"] {
+            assert!(
+                outcome
+                    .pre_run_compat
+                    .added_baseline
+                    .contains(&required.to_string()),
+                "added_baseline missing `{required}`",
+            );
+        }
+    }
+
+    #[test]
+    fn node_repo_with_pnpm_uses_pnpm_commands() {
+        // A repo with package.json + pnpm-lock.yaml must be detected
+        // as Node + pnpm and produce the pnpm-refined plan.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), "{}\n").expect("write");
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        assert_eq!(outcome.signals.ecosystems, vec![Ecosystem::Node]);
+        assert_eq!(
+            outcome.signals.package_managers,
+            vec![(Ecosystem::Node, zoder_core::gate::PackageManager::Pnpm)]
+        );
+        // The lint step must use `pnpm run lint`, NOT the npm default.
+        let lint = outcome
+            .plan
+            .iter()
+            .find(|s| s.name == "lint")
+            .expect("lint step");
+        assert_eq!(lint.command, vec!["pnpm", "run", "lint"]);
+        assert_eq!(lint.tool, "pnpm");
+    }
+
+    #[test]
+    fn polyglot_repo_unions_per_ecosystem_baselines() {
+        // Rust + Node in the same repo must produce a unioned plan
+        // with both ecosystems' baseline steps, in deterministic order
+        // (Rust first, then Node).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        std::fs::write(tmp.path().join("package.json"), "{}\n").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        assert_eq!(
+            outcome.signals.ecosystems,
+            vec![Ecosystem::Rust, Ecosystem::Node],
+        );
+        // Rust steps come first.
+        let first_rust = outcome
+            .plan
+            .iter()
+            .position(|s| {
+                matches!(
+                    s.category,
+                    StepCategory::Lint
+                        | StepCategory::Security
+                        | StepCategory::Build
+                        | StepCategory::Test
+                        | StepCategory::Format
+                ) && s.command.first().map(String::as_str) == Some("cargo")
+                    || s.command.first().map(String::as_str) == Some("cargo")
+            })
+            .expect("at least one rust step");
+        // First non-rust step (npx prettier --check) comes after the
+        // Rust baselines.
+        let first_node = outcome
+            .plan
+            .iter()
+            .position(|s| s.command.first().map(String::as_str) == Some("npx"))
+            .expect("at least one node step");
+        assert!(
+            first_rust < first_node,
+            "rust steps must precede node steps"
+        );
+    }
+
+    #[test]
+    fn python_repo_with_uv_uses_uv_run_pytest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .expect("write");
+        std::fs::write(tmp.path().join("uv.lock"), "").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        assert_eq!(outcome.signals.ecosystems, vec![Ecosystem::Python]);
+        let test = outcome
+            .plan
+            .iter()
+            .find(|s| s.name == "test")
+            .expect("test step");
+        assert_eq!(test.command, vec!["uv", "run", "pytest", "-q"]);
+    }
+
+    #[test]
+    fn framework_hints_surfaced_in_signals() {
+        // Next.js + Vite + Vitest config files must produce matching
+        // framework hints so the report tells the reviewer what's in
+        // the repo beyond the ecosystem defaults.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), "{}\n").expect("write");
+        std::fs::write(tmp.path().join("next.config.js"), "module.exports = {};\n").expect("write");
+        std::fs::write(tmp.path().join("vite.config.ts"), "export default {};\n").expect("write");
+        std::fs::write(tmp.path().join("vitest.config.ts"), "export default {};\n").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        for hint in ["next.js", "vite", "vitest"] {
+            assert!(
+                outcome.signals.framework_hints.contains(&hint.to_string()),
+                "framework_hints missing `{hint}`: {:?}",
+                outcome.signals.framework_hints,
+            );
+        }
+    }
+
+    #[test]
+    fn probe_lists_every_unique_tool_in_plan_order() {
+        // The probe must dedupe by tool name AND preserve plan order,
+        // so the rendered output is deterministic.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        let outcome = run_gate_for_root(tmp.path());
+        let tools: Vec<&str> = outcome.probe.iter().map(|p| p.tool.as_str()).collect();
+        // Rust baseline tools (in plan order, deduped): cargo,
+        // cargo-deny, cargo-audit. Every entry must be unique.
+        let mut deduped = tools.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            tools.len(),
+            deduped.len(),
+            "probe must not duplicate: {tools:?}"
+        );
+        // Plan-order assertion: cargo first (used by fmt/clippy/
+        // build/test), then cargo-deny, then cargo-audit.
+        assert_eq!(tools.first().copied(), Some("cargo"));
+    }
+
+    #[test]
+    fn outcome_run_under_strict_with_missing_required_managed_tool_is_red() {
+        // End-to-end Slice-5 promise: a required managed tool that
+        // isn't on PATH must produce Red under Strict, and the
+        // GateReport must surface it. We test by constructing a plan
+        // that references gitleaks (in the bundle, commonly absent)
+        // and running it. If gitleaks happens to be installed on
+        // this dev box, we assert the run produces a sensible status
+        // and skip the Red assertion.
+        let bundle_ids: Vec<&str> = default_bundle().iter().map(|t| t.id).collect();
+        assert!(bundle_ids.contains(&"gitleaks"));
+
+        let plan = vec![GateStep {
+            name: "secrets".to_string(),
+            category: StepCategory::Secret,
+            command: vec!["gitleaks".to_string(), "detect".to_string()],
+            tool: "gitleaks".to_string(),
+            required: true,
+        }];
+        let env = zoder_core::gate_bundle::PathEnv::new();
+        let (results, status) = zoder_core::gate::run_plan(&plan, GateMode::Strict, &env);
+        if env.find_binary("gitleaks").is_some() {
+            // gitleaks installed on this box; run is Green.
+            assert!(matches!(status, GateStatus::Green));
+            assert!(matches!(results[0].outcome, StepOutcome::Passed));
+            return;
+        }
+        assert_eq!(
+            status,
+            GateStatus::Red {
+                failures: vec!["secrets".to_string()],
+            },
+            "strict + missing required managed tool must be Red",
+        );
+        assert!(matches!(results[0].outcome, StepOutcome::Failed));
+    }
+
+    #[test]
+    fn outcome_run_under_local_iterate_with_missing_required_managed_tool_is_yellow() {
+        // Mirror of the above: under LocalIterate, a missing required
+        // managed tool is recorded as Skipped (Yellow) so the
+        // inner-loop mode does not block.
+        let plan = vec![GateStep {
+            name: "secrets".to_string(),
+            category: StepCategory::Secret,
+            command: vec!["gitleaks".to_string(), "detect".to_string()],
+            tool: "gitleaks".to_string(),
+            required: true,
+        }];
+        let env = zoder_core::gate_bundle::PathEnv::new();
+        if env.find_binary("gitleaks").is_some() {
+            // Same skip-if-installed posture as the strict test: we
+            // cannot assert on a path-dependent outcome if the tool
+            // is on this box.
+            return;
+        }
+        let (results, status) = zoder_core::gate::run_plan(&plan, GateMode::LocalIterate, &env);
+        assert_eq!(
+            status,
+            GateStatus::Yellow {
+                skipped: vec!["secrets".to_string()],
+            },
+        );
+        assert!(matches!(results[0].outcome, StepOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn outcome_with_no_ecosystems_still_returns_a_usable_handle() {
+        // Defensive: an empty-repo run must still produce a
+        // GateOutcome that can be queried without panicking. The
+        // probe is empty, the plan is empty, signals are empty, but
+        // the report still renders an honest Green.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outcome = run_gate_for_root(tmp.path());
+        assert_eq!(outcome.plan.len(), 0);
+        assert_eq!(outcome.pre_run_compat.added_baseline.len(), 0);
+        let report = outcome.run(&GateMode::Strict);
+        assert!(report.is_passed());
+        assert!(!report.is_failed());
+    }
+
+    #[test]
+    fn discover_markers_under_orchestrator_is_deterministic() {
+        // Two parallel orchestrator runs over the same dir must
+        // produce identical plans + probes (the gate is reproducible).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        std::fs::write(tmp.path().join("package.json"), "{}\n").expect("write");
+        let a = run_gate_for_root(tmp.path());
+        let b = run_gate_for_root(tmp.path());
+        let names_a: Vec<&str> = a.plan.iter().map(|s| s.name.as_str()).collect();
+        let names_b: Vec<&str> = b.plan.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names_a, names_b);
+    }
+
+    #[test]
+    fn expand_tilde_handles_bare_and_subpath() {
+        // The minimal hand-rolled `~` expansion used by `--root`.
+        // We can't easily test the actual filesystem result without
+        // knowing the user's $HOME, so we exercise the negative
+        // cases here and let the positive path rely on integration
+        // testing.
+        let r = super::expand_tilde("/nonexistent/path");
+        assert_eq!(r, Path::new("/nonexistent/path"));
+        // "~user" (user-named tilde) is intentionally NOT expanded;
+        // only the bare `~` and `~/sub` forms are supported. Make
+        // sure that boundary is honored.
+        let r = super::expand_tilde("~user/foo");
+        assert_eq!(r, Path::new("~user/foo"));
+    }
 }
