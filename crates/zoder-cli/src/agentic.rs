@@ -1,4 +1,4 @@
-//! Codex-compatible command surface: `review`, `adversarial-review`, `rescue`,
+//! zoder's agentic command surface (a drop-in for codex `exec`/`review`): `review`, `adversarial-review`, `rescue`,
 //! `transfer`, and a file-backed background job registry (`status`/`result`/
 //! `cancel`). Reviews run as single completions over a chosen model (the diff is
 //! embedded), with optional multi-reviewer fan-out; `rescue` is an agentic,
