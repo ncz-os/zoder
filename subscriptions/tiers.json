@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "as_of": "2026-06-30",
+  "disclaimer": "ESTIMATES from known/observed service behavior. Providers change limits without notice and rarely publish exact numbers. Treat utilization as approximate; verify against your provider dashboard.",
+  "providers": {
+    "anthropic": {
+      "tiers": {
+        "claude-pro": {
+          "monthly_fee_usd": 20,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 200 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 2000 }
+          ]
+        },
+        "claude-max-5x": {
+          "monthly_fee_usd": 100,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 225 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 2000 }
+          ]
+        },
+        "claude-max-20x": {
+          "monthly_fee_usd": 200,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 900 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 8000 }
+          ]
+        }
+      }
+    },
+    "openai": {
+      "tiers": {
+        "chatgpt-plus": {
+          "monthly_fee_usd": 20,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 80 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 800 }
+          ]
+        },
+        "chatgpt-pro": {
+          "monthly_fee_usd": 200,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 200 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 4000 }
+          ]
+        },
+        "chatgpt-team": {
+          "monthly_fee_usd": 25,
+          "confidence": "observed",
+          "source": "observed",
+          "windows": [
+            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 100 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 1000 }
+          ]
+        },
+        "chatgpt-enterprise": {
+          "monthly_fee_usd": 60,
+          "confidence": "estimated",
+          "source": "observed",
+          "windows": [
+            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 200 },
+            { "name": "weekly", "hours": 168, "unit": "messages", "cap": 4000 }
+          ]
+        }
+      }
+    },
+    "minimax": {
+      "tiers": {
+        "token-plan-1": {
+          "monthly_fee_usd": 10,
+          "confidence": "published",
+          "source": "minimax_token_plan",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "tokens", "cap": 10000000 },
+            { "name": "weekly", "hours": 168, "unit": "tokens", "cap": 200000000 }
+          ]
+        },
+        "token-plan-2": {
+          "monthly_fee_usd": 30,
+          "confidence": "published",
+          "source": "minimax_token_plan",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "tokens", "cap": 20000000 },
+            { "name": "weekly", "hours": 168, "unit": "tokens", "cap": 500000000 }
+          ]
+        },
+        "token-plan-3": {
+          "monthly_fee_usd": 100,
+          "confidence": "published",
+          "source": "minimax_token_plan",
+          "windows": [
+            { "name": "5h",     "hours": 5,   "unit": "tokens", "cap": 50000000 },
+            { "name": "weekly", "hours": 168, "unit": "tokens", "cap": 1500000000 }
+          ]
+        }
+      }
+    }
+  }
+}

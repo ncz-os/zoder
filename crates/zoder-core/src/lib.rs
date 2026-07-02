@@ -22,6 +22,7 @@ pub mod reconcile;
 pub mod report;
 pub mod router;
 pub mod session;
+pub mod subscription_tiers;
 pub mod update;
 
 pub use acp_client::{
@@ -57,6 +58,10 @@ pub use reconcile::{anthropic_costs, openai_costs, ReconResult};
 pub use report::{build_report, build_report_from_entries, Bucket, Gran, Report, RowByModel};
 pub use router::{Route, Router, Tier};
 pub use session::Session;
+pub use subscription_tiers::{
+    load_tier_catalog, resolve_plan_windows, Confidence, ProviderTiers, ResolveSource,
+    ResolvedPlan, TierCatalog, TierEntry, TierWindow, WindowProvenance, TIERS_JSON_DEFAULT,
+};
 
 /// Crate version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

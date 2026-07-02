@@ -9,11 +9,11 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
-    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, run_agent_dispatch,
-    sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind, Entry, Gran,
-    HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
-    PricingSource, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
+    estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage,
+    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
+    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
+    Entry, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate,
+    PricingCatalog, PricingSource, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
 };
 
 #[derive(Parser, Clone)]
@@ -3631,9 +3631,40 @@ fn auth_kind_label(a: &zoder_core::Auth) -> String {
 
 fn cmd_providers(json: bool) -> anyhow::Result<()> {
     let eng = Engine::load()?;
+    // The tier catalog is bundled + on-disk refreshable; same pattern as
+    // Corpus. Loading it is best-effort: an unreadable / unparseable catalog
+    // never breaks `zoder providers` — explicit windows still work, the
+    // `tier` field on a plan just degrades to "unknown tier" gracefully.
+    let catalog = load_tier_catalog(Some(&zoder_core::subscription_tiers::default_catalog_path(
+        &Config::home(),
+    )));
+    // Track whether any provider actually USED the catalog (preset or
+    // preset-with-overrides). The disclaimer is only relevant when a
+    // preset-backed number appears in the output — an operator who hand-
+    // entered every window doesn't need the "estimates — verify against
+    // your dashboard" reminder. We track per-provider so the disclaimer
+    // shows up exactly when it earns its keep, and not as noise.
+    let has_any_preset = eng
+        .cfg
+        .providers
+        .iter()
+        .any(|p| match (p.billing, &p.subscription) {
+            (BillingMode::Subscription, Some(plan)) => plan.tier.is_some(),
+            _ => false,
+        });
     if json {
-        // Redacted view: never serialize inline bearer tokens (the raw config
-        // carries `Auth::Bearer { token }`). Env-var names are safe to show.
+        // Top-level array shape (NOT wrapped in `{ "providers": [...] }`).
+        // The JSON contract for `zoder providers --json` is a bare array of
+        // provider descriptors — preserving this shape is required so
+        // existing scrapers / scripts that consume the output by indexing
+        // the array directly continue to work. The tier-catalog disclaimer
+        // is emitted on the human-readable path (below); it is intentionally
+        // NOT threaded into the machine JSON here because doing so would
+        // break the array contract.
+        //
+        // Redacted view: never serialize inline bearer tokens (the raw
+        // config carries `Auth::Bearer { token }`). Env-var names are safe
+        // to show.
         let redacted: Vec<serde_json::Value> = eng
             .cfg
             .providers
@@ -3652,21 +3683,50 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&redacted)?);
         return Ok(());
     }
+    // The disclaimer is the "verify-dashboard" reminder that makes a
+    // preset-driven report honest. We print it ONCE, above the table, and
+    // only when at least one provider in the output used a preset — never
+    // as boilerplate on a fully-explicit config.
+    if has_any_preset && !catalog.disclaimer.is_empty() {
+        println!(
+            "tier catalog: as_of={} — {}",
+            catalog.as_of, catalog.disclaimer
+        );
+    }
     let entries = Ledger::new(&eng.cfg.ledger_path)
         .entries()
         .unwrap_or_default();
     for p in &eng.cfg.providers {
         let auth = p.auth.resolve().map(|_| "ok").unwrap_or("MISSING");
+        // Subscription plan header: declare the tier name + `as_of` +
+        // `confidence` so the operator reads the cap honestly and knows when
+        // the catalog was last curated. Explicit (no `tier`) plans print
+        // nothing extra; that path is unchanged.
+        let plan_header = match (p.billing, &p.subscription) {
+            (BillingMode::Subscription, Some(plan)) => {
+                if let Some(t) = &plan.tier {
+                    let conf = catalog
+                        .tier(&p.id, t)
+                        .map(|e| e.confidence.as_str())
+                        .unwrap_or("unknown");
+                    format!(" tier={} (as_of={}, confidence={})", t, catalog.as_of, conf)
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
         println!(
-            "{:10} {:42} kind={:12} billing={:12} auth={}",
+            "{:10} {:42} kind={:12} billing={:12} auth={}{}",
             p.id,
             p.base_url,
             p.kind,
             billing_label(p.billing),
-            auth
+            auth,
+            plan_header
         );
         if let (BillingMode::Subscription, Some(plan)) = (p.billing, &p.subscription) {
-            for w in plan_usage(&entries, &p.id, plan) {
+            for w in plan_usage(&entries, &p.id, plan, &catalog) {
                 let reset = w
                     .next_reset_utc
                     .as_deref()
@@ -3677,18 +3737,24 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
                 } else {
                     ""
                 };
+                let conf_tag = w
+                    .confidence
+                    .as_deref()
+                    .map(|c| format!(" [est:{}]", c))
+                    .unwrap_or_default();
                 println!(
-                    "             {:>7} window: {:.0}/{:.0} {} ({:.0}% of cap){}{}",
+                    "             {:>7} window: {:.0}/{:.0} {} ({:.0}% of cap){}{}{}",
                     w.name,
                     w.used,
                     w.cap,
                     w.unit,
                     w.pct * 100.0,
                     reset,
+                    conf_tag,
                     warn
                 );
             }
-            let amort = amortized_per_call(&entries, &p.id, plan);
+            let amort = amortized_per_call(&entries, &p.id, plan, &catalog);
             if amort > 0.0 {
                 println!("             amortized: ${amort:.4}/call (flat fee / 30d calls)");
             }
