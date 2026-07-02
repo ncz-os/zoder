@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/acp-client", "crates/model-health", "crates/zoder-core", "crates/zoder-cli"]
+members = [
+    "crates/acp-client",
+    "crates/agent-descriptor",
+    "crates/model-health",
+    "crates/zoder-core",
+    "crates/zoder-cli",
+]
 
 [workspace.package]
 version = "0.2.1"
@@ -27,6 +33,12 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.8"
+# schemars-style JSON Schema derivation for zoder-core's config structs
+# (used at codegen time only - by `crates/agent-descriptor/src/bin/codegen-zoder.rs`).
+schemars = "0.8"
+# Lightweight JSON-Schema validator (Draft 2020-12 subset). Used to confirm
+# that descriptors we read from disk validate against the checked-in schema.
+jsonschema = { version = "0.17", default-features = false }
 
 # dev
 wiremock = "0.6"

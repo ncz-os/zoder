@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ncz-os.dev/schemas/agent-descriptor/v1.json",
+  "title": "Agent Descriptor (v1)",
+  "description": "Vendor-neutral agent descriptor covering (a) connection: transport + endpoint + auth + acp_capable, (b) config surface: knob list with names, types, defaults, required, secret flag. Conforms to the ncz-os agent-descriptor ADR (docs/adr/0001). Static only - no runtime discovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name", "agent_id", "version", "schema_version", "conformance_level", "connection", "capabilities"],
+  "properties": {
+    "id": {
+      "description": "Stable identifier URI for this descriptor. Format: <vendor-namespace>:agent-descriptor:<implementation-slug>:v<schema-version>",
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+:agent-descriptor:[a-z0-9._-]+:v[0-9]+$"
+    },
+    "name": {
+      "description": "Human-readable implementation name (e.g. 'zoder / zeroclaw').",
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_id": {
+      "description": "Stable reverse-DNS identifier for the agent itself (must match across descriptor revisions for the same implementation).",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]*$"
+    },
+    "version": {
+      "description": "Implementation version of the agent that emitted this descriptor (free-form semver or date). NOT the schema version.",
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_version": {
+      "description": "Version of the agent-descriptor schema this artifact conforms to. MUST match the major version embedded in `id`.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1
+    },
+    "conformance_level": {
+      "description": "MIF-style conformance level: 1 = identity + connection only; 2 = identity + connection + config surface (knobs).",
+      "type": "integer",
+      "enum": [1, 2]
+    },
+    "connection": {
+      "$ref": "#/$defs/connection"
+    },
+    "config_surface": {
+      "description": "Required when conformance_level >= 2; optional otherwise. Describes the agent's user-facing configuration surface (knobs, defaults, secret flags).",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/config_surface" }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["acp_capable"],
+      "properties": {
+        "acp_capable": {
+          "description": "Whether this agent speaks the Agent Client Protocol (editor <-> agent). Connection descriptor still applies (ACP is transport-agnostic).",
+          "type": "boolean"
+        },
+        "extensions": {
+          "description": "Reserved escape hatch for vendor-specific flags. Keys MUST be reverse-DNS.",
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        }
+      }
+    },
+    "extensions": {
+      "description": "Reserved escape hatch for descriptor-level vendor extensions. Keys MUST be reverse-DNS.",
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "$defs": {
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "endpoint", "auth"],
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": ["stdio", "unix_socket", "tcp", "http", "websocket", "wss", "https"]
+        },
+        "endpoint": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "auth": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/auth" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "description": "stdin/stdout transport requires no real auth (no network surface); record as null.",
+          "if": { "properties": { "transport": { "const": "stdio" } } },
+          "then": { "properties": { "auth": { "const": null } } }
+        }
+      ]
+    },
+    "endpoint": {
+      "description": "Tagged union: each transport has a different endpoint shape. Use `kind` to discriminate.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["path", "url", "host_port"]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "path" },
+            "path": { "type": "string", "minLength": 1 }
+          },
+          "required": ["kind", "path"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "url" },
+            "url":  { "type": "string", "format": "uri" }
+          },
+          "required": ["kind", "url"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "host_port" },
+            "host": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "required": ["kind", "host", "port"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "auth": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["none", "env_var", "bearer", "api_key_header"]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "none" }
+          },
+          "required": ["kind"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "env_var" },
+            "var": { "type": "string", "minLength": 1, "pattern": "^[A-Z_][A-Z0-9_]*$" }
+          },
+          "required": ["kind", "var"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "bearer" },
+            "var": { "type": "string", "minLength": 1, "pattern": "^[A-Z_][A-Z0-9_]*$" }
+          },
+          "required": ["kind", "var"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "api_key_header" },
+            "header": { "type": "string", "minLength": 1 },
+            "var":    { "type": "string", "minLength": 1, "pattern": "^[A-Z_][A-Z0-9_]*$" }
+          },
+          "required": ["kind", "header", "var"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "config_surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["knobs"],
+      "properties": {
+        "source": {
+          "description": "How the agent loads its configuration file (json / toml / yaml / env).",
+          "type": "string",
+          "enum": ["json", "toml", "yaml", "env"]
+        },
+        "default_path": {
+          "description": "Conventional default file path for the configuration (relative or absolute). Optional; agents may rely purely on env-var overrides.",
+          "type": ["string", "null"]
+        },
+        "schema": {
+          "description": "Inline JSON Schema for the underlying config object. Kept inline so a consumer parses one document; mirrors MIF's `package.json` style.",
+          "type": "object"
+        },
+        "knobs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/knob" }
+        }
+      }
+    },
+    "knob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "required"],
+      "properties": {
+        "name": {
+          "description": "Identifier of the knob (e.g. 'default_provider', or 'providers[*].auth.var' to scope to a per-array-element sub-knob). MUST be unique within `config_surface.knobs`.",
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_.\\[\\]-]*$"
+        },
+        "kind": {
+          "description": "Stable type tag. `enum` and `reference` delegate to `enum_values` / `ref` respectively.",
+          "type": "string",
+          "enum": ["string", "integer", "number", "boolean", "array", "object", "enum", "path", "url", "secret_ref"]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "default": {
+          "description": "JSON value of the default if defined. Omitted when default is non-deterministic (e.g. system path).",
+          "type": ["string", "number", "boolean", "array", "object", "null"]
+        },
+        "secret": {
+          "description": "True when the knob's value is a credential or token that must be redacted from logs / reports. UI hint only; format/validation is independent.",
+          "type": "boolean",
+          "default": false
+        },
+        "enum_values": {
+          "description": "When `kind = \"enum\"`, the permitted values. Order is significant for client UIs.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ref": {
+          "description": "When `kind = \"secret_ref\"`, the env-var name OR the credential reference key (e.g. `OPENAI_API_KEY`).",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "enum" } } },
+          "then": { "required": ["enum_values"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "secret_ref" } } },
+          "then": { "required": ["ref"], "properties": { "secret": { "const": true } } }
+        }
+      ]
+    }
+  }
+}
