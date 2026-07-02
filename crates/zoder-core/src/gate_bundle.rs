@@ -350,19 +350,11 @@ impl InstallHint {
 ///    anything else. Stdout/stderr are deliberately NOT captured here
 ///    (the gate rendering stays purely about pass/fail); a future slice
 ///    can plumb them through if a reviewer-facing view needs them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct PathEnv {
     /// Extra search directories to consider BEFORE `PATH`. Tests use
     /// this to inject a fake tool without polluting the real PATH.
     pub extra_dirs: Vec<PathBuf>,
-}
-
-impl Default for PathEnv {
-    fn default() -> Self {
-        Self {
-            extra_dirs: Vec::new(),
-        }
-    }
 }
 
 impl PathEnv {
@@ -479,7 +471,12 @@ impl ToolProbe {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<unknown path>".to_string());
             if let Some(t) = self.managed {
-                format!("✅ {id} v{version} ({path})", id = t.id, version = t.version, path = path)
+                format!(
+                    "✅ {id} v{version} ({path})",
+                    id = t.id,
+                    version = t.version,
+                    path = path
+                )
             } else {
                 format!("✅ {tool} ({path})", tool = self.tool, path = path)
             }
@@ -513,7 +510,9 @@ pub fn probe_tools(plan: &[GateStep], env: &PathEnv, lookup: &ToolLookup) -> Vec
         }
         seen.insert(step.tool.clone());
         let present = env.find_binary(&step.tool);
-        let managed = lookup.get(&step.tool).or_else(|| lookup.get_by_binary(&step.tool));
+        let managed = lookup
+            .get(&step.tool)
+            .or_else(|| lookup.get_by_binary(&step.tool));
         out.push(ToolProbe {
             tool: step.tool.clone(),
             present: present.is_some(),
@@ -622,7 +621,10 @@ mod tests {
     #[test]
     fn default_bundle_is_non_empty_and_unique() {
         let bundle = default_bundle();
-        assert!(!bundle.is_empty(), "default bundle must list at least one tool");
+        assert!(
+            !bundle.is_empty(),
+            "default bundle must list at least one tool"
+        );
         // Unique by id.
         let mut seen: HashSet<&str> = HashSet::new();
         for t in &bundle {
@@ -724,7 +726,9 @@ mod tests {
     fn lookup_returns_none_for_unknown_tool() {
         let lookup = ToolLookup::from_default_bundle();
         assert!(lookup.get("definitely-not-a-real-tool").is_none());
-        assert!(lookup.get_by_binary("definitely-not-a-real-binary").is_none());
+        assert!(lookup
+            .get_by_binary("definitely-not-a-real-binary")
+            .is_none());
     }
 
     // ----- InstallHint ----------------------------------------------------
@@ -755,7 +759,11 @@ mod tests {
         // The hint template uses ${VERSION}; after substitution the
         // resolved version string must appear in the rendered reason
         // and the literal placeholder must NOT.
-        assert!(!h.reason.contains("${VERSION}"), "placeholder not substituted: {}", h.reason);
+        assert!(
+            !h.reason.contains("${VERSION}"),
+            "placeholder not substituted: {}",
+            h.reason
+        );
         assert!(h.reason.contains("pip-audit"));
     }
 
@@ -765,7 +773,9 @@ mod tests {
     fn path_env_find_binary_returns_none_for_missing() {
         // No extra dirs, no PATH entries -> never finds anything.
         let env = PathEnv::new();
-        assert!(env.find_binary("definitely-not-a-real-binary-12345").is_none());
+        assert!(env
+            .find_binary("definitely-not-a-real-binary-12345")
+            .is_none());
     }
 
     #[test]
@@ -1081,8 +1091,7 @@ mod tests {
             tool: "gitleaks".to_string(),
             required: true,
         }];
-        let (results, status) =
-            crate::gate::run_plan(&plan, crate::gate::GateMode::Strict, &env);
+        let (results, status) = crate::gate::run_plan(&plan, crate::gate::GateMode::Strict, &env);
         if env.find_binary("gitleaks").is_some() {
             // gitleaks IS installed on this box (rare but possible).
             // Skip the strict-fail assertion but still verify the
