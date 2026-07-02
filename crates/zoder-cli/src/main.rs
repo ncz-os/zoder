@@ -1089,6 +1089,17 @@ fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<(
 
 /// Build the ordered model chain to attempt: an explicit model is used alone;
 /// otherwise the routed primary followed by its fallback chain (unless disabled).
+/// Model ids in the free pool that a REAL (non-placeholder) provider serves on
+/// this host. The router uses this to avoid auto-picking a free-pool model that
+/// would fall through to the `api.example.com` placeholder default and fail.
+fn backed_free_model_ids(eng: &Engine) -> std::collections::HashSet<String> {
+    eng.corpus
+        .free_chat()
+        .filter(|m| eng.cfg.model_has_real_provider(&m.id))
+        .map(|m| m.id.clone())
+        .collect()
+}
+
 fn resolve_chain(
     cli: &Cli,
     eng: &Engine,
@@ -1097,7 +1108,9 @@ fn resolve_chain(
     if let Some(m) = &cli.model {
         return Ok((vec![m.clone()], format!("explicit model {m}")));
     }
-    let router = Router::new(&eng.corpus, health).with_primary(eng.cfg.primary_model.clone());
+    let router = Router::new(&eng.corpus, health)
+        .with_primary(eng.cfg.primary_model.clone())
+        .with_backed(Some(backed_free_model_ids(eng)));
     let route = router.select(Tier::parse(&cli.tier))?;
     let mut chain = vec![route.primary.clone()];
     if !cli.no_fallback {
@@ -1109,7 +1122,9 @@ fn resolve_chain(
 fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let health = HealthStore::load(&eng.cfg.health_path);
-    let router = Router::new(&eng.corpus, &health).with_primary(eng.cfg.primary_model.clone());
+    let router = Router::new(&eng.corpus, &health)
+        .with_primary(eng.cfg.primary_model.clone())
+        .with_backed(Some(backed_free_model_ids(&eng)));
     let route = router.select(Tier::parse(&cli.tier))?;
     // Echo the task so the decision is traceable; routing is currently
     // capability/health based, not prompt-content based (see roadmap).
@@ -1271,10 +1286,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // (e.g. a pinned `MiniMax-M3` -> the `minimax` provider). Each link in the
     // chain is resolved independently in the loop below, so one chain can span
     // providers (MiniMax -> EIH).
-    let provider_cfg = eng
-        .cfg
-        .provider_for_model(&primary)
-        .ok_or_else(|| anyhow::anyhow!("no provider configured for model {primary}"))?;
+    let provider_cfg = eng.cfg.real_provider_for_model(&primary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no real provider is configured for model '{primary}' — routing would fall through to \
+             the {host} placeholder and fail. Configure a provider that serves it (e.g. in \
+             ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass \
+             `-m <backed-model>`.",
+            host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+        )
+    })?;
 
     // L2: --dry-run short-circuits before reading stdin and any paid confirm.
     if cli.dry_run {
@@ -1331,12 +1351,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // through (paid must still confirm).
     let provider_paid = eng
         .cfg
-        .provider_for_model(&primary)
+        .real_provider_for_model(&primary)
         .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
     let provider_cost_neutral = eng
         .cfg
-        .provider_for_model(&primary)
+        .real_provider_for_model(&primary)
         .map(|p| !p.paid && p.billing != BillingMode::Metered)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) =
@@ -1414,8 +1434,14 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // that), so it is a hard configuration error.
         let pid = eng
             .cfg
-            .provider_for_model(model_id)
-            .ok_or_else(|| anyhow::anyhow!("no provider configured for model {model_id}"))?
+            .real_provider_for_model(model_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no real provider is configured for fallback model '{model_id}' (would hit the \
+                     {host} placeholder)",
+                    host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+                )
+            })?
             .id
             .clone();
         // Per-link paid gate: with per-model routing a fallback can resolve to a
@@ -1775,6 +1801,20 @@ pub(crate) async fn agentic_turn(
         eprintln!("[route] {reason}");
     }
 
+    // Backed-provider guard (agentic path): a routed/forced/pinned model with no
+    // REAL provider would be handed to the engine and dial the api.example.com
+    // placeholder default, failing cryptically. Fail legibly here — BEFORE the
+    // paid gate and the engine spawn — so `-m <unbacked>` reports the real cause
+    // ("no provider") instead of a misleading paid-confirm, mirroring oneshot.
+    eng.cfg.real_provider_for_model(&primary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no real provider is configured for model '{primary}' — it would fall through to the \
+             {host} placeholder and fail. Configure a provider that serves it, pin a backed model \
+             via [profile].primary_model, or pass `-m <backed-model>`.",
+            host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+        )
+    })?;
+
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let primary_entry = eng
@@ -1797,12 +1837,12 @@ pub(crate) async fn agentic_turn(
     // through (paid must still confirm).
     let provider_paid = eng
         .cfg
-        .provider_for_model(&primary)
+        .real_provider_for_model(&primary)
         .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
     let provider_cost_neutral = eng
         .cfg
-        .provider_for_model(&primary)
+        .real_provider_for_model(&primary)
         .map(|p| !p.paid && p.billing != BillingMode::Metered)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) =
@@ -2938,7 +2978,18 @@ async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
         let provider_cfg = eng
             .cfg
             .provider(&eng.cfg.default_provider)
-            .ok_or_else(|| anyhow::anyhow!("default provider not configured"))?;
+            .filter(|p| {
+                !p.base_url
+                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot probe: default provider '{}' is unconfigured (the {} placeholder). \
+                     Configure a real provider first.",
+                    eng.cfg.default_provider,
+                    zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+                )
+            })?;
         let provider = OpenAiProvider::new(provider_cfg)?;
         let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
         if !cli.quiet {
@@ -3005,7 +3056,17 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
     let provider_cfg = eng
         .cfg
         .provider(&default_id)
-        .ok_or_else(|| anyhow::anyhow!("default provider not configured"))?;
+        .filter(|p| {
+            !p.base_url
+                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot refresh: default provider '{default_id}' is unconfigured (the {} \
+                 placeholder). Configure a real provider first.",
+                zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            )
+        })?;
     let provider = OpenAiProvider::new(provider_cfg)?;
     let served = provider.list_models().await.map_err(|e| {
         anyhow::anyhow!(

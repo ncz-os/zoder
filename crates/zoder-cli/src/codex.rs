@@ -63,10 +63,14 @@ async fn complete_once(
     // Per-model routing: resolve the provider that actually serves this model
     // (e.g. a pinned MiniMax-M3 -> the minimax provider), not always the default
     // provider — otherwise a reviewer model could be sent to the wrong endpoint.
-    let provider_cfg = eng
-        .cfg
-        .provider_for_model(&model)
-        .ok_or_else(|| anyhow!("no provider configured for reviewer model {model}"))?;
+    let provider_cfg = eng.cfg.real_provider_for_model(&model).ok_or_else(|| {
+        anyhow!(
+            "no real provider is configured for reviewer model '{model}' — it would fall through \
+             to the {host} placeholder and fail. Configure a provider that serves it, or pass a \
+             backed reviewer via `--reviewer <model>`.",
+            host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+        )
+    })?;
 
     // Gate the reviewer/panel model. Reviewers run non-interactively (panel +
     // fix loop), so a PAID reviewer is REJECTED rather than prompted — pass

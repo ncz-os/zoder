@@ -47,6 +47,13 @@ pub struct Router<'a> {
     /// set, it always leads the chain and the capability/health-ranked free
     /// pool becomes the fallback chain behind it.
     pinned_primary: Option<String>,
+    /// Optional set of model ids that a REAL (non-placeholder) provider serves
+    /// on this host (`Config::model_has_real_provider`). When present, the
+    /// auto-pick pool is filtered to these so the router never selects a
+    /// free-pool model that would fall through to the `api.example.com`
+    /// placeholder default and fail cryptically. `None` = no filter (legacy
+    /// behavior for callers without a config in hand).
+    backed: Option<std::collections::HashSet<String>>,
 }
 
 impl<'a> Router<'a> {
@@ -55,12 +62,28 @@ impl<'a> Router<'a> {
             corpus,
             health,
             pinned_primary: None,
+            backed: None,
         }
     }
 
     /// Pin a primary model (from `Config.primary_model`) to lead the chain.
     pub fn with_primary(mut self, primary: Option<String>) -> Self {
         self.pinned_primary = primary.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Restrict the auto-pick pool to models a real provider serves on this
+    /// host. Pass `None` to disable filtering. The pinned primary is exempt
+    /// (an operator pin is honored even if it is a subscription model outside
+    /// the free pool); a bad pin still surfaces at call-site provider
+    /// resolution as a clear error, not a silent `example.com` dial.
+    pub fn with_backed(mut self, backed: Option<std::collections::HashSet<String>>) -> Self {
+        // NOTE: an *empty* Some(set) is a real signal ("no free model has a
+        // configured provider on this host") and MUST filter the pool to empty
+        // — do NOT collapse it to None. None means "caller has no config info,
+        // don't filter" (legacy). The distinction is what makes an unconfigured
+        // host fail cleanly instead of auto-picking an example.com-bound model.
+        self.backed = backed;
         self
     }
 
@@ -118,6 +141,10 @@ impl<'a> Router<'a> {
             .corpus
             .free_chat()
             .filter(|m| !self.health.breaker_open(&m.id))
+            // Only models a real provider serves on this host (when known):
+            // keeps auto-pick from selecting a free-pool model that would fall
+            // through to the api.example.com placeholder default and fail.
+            .filter(|m| self.backed.as_ref().is_none_or(|b| b.contains(&m.id)))
             .map(|m| (Self::rank_key(m, tier), m))
             .filter(|(k, _)| *k > 0.0)
             .collect();
@@ -179,9 +206,27 @@ impl<'a> Router<'a> {
             });
         }
 
-        let primary = ranked
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no healthy free model available for tier {tier:?}"))?;
+        let primary = ranked.first().ok_or_else(|| {
+            match &self.backed {
+                // A backed model exists in the pool but every one is filtered by
+                // an open circuit breaker (all unhealthy right now) — distinct
+                // from "none configured", so the operator retries rather than
+                // reconfigures.
+                Some(b) if self.corpus.free_chat().any(|m| b.contains(&m.id)) => anyhow::anyhow!(
+                    "all backed free models are currently unhealthy (circuit breaker open) — \
+                     retry shortly, or pass `-m <backed-model>` to force one"
+                ),
+                // The backed filter emptied the pool: this host has no free
+                // model served by a real (non-placeholder) provider. Auto-pick
+                // would otherwise have dialed the api.example.com placeholder.
+                Some(_) => anyhow::anyhow!(
+                    "no free model has a configured provider on this host — configure a provider \
+                     (e.g. in ~/.zoder/config.toml), pin a backed model via [profile].primary_model, \
+                     or pass `-m <backed-model>`"
+                ),
+                None => anyhow::anyhow!("no healthy free model available for tier {tier:?}"),
+            }
+        })?;
 
         let fallbacks = Self::build_fallbacks(&ranked, &primary.id, &primary.family);
 
@@ -285,6 +330,82 @@ mod tests {
         // `hi` (higher SWE) leads the fallbacks, proving the rest stay ranked.
         assert_eq!(route.fallbacks.first().map(String::as_str), Some("hi"));
         assert!(!route.fallbacks.contains(&"MiniMax-M3".to_string()));
+    }
+
+    fn three_free_model_corpus() -> Corpus {
+        Corpus {
+            models: vec![
+                ModelEntry {
+                    family: "alpha".into(),
+                    ..benched("backed-hi", 90.0)
+                },
+                ModelEntry {
+                    family: "beta".into(),
+                    ..benched("unbacked-top", 95.0)
+                },
+                ModelEntry {
+                    family: "gamma".into(),
+                    ..benched("backed-lo", 50.0)
+                },
+            ]
+            .into_iter()
+            .map(|mut m| {
+                m.free = true;
+                m.route_candidate = true;
+                m.kind = "chat".into();
+                m
+            })
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backed_filter_excludes_unbacked_models_from_autopick() {
+        // The highest-ranked model (`unbacked-top`, SWE 95) has NO configured
+        // provider on this host, so the backed filter must skip it — auto-pick
+        // lands on the top BACKED model instead of a model that would fall
+        // through to the api.example.com placeholder default.
+        let health = HealthStore::default();
+        let corpus = three_free_model_corpus();
+        let backed: std::collections::HashSet<String> =
+            ["backed-hi".to_string(), "backed-lo".to_string()].into();
+        let router = Router::new(&corpus, &health).with_backed(Some(backed));
+        let route = router.select(Tier::Auto).unwrap();
+        assert_eq!(
+            route.primary, "backed-hi",
+            "unbacked-top must be filtered out"
+        );
+        assert!(!route.fallbacks.contains(&"unbacked-top".to_string()));
+    }
+
+    #[test]
+    fn empty_backed_set_errors_instead_of_dialing_placeholder() {
+        // An empty Some(backed) means "no free model has a real provider" — the
+        // pool must filter to empty and select() must error (a legible failure),
+        // NOT be treated as "no filter" and auto-pick an example.com-bound model.
+        let health = HealthStore::default();
+        let corpus = three_free_model_corpus();
+        let router =
+            Router::new(&corpus, &health).with_backed(Some(std::collections::HashSet::new()));
+        let err = router.select(Tier::Auto).unwrap_err().to_string();
+        assert!(
+            err.contains("no free model has a configured provider"),
+            "expected the actionable no-provider error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn none_backed_preserves_legacy_unfiltered_routing() {
+        // A caller without config info (None) must not filter — legacy behavior.
+        let health = HealthStore::default();
+        let corpus = three_free_model_corpus();
+        let router = Router::new(&corpus, &health).with_backed(None);
+        let route = router.select(Tier::Auto).unwrap();
+        assert_eq!(
+            route.primary, "unbacked-top",
+            "None must not filter the pool"
+        );
     }
 
     #[test]

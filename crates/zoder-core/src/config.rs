@@ -18,6 +18,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Host substring of the built-in placeholder `default` provider. A host with
+/// no real routing config resolves every model to this sentinel endpoint;
+/// [`Config::real_provider_for_model`] treats a match as "no provider
+/// configured" so the router never auto-picks an unbacked model and callers
+/// hard-error instead of dialing a bogus URL. Kept as a constant so the
+/// sentinel and the detector can never drift.
+pub const PLACEHOLDER_PROVIDER_HOST: &str = "api.example.com";
 use std::path::{Path, PathBuf};
 
 /// How a provider authenticates. Secrets are never stored in the repo; only
@@ -320,11 +328,17 @@ impl Config {
     }
 
     /// Default config: free-tier as the single free provider.
+    ///
+    /// NOTE: the placeholder base_url ([`PLACEHOLDER_PROVIDER_HOST`]) is a
+    /// deliberate sentinel — a host with no real routing config resolves every
+    /// model to this, and [`real_provider_for_model`](Config::real_provider_for_model)
+    /// treats that as "no provider configured" so callers hard-error instead of
+    /// dialing a bogus endpoint.
     pub fn default_provider(home: &std::path::Path) -> Self {
         Config {
             providers: vec![Provider {
                 id: "default".into(),
-                base_url: "https://api.example.com/v1".into(),
+                base_url: format!("https://{PLACEHOLDER_PROVIDER_HOST}/v1"),
                 kind: "openai-chat".into(),
                 auth: Auth::Env {
                     var: "ZODER_API_KEY".into(),
@@ -377,6 +391,23 @@ impl Config {
             .reduce(|a, b| if b.0 > a.0 { b } else { a })
             .map(|(_, p)| p)
             .or_else(|| self.provider(&self.default_provider))
+    }
+
+    /// Like [`provider_for_model`], but returns `None` when the only match is
+    /// the built-in placeholder `default` provider (base_url `api.example.com`,
+    /// see [`Config::default_provider`]). A model that resolves ONLY to the
+    /// placeholder has no real backing provider on this host — dialing it hits
+    /// a bogus endpoint and fails cryptically. Callers use this to (a) keep the
+    /// router from auto-picking unbacked free-pool models and (b) hard-error
+    /// with a clear message instead of calling `api.example.com`.
+    pub fn real_provider_for_model(&self, model_id: &str) -> Option<&Provider> {
+        self.provider_for_model(model_id)
+            .filter(|p| !p.base_url.contains(PLACEHOLDER_PROVIDER_HOST))
+    }
+
+    /// `true` if a real (configured, non-placeholder) provider serves `model_id`.
+    pub fn model_has_real_provider(&self, model_id: &str) -> bool {
+        self.real_provider_for_model(model_id).is_some()
     }
 
     /// Provider ids contributed by a given vendor overlay. Returns an empty
