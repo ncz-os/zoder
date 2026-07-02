@@ -1,10 +1,15 @@
 # The CI-parity gate — zoder's compliance-first stance
 
-> **Status:** decided + being built. Slices 1-4 of the gate engine have
-> landed (planning core, CI derivation, runner, language/framework
-> detectors + honest-degradation reporting); managed tool bundle and the
-> `zoder loop --check` wiring are next (see [Roadmap](#roadmap)). This
-> document is the design of record.
+> **Status:** slices 1-5 of the gate engine have landed (planning core,
+> CI derivation, runner, language/framework detectors + honest-
+> degradation reporting, and the managed tool bundle + `zoder gate`
+> CLI wiring). The `zoder gate` subcommand is operational: `zoder gate
+> [--root DIR] [--strict|--local-iterate] [--tools-only|--plan-only]
+> [--json]` runs the gate end-to-end against the current repo. Next
+> is CI YAML adapters (Actions / GitLab / Woodpecker → `CiJob`) so
+> repo-declared CI is unioned into the plan via `derive_plan`, and
+> then `zoder loop --check` becomes the gate by default. See
+> [Roadmap](#roadmap). This document is the design of record.
 
 ## The position
 
@@ -133,9 +138,23 @@ install keeps "fail-closed" from becoming "can't work because a tool is missing.
    `GateReport` pretty/compact renderer that always attaches the
    compatibility breakdown (even on Green) so the gate's "CI parity
    within local compute/network scope" claim stays honest.
-5. **Managed tool bundle** — pinned install of the gate tools (cargo-deny,
-   cargo-audit, osv-scanner, gitleaks, cyclonedx, govulncheck, pip-audit,
-   ...) so strict-mode is reproducible and "fail-closed" never becomes
-   "can't work because a tool is missing".
-6. **Wiring** — make the gate the default `zoder loop --check`, and ground
-   the adversarial reviewer on the `GateReport` (no approve over Red).
+5. ✅ **Managed tool bundle + `zoder gate` CLI** — pinned install catalog
+   for the gate tools (cargo-deny v0.16.2, cargo-audit v0.21.4,
+   osv-scanner v2.2.1, gitleaks v8.28.0, cyclonedx v1.9.1,
+   govulncheck v1.1.4, pip-audit v2.9.0) in
+   `crates/zoder-core/src/gate_bundle.rs`, `PathEnv` real `GateEnv`
+   impl, `ToolLookup`/`InstallHint`/`ToolProbe` for the "what's
+   installed / what's missing" view, and the `zoder gate [--root DIR]
+   [--strict|--local-iterate] [--tools-only|--plan-only] [--json]`
+   subcommand that detects ecosystems, derives the plan, runs it
+   against the managed bundle, and prints the `GateReport`. Exit codes
+   follow the fail-closed posture: Green/Yellow → 0, Red → 1. The
+   report always attaches the runnable / skipped / added-baseline
+   breakdown; the renderer never silently passes a missing required
+   tool. CI YAML adapters (Actions / GitLab / Woodpecker → `CiJob`)
+   remain the next slice, which will union repo-declared CI into the
+   plan via `derive_plan` so the local simulation tracks the upstream
+   CI verbatim.
+6. **Loop wiring** — make the gate the default `zoder loop --check`,
+   and ground the adversarial reviewer on the `GateReport` (no approve
+   over Red).
