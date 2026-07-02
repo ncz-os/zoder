@@ -866,8 +866,12 @@ nits).\n",
             },
         };
         final_verdict = review.verdict.clone();
-        // The objective gate is "green" when the check passed (or none was given).
-        let green = check_passed.unwrap_or(true);
+        // Fail-closed (ADR 0002, codex emulation): the objective gate is green ONLY when a
+        // check actually RAN and passed. No executed check => NOT green, so the loop can never
+        // reach RESOLVED on the objective gate without real validation (kills the check=null /
+        // syntax-only / green-on-broken convergence that produced junk in the 12h runs). A loop
+        // with no --check now honestly stops UNRESOLVED rather than falsely resolving.
+        let green = check_passed.unwrap_or(false);
         let blocking = count_blocking(&review, green);
 
         let author_model = turn.as_ref().map(|t| t.model.clone());
