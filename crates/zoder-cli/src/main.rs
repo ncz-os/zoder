@@ -13,7 +13,8 @@ use zoder_core::{
     run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
     BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
     Entry, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate,
-    PricingCatalog, PricingSource, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
+    PricingCatalog, PricingSource, Provider, ProviderError, Router, ScopeStat, Session, State,
+    Theme, Tier,
 };
 
 #[derive(Parser, Clone)]
@@ -517,6 +518,38 @@ impl Engine {
         let cfg = Config::load()?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
         Ok(Self { cfg, corpus })
+    }
+}
+
+/// Quota-aware routing context: a snapshot of (ledger entries, tier catalog)
+/// taken once per command execution so the smart router can consult window
+/// usage on the calling thread without re-reading `ledger.jsonl` and the
+/// catalog file for every model in the fallback chain. The tier catalog is
+/// loaded the same way the report does (`load_tier_catalog`), so the router
+/// and the utilization report agree on what's "exhausted". The struct is
+/// cheap to construct (two file reads) and cheap to pass around (just refs).
+struct RoutingContext {
+    entries: Vec<Entry>,
+    catalog: zoder_core::subscription_tiers::TierCatalog,
+}
+
+impl RoutingContext {
+    fn load(cfg: &Config) -> Self {
+        let entries = Ledger::new(&cfg.ledger_path).entries().unwrap_or_default();
+        let catalog = load_tier_catalog(Some(
+            &zoder_core::subscription_tiers::default_catalog_path(&Config::home()),
+        ));
+        Self { entries, catalog }
+    }
+
+    /// Quota-aware variant of [`Config::real_provider_for_model`]. The CLI
+    /// router calls this in preference to the no-ledger form so a
+    /// subscription provider whose rolling window is at/over cap
+    /// transparently falls through to its metered sibling (vendor
+    /// dual-billing). Returns `None` for unbacked models so the caller can
+    /// hard-error with a clear message instead of dialing the placeholder.
+    fn real_provider_for_model<'a>(&self, cfg: &'a Config, model_id: &str) -> Option<&'a Provider> {
+        cfg.real_best_provider_for_model(model_id, &self.entries, &self.catalog)
     }
 }
 
@@ -1285,16 +1318,23 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // primary may belong to a different provider than `default_provider`
     // (e.g. a pinned `MiniMax-M3` -> the `minimax` provider). Each link in the
     // chain is resolved independently in the loop below, so one chain can span
-    // providers (MiniMax -> EIH).
-    let provider_cfg = eng.cfg.real_provider_for_model(&primary).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no real provider is configured for model '{primary}' — routing would fall through to \
-             the {host} placeholder and fail. Configure a provider that serves it (e.g. in \
-             ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass \
-             `-m <backed-model>`.",
-            host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-        )
-    })?;
+    // providers (MiniMax -> EIH). `routing.real_provider_for_model` is the
+    // quota-aware variant: when two providers (e.g. a subscription and its
+    // metered sibling) claim the same prefix, it picks the cost-neutral one
+    // while the subscription's rolling window has headroom and transparently
+    // falls through to the metered path when the window is exhausted.
+    let routing = RoutingContext::load(&eng.cfg);
+    let provider_cfg = routing
+        .real_provider_for_model(&eng.cfg, &primary)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no real provider is configured for model '{primary}' — routing would fall through to \
+                 the {host} placeholder and fail. Configure a provider that serves it (e.g. in \
+                 ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass \
+                 `-m <backed-model>`.",
+                host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            )
+        })?;
 
     // L2: --dry-run short-circuits before reading stdin and any paid confirm.
     if cli.dry_run {
@@ -1349,14 +1389,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // A Subscription-or-Free serving provider is $0-marginal — the call is
     // cost-neutral even if the corpus has the model non-free, so we let it
     // through (paid must still confirm).
-    let provider_paid = eng
-        .cfg
-        .real_provider_for_model(&primary)
+    let provider_paid = routing
+        .real_provider_for_model(&eng.cfg, &primary)
         .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
-    let provider_cost_neutral = eng
-        .cfg
-        .real_provider_for_model(&primary)
+    let provider_cost_neutral = routing
+        .real_provider_for_model(&eng.cfg, &primary)
         .map(|p| !p.paid && p.billing != BillingMode::Metered)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) =
@@ -1431,10 +1469,13 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // Resolve (and cache) the provider that serves THIS model. A model with
         // no provider claiming its prefix falls back to `default_provider`;
         // `None` only happens when no providers exist at all (validate() bars
-        // that), so it is a hard configuration error.
-        let pid = eng
-            .cfg
-            .real_provider_for_model(model_id)
+        // that), so it is a hard configuration error. The quota-aware
+        // router (`routing.real_provider_for_model`) transparently falls
+        // through a subscription provider whose rolling window is at/over
+        // cap to its metered sibling, so a single fallback chain can span
+        // providers AND billing modes without per-link special-casing.
+        let pid = routing
+            .real_provider_for_model(&eng.cfg, model_id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "no real provider is configured for fallback model '{model_id}' (would hit the \
@@ -1806,14 +1847,20 @@ pub(crate) async fn agentic_turn(
     // placeholder default, failing cryptically. Fail legibly here — BEFORE the
     // paid gate and the engine spawn — so `-m <unbacked>` reports the real cause
     // ("no provider") instead of a misleading paid-confirm, mirroring oneshot.
-    eng.cfg.real_provider_for_model(&primary).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no real provider is configured for model '{primary}' — it would fall through to the \
-             {host} placeholder and fail. Configure a provider that serves it, pin a backed model \
-             via [profile].primary_model, or pass `-m <backed-model>`.",
-            host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-        )
-    })?;
+    // Quota-aware variant: a subscription provider with a saturated window is
+    // transparently demoted to its metered sibling, so this guard only fires
+    // when NEITHER path has a real backing provider.
+    let routing = RoutingContext::load(&eng.cfg);
+    routing
+        .real_provider_for_model(&eng.cfg, &primary)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no real provider is configured for model '{primary}' — it would fall through to the \
+                 {host} placeholder and fail. Configure a provider that serves it, pin a backed model \
+                 via [profile].primary_model, or pass `-m <backed-model>`.",
+                host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            )
+        })?;
 
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
@@ -1835,14 +1882,12 @@ pub(crate) async fn agentic_turn(
     // A Subscription-or-Free serving provider is $0-marginal — the call is
     // cost-neutral even if the corpus has the model non-free, so we let it
     // through (paid must still confirm).
-    let provider_paid = eng
-        .cfg
-        .real_provider_for_model(&primary)
+    let provider_paid = routing
+        .real_provider_for_model(&eng.cfg, &primary)
         .map(|p| p.paid || p.billing == BillingMode::Metered)
         .unwrap_or(false);
-    let provider_cost_neutral = eng
-        .cfg
-        .real_provider_for_model(&primary)
+    let provider_cost_neutral = routing
+        .real_provider_for_model(&eng.cfg, &primary)
         .map(|p| !p.paid && p.billing != BillingMode::Metered)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) =

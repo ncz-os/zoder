@@ -271,6 +271,96 @@ fn default_strict_free() -> bool {
     true
 }
 
+/// One provider-as-candidate for the smart router, decorated with its rank
+/// criteria (billing tier + prefix specificity). The struct exists so the
+/// inner ranking function can return multiple candidates (tests inspect
+/// them, future "show me the fallback chain" UI can too) and so the sort
+/// key (`Ord` on `(billing_tier, prefix_len)`) is named once.
+struct RankedProvider<'a> {
+    provider: &'a Provider,
+    /// Longest matching `serves` prefix; higher = more specific.
+    prefix_len: usize,
+    /// Cost/preference tier (`0` = best, cheapest). See `billing_tier`
+    /// for the enum and the assignment.
+    billing_tier: BillingTier,
+}
+
+/// Ranking tier for the smart router: smaller ordinals are preferred. The
+/// ordering encodes the whole "subscription with quota beats metered;
+/// exhausted-window subscription falls through to metered" rule.
+///
+/// - `Free` (`0`): $0 marginal, no windows to be exhausted on. Always wins
+///   over everything except a longer-prefix competing Free provider.
+/// - `SubscriptionLive` (`1`): a subscription provider with remaining
+///   window quota. Marginal cost is $0; the constraint is the rolling
+///   cap.
+/// - `Metered` (`2`): pay-as-you-go. Billed per call.
+/// - `SubscriptionExhausted` (`3`): a subscription whose rolling window
+///   is at/over cap. The API call would error, so we transparently fall
+///   through to a metered alternative. Only surfaces as a last resort
+///   when no live provider claims the model — operators should re-route
+///   or wait for the window to elapse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BillingTier {
+    Free = 0,
+    SubscriptionLive = 1,
+    Metered = 2,
+    SubscriptionExhausted = 3,
+}
+
+/// Decide the billing tier for a provider given its config and (for a
+/// `Subscription`) the live usage measured from the ledger. A subscription
+/// with no resolved windows (no explicit `windows`, no catalog tier, or an
+/// unknown tier) is treated as `SubscriptionLive` (uncapped or
+/// operator-trusted): it would be wrong to demote an "I don't track this"
+/// plan to metered just because we couldn't see its caps.
+fn billing_tier(
+    p: &Provider,
+    entries: &[crate::ledger::Entry],
+    catalog: &crate::subscription_tiers::TierCatalog,
+) -> BillingTier {
+    match p.billing {
+        BillingMode::Free => BillingTier::Free,
+        BillingMode::Metered => BillingTier::Metered,
+        BillingMode::Subscription => {
+            if subscription_window_exhausted(p, entries, catalog) {
+                BillingTier::SubscriptionExhausted
+            } else {
+                BillingTier::SubscriptionLive
+            }
+        }
+    }
+}
+
+/// `true` when a subscription provider has at least one rolling window that
+/// is at/over cap per the ledger+catalog resolution. A provider with NO
+/// resolved windows returns `false` — there is no cap to be over. The
+/// check reads the local ledger (via [`crate::quota::plan_usage`]); it is
+/// inherently best-effort, exactly like the utilization report, and the
+/// window rolls forward so the same provider automatically becomes the
+/// preferred choice again once usage drops back under cap.
+fn subscription_window_exhausted(
+    p: &Provider,
+    entries: &[crate::ledger::Entry],
+    catalog: &crate::subscription_tiers::TierCatalog,
+) -> bool {
+    let Some(plan) = p.subscription.as_ref() else {
+        return false;
+    };
+    let usage = crate::quota::plan_usage(entries, &p.id, plan, catalog);
+    if usage.is_empty() {
+        return false;
+    }
+    // A subscription is "exhausted" when ANY of its rolling windows is at
+    // or over cap. The shortest window in the plan is the binding
+    // constraint — if the 5h window is at 100% the API will refuse the
+    // call even if the weekly window has headroom — so we treat any
+    // saturated window as fatal. Recovery is automatic: each window
+    // rolls forward independently on its own `hours` cadence, and
+    // `window_usage().next_reset_utc` is the exact recovery moment.
+    usage.iter().any(|w| w.pct >= 1.0)
+}
+
 impl Config {
     /// Config directory: $ZODER_HOME or ~/.zoder.
     pub fn home() -> PathBuf {
@@ -383,32 +473,107 @@ impl Config {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// Resolve which provider should serve a given model id. Returns the
-    /// provider with the LONGEST `serves` prefix matching `model_id` (most
-    /// specific wins, so `nvidia/` on one provider and `nvidia/llama-` on
-    /// another route deterministically; config order breaks exact ties). Falls
-    /// back to `default_provider` when no provider claims the prefix —
-    /// preserving the historical single-endpoint behavior for unclaimed models.
-    /// This is what lets a single routed fallback chain span providers
-    /// (MiniMax -> EIH). Empty prefixes are ignored (and rejected by
-    /// `validate()`) so a stray `serves = [""]` can never capture every model.
+    /// Resolve which provider should serve a given model id, ranked by cost:
+    /// `Free` > `Subscription` (with remaining window quota) > `Metered`.
+    /// Within each billing tier, the provider with the LONGEST matching
+    /// `serves` prefix wins (most specific claim, e.g. `nvidia/` vs
+    /// `nvidia/llama-`); equal-length ties break by config order. A model
+    /// no provider claims falls back to `default_provider`.
+    ///
+    /// Subscription providers are treated as cost-neutral ($0 marginal) only
+    /// while they have remaining window quota. An exhausted-window
+    /// subscription is demoted to the metered tier — it would error at the
+    /// API side anyway, so we skip it in favor of a working alternative.
+    /// The window rolls forward over time and the subscription becomes
+    /// available again automatically; no operator intervention is required
+    /// for recovery.
+    ///
+    /// This is the route the dual-billing vendor overlay relies on: a single
+    /// vendor modeled as SEPARATE provider entries (one subscription, one
+    /// metered — different auth and endpoint, both claiming the same model
+    /// prefixes). The subscription wins while its window has headroom; the
+    /// metered entry picks up the slack when the subscription is exhausted.
+    ///
+    /// Window-exhaustion detection needs the local ledger and the tier
+    /// catalog. Pass them in via [`best_provider_for_model`]; this
+    /// convenience wrapper passes empty entries and an empty catalog, which
+    /// degenerates to "every subscription looks non-exhausted" — still
+    /// preferred over metered, but unable to skip a saturated one. Callers
+    /// that have a `Ledger` open (the CLI router loop, pre-call routing in
+    /// `zoder exec`) should prefer [`best_provider_for_model`] so the
+    /// metered fallback actually triggers.
     pub fn provider_for_model(&self, model_id: &str) -> Option<&Provider> {
-        self.providers
+        self.best_provider_for_model(
+            model_id,
+            &[],
+            &crate::subscription_tiers::TierCatalog::empty(),
+        )
+    }
+
+    /// Full quota-aware ranking for routing. Identical to
+    /// [`provider_for_model`] but the subscription-vs-metered decision is
+    /// driven by the ledger (`entries`) and the tier `catalog` so that a
+    /// subscription whose rolling window is at/over cap is treated like a
+    /// metered provider (i.e. demoted below live subscriptions). Pass the
+    /// same `entries` / `catalog` pair the report uses so routing and the
+    /// utilization report never disagree about whether a window is full.
+    pub fn best_provider_for_model(
+        &self,
+        model_id: &str,
+        entries: &[crate::ledger::Entry],
+        catalog: &crate::subscription_tiers::TierCatalog,
+    ) -> Option<&Provider> {
+        let candidates = self.ranked_providers_for_model(model_id, entries, catalog);
+        if candidates.is_empty() {
+            // No provider claims the prefix -> fall through to
+            // `default_provider`. This is the historical single-endpoint
+            // behavior: the CLI expects a non-None answer for `-m
+            // <unprefixed>`, and the report always shows the default as
+            // the "unrouted" route. We deliberately do NOT re-rank
+            // `default_provider` against its real billing tier here —
+            // there is no competition (the list is empty by construction),
+            // so any tier assignment would be cosmetic. Just return it.
+            return self.provider(&self.default_provider);
+        }
+        candidates.into_iter().next().map(|c| c.provider)
+    }
+
+    /// Internal: return every provider that claims `model_id`, sorted best
+    /// (cheapest tier, longest prefix, earliest config order) first. The
+    /// router returns just the head; the wider list is exposed here for
+    /// testing and for future "show me the fallback chain" affordances.
+    fn ranked_providers_for_model(
+        &self,
+        model_id: &str,
+        entries: &[crate::ledger::Entry],
+        catalog: &crate::subscription_tiers::TierCatalog,
+    ) -> Vec<RankedProvider<'_>> {
+        let mut candidates: Vec<RankedProvider<'_>> = self
+            .providers
             .iter()
             .filter_map(|p| {
-                p.serves
+                let best_prefix_len = p
+                    .serves
                     .iter()
                     .filter(|prefix| !prefix.is_empty() && model_id.starts_with(prefix.as_str()))
                     .map(|prefix| prefix.len())
-                    .max()
-                    .map(|len| (len, p))
+                    .max()?;
+                Some(RankedProvider {
+                    provider: p,
+                    prefix_len: best_prefix_len,
+                    billing_tier: billing_tier(p, entries, catalog),
+                })
             })
-            // Keep the FIRST provider on an equal-length tie (config order):
-            // `reduce` retains the accumulator unless a strictly longer prefix
-            // appears, so earlier providers win ties.
-            .reduce(|a, b| if b.0 > a.0 { b } else { a })
-            .map(|(_, p)| p)
-            .or_else(|| self.provider(&self.default_provider))
+            .collect();
+        // Sort: smaller `billing_tier` wins (cheaper). Within a tier, longer
+        // `serves` prefix wins (more specific). Within those ties, original
+        // config order (stable sort on `Index`).
+        candidates.sort_by(|a, b| {
+            a.billing_tier
+                .cmp(&b.billing_tier)
+                .then_with(|| b.prefix_len.cmp(&a.prefix_len))
+        });
+        candidates
     }
 
     /// Like [`provider_for_model`], but returns `None` when the only match is
@@ -420,6 +585,21 @@ impl Config {
     /// with a clear message instead of calling `api.example.com`.
     pub fn real_provider_for_model(&self, model_id: &str) -> Option<&Provider> {
         self.provider_for_model(model_id)
+            .filter(|p| !p.base_url.contains(PLACEHOLDER_PROVIDER_HOST))
+    }
+
+    /// Quota-aware variant of [`real_provider_for_model`]. When multiple
+    /// providers claim the model's prefix, the smart router prefers a
+    /// subscription with remaining quota over its metered sibling; an
+    /// exhausted-window subscription falls through to metered. Pass the
+    /// same ledger entries and tier catalog the report uses.
+    pub fn real_best_provider_for_model(
+        &self,
+        model_id: &str,
+        entries: &[crate::ledger::Entry],
+        catalog: &crate::subscription_tiers::TierCatalog,
+    ) -> Option<&Provider> {
+        self.best_provider_for_model(model_id, entries, catalog)
             .filter(|p| !p.base_url.contains(PLACEHOLDER_PROVIDER_HOST))
     }
 
@@ -725,6 +905,9 @@ fn collect_overlays(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::Entry;
+    use crate::subscription_tiers::TierCatalog;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn provider_for_model_routes_by_serves_prefix_else_default() {
@@ -772,6 +955,183 @@ mod tests {
         assert_eq!(
             cfg.provider_for_model("azure/gpt-4o").unwrap().id,
             cfg.default_provider
+        );
+    }
+
+    /// Build a minimal config with two providers that both serve the same
+    /// `MiniMax-` prefix — one as a flat-fee subscription, one as
+    /// pay-as-you-go metered. This is the vendor-dual-billing shape:
+    /// `serves` is identical, `auth` and `base_url` differ (subscription
+    /// rides the vendor's admin-key path, metered goes through the public
+    /// API), and the smart router must pick the subscription while its
+    /// window has headroom. Tests below vary the ledger to exercise the
+    /// three phase-2 invariants.
+    fn dual_billing_fixture() -> (Config, TierCatalog) {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers.push(Provider {
+            id: "minimax-sub".into(),
+            base_url: "https://api.minimax.io/admin/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 20.0,
+                // Explicit window: 5-hour rolling cap of 900 messages.
+                // Tests saturate the ledger with >= 900 messages in the
+                // last 5 hours to flip it to "exhausted".
+                windows: vec![QuotaWindow {
+                    name: "5h".into(),
+                    hours: 5,
+                    unit: QuotaUnit::Messages,
+                    cap: 900.0,
+                }],
+                tier: None,
+            }),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "minimax-met".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            // paid=false keeps `--require-free` strict-mode honest for the
+            // metered path only insofar as the *model* (not the billing
+            // mode) decides it; the smart router does NOT short-circuit on
+            // `paid` here — billing-tier ranking owns the decision, as
+            // documented.
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: vec!["MiniMax-".into()],
+        });
+        // Empty catalog: explicit `windows` on the subscription resolve
+        // directly, no preset lookup needed. (Passing an empty catalog is
+        // equivalent here; checked explicitly in case `plan_usage` is
+        // called.)
+        (cfg, TierCatalog::empty())
+    }
+
+    /// Synthesize `n` ledger entries on `provider_id` whose `ts_utc` is
+    /// `back_min + (i as i64 % spread)` minutes behind `now`. Spreading
+    /// entries across `[back_min, back_min + spread)` lets tests pin
+    /// whether they fall INSIDE or OUTSIDE a given rolling window —
+    ///   - "in-window" use a back_min inside the lookback and a tight
+    ///     spread, so every entry counts toward `used`.
+    ///   - "out-of-window" use a back_min past the lookback so every
+    ///     entry ages out and `used` is 0.
+    ///
+    /// Each entry counts as one message (the `QuotaUnit::Messages` unit
+    /// used in the fixture).
+    fn entries_n(provider_id: &str, n: usize, back_min: i64, spread: i64) -> Vec<Entry> {
+        let now = Utc::now();
+        (0..n)
+            .map(|i| Entry {
+                ts_utc: now - Duration::minutes(back_min + i as i64 % spread),
+                provider: provider_id.into(),
+                model: "MiniMax-M3".into(),
+                host: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                calls: 1,
+                violation: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn best_provider_prefers_subscription_with_remaining_quota_over_metered() {
+        // Zero usage on the subscription: the 5h window is at 0/900. The
+        // smart router must pick the subscription (tier 1) over the
+        // metered sibling (tier 2). Without this, dual-billing would
+        // always burn the metered path and the subscription would be
+        // dead weight on disk.
+        let (cfg, cat) = dual_billing_fixture();
+        let entries = entries_n("minimax-sub", 0, 0, 1);
+        let picked = cfg
+            .best_provider_for_model("MiniMax-M3", &entries, &cat)
+            .expect("dual-billing fixture must resolve");
+        assert_eq!(
+            picked.id, "minimax-sub",
+            "subscription with remaining quota must beat metered"
+        );
+
+        // Sanity: the convenience `provider_for_model` (no ledger context)
+        // also ranks subscription above metered — its degenerated
+        // "every subscription looks non-exhausted" assumption is exactly
+        // the success-path behavior.
+        assert_eq!(
+            cfg.provider_for_model("MiniMax-M3").unwrap().id,
+            "minimax-sub",
+            "the no-ledger routing path must also prefer the subscription"
+        );
+    }
+
+    #[test]
+    fn best_provider_falls_through_to_metered_when_subscription_window_exhausted() {
+        let (cfg, cat) = dual_billing_fixture();
+        // 900 messages spread across the last 5h (5h = 300 min) ==
+        // window at cap (cap = 900.0). The subscription is "exhausted";
+        // the API would error anyway, so the router must transparently
+        // fall through to the metered sibling. Both providers claim the
+        // same prefix, so this is a pure billing-tier decision.
+        let entries = entries_n("minimax-sub", 900, 1, 290);
+        let picked = cfg
+            .best_provider_for_model("MiniMax-M3", &entries, &cat)
+            .expect("even with both providers claimed, one must resolve");
+        assert_eq!(
+            picked.id, "minimax-met",
+            "exhausted-window subscription must fall through to metered sibling"
+        );
+
+        // Regression guard for the no-ledger path: with no entries it
+        // CAN'T know the window is gone, so it picks the subscription
+        // (correctly: that IS its degenerate assumption). Document the
+        // asymmetry in the test so a future reader understands why the
+        // two views disagree — and why callers that care MUST pass
+        // entries.
+        let picked_no_ledger = cfg.provider_for_model("MiniMax-M3").unwrap();
+        assert_eq!(
+            picked_no_ledger.id, "minimax-sub",
+            "without ledger context the smart router has no signal that the \
+             subscription is saturated and conservatively picks it; this is \
+             why `best_provider_for_model` exists"
+        );
+    }
+
+    #[test]
+    fn best_provider_recovers_subscription_once_window_resets() {
+        // Same fixture, but the 900-saturating entries are OUTSIDE the
+        // rolling 5h window — they're 5h20m to 6h20m old, so the 5h
+        // window's measured `used` is 0/900. The router must treat the
+        // subscription as live again. This is the "automatic recovery"
+        // half of the spec: no operator intervention, the window rolls
+        // forward on its own.
+        let (cfg, cat) = dual_billing_fixture();
+        // 900 entries spread across `[320, 380)` minutes back — every
+        // one of them is older than the 5h (300 min) lookback, so the
+        // 5h window measures `used == 0`.
+        let entries = entries_n("minimax-sub", 900, 320, 60);
+        let picked = cfg
+            .best_provider_for_model("MiniMax-M3", &entries, &cat)
+            .expect("both providers claim the prefix; one must resolve");
+        assert_eq!(
+            picked.id, "minimax-sub",
+            "the rolling 5h window must have aged the saturating entries \
+             out; the subscription is live again and must be preferred"
+        );
+
+        // And the saturating entries, when placed INSIDE the window,
+        // still trigger the metered fall-through (sanity — recovery is
+        // the contrast, not a substitute for the saturation case).
+        let in_window = entries_n("minimax-sub", 900, 1, 290);
+        let picked_saturated = cfg
+            .best_provider_for_model("MiniMax-M3", &in_window, &cat)
+            .unwrap();
+        assert_eq!(
+            picked_saturated.id, "minimax-met",
+            "control: in-window saturation still falls through to metered"
         );
     }
 
