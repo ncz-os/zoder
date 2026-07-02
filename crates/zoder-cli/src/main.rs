@@ -17,9 +17,9 @@ use zoder_core::{
     estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage,
     run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
     BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
-    Entry, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate,
-    PricingCatalog, PricingSource, Provider, ProviderError, Router, ScopeStat, Session, State,
-    Theme, Tier,
+    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
+    Period, PolicyGate, PricingCatalog, PricingSource, Provider, ProviderError, Router, ScopeStat,
+    Session, State, Theme, Tier,
 };
 
 #[derive(Parser, Clone)]
@@ -2412,6 +2412,32 @@ pub(crate) async fn agentic_turn(
     // field. Use the engine's configured socket path so any logging that
     // happens to reference it (none on the goose path) is still meaningful.
     let socket_path = socket.unwrap_or_else(engine_socket_path);
+
+    // CREDENTIAL/ENDPOINT bridge (task #19, seam 1): when the operator
+    // selected the goose engine, resolve the same provider the oneshot
+    // + agentic gates already validated (`real_best_provider_for_model`)
+    // and forward its key + base_url to the spawned `goose acp` child.
+    // Without this, goose can't authenticate against a free/subscription
+    // provider and the loop silently fails or dials the wrong endpoint.
+    // We only build this on the goose path — zeroclaw handles its own
+    // auth and never sees these vars.
+    let goose_provider = if matches!(engine_kind, EngineKind::Goose) {
+        routing
+            .real_provider_for_model(&eng.cfg, &primary)
+            .map(|p| GooseProviderEnv {
+                provider_id: p.id.clone(),
+                kind: p.kind.clone(),
+                base_url: p.base_url.clone(),
+                // Resolve the credential the SAME way the engine bridge
+                // does (auth.resolve() reads env vars or returns the
+                // inline bearer — never log this value; it is redacted
+                // by `GooseProviderEnv`'s Debug impl above).
+                api_key: p.auth.resolve(),
+            })
+    } else {
+        None
+    };
+
     let opts = AgentOptions {
         socket: socket_path,
         agent_alias: alias.clone(),
@@ -2427,6 +2453,7 @@ pub(crate) async fn agentic_turn(
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
+        goose_provider,
     };
 
     let started = std::time::Instant::now();
