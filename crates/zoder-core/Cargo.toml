@@ -8,6 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Core engine for zoder: cost-aware free-first model routing, health, policy gate, and spend ledger over any OpenAI-compatible/LiteLLM fleet."
 
+[build-dependencies]
+# build.rs only emits rustc-env values; no third-party deps needed.
+
 [dependencies]
 acp-client = { path = "../acp-client" }
 model-health = { path = "../model-health" }
