@@ -31,7 +31,7 @@ use tokio::process::Child;
 /// Unix socket. Future: spawn a child process (e.g. `goose acp`) and speak
 /// ACP over its stdio. The JSON-RPC layer is identical in both cases — only
 /// the transport half-acquisition differs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum EngineTransport {
     /// Connect to an existing daemon over a Unix-domain socket.
     UnixSocket(PathBuf),
@@ -42,6 +42,46 @@ pub enum EngineTransport {
         args: Vec<String>,
         env: Vec<(String, String)>,
     },
+}
+
+/// A process-env key whose VALUE is a secret (API key / token / bearer). Used
+/// to redact values in any Debug/log rendering of a spawned engine's env — the
+/// goose bridge injects `OPENAI_API_KEY`, so a bare `{:?}` on the transport or
+/// its env vector would otherwise leak the operator's provider key.
+pub(crate) fn is_secret_env_key(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k.contains("API_KEY") || k.contains("TOKEN") || k.contains("SECRET") || k.ends_with("_KEY")
+}
+
+/// Render an engine env vector for Debug/log output with secret VALUES masked
+/// while non-secret vars (GOOSE_PROVIDER, GOOSE_MODEL, OPENAI_BASE_URL, …) stay
+/// visible so the output remains useful.
+pub(crate) fn redact_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(k, v)| {
+            let shown = if is_secret_env_key(k) {
+                "***REDACTED***".to_string()
+            } else {
+                v.clone()
+            };
+            (k.clone(), shown)
+        })
+        .collect()
+}
+
+impl std::fmt::Debug for EngineTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineTransport::UnixSocket(p) => f.debug_tuple("UnixSocket").field(p).finish(),
+            EngineTransport::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                // env values are redacted: the goose bridge injects OPENAI_API_KEY.
+                .field("env", &redact_env(env))
+                .finish(),
+        }
+    }
 }
 
 /// A live, connected ACP transport: a byte-stream reader + writer. For
@@ -1816,7 +1856,7 @@ mod tests {
     fn env_get<'a>(env: &'a [(String, String)], key: &str) -> &'a str {
         env.iter()
             .find(|(k, _)| k == key)
-            .unwrap_or_else(|| panic!("env missing required var {key}; got {env:?}"))
+            .unwrap_or_else(|| panic!("env missing required var {key}; got {:?}", redact_env(env)))
             .1
             .as_str()
     }
@@ -1827,7 +1867,33 @@ mod tests {
     fn assert_env_absent(env: &[(String, String)], key: &str) {
         assert!(
             env.iter().all(|(k, _)| k != key),
-            "env must not contain {key}; got {env:?}"
+            "env must not contain {key}; got {:?}",
+            redact_env(env)
+        );
+    }
+
+    #[test]
+    fn engine_transport_debug_redacts_secret_env_values() {
+        let t = EngineTransport::Stdio {
+            command: "goose".to_string(),
+            args: vec!["acp".to_string()],
+            env: vec![
+                ("GOOSE_MODEL".to_string(), "MiniMax-M3".to_string()),
+                (
+                    "OPENAI_API_KEY".to_string(),
+                    "sk-super-secret-value".to_string(),
+                ),
+            ],
+        };
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains("sk-super-secret-value"),
+            "key leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+        assert!(
+            dbg.contains("MiniMax-M3"),
+            "non-secret value should stay visible: {dbg}"
         );
     }
 
