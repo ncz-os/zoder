@@ -876,6 +876,13 @@ pub(crate) async fn cmd_loop(
     // child with no progress is indistinguishable from no-op output for the
     // purpose of deciding whether to keep grinding.
     let mut dead_streak = 0usize;
+    // Consecutive iterations that produced NO NEW progress (identical diff, still
+    // unresolved). A single no-op turn is NOT fatal — the author may just need a
+    // firmer nudge (or a harder blocker to chew on). Only give up after this many
+    // consecutive stalls, mirroring `dead_streak`. Prevents one empty author turn
+    // from terminating a task that is genuinely still converging.
+    let mut stall_streak = 0usize;
+    const STALL_LIMIT: usize = 3;
 
     for i in 1..=max_iters {
         // 1. Author turn — continue the SAME engine session for memory.
@@ -1131,7 +1138,8 @@ reviewer advisory, verdict={}, blocking={blocking})",
 
         // No-progress guard (2nd iteration on): an identical diff that still
         // isn't accepted. (Never trips on iter 1, where prev_diff is empty.)
-        if i > 1 && diff == prev_diff {
+        let no_new_progress = i > 1 && diff == prev_diff;
+        if no_new_progress {
             // Stalemate breaker: the objective check is GREEN but the reviewer
             // keeps blocking the SAME diff. Rather than discard a verified fix,
             // resolve with the findings recorded as warnings.
@@ -1145,10 +1153,28 @@ reviewer keeps blocking an unchanged diff ({blocking} blocking finding(s) record
                 }
                 break;
             }
-            if !cli.quiet {
-                eprintln!("[loop] iter {i}: no progress (diff unchanged); stopping.");
+            // A single no-op turn is not fatal: the author may just need a firmer
+            // nudge (see the escalated feedback below). Only give up after
+            // STALL_LIMIT consecutive stalls — otherwise keep grinding.
+            stall_streak += 1;
+            if stall_streak >= STALL_LIMIT {
+                if !cli.quiet {
+                    eprintln!(
+                        "[loop] iter {i}: no new progress for {stall_streak} consecutive \
+iteration(s); stopping."
+                    );
+                }
+                break;
             }
-            break;
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: no new progress ({stall_streak}/{STALL_LIMIT}); \
+re-prompting the author with a firmer directive."
+                );
+            }
+            // fall through: compose escalated feedback and try again.
+        } else {
+            stall_streak = 0;
         }
         prev_diff = diff.clone();
 
@@ -1166,6 +1192,17 @@ prioritize making the validation command pass.\n\n"
                 "You made NO changes to the repository in the previous turn. You MUST actually \
 edit the source files using your file/shell tools (e.g. write to src/lib.rs), not just describe \
 the fix. Apply the changes now.\n\n",
+            );
+        } else if no_new_progress {
+            // The author left the diff identical to last turn yet the task is
+            // still unresolved. Push harder, and give it a legitimate way to say
+            // it's blocked (rather than silently producing nothing again).
+            fb.push_str(
+                "Your previous turn produced NO NEW edits, yet the validation still fails. Do NOT \
+repeat prior work or stop — make ADDITIONAL, different changes this turn to clear the remaining \
+blocker shown below. If (and only if) the required fix genuinely lies OUTSIDE the files/scope you \
+were told to edit, respond on the FIRST line with `BLOCKED: <exactly what change is needed and \
+where>` and stop; otherwise keep editing until the check passes.\n\n",
             );
         }
         if check_passed == Some(false) {
