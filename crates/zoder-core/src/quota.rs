@@ -9,8 +9,16 @@
 
 use crate::config::{QuotaUnit, QuotaWindow, SubscriptionPlan};
 use crate::ledger::Entry;
+use crate::subscription_tiers::{resolve_plan_windows, TierCatalog, WindowProvenance};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
+
+/// Distinct `source` value for operator-entered windows in serialized reports.
+/// Catalog windows carry the catalog row's own `source` string
+/// (e.g. `"minimax_token_plan"`, `"observed"`); windows with no catalog origin
+/// carry this constant so JSON consumers can filter/sort/label report rows
+/// unambiguously without parsing the `confidence` field.
+pub const SOURCE_OPERATOR: &str = "operator";
 
 /// pct at/above which a window is flagged as approaching its cap.
 pub const APPROACHING_THRESHOLD: f64 = 0.8;
@@ -31,6 +39,20 @@ pub struct WindowUsage {
     pub next_reset_utc: Option<String>,
     /// True when usage is at/above [`APPROACHING_THRESHOLD`] of the cap.
     pub approaching: bool,
+    /// `confidence` of the cap value (`published` | `observed` | `estimated`).
+    /// Always carried so the caller can label reports "ESTIMATED" honestly;
+    /// `None` for explicit (hand-entered) windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Provenance of this window: `None` (legacy callers without a `source`
+    /// arg), the catalog row's own `source` string (e.g.
+    /// `"minimax_token_plan"`, `"observed"`), or [`crate::quota::SOURCE_OPERATOR`]
+    /// when the window came from the operator's config rather than a catalog
+    /// preset. Carried PER WINDOW (not per plan) so override / appended
+    /// windows in a `PresetWithOverrides` plan are not mislabeled as
+    /// catalog-backed. Always `Some` after going through [`plan_usage`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
@@ -41,8 +63,20 @@ fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
 }
 
 /// Consumption of one rolling window for `provider_id`, measured over the
-/// trailing `window.hours` from now.
-pub fn window_usage(entries: &[Entry], provider_id: &str, w: &QuotaWindow) -> WindowUsage {
+/// trailing `window.hours` from now. The optional `confidence` + `source` are
+/// plumbed through from the catalog so the report can label preset-driven
+/// windows (and leave explicit windows unlabeled) without mislabeling
+/// operator-entered overrides / extras as catalog-backed estimates.
+///
+/// `confidence = None` AND `source = None` ↔ hand-entered window (legacy
+/// `confidence`-only callers get identical behavior to before).
+pub fn window_usage(
+    entries: &[Entry],
+    provider_id: &str,
+    w: &QuotaWindow,
+    confidence: Option<&str>,
+    source: Option<&str>,
+) -> WindowUsage {
     let now = Utc::now();
     let since = now - Duration::hours(w.hours as i64);
     let mut used = 0.0;
@@ -65,25 +99,80 @@ pub fn window_usage(entries: &[Entry], provider_id: &str, w: &QuotaWindow) -> Wi
         pct,
         next_reset_utc,
         approaching: pct >= APPROACHING_THRESHOLD,
+        confidence: confidence.map(|s| s.to_string()),
+        source: source.map(|s| s.to_string()),
     }
 }
 
-/// Consumption of every window in a plan, for one provider.
+/// Backward-compat shim: original 4-arg signature for callers that don't have
+/// a per-window `source` to plumb through (the old `confidence`-only API).
+/// Equivalent to [`window_usage`] with `source = None`.
+pub fn window_usage_confidence_only(
+    entries: &[Entry],
+    provider_id: &str,
+    w: &QuotaWindow,
+    confidence: Option<&str>,
+) -> WindowUsage {
+    window_usage(entries, provider_id, w, confidence, None)
+}
+
+/// Consumption of every window in a plan, for one provider. When the plan
+/// declares a `tier`, the effective windows are resolved through the
+/// `catalog` first (preset → explicit overrides by `name`). When the plan
+/// has no `tier` or the resolver falls back to explicit windows, the
+/// confidence tag is `None` (hand-entered).
+///
+/// **Per-window provenance** (the fix vs. the prior single-`confidence` tag):
+/// the resolver attaches a [`WindowProvenance`] to every emitted window, and
+/// we propagate it row-by-row. Catalog windows inherit the catalog row's
+/// `confidence` + `source` (e.g. `("observed", "minimax_token_plan")`);
+/// operator-entered override windows and "extra" appended windows are tagged
+/// `None` confidence with `source = "operator"` so JSON consumers can
+/// distinguish them from catalog rows without parsing the `confidence` field.
+/// No more "every window in this plan reads as catalog-backed" mislabeling.
 pub fn plan_usage(
     entries: &[Entry],
     provider_id: &str,
     plan: &SubscriptionPlan,
+    catalog: &TierCatalog,
 ) -> Vec<WindowUsage> {
-    plan.windows
+    let resolved = resolve_plan_windows(plan, catalog, Some(provider_id));
+    debug_assert_eq!(
+        resolved.windows.len(),
+        resolved.provenance.len(),
+        "resolver invariant violated: windows.len() != provenance.len() ({} vs {})",
+        resolved.windows.len(),
+        resolved.provenance.len(),
+    );
+    resolved
+        .windows
         .iter()
-        .map(|w| window_usage(entries, provider_id, w))
+        .zip(resolved.provenance.iter())
+        .map(|(w, prov)| {
+            let (confidence, source) = match prov {
+                WindowProvenance::Catalog { confidence, source } => {
+                    (Some(confidence.as_str()), Some(source.as_str()))
+                }
+                WindowProvenance::Operator => (None, Some(SOURCE_OPERATOR)),
+            };
+            window_usage(entries, provider_id, w, confidence, source)
+        })
         .collect()
 }
 
 /// Amortized $/call for the flat fee: the monthly fee spread across the calls
 /// actually made on this provider in the trailing 30 days. Returns 0 when the
-/// plan has no fee or no calls were made.
-pub fn amortized_per_call(entries: &[Entry], provider_id: &str, plan: &SubscriptionPlan) -> f64 {
+/// plan has no fee or no calls were made. Accepts the catalog so it stays
+/// symmetric with [`plan_usage`]; the catalog is not consulted here (the
+/// `monthly_fee_usd` lives on the plan, not the catalog), but accepting it
+/// keeps the call sites uniform and lets a future enhancement factor the
+/// catalog's `monthly_fee_usd` override in one place.
+pub fn amortized_per_call(
+    entries: &[Entry],
+    provider_id: &str,
+    plan: &SubscriptionPlan,
+    _catalog: &TierCatalog,
+) -> f64 {
     if plan.monthly_fee_usd <= 0.0 {
         return 0.0;
     }
@@ -96,5 +185,256 @@ pub fn amortized_per_call(entries: &[Entry], provider_id: &str, plan: &Subscript
         0.0
     } else {
         plan.monthly_fee_usd / calls as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Per-window confidence + source threading (the BLOCKER fix).
+    //!
+    //! Asserts that `plan_usage` propagates the catalog's `(confidence,
+    //! source)` tuple ONLY to preset windows that survived untouched, and
+    //! tags operator-entered override / appended windows with `confidence
+    //! = None` and `source = "operator"`. Before the fix, every window in a
+    //! `PresetWithOverrides` plan inherited the catalog confidence — this
+    //! suite is the regression guard.
+
+    use super::*;
+    use crate::config::{QuotaUnit, QuotaWindow, SubscriptionPlan};
+    use crate::subscription_tiers::{
+        Confidence, ProviderTiers, TierCatalog, TierEntry, TierWindow,
+    };
+    use chrono::{Duration, Utc};
+    use std::collections::BTreeMap;
+
+    fn w(name: &str, hours: u32, cap: f64, unit: QuotaUnit) -> QuotaWindow {
+        QuotaWindow {
+            name: name.into(),
+            hours,
+            unit,
+            cap,
+        }
+    }
+
+    fn tw(name: &str, hours: u32, cap: f64, unit: QuotaUnit) -> TierWindow {
+        TierWindow {
+            name: name.into(),
+            hours,
+            unit,
+            cap,
+        }
+    }
+
+    /// One Anthropic `claude-max-20x` tier with `(Observed, "observed")` and
+    /// two windows: a 5h of 900 messages and a weekly of 8000 messages.
+    fn catalog() -> TierCatalog {
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "claude-max-20x".into(),
+            TierEntry {
+                monthly_fee_usd: 200.0,
+                confidence: Confidence::Observed,
+                source: "observed".into(),
+                windows: vec![
+                    tw("5h", 5, 900.0, QuotaUnit::Messages),
+                    tw("weekly", 168, 8000.0, QuotaUnit::Messages),
+                ],
+            },
+        );
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic".into(),
+            ProviderTiers {
+                tiers: tiers.clone(),
+            },
+        );
+        TierCatalog {
+            version: 1,
+            as_of: "2026-06-30".into(),
+            disclaimer: "ESTIMATES".into(),
+            providers,
+        }
+    }
+
+    fn by_name(usage: &[WindowUsage]) -> std::collections::HashMap<String, WindowUsage> {
+        usage.iter().map(|w| (w.name.clone(), w.clone())).collect()
+    }
+
+    #[test]
+    fn plan_usage_no_tier_leaves_every_window_unlabeled_for_confidence() {
+        // Explicit-only plan: every window is hand-entered → `confidence =
+        // None`. Source is uniformly tagged `Some("operator")` so downstream
+        // JSON consumers can filter all operator-provenance rows with the
+        // same predicate regardless of whether they came from a full-explicit
+        // plan or a `PresetWithOverrides` override / extra.
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![w("5h", 5, 100.0, QuotaUnit::Messages)],
+            tier: None,
+        };
+        let cat = TierCatalog::empty();
+        let out = plan_usage(&[], "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].confidence.is_none());
+        assert_eq!(out[0].source.as_deref(), Some("operator"));
+    }
+
+    #[test]
+    fn plan_usage_preset_alone_tags_every_window_with_catalog_provenance() {
+        // Preset with no operator windows → every row inherits the catalog
+        // row's (Observed, "observed").
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![],
+            tier: Some("claude-max-20x".into()),
+        };
+        let cat = catalog();
+        let out = plan_usage(&[], "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 2);
+        let by_n = by_name(&out);
+        assert_eq!(by_n["5h"].confidence.as_deref(), Some("observed"));
+        assert_eq!(by_n["5h"].source.as_deref(), Some("observed"));
+        assert_eq!(by_n["weekly"].confidence.as_deref(), Some("observed"));
+        assert_eq!(by_n["weekly"].source.as_deref(), Some("observed"));
+    }
+
+    #[test]
+    fn plan_usage_preset_with_overrides_threading_per_window_provenance() {
+        // THIS is the regression guard for the BLOCKER. Pre-fix, every
+        // window in a `PresetWithOverrides` plan was labeled with the
+        // catalog confidence. We now expect:
+        //   - "5h" (overridden)       → None / "operator"
+        //   - "weekly" (preserved)    → "observed" / "observed"
+        //   - "daily" (appended)      → None / "operator"
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![
+                w("5h", 5, 1500.0, QuotaUnit::Messages),    // override
+                w("daily", 24, 500.0, QuotaUnit::Messages), // append (extra)
+            ],
+            tier: Some("claude-max-20x".into()),
+        };
+        let cat = catalog();
+        let out = plan_usage(&[], "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 3);
+        let by_n = by_name(&out);
+
+        // 5h: overridden → operator.
+        assert_eq!(
+            by_n["5h"].confidence, None,
+            "overridden window must not carry catalog confidence"
+        );
+        assert_eq!(
+            by_n["5h"].source.as_deref(),
+            Some("operator"),
+            "overridden window must be tagged source = \"operator\""
+        );
+        // Override cap must reach the usage row (operator's value, not the
+        // catalog's 900).
+        assert_eq!(by_n["5h"].cap, 1500.0);
+
+        // weekly: untouched preset row → catalog provenance intact.
+        assert_eq!(by_n["weekly"].confidence.as_deref(), Some("observed"));
+        assert_eq!(by_n["weekly"].source.as_deref(), Some("observed"));
+        assert_eq!(by_n["weekly"].cap, 8000.0);
+
+        // daily: appended → operator.
+        assert_eq!(by_n["daily"].confidence, None);
+        assert_eq!(by_n["daily"].source.as_deref(), Some("operator"));
+        assert_eq!(by_n["daily"].cap, 500.0);
+    }
+
+    #[test]
+    fn plan_usage_unknown_tier_every_window_operator() {
+        // Unknown tier (or empty catalog) → can't inherit provenance from
+        // nothing → operator-entered windows are unlabeled for confidence but
+        // tagged `source = "operator"` so JSON consumers have a uniform
+        // signal across every operator-provenance path.
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![w("5h", 5, 250.0, QuotaUnit::Messages)],
+            tier: Some("claude-max-does-not-exist".into()),
+        };
+        let cat = catalog(); // catalog exists but tier is unknown.
+        let out = plan_usage(&[], "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].confidence, None);
+        assert_eq!(out[0].source.as_deref(), Some("operator"));
+        assert_eq!(out[0].cap, 250.0);
+    }
+
+    #[test]
+    fn plan_usage_carries_confidence_for_distinct_catalog_tiers() {
+        // A different catalog row with a different `confidence` / `source`
+        // must round-trip unchanged through `plan_usage`. Guards against
+        // accidentally hard-coding one tier's provenance in the engine.
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "pro".into(),
+            TierEntry {
+                monthly_fee_usd: 20.0,
+                confidence: Confidence::Published,
+                source: "minimax_token_plan".into(),
+                windows: vec![tw("5h", 5, 200.0, QuotaUnit::Messages)],
+            },
+        );
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic".into(),
+            ProviderTiers {
+                tiers: tiers.clone(),
+            },
+        );
+        let cat = TierCatalog {
+            version: 1,
+            as_of: "2026-06-30".into(),
+            disclaimer: "d".into(),
+            providers,
+        };
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![],
+            tier: Some("pro".into()),
+        };
+        let out = plan_usage(&[], "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].confidence.as_deref(), Some("published"));
+        assert_eq!(out[0].source.as_deref(), Some("minimax_token_plan"));
+    }
+
+    #[test]
+    fn plan_usage_measured_calls_in_lookback() {
+        // Smoke test that the actual measurement loop still works with the
+        // new signature: synthesize a few entries in the last 5h, confirm
+        // `used` and `pct` reflect them while confidence / source are
+        // independent.
+        let now = Utc::now();
+        let mk = |provider: &str, mins_ago: i64, calls: u64| Entry {
+            ts_utc: now - Duration::minutes(mins_ago),
+            provider: provider.into(),
+            model: "x".into(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            calls,
+            violation: None,
+        };
+        let entries = vec![mk("anthropic", 10, 1), mk("anthropic", 60, 1)];
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![],
+            tier: Some("claude-max-20x".into()),
+        };
+        let cat = catalog();
+        let out = plan_usage(&entries, "anthropic", &plan, &cat);
+        assert_eq!(out.len(), 2);
+        // Both windows picked up the catalog provenance.
+        let by_n = by_name(&out);
+        assert_eq!(by_n["5h"].confidence.as_deref(), Some("observed"));
+        assert_eq!(by_n["weekly"].confidence.as_deref(), Some("observed"));
+        // Note: `unit_amount` returns 1.0 per matching Entry for
+        // QuotaUnit::Messages, so two entries in-window → `used >= 2.0`.
+        assert!(by_n["5h"].used >= 2.0);
     }
 }

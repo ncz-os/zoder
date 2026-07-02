@@ -122,12 +122,30 @@ pub struct QuotaWindow {
 }
 
 /// Subscription terms for a flat-fee provider (ChatGPT/Claude/Cursor-style).
+///
+/// A plan can be declared in three shapes (see
+/// [`crate::subscription_tiers::resolve_plan_windows`]):
+///   1. **Explicit**: `windows: [...]` is set, no `tier` → used as-is.
+///   2. **Preset**:   only `tier: "..."` is set → catalog lookup fills the
+///      windows.
+///   3. **Preset + overrides**: both are set → preset windows, then explicit
+///      windows override by `name` (operator tunes one cap).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionPlan {
     /// Flat monthly fee in USD (used only to amortize an effective per-call $).
     #[serde(default)]
     pub monthly_fee_usd: f64,
+    /// Optional curated tier id (e.g. `claude-max-20x`, `token-plan-2`). When
+    /// set, the windows come from [`crate::subscription_tiers::TierCatalog`]
+    /// resolved at load time. May be combined with `windows` to override
+    /// individual caps by `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     /// Rolling rate-limit windows (e.g. a 5-hour cap plus a weekly cap).
+    /// - With `tier = None`: used as-is.
+    /// - With `tier = Some(_)`: every window with a `name` that also exists
+    ///   in the catalog preset overrides that cap; windows without a
+    ///   matching preset `name` are appended as extra windows.
     #[serde(default)]
     pub windows: Vec<QuotaWindow>,
 }
