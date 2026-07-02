@@ -15,7 +15,9 @@
 //!    `CompatibilityReport`, `derive_plan`.                    ✅
 //!  - Slice 4 — language/framework detectors beyond Rust + the
 //!    `GateReport` honest-degradation renderer.                ✅
-//!  - Slice 5 — managed tool bundle + `--check` wiring.        (next)
+//!  - Slice 5 — managed tool bundle (`gate_bundle::default_bundle` +
+//!    `PathEnv`/`ToolLookup`/`InstallHint`) + `zoder gate` CLI
+//!    wiring (`crates/zoder-cli/src/main.rs::cmd_gate`).        ✅
 //!
 //! Everything is deterministic and unit-tested so the planning + reporting
 //! layer can be reasoned about without spinning a process.
@@ -790,9 +792,15 @@ pub fn baseline_plan_for(eco: Ecosystem, marker_files: &[&str]) -> Vec<GateStep>
         // For Poetry / Uv the canonical test invocation is `poetry run
         // pytest` / `uv run pytest` and the canonical audit must be run
         // *inside* the locked env, otherwise we're auditing the wrong set
-        // of packages. We do not invent a separate `uv audit` command
-        // (none exists) — pip-audit remains the audit, but it's required to
-        // be `pip-audit -r <requirements>` to ensure it reads the locked env.
+        // of packages. The audit command is the package-manager-native
+        // form (`poetry run pip-audit` / `uv run pip-audit`), which runs
+        // pip-audit against the locked env directly. This avoids the
+        // previous bug where the audit step hard-coded
+        // `pip-audit -r requirements.txt` even when no `requirements.txt`
+        // exists in the repo (the typical Poetry/uv layout is
+        // `pyproject.toml` + `<pm>.lock` only). Tool stays `pip-audit` —
+        // the binary that actually performs the audit must be on PATH
+        // (or installable into the PM env) for the step to succeed.
         (Ecosystem::Python, PackageManager::Poetry) => Some(vec![
             step(
                 "fmt",
@@ -825,7 +833,7 @@ pub fn baseline_plan_for(eco: Ecosystem, marker_files: &[&str]) -> Vec<GateStep>
             step(
                 "audit",
                 StepCategory::Security,
-                vec_strs(&["pip-audit", "-r", "requirements.txt"]),
+                vec_strs(&["poetry", "run", "pip-audit"]),
                 "pip-audit",
                 true,
             ),
@@ -862,7 +870,7 @@ pub fn baseline_plan_for(eco: Ecosystem, marker_files: &[&str]) -> Vec<GateStep>
             step(
                 "audit",
                 StepCategory::Security,
-                vec_strs(&["pip-audit", "-r", "requirements.txt"]),
+                vec_strs(&["uv", "run", "pip-audit"]),
                 "pip-audit",
                 true,
             ),
@@ -913,14 +921,22 @@ pub fn detect_go(marker_files: &[&str]) -> bool {
 /// for "what did we find in this repo?" reporting, not for naming any
 /// step. Every entry is independently testable.
 pub fn detect_frameworks(marker_files: &[&str]) -> Vec<String> {
-    // Order is deterministic; we dedupe case-sensitively but every hint
-    // string in the table is already canonical lowercase, so the
-    // case-sensitive dedup produces the same output as a case-insensitive
-    // one in practice. No external I/O. No JSON parsing (we can't safely
-    // without serde_json being a hard dep on this planning module — and
-    // the gate engine wants pure planning). Future slices may add
-    // content-based hints (e.g. reading `package.json` to spot a React
-    // dep), gated behind a trait.
+    // Deterministic output is load-bearing for the audit trail: this
+    // function may be called with marker lists produced by filesystem
+    // enumeration (different order on different machines / filesystems),
+    // so output order MUST NOT depend on input order. We iterate
+    // MARKER_HINTS in table order as the OUTER loop and the input marker
+    // list as the INNER check — first hit for each (key -> hint) wins,
+    // and each hint is pushed at most once because the table is
+    // deduplicated by construction.
+    //
+    // Every hint string in the table is already canonical lowercase, so
+    // the case-sensitive dedup (via the `seen` set below) is identical to
+    // a case-insensitive one in practice. No external I/O. No JSON
+    // parsing (we can't safely without serde_json being a hard dep on
+    // this planning module — and the gate engine wants pure planning).
+    // Future slices may add content-based hints (e.g. reading
+    // `package.json` to spot a React dep), gated behind a trait.
     const MARKER_HINTS: &[(&str, &str)] = &[
         // Node / JS / TS
         ("tsconfig.json", "typescript"),
@@ -946,12 +962,17 @@ pub fn detect_frameworks(marker_files: &[&str]) -> Vec<String> {
         ("go.mod", "go-modules"),
     ];
     let mut out: Vec<String> = Vec::new();
-    for marker in marker_files {
-        for (key, hint) in MARKER_HINTS {
-            if marker == key && !out.iter().any(|h| h == hint) {
-                out.push((*hint).to_string());
-            }
+    for (key, hint) in MARKER_HINTS {
+        if !marker_files.contains(key) {
+            continue;
         }
+        // Each hint is emitted at most once even when multiple table
+        // entries collapse to the same hint (e.g. tsconfig.json and
+        // tsconfig.base.json both -> "typescript").
+        if out.iter().any(|h| h == hint) {
+            continue;
+        }
+        out.push((*hint).to_string());
     }
     out
 }
@@ -1025,11 +1046,56 @@ impl GateReport {
     /// Build the canonical `GateReport` from runner outputs. Always
     /// recomputes the status from `results` via `aggregate` so the report
     /// can never get out of sync with what actually happened.
+    ///
+    /// Fail-closed contract for the compatibility breakdown: a non-empty
+    /// `compatibility.skipped` set means CI jobs exist that this local
+    /// gate did NOT verify. "Green = nothing skipped" is load-bearing —
+    /// the gate's claim of CI parity is only honest when nothing was
+    /// pushed off to upstream CI. Therefore, if the results-only status
+    /// would be Green but the compatibility report has at least one
+    /// skipped job, we downgrade to Yellow (with the skipped job names
+    /// surfaced for the reviewer). Red still dominates: a results-only
+    /// Red is preserved as Red regardless of how clean the compatibility
+    /// breakdown is.
     pub fn new(results: Vec<StepResult>, compatibility: CompatibilityReport) -> Self {
         // Defensive recompute: a caller could in principle construct a
         // status manually and disagree with the results. We refuse to be
         // the source of that disagreement.
-        let status = aggregate(&results);
+        let mut status = aggregate(&results);
+        // Compatibility-driven downgrade: only Green can be downgraded to
+        // Yellow. Red (required failures) and Yellow (skipped steps in
+        // results) already block convergence, so we leave them alone.
+        // Yellow via results is widened to include the compatibility
+        // skipped names so the reviewer sees the full unverified set.
+        if !compatibility.skipped.is_empty() {
+            match &status {
+                GateStatus::Green => {
+                    let mut skipped: Vec<String> = compatibility
+                        .skipped
+                        .iter()
+                        .map(|(name, _reason)| name.clone())
+                        .collect();
+                    // Stable, deterministic ordering for the surfaced set.
+                    skipped.sort();
+                    skipped.dedup();
+                    status = GateStatus::Yellow { skipped };
+                }
+                GateStatus::Yellow { skipped: existing } => {
+                    // Union the compatibility-skipped names into the
+                    // already-skipped list, sorted+deduped for stability.
+                    let mut union: Vec<String> = existing.clone();
+                    for (name, _reason) in &compatibility.skipped {
+                        union.push(name.clone());
+                    }
+                    union.sort();
+                    union.dedup();
+                    status = GateStatus::Yellow { skipped: union };
+                }
+                GateStatus::Red { .. } => {
+                    // Red dominates: do not mutate.
+                }
+            }
+        }
         Self {
             status,
             results,
@@ -2325,6 +2391,96 @@ mod tests {
     }
 
     #[test]
+    fn baseline_plan_for_python_poetry_audit_uses_pm_native_pip_audit_not_requirements_txt() {
+        // Adversarial-review pin: Poetry projects typically do NOT ship
+        // a `requirements.txt` file (the canonical lockfile is
+        // `poetry.lock`). The audit step must therefore NOT hard-code
+        // `pip-audit -r requirements.txt`; it must use the Poetry-native
+        // audit path so pip-audit runs against the locked env.
+        let plan = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "poetry.lock"]);
+        let audit = plan.iter().find(|s| s.name == "audit").expect("audit");
+        assert_eq!(
+            audit.command,
+            vec!["poetry", "run", "pip-audit"],
+            "Poetry audit must use PM-native `poetry run pip-audit`, got {:?}",
+            audit.command,
+        );
+        // No -r requirements.txt anywhere in the argv.
+        assert!(
+            !audit.command.iter().any(|a| a == "-r"),
+            "Poetry audit must not use `-r`; got {:?}",
+            audit.command,
+        );
+        assert!(
+            !audit.command.iter().any(|a| a == "requirements.txt"),
+            "Poetry audit must not reference requirements.txt; got {:?}",
+            audit.command,
+        );
+        // Tool stays pip-audit (the binary doing the actual audit).
+        assert_eq!(audit.tool, "pip-audit");
+        // And it remains required: an unverified audit is a blocker.
+        assert!(audit.required, "audit remains required under Poetry");
+    }
+
+    #[test]
+    fn baseline_plan_for_python_uv_audit_uses_pm_native_pip_audit_not_requirements_txt() {
+        // Same contract for uv: `uv.lock` is the canonical lockfile, no
+        // `requirements.txt` typically present. The audit must use
+        // `uv run pip-audit` so pip-audit reads the locked env directly.
+        let plan = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "uv.lock"]);
+        let audit = plan.iter().find(|s| s.name == "audit").expect("audit");
+        assert_eq!(
+            audit.command,
+            vec!["uv", "run", "pip-audit"],
+            "uv audit must use PM-native `uv run pip-audit`, got {:?}",
+            audit.command,
+        );
+        assert!(
+            !audit.command.iter().any(|a| a == "-r"),
+            "uv audit must not use `-r`; got {:?}",
+            audit.command,
+        );
+        assert!(
+            !audit.command.iter().any(|a| a == "requirements.txt"),
+            "uv audit must not reference requirements.txt; got {:?}",
+            audit.command,
+        );
+        assert_eq!(audit.tool, "pip-audit");
+        assert!(audit.required);
+    }
+
+    #[test]
+    fn baseline_plan_for_python_default_audit_does_not_reference_requirements_txt() {
+        // When no Poetry/uv markers are present, the default Python
+        // baseline is used. The audit step in that baseline is just
+        // `pip-audit` (no `-r requirements.txt`) — pip-audit walks the
+        // active interpreter's installed packages. This is what the
+        // Poetry/uv refinements diverge FROM (and why they now use the
+        // PM-native form to ensure the audit reads the LOCKED env, not
+        // whatever the local interpreter happens to have installed).
+        let plan = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "requirements.txt"]);
+        let audit = plan.iter().find(|s| s.name == "audit").expect("audit");
+        assert_eq!(
+            audit.command,
+            vec!["pip-audit"],
+            "default-Python audit (no Poetry/uv markers) is `pip-audit` (no -r), got {:?}",
+            audit.command,
+        );
+        assert!(
+            !audit.command.iter().any(|a| a == "-r"),
+            "default Python audit must not use `-r`; got {:?}",
+            audit.command,
+        );
+        assert!(
+            !audit.command.iter().any(|a| a == "requirements.txt"),
+            "default Python audit must not reference requirements.txt; got {:?}",
+            audit.command,
+        );
+        assert_eq!(audit.tool, "pip-audit");
+        assert!(audit.required);
+    }
+
+    #[test]
     fn baseline_plan_for_python_with_no_pm_marker_falls_back_to_default() {
         // pyproject.toml only (no poetry.lock, no uv.lock) -> default
         // Python baseline (pip / pytest / pip-audit).
@@ -2439,31 +2595,129 @@ mod tests {
     #[test]
     fn detect_frameworks_is_deterministic_and_excludes_unrelated_files() {
         // Determinism contract: same input set in different orders MUST
-        // yield the same set of hints, even if the hint ORDER is allowed
-        // to depend on input order. (We use a per-marker stable mapping,
-        // so input order matters for output order — that's deliberate:
-        // it makes the function trivially predictable and `unwrap`-free.)
+        // yield the same output VECTOR (not just the same set) — order
+        // matters because this is consumed by reporting layers that
+        // surface the hints to reviewers. We iterate MARKER_HINTS in
+        // table order as the outer loop, so input order cannot perturb
+        // the output.
         let a = detect_frameworks(&["Cargo.toml", "tsconfig.json", "vite.config.ts", "README.md"]);
         let b = detect_frameworks(&["README.md", "vite.config.ts", "tsconfig.json", "Cargo.toml"]);
 
-        // Same SET, even if order varies.
-        let mut a_sorted = a.clone();
-        let mut b_sorted = b.clone();
-        a_sorted.sort();
-        b_sorted.sort();
+        // Exact vector equality: same input set in different orders must
+        // produce IDENTICAL output (no input-order dependence).
         assert_eq!(
-            a_sorted, b_sorted,
-            "detect_frameworks must be deterministic w.r.t. input set, got left={a:?} right={b:?}",
+            a, b,
+            "detect_frameworks must be input-order independent, got left={a:?} right={b:?}",
         );
 
-        // And the output set itself, sorted for stable comparison.
-        let mut want = vec!["typescript".to_string(), "vite".to_string()];
-        want.sort();
-        assert_eq!(a_sorted, want);
+        // Expected output: ORDER IS FIXED by the MARKER_HINTS table, not
+        // the input. tsconfig.json ("typescript") comes before
+        // vite.config.ts ("vite") in the table, so "typescript" precedes
+        // "vite" in the output regardless of input order.
+        assert_eq!(
+            a,
+            vec!["typescript".to_string(), "vite".to_string()],
+            "output order must follow MARKER_HINTS table order (input-order independent)",
+        );
 
         // No false positives on locked-down unrelated filenames.
         assert!(!a.iter().any(|h| h == "django"));
         assert!(!a.iter().any(|h| h == "flask"));
+    }
+
+    #[test]
+    fn detect_frameworks_is_input_order_independent_under_filesystem_enumeration() {
+        // Adversarial-review pin: marker_files in the wild can come from
+        // filesystem enumeration, where ordering is platform- and
+        // filesystem-dependent (ext4 vs APFS vs NTFS, dir readdir order,
+        // case-folding filesystems). Output MUST be the same vector
+        // regardless of permutation.
+        let canonical = vec![
+            "Cargo.toml",
+            "package.json",
+            "tsconfig.json",
+            "next.config.ts",
+            "vite.config.ts",
+            "jest.config.js",
+            "pyproject.toml",
+            "poetry.lock",
+            "uv.lock",
+            "manage.py",
+            "go.mod",
+        ];
+
+        // Reference: forward order.
+        let reference = detect_frameworks(&canonical);
+
+        // Reversed: exact reverse of the canonical list.
+        let mut reversed = canonical.clone();
+        reversed.reverse();
+        assert_eq!(detect_frameworks(&reversed), reference);
+
+        // Rotated-by-3: shift every element 3 positions left.
+        let rotated: Vec<&str> = canonical
+            .iter()
+            .cycle()
+            .skip(3)
+            .take(canonical.len())
+            .copied()
+            .collect();
+        assert_eq!(detect_frameworks(&rotated), reference);
+
+        // Shuffled-by-swaps: a deterministic non-identity permutation
+        // that swaps pairs to ensure the output isn't accidentally equal
+        // only because of structural similarity.
+        let swapped: Vec<&str> = vec![
+            "go.mod",
+            "pyproject.toml",
+            "poetry.lock",
+            "uv.lock",
+            "manage.py",
+            "package.json",
+            "jest.config.js",
+            "vite.config.ts",
+            "next.config.ts",
+            "tsconfig.json",
+            "Cargo.toml",
+        ];
+        assert_eq!(detect_frameworks(&swapped), reference);
+
+        // Single-element list (degenerate case): each marker individually
+        // produces a one-element vector in table order.
+        assert_eq!(
+            detect_frameworks(&["pyproject.toml"]),
+            vec!["pyproject".to_string()],
+        );
+        assert_eq!(
+            detect_frameworks(&["tsconfig.json"]),
+            vec!["typescript".to_string()],
+        );
+        // "Cargo.toml" is NOT a framework hint (Rust ecosystem marker
+        // only). The empty vector must be exactly empty, not skipped.
+        assert_eq!(detect_frameworks(&["Cargo.toml"]), Vec::<String>::new());
+
+        // The reference itself, asserted for the audit trail: it must
+        // equal the MARKER_HINTS table order restricted to entries whose
+        // key is in the input. The table order is Node/TS first, then
+        // Python, then Go, with internal dedup (typescript once, etc.).
+        let mut want = vec![
+            "typescript".to_string(),
+            "next.js".to_string(),
+            "vite".to_string(),
+            "jest".to_string(),
+            "django".to_string(),
+            "poetry".to_string(),
+            "pyproject".to_string(),
+            "uv".to_string(),
+            "go-modules".to_string(),
+        ];
+        // Sanity: the reference equals want.
+        assert_eq!(reference, want);
+        // Spot-check: every hint comes from the table, no surprise extras.
+        want.sort();
+        let mut got_sorted = reference.clone();
+        got_sorted.sort();
+        assert_eq!(got_sorted, want);
     }
 
     #[test]
@@ -2709,12 +2963,48 @@ mod tests {
         // A Green report MUST attach the compatibility breakdown so the
         // audit trail is complete. The contract is set in the docstring:
         // an all-Green report without a breakdown is not honestly
-        // auditable.
+        // auditable. With the fail-closed skip contract in effect, a
+        // genuine Green report is only possible when the compatibility
+        // `skipped` set is empty — so we exercise that path here.
         let report = GateReport::new(
             vec![
                 result("fmt", true, StepOutcome::Passed),
                 result("test", true, StepOutcome::Passed),
             ],
+            compat(&["fmt", "test"], &[], &["deny"]),
+        );
+        let pretty = report.to_pretty();
+        // Verdict line.
+        assert!(pretty.contains("🟢 GREEN"));
+        // Breakdown header summary.
+        assert!(pretty.contains("breakdown:"));
+        assert!(pretty.contains("2 runnable"));
+        assert!(pretty.contains("1 added-baseline"));
+        assert!(pretty.contains("0 skipped"));
+        // Per-step table.
+        assert!(pretty.contains("PASSED"));
+        assert!(pretty.contains("fmt"));
+        assert!(pretty.contains("test"));
+        // Compatibility section, with the added-baseline item surfaced.
+        assert!(pretty.contains("compatibility:"));
+        assert!(pretty.contains("runnable"));
+        assert!(pretty.contains("added-baseline"));
+        assert!(pretty.contains("deny"));
+    }
+
+    #[test]
+    fn gate_report_skipped_compat_downgrades_green_to_yellow() {
+        // Adversarial-review pin: the original bug let a report with
+        // skipped CI jobs + all-passing baseline steps render Green. That
+        // is dishonest — "Green = nothing skipped". A non-empty
+        // compatibility.skipped set MUST downgrade Green to Yellow so
+        // reviewers see that some CI jobs were not verified locally.
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result("test", true, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(
+            results,
             compat(
                 &["fmt", "test"],
                 &[(
@@ -2724,24 +3014,96 @@ mod tests {
                 &["deny"],
             ),
         );
-        let pretty = report.to_pretty();
-        // Verdict line.
-        assert!(pretty.contains("🟢 GREEN"));
-        // Breakdown header summary.
-        assert!(pretty.contains("breakdown:"));
-        assert!(pretty.contains("2 runnable"));
-        assert!(pretty.contains("1 added-baseline"));
-        assert!(pretty.contains("1 skipped"));
-        // Per-step table.
-        assert!(pretty.contains("PASSED"));
-        assert!(pretty.contains("fmt"));
-        assert!(pretty.contains("test"));
-        // Compatibility section, with the skipped reason.
-        assert!(pretty.contains("compatibility:"));
-        assert!(pretty.contains("runnable"));
-        assert!(pretty.contains("added-baseline"));
-        assert!(pretty.contains("integration"));
-        assert!(pretty.contains("requires service containers"));
+        // The status must be Yellow (not Green) because CI skipped a job.
+        match &report.status {
+            GateStatus::Yellow { skipped } => {
+                assert!(
+                    skipped.iter().any(|n| n == "integration"),
+                    "the skipped CI job name must surface in the Yellow skipped set, got {skipped:?}",
+                );
+            }
+            other => panic!(
+                "expected Yellow (skip-compat downgrade), got {other:?} — fail-closed posture broken"
+            ),
+        }
+        assert!(!report.is_passed(), "skip-compat must block is_passed()");
+        assert!(
+            !report.is_failed(),
+            "skip-compat downgrade is Yellow, not Red"
+        );
+        // The headline + pretty + compact renderings must reflect Yellow.
+        assert!(report.headline().contains("🟡 YELLOW"));
+        assert!(report.to_pretty().contains("🟡 YELLOW"));
+        assert!(report.to_compact().contains("🟡 YELLOW"));
+    }
+
+    #[test]
+    fn gate_report_skipped_compat_unions_into_existing_yellow() {
+        // If results alone would already yield Yellow (e.g. an optional
+        // step skipped because its tool is missing), the compatibility
+        // skipped names are UNIONED into the Yellow.skipped list so the
+        // reviewer sees the full unverified set, not just the in-process
+        // one. Order is sorted for determinism.
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result(
+                "audit",
+                false,
+                StepOutcome::Skipped {
+                    reason: "tool `cargo-audit` not available".to_string(),
+                },
+            ),
+        ];
+        let report = GateReport::new(
+            results,
+            compat(
+                &["fmt"],
+                &[("zeta", "requires CI secrets (upstream CI verifies)")],
+                &["audit"],
+            ),
+        );
+        match &report.status {
+            GateStatus::Yellow { skipped } => {
+                // Both names surfaced (sorted, deduped).
+                assert_eq!(
+                    skipped,
+                    &vec!["audit".to_string(), "zeta".to_string()],
+                    "compat.skipped + results-skipped must be unioned (sorted+deduped) into Yellow.skipped, got {skipped:?}",
+                );
+            }
+            other => panic!("expected Yellow with unioned skips, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_report_skipped_compat_does_not_downgrade_red() {
+        // Red dominates: a results-only Red must NOT be masked by an
+        // empty compatibility.skipped (and conversely, a results-only
+        // Red stays Red even when compat has skipped items).
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result("test", true, StepOutcome::Failed),
+        ];
+        let report = GateReport::new(
+            results,
+            compat(
+                &["fmt"],
+                &[(
+                    "integration",
+                    "requires service containers (upstream CI verifies)",
+                )],
+                &["test"],
+            ),
+        );
+        // Red must be preserved end-to-end.
+        assert_eq!(
+            report.status,
+            GateStatus::Red {
+                failures: vec!["test".to_string()],
+            },
+        );
+        assert!(report.is_failed());
+        assert!(!report.is_passed());
     }
 
     #[test]
