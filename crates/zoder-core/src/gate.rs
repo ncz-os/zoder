@@ -1,14 +1,29 @@
 //! CI-parity gate engine: pure planning core.
 //!
-//! This module is the SLICE 1 of the gate engine. It is intentionally
-//! pure — no subprocess execution and no CI-file parsing here, those
-//! belong to later slices. What lives here is the data model
-//! (ecosystems, steps, outcomes), marker-based ecosystem detection,
-//! baseline OSS-hygiene plans per ecosystem, and the Green/Yellow/Red
-//! aggregation of step results.
+//! This module is the **gate engine** (see `docs/CI-PARITY-GATE.md` for the
+//! design of record). It is intentionally pure — no subprocess execution
+//! and no real CI-file YAML parsing here, those belong to later wiring
+//! slices. What lives here is the data model, the planning layer, the
+//! runner core, and the honest-degradation reporting.
 //!
-//! Everything is deterministic and unit-tested so the planning layer
-//! can be reasoned about without spinning a process.
+//! Slice status:
+//!  - Slice 1 — gate-planning core: `Ecosystem`, `GateStep`, detection,
+//!    `baseline_plan`, `GateStatus`, `aggregate`.             ✅
+//!  - Slice 2 — gate runner core: `GateMode`, `GateEnv`, `StepExec`,
+//!    `run_plan`.                                              ✅
+//!  - Slice 3 — CI-derivation classifier: `CiJob`,
+//!    `CompatibilityReport`, `derive_plan`.                    ✅
+//!  - Slice 4 — language/framework detectors beyond Rust + the
+//!    `GateReport` honest-degradation renderer.                ✅
+//!  - Slice 5 — managed tool bundle + `--check` wiring.        (next)
+//!
+//! Everything is deterministic and unit-tested so the planning + reporting
+//! layer can be reasoned about without spinning a process.
+//!
+//! The fail-closed posture is **load-bearing**: aggregate / run / report
+//! must never silently pass a missing required tool, and the report
+//! renderer must always surface the runnable / skipped / added-baseline
+//! breakdown so the claim "it passed the gate" stays honest.
 
 /// Detected project ecosystem (from marker files at the repo root).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +537,649 @@ pub fn run_plan(
 
     let status = aggregate(&results);
     (results, status)
+}
+
+// ============================================================================
+// === SLICE 4 (a) — language / framework detectors BEYOND Rust + canonical ===
+// === commands per language.                                              ===
+// ============================================================================
+//
+// The original `detect_ecosystems` + `baseline_plan` cover Rust, Node, Python,
+// Go at the ecosystem level. What this slice adds is:
+//
+//  1. Per-language explicit detectors (Rust / Node / Python / Go) that
+//     canonicalize on MARKER files (the same set `detect_ecosystems` uses)
+//     but expose them as named predicates so callers don't have to know the
+//     marker convention.
+//  2. A `PackageManager` enum + `detect_package_manager` so we can pick the
+//     correct test/build command (yarn vs pnpm vs npm vs bun for Node;
+//     poetry vs uv vs pip for Python). Pnpm/Yarn/Poetry/Uv are first-class
+//     in the wild and silently defaulting to `npm`/`pip` ships wrong CI.
+//  3. `baseline_plan_for(eco, marker_files)` — the marker-aware version
+//     of `baseline_plan` that returns the canonical fmt/lint/test/build
+//     commands for the EXACT package manager the project uses. Falls back
+//     to `baseline_plan(eco)` when the package manager can't be inferred,
+//     so this never weakens the existing plans.
+//  4. `detect_frameworks(marker_files)` — lightweight, pure, no-JSON
+//     framework-hint detector that returns strings like "typescript",
+//     "react", "next.js", "vite", "django", "flask", "fastapi", "poetry",
+//     "uv". Marker names drive the hints so the detector stays deterministic,
+//     `unwrap`-free, and trivial to unit-test.
+//
+// Honest-degradation contract for this slice:
+//  - Per-language detectors MUST be exact-string marker checks (no
+//    substring fuzz). The existing detect contract forbids that, and
+//    these detectors honor it.
+//  - `baseline_plan_for` MUST return at least the same canonical fmt/lint/
+//    test/build steps as `baseline_plan` (degrades gracefully); it only
+//    ADDS package-manager refinement on top.
+//  - A detected framework MUST never REPLACE the canonical step — only
+//    flag an extra hint. Frameworks can have broken tooling; the canonical
+//    command remains the safety floor.
+
+/// A detected package manager (Node- or Python-side; Cargo/Go are
+/// single-tool, so they don't get an enum variant). Anything not enumerated
+/// here falls through to the ecosystem's default in `baseline_plan`.
+///
+/// This enum is deliberately scoped to package managers whose command line
+/// differs meaningfully from the ecosystem default. We do not enumerate
+/// `npm` as a separate Node variant — npm is the ecosystem default. Same
+/// for `pip`: the default Python baseline assumes `pip` / the user env.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    // Node / JS / TS — non-default
+    Yarn,
+    Pnpm,
+    Bun,
+    // Python — non-default
+    Poetry,
+    Uv,
+}
+
+impl PackageManager {
+    /// Canonical cli name ("yarn" / "pnpm" / "bun" / "poetry" / "uv").
+    /// Slotted here (rather than inlined at the call site) so the canonical
+    /// name list is the single source of truth.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            PackageManager::Yarn => "yarn",
+            PackageManager::Pnpm => "pnpm",
+            PackageManager::Bun => "bun",
+            PackageManager::Poetry => "poetry",
+            PackageManager::Uv => "uv",
+        }
+    }
+}
+
+/// Detect the per-ecosystem package manager from repo-root marker files.
+/// Marker → package manager mapping is intentional and exact:
+///   - `pnpm-lock.yaml` / `.pnpmfile.cjs`      -> Pnpm (Node)
+///   - `yarn.lock`                              -> Yarn  (Node)
+///   - `bun.lockb`                              -> Bun   (Node)
+///   - `poetry.lock`                            -> Poetry (Python)
+///   - `uv.lock`                                -> Uv    (Python)
+///   - `Pipfile.lock` / `requirements.txt`     -> (default: pip) — intentionally
+///     left as `None` because pip is the Python baseline default.
+///
+/// For Rust and Go there is no relevant enum variant (single toolchain),
+/// so `detect_package_manager` for those ecosystems always returns `None`.
+pub fn detect_package_manager(eco: Ecosystem, marker_files: &[&str]) -> Option<PackageManager> {
+    let has = |name: &str| marker_files.contains(&name);
+    match eco {
+        Ecosystem::Node => {
+            if has("pnpm-lock.yaml") {
+                Some(PackageManager::Pnpm)
+            } else if has("yarn.lock") {
+                Some(PackageManager::Yarn)
+            } else if has("bun.lockb") {
+                Some(PackageManager::Bun)
+            } else {
+                None
+            }
+        }
+        Ecosystem::Python => {
+            if has("uv.lock") {
+                Some(PackageManager::Uv)
+            } else if has("poetry.lock") {
+                Some(PackageManager::Poetry)
+            } else {
+                None
+            }
+        }
+        // Rust (cargo) and Go (go toolchain) are single-tool ecosystems;
+        // if a project uses one it uses that one. No refinement needed.
+        Ecosystem::Rust | Ecosystem::Go => None,
+    }
+}
+
+/// Marker-aware baseline plan. Equal to `baseline_plan(eco)` UNLESS a
+/// non-default package manager can be inferred from the markers, in which
+/// case the canonical fmt/lint/test/build argv is adjusted to use that
+/// package manager's CLI (e.g. `pnpm test` for a pnpm project, `uv run
+/// pytest` for a uv-managed project).
+///
+/// IMPORTANT — fail-closed contract:
+///  - This function NEVER returns fewer required steps than `baseline_plan`.
+///    At worst, it returns the same steps (degraded to default CLI args).
+///  - When the package-manager refinement changes a step's `required`
+///    classification relative to the default baseline, it can only ever
+///    raise it (optional -> required), never lower it. The strict posture
+///    must not be weakened by a marker-fuzzy refinement.
+pub fn baseline_plan_for(eco: Ecosystem, marker_files: &[&str]) -> Vec<GateStep> {
+    let default = baseline_plan(eco);
+    let Some(pm) = detect_package_manager(eco, marker_files) else {
+        return default;
+    };
+
+    let refined = match (eco, pm) {
+        // --- Node refinements -----------------------------------------------
+        (Ecosystem::Node, PackageManager::Yarn) => Some(vec![
+            step(
+                "fmt",
+                StepCategory::Format,
+                vec_strs(&["npx", "prettier", "--check", "."]),
+                "npx",
+                false,
+            ),
+            step(
+                "lint",
+                StepCategory::Lint,
+                vec_strs(&["yarn", "lint"]),
+                "yarn",
+                true,
+            ),
+            step(
+                "build",
+                StepCategory::Build,
+                vec_strs(&["yarn", "build"]),
+                "yarn",
+                true,
+            ),
+            step(
+                "test",
+                StepCategory::Test,
+                vec_strs(&["yarn", "test"]),
+                "yarn",
+                true,
+            ),
+            step(
+                "audit",
+                StepCategory::Security,
+                vec_strs(&["yarn", "npm", "audit", "--audit-level=high"]),
+                "yarn",
+                true,
+            ),
+        ]),
+        (Ecosystem::Node, PackageManager::Pnpm) => Some(vec![
+            step(
+                "fmt",
+                StepCategory::Format,
+                vec_strs(&["npx", "prettier", "--check", "."]),
+                "npx",
+                false,
+            ),
+            step(
+                "lint",
+                StepCategory::Lint,
+                vec_strs(&["pnpm", "run", "lint"]),
+                "pnpm",
+                true,
+            ),
+            step(
+                "build",
+                StepCategory::Build,
+                vec_strs(&["pnpm", "run", "build"]),
+                "pnpm",
+                true,
+            ),
+            step(
+                "test",
+                StepCategory::Test,
+                vec_strs(&["pnpm", "test"]),
+                "pnpm",
+                true,
+            ),
+            step(
+                "audit",
+                StepCategory::Security,
+                vec_strs(&["pnpm", "audit", "--audit-level=high"]),
+                "pnpm",
+                true,
+            ),
+        ]),
+        (Ecosystem::Node, PackageManager::Bun) => Some(vec![
+            step(
+                "fmt",
+                StepCategory::Format,
+                vec_strs(&["bunx", "prettier", "--check", "."]),
+                "bun",
+                false,
+            ),
+            step(
+                "lint",
+                StepCategory::Lint,
+                vec_strs(&["bun", "run", "lint"]),
+                "bun",
+                true,
+            ),
+            step(
+                "build",
+                StepCategory::Build,
+                vec_strs(&["bun", "run", "build"]),
+                "bun",
+                true,
+            ),
+            step(
+                "test",
+                StepCategory::Test,
+                vec_strs(&["bun", "test"]),
+                "bun",
+                true,
+            ),
+            step(
+                "audit",
+                StepCategory::Security,
+                vec_strs(&["bun", "audit", "--audit-level=high"]),
+                "bun",
+                true,
+            ),
+        ]),
+
+        // --- Python refinements ---------------------------------------------
+        //
+        // For Poetry / Uv the canonical test invocation is `poetry run
+        // pytest` / `uv run pytest` and the canonical audit must be run
+        // *inside* the locked env, otherwise we're auditing the wrong set
+        // of packages. We do not invent a separate `uv audit` command
+        // (none exists) — pip-audit remains the audit, but it's required to
+        // be `pip-audit -r <requirements>` to ensure it reads the locked env.
+        (Ecosystem::Python, PackageManager::Poetry) => Some(vec![
+            step(
+                "fmt",
+                StepCategory::Format,
+                vec_strs(&["ruff", "format", "--check", "."]),
+                "ruff",
+                false,
+            ),
+            step(
+                "lint",
+                StepCategory::Lint,
+                vec_strs(&["ruff", "check", "."]),
+                "ruff",
+                true,
+            ),
+            step(
+                "build",
+                StepCategory::Build,
+                vec_strs(&["poetry", "build"]),
+                "poetry",
+                false,
+            ),
+            step(
+                "test",
+                StepCategory::Test,
+                vec_strs(&["poetry", "run", "pytest", "-q"]),
+                "poetry",
+                true,
+            ),
+            step(
+                "audit",
+                StepCategory::Security,
+                vec_strs(&["pip-audit", "-r", "requirements.txt"]),
+                "pip-audit",
+                true,
+            ),
+        ]),
+        (Ecosystem::Python, PackageManager::Uv) => Some(vec![
+            step(
+                "fmt",
+                StepCategory::Format,
+                vec_strs(&["ruff", "format", "--check", "."]),
+                "ruff",
+                false,
+            ),
+            step(
+                "lint",
+                StepCategory::Lint,
+                vec_strs(&["ruff", "check", "."]),
+                "ruff",
+                true,
+            ),
+            step(
+                "build",
+                StepCategory::Build,
+                vec_strs(&["uv", "build"]),
+                "uv",
+                false,
+            ),
+            step(
+                "test",
+                StepCategory::Test,
+                vec_strs(&["uv", "run", "pytest", "-q"]),
+                "uv",
+                true,
+            ),
+            step(
+                "audit",
+                StepCategory::Security,
+                vec_strs(&["pip-audit", "-r", "requirements.txt"]),
+                "pip-audit",
+                true,
+            ),
+        ]),
+
+        // The remaining combinations are unreachable:
+        //   - `detect_package_manager` returns `Some(pm)` only for Node /
+        //     Python.
+        //   - Rust and Go ecosystems never produce `Some(pm)`; they reach
+        //     here only via `None` -> default (handled above).
+        //   - Cross-ecosystem combos (e.g. Node + Poetry) are impossible:
+        //     `detect_package_manager` keys `pm` off `eco`.
+        // These collapses to the default baseline — exactly what the
+        // fail-closed contract requires.
+        (Ecosystem::Rust, _)
+        | (Ecosystem::Go, _)
+        | (Ecosystem::Node, PackageManager::Poetry)
+        | (Ecosystem::Node, PackageManager::Uv)
+        | (Ecosystem::Python, PackageManager::Yarn)
+        | (Ecosystem::Python, PackageManager::Pnpm)
+        | (Ecosystem::Python, PackageManager::Bun) => None,
+    };
+
+    refined.unwrap_or(default)
+}
+
+/// Per-ecosystem explicit detectors (boolean predicates). These are the
+/// "I want a clear yes/no for THIS language" shape; `detect_ecosystems`
+/// is for "give me every ecosystem this repo looks like". Both must agree
+/// on the same markers — and they do: see tests.
+pub fn detect_rust(marker_files: &[&str]) -> bool {
+    marker_files.contains(&"Cargo.toml")
+}
+pub fn detect_node(marker_files: &[&str]) -> bool {
+    marker_files.contains(&"package.json")
+}
+pub fn detect_python(marker_files: &[&str]) -> bool {
+    marker_files.contains(&"pyproject.toml")
+        || marker_files.contains(&"requirements.txt")
+        || marker_files.contains(&"setup.py")
+}
+pub fn detect_go(marker_files: &[&str]) -> bool {
+    marker_files.contains(&"go.mod")
+}
+
+/// A framework / family hint derived purely from marker filenames. The
+/// returned strings are stable, lowercase, and human-readable — meant
+/// for "what did we find in this repo?" reporting, not for naming any
+/// step. Every entry is independently testable.
+pub fn detect_frameworks(marker_files: &[&str]) -> Vec<String> {
+    // Order is deterministic; we dedupe case-sensitively but every hint
+    // string in the table is already canonical lowercase, so the
+    // case-sensitive dedup produces the same output as a case-insensitive
+    // one in practice. No external I/O. No JSON parsing (we can't safely
+    // without serde_json being a hard dep on this planning module — and
+    // the gate engine wants pure planning). Future slices may add
+    // content-based hints (e.g. reading `package.json` to spot a React
+    // dep), gated behind a trait.
+    const MARKER_HINTS: &[(&str, &str)] = &[
+        // Node / JS / TS
+        ("tsconfig.json", "typescript"),
+        ("tsconfig.base.json", "typescript"),
+        ("next.config.js", "next.js"),
+        ("next.config.ts", "next.js"),
+        ("next.config.mjs", "next.js"),
+        ("nuxt.config.ts", "nuxt"),
+        ("nuxt.config.js", "nuxt"),
+        ("vite.config.ts", "vite"),
+        ("vite.config.js", "vite"),
+        ("vitest.config.ts", "vitest"),
+        ("vitest.config.js", "vitest"),
+        ("jest.config.js", "jest"),
+        ("jest.config.ts", "jest"),
+        // Python
+        ("manage.py", "django"),
+        ("Pipfile", "pipenv"),
+        ("poetry.lock", "poetry"),
+        ("pyproject.toml", "pyproject"), // generic Python packaging
+        ("uv.lock", "uv"),
+        // Go
+        ("go.mod", "go-modules"),
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for marker in marker_files {
+        for (key, hint) in MARKER_HINTS {
+            if marker == key && !out.iter().any(|h| h == hint) {
+                out.push((*hint).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Bring all per-language detectors + framework detectors under a single
+/// "what does the repo look like?" call. Pure, deterministic, no I/O.
+/// Structured for: "given a list of repo-root filenames, give me every
+/// signal we can extract without reading file contents".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoSignals {
+    pub ecosystems: Vec<Ecosystem>,
+    pub package_managers: Vec<(Ecosystem, PackageManager)>,
+    pub framework_hints: Vec<String>,
+}
+
+pub fn detect_repo_signals(marker_files: &[&str]) -> RepoSignals {
+    let ecosystems = detect_ecosystems(marker_files);
+    let mut package_managers: Vec<(Ecosystem, PackageManager)> = Vec::new();
+    for &eco in &ecosystems {
+        if let Some(pm) = detect_package_manager(eco, marker_files) {
+            package_managers.push((eco, pm));
+        }
+    }
+    let framework_hints = detect_frameworks(marker_files);
+    RepoSignals {
+        ecosystems,
+        package_managers,
+        framework_hints,
+    }
+}
+
+// ============================================================================
+// === SLICE 4 (b) — fail-closed Green / Yellow / Red honest-degradation    ===
+// === reporting. The aggregator logic already exists (`aggregate`); this    ===
+// === slice adds the human/serializable report that the runner hands to     ===
+// === reviewers / logs / CI dashboards.                                     ===
+// ============================================================================
+//
+// The reporting layer is load-bearing for the gate's claim:
+// "CI parity within local compute/network scope". To honor that claim it
+// MUST:
+//  (1) attach the compatibility breakdown (runnable / added_baseline /
+//      skipped) to every verdict,
+//  (2) render the 🟢 / 🟡 / 🔴 badge corresponding to the verdict — never
+//      round-trip Red -> Yellow to "look nicer",
+//  (3) when Red, list every required-failed step name (for the reviewer)
+//      and every Skipped-with-reason (so the audit trail is complete),
+//  (4) when Yellow, list every Skipped step + its reason,
+/// The full structured gate outcome: verdict + per-step results +
+/// compatibility breakdown. This is what the runner returns, what the
+/// reviewer is grounded on, and what `to_pretty` / `to_compact` render.
+///
+/// Construct via [`GateReport::new`] so the compatibility breakdown can't
+/// be lost (the renderer relies on it for honest accounting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateReport {
+    /// The aggregated verdict (Green / Yellow / Red). Sourced from
+    /// `aggregate(&results)`. Held by value so the report is fully
+    /// self-contained and cannot drift from the results.
+    pub status: GateStatus,
+    /// Per-step results, in plan order.
+    pub results: Vec<StepResult>,
+    /// The compatibility breakdown (runnable / added_baseline /
+    /// skipped-with-reason). MUST be attached even when the verdict is
+    /// Green — an all-Green report without a compatibility breakdown is
+    /// not honestly auditable.
+    pub compatibility: CompatibilityReport,
+}
+
+impl GateReport {
+    /// Build the canonical `GateReport` from runner outputs. Always
+    /// recomputes the status from `results` via `aggregate` so the report
+    /// can never get out of sync with what actually happened.
+    pub fn new(results: Vec<StepResult>, compatibility: CompatibilityReport) -> Self {
+        // Defensive recompute: a caller could in principle construct a
+        // status manually and disagree with the results. We refuse to be
+        // the source of that disagreement.
+        let status = aggregate(&results);
+        Self {
+            status,
+            results,
+            compatibility,
+        }
+    }
+
+    /// True iff the gate is Green (safe to merge, within known local
+    /// scope). Yellow and Red both block convergence / approval.
+    pub fn is_passed(&self) -> bool {
+        matches!(self.status, GateStatus::Green)
+    }
+
+    /// True iff the gate is Red. Most callers want `is_passed()` — this is
+    /// for callers that explicitly handle the blocking branches.
+    pub fn is_failed(&self) -> bool {
+        matches!(self.status, GateStatus::Red { .. })
+    }
+
+    /// Names of every required step that ran AND passed. Useful for
+    /// reviewers and for differential testing across runs.
+    pub fn passed_required_names(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .filter(|r| r.required && matches!(r.outcome, StepOutcome::Passed))
+            .map(|r| r.step_name.as_str())
+            .collect()
+    }
+
+    /// Single-line human verdict ("🟢 GREEN", "🟡 YELLOW (skipped: n)",
+    /// "🔴 RED (failed: a, b)"). Useful for log lines / structured logs /
+    /// dashboards where a `GateStatus` enum is awkward.
+    pub fn headline(&self) -> String {
+        match &self.status {
+            GateStatus::Green => "🟢 GREEN \u{2014} every required check ran and passed, nothing was skipped; safe to merge within known local scope".to_string(),
+            GateStatus::Yellow { skipped } => format!(
+                "🟡 YELLOW \u{2014} all required checks that could run passed, but {} step(s) skipped: [{}]",
+                skipped.len(),
+                skipped.join(", "),
+            ),
+            GateStatus::Red { failures } => format!(
+                "🔴 RED \u{2014} {} required check(s) failed: [{}]; cannot converge, cannot approve",
+                failures.len(),
+                failures.join(", "),
+            ),
+        }
+    }
+
+    /// Multi-line, human-readable gate report suitable for printing to a
+    /// reviewer's terminal or a CI summary. Always includes the
+    /// compatibility breakdown — even on Green — so the audit trail is
+    /// complete.
+    ///
+    /// Format (line-by-line, with section markers); `*` marks required
+    /// steps so reviewers can scan the table for blockers vs advisories:
+    ///   <headline badge + verdict line>
+    ///   breakdown:   <N> runnable, <M> added-baseline, <K> skipped
+    ///   steps:
+    ///     PASSED  * fmt
+    ///     FAILED  * test (tool or command failed)
+    ///     SKIPPED  audit (<reason>)
+    ///   compatibility:
+    ///     runnable       [fmt, clippy, build, test]
+    ///     added-baseline [deny]
+    ///     skipped-with-reason [(integration, requires service containers (upstream CI verifies))]
+    pub fn to_pretty(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.headline());
+        out.push('\n');
+
+        out.push_str(&format!(
+            "breakdown: {} runnable, {} added-baseline, {} skipped\n",
+            self.compatibility.runnable.len(),
+            self.compatibility.added_baseline.len(),
+            self.compatibility.skipped.len(),
+        ));
+
+        out.push_str("steps:\n");
+        for r in &self.results {
+            let (tag, note) = match &r.outcome {
+                StepOutcome::Passed => ("PASSED ", String::new()),
+                StepOutcome::Failed => ("FAILED ", "(tool or command failed)".to_string()),
+                StepOutcome::Skipped { reason } => ("SKIPPED", format!("({})", reason)),
+            };
+            // Required-ness is encoded in the tag so reviewers can scan
+            // the list and immediately see required-blockers vs optional.
+            let req_marker = if r.required { "*" } else { " " };
+            if note.is_empty() {
+                out.push_str(&format!("  {} {} {}\n", tag, req_marker, r.step_name));
+            } else {
+                out.push_str(&format!(
+                    "  {} {} {} {}\n",
+                    tag, req_marker, r.step_name, note
+                ));
+            }
+        }
+
+        out.push_str("compatibility:\n");
+        out.push_str(&format!(
+            "  runnable        [{}]\n",
+            self.compatibility.runnable.join(", "),
+        ));
+        out.push_str(&format!(
+            "  added-baseline  [{}]\n",
+            self.compatibility.added_baseline.join(", "),
+        ));
+        if self.compatibility.skipped.is_empty() {
+            out.push_str("  skipped         []\n");
+        } else {
+            out.push_str("  skipped-with-reason [\n");
+            for (name, reason) in &self.compatibility.skipped {
+                out.push_str(&format!("    ({}, {})\n", name, reason));
+            }
+            out.push_str("  ]\n");
+        }
+
+        out
+    }
+
+    /// Compact one-line summary, suitable for structured log lines and
+    /// for CI summarizers that want a single record per gate run. Format:
+    ///   <Badge> GREEN|YELLOW|RED [required=N passed=M optional=K]
+    pub fn to_compact(&self) -> String {
+        let mut required = 0usize;
+        let mut required_passed = 0usize;
+        let mut optional = 0usize;
+        let mut optional_passed = 0usize;
+        for r in &self.results {
+            if r.required {
+                required += 1;
+                if matches!(r.outcome, StepOutcome::Passed) {
+                    required_passed += 1;
+                }
+            } else {
+                optional += 1;
+                if matches!(r.outcome, StepOutcome::Passed) {
+                    optional_passed += 1;
+                }
+            }
+        }
+
+        let (badge, label) = match &self.status {
+            GateStatus::Green => ("🟢", "GREEN"),
+            GateStatus::Yellow { .. } => ("🟡", "YELLOW"),
+            GateStatus::Red { .. } => ("🔴", "RED"),
+        };
+        format!(
+            "{badge} {label} [required={required} passed={required_passed} optional={optional} passed={optional_passed}]"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1429,5 +2087,844 @@ mod tests {
             ],
         );
         assert!(report.runnable.is_empty());
+    }
+
+    // ----- SLICE 4 (a) — per-language detectors + canonical commands -----
+
+    #[test]
+    fn per_language_detectors_match_detect_ecosystems_truth_table() {
+        // The per-language detector predicates must agree with the marker
+        // set `detect_ecosystems` already canonicalizes — otherwise the
+        // "explicit Rust detector" and the "what ecosystems" call would
+        // disagree, which is a bug, not a feature.
+        let cases: &[(&[&str], Ecosystem, bool)] = &[
+            (&["Cargo.toml"], Ecosystem::Rust, true),
+            (&["Cargo.toml", "package.json"], Ecosystem::Rust, true),
+            (&["README.md"], Ecosystem::Rust, false),
+            (&["Cargo.toml"], Ecosystem::Go, false),
+            (&["package.json"], Ecosystem::Node, true),
+            (&["package.json", "yarn.lock"], Ecosystem::Node, true),
+            (&["Cargo.toml"], Ecosystem::Node, false),
+            (&["pyproject.toml"], Ecosystem::Python, true),
+            (&["requirements.txt"], Ecosystem::Python, true),
+            (&["setup.py"], Ecosystem::Python, true),
+            (&["requirements.txt", "setup.py"], Ecosystem::Python, true),
+            (
+                &["pyproject.toml", "requirements.txt"],
+                Ecosystem::Python,
+                true,
+            ),
+            (&["Cargo.toml"], Ecosystem::Python, false),
+            (&["go.mod"], Ecosystem::Go, true),
+            (&["go.sum"], Ecosystem::Go, false), // NOT a marker (lockfile only)
+            (&["package.json"], Ecosystem::Go, false),
+        ];
+
+        for (markers, eco, want) in cases {
+            let got = match eco {
+                Ecosystem::Rust => detect_rust(markers),
+                Ecosystem::Node => detect_node(markers),
+                Ecosystem::Python => detect_python(markers),
+                Ecosystem::Go => detect_go(markers),
+            };
+            assert_eq!(
+                got, *want,
+                "per-language detector disagreed for {markers:?}/{eco:?}: got {got}, want {want}",
+            );
+
+            // Cross-check: `detect_ecosystems` should agree in the broad
+            // sense (yes iff the per-language detector is yes).
+            let in_ecosystems = detect_ecosystems(markers).contains(eco);
+            assert_eq!(
+                in_ecosystems, *want,
+                "detect_ecosystems disagreed with per-language detector for {markers:?}/{eco:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn detect_package_manager_node_prioritizes_pnpm_over_yarn_over_bun() {
+        // pnpm-lock.yaml wins over yarn.lock (a project should only have
+        // one primary lockfile in practice, but the precedence is
+        // well-defined if both happen to be present).
+        let got = detect_package_manager(Ecosystem::Node, &["package.json", "pnpm-lock.yaml"]);
+        assert_eq!(got, Some(PackageManager::Pnpm));
+        let got = detect_package_manager(Ecosystem::Node, &["package.json", "yarn.lock"]);
+        assert_eq!(got, Some(PackageManager::Yarn));
+        let got = detect_package_manager(Ecosystem::Node, &["package.json", "bun.lockb"]);
+        assert_eq!(got, Some(PackageManager::Bun));
+
+        // Pnpm wins over Yarn.
+        let got = detect_package_manager(
+            Ecosystem::Node,
+            &["package.json", "yarn.lock", "pnpm-lock.yaml"],
+        );
+        assert_eq!(got, Some(PackageManager::Pnpm));
+    }
+
+    #[test]
+    fn detect_package_manager_node_defaults_to_none_when_only_package_json() {
+        // npm is the Node default; we don't enumerate it. A plain
+        // package.json (no lockfile) means "use the baseline default".
+        assert_eq!(
+            detect_package_manager(Ecosystem::Node, &["package.json"]),
+            None,
+        );
+    }
+
+    #[test]
+    fn detect_package_manager_node_does_not_match_unrelated_lockfiles() {
+        // Lockfiles for other ecosystems must not trigger a Node
+        // package-manager detection.
+        assert_eq!(
+            detect_package_manager(Ecosystem::Node, &["Cargo.lock"]),
+            None,
+        );
+        assert_eq!(
+            detect_package_manager(Ecosystem::Node, &["poetry.lock"]),
+            None,
+        );
+    }
+
+    #[test]
+    fn detect_package_manager_python_uv_beats_poetry() {
+        assert_eq!(
+            detect_package_manager(Ecosystem::Python, &["pyproject.toml", "uv.lock"]),
+            Some(PackageManager::Uv),
+        );
+        assert_eq!(
+            detect_package_manager(Ecosystem::Python, &["pyproject.toml", "poetry.lock"]),
+            Some(PackageManager::Poetry),
+        );
+        assert_eq!(
+            detect_package_manager(
+                Ecosystem::Python,
+                &["pyproject.toml", "poetry.lock", "uv.lock"],
+            ),
+            Some(PackageManager::Uv),
+            "uv.lock wins over poetry.lock when both are present",
+        );
+    }
+
+    #[test]
+    fn detect_package_manager_python_defaults_to_none_when_only_pyproject() {
+        assert_eq!(
+            detect_package_manager(Ecosystem::Python, &["pyproject.toml"]),
+            None,
+            "pyproject.toml alone means 'use pip / setuptools' — the default baseline",
+        );
+    }
+
+    #[test]
+    fn detect_package_manager_rust_and_go_always_return_none() {
+        // These ecosystems have a single toolchain (cargo / go); no
+        // refinement possible.
+        assert_eq!(
+            detect_package_manager(Ecosystem::Rust, &["Cargo.toml", "Cargo.lock"]),
+            None,
+        );
+        assert_eq!(
+            detect_package_manager(Ecosystem::Go, &["go.mod", "go.sum"]),
+            None,
+        );
+        // Even wild markers shouldn't fool it.
+        assert_eq!(
+            detect_package_manager(Ecosystem::Rust, &["Cargo.toml", "yarn.lock"]),
+            None,
+        );
+    }
+
+    #[test]
+    fn package_manager_cli_name_is_canonical_lowercase() {
+        assert_eq!(PackageManager::Yarn.cli_name(), "yarn");
+        assert_eq!(PackageManager::Pnpm.cli_name(), "pnpm");
+        assert_eq!(PackageManager::Bun.cli_name(), "bun");
+        assert_eq!(PackageManager::Poetry.cli_name(), "poetry");
+        assert_eq!(PackageManager::Uv.cli_name(), "uv");
+    }
+
+    #[test]
+    fn baseline_plan_for_node_pnpm_uses_pnpm_argv() {
+        let plan = baseline_plan_for(Ecosystem::Node, &["package.json", "pnpm-lock.yaml"]);
+        // The test step must use `pnpm test`, NOT `npm test`.
+        let test = plan.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(
+            test.command,
+            vec!["pnpm", "test"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(test.tool, "pnpm");
+
+        // The required-classification must be preserved (and we never lose
+        // a required step vs. the npm baseline).
+        let default_plan = baseline_plan(Ecosystem::Node);
+        let refined_required: usize = plan.iter().filter(|s| s.required).count();
+        let default_required: usize = default_plan.iter().filter(|s| s.required).count();
+        assert!(
+            refined_required >= default_required,
+            "refined Node plan must not have fewer required steps ({refined_required}) than default ({default_required})",
+        );
+    }
+
+    #[test]
+    fn baseline_plan_for_node_yarn_uses_yarn_argv_and_required_count_dominates() {
+        let plan = baseline_plan_for(Ecosystem::Node, &["package.json", "yarn.lock"]);
+        let test = plan.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(
+            test.command,
+            vec!["yarn", "test"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(test.tool, "yarn");
+
+        // Every step name from the default baseline must still exist in
+        // the refined plan (fail-closed: we don't lose checks).
+        for s in baseline_plan(Ecosystem::Node) {
+            assert!(
+                plan.iter().any(|p| p.name == s.name),
+                "refined Yarn plan missing step `{}` from default baseline",
+                s.name,
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_plan_for_node_bun_uses_bun_argv() {
+        let plan = baseline_plan_for(Ecosystem::Node, &["package.json", "bun.lockb"]);
+        let test = plan.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.command, vec!["bun", "test"]);
+        assert_eq!(test.tool, "bun");
+    }
+
+    #[test]
+    fn baseline_plan_for_python_poetry_uses_poetry_run_pytest() {
+        let plan = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "poetry.lock"]);
+        let test = plan.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(
+            test.command,
+            vec!["poetry", "run", "pytest", "-q"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(test.tool, "poetry");
+        assert!(test.required, "test remains required under Poetry");
+    }
+
+    #[test]
+    fn baseline_plan_for_python_uv_uses_uv_run_pytest() {
+        let plan = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "uv.lock"]);
+        let test = plan.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.command, vec!["uv", "run", "pytest", "-q"]);
+        assert_eq!(test.tool, "uv");
+        assert!(test.required);
+    }
+
+    #[test]
+    fn baseline_plan_for_python_with_no_pm_marker_falls_back_to_default() {
+        // pyproject.toml only (no poetry.lock, no uv.lock) -> default
+        // Python baseline (pip / pytest / pip-audit).
+        let refined = baseline_plan_for(Ecosystem::Python, &["pyproject.toml", "requirements.txt"]);
+        let default = baseline_plan(Ecosystem::Python);
+        assert_eq!(
+            refined, default,
+            "no PM marker present must yield the baseline unchanged",
+        );
+    }
+
+    #[test]
+    fn baseline_plan_for_node_with_no_pm_marker_falls_back_to_default() {
+        // npm is the default; a project with package.json but no lockfile
+        // gets the npm baseline unchanged.
+        let refined = baseline_plan_for(Ecosystem::Node, &["package.json"]);
+        let default = baseline_plan(Ecosystem::Node);
+        assert_eq!(refined, default);
+    }
+
+    #[test]
+    fn baseline_plan_for_rust_ignores_unrelated_lockfiles() {
+        // Rust's `baseline_plan` does no PM refinement, so the output is
+        // identical regardless of markers. Test this stays true.
+        let refined_a = baseline_plan_for(Ecosystem::Rust, &["Cargo.toml"]);
+        let refined_b = baseline_plan_for(Ecosystem::Rust, &["Cargo.toml", "yarn.lock"]);
+        let default = baseline_plan(Ecosystem::Rust);
+        assert_eq!(refined_a, default);
+        assert_eq!(refined_b, default);
+    }
+
+    #[test]
+    fn baseline_plan_for_never_drops_a_required_step() {
+        // The blanket contract: for every ecosystem + PM combination we
+        // can possibly refine, the refined plan's required-set must
+        // SUPERSET the default plan's required-set. (failure here would
+        // mean the marker-fuzzy refinement silently weakens the gate.)
+        let combos: &[(&[&str], Ecosystem)] = &[
+            (&["package.json"], Ecosystem::Node),
+            (&["package.json", "pnpm-lock.yaml"], Ecosystem::Node),
+            (&["package.json", "yarn.lock"], Ecosystem::Node),
+            (&["package.json", "bun.lockb"], Ecosystem::Node),
+            (&["pyproject.toml", "requirements.txt"], Ecosystem::Python),
+            (&["pyproject.toml", "poetry.lock"], Ecosystem::Python),
+            (&["pyproject.toml", "uv.lock"], Ecosystem::Python),
+            (&["Cargo.toml"], Ecosystem::Rust),
+            (&["go.mod"], Ecosystem::Go),
+        ];
+        for (markers, eco) in combos {
+            let default = baseline_plan(*eco);
+            let refined = baseline_plan_for(*eco, markers);
+            let default_required: std::collections::BTreeSet<&str> = default
+                .iter()
+                .filter(|s| s.required)
+                .map(|s| s.name.as_str())
+                .collect();
+            let refined_required: std::collections::BTreeSet<&str> = refined
+                .iter()
+                .filter(|s| s.required)
+                .map(|s| s.name.as_str())
+                .collect();
+            for name in &default_required {
+                assert!(
+                    refined_required.contains(name),
+                    "{markers:?} for {eco:?}: refined plan dropped required step `{name}`",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detect_frameworks_returns_known_markers() {
+        // Each marker maps to a known hint. The hints are stable, lowercase.
+        assert_eq!(
+            detect_frameworks(&["tsconfig.json"]),
+            vec!["typescript".to_string()],
+        );
+        assert_eq!(
+            detect_frameworks(&["next.config.ts"]),
+            vec!["next.js".to_string()],
+        );
+        assert_eq!(
+            detect_frameworks(&["vite.config.js"]),
+            vec!["vite".to_string()],
+        );
+        assert_eq!(
+            detect_frameworks(&["manage.py"]),
+            vec!["django".to_string()],
+        );
+        assert_eq!(
+            detect_frameworks(&["pyproject.toml"]),
+            vec!["pyproject".to_string()],
+        );
+        assert_eq!(detect_frameworks(&["uv.lock"]), vec!["uv".to_string()],);
+    }
+
+    #[test]
+    fn detect_frameworks_dedupes_across_alternate_marker_names() {
+        // next.config.js and next.config.ts both map to "next.js" — must dedupe.
+        let got = detect_frameworks(&[
+            "package.json",
+            "next.config.js",
+            "next.config.ts",
+            "next.config.mjs",
+        ]);
+        // Containment (rather than exact eq) because "package.json" may
+        // also fire framework hints via overlap; in this dataset it does
+        // not.
+        assert_eq!(got, vec!["next.js".to_string()]);
+    }
+
+    #[test]
+    fn detect_frameworks_is_deterministic_and_excludes_unrelated_files() {
+        // Determinism contract: same input set in different orders MUST
+        // yield the same set of hints, even if the hint ORDER is allowed
+        // to depend on input order. (We use a per-marker stable mapping,
+        // so input order matters for output order — that's deliberate:
+        // it makes the function trivially predictable and `unwrap`-free.)
+        let a = detect_frameworks(&["Cargo.toml", "tsconfig.json", "vite.config.ts", "README.md"]);
+        let b = detect_frameworks(&["README.md", "vite.config.ts", "tsconfig.json", "Cargo.toml"]);
+
+        // Same SET, even if order varies.
+        let mut a_sorted = a.clone();
+        let mut b_sorted = b.clone();
+        a_sorted.sort();
+        b_sorted.sort();
+        assert_eq!(
+            a_sorted, b_sorted,
+            "detect_frameworks must be deterministic w.r.t. input set, got left={a:?} right={b:?}",
+        );
+
+        // And the output set itself, sorted for stable comparison.
+        let mut want = vec!["typescript".to_string(), "vite".to_string()];
+        want.sort();
+        assert_eq!(a_sorted, want);
+
+        // No false positives on locked-down unrelated filenames.
+        assert!(!a.iter().any(|h| h == "django"));
+        assert!(!a.iter().any(|h| h == "flask"));
+    }
+
+    #[test]
+    fn detect_frameworks_returns_empty_when_no_known_markers() {
+        assert!(detect_frameworks(&[]).is_empty());
+        assert!(detect_frameworks(&["README.md", "LICENSE"]).is_empty());
+        // Substring confusion: a file named exactly "fake_vite.config.ts"
+        // (no, we match exact) — verify the contract.
+        assert!(detect_frameworks(&["fake_vite.config.ts"]).is_empty());
+        assert!(detect_frameworks(&["vite.config.ts.bak"]).is_empty());
+    }
+
+    #[test]
+    fn detect_repo_signals_groups_ecosystems_pms_and_frameworks() {
+        let markers = [
+            "Cargo.toml",
+            "package.json",
+            "yarn.lock",
+            "tsconfig.json",
+            "next.config.ts",
+            "pyproject.toml",
+            "uv.lock",
+            "go.mod",
+        ];
+        let signals = detect_repo_signals(&markers);
+
+        // Each ecosystem detected once, in canonical order.
+        assert_eq!(
+            signals.ecosystems,
+            vec![
+                Ecosystem::Rust,
+                Ecosystem::Node,
+                Ecosystem::Python,
+                Ecosystem::Go,
+            ],
+        );
+
+        // Two PMs detected (Yarn for Node, Uv for Python). Rust/Go: none.
+        assert_eq!(
+            signals.package_managers,
+            vec![
+                (Ecosystem::Node, PackageManager::Yarn),
+                (Ecosystem::Python, PackageManager::Uv),
+            ],
+        );
+
+        // Frameworks: typescript + next.js (deduped) + pyproject + uv (the
+        // Python PM marker) + go-modules. Order is input-marker order; we
+        // assert via set-containment on a sorted view for stability.
+        let mut sorted_hints = signals.framework_hints.clone();
+        sorted_hints.sort();
+        assert_eq!(
+            sorted_hints,
+            vec![
+                "go-modules".to_string(),
+                "next.js".to_string(),
+                "pyproject".to_string(),
+                "typescript".to_string(),
+                "uv".to_string(),
+            ],
+            "framework hints (sorted) must match the expected set",
+        );
+
+        // Dedup contract: the raw (unsorted) hint vector must equal its
+        // deduped form, regardless of order. This is the cheap invariant
+        // that pins down "we didn't push duplicates".
+        let mut deduped = signals.framework_hints.clone();
+        deduped.sort();
+        deduped.dedup();
+        let mut raw_sorted = signals.framework_hints.clone();
+        raw_sorted.sort();
+        assert_eq!(
+            raw_sorted, deduped,
+            "framework hints must already be deduped (sorted equality after dedup)",
+        );
+        assert!(signals.framework_hints.contains(&"typescript".to_string()));
+        assert!(signals.framework_hints.contains(&"next.js".to_string()));
+        assert!(signals.framework_hints.contains(&"uv".to_string()));
+    }
+
+    #[test]
+    fn detect_repo_signals_default_for_npm_only_node_project() {
+        let markers = ["package.json", "tsconfig.json", "vite.config.js"];
+        let signals = detect_repo_signals(&markers);
+        assert_eq!(signals.ecosystems, vec![Ecosystem::Node]);
+        assert!(
+            signals.package_managers.is_empty(),
+            "npm-only project has no refined PM",
+        );
+        // typescript + vite are both detected.
+        assert!(signals.framework_hints.contains(&"typescript".to_string()));
+        assert!(signals.framework_hints.contains(&"vite".to_string()));
+    }
+
+    // ----- SLICE 4 (b) — GateReport honest-degradation reporting -----
+
+    /// Helper to build a CompatibilityReport with explicit vectors.
+    fn compat(
+        runnable: &[&str],
+        skipped: &[(&str, &str)],
+        added_baseline: &[&str],
+    ) -> CompatibilityReport {
+        CompatibilityReport {
+            runnable: runnable.iter().map(|s| (*s).to_string()).collect(),
+            skipped: skipped
+                .iter()
+                .map(|(n, r)| ((*n).to_string(), (*r).to_string()))
+                .collect(),
+            added_baseline: added_baseline.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn gate_report_recomputes_status_from_results() {
+        // Construct the report with results that imply Green, but pretend
+        // a caller forced a stale Red. `GateReport::new` must recompute
+        // from results and emit Green (no drift).
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result("test", true, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &[]));
+        assert_eq!(report.status, GateStatus::Green);
+        assert!(report.is_passed());
+        assert!(!report.is_failed());
+    }
+
+    #[test]
+    fn gate_report_green_is_passed_and_required_count_matches_results() {
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result("lint", true, StepOutcome::Passed),
+            result("test", true, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(results, compat(&["fmt", "lint", "test"], &[], &[]));
+        assert_eq!(report.status, GateStatus::Green);
+        assert!(report.is_passed());
+        assert_eq!(report.passed_required_names(), vec!["fmt", "lint", "test"],);
+    }
+
+    #[test]
+    fn gate_report_yellow_when_only_optional_steps_skipped() {
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result(
+                "audit",
+                false,
+                StepOutcome::Skipped {
+                    reason: "tool `cargo-audit` not available".to_string(),
+                },
+            ),
+            result("test", true, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &["audit"]));
+        assert_eq!(
+            report.status,
+            GateStatus::Yellow {
+                skipped: vec!["audit".to_string()],
+            },
+        );
+        assert!(!report.is_passed());
+        assert!(!report.is_failed());
+    }
+
+    #[test]
+    fn gate_report_red_when_any_required_fails() {
+        // A single required-failed step -> Red, even if everything else is
+        // passed and even if some optional steps were skipped.
+        let results = vec![
+            result("fmt", true, StepOutcome::Passed),
+            result(
+                "audit",
+                false,
+                StepOutcome::Skipped {
+                    reason: "tool `cargo-audit` not available".to_string(),
+                },
+            ),
+            result("test", true, StepOutcome::Failed),
+        ];
+        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &["audit"]));
+        assert_eq!(
+            report.status,
+            GateStatus::Red {
+                failures: vec!["test".to_string()],
+            },
+        );
+        assert!(report.is_failed());
+        assert!(!report.is_passed());
+        // Required-Failed still surfaces as a failure; required-passed
+        // names exclude it.
+        assert_eq!(report.passed_required_names(), vec!["fmt"]);
+    }
+
+    #[test]
+    fn gate_report_red_preserves_full_required_failure_set() {
+        let results = vec![
+            result("a", true, StepOutcome::Failed),
+            result("b", true, StepOutcome::Failed),
+            result("c", true, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(results, compat(&["a", "b", "c"], &[], &[]));
+        assert_eq!(
+            report.status,
+            GateStatus::Red {
+                failures: vec!["a".to_string(), "b".to_string()],
+            },
+        );
+    }
+
+    #[test]
+    fn gate_report_headline_badge_matches_status() {
+        // Contract: headline must embed the right badge + verdict string.
+        let green = GateReport::new(
+            vec![result("fmt", true, StepOutcome::Passed)],
+            compat(&["fmt"], &[], &[]),
+        );
+        assert!(green.headline().contains("🟢"));
+        assert!(green.headline().contains("GREEN"));
+
+        let yellow = GateReport::new(
+            vec![result(
+                "audit",
+                false,
+                StepOutcome::Skipped {
+                    reason: "tool `x` not available".to_string(),
+                },
+            )],
+            compat(&[], &[], &["audit"]),
+        );
+        assert!(yellow.headline().contains("🟡"));
+        assert!(yellow.headline().contains("YELLOW"));
+
+        let red = GateReport::new(
+            vec![result("test", true, StepOutcome::Failed)],
+            compat(&["test"], &[], &[]),
+        );
+        assert!(red.headline().contains("🔴"));
+        assert!(red.headline().contains("RED"));
+    }
+
+    #[test]
+    fn gate_report_to_pretty_includes_compatibility_breakdown_even_when_green() {
+        // A Green report MUST attach the compatibility breakdown so the
+        // audit trail is complete. The contract is set in the docstring:
+        // an all-Green report without a breakdown is not honestly
+        // auditable.
+        let report = GateReport::new(
+            vec![
+                result("fmt", true, StepOutcome::Passed),
+                result("test", true, StepOutcome::Passed),
+            ],
+            compat(
+                &["fmt", "test"],
+                &[(
+                    "integration",
+                    "requires service containers (upstream CI verifies)",
+                )],
+                &["deny"],
+            ),
+        );
+        let pretty = report.to_pretty();
+        // Verdict line.
+        assert!(pretty.contains("🟢 GREEN"));
+        // Breakdown header summary.
+        assert!(pretty.contains("breakdown:"));
+        assert!(pretty.contains("2 runnable"));
+        assert!(pretty.contains("1 added-baseline"));
+        assert!(pretty.contains("1 skipped"));
+        // Per-step table.
+        assert!(pretty.contains("PASSED"));
+        assert!(pretty.contains("fmt"));
+        assert!(pretty.contains("test"));
+        // Compatibility section, with the skipped reason.
+        assert!(pretty.contains("compatibility:"));
+        assert!(pretty.contains("runnable"));
+        assert!(pretty.contains("added-baseline"));
+        assert!(pretty.contains("integration"));
+        assert!(pretty.contains("requires service containers"));
+    }
+
+    #[test]
+    fn gate_report_to_pretty_red_lists_required_failures() {
+        let report = GateReport::new(
+            vec![
+                result("fmt", true, StepOutcome::Passed),
+                result("test", true, StepOutcome::Failed),
+            ],
+            compat(&["fmt"], &[], &["test"]),
+        );
+        let pretty = report.to_pretty();
+        assert!(pretty.contains("🔴 RED"));
+        assert!(pretty.contains("test"));
+        assert!(pretty.contains("FAILED"));
+    }
+
+    #[test]
+    fn gate_report_to_pretty_yellow_lists_skipped_with_reason() {
+        let report = GateReport::new(
+            vec![
+                result("lint", true, StepOutcome::Passed),
+                result(
+                    "audit",
+                    false,
+                    StepOutcome::Skipped {
+                        reason: "tool `cargo-audit` not available".to_string(),
+                    },
+                ),
+            ],
+            compat(&["lint"], &[], &["audit"]),
+        );
+        let pretty = report.to_pretty();
+        assert!(pretty.contains("🟡 YELLOW"));
+        assert!(pretty.contains("SKIPPED"));
+        assert!(pretty.contains("audit"));
+        assert!(pretty.contains("tool `cargo-audit` not available"));
+    }
+
+    #[test]
+    fn gate_report_to_pretty_marks_required_vs_optional_for_skip() {
+        // The renderer marks required (`*`) vs optional (` `) on every
+        // step line so reviewers can scan for blockers vs advisories.
+        let report = GateReport::new(
+            vec![
+                result("required-step", true, StepOutcome::Passed),
+                result(
+                    "optional-step",
+                    false,
+                    StepOutcome::Skipped {
+                        reason: "no tool".to_string(),
+                    },
+                ),
+            ],
+            compat(&["required-step"], &[], &["optional-step"]),
+        );
+        let pretty = report.to_pretty();
+        // The required-step line must have the `*` marker.
+        let required_line = pretty
+            .lines()
+            .find(|l| l.contains("required-step"))
+            .expect("required-step line");
+        assert!(required_line.contains('*'));
+
+        // The optional step line must NOT carry the `*` marker.
+        let optional_line = pretty
+            .lines()
+            .find(|l| l.contains("optional-step"))
+            .expect("optional-step line");
+        assert!(!optional_line.contains('*'));
+    }
+
+    #[test]
+    fn gate_report_to_compact_is_one_line_and_labels_color() {
+        let report = GateReport::new(
+            vec![
+                result("fmt", true, StepOutcome::Passed),
+                result(
+                    "audit",
+                    false,
+                    StepOutcome::Skipped {
+                        reason: "no tool".to_string(),
+                    },
+                ),
+            ],
+            compat(&["fmt"], &[], &["audit"]),
+        );
+        let compact = report.to_compact();
+        assert!(compact.lines().count() <= 2, "compact must fit on one line");
+        assert!(compact.contains("🟡 YELLOW"));
+        assert!(compact.contains("required=1"));
+        assert!(compact.contains("passed=1"));
+        assert!(compact.contains("optional=1"));
+        assert!(compact.contains("passed=0"));
+    }
+
+    #[test]
+    fn gate_report_fail_closed_required_skipped_under_strict_runs_to_red() {
+        // End-to-end: the runner with a missing REQUIRED tool under Strict
+        // mode produces a Skipped-with-reason that the runner core
+        // upgrades to a Failed outcome — which then aggregates to Red.
+        // This test pins down the full integration (run_plan + aggregate +
+        // GateReport) so the fail-closed contract is verified
+        // end-to-end, not just at the aggregator level.
+        let plan = vec![
+            s("fmt", true),
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["cargo-deny", "check"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                tool: "cargo-deny".to_string(),
+                required: true,
+            },
+        ];
+        // Only `fmt` is available; `deny` is missing.
+        let env = FakeEnv::new(&["fmt"]);
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Red {
+                failures: vec!["deny".to_string()],
+            },
+        );
+
+        let report = GateReport::new(results.clone(), compat(&["fmt"], &[], &["deny"]));
+        assert_eq!(
+            report.status,
+            GateStatus::Red {
+                failures: vec!["deny".to_string()],
+            },
+        );
+        assert!(report.is_failed());
+        // Headline + pretty must reflect Red.
+        assert!(report.headline().contains("🔴 RED"));
+        let pretty = report.to_pretty();
+        assert!(pretty.contains("🔴 RED"));
+        assert!(pretty.contains("deny"));
+    }
+
+    #[test]
+    fn gate_report_local_iterate_required_missing_tool_runs_to_yellow() {
+        // Mirror image of the above: in LocalIterate mode, a missing
+        // REQUIRED tool is recorded as Skipped -> Yellow. Fail-closed
+        // posture is preserved: this is the inner-loop mode, deliberately
+        // degraded, and the report says so.
+        let plan = vec![s("fmt", true), s("deny", true)];
+        let env = FakeEnv::new(&["fmt"]);
+        let (results, status) = run_plan(&plan, GateMode::LocalIterate, &env);
+
+        assert_eq!(
+            status,
+            GateStatus::Yellow {
+                skipped: vec!["deny".to_string()],
+            },
+        );
+
+        let report = GateReport::new(results, compat(&["fmt"], &[], &["deny"]));
+        assert!(!report.is_passed());
+        assert!(!report.is_failed());
+        assert!(report.headline().contains("🟡 YELLOW"));
+    }
+
+    #[test]
+    fn gate_report_does_not_round_trip_red_to_green_or_yellow() {
+        // Adversarial: no rendering path should ever mutate Red to a
+        // friendlier verdict. We construct a Red report and assert all
+        // three renderings (headline, pretty, compact) carry Red, and
+        // `is_passed()` stays false.
+        let results = vec![result("test", true, StepOutcome::Failed)];
+        let report = GateReport::new(results, compat(&["test"], &[], &[]));
+        assert_eq!(
+            report.status,
+            GateStatus::Red {
+                failures: vec!["test".to_string()],
+            },
+        );
+        assert!(report.headline().contains("🔴 RED"));
+        assert!(report.to_pretty().contains("🔴 RED"));
+        assert!(report.to_compact().contains("🔴 RED"));
+        assert!(!report.is_passed());
     }
 }
