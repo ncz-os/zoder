@@ -31,7 +31,7 @@ use tokio::process::Child;
 /// Unix socket. Future: spawn a child process (e.g. `goose acp`) and speak
 /// ACP over its stdio. The JSON-RPC layer is identical in both cases — only
 /// the transport half-acquisition differs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum EngineTransport {
     /// Connect to an existing daemon over a Unix-domain socket.
     UnixSocket(PathBuf),
@@ -42,6 +42,46 @@ pub enum EngineTransport {
         args: Vec<String>,
         env: Vec<(String, String)>,
     },
+}
+
+/// A process-env key whose VALUE is a secret (API key / token / bearer). Used
+/// to redact values in any Debug/log rendering of a spawned engine's env — the
+/// goose bridge injects `OPENAI_API_KEY`, so a bare `{:?}` on the transport or
+/// its env vector would otherwise leak the operator's provider key.
+pub(crate) fn is_secret_env_key(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k.contains("API_KEY") || k.contains("TOKEN") || k.contains("SECRET") || k.ends_with("_KEY")
+}
+
+/// Render an engine env vector for Debug/log output with secret VALUES masked
+/// while non-secret vars (GOOSE_PROVIDER, GOOSE_MODEL, OPENAI_BASE_URL, …) stay
+/// visible so the output remains useful.
+pub(crate) fn redact_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(k, v)| {
+            let shown = if is_secret_env_key(k) {
+                "***REDACTED***".to_string()
+            } else {
+                v.clone()
+            };
+            (k.clone(), shown)
+        })
+        .collect()
+}
+
+impl std::fmt::Debug for EngineTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineTransport::UnixSocket(p) => f.debug_tuple("UnixSocket").field(p).finish(),
+            EngineTransport::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                // env values are redacted: the goose bridge injects OPENAI_API_KEY.
+                .field("env", &redact_env(env))
+                .finish(),
+        }
+    }
 }
 
 /// A live, connected ACP transport: a byte-stream reader + writer. For
@@ -250,6 +290,61 @@ pub enum ApprovalPolicy {
     None,
 }
 
+/// Resolved zoder-provider config that `run_goose_agent` bridges into
+/// the spawned `goose acp` child environment.
+///
+/// This is the CREDENTIAL/ENDPOINT seam (task #19) that makes
+/// `zoder loop --engine goose` actually authenticate against the
+/// free/subscription provider zoder picked, instead of falling back to
+/// goose's own `~/.config/goose/config.yaml` and dialing the operator's
+/// previous session (wrong auth, wrong model, wrong bill).
+///
+/// Construction contract (used by tests AND by `zoder-cli`):
+///   * `provider_id` — the zoder `Provider::id` (e.g. `"minimax"`,
+///     `"nvidia-eih"`, `"openrouter"`). Echoed in logs / surfaces.
+///   * `kind` — zoder's `Provider::kind` (`openai-chat` |
+///     `openai-responses` | `anthropic` | `custom`); used to derive
+///     `GOOSE_PROVIDER` (the value goose keys on) and to decide
+///     whether the OPENAI_* env-var bridge applies.
+///   * `base_url` — the zoder `Provider::base_url`. Used verbatim for
+///     `OPENAI_BASE_URL`; host-stripped for `OPENAI_HOST`.
+///   * `api_key` — the credential as zoder resolved it from `Auth`
+///     (env var OR inline bearer). NEVER logged. `Debug` renders it
+///     as `[REDACTED]` so a stray `dbg!`/`println!("{opts:?}")`
+///     can't leak the secret. The credential is set as
+///     `OPENAI_API_KEY` regardless of auth style (bearer or custom
+///     header) because goose's `openai` engine only reads
+///     `OPENAI_API_KEY`; for ApiKeyHeader-style auth the operator's
+///     gateway must accept the value as a bearer, which is the
+///     common case for OpenAI-compatible endpoints.
+///
+/// The zoder CLI builds this from the same `Config::real_best_provider_for_model`
+/// call the oneshot + agentic paths already use, so the loop and the
+/// single-shot turn always target the same provider.
+#[derive(Clone)]
+pub struct GooseProviderEnv {
+    pub provider_id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for GooseProviderEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hard redaction: the key is NEVER rendered, even in test
+        // failure output (`cargo test -- --nocapture` + an unexpected
+        // panic would otherwise dump the full struct). `None` is
+        // distinct from `Some(...)` so a test can still assert
+        // presence, but the secret itself stays opaque.
+        f.debug_struct("GooseProviderEnv")
+            .field("provider_id", &self.provider_id)
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
 /// Inputs for one agentic turn.
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -283,6 +378,16 @@ pub struct AgentOptions {
     pub approval: ApprovalPolicy,
     /// Overall wall-clock budget for the turn.
     pub timeout: Duration,
+    /// Resolved provider to bridge into the spawned `goose acp` child
+    /// (the CREDENTIAL/ENDPOINT seam). When set, `run_goose_agent`
+    /// forwards the provider's API key + base_url as `OPENAI_API_KEY`
+    /// / `OPENAI_HOST` / `OPENAI_BASE_URL` on the child so goose can
+    /// authenticate against a free/subscription provider; without this
+    /// goose falls back to its own `~/.config/goose/config.yaml` and
+    /// silently dials the operator's previous session — wrong model,
+    /// wrong auth, wrong bill. `None` for zeroclaw (no spawn). See
+    /// [`GooseProviderEnv`] for the exact env-construction contract.
+    pub goose_provider: Option<GooseProviderEnv>,
 }
 
 impl AgentOptions {
@@ -303,6 +408,7 @@ impl AgentOptions {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: Duration::from_secs(900),
+            goose_provider: None,
         }
     }
 }
@@ -716,23 +822,49 @@ fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
 /// the wire shape is easy to audit against future spec changes.
 const GOOSE_PROTOCOL_VERSION: u64 = 1;
 
-/// Build the env that selects a goose model/provider. The rest of the
-/// environment is inherited by [`EngineTransport::Stdio`].
+/// Build the env that selects a goose model/provider AND bridges the
+/// resolved provider's credential + endpoint into the child process.
+/// The rest of the environment is inherited by [`EngineTransport::Stdio`].
 ///
-///   * `GOOSE_PROVIDER`: from `provider_override` (a test seam to avoid
-///     mutating global process env — `std::env::set_var`/`remove_var` are
-///     `unsafe` in Rust 2024 because they're racy with parallel readers; we
-///     refuse to rely on that), else from `$GOOSE_PROVIDER`, else `"openai"`
-///     (goose treats custom OpenAI-compatible endpoints as the `openai`
-///     provider when `OPENAI_BASE_URL` etc. are set in the inherited env).
-///   * `GOOSE_MODEL`: prefers `opts.model_id` (the routed model id, e.g.
-///     `MiniMax-M3`, `deepseek-chat`, `gpt-4o`), then `opts.model_override`,
-///     and only then `opts.agent_alias` as a last-resort fallback. NEVER
-///     send a zeroclaw agent alias (like `minimax` or `deepseek-v4-pro`) as
-///     `GOOSE_MODEL` unless the operator pinned that exact alias as the
-///     routed model — goose has no concept of zeroclaw aliases and will try
-///     to load it as a model id, which is what the previous version did and
-///     why this driver hung on first tool call.
+/// Resolution precedence for `GOOSE_PROVIDER` (highest first):
+///   1. explicit `provider_override` — a `Some(s)` is a test seam that
+///      forces a specific value (used to avoid mutating global env,
+///      which is `unsafe` in Rust 2024 because of parallel readers).
+///   2. the resolved `GooseProviderEnv::kind` (from the zoder CLI's
+///      `Config::real_best_provider_for_model` call). This is the
+///      MODEL/PROVIDER selection parity seam: when zoder has picked
+///      a specific provider we ALWAYS echo its kind so goose doesn't
+///      silently fall through to its own default ("openai" or
+///      "anthropic" depending on the binary).
+///   3. `$GOOSE_PROVIDER` (operator override on the parent shell).
+///   4. `"openai"` (goose's default; covers unknown zoder kinds +
+///      custom OpenAI-compatible endpoints).
+///
+/// Resolution precedence for `GOOSE_MODEL`:
+///   1. `opts.model_id` (the routed model id, e.g. `MiniMax-M3`,
+///      `deepseek-chat`),
+///   2. `opts.model_override`,
+///   3. `opts.agent_alias` (last-resort fallback; zeroclaw alias).
+///
+/// Credential/endpoint bridge (the CREDENTIAL/ENDPOINT seam): when
+/// `opts.goose_provider` is set, append:
+///   * `OPENAI_API_KEY` = resolved key (NEVER logged; `Debug` on the
+///     input struct redacts it; this fn never puts the key in any log
+///     line, including the `tracing::debug!` callers typically add).
+///   * `OPENAI_BASE_URL` = provider's `base_url` verbatim.
+///   * `OPENAI_HOST` = base_url with the trailing `/v1` (and any deeper
+///     version segment) stripped — goose uses `OPENAI_HOST` as the
+///     session-override host and `OPENAI_BASE_URL` for the API path.
+///
+/// The bridge is ONLY applied when the resolved kind is OpenAI-
+/// compatible (`openai-chat`, `openai-responses`, `custom`, or any
+/// unknown kind — they all map onto goose's `openai` engine).
+/// Anthropic kinds skip the OPENAI_* bridge entirely; goose reads
+/// `ANTHROPIC_*` for those and the zoder provider's auth shape does
+/// not map cleanly. For Anthropic, the CLI/operator is expected to
+/// configure `ANTHROPIC_API_KEY` etc. on the parent shell — this
+/// preserves the existing behavior and prevents leaking the wrong
+/// credential into the wrong engine.
 ///
 /// `provider_override` is a nested `Option` so the test seam can
 /// distinguish "caller explicitly says: use this provider" (`Some(s)`)
@@ -743,24 +875,127 @@ pub(crate) fn goose_env(
     opts: &AgentOptions,
     provider_override: Option<Option<&str>>,
 ) -> Vec<(String, String)> {
-    // Resolution precedence (highest first):
-    //   1. explicit override passed in (used by tests; never mutates env)
-    //   2. $GOOSE_PROVIDER (operator override on the parent shell)
-    //   3. "openai" (goose's default for OpenAI-compatible endpoints)
+    // Pick the canonical goose provider name for GOOSE_PROVIDER. The
+    // precedence is documented above; `provider_override` (the test
+    // seam) ALWAYS wins.
     let provider = match provider_override {
         Some(Some(s)) => s.to_string(),
         Some(None) => "openai".to_string(),
-        None => std::env::var("GOOSE_PROVIDER").unwrap_or_else(|_| "openai".to_string()),
+        None => match &opts.goose_provider {
+            Some(gp) => goose_provider_kind(gp).to_string(),
+            None => std::env::var("GOOSE_PROVIDER").unwrap_or_else(|_| "openai".to_string()),
+        },
     };
     let model = opts
         .model_id
         .clone()
         .or_else(|| opts.model_override.clone())
         .unwrap_or_else(|| opts.agent_alias.clone());
-    vec![
-        ("GOOSE_PROVIDER".to_string(), provider),
-        ("GOOSE_MODEL".to_string(), model),
-    ]
+    let mut env: Vec<(String, String)> = Vec::with_capacity(5);
+    env.push(("GOOSE_PROVIDER".to_string(), provider));
+    env.push(("GOOSE_MODEL".to_string(), model));
+    // CREDENTIAL/ENDPOINT bridge: only when the resolved provider is
+    // OpenAI-compatible. Anthropic providers keep their existing
+    // ambient-env behavior.
+    if let Some(gp) = &opts.goose_provider {
+        if is_openai_compatible_kind(&gp.kind) {
+            if let Some(key) = gp.api_key.as_deref().filter(|s| !s.is_empty()) {
+                env.push(("OPENAI_API_KEY".to_string(), key.to_string()));
+            }
+            if !gp.base_url.is_empty() {
+                env.push(("OPENAI_BASE_URL".to_string(), gp.base_url.clone()));
+                env.push(("OPENAI_HOST".to_string(), strip_v1(&gp.base_url)));
+            }
+        }
+    }
+    env
+}
+
+/// Map a zoder `Provider::kind` to the corresponding goose provider
+/// name (the value goose keys on for `GOOSE_PROVIDER`). OpenAI-
+/// compatible kinds collapse to `"openai"` because that's what
+/// goose's `openai` engine handles (it reads `OPENAI_BASE_URL` etc.
+/// for custom endpoints). Anthropic stays `"anthropic"`. Unknown
+/// kinds are reported verbatim — if the operator pinned something
+/// exotic they probably know the goose name; we don't guess.
+pub(crate) fn goose_provider_kind(gp: &GooseProviderEnv) -> &'static str {
+    if is_openai_compatible_kind(&gp.kind) {
+        "openai"
+    } else if gp.kind == "anthropic" {
+        "anthropic"
+    } else {
+        // Unknown kind: fall through to the caller's provider_override
+        // resolution (which defaults to "openai" / ambient). We return
+        // a static sentinel by leaking into the resolution upstream;
+        // here we just return "openai" so an unrecognized kind still
+        // gets a sensible default rather than panicking.
+        "openai"
+    }
+}
+
+/// `true` for kinds that map onto goose's `openai` engine. This is
+/// the central predicate for the OPENAI_* credential bridge.
+pub(crate) fn is_openai_compatible_kind(kind: &str) -> bool {
+    matches!(kind, "openai-chat" | "openai-responses" | "custom" | "")
+}
+
+/// Strip a trailing `/v1` (case-sensitive; must be exactly `/v1`,
+/// not `/v1beta` or `/v2`) from `url` to produce the OPENAI_HOST
+/// value goose expects. Mirrors goose's own
+/// `goose_providers::openai::parse_openai_base_url` so the host
+/// zoder forwards matches the host goose derives from the same
+/// OPENAI_BASE_URL — a divergence here is exactly what would break
+/// a custom-endpoint setup silently.
+///
+/// Rules (all taken from the goose test matrix):
+///   * `https://api.openai.com/v1`  -> `https://api.openai.com`
+///   * `https://gw.example.com/openai/v1` -> `https://gw.example.com/openai`
+///   * `https://api.openai.com/v1/` -> `https://api.openai.com`
+///     (trailing `/` is trimmed before the strip)
+///   * `https://api.openai.com`     -> `https://api.openai.com` (no /v1)
+///   * `https://example.com/v1beta` -> `https://example.com/v1beta`
+///     (`/v1beta` is NOT `/v1` — preserve verbatim)
+///   * `https://example.com/v2`     -> `https://example.com/v2`
+///     (only `/v1` is stripped; other version segments are kept so
+///     e.g. `/v4` Zhipu endpoints aren't silently rewired)
+///   * Query strings on the BASE_URL are preserved verbatim — zoder
+///     forwards `OPENAI_BASE_URL` unchanged; the host extract here
+///     is only for OPENAI_HOST, which is the override surface and
+///     isn't expected to carry query params in practice.
+fn strip_v1(url: &str) -> String {
+    // Split path from the rest at the FIRST `/` after the scheme
+    // (or after `://` if present). We don't pull in the `url` crate
+    // for one helper — a manual split keeps this hermetic.
+    let (pre, path_with_query) = match url.find("://") {
+        Some(i) => {
+            let rest = &url[i + 3..];
+            match rest.find('/') {
+                Some(j) => (&url[..i + 3 + j], &rest[j..]),
+                None => return url.to_string(),
+            }
+        }
+        None => match url.find('/') {
+            Some(j) => (&url[..j], &url[j..]),
+            None => return url.to_string(),
+        },
+    };
+    // Strip the query string for the matching test — goose's parser
+    // keeps query params on the API request, not on OPENAI_HOST, so
+    // the host extract must ignore them.
+    let path_only = match path_with_query.find('?') {
+        Some(q) => &path_with_query[..q],
+        None => path_with_query,
+    };
+    // Trim trailing slashes so `/v1/` matches `/v1` (and `/v1/?...`
+    // is treated identically).
+    let path = path_only.trim_end_matches('/');
+    if path == "/v1" {
+        return pre.to_string();
+    }
+    if let Some(prefix) = path.strip_suffix("/v1") {
+        return format!("{pre}{prefix}");
+    }
+    url.to_string()
 }
 
 /// Drive a single goose ACP turn: spawn `goose acp`, do the ACP handshake,
@@ -1542,6 +1777,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(5),
+            goose_provider: None,
         }
     }
 
@@ -1597,6 +1833,381 @@ mod tests {
         let env = goose_env(&goose_opts(None), Some(Some("anthropic")));
         let provider = env.iter().find(|(k, _)| k == "GOOSE_PROVIDER").unwrap();
         assert_eq!(provider.1, "anthropic");
+    }
+
+    // ----- task #19 seam tests (CREDENTIAL/ENDPOINT bridge + parity) ----
+
+    /// Build a `GooseProviderEnv` from a (kind, base_url, key) tuple —
+    /// the shape `zoder-cli::agentic_turn` produces after
+    /// `real_best_provider_for_model`. `provider_id` is a static label
+    /// so the test can assert against an exact field value.
+    fn gpe(kind: &str, base_url: &str, api_key: Option<&str>) -> GooseProviderEnv {
+        GooseProviderEnv {
+            provider_id: "test-provider".to_string(),
+            kind: kind.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.map(|s| s.to_string()),
+        }
+    }
+
+    /// Convenience: pull the value for `key` from the env vec returned
+    /// by `goose_env`. Panics if the var isn't present — every test
+    /// asserts presence as part of the seam contract.
+    fn env_get<'a>(env: &'a [(String, String)], key: &str) -> &'a str {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("env missing required var {key}; got {:?}", redact_env(env)))
+            .1
+            .as_str()
+    }
+
+    /// Convenience: assert a var is NOT present (used to prove the
+    /// bridge skips variables for kinds that don't map onto goose's
+    /// openai engine — e.g. anthropic).
+    fn assert_env_absent(env: &[(String, String)], key: &str) {
+        assert!(
+            env.iter().all(|(k, _)| k != key),
+            "env must not contain {key}; got {:?}",
+            redact_env(env)
+        );
+    }
+
+    #[test]
+    fn engine_transport_debug_redacts_secret_env_values() {
+        let t = EngineTransport::Stdio {
+            command: "goose".to_string(),
+            args: vec!["acp".to_string()],
+            env: vec![
+                ("GOOSE_MODEL".to_string(), "MiniMax-M3".to_string()),
+                (
+                    "OPENAI_API_KEY".to_string(),
+                    "sk-super-secret-value".to_string(),
+                ),
+            ],
+        };
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains("sk-super-secret-value"),
+            "key leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "expected redaction marker: {dbg}");
+        assert!(
+            dbg.contains("MiniMax-M3"),
+            "non-secret value should stay visible: {dbg}"
+        );
+    }
+
+    #[test]
+    fn goose_provider_env_debug_redacts_api_key() {
+        // The Debug impl MUST scrub the key. A test panic with
+        // `--nocapture` would otherwise print the secret verbatim
+        // alongside the rest of the struct; this guards against that
+        // and against any future caller doing `println!("{env:?}")`.
+        let env = gpe(
+            "openai-chat",
+            "https://api.minimax.io/v1",
+            Some("sk-supersecret-do-not-leak"),
+        );
+        let rendered = format!("{env:?}");
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "Debug must render the key as [REDACTED]; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-supersecret"),
+            "Debug must NOT leak the raw key; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("do-not-leak"),
+            "Debug must NOT leak any portion of the key; got {rendered}"
+        );
+        // Non-secret fields stay visible so debug output is still
+        // useful for triage.
+        assert!(
+            rendered.contains("test-provider"),
+            "Debug must keep provider_id visible; got {rendered}"
+        );
+        assert!(
+            rendered.contains("https://api.minimax.io/v1"),
+            "Debug must keep base_url visible; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn goose_provider_env_debug_handles_no_key() {
+        // `api_key = None` renders as the literal `None`, NOT
+        // `[REDACTED]`, so a test can distinguish "no key configured"
+        // from "key present but hidden". This is the only Debug
+        // surface where the two cases are intentionally distinguishable.
+        let env = gpe("openai-chat", "https://api.example/v1", None);
+        let rendered = format!("{env:?}");
+        assert!(
+            rendered.contains("None"),
+            "None api_key stays None; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("[REDACTED]"),
+            "[REDACTED] must only appear when a key IS set; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn goose_env_bridges_openai_compatible_provider_credential_and_endpoint() {
+        // The CORE seam test (task #19, seam 1). Given a resolved
+        // OpenAI-compatible provider (zoder's `minimax` -> openai-chat
+        // against api.minimax.io), the child env must carry:
+        //   * GOOSE_PROVIDER = "openai"  (parity: kind -> goose name)
+        //   * GOOSE_MODEL    = routed model id (parity seam 2)
+        //   * OPENAI_API_KEY = the resolved credential
+        //   * OPENAI_BASE_URL = base_url verbatim
+        //   * OPENAI_HOST = base_url with trailing /v1 stripped
+        // and nothing else: no `ANTHROPIC_API_KEY`, no other random vars.
+        let mut opts = goose_opts(None);
+        opts.model_id = Some("MiniMax-M3".to_string());
+        opts.goose_provider = Some(gpe(
+            "openai-chat",
+            "https://api.minimax.io/v1",
+            Some("sk-test-key"),
+        ));
+        let env = goose_env(&opts, None);
+
+        assert_eq!(env_get(&env, "GOOSE_PROVIDER"), "openai");
+        assert_eq!(env_get(&env, "GOOSE_MODEL"), "MiniMax-M3");
+        assert_eq!(env_get(&env, "OPENAI_API_KEY"), "sk-test-key");
+        assert_eq!(
+            env_get(&env, "OPENAI_BASE_URL"),
+            "https://api.minimax.io/v1"
+        );
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.minimax.io");
+        // No leakage of the wrong-engine vars.
+        assert_env_absent(&env, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn goose_env_bridge_works_for_openai_responses_and_custom_kinds() {
+        // The OpenAI-compatible predicate covers three kinds (any of
+        // which the router may resolve to). Test each so a typo in the
+        // match arm that silently drops one kind would fail loudly.
+        for kind in ["openai-chat", "openai-responses", "custom"] {
+            let mut opts = goose_opts(None);
+            opts.model_id = Some("routed".to_string());
+            opts.goose_provider = Some(gpe(kind, "https://gw.example.com/v1", Some("k")));
+            let env = goose_env(&opts, None);
+            assert_eq!(
+                env_get(&env, "OPENAI_API_KEY"),
+                "k",
+                "kind={kind} must bridge the key"
+            );
+            assert_eq!(
+                env_get(&env, "OPENAI_BASE_URL"),
+                "https://gw.example.com/v1",
+                "kind={kind} must bridge the base url"
+            );
+            assert_eq!(
+                env_get(&env, "OPENAI_HOST"),
+                "https://gw.example.com",
+                "kind={kind} must bridge the host"
+            );
+        }
+    }
+
+    #[test]
+    fn goose_env_anthropic_provider_skips_openai_bridge() {
+        // Anthropic providers don't map onto goose's `openai` engine —
+        // they need `ANTHROPIC_API_KEY` etc. (which we leave to the
+        // ambient env / operator config). Forcing the OPENAI_* vars
+        // here would leak the bearer into goose's openai path if the
+        // operator ever switched GOOSE_PROVIDER via shell, so we
+        // explicitly skip the bridge.
+        let mut opts = goose_opts(None);
+        opts.model_id = Some("claude-3-5-sonnet".to_string());
+        opts.goose_provider = Some(gpe(
+            "anthropic",
+            "https://api.anthropic.com",
+            Some("sk-ant-test"),
+        ));
+        let env = goose_env(&opts, None);
+
+        assert_eq!(env_get(&env, "GOOSE_PROVIDER"), "anthropic");
+        assert_eq!(env_get(&env, "GOOSE_MODEL"), "claude-3-5-sonnet");
+        assert_env_absent(&env, "OPENAI_API_KEY");
+        assert_env_absent(&env, "OPENAI_BASE_URL");
+        assert_env_absent(&env, "OPENAI_HOST");
+    }
+
+    #[test]
+    fn goose_env_openai_host_strips_trailing_v1_only() {
+        // OPENAI_HOST = base_url minus a clean trailing `/vN` segment.
+        // We must NOT strip:
+        //   * versioned paths like `/v1beta` (not a clean /vN segment),
+        //   * any subpath after /v1 (it's the API route, not a version),
+        //   * a path prefix before /v1 (e.g. `/openai/v1` -> host ends
+        //     at `/openai`).
+        // Each case is asserted with an exact expected string so a
+        // future strip_v1 regression fails loudly.
+        let mut opts = goose_opts(None);
+        opts.goose_provider = Some(gpe("openai-chat", "", None));
+        // Bare /v1 — strip it.
+        opts.goose_provider.as_mut().unwrap().base_url = "https://api.minimax.io/v1".into();
+        let env = goose_env(&opts, None);
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.minimax.io");
+
+        // No /v1 — host == base_url.
+        opts.goose_provider.as_mut().unwrap().base_url = "https://api.openai.com".into();
+        let env = goose_env(&opts, None);
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.openai.com");
+
+        // Path prefix + /v1 — strip the version, keep the prefix.
+        opts.goose_provider.as_mut().unwrap().base_url = "https://gw.example.com/openai/v1".into();
+        let env = goose_env(&opts, None);
+        assert_eq!(
+            env_get(&env, "OPENAI_HOST"),
+            "https://gw.example.com/openai"
+        );
+
+        // Trailing slash on /v1 — goose's parser strips it (mirrors the
+        // `parse_base_url_handles_trailing_slash` test in goose's own
+        // source). We do the same so the host zoder forwards matches
+        // the host goose derives from the same OPENAI_BASE_URL.
+        opts.goose_provider.as_mut().unwrap().base_url = "https://api.minimax.io/v1/".into();
+        let env = goose_env(&opts, None);
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.minimax.io");
+
+        // /v1beta is NOT a clean /vN segment — don't strip.
+        opts.goose_provider.as_mut().unwrap().base_url = "https://api.example/v1beta".into();
+        let env = goose_env(&opts, None);
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.example/v1beta");
+    }
+
+    #[test]
+    fn goose_env_provider_kind_selection_is_deterministic() {
+        // Direct test of the kind-to-goose-name mapping. The intent
+        // is to lock in the parity contract: every zoder kind maps
+        // onto a stable goose provider name so a config rename can't
+        // silently switch the engine.
+        let openai_env = gpe("openai-chat", "x", None);
+        assert_eq!(goose_provider_kind(&openai_env), "openai");
+        let openai2 = gpe("openai-responses", "x", None);
+        assert_eq!(goose_provider_kind(&openai2), "openai");
+        let custom = gpe("custom", "x", None);
+        assert_eq!(goose_provider_kind(&custom), "openai");
+        let anth = gpe("anthropic", "x", None);
+        assert_eq!(goose_provider_kind(&anth), "anthropic");
+        // Unknown kind must NOT panic; it falls back to "openai" so a
+        // freshly-added zoder kind that has no mapping yet still
+        // produces a sensible default (and gets the OPENAI_* bridge
+        // applied if is_openai_compatible_kind also says so).
+        let unknown = gpe("something-brand-new", "x", None);
+        assert_eq!(goose_provider_kind(&unknown), "openai");
+    }
+
+    #[test]
+    fn goose_env_provider_derives_from_resolved_kind_overriding_ambient() {
+        // Parity seam (task #19, seam 2): when the operator has an
+        // ambient `$GOOSE_PROVIDER=anthropic` on the parent shell but
+        // the routed model resolves to an openai-chat provider, the
+        // resolved kind MUST win — otherwise the loop dials the wrong
+        // engine (and the auth bridge wouldn't even apply, since the
+        // anthropic path skips it). The test deliberately doesn't
+        // touch `std::env`; instead it proves the precedence via
+        // `provider_override = None` (the production call) with
+        // `goose_provider` set, which is documented to outrank the
+        // ambient env. The existing `goose_env_provider_defaults_to_openai`
+        // test covers the "no provider set, no override" default.
+        let mut opts = goose_opts(None);
+        opts.model_id = Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string());
+        opts.goose_provider = Some(gpe(
+            "openai-chat",
+            "https://integrate.api.nvidia.com/v1",
+            Some("nvapi-test"),
+        ));
+        // `provider_override = None` exercises the real production
+        // resolution path (which would normally consult $GOOSE_PROVIDER).
+        let env = goose_env(&opts, None);
+        assert_eq!(
+            env_get(&env, "GOOSE_PROVIDER"),
+            "openai",
+            "resolved kind outranks ambient $GOOSE_PROVIDER"
+        );
+        assert_eq!(
+            env_get(&env, "GOOSE_MODEL"),
+            "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+            "GOOSE_MODEL = routed model id, NOT the agent alias"
+        );
+    }
+
+    #[test]
+    fn goose_env_omits_credential_when_provider_has_no_key() {
+        // Real-world case: the operator's `minimax` provider is
+        // configured with `auth = { type = "none" }` (no auth). We
+        // must NOT inject an empty `OPENAI_API_KEY=` — goose's parser
+        // may reject it, and at minimum it advertises a credential
+        // that isn't there. The bridge is conditional on a non-empty
+        // resolved key.
+        let mut opts = goose_opts(None);
+        opts.model_id = Some("model-1".to_string());
+        opts.goose_provider = Some(gpe("openai-chat", "https://api.minimax.io/v1", None));
+        let env = goose_env(&opts, None);
+        assert_env_absent(&env, "OPENAI_API_KEY");
+        // Base URL + host ARE still set — the operator chose this
+        // endpoint, the bridge should still route to it.
+        assert_eq!(
+            env_get(&env, "OPENAI_BASE_URL"),
+            "https://api.minimax.io/v1"
+        );
+        assert_eq!(env_get(&env, "OPENAI_HOST"), "https://api.minimax.io");
+    }
+
+    #[test]
+    fn goose_env_skips_endpoint_vars_for_empty_base_url() {
+        // A misconfigured provider with an empty base_url shouldn't
+        // poison the child env with `OPENAI_BASE_URL=""` /
+        // `OPENAI_HOST=""`. Skipping the endpoint pair entirely
+        // lets goose fall back to its own config (or fail loudly,
+        // which is the right behavior).
+        let mut opts = goose_opts(None);
+        opts.model_id = Some("model-1".to_string());
+        opts.goose_provider = Some(gpe("openai-chat", "", Some("key")));
+        let env = goose_env(&opts, None);
+        // Key still bridges (a key without an endpoint is the right
+        // direction to leak a credential into a default endpoint —
+        // see comment above; but the test only checks the skip-path).
+        assert_eq!(env_get(&env, "OPENAI_API_KEY"), "key");
+        assert_env_absent(&env, "OPENAI_BASE_URL");
+        assert_env_absent(&env, "OPENAI_HOST");
+    }
+
+    #[test]
+    fn goose_env_without_resolved_provider_does_not_inject_bridge() {
+        // The legacy / no-provider-configured path must keep the old
+        // behavior exactly: only GOOSE_PROVIDER + GOOSE_MODEL, no
+        // OPENAI_* vars. (Otherwise a future refactor that always
+        // injects the bridge could leak a stale credential from a
+        // previous test run into a clean repo.)
+        let opts = goose_opts(Some("gpt-4o-mini"));
+        let env = goose_env(&opts, None);
+        assert!(env.iter().any(|(k, _)| k == "GOOSE_PROVIDER"));
+        assert!(env.iter().any(|(k, _)| k == "GOOSE_MODEL"));
+        assert_env_absent(&env, "OPENAI_API_KEY");
+        assert_env_absent(&env, "OPENAI_BASE_URL");
+        assert_env_absent(&env, "OPENAI_HOST");
+    }
+
+    #[test]
+    fn is_openai_compatible_kind_recognizes_known_and_unknown_kinds() {
+        // The predicate is the central gate for the credential bridge;
+        // any future kind addition that should NOT get OPENAI_* vars
+        // (e.g. a future non-OpenAI provider type) needs a deliberate
+        // negative test here. Today: openai-chat/responses/custom +
+        // the empty-string default are OpenAI-compatible; anthropic is
+        // not.
+        assert!(is_openai_compatible_kind("openai-chat"));
+        assert!(is_openai_compatible_kind("openai-responses"));
+        assert!(is_openai_compatible_kind("custom"));
+        assert!(is_openai_compatible_kind(""));
+        assert!(!is_openai_compatible_kind("anthropic"));
+        assert!(!is_openai_compatible_kind("azure-openai"));
+        assert!(!is_openai_compatible_kind("cohere"));
     }
 
     // ---- Real ACP v1 wire-shape mock ------------------------------------
@@ -3157,6 +3768,7 @@ mod goose_acp_real_turn {
             show_reasoning: false,
             approval: ApprovalPolicy::None,
             timeout: std::time::Duration::from_secs(60),
+            goose_provider: None,
         };
         let mut conn = connect_transport(&transport)
             .await
