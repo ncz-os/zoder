@@ -1,9 +1,10 @@
 # The CI-parity gate — zoder's compliance-first stance
 
-> **Status:** decided + being built. Slice 1 (the gate-planning core) has landed
-> (`crates/zoder-core/src/gate.rs`); the runner, CI-file derivation, and loop/review
-> wiring are in progress (see [Roadmap](#roadmap)). This document is the design of
-> record.
+> **Status:** decided + being built. Slices 1-4 of the gate engine have
+> landed (planning core, CI derivation, runner, language/framework
+> detectors + honest-degradation reporting); managed tool bundle and the
+> `zoder loop --check` wiring are next (see [Roadmap](#roadmap)). This
+> document is the design of record.
 
 ## The position
 
@@ -49,11 +50,29 @@ by design — not Rust-only:
 
 | Ecosystem | Format | Lint | Build | Test | Security / supply-chain |
 |---|---|---|---|---|---|
-| Rust | `cargo fmt --all --check` | `cargo clippy -D warnings` | `cargo build` | `cargo test` | `cargo deny check` (req) + `cargo audit` (advisory) |
-| Node / TS | `prettier --check` | `npm run lint` | `npm run build` | `npm test` | `npm audit` / `osv-scanner` |
-| Python | `ruff format --check` | `ruff check` | `python -m build` | `pytest` | `pip-audit` |
-| Go | `gofmt -l` | `go vet` | `go build ./...` | `go test ./...` | `govulncheck` |
-| _(more ecosystems + framework detectors to follow)_ | | | | | |
+| Rust | `cargo fmt --all -- --check` | `cargo clippy --all-targets -- -D warnings` | `cargo build --all-targets` | `cargo test --all-targets` | `cargo deny check` (req) + `cargo audit` (advisory) |
+| Node / TS (npm) | `npx prettier --check .` | `npm run lint` | `npm run build` | `npm test` | `npm audit --audit-level=high` |
+| Node / TS (yarn) | `npx prettier --check .` | `yarn lint` | `yarn build` | `yarn test` | `yarn npm audit --audit-level=high` |
+| Node / TS (pnpm) | `npx prettier --check .` | `pnpm run lint` | `pnpm run build` | `pnpm test` | `pnpm audit --audit-level=high` |
+| Node / TS (bun) | `bunx prettier --check .` | `bun run lint` | `bun run build` | `bun test` | `bun audit --audit-level=high` |
+| Python (pip / setuptools) | `ruff format --check .` | `ruff check .` | `python -m build` | `pytest -q` | `pip-audit` |
+| Python (poetry) | `ruff format --check .` | `ruff check .` | `poetry build` | `poetry run pytest -q` | `pip-audit -r requirements.txt` |
+| Python (uv) | `ruff format --check .` | `ruff check .` | `uv build` | `uv run pytest -q` | `pip-audit -r requirements.txt` |
+| Go | `gofmt -l .` | `go vet ./...` | `go build ./...` | `go test ./...` | `govulncheck ./...` |
+
+The Rust / Node / Python / Go / package-manager defaults above are the
+canonical baseline commands the gate picks for a repo when its declared
+CI does not cover the relevant category. The package-manager column
+(node-default `npm` is omitted because it is the baseline default) lets
+the gate match the exact toolchain a project actually uses — a silent
+fallback from `pnpm test` to `npm test` for a pnpm project would produce
+a CI that diverges from upstream.
+
+Framework hints (Next.js, Nuxt, Vite, Vitest, Jest, Django, Pipenv,
+pyproject, uv, go-modules, …) are detected in `detect_frameworks` from
+marker filenames alone and surfaced for review; they never replace the
+canonical command — frameworks can have broken tooling, and the canonical
+command remains the safety floor.
 
 Cross-cutting baseline checks (language-agnostic): **license / SPDX** compliance,
 **secret scanning** (gitleaks), **conventional-commits** + **DCO sign-off** (when
@@ -101,10 +120,22 @@ install keeps "fail-closed" from becoming "can't work because a tool is missing.
 
 1. ✅ **Gate planning core** — ecosystem detection, `GateStep` model, baseline
    plans, Green/Yellow/Red aggregation (`crates/zoder-core/src/gate.rs`).
-2. **CI-file derivation** — parse Actions / GitLab CI / Woodpecker into `GateStep`s
-   with a runnable-vs-skipped compatibility report.
-3. **The runner** — execute steps, detect missing tools (hard-error in strict),
-   produce `StepResult`s and the aggregated status.
-4. **Wiring** — make the gate the default `zoder loop --check`, and ground the
-   adversarial reviewer on the gate report (no approve over red).
-5. **Managed tool bundle** — pinned install of the gate tools.
+2. ✅ **CI-file derivation** — `CiJob` / `CompatibilityReport` classifier that
+   produces runnable-vs-skipped breakdown from a repo's declared CI
+   (`derive_plan` in `gate.rs`).
+3. ✅ **The runner** — `GateEnv`/`run_plan` execute steps, route missing tools
+   to Skipped (advisory) or Failed (fail-closed) by mode (`gate.rs`).
+4. ✅ **Language/framework detectors beyond Rust + honest-degradation
+   reporting** — per-language predicates (`detect_rust`/`detect_node`/
+   `detect_python`/`detect_go`), `PackageManager` enum with pnpm/yarn/bun/
+   poetry/uv refinement, `detect_frameworks` (Next, Nuxt, Vite, Vitest,
+   Jest, Django, Pipenv, pyproject, uv, etc.), `RepoSignals`, and the
+   `GateReport` pretty/compact renderer that always attaches the
+   compatibility breakdown (even on Green) so the gate's "CI parity
+   within local compute/network scope" claim stays honest.
+5. **Managed tool bundle** — pinned install of the gate tools (cargo-deny,
+   cargo-audit, osv-scanner, gitleaks, cyclonedx, govulncheck, pip-audit,
+   ...) so strict-mode is reproducible and "fail-closed" never becomes
+   "can't work because a tool is missing".
+6. **Wiring** — make the gate the default `zoder loop --check`, and ground
+   the adversarial reviewer on the `GateReport` (no approve over Red).
