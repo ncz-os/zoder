@@ -11,6 +11,7 @@ pub use acp_client as engine_rpc;
 pub mod enterprise_cost;
 pub mod finops;
 pub mod gate;
+pub mod gate_bundle;
 pub use model_health as health;
 pub mod ledger;
 pub mod policy;
