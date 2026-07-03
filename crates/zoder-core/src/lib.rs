@@ -12,6 +12,12 @@ pub mod enterprise_cost;
 pub mod finops;
 pub mod gate;
 pub mod gate_bundle;
+pub mod health_probe;
+pub use health_probe::{
+    cap_targets, classify_err, classify_err_kind, probe_all, probe_request, Probe, ProbeOutcome,
+    ProbePlan, ProbeResolver, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_MAX_TOKENS,
+    PROBE_PING_TIMEOUT_SECS, PROBE_PROMPT,
+};
 pub use model_health as health;
 pub mod ledger;
 pub mod policy;
@@ -46,7 +52,7 @@ pub use finops::{
     BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, FinOpsTags, ModelRealized, SpendGroup,
 };
 pub use ledger::{Entry, Ledger, Period, Rollup};
-pub use model_health::{HealthStore, State};
+pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{ModelPrice, PricingCatalog};
 pub use pricing_sync::{sync_catalog, Source as PricingSource, SyncStats};
