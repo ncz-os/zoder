@@ -621,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn probe_ping_timeout_is_bounded() {
         // The per-ping cap must be a positive number of seconds and must
         // not exceed a minute — anything larger risks undoing the
