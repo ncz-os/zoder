@@ -108,7 +108,7 @@ release:trio:
 # Driven by a pipeline schedule with NIGHTLY=1; also runnable manually from web.
 .nightly-rules: &nightly-rules
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $NIGHTLY == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
