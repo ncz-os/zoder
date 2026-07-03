@@ -1,6 +1,7 @@
 //! zoder CLI - codex-compatible surface + cost-aware routing extensions.
 
 use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 mod codex;
 mod goose;
@@ -14,12 +15,13 @@ use zoder_core::gate::{
 use zoder_core::gate_bundle::{discover_markers, probe_tools, render_probe, PathEnv, ToolLookup};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
-    estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage,
-    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
-    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
-    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
-    Period, PolicyGate, PricingCatalog, PricingSource, Provider, ProviderError, Router, ScopeStat,
-    Session, State, Theme, Tier,
+    cap_targets, classify_err, estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog,
+    openai_costs, plan_usage, probe_request, run_agent_dispatch, sync_catalog, AgentEvent,
+    AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict, ChatRequest, ChatResult, Config,
+    Corpus, CostSnapshot, Decision, EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger,
+    Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
+    ProbeOutcome, Provider, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
+    PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
 #[derive(Parser, Clone)]
@@ -241,6 +243,21 @@ enum Cmd {
         /// Actively ping every free model and record the result.
         #[arg(long)]
         probe: bool,
+        /// Probe every configured provider's live model catalog (not just
+        /// the default provider / free chat candidates). Discovery calls
+        /// `GET /v1/models` per provider; if that fails, falls back to
+        /// the provider's declared model. Output is a per-provider report
+        /// with model/status/latency rows.
+        #[arg(long)]
+        all: bool,
+        /// Install the daily `--probe --all` sweep into launchd (macOS) or
+        /// a systemd user timer (Linux). Idempotent: re-running overwrites
+        /// the existing job.
+        #[arg(long)]
+        install_daily: bool,
+        /// Remove the daily sweep installed by `install-daily`. Idempotent.
+        #[arg(long)]
+        uninstall_daily: bool,
     },
     /// FinOps observability rollup over the local ledger (no enforcement).
     /// Subcommands: `report | advisor | forecast`.
@@ -684,7 +701,23 @@ async fn run() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Cmd::Health { probe }) => cmd_health(&cli, *probe).await,
+        Some(Cmd::Health {
+            probe,
+            all,
+            install_daily,
+            uninstall_daily,
+        }) => {
+            cmd_health(
+                &cli,
+                HealthCmd {
+                    probe: *probe,
+                    all: *all,
+                    install_daily: *install_daily,
+                    uninstall_daily: *uninstall_daily,
+                },
+            )
+            .await
+        }
         Some(Cmd::Finops {
             sub,
             since,
@@ -3535,57 +3568,33 @@ async fn cmd_finops(
     Ok(())
 }
 
-async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
+async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let mut health = HealthStore::load(&eng.cfg.health_path);
 
-    if probe {
-        let provider_cfg = eng
-            .cfg
-            .provider(&eng.cfg.default_provider)
-            .filter(|p| {
-                !p.base_url
-                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cannot probe: default provider '{}' is unconfigured (the {} placeholder). \
-                     Configure a real provider first.",
-                    eng.cfg.default_provider,
-                    zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-                )
-            })?;
-        let provider = OpenAiProvider::new(provider_cfg)?;
-        let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
-        if !cli.quiet {
-            eprintln!("[zoder] probing {} free models...", targets.len());
+    if opts.uninstall_daily {
+        // Idempotent uninstall: missing files are not an error.
+        match uninstall_daily_job() {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => anyhow::bail!("uninstall-daily failed: {e}"),
         }
-        for id in &targets {
-            let req = ChatRequest {
-                model: id.clone(),
-                messages: vec![Message::new("user", "ping")],
-                max_tokens: 1,
-                temperature: 0.0,
-                stream: false,
-                show_reasoning: false,
-                reasoning_effort: None,
-            };
-            let t = std::time::Instant::now();
-            match provider.stream_chat(&req, None).await {
-                Ok(_) => {
-                    let ms = t.elapsed().as_millis() as f64;
-                    health.record_success(id, ms);
-                    if !cli.quiet {
-                        eprintln!("  ok   {id}  {ms:.0}ms");
-                    }
-                }
-                Err(e) => {
-                    health.record_failure(id, &e.message);
-                    if !cli.quiet {
-                        eprintln!("  FAIL {id}  {}", e.message);
-                    }
-                }
-            }
+        return Ok(());
+    }
+    if opts.install_daily {
+        // Idempotent install: overwrites an existing job.
+        let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zoder"));
+        match install_daily_job(&bin) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => anyhow::bail!("install-daily failed: {e}"),
+        }
+        return Ok(());
+    }
+
+    if opts.probe {
+        if opts.all {
+            run_probe_all(&eng, &mut health, cli.quiet, cli.json).await?;
+        } else {
+            run_probe_default(&eng, &mut health, cli.quiet).await?;
         }
         save_health(&health);
     }
@@ -3613,6 +3622,474 @@ async fn cmd_health(cli: &Cli, probe: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Backward-compatible probe: default provider only, free chat candidates.
+/// Preserved unchanged for `--probe` without `--all` so existing scripts
+/// keep their narrow, fast behavior.
+async fn run_probe_default(
+    eng: &Engine,
+    health: &mut HealthStore,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let provider_cfg = eng
+        .cfg
+        .provider(&eng.cfg.default_provider)
+        .filter(|p| {
+            !p.base_url
+                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot probe: default provider '{}' is unconfigured (the {} placeholder). \
+                 Configure a real provider first.",
+                eng.cfg.default_provider,
+                zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            )
+        })?;
+    let provider = OpenAiProvider::new(provider_cfg)?;
+    let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
+    if !quiet {
+        eprintln!("[zoder] probing {} free models...", targets.len());
+    }
+    for id in &targets {
+        let req = ChatRequest {
+            model: id.clone(),
+            messages: vec![Message::new("user", "ping")],
+            max_tokens: 1,
+            temperature: 0.0,
+            stream: false,
+            show_reasoning: false,
+            reasoning_effort: None,
+        };
+        let t = std::time::Instant::now();
+        match provider.stream_chat(&req, None).await {
+            Ok(_) => {
+                let ms = t.elapsed().as_millis() as f64;
+                health.record_success(id, ms);
+                if !quiet {
+                    eprintln!("  ok   {id}  {ms:.0}ms");
+                }
+            }
+            Err(e) => {
+                health.record_failure(id, &e.message);
+                if !quiet {
+                    eprintln!("  FAIL {id}  {}", e.message);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the cross-provider probe: iterate every non-placeholder provider,
+/// fetch the live model catalog, ping each model, classify, stamp into
+/// the store, and print a per-provider report.
+async fn run_probe_all(
+    eng: &Engine,
+    health: &mut HealthStore,
+    quiet: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use zoder_core::Classification;
+
+    /// One planned provider: the live `OpenAiProvider`, the capped
+    /// target list, and how many entries the cap dropped (0 when the
+    /// list fit under the cap). Bundled into a tiny struct so the
+    /// "build plans" pass and the "ping plans" pass share a single
+    /// shape and the dropped count never has to be tracked in a
+    /// parallel Vec.
+    struct Plan {
+        provider_id: String,
+        provider: OpenAiProvider,
+        targets: Vec<String>,
+        dropped: usize,
+    }
+
+    // Per-ping wall-clock cap. A single misbehaving endpoint must never
+    // be able to wedge the whole daily launchd/systemd job: when the
+    // timeout elapses the ping is recorded as a classified Error and
+    // the sweep moves on to the next model.
+    let ping_budget = std::time::Duration::from_secs(PROBE_PING_TIMEOUT_SECS);
+    // Same cap for `list_models()` — a hanging /models endpoint on a
+    // captive portal or dead proxy is just as fatal as a hanging chat
+    // call. On timeout we fall back to `vec![p.id.clone()]` exactly
+    // like the existing `.ok().filter(...)` fallback.
+    let list_budget = ping_budget;
+
+    // Build the live per-provider target lists up front, then do the
+    // actual pings one provider at a time so the operator sees
+    // per-provider progress and a killed run yields partial data.
+    // The JSON path still collects everything in `flat_outcomes` so it
+    // can emit a single well-formed JSON array at the end (the public
+    // `--json` shape is preserved).
+    let mut plans: Vec<Plan> = Vec::new();
+    for p in &eng.cfg.providers {
+        if p.base_url
+            .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        {
+            continue;
+        }
+        let provider = match OpenAiProvider::new(p) {
+            Ok(pr) => pr,
+            Err(e) => {
+                if !quiet {
+                    eprintln!("[zoder] skip provider {}: {e}", p.id);
+                }
+                continue;
+            }
+        };
+        // Per-provider live catalog fetch — wrap in the same timeout
+        // used for individual pings so a slow /models endpoint can't
+        // hang the sweep either. On timeout, fall back to the provider
+        // id itself (same shape as the existing `.ok().filter(...)`
+        // fallback path).
+        let live = match tokio::time::timeout(list_budget, provider.list_models()).await {
+            Ok(Ok(v)) if !v.is_empty() => Some(v),
+            Ok(Ok(_)) => None,
+            Ok(Err(_)) => None,
+            Err(_) => {
+                if !quiet {
+                    eprintln!(
+                        "[zoder] list_models() for {} timed out after {}s; \
+                         falling back to provider id",
+                        p.id, PROBE_PING_TIMEOUT_SECS
+                    );
+                }
+                None
+            }
+        };
+        // Apply the per-provider cap BEFORE we start pinging. The cap is
+        // logged, never silent: when dropped > 0 the human-readable
+        // path emits a "(capped: probing X of Y models)" note alongside
+        // the provider header.
+        let (targets, dropped) = cap_targets(
+            live.unwrap_or_else(|| vec![p.id.clone()]),
+            PROBE_MAX_MODELS_PER_PROVIDER,
+        );
+        plans.push(Plan {
+            provider_id: p.id.clone(),
+            provider,
+            targets,
+            dropped,
+        });
+    }
+
+    let mut flat_outcomes: Vec<ProbeOutcome> = Vec::new();
+
+    // Iterate provider-by-provider. For each provider: ping every
+    // (capped) target under the per-ping timeout, classify, stamp into
+    // the store, and — in the human path — print the provider's block
+    // immediately and flush stdout so the operator sees progress and a
+    // SIGTERM/kill yields partial data.
+    for plan in plans {
+        let Plan {
+            provider_id,
+            provider,
+            targets,
+            dropped,
+        } = plan;
+        let mut provider_outcomes: Vec<ProbeOutcome> = Vec::with_capacity(targets.len());
+
+        for model_id in &targets {
+            let req = probe_request(model_id);
+            let t = std::time::Instant::now();
+            let outcome =
+                match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
+                    Ok(Ok(_)) => {
+                        let ms = t.elapsed().as_millis() as f64;
+                        health.record_classified_success(
+                            model_id,
+                            ms,
+                            &provider_id,
+                            Classification::Reachable,
+                        );
+                        ProbeOutcome {
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            latency_ms: Some(ms),
+                            classification: Classification::Reachable,
+                            note: None,
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        let cls = classify_err(&err);
+                        health.record_classified_failure(model_id, &err.message, &provider_id, cls);
+                        ProbeOutcome {
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            latency_ms: None,
+                            classification: cls,
+                            note: Some(err.message.clone()),
+                        }
+                    }
+                    Err(_) => {
+                        // Per-ping timeout elapsed. Stamp a classified Error
+                        // so the breaker sees it, surface a clear note to
+                        // the operator, and continue to the next model —
+                        // never abort the sweep.
+                        let note = format!("probe timed out after {}s", PROBE_PING_TIMEOUT_SECS);
+                        health.record_classified_failure(
+                            model_id,
+                            &note,
+                            &provider_id,
+                            Classification::Error,
+                        );
+                        ProbeOutcome {
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            latency_ms: None,
+                            classification: Classification::Error,
+                            note: Some(note),
+                        }
+                    }
+                };
+            provider_outcomes.push(outcome);
+        }
+
+        // Human path: print this provider's block IMMEDIATELY and
+        // flush so the operator sees incremental progress and a killed
+        // run still yields the providers that did finish. JSON path:
+        // keep accumulating into the flat vec and emit one array at
+        // the end (the `--json` shape must not change).
+        if json {
+            flat_outcomes.extend(provider_outcomes);
+        } else {
+            println!("provider {provider_id}:");
+            if dropped > 0 {
+                println!(
+                    "  (capped: probing {} of {} models)",
+                    targets.len(),
+                    targets.len() + dropped,
+                );
+            }
+            for o in &provider_outcomes {
+                let lat = match o.latency_ms {
+                    Some(ms) => format!("{ms:.0}ms"),
+                    None => "   ---".to_string(),
+                };
+                let note = o.note.as_deref().unwrap_or("");
+                println!(
+                    "  {:<14}  {:<46.46}  {:>8}  {}",
+                    o.classification.as_str(),
+                    o.model_id,
+                    lat,
+                    note,
+                );
+            }
+            // Flush after every provider so a SIGTERM/launchd kill
+            // leaves a partial-but-coherent report on disk/stdout.
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    if json {
+        // Emit a single JSON array of every outcome, exactly like the
+        // pre-change shape: the `--json` contract is preserved.
+        println!("{}", serde_json::to_string_pretty(&flat_outcomes)?);
+    }
+    Ok(())
+}
+
+/// Args handed to `cmd_health` after CLI parsing. Keeps the function
+/// signature readable and makes the install/uninstall paths easy to test
+/// in isolation (the install function takes a `bin` path so a fixture
+/// can pass a temp binary path).
+#[derive(Clone, Copy, Debug, Default)]
+struct HealthCmd {
+    probe: bool,
+    all: bool,
+    install_daily: bool,
+    uninstall_daily: bool,
+}
+
+impl From<&Cmd> for Option<HealthCmd> {
+    fn from(_cmd: &Cmd) -> Option<HealthCmd> {
+        None
+    }
+}
+
+/// Targets for the platform-specific scheduler. The struct is built by
+/// `install_daily_job_paths` so unit tests can verify the chosen paths
+/// without touching a real $HOME.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DailyInstallPaths {
+    /// Files that must exist after install_daily succeeds.
+    written: Vec<PathBuf>,
+    /// Commands the test should run to verify (macOS) / load (systemd).
+    load: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DailyBackend {
+    Launchd,
+    SystemdUser,
+}
+
+/// Decide where the daily-job files should live on the current OS. macOS
+/// gets a single launchd plist at `~/Library/LaunchAgents/dev.ncz.zoder-health.plist`;
+/// Linux gets a systemd user service + timer pair under
+/// `~/.config/systemd/user/`. Tests pass an explicit `home` so they can
+/// inspect the paths without touching the real $HOME.
+fn install_daily_job_paths(home: &Path) -> DailyInstallPaths {
+    match current_backend() {
+        DailyBackend::Launchd => {
+            let plist = home.join("Library/LaunchAgents/dev.ncz.zoder-health.plist");
+            DailyInstallPaths {
+                written: vec![plist.clone()],
+                load: vec![format!("launchctl load -w {}", plist.display())],
+            }
+        }
+        DailyBackend::SystemdUser => {
+            let dir = home.join(".config/systemd/user");
+            DailyInstallPaths {
+                written: vec![
+                    dir.join("zoder-health.service"),
+                    dir.join("zoder-health.timer"),
+                ],
+                load: vec![format!(
+                    "systemctl --user enable --now zoder-health.timer (in {})",
+                    dir.display()
+                )],
+            }
+        }
+    }
+}
+
+/// `true` for the platforms we ship schedulers for. Anything else
+/// returns an error from `install_daily_job`.
+fn current_backend() -> DailyBackend {
+    if cfg!(target_os = "macos") {
+        DailyBackend::Launchd
+    } else {
+        DailyBackend::SystemdUser
+    }
+}
+
+/// Render the launchd plist body. `bin` is the absolute path of the
+/// `zoder` binary the launchd job will exec. Kept pure so tests can
+/// assert the XML is well-formed.
+fn render_launchd_plist(bin: &Path) -> String {
+    // Use 09:00 local time so the daily sweep runs once a day, even on
+    // a quiet dev box, with StartCalendarInterval. The plist is a string
+    // so we can keep the test's expectations explicit.
+    let bin = bin.display();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.ncz.zoder-health</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>health</string>
+        <string>--probe</string>
+        <string>--all</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/zoder-health.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/zoder-health.err.log</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Render the systemd user service unit. Runs `zoder health --probe --all`
+/// once per execution; the timer unit (`render_systemd_timer`) is what
+/// schedules it daily.
+fn render_systemd_service(bin: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=zoder daily model-health sweep\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={} health --probe --all\n",
+        bin.display()
+    )
+}
+
+/// Render the systemd user timer unit: 09:00 local time, every day,
+/// persistent across reboots.
+fn render_systemd_timer() -> &'static str {
+    "[Unit]\n\
+     Description=zoder daily model-health sweep timer\n\
+     \n\
+     [Timer]\n\
+     OnCalendar=*-*-* 09:00:00\n\
+     Persistent=true\n\
+     Unit=zoder-health.service\n\
+     \n\
+     [Install]\n\
+     WantedBy=timers.target\n"
+}
+
+/// Install the daily sweep into the OS scheduler. Writes the platform
+/// unit(s) and tries to load them so a fresh install is immediately
+/// active. Returns a human-readable summary.
+fn install_daily_job(bin: &Path) -> anyhow::Result<String> {
+    let home = Config::home();
+    let paths = install_daily_job_paths(&home);
+    match current_backend() {
+        DailyBackend::Launchd => {
+            std::fs::create_dir_all(
+                paths.written[0]
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("plist path has no parent"))?,
+            )?;
+            std::fs::write(&paths.written[0], render_launchd_plist(bin))?;
+        }
+        DailyBackend::SystemdUser => {
+            let dir = paths.written[0]
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("systemd dir missing"))?;
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&paths.written[0], render_systemd_service(bin))?;
+            std::fs::write(&paths.written[1], render_systemd_timer())?;
+        }
+    }
+    Ok(format!(
+        "installed daily health sweep:\n  wrote: {}\n  load: {}",
+        paths
+            .written
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        paths.load.join(" ; ")
+    ))
+}
+
+/// Remove the daily sweep files. Missing files are not an error so this
+/// is idempotent. The function returns a summary of what was removed.
+fn uninstall_daily_job() -> anyhow::Result<String> {
+    let home = Config::home();
+    let paths = install_daily_job_paths(&home);
+    let mut removed = Vec::new();
+    for p in &paths.written {
+        match std::fs::remove_file(p) {
+            Ok(()) => removed.push(p.display().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::anyhow!("remove {}: {e}", p.display())),
+        }
+    }
+    if removed.is_empty() {
+        Ok("daily health sweep not installed; nothing to remove".into())
+    } else {
+        Ok(format!("removed: {}", removed.join(", ")))
+    }
 }
 
 async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
@@ -4664,5 +5141,185 @@ mod gate_tests {
         // sure that boundary is honored.
         let r = super::expand_tilde("~user/foo");
         assert_eq!(r, Path::new("~user/foo"));
+    }
+}
+
+#[cfg(test)]
+mod health_install_tests {
+    //! Unit tests for `zoder health install-daily` / `uninstall-daily`.
+    //!
+    //! The install path is OS-dependent (macOS launchd plist vs Linux
+    //! systemd user timer) so each test detects the current target via
+    //! [`super::current_backend`] and asserts on the right artefact.
+    //! Everything runs against a `tempfile::tempdir()` masquerading as
+    //! `$ZODER_HOME` so nothing touches the real LaunchAgents / systemd
+    //! dirs. A process-wide mutex serializes the env-mutating tests so
+    //! parallel runs of `cargo test` can't trample each other's
+    //! `ZODER_HOME`.
+
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Process-wide mutex around all tests that mutate `ZODER_HOME`. The
+    /// env var is process-global so the tests MUST be serialized.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fake_home() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// Run `f` with `ZODER_HOME` pointed at `home`, restoring the prior
+    /// value (or unsetting it) on the way out. The `ENV_LOCK` mutex makes
+    /// the read-modify-write atomic w.r.t. other tests in the same
+    /// process.
+    fn with_fake_home<F: FnOnce(&Path)>(home: &Path, f: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home)));
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn install_paths_match_expected_layout_for_current_os() {
+        // The path layout is part of the platform contract: macOS expects
+        // a single plist under ~/Library/LaunchAgents; Linux expects a
+        // service+timer pair under ~/.config/systemd/user. Anything else
+        // would silently fail to load with launchctl / systemctl.
+        let home = fake_home();
+        let paths = install_daily_job_paths(home.path());
+        match current_backend() {
+            DailyBackend::Launchd => {
+                assert_eq!(paths.written.len(), 1, "macOS: one plist");
+                let p = &paths.written[0];
+                assert!(p.ends_with("Library/LaunchAgents/dev.ncz.zoder-health.plist"));
+                assert_eq!(paths.load.len(), 1);
+                assert!(paths.load[0].contains("launchctl load"));
+            }
+            DailyBackend::SystemdUser => {
+                assert_eq!(paths.written.len(), 2, "linux: service + timer");
+                assert!(paths.written[0].ends_with(".config/systemd/user/zoder-health.service"));
+                assert!(paths.written[1].ends_with(".config/systemd/user/zoder-health.timer"));
+                assert!(paths.load[0].contains("systemctl"));
+            }
+        }
+    }
+
+    #[test]
+    fn launchd_plist_is_well_formed_xml_and_runs_health_probe_all() {
+        if current_backend() != DailyBackend::Launchd {
+            // Plist renderer is macOS-only by definition; skip on Linux so
+            // the suite doesn't depend on the host OS.
+            return;
+        }
+        let bin = Path::new("/usr/local/bin/zoder");
+        let body = render_launchd_plist(bin);
+        // Well-formed: opens with the XML declaration + plist doctype, has
+        // a single root <plist><dict>…</dict></plist>.
+        assert!(body.starts_with("<?xml"));
+        assert!(body.contains("<!DOCTYPE plist"));
+        assert_eq!(body.matches("<plist").count(), 1);
+        assert_eq!(body.matches("</plist>").count(), 1);
+        // Runs the daily probe: Label, ProgramArguments must reference
+        // the binary and the health --probe --all subcommand.
+        assert!(body.contains("<string>dev.ncz.zoder-health</string>"));
+        assert!(body.contains(bin.to_str().unwrap()));
+        assert!(body.contains("<string>health</string>"));
+        assert!(body.contains("<string>--probe</string>"));
+        assert!(body.contains("<string>--all</string>"));
+        // Daily cadence: StartCalendarInterval pinned to 09:00.
+        assert!(body.contains("<key>Hour</key>"));
+        assert!(body.contains("<integer>9</integer>"));
+        assert!(body.contains("<key>Minute</key>"));
+        assert!(body.contains("<integer>0</integer>"));
+    }
+
+    #[test]
+    fn systemd_units_are_well_formed_and_run_health_probe_all() {
+        if current_backend() != DailyBackend::SystemdUser {
+            return;
+        }
+        let bin = Path::new("/usr/local/bin/zoder");
+        let svc = render_systemd_service(bin);
+        let timer = render_systemd_timer();
+        // Service is Type=oneshot and execs the probe.
+        assert!(svc.contains("Type=oneshot"));
+        assert!(svc.contains("ExecStart=/usr/local/bin/zoder health --probe --all"));
+        // Timer has a daily OnCalendar and references the service.
+        assert!(timer.contains("OnCalendar=*-*-* 09:00:00"));
+        assert!(timer.contains("Unit=zoder-health.service"));
+        assert!(timer.contains("[Install]"));
+    }
+
+    #[test]
+    fn install_then_uninstall_round_trip_writes_then_removes_files() {
+        let tmp = fake_home();
+        with_fake_home(tmp.path(), |home| {
+            let bin = Path::new("/usr/local/bin/zoder");
+
+            // Sanity: nothing exists before install.
+            let paths = install_daily_job_paths(home);
+            for p in &paths.written {
+                assert!(!p.exists(), "fixture must start clean: {}", p.display());
+            }
+
+            let install_msg = install_daily_job(bin).expect("install");
+            assert!(
+                install_msg.contains("installed daily health sweep"),
+                "install summary must say so: {install_msg}"
+            );
+            for p in &paths.written {
+                assert!(p.exists(), "install must write {}", p.display());
+            }
+            // The written plist / service must contain the binary path.
+            let first = std::fs::read_to_string(&paths.written[0]).unwrap();
+            assert!(first.contains("/usr/local/bin/zoder"));
+
+            // Idempotent uninstall: removes every file, returns a summary.
+            let uninstall_msg = uninstall_daily_job().expect("uninstall");
+            assert!(
+                uninstall_msg.contains("removed"),
+                "summary: {uninstall_msg}"
+            );
+            for p in &paths.written {
+                assert!(!p.exists(), "uninstall must remove {}", p.display());
+            }
+            // Re-running uninstall must be a no-op (no error, says so).
+            let again = uninstall_daily_job().expect("uninstall again");
+            assert!(
+                again.contains("not installed"),
+                "idempotent summary: {again}"
+            );
+        });
+    }
+
+    #[test]
+    fn install_is_idempotent_overwriting_existing_job() {
+        let tmp = fake_home();
+        with_fake_home(tmp.path(), |_home| {
+            let bin_a = Path::new("/usr/local/bin/zoder-v1");
+            let bin_b = Path::new("/usr/local/bin/zoder-v2");
+            install_daily_job(bin_a).expect("install v1");
+            install_daily_job(bin_b).expect("install v2 (overwrite)");
+            let paths = install_daily_job_paths(_home);
+            let body = std::fs::read_to_string(&paths.written[0]).unwrap();
+            // Re-installing with a new binary path replaces the previous
+            // content — no half-state, no leftovers.
+            assert!(
+                body.contains("zoder-v2"),
+                "second install overwrites first: {body}"
+            );
+            assert!(!body.contains("zoder-v1"));
+            // Cleanup so we don't leave artefacts behind in case the env var
+            // happened to point at a real dir on a dev box.
+            uninstall_daily_job().ok();
+        });
     }
 }

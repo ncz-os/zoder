@@ -13,3 +13,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
