@@ -43,6 +43,15 @@ pub struct AgentDescriptor {
     pub config_surface: Option<ConfigSurface>,
     /// Implementation-level capability flags (acp_capable, etc.).
     pub capabilities: Capabilities,
+    /// Descriptor-level vendor extensions (e.g. goose-specific
+    /// `recipes`/`scheduler` blobs that no other implementation needs).
+    /// Modeled as a free-form key→`Value` map: the schema only mandates
+    /// that keys be reverse-DNS; shape per key is vendor-private.
+    /// Free-form `Value` is intentional — matching the schema's
+    /// `additionalProperties: true` so descriptor-level extensions never
+    /// require a schema bump. Empty when the descriptor carries none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 /// MIF-style conformance level. Two levels; we do not add more without an
@@ -324,6 +333,7 @@ mod tests {
                 acp_capable: true,
                 extensions: BTreeMap::new(),
             },
+            extensions: BTreeMap::new(),
         };
 
         let s = serde_json::to_string(&original).expect("serialize");

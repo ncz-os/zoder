@@ -132,6 +132,7 @@ mod tests {
                 acp_capable: true,
                 extensions: BTreeMap::new(),
             },
+            extensions: BTreeMap::new(),
         };
         serde_json::to_value(&desc).unwrap()
     }

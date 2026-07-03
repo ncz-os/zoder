@@ -4,6 +4,7 @@
 //! format invariant.
 
 use agent_descriptor::{
+    consumer::{derive_transport, Error as ConsumerError},
     descriptor_id,
     validate::{validate_and_parse, validate_v1},
     AgentDescriptor, Capabilities, ConformanceLevel,
@@ -123,5 +124,222 @@ fn capabilities_extensions_roundtrip() {
     assert!(
         !s.contains("\"extensions\""),
         "empty extensions must be skipped"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Goose descriptor (slice 2): validation + structural asserts.
+// ----------------------------------------------------------------------------
+
+/// Path to the checked-in goose descriptor artifact (slice 2).
+const GOOSE_DESCRIPTOR: &str = "schema/goose.descriptor.json";
+
+#[test]
+fn checked_in_goose_descriptor_validates_against_v1_schema() {
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    validate_v1(&descriptor)
+        .expect("checked-in `schema/goose.descriptor.json` must validate against the v1 schema");
+}
+
+#[test]
+fn checked_in_goose_descriptor_parses_and_roundtrips() {
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor =
+        validate_and_parse(&descriptor).expect("descriptor must validate + deserialize");
+
+    let s1 = serde_json::to_string(&parsed).expect("serialize");
+    let v1: Value = serde_json::from_str(&s1).unwrap();
+    let v2 = descriptor;
+    assert_eq!(v1, v2, "goose round-trip drifted");
+}
+
+#[test]
+fn goose_descriptor_is_l2_and_advertises_acp() {
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor =
+        validate_and_parse(&descriptor).expect("descriptor must validate + deserialize");
+
+    assert_eq!(parsed.conformance_level, ConformanceLevel::L2);
+    assert!(
+        parsed.capabilities.acp_capable,
+        "goose advertises ACP support (it IS the ACP reference engine)"
+    );
+    assert!(
+        parsed.config_surface.is_some(),
+        "L2 descriptor must include a config surface"
+    );
+}
+
+#[test]
+fn goose_descriptor_connection_is_stdio() {
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor = validate_and_parse(&descriptor).expect("parses");
+
+    use agent_descriptor::Transport;
+    assert_eq!(
+        parsed.connection.transport,
+        Transport::Stdio,
+        "goose is reached by spawning `goose acp` over stdio"
+    );
+    use agent_descriptor::Endpoint;
+    match &parsed.connection.endpoint {
+        Endpoint::Path { path } => assert_eq!(path, "goose"),
+        other => panic!("goose endpoint must be Path, got {other:?}"),
+    }
+    assert!(
+        parsed.connection.auth.is_none(),
+        "stdio transport must carry no auth (schema enforces this)"
+    );
+}
+
+#[test]
+fn goose_descriptor_knobs_carry_provenance_in_description() {
+    // The v1 schema does not model per-knob source as a separate field
+    // (only `ConfigSurface.source` is required). The contract used by
+    // descriptors in this repo: each knob's `description` is prefixed
+    // with `[env]` or `[file: <ext>]` so a consumer can grep on it.
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor = validate_and_parse(&descriptor).expect("parses");
+
+    let surface = parsed
+        .config_surface
+        .expect("L2 descriptor must include a config surface");
+
+    // We expect GOOSE_PROVIDER + GOOSE_MODEL + OPENAI_API_KEY +
+    // ANTHROPIC_API_KEY to be env knobs; the rest to be file knobs.
+    let env_knobs = [
+        "GOOSE_PROVIDER",
+        "GOOSE_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ];
+
+    for knob in &surface.knobs {
+        let desc = knob.description.as_deref().unwrap_or("");
+        let is_env = env_knobs.contains(&knob.name.as_str());
+        let prefix = if is_env { "[env]" } else { "[file:" };
+        assert!(
+            desc.starts_with(prefix),
+            "knob `{}` description must start with `{prefix}` (got: {desc:?})",
+            knob.name
+        );
+    }
+}
+
+#[test]
+fn goose_descriptor_recipes_and_scheduler_live_in_extensions() {
+    // Per ADR-0001 + the descriptor's own comment, recipes/scheduling are
+    // goose-specific extensions — they MUST NOT be modeled as core
+    // knobs (no other conformant implementation needs them; uplifting
+    // would require a new conformance level). Assert they are present
+    // on the descriptor-level `extensions` blob.
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+
+    let top = descriptor
+        .as_object()
+        .expect("descriptor must be a JSON object");
+    let ext = top
+        .get("extensions")
+        .expect("goose descriptor must have a top-level extensions blob")
+        .as_object()
+        .expect("extensions must be a JSON object");
+    assert!(
+        ext.contains_key("block.goose.recipes"),
+        "goose descriptor must carry recipes under extensions.goose.recipes"
+    );
+    assert!(
+        ext.contains_key("block.goose.scheduler"),
+        "goose descriptor must carry scheduling under extensions.goose.scheduler"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Consumer (slice 2 part 3): a single, testable seam that projects both
+// descriptors onto the engine transport shape uniformly.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn consumer_drives_goose_as_stdio() {
+    // Load goose from disk end-to-end: read -> JSON-schema validate ->
+    // typed parse -> consumer. Anything failing along the way surfaces as
+    // a panic with a precise cause.
+    let descriptor_str = read_workspace_path(GOOSE_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor = validate_and_parse(&descriptor).expect("parses + validates");
+
+    let transport = derive_transport(&parsed).expect("goose descriptor must be driveable");
+    match transport {
+        acp_client::EngineTransport::Stdio { command, args, env } => {
+            assert_eq!(command, "goose", "endpoint.path is the binary to spawn");
+            assert_eq!(
+                args,
+                vec!["acp".to_string()],
+                "stdio + acp_capable conventional args are `acp`"
+            );
+            assert!(
+                env.is_empty(),
+                "the consumer yields the SHAPE only; the credential/endpoint bridge \
+                 (zoder -> OPENAI_* / OPENAI_HOST) is layered on top by callers via \
+                 `acp_client::GooseProviderEnv`, never baked into the descriptor"
+            );
+        }
+        other => panic!("goose descriptor must yield EngineTransport::Stdio, got {other:?}"),
+    }
+}
+
+#[test]
+fn consumer_drives_zeroclaw_as_unix_socket() {
+    let descriptor_str = read_workspace_path(ZODER_DESCRIPTOR);
+    let descriptor: Value = serde_json::from_str(&descriptor_str).expect("descriptor is JSON");
+    let parsed: AgentDescriptor = validate_and_parse(&descriptor).expect("parses + validates");
+
+    let transport = derive_transport(&parsed).expect("zoder descriptor must be driveable");
+    match transport {
+        acp_client::EngineTransport::UnixSocket(path) => {
+            // The checked-in zoder descriptor names the conventional
+            // socket path under $ZODER_HOME; the helper keeps it as a
+            // plain string so the test doesn't drift across operators.
+            assert_eq!(path.to_string_lossy(), "$ZODER_HOME/run/zoder.sock");
+        }
+        other => panic!("zoder descriptor must yield EngineTransport::UnixSocket, got {other:?}"),
+    }
+}
+
+#[test]
+fn consumer_rejects_unsupported_transport() {
+    // Sanity: the consumer must NOT silently misdrive an engine it
+    // cannot reach. Build a tiny descriptor naming `wss` and confirm
+    // `derive_transport` returns `Error::UnsupportedTransport`.
+    let desc = AgentDescriptor {
+        id: descriptor_id("probe", 1),
+        name: "probe".into(),
+        agent_id: "ncz-os/probe".into(),
+        version: "0.0.1".into(),
+        schema_version: 1,
+        conformance_level: ConformanceLevel::L1,
+        connection: agent_descriptor::Connection {
+            transport: agent_descriptor::Transport::Wss,
+            endpoint: agent_descriptor::Endpoint::Url {
+                url: "wss://example.invalid/acp".into(),
+            },
+            auth: None,
+        },
+        config_surface: None,
+        capabilities: Capabilities {
+            acp_capable: true,
+            extensions: Default::default(),
+        },
+        extensions: Default::default(),
+    };
+    let err = derive_transport(&desc).expect_err("wss must be rejected");
+    assert!(
+        matches!(err, ConsumerError::UnsupportedTransport(_)),
+        "expected UnsupportedTransport, got {err:?}"
     );
 }
