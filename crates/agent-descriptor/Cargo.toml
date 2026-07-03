@@ -22,6 +22,10 @@ thiserror.workspace = true
 # Lightweight JSON-Schema validator (Draft 2020-12 subset). Used to confirm
 # that descriptors we read from disk validate against the checked-in schema.
 jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
+# Slice-2 consumer: derives an `EngineTransport` from a parsed `AgentDescriptor`
+# so a single seam maps goose (stdio `goose acp`) and zeroclaw (Unix socket)
+# uniformly. Engine-agnostic core types only (no zoder-specific shims).
+acp-client = { path = "../acp-client", version = "0.2.1" }
 
 [dev-dependencies]
 serde_json.workspace = true

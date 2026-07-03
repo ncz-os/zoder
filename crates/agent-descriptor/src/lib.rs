@@ -15,10 +15,12 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+pub mod consumer;
 pub mod descriptor;
 pub mod schema;
 pub mod validate;
 
+pub use consumer::{derive_transport, Error as ConsumerError};
 pub use descriptor::{
     AgentDescriptor, AuthSpec, Capabilities, ConfigSource, ConfigSurface, ConformanceLevel,
     Connection, Endpoint, Knob, KnobKind, Transport, SCHEMA_VERSION,

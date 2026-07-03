@@ -1,0 +1,133 @@
+{
+  "id": "ncz-os:agent-descriptor:goose:v1",
+  "name": "goose (Block)",
+  "agent_id": "block/goose",
+  "version": "1.x",
+  "schema_version": 1,
+  "conformance_level": 2,
+  "connection": {
+    "transport": "stdio",
+    "endpoint": {
+      "kind": "path",
+      "path": "goose"
+    },
+    "auth": null
+  },
+  "config_surface": {
+    "source": "yaml",
+    "default_path": "~/.config/goose/config.yaml",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://ncz-os.dev/schemas/agent-descriptor/goose.v1.inline.json",
+      "title": "goose config.yaml (representative shape)",
+      "description": "Representative shape of goose's config.yaml (block/goose); minimum fields needed to drive `goose acp` from a foreign client. Not an exhaustive schema; per-knob provenance is recorded in each Knob's description as `[env]` or `[file: yaml]`.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "GOOSE_PROVIDER": { "type": "string" },
+        "GOOSE_MODEL":    { "type": "string" },
+        "providers": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "default_provider": { "type": "string" },
+        "recipes": {
+          "type": "object",
+          "additionalProperties": { "type": "object" }
+        },
+        "scheduler": { "type": "object" }
+      }
+    },
+    "knobs": [
+      {
+        "name": "GOOSE_PROVIDER",
+        "kind": "string",
+        "required": false,
+        "secret": false,
+        "description": "[env] Selecting provider (e.g. openai, anthropic). Read from the GOOSE_PROVIDER environment variable when set; falls through to goose's own config.yaml default."
+      },
+      {
+        "name": "GOOSE_MODEL",
+        "kind": "string",
+        "required": false,
+        "secret": false,
+        "description": "[env] Model id passed to the selected provider. Read from the GOOSE_MODEL environment variable when set; falls through to goose's own config.yaml default. zoder's GooseProviderEnv seam bridge uses this env var on the spawned `goose acp` child."
+      },
+      {
+        "name": "providers",
+        "kind": "array",
+        "required": false,
+        "secret": false,
+        "description": "[file: yaml] Provider entries declared in goose's config.yaml (`providers:` section). Each item is an object with provider-specific auth + endpoint fields. Foreign clients (zoder) typically override this via env rather than writing to the file."
+      },
+      {
+        "name": "default_provider",
+        "kind": "string",
+        "required": false,
+        "secret": false,
+        "description": "[file: yaml] Default provider id (from `default_provider` / first item in `providers:`) used when neither GOOSE_PROVIDER nor a foreign-client override is set."
+      },
+      {
+        "name": "OPENAI_API_KEY",
+        "kind": "secret_ref",
+        "required": false,
+        "secret": true,
+        "ref": "OPENAI_API_KEY",
+        "description": "[env] OpenAI API key. Resolved at request time from the OPENAI_API_KEY env var. Marked `secret = true` so client UIs redact it. zoder's GooseProviderEnv seam sets this on the spawned child when bridging a free/subscription provider into goose."
+      },
+      {
+        "name": "ANTHROPIC_API_KEY",
+        "kind": "secret_ref",
+        "required": false,
+        "secret": true,
+        "ref": "ANTHROPIC_API_KEY",
+        "description": "[env] Anthropic API key. Resolved at request time from the ANTHROPIC_API_KEY env var. Marked `secret = true`."
+      },
+      {
+        "name": "recipes",
+        "kind": "object",
+        "required": false,
+        "secret": false,
+        "description": "[file: yaml] Goose-specific extension: `recipes:` section in config.yaml mapping recipe id to recipe parameters. NOT modeled as a Knob kind — see the descriptor-level `extensions.goose.recipes` field for the full shape and value-type info."
+      },
+      {
+        "name": "scheduler",
+        "kind": "object",
+        "required": false,
+        "secret": false,
+        "description": "[file: yaml] Goose-specific extension: `scheduler:` section in config.yaml (recurring / one-shot scheduling of recipes). See the descriptor-level `extensions.goose.scheduler` field for the full shape."
+      }
+    ]
+  },
+  "capabilities": {
+    "acp_capable": true,
+    "extensions": {
+      "block.goose.acp-transport": "stdio",
+      "block.goose.acp-command":   "goose acp",
+      "block.goose.crd":           "https://github.com/block/goose"
+    }
+  },
+  "extensions": {
+    "block.goose.recipes": {
+      "kind": "object",
+      "description": "Vendor extension: full recipes object from config.yaml. The descriptor model deliberately keeps `recipes`/`scheduler` at the descriptor-extension layer (NOT as core knobs) because no other conformant implementation needs them; uplifting to core would require a new conformance level.",
+      "fields": {
+        "recipe_id":    { "type": "string",  "description": "Human-readable recipe identifier (the YAML key)." },
+        "title":        { "type": "string",  "description": "Optional recipe title." },
+        "description":  { "type": "string",  "description": "Optional recipe description." },
+        "instructions": { "type": "string",  "description": "The natural-language instructions executed when the recipe is invoked." },
+        "parameters":   { "type": "array",   "items": { "type": "object" }, "description": "Recipe parameter schema (name + type + required + default)." }
+      }
+    },
+    "block.goose.scheduler": {
+      "kind": "object",
+      "description": "Vendor extension: recipe-scheduling configuration. `cron` is a 5-field cron expression in the user's local timezone; `one_shot` is an RFC3339 timestamp.",
+      "fields": {
+        "enabled":  { "type": "boolean" },
+        "cron":     { "type": "string",  "pattern": "^[*0-9,/-]+\\s+[*0-9,/-]+\\s+[*0-9,/-]+\\s+[*0-9,/-]+\\s+[*0-9,/-]+$" },
+        "one_shot": { "type": "string",  "format": "date-time" },
+        "recipe":   { "type": "string",  "description": "Recipe id (matches a key in `recipes:`) to invoke on the schedule." }
+      }
+    }
+  }
+}
