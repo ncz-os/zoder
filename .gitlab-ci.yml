@@ -116,6 +116,7 @@ release:trio:
 nightly:linux:
   stage: release
   <<: *nightly-rules
+  needs: []
   timeout: 40m
   script:
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
@@ -131,6 +132,7 @@ nightly:linux:
 nightly:macos-arm64:
   stage: release
   <<: *nightly-rules
+  needs: []
   tags: [fleet-macos-arm64]
   timeout: 40m
   variables:
