@@ -100,3 +100,42 @@ release:trio:
         - { name: "x86_64-linux",   url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-x86_64-unknown-linux-gnu.tar.gz" }
         - { name: "aarch64-darwin", url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-apple-darwin.tar.gz" }
         - { name: "aarch64-linux",  url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz" }
+
+# ── nightly: rolling "master of the day" binaries ────────────────────────────
+# Linux builds on GitLab shared runners (x86_64 native + aarch64 cross-compiled);
+# macOS arm64 builds on ULTRA via the fleet-macos-arm64 runner. Both publish to
+# the rolling `zoder-nightly/master` generic package (overwritten each night).
+# Driven by a pipeline schedule with NIGHTLY=1; also runnable manually from web.
+.nightly-rules: &nightly-rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $NIGHTLY == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+
+nightly:linux:
+  stage: release
+  <<: *nightly-rules
+  timeout: 40m
+  script:
+    - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+    - apt-get update && apt-get install -y gcc-aarch64-linux-gnu
+    - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+    - cargo build --release --bin zoder --target x86_64-unknown-linux-gnu
+    - cargo build --release --bin zoder --target aarch64-unknown-linux-gnu
+    - |
+      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "target/$t/release/zoder" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t"
+      done
+
+nightly:macos-arm64:
+  stage: release
+  <<: *nightly-rules
+  tags: [fleet-macos-arm64]
+  timeout: 40m
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    - rustup target add aarch64-apple-darwin
+    - cargo build --release --bin zoder --target aarch64-apple-darwin
+    - 'curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file target/aarch64-apple-darwin/release/zoder "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin"'
