@@ -766,7 +766,9 @@ async fn run() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Cmd::Rescue { task, background }) => agentic::cmd_rescue(&cli, task, *background).await,
+        Some(Cmd::Rescue { task, background }) => {
+            agentic::cmd_rescue(&cli, task, *background).await
+        }
         Some(Cmd::Status { job, all }) => agentic::cmd_status(&cli, job.clone(), *all),
         Some(Cmd::Result { job }) => agentic::cmd_result(&cli, job.clone()),
         Some(Cmd::Cancel { job }) => agentic::cmd_cancel(&cli, job.clone()),
