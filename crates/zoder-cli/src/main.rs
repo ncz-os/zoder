@@ -91,6 +91,13 @@ struct Cli {
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
+    /// Hard wall-clock budget for a single `loop` phase (author, `--check`,
+    /// review), in seconds (default 900). The watchdog kills the spawned
+    /// child AND its process group when the budget elapses, so a wedged
+    /// child can never hang the loop indefinitely. `agent_timeout` controls
+    /// the engine's internal turn budget and is independent.
+    #[arg(long, global = true, value_name = "SECS")]
+    loop_timeout: Option<u64>,
     /// Which agentic engine to drive the loop with: zeroclaw | goose
     /// (default zeroclaw — current behavior). `goose` spawns a `goose acp`
     /// child process and drives standard ACP over its stdio; model
@@ -752,6 +759,7 @@ async fn run() -> anyhow::Result<()> {
                 *scope,
                 *accept_on_green,
                 *background,
+                cli.loop_timeout.unwrap_or(900),
             )
             .await
         }
