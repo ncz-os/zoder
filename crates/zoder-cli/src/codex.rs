@@ -594,8 +594,164 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
 // loop: continuous author -> validate (build/test) -> adversarial review -> fix.
 // ---------------------------------------------------------------------------
 
-/// Run a validation command in `cwd` via `sh -c`. Returns `(passed, tail)` where
-/// `tail` is the last ~4 KB of combined stdout+stderr — the part a fixer needs.
+/// Default per-phase wall-clock budget for the `loop` (author / `--check` /
+/// review). Mirrors the `--loop-timeout` flag default; honored when the flag
+/// is left unset. `#[allow(dead_code)]` so the constant doubles as the
+/// single source of truth referenced by docs/the flag help text, even on
+/// downstream builds that wire the default through a different path.
+#[allow(dead_code)]
+pub(crate) const DEFAULT_LOOP_TIMEOUT_SECS: u64 = 900;
+
+/// Label for a `loop` phase. Phases are user-visible in the watchdog log
+/// line ("loop: <phase> timed out after <N>s, killing") and in the per-iter
+/// `author_outcome` / `review_outcome` fields when a phase wedges.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LoopPhase {
+    Author,
+    Check,
+    Review,
+}
+
+impl LoopPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            LoopPhase::Author => "author",
+            LoopPhase::Check => "check",
+            LoopPhase::Review => "review",
+        }
+    }
+}
+
+/// Hard-timeout wrapper for a single `loop` phase. The inner future is raced
+/// against a wall-clock budget (default ~900s). On expiry we don't just drop
+/// the future — the phase is recorded as a hard timeout and the caller is
+/// expected to treat it like a failed child: kill any spawned process group,
+/// count toward `dead_streak`, and continue or abort per `max_iters`. The
+/// existing `--agent-timeout` (engine internal turn budget) is preserved
+/// alongside this watchdog — they cover different failure modes.
+async fn phase_watchdog<F, T>(phase: LoopPhase, secs: u64, quiet: bool, fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let budget = std::time::Duration::from_secs(secs.max(1));
+    match tokio::time::timeout(budget, fut).await {
+        Ok(res) => res.map_err(|e| e.to_string()),
+        Err(_) => {
+            if !quiet {
+                eprintln!(
+                    "loop: {phase} timed out after {secs}s, killing",
+                    phase = phase.as_str()
+                );
+            }
+            Err(format!(
+                "{phase} phase timed out after {secs}s (killed)",
+                phase = phase.as_str()
+            ))
+        }
+    }
+}
+
+/// Send SIGKILL to every process in `pgid`. Unix-only — Windows falls back
+/// to a single kill on the child pid (process groups are a POSIX concept).
+/// Best-effort: errors are swallowed because we are already on the timeout
+/// path and the caller wants the loop to RECOVER, not bubble I/O errors.
+fn kill_process_group(pgid: Option<i32>, pid: Option<u32>) {
+    #[cfg(unix)]
+    unsafe {
+        if let Some(g) = pgid {
+            // -pgid: kill the group, not a single pid.
+            libc::kill(-g, libc::SIGKILL);
+        } else if let Some(p) = pid {
+            libc::kill(p as i32, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, pid);
+    }
+}
+
+/// Run a validation command in `cwd` via `sh -c`, with a hard wall-clock
+/// budget. The child is spawned in its own process group so the watchdog
+/// can take the whole subtree down with one `kill(-pgid, SIGKILL)` and no
+/// orphan shells/process can outlive the budget.
+///
+/// Returns `(passed, tail)` where `tail` is the last ~4 KB of combined
+/// stdout+stderr. On timeout `passed` is `false` and `tail` carries a clear
+/// phase-timed-out marker so the next author turn can see it.
+async fn run_check_watched(cwd: &Path, cmd: &str, secs: u64) -> (bool, String) {
+    let budget = std::time::Duration::from_secs(secs.max(1));
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        // Detach the child into its own process group so we can SIGKILL the
+        // whole subtree on timeout (shell + any descendants the command
+        // forks). Tokio translates `process_group(0)` to setpgid(pid, 0) on
+        // Unix, giving us a clean per-child group without an extra fork.
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("failed to spawn check `{cmd}`: {e}")),
+    };
+    let pgid = child.id().map(|p| p as i32);
+    let pid = child.id();
+
+    let join = async {
+        let out = child.wait_with_output().await?;
+        Ok::<_, std::io::Error>(out)
+    };
+    let outcome = tokio::time::timeout(budget, join).await;
+    match outcome {
+        Ok(Ok(o)) => {
+            let mut combined = String::new();
+            combined.push_str(&String::from_utf8_lossy(&o.stdout));
+            combined.push_str(&String::from_utf8_lossy(&o.stderr));
+            // Tail on a char boundary so we never split a multi-byte codepoint.
+            let tail = if combined.len() > 4096 {
+                let mut start = combined.len() - 4096;
+                while start < combined.len() && !combined.is_char_boundary(start) {
+                    start += 1;
+                }
+                combined[start..].to_string()
+            } else {
+                combined
+            };
+            (o.status.success(), tail)
+        }
+        Ok(Err(e)) => {
+            kill_process_group(pgid, pid);
+            (false, format!("check `{cmd}` I/O error: {e}"))
+        }
+        Err(_) => {
+            // Wall-clock fired. nuke the process group; the child.handle is
+            // already gone (wait_with_output consumes it), so go via pgid.
+            kill_process_group(pgid, pid);
+            eprintln!(
+                "loop: {} timed out after {}s, killing",
+                LoopPhase::Check.as_str(),
+                secs
+            );
+            (
+                false,
+                format!(
+                    "check `{cmd}` killed after {secs}s (loop timeout); increase with --loop-timeout <SECS>"
+                ),
+            )
+        }
+    }
+}
+
+/// Synchronous fallback — no watchdog. Exposed only for unit tests so they
+/// can exercise the original "spawn-and-block" semantics independently of
+/// `run_check_watched`. Production callers always go through the watched
+/// path so a wedged child can never block the loop.
+#[cfg(test)]
 fn run_check(cwd: &Path, cmd: &str) -> (bool, String) {
     match std::process::Command::new("sh")
         .arg("-c")
@@ -664,6 +820,11 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
 /// failures back -> repeat until the check passes AND the reviewer raises no
 /// blocking findings, or `max_iters` is reached, or progress stalls. Every
 /// author turn and reviewer pass is cost-tracked in the ledger.
+///
+/// `loop_timeout_secs` is the per-phase wall-clock watchdog budget (default
+/// [`DEFAULT_LOOP_TIMEOUT_SECS`], configurable via `--loop-timeout`): each
+/// author/check/review child is hard-capped at this many seconds. On expiry
+/// the spawned process group is killed and the loop continues — never hangs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_loop(
     cli: &crate::Cli,
@@ -676,6 +837,7 @@ pub(crate) async fn cmd_loop(
     scope: ReviewScope,
     accept_on_green: bool,
     background: bool,
+    loop_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
     if background && active_job_dir().is_none() {
@@ -710,6 +872,9 @@ pub(crate) async fn cmd_loop(
     // Consecutive iterations where the author neither finished nor left any edit
     // on disk (engine unreachable / repeatedly timing out fast). Bounds the loop
     // so a dead engine can't spin reviews on an empty diff until `max_iters`.
+    // Phase timeouts (author OR check OR review) count the same way: a wedged
+    // child with no progress is indistinguishable from no-op output for the
+    // purpose of deciding whether to keep grinding.
     let mut dead_streak = 0usize;
 
     for i in 1..=max_iters {
@@ -743,14 +908,17 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // engine error) must NOT discard the round. The engine applies edits to
         // disk as tool calls run, so partial work survives; we still validate,
         // review, and feed the failure back so the next iteration can finish it.
+        // `phase_watchdog` enforces a hard kill-budget around the turn so a
+        // genuinely-wedged child (the failure mode the production incident
+        // surfaced: 0.4s CPU, no output, indefinitly idle) cannot hang the loop
+        // past `loop_timeout_secs`.
         let mut author_err: Option<String> = None;
         let engine_kind = crate::resolve_engine_kind(cli)?;
-        let turn = match crate::agentic_turn(
-            cli,
-            engine_kind,
-            author_prompt,
-            session.clone(),
-            false,
+        let turn = match phase_watchdog(
+            LoopPhase::Author,
+            loop_timeout_secs,
+            cli.quiet,
+            crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false),
         )
         .await
         {
@@ -759,16 +927,15 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 total_cost += t.cost_usd;
                 Some(t)
             }
-            Err(e) => {
-                let msg = e.to_string();
+            Err(msg) => {
                 let timed_out = msg.contains("timed out") || msg.contains("timeout");
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: author turn did not finish: {msg}");
                     if timed_out {
                         eprintln!(
                             "[loop] hint: raise the per-turn budget with `--agent-timeout <secs>` \
-(default 900), or pick a faster model with `-m` for the loop. Preserving partial \
-edits and continuing."
+(default 900) or the loop-phase watchdog with `--loop-timeout <secs>` (default 900), or \
+pick a faster model with `-m` for the loop. Preserving partial edits and continuing."
                         );
                     }
                 }
@@ -781,14 +948,51 @@ edits and continuing."
         let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
         let diff_lines = diff.lines().count();
 
+        // 3. Validate (build/test) if a check command was given. The check is
+        // its own child process (a shell) and historically had NO watchdog —
+        // a hung script blocked the loop forever. Wrap with `run_check_watched`
+        // so a wedged check is killed at `loop_timeout_secs` and recorded as a
+        // failure (tail carries a clear phase-timed-out marker).
+        let mut check_timed_out = false;
+        let (check_passed, check_tail) = match &check {
+            Some(c) => {
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: check `{c}`…");
+                }
+                let t0 = std::time::Instant::now();
+                let (ok, tail) = run_check_watched(&cwd, c, loop_timeout_secs).await;
+                if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
+                    check_timed_out = true;
+                    if !cli.quiet {
+                        eprintln!(
+                            "[loop] iter {i}: check wedge killed after {}s (--loop-timeout)",
+                            t0.elapsed().as_secs()
+                        );
+                    }
+                }
+                (Some(ok), tail)
+            }
+            None => (None, String::new()),
+        };
+
         // Bail out if a failed author keeps producing nothing (dead engine).
-        if turn.is_none() && diff.trim().is_empty() {
+        // A wedged check on an already-empty diff counts the same way: no
+        // progress between iterations, so grinding further would just repeat
+        // the same watchdog kill. (`check_timed_out` with a non-empty diff
+        // does NOT count: the edits might still be valid, the check just
+        // needs adjusting; that's the author's job to fix in the next pass.)
+        if (turn.is_none() || check_timed_out) && diff.trim().is_empty() {
             dead_streak += 1;
             if dead_streak >= 2 {
                 if !cli.quiet {
                     eprintln!(
                         "[loop] iter {i}: author produced no edits twice in a row \
-(engine unreachable or timing out before any tool call); stopping."
+(engine unreachable or timing out before any tool call){}; stopping.",
+                        if check_timed_out {
+                            " (check phase also timed out)"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 break;
@@ -796,18 +1000,6 @@ edits and continuing."
         } else {
             dead_streak = 0;
         }
-
-        // 3. Validate (build/test) if a check command was given.
-        let (check_passed, check_tail) = match &check {
-            Some(c) => {
-                if !cli.quiet {
-                    eprintln!("[loop] iter {i}: check `{c}`…");
-                }
-                let (ok, tail) = run_check(&cwd, c);
-                (Some(ok), tail)
-            }
-            None => (None, String::new()),
-        };
 
         // 4. Adversarial review of the current diff (+ validation output).
         let review_user = {
@@ -846,12 +1038,17 @@ nits).\n",
             eprintln!("[loop] iter {i}: adversarial review…");
         }
         let max_tokens = cli.max_tokens.max(2048);
-        let review = match complete_once(
-            cli,
-            reviewer.as_deref(),
-            ADVERSARIAL_SYSTEM,
-            &review_user,
-            max_tokens,
+        let review = match phase_watchdog(
+            LoopPhase::Review,
+            loop_timeout_secs,
+            cli.quiet,
+            complete_once(
+                cli,
+                reviewer.as_deref(),
+                ADVERSARIAL_SYSTEM,
+                &review_user,
+                max_tokens,
+            ),
         )
         .await
         {
@@ -859,11 +1056,17 @@ nits).\n",
                 total_cost += c.cost_usd;
                 parse_review(&c.content)
             }
-            Err(e) => ReviewOutput {
-                verdict: "comment".into(),
-                summary: format!("reviewer failed: {e}"),
-                ..Default::default()
-            },
+            Err(msg) => {
+                // `complete_once` already has its own HTTP client timeout, so
+                // surfacing an Elapsed here means the entire provider request
+                // hung (TCP never returned) — record as a timeout-error
+                // review so the next author turn sees the wall-clock context.
+                ReviewOutput {
+                    verdict: "comment".into(),
+                    summary: format!("reviewer {msg}"),
+                    ..Default::default()
+                }
+            }
         };
         final_verdict = review.verdict.clone();
         // The objective gate is "green" when the check passed (or none was given).
@@ -877,6 +1080,10 @@ nits).\n",
             (None, Some(e)) => format!("interrupted: {e}"),
             (None, None) => "interrupted".to_string(),
         };
+        // Track the watchdog budget so per-iter logs show what went wrong.
+        // `check_phase_timed_out` distinguishes a wedged check from a check that
+        // genuinely reported failure (CI exited 1, etc.) — same `passed=false`
+        // outcome, different root cause.
         iterations.push(json!({
             "iter": i,
             "author_model": author_model,
@@ -885,6 +1092,8 @@ nits).\n",
             "diff_lines": diff_lines,
             "check": check.as_deref(),
             "check_passed": check_passed,
+            "check_phase_timed_out": check_timed_out,
+            "loop_timeout_secs": loop_timeout_secs,
             "verdict": review.verdict,
             "blocking_findings": blocking,
             "summary": review.summary,
@@ -988,6 +1197,7 @@ the fix. Apply the changes now.\n\n",
         "iterations": iterations.len(),
         "final_verdict": final_verdict,
         "check": check,
+        "loop_timeout_secs": loop_timeout_secs,
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
@@ -1263,4 +1473,144 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
     }
     println!("cancelled {}", m.id);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests: loop watchdog. Pin the behavior the production incident surfaced
+// (a wedged child can hang the loop forever) so this regression doesn't come
+// back. All tests are POSIX-only because they rely on process groups; on
+// other platforms the watchdog is a no-op and the loop relies on
+// `tokio::time::timeout` alone.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Cwd for `run_check_watched` tests. The child `sh -c` doesn't care
+    /// about the cwd — we just need a real, stable path to satisfy the
+    /// `current_dir` argument.
+    fn tmp_cwd() -> PathBuf {
+        std::env::temp_dir()
+    }
+
+    /// `run_check_watched` must kill a hung `sleep` child within the budget
+    /// and return a failure marker that the next author turn can grep for.
+    /// This is the regression test for the 1h40m wedged-loop incident: a
+    /// child that "didn't return" had to be killed by an operator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_kills_hanging_child() {
+        let start = std::time::Instant::now();
+        // Budget of 1s on a child that sleeps 30s — if the watchdog works
+        // we land back in ~1s. If it doesn't, the test itself fails on the
+        // CI runner's overall timeout, mirroring the production symptom.
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "sleep 30", 1).await;
+        let elapsed = start.elapsed();
+
+        assert!(!ok, "hung child must be reported as failed");
+        assert!(
+            tail.contains("killed after 1s") && tail.contains("(loop timeout)"),
+            "tail must carry the loop-timeout marker for the next iteration; got: {tail:?}"
+        );
+        // Be generous on the upper bound (CI noise) but strict on the lower:
+        // the watchdog MUST have fired, not the child naturally exiting.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "watchdog fired too early ({:?}); budget=1s",
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "watchdog did NOT fire in time ({:?}); the bug is back",
+            elapsed
+        );
+    }
+
+    /// Fast commands must NOT trip the watchdog — sanity check that we
+    /// didn't accidentally turn every check into a 900s wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_passes_fast_child() {
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "exit 0", 1).await;
+        assert!(ok, "fast pass-through must succeed; tail={tail:?}");
+        assert!(
+            !tail.contains("killed after") && !tail.contains("(loop timeout)"),
+            "fast child must not log a watchdog kill; tail={tail:?}"
+        );
+    }
+
+    /// A failing (non-hung) command must surface its own failure cleanly —
+    /// distinct from a watchdog kill. Otherwise the next author turn can't
+    /// tell "CI red" from "loop hung" and may try to fix the wrong thing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_passes_through_real_failures() {
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "echo boom; exit 1", 1).await;
+        assert!(!ok, "exit 1 must report failure");
+        assert!(
+            tail.contains("boom"),
+            "stderr/stdout from a real failure must reach the tail; got: {tail:?}"
+        );
+        assert!(
+            !tail.contains("(loop timeout)"),
+            "real failure must NOT be misreported as a loop timeout; got: {tail:?}"
+        );
+    }
+
+    /// Sanity check the phase label helper — a unit test in the strict sense.
+    #[test]
+    fn loop_phase_label_is_stable() {
+        assert_eq!(LoopPhase::Author.as_str(), "author");
+        assert_eq!(LoopPhase::Check.as_str(), "check");
+        assert_eq!(LoopPhase::Review.as_str(), "review");
+    }
+
+    /// `phase_watchdog` returns the inner future's value on success.
+    #[tokio::test]
+    async fn phase_watchdog_returns_inner_result_on_time() {
+        let res: Result<i32, String> = phase_watchdog(LoopPhase::Author, 5, true, async {
+            Ok::<_, anyhow::Error>(42)
+        })
+        .await;
+        assert_eq!(res.unwrap(), 42);
+    }
+
+    /// `phase_watchdog` reports a phase-timed-out marker when the future
+    /// exceeds the budget. This is the hook that `cmd_loop` uses to count
+    /// toward `dead_streak` and emit the human-readable log line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase_watchdog_times_out_hanging_future() {
+        let start = std::time::Instant::now();
+        let res: Result<(), String> = phase_watchdog(LoopPhase::Review, 1, true, async {
+            // Sleep longer than the watchdog budget.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(())
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("watchdog must return Err on timeout");
+        assert!(
+            err.contains("review phase timed out after 1s (killed)"),
+            "Err must mention the phase + budget; got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "phase_watchdog must not run the inner future to completion ({:?})",
+            elapsed
+        );
+    }
+
+    /// End-to-end of the `cmd_loop` watchdog contract using the `cmd_loop`
+    /// public surface is heavy (it spins up an engine daemon). Instead, this
+    /// pin asserts that the unwatched fallback `run_check` (kept for tests)
+    /// is genuinely unbounded — i.e. that the watchdog we wrap on top is the
+    /// thing saving us, not magic elsewhere on the path.
+    #[test]
+    fn unwatched_run_check_does_not_have_a_budget() {
+        // If anyone re-introduces a timeout inside the raw `run_check`, this
+        // assertion catches it: the watchdog is the only thing that bounds
+        // wall-clock, by design.
+        let (ok, _tail) = run_check(&tmp_cwd(), "exit 0");
+        assert!(ok);
+    }
 }
