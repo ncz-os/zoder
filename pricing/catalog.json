@@ -7204,8 +7204,8 @@
       "output_usd_per_mtok": 0.0
     },
     "nvidia/nemotron-3-super-120b-a12b": {
-      "input_usd_per_mtok": 0.08499999999999999,
-      "output_usd_per_mtok": 0.39999999999999997
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.44999999999999996
     },
     "nvidia/nemotron-3-super-120b-a12b:free": {
       "input_usd_per_mtok": 0.0,
@@ -10920,8 +10920,8 @@
       "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.9099999999999999,
-      "output_usd_per_mtok": 2.8600000000000003
+      "input_usd_per_mtok": 0.9086,
+      "output_usd_per_mtok": 2.8556
     },
     "z-ai/glm-5v-turbo": {
       "input_usd_per_mtok": 1.2,
