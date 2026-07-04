@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-06-29",
+  "generated": "2026-07-03",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -207,6 +207,10 @@
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
     },
+    "anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
     "anthropic.claude-v1": {
       "input_usd_per_mtok": 8.0,
       "output_usd_per_mtok": 24.0
@@ -270,6 +274,10 @@
     "anthropic/claude-sonnet-4.6": {
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
+    },
+    "anthropic/claude-sonnet-5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0
     },
     "anyscale/HuggingFaceH4/zephyr-7b-beta": {
       "input_usd_per_mtok": 0.15,
@@ -400,6 +408,10 @@
       "output_usd_per_mtok": 16.5
     },
     "au.anthropic.claude-sonnet-4-6": {
+      "input_usd_per_mtok": 3.3000000000000003,
+      "output_usd_per_mtok": 16.5
+    },
+    "au.anthropic.claude-sonnet-5": {
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5
     },
@@ -1024,6 +1036,10 @@
       "output_usd_per_mtok": 15.0
     },
     "azure_ai/claude-sonnet-4-6": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
+    "azure_ai/claude-sonnet-5": {
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
     },
@@ -1963,6 +1979,10 @@
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
     },
+    "claude-sonnet-5": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
     "cloudflare/@cf/aisingapore/gemma-sea-lion-v4-27b-it": {
       "input_usd_per_mtok": 0.351,
       "output_usd_per_mtok": 0.5549999999999999
@@ -2844,11 +2864,11 @@
       }
     },
     "deepseek/deepseek-chat-v3-0324": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.77,
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.8999999999999999,
       "off_peak": {
-        "input_usd_per_mtok": 0.1,
-        "output_usd_per_mtok": 0.385,
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 0.45,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -3056,6 +3076,10 @@
       "output_usd_per_mtok": 16.5
     },
     "eu.anthropic.claude-sonnet-4-6": {
+      "input_usd_per_mtok": 3.3000000000000003,
+      "output_usd_per_mtok": 16.5
+    },
+    "eu.anthropic.claude-sonnet-5": {
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5
     },
@@ -4753,6 +4777,10 @@
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
     },
+    "global.anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
     "gmi/MiniMaxAI/MiniMax-M2.1": {
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 1.2
@@ -4894,6 +4922,10 @@
       "output_usd_per_mtok": 3.0
     },
     "google/gemini-3.1-flash-lite": {
+      "input_usd_per_mtok": 0.25,
+      "output_usd_per_mtok": 1.5
+    },
+    "google/gemini-3.1-flash-lite-image": {
       "input_usd_per_mtok": 0.25,
       "output_usd_per_mtok": 1.5
     },
@@ -5555,6 +5587,10 @@
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5
     },
+    "jp.anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 3.3000000000000003,
+      "output_usd_per_mtok": 16.5
+    },
     "kimi-k2-thinking-251104": {
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
@@ -5953,10 +5989,6 @@
       "input_usd_per_mtok": 0.07,
       "output_usd_per_mtok": 0.14
     },
-    "microsoft/phi-4-mini-instruct": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.35
-    },
     "microsoft/wizardlm-2-8x22b": {
       "input_usd_per_mtok": 0.62,
       "output_usd_per_mtok": 0.62
@@ -6007,15 +6039,15 @@
     },
     "minimax/minimax-m2": {
       "input_usd_per_mtok": 0.255,
-      "output_usd_per_mtok": 1.0
+      "output_usd_per_mtok": 1.02
     },
     "minimax/minimax-m2-her": {
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 1.2
     },
     "minimax/minimax-m2.1": {
-      "input_usd_per_mtok": 0.29,
-      "output_usd_per_mtok": 0.95
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2
     },
     "minimax/minimax-m2.5": {
       "input_usd_per_mtok": 0.12,
@@ -6474,8 +6506,8 @@
       "output_usd_per_mtok": 2.025
     },
     "moonshotai/kimi-k2.6": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 3.1999999999999997
+      "input_usd_per_mtok": 0.66,
+      "output_usd_per_mtok": 3.41
     },
     "moonshotai/kimi-k2.7-code": {
       "input_usd_per_mtok": 0.74,
@@ -8057,10 +8089,6 @@
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
     },
-    "openrouter/owl-alpha": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
     "openrouter/pareto-code": {
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
@@ -8365,6 +8393,14 @@
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
     },
+    "poolside/laguna-xs-2.1": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.12
+    },
+    "poolside/laguna-xs-2.1:free": {
+      "input_usd_per_mtok": 0.0,
+      "output_usd_per_mtok": 0.0
+    },
     "poolside/laguna-xs.2": {
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.19999999999999998
@@ -8478,8 +8514,8 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "qwen/qwen3-235b-a22b-thinking-2507": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.09999999999999999
+      "input_usd_per_mtok": 0.14950000000000002,
+      "output_usd_per_mtok": 1.495
     },
     "qwen/qwen3-30b-a3b": {
       "input_usd_per_mtok": 0.12,
@@ -8490,16 +8526,16 @@
       "output_usd_per_mtok": 0.19305
     },
     "qwen/qwen3-30b-a3b-thinking-2507": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.39999999999999997
+      "input_usd_per_mtok": 0.13,
+      "output_usd_per_mtok": 1.56
     },
     "qwen/qwen3-32b": {
       "input_usd_per_mtok": 0.08,
       "output_usd_per_mtok": 0.28
     },
     "qwen/qwen3-8b": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.39999999999999997
+      "input_usd_per_mtok": 0.117,
+      "output_usd_per_mtok": 0.45499999999999996
     },
     "qwen/qwen3-coder": {
       "input_usd_per_mtok": 0.22,
@@ -8566,8 +8602,8 @@
       "output_usd_per_mtok": 0.41600000000000004
     },
     "qwen/qwen3-vl-8b-instruct": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.5
+      "input_usd_per_mtok": 0.117,
+      "output_usd_per_mtok": 0.45499999999999996
     },
     "qwen/qwen3-vl-8b-thinking": {
       "input_usd_per_mtok": 0.117,
@@ -8606,8 +8642,8 @@
       "output_usd_per_mtok": 1.7999999999999998
     },
     "qwen/qwen3.6-27b": {
-      "input_usd_per_mtok": 0.2596,
-      "output_usd_per_mtok": 2.3850000000000002
+      "input_usd_per_mtok": 0.28500000000000003,
+      "output_usd_per_mtok": 2.4
     },
     "qwen/qwen3.6-35b-a3b": {
       "input_usd_per_mtok": 0.14,
@@ -9545,6 +9581,10 @@
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5
     },
+    "us.anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 3.3000000000000003,
+      "output_usd_per_mtok": 16.5
+    },
     "us.deepseek.r1-v1:0": {
       "input_usd_per_mtok": 1.35,
       "output_usd_per_mtok": 5.4
@@ -10148,6 +10188,14 @@
       "output_usd_per_mtok": 15.0
     },
     "vertex_ai/claude-sonnet-4@20250514": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
+    "vertex_ai/claude-sonnet-5": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0
+    },
+    "vertex_ai/claude-sonnet-5@default": {
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0
     },
@@ -10844,11 +10892,11 @@
       "output_usd_per_mtok": 4.0
     },
     "z-ai/glm-5.1": {
-      "input_usd_per_mtok": 0.98,
-      "output_usd_per_mtok": 3.08
+      "input_usd_per_mtok": 0.966,
+      "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.94,
+      "input_usd_per_mtok": 0.9299999999999999,
       "output_usd_per_mtok": 3.0
     },
     "z-ai/glm-5v-turbo": {
@@ -10932,8 +10980,8 @@
       "output_usd_per_mtok": 25.0
     },
     "~anthropic/claude-sonnet-latest": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0
     },
     "~google/gemini-flash-latest": {
       "input_usd_per_mtok": 1.5,
@@ -10944,8 +10992,8 @@
       "output_usd_per_mtok": 12.0
     },
     "~moonshotai/kimi-latest": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 3.1999999999999997
+      "input_usd_per_mtok": 0.66,
+      "output_usd_per_mtok": 3.41
     },
     "~openai/gpt-latest": {
       "input_usd_per_mtok": 5.0,
