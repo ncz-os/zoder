@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_is_the_default_and_matches_DocSpec() {
+    fn balanced_is_the_default_and_matches_doc_spec() {
         let s = RouteScenario::balanced();
         assert_eq!(s.primary_classes, vec![ProviderClass::Free, ProviderClass::Sub]);
         assert_eq!(s.reviewer_classes, vec![ProviderClass::Sub, ProviderClass::Free]);
@@ -1037,7 +1037,6 @@ mod tests {
 
     #[test]
     fn no_eligible_returns_none() {
-        let scenario = RouteScenario::economy();
         let snap = snapshot_with_used(99.0, None); // sub at cap
         let cands = vec![
             candidate("free-a", ProviderClass::Free, 99.0), // not in primary classes
