@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{BillingMode, Provider};
 use crate::utilization::{
-    BudgetMode, RateLimitSnapshot, RouteDecision, RouteKnobs, DEFAULT_CAP_GUARD, DEFAULT_USE_TARGET,
+    AccountDecision, AccountView, BudgetMode, RateLimitSnapshot, RouteDecision, RouteKnobs,
+    DEFAULT_CAP_GUARD, DEFAULT_USE_TARGET,
 };
 
 // ---------------------------------------------------------------------------
@@ -268,6 +269,7 @@ impl RouteScenario {
             cap_guard: self.cap_guard,
             budget_mode: self.budget_mode,
             chargeback_budget_usd: None, // set at call-site via `decide(.., Some(remaining))`
+            reset_imminence_threshold: crate::utilization::DEFAULT_RESET_IMMINENCE_THRESHOLD,
         }
     }
 
@@ -484,6 +486,346 @@ pub fn chain_for_role(
                 out.push(c.model_id.clone());
                 if max_chain > 0 && out.len() >= max_chain {
                     return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// KNEMON Layer 4 — per-account multi-window view.
+// ---------------------------------------------------------------------------
+
+/// Per-candidate eligibility under the Layer 4 (per-account) path. The
+/// `account_view` is consumed by [`crate::utilization::decide_account`]
+/// instead of the legacy single-snapshot [`crate::utilization::decide`],
+/// so a `Sub` candidate's eligibility reflects ALL windows on its
+/// account (multi-window binding) rather than just the snapshot's
+/// `primary` / `secondary` max. The verdict mapping mirrors the
+/// single-snapshot path so callers see the same `RouteDecision` shape.
+///
+/// `None` `account_view` for a `Sub` candidate falls back to the legacy
+/// single-snapshot path — that's the documented "no per-account
+/// information -> headroom" baseline so a candidate without a layered
+/// account view never gets artificially demoted.
+pub fn candidate_eligible_with_account(
+    role: Role,
+    candidate: &RoutableCandidate,
+    scenario: &RouteScenario,
+    snapshot: Option<&RateLimitSnapshot>,
+    account_view: Option<&AccountView>,
+    allow_paid_runtime: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !candidate.healthy {
+        return false;
+    }
+    let classes = scenario.classes_for(role);
+    match candidate.class {
+        ProviderClass::Free => classes.contains(&ProviderClass::Free),
+        ProviderClass::Sub => {
+            if !classes.contains(&ProviderClass::Sub) {
+                return false;
+            }
+            // Layer 4 path: when an AccountView is provided, run
+            // decide_account and honor its verdict exactly. When no
+            // AccountView is provided, fall back to the legacy
+            // single-snapshot `decide()` so callers without a layered
+            // account view (e.g. the legacy CLI ingest path that only
+            // has the most-recent header snapshot) keep working.
+            if let Some(view) = account_view {
+                let knobs = scenario.knobs();
+                let verdict = crate::utilization::decide_account(view, &knobs, now, None);
+                match verdict.decision {
+                    RouteDecision::PreferSub | RouteDecision::Chargeback => true,
+                    RouteDecision::FallBackToFree => {
+                        // Same scenario-mode override as the legacy
+                        // path: when the scenario opted into
+                        // chargeback, keep the sub even if the
+                        // account-level verdict dropped it.
+                        matches!(scenario.budget_mode, BudgetMode::Chargeback)
+                    }
+                }
+            } else {
+                let snap = snapshot.cloned().unwrap_or_default();
+                let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
+                match decision {
+                    RouteDecision::PreferSub | RouteDecision::Chargeback => true,
+                    RouteDecision::FallBackToFree => {
+                        matches!(scenario.budget_mode, BudgetMode::Chargeback)
+                    }
+                }
+            }
+        }
+        ProviderClass::Paid => {
+            scenario.allow_paid && allow_paid_runtime && classes.contains(&ProviderClass::Paid)
+        }
+    }
+}
+
+/// Pick the highest-ranked eligible candidate for `role` under the
+/// per-account (Layer 4) path. Same contract as
+/// [`pick_candidate_for_role`] except that `Sub` candidates are ranked
+/// by ASCENDING `decide_account(view).strength` (most-idle first)
+/// rather than `swe_rank`. This is the routing-tier
+/// "drain-the-most-idle-subscription-before-touching-the-rest" rule
+/// that KNEMON Layer 4 is designed to support.
+///
+/// `account_views` must be the same length as `candidates` and align
+/// positionally: `account_views[i]` is the per-account view for
+/// `candidates[i]`. Pass an empty `Vec` (or one that's None for every
+/// entry — see the helper signature below) to fall back to the legacy
+/// single-snapshot path entirely.
+///
+/// For non-Sub classes the legacy swe_rank ordering applies (free is
+/// effectively free — its "rank" is meaningless; paid is rare and
+/// explicit).
+pub fn pick_candidate_for_role_with_account(
+    role: Role,
+    candidates: &[RoutableCandidate],
+    account_views: &[Option<AccountView>],
+    scenario: &RouteScenario,
+    snapshot: Option<&RateLimitSnapshot>,
+    allow_paid_runtime: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let classes = scenario.classes_for(role);
+    for class in classes {
+        if *class == ProviderClass::Sub {
+            // KNEMON L4: ascending strength (most-idle first). Only
+            // treat the Sub pick as the role's head when at least one
+            // Sub candidate is actually eligible; otherwise fall
+            // through to the next class in the role's preference order
+            // (mirrors the legacy behavior when Sub gets dropped by
+            // the gate).
+            if let Some(pick) = pick_sub_candidate_by_idle(
+                role,
+                candidates,
+                account_views,
+                scenario,
+                snapshot,
+                allow_paid_runtime,
+                now,
+            ) {
+                return Some(pick);
+            }
+            continue;
+        }
+        // Free / Paid: legacy swe_rank ordering.
+        let mut best: Option<&RoutableCandidate> = None;
+        for c in candidates.iter().filter(|c| c.class == *class) {
+            match best {
+                None => best = Some(c),
+                Some(b) if c.swe_rank > b.swe_rank => best = Some(c),
+                _ => {}
+            }
+        }
+        if let Some(c) = best {
+            if candidate_eligible_with_account(
+                role,
+                c,
+                scenario,
+                snapshot,
+                None,
+                allow_paid_runtime,
+                now,
+            ) {
+                return Some(c.model_id.clone());
+            }
+        }
+    }
+    None
+}
+
+fn pick_sub_candidate_by_idle(
+    role: Role,
+    candidates: &[RoutableCandidate],
+    account_views: &[Option<AccountView>],
+    scenario: &RouteScenario,
+    snapshot: Option<&RateLimitSnapshot>,
+    allow_paid_runtime: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let knobs = scenario.knobs();
+    // Detect "all sub candidates lack an AccountView" up front — when
+    // nobody has a layered view, the L4 picker must degenerate to the
+    // legacy swe_rank ordering (rather than relying on index position
+    // as a tiebreak, which would silently corrupt callers that pass
+    // candidates in swe_rank order).
+    let any_sub_has_view = candidates.iter().enumerate().any(|(i, c)| {
+        c.class == ProviderClass::Sub && account_views.get(i).and_then(|v| v.as_ref()).is_some()
+    });
+    let mut scored: Vec<(usize, f64, bool)> = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        if c.class != ProviderClass::Sub {
+            continue;
+        }
+        let view_ref = account_views.get(i).and_then(|v| v.as_ref());
+        let ad: AccountDecision = match view_ref {
+            Some(v) => crate::utilization::decide_account(v, &knobs, now, None),
+            None => AccountDecision {
+                decision: crate::utilization::decide(
+                    &snapshot.cloned().unwrap_or_default(),
+                    &knobs,
+                    now,
+                    None,
+                ),
+                // When nobody has a layered view, fall back to
+                // swe_rank ordering by encoding it as a comparable
+                // scalar (higher swe_rank => lower "strength" so it
+                // sorts FIRST — the legacy spec was "highest rank
+                // first").
+                strength: if any_sub_has_view {
+                    f64::INFINITY
+                } else {
+                    -c.swe_rank
+                },
+                binding_window: None,
+            },
+        };
+        let eligible = candidate_eligible_with_account(
+            role,
+            c,
+            scenario,
+            snapshot,
+            view_ref,
+            allow_paid_runtime,
+            now,
+        );
+        scored.push((i, ad.strength, eligible));
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    // Sort: eligible first, then ascending strength. Within a tier,
+    // index ordering is the stable tiebreak so the test fixtures stay
+    // reproducible. NOTE: when all subs lack an account view we
+    // packed `strength = -swe_rank`, so ascending strength == descending
+    // swe_rank == legacy ordering. Mixed views (some layered, some
+    // not) sort account-less subs LAST (strength=INFINITY), which is
+    // the documented "prefer the layered view when both kinds are
+    // present" tiebreak.
+    scored.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored
+        .into_iter()
+        .find(|(_, _, eligible)| *eligible)
+        .map(|(i, _, _)| candidates[i].model_id.clone())
+}
+
+/// Ordered chain under the Layer 4 path. Same as [`chain_for_role`] but
+/// ranks `Sub` candidates by ascending `decide_account(view).strength`.
+/// Non-Sub classes use legacy swe_rank ordering.
+#[allow(clippy::too_many_arguments)]
+pub fn chain_for_role_with_account(
+    role: Role,
+    candidates: &[RoutableCandidate],
+    account_views: &[Option<AccountView>],
+    scenario: &RouteScenario,
+    snapshot: Option<&RateLimitSnapshot>,
+    allow_paid_runtime: bool,
+    now: chrono::DateTime<chrono::Utc>,
+    max_chain: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let classes = scenario.classes_for(role);
+    // Mirror the picker: when no Sub candidate has a layered view,
+    // fall back to legacy swe_rank ordering. Mixed: account-less
+    // sorts LAST.
+    let any_sub_has_view = candidates.iter().enumerate().any(|(i, c)| {
+        c.class == ProviderClass::Sub && account_views.get(i).and_then(|v| v.as_ref()).is_some()
+    });
+    for class in classes {
+        if *class == ProviderClass::Sub {
+            let knobs = scenario.knobs();
+            let mut scored: Vec<(usize, f64, bool)> = Vec::new();
+            for (i, c) in candidates.iter().enumerate() {
+                if c.class != ProviderClass::Sub {
+                    continue;
+                }
+                let view_ref = account_views.get(i).and_then(|v| v.as_ref());
+                let ad: AccountDecision = match view_ref {
+                    Some(v) => crate::utilization::decide_account(v, &knobs, now, None),
+                    None => AccountDecision {
+                        decision: crate::utilization::decide(
+                            &snapshot.cloned().unwrap_or_default(),
+                            &knobs,
+                            now,
+                            None,
+                        ),
+                        strength: if any_sub_has_view {
+                            f64::INFINITY
+                        } else {
+                            -c.swe_rank
+                        },
+                        binding_window: None,
+                    },
+                };
+                let eligible = candidate_eligible_with_account(
+                    role,
+                    c,
+                    scenario,
+                    snapshot,
+                    view_ref,
+                    allow_paid_runtime,
+                    now,
+                );
+                scored.push((i, ad.strength, eligible));
+            }
+            scored.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (i, _, _) in scored {
+                let c = &candidates[i];
+                if out.contains(&c.model_id) {
+                    continue;
+                }
+                if candidate_eligible_with_account(
+                    role,
+                    c,
+                    scenario,
+                    snapshot,
+                    account_views.get(i).and_then(|v| v.as_ref()),
+                    allow_paid_runtime,
+                    now,
+                ) {
+                    out.push(c.model_id.clone());
+                    if max_chain > 0 && out.len() >= max_chain {
+                        return out;
+                    }
+                }
+            }
+        } else {
+            let mut ranked: Vec<&RoutableCandidate> =
+                candidates.iter().filter(|c| c.class == *class).collect();
+            ranked.sort_by(|a, b| {
+                b.swe_rank
+                    .partial_cmp(&a.swe_rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for c in ranked {
+                if out.contains(&c.model_id) {
+                    continue;
+                }
+                if candidate_eligible_with_account(
+                    role,
+                    c,
+                    scenario,
+                    snapshot,
+                    None,
+                    allow_paid_runtime,
+                    now,
+                ) {
+                    out.push(c.model_id.clone());
+                    if max_chain > 0 && out.len() >= max_chain {
+                        return out;
+                    }
                 }
             }
         }
@@ -970,6 +1312,279 @@ mod tests {
                 .as_deref(),
             Some("sub-a"),
             "reviewer class preference must override rank"
+        );
+    }
+
+    // -------- KNEMON Layer 4 (per-account) scenario wiring ------------
+    //
+    // The L4 path runs `decide_account` per candidate and ranks Sub
+    // candidates by ascending strength (most-idle first). The legacy
+    // swe_rank ordering still applies within non-Sub classes. These
+    // tests pin the contract end-to-end through the scenario layer.
+
+    fn view(
+        provider: crate::utilization::Provider,
+        account_id: &str,
+        plan: &str,
+        windows: Vec<crate::utilization::WindowView>,
+    ) -> crate::utilization::AccountView {
+        crate::utilization::AccountView {
+            provider,
+            account_id: account_id.to_string(),
+            plan: plan.to_string(),
+            windows,
+        }
+    }
+
+    fn w(
+        name: &str,
+        hours: u32,
+        pct: Option<f64>,
+        h: crate::utilization::TelemetryHealth,
+    ) -> crate::utilization::WindowView {
+        crate::utilization::WindowView {
+            name: name.into(),
+            used_percent: pct,
+            observability: crate::config::Observability::Header,
+            health: h,
+            reset_at: None,
+            hours,
+        }
+    }
+
+    #[test]
+    fn l4_sub_ranker_prefers_most_idle_account_first() {
+        // Two sub candidates with AccountViews. Sub-a has 40% used
+        // (most idle, strength=40); sub-b has 82% used (strength=82).
+        // The L4 picker must return sub-a even though sub-b has a
+        // higher swe_rank.
+        let scenario = RouteScenario::balanced();
+        let n = now();
+        let idle = view(
+            crate::utilization::Provider::Anthropic,
+            "acct-idle",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(40.0),
+                crate::utilization::TelemetryHealth::Fresh,
+            )],
+        );
+        let busy = view(
+            crate::utilization::Provider::Anthropic,
+            "acct-busy",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(82.0),
+                crate::utilization::TelemetryHealth::Fresh,
+            )],
+        );
+        let cands = vec![
+            // Higher swe_rank, but the busier account — must NOT win.
+            candidate("sub-busy", ProviderClass::Sub, 99.0),
+            candidate("sub-idle", ProviderClass::Sub, 50.0),
+        ];
+        let views = vec![Some(busy), Some(idle)];
+        // Reviewer role: sub-first in balanced -> sub-idle wins
+        // (ascending strength).
+        assert_eq!(
+            pick_candidate_for_role_with_account(
+                Role::Reviewer,
+                &cands,
+                &views,
+                &scenario,
+                None,
+                false,
+                n,
+            )
+            .as_deref(),
+            Some("sub-idle"),
+            "most-idle sub must be preferred over a higher-rank busier sub"
+        );
+    }
+
+    #[test]
+    fn l4_sub_ranker_drops_sub_above_cap_guard_and_picks_free() {
+        // Sub is at 90% used -> cap_guard trips -> sub ineligible. With
+        // a free candidate present, free wins.
+        let scenario = RouteScenario::balanced();
+        let n = now();
+        let hot = view(
+            crate::utilization::Provider::Anthropic,
+            "acct",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(90.0),
+                crate::utilization::TelemetryHealth::Fresh,
+            )],
+        );
+        let cands = vec![
+            candidate("sub-a", ProviderClass::Sub, 99.0),
+            candidate("free-a", ProviderClass::Free, 50.0),
+        ];
+        let views = vec![Some(hot), None];
+        // Reviewer: [sub, free]. Sub is ineligible -> free wins.
+        assert_eq!(
+            pick_candidate_for_role_with_account(
+                Role::Reviewer,
+                &cands,
+                &views,
+                &scenario,
+                None,
+                false,
+                n,
+            )
+            .as_deref(),
+            Some("free-a"),
+            "sub over cap_guard must fall back to free"
+        );
+    }
+
+    #[test]
+    fn l4_sub_ranker_legacy_swe_rank_used_when_no_account_views() {
+        // When every account view is None, the L4 path must NOT
+        // invent ranking — it must use the legacy single-snapshot
+        // decide() path and the sub's swe_rank ordering. swe_rank=99
+        // wins over swe_rank=50.
+        let scenario = RouteScenario::balanced();
+        let n = now();
+        let snap = snapshot_with_used(20.0, None); // headroom
+        let cands = vec![
+            candidate("sub-low", ProviderClass::Sub, 50.0),
+            candidate("sub-high", ProviderClass::Sub, 99.0),
+        ];
+        let views = vec![None, None];
+        assert_eq!(
+            pick_candidate_for_role_with_account(
+                Role::Reviewer,
+                &cands,
+                &views,
+                &scenario,
+                Some(&snap),
+                false,
+                n,
+            )
+            .as_deref(),
+            Some("sub-high"),
+            "with no account views, L4 must fall back to legacy swe_rank ordering"
+        );
+    }
+
+    #[test]
+    fn l4_sub_ranker_excludes_degraded_window_and_prefers_idle_observable() {
+        // A 95% degraded window on sub-a must NOT cause it to be
+        // dropped. With no other windows, sub-a is treated as headroom
+        // (Degraded-only => observable set empty => PreferSub).
+        let scenario = RouteScenario::balanced();
+        let n = now();
+        let degraded_only = view(
+            crate::utilization::Provider::Anthropic,
+            "acct-d",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(95.0),
+                crate::utilization::TelemetryHealth::Degraded,
+            )],
+        );
+        let cands = vec![candidate("sub-a", ProviderClass::Sub, 50.0)];
+        let views = vec![Some(degraded_only)];
+        // Reviewer: sub only candidate -> PreferSub despite 95%
+        // degraded (the L4 "no observable signal = headroom" rule).
+        assert_eq!(
+            pick_candidate_for_role_with_account(
+                Role::Reviewer,
+                &cands,
+                &views,
+                &scenario,
+                None,
+                false,
+                n,
+            )
+            .as_deref(),
+            Some("sub-a"),
+            "Degraded-only window must not demote a sub candidate"
+        );
+    }
+
+    #[test]
+    fn l4_chain_for_role_orders_by_ascending_strength() {
+        // Chain output should list sub candidates in ascending
+        // strength order: 40% first, then 82%.
+        let scenario = RouteScenario::balanced();
+        let n = now();
+        let idle = view(
+            crate::utilization::Provider::Anthropic,
+            "i",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(40.0),
+                crate::utilization::TelemetryHealth::Fresh,
+            )],
+        );
+        let busy = view(
+            crate::utilization::Provider::Anthropic,
+            "b",
+            "max",
+            vec![w(
+                "5h",
+                5,
+                Some(82.0),
+                crate::utilization::TelemetryHealth::Fresh,
+            )],
+        );
+        let cands = vec![
+            candidate("sub-busy", ProviderClass::Sub, 99.0),
+            candidate("sub-idle", ProviderClass::Sub, 50.0),
+        ];
+        let views = vec![Some(busy), Some(idle)];
+        let chain = chain_for_role_with_account(
+            Role::Reviewer,
+            &cands,
+            &views,
+            &scenario,
+            None,
+            false,
+            n,
+            0,
+        );
+        assert_eq!(
+            chain,
+            vec!["sub-idle".to_string(), "sub-busy".to_string()],
+            "chain must list sub candidates in ascending strength order"
+        );
+    }
+
+    #[test]
+    fn l4_legacy_picker_unchanged_when_no_account_view_passed() {
+        // The legacy `pick_candidate_for_role` signature is preserved
+        // and behaves exactly as it did before L4 was added. This is
+        // the "single-snapshot fallback" the spec requires.
+        let scenario = RouteScenario::balanced();
+        let snap = snapshot_with_used(20.0, None);
+        let cands = vec![
+            candidate("sub-a", ProviderClass::Sub, 80.0),
+            candidate("free-a", ProviderClass::Free, 99.0),
+        ];
+        // Reviewer: [sub, free]. Sub has headroom -> sub wins.
+        assert_eq!(
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
+            Some("sub-a"),
+        );
+        // Primary: [free, sub]. Free wins on rank.
+        assert_eq!(
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
+            Some("free-a"),
         );
     }
 }

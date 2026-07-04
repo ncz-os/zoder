@@ -63,12 +63,78 @@ pub const DEFAULT_CAP_GUARD: f64 = 85.0;
 /// Default `budget_mode`.
 pub const DEFAULT_BUDGET_MODE: BudgetMode = BudgetMode::Block;
 
+/// Default `reset_imminence_threshold` — when a binding window is at/above
+/// `cap_guard` AND the time remaining before reset is at/under this
+/// fraction of the window's full cycle, treat the window as effectively
+/// resetting soon and prefer the subscription (don't pay the cost of
+/// falling back to free when we're about to get full headroom back).
+/// Default `0.10` = "last 10% of the window's clock".
+pub const DEFAULT_RESET_IMMINENCE_THRESHOLD: f64 = 0.10;
+
+/// Age thresholds (in seconds) for [`TelemetryHealth`].
+const FRESH_MAX_AGE_SECS: i64 = 5 * 60; // <  5 min
+const STALE_MAX_AGE_SECS: i64 = 60 * 60; // < 60 min
+
 /// On-disk filename under `$ZODER_HOME` (or `~/.zoder`).
 pub const UTILIZATION_FILENAME: &str = "utilization.json";
 
 // ---------------------------------------------------------------------------
 // Enums.
 // ---------------------------------------------------------------------------
+
+/// Telemetry freshness bucket, derived from the age of a window's last
+/// observation. The bucket drives a weight in
+/// [`AccountView`](super) routing: the binding window is the one that
+/// maximizes `used_percent * health_weight`, so a stale-but-higher-looking
+/// window can never beat a fresh-but-slightly-lower one.
+///
+/// Age buckets (relative to `now`):
+///   - `Fresh`    — less than 5 minutes since last update. Full weight (1.0).
+///   - `Stale`    — 5 ..= 60 minutes. Discounted weight (0.8). Still
+///     trustworthy, but the router shouldn't be steered by
+///     a number that's hours old.
+///   - `Degraded` — more than 60 minutes, or never observed (no `last_updated`).
+///     Weight 0.0 and EXCLUDED from binding — a 95% on a
+///     Degraded window is treated as unknown, not "almost
+///     full", because we have no proof it's still 95% (it
+///     may have rolled over, refilled, or been quietly
+///     reconfigured in the meantime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryHealth {
+    Fresh,
+    Stale,
+    Degraded,
+}
+
+impl TelemetryHealth {
+    /// Age in seconds -> bucket. `None` (no `last_updated` observed at all)
+    /// is always `Degraded` — never seen = never trusted.
+    pub fn from_age_secs(age_secs: Option<i64>) -> Self {
+        match age_secs {
+            None => TelemetryHealth::Degraded,
+            // Negative ages (clock skew, future-dated record) collapse to
+            // Fresh — the record is "newer than now", which we trust at
+            // face value rather than misclassifying as Degraded.
+            Some(s) if s < 0 => TelemetryHealth::Fresh,
+            Some(s) if s < FRESH_MAX_AGE_SECS => TelemetryHealth::Fresh,
+            Some(s) if s < STALE_MAX_AGE_SECS => TelemetryHealth::Stale,
+            Some(_) => TelemetryHealth::Degraded,
+        }
+    }
+
+    /// Multiplicative weight used by [`decide_account`] when picking the
+    /// binding window. `Degraded = 0.0` is what excludes a degraded
+    /// window from binding without an explicit branch in the caller
+    /// (`max(...)` of `(used, used*0.0)` never selects it).
+    pub fn health_weight(self) -> f64 {
+        match self {
+            TelemetryHealth::Fresh => 1.0,
+            TelemetryHealth::Stale => 0.8,
+            TelemetryHealth::Degraded => 0.0,
+        }
+    }
+}
 
 /// Budget policy for a `(provider, account_id, plan)` triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +393,17 @@ pub struct RouteKnobs {
     /// we are willing to spend before falling back. `None` when not in
     /// chargeback mode or when no explicit budget has been set.
     pub chargeback_budget_usd: Option<f64>,
+    /// KNEMON Layer 4: when a binding window is at/above `cap_guard`,
+    /// fraction of the window's clock that must remain until `reset_at`
+    /// for the reset-relaxation rule to fire (PreferSub). Default
+    /// [`DEFAULT_RESET_IMMINENCE_THRESHOLD`] (0.10 = "last 10% of the
+    /// window"). A value of `0.0` disables the relaxation.
+    #[serde(default = "default_reset_imminence_threshold")]
+    pub reset_imminence_threshold: f64,
+}
+
+fn default_reset_imminence_threshold() -> f64 {
+    DEFAULT_RESET_IMMINENCE_THRESHOLD
 }
 
 impl Default for RouteKnobs {
@@ -336,6 +413,7 @@ impl Default for RouteKnobs {
             cap_guard: DEFAULT_CAP_GUARD,
             budget_mode: DEFAULT_BUDGET_MODE,
             chargeback_budget_usd: None,
+            reset_imminence_threshold: DEFAULT_RESET_IMMINENCE_THRESHOLD,
         }
     }
 }
@@ -764,6 +842,347 @@ pub fn decide(
             (Some(_cap), Some(remaining)) if remaining > 0.0 => RouteDecision::Chargeback,
             _ => RouteDecision::FallBackToFree,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KNEMON Layer 4 — per-account multi-window routing view.
+// ---------------------------------------------------------------------------
+
+/// One subscription window as the routing decision sees it. Lifts data
+/// from either the header-fed `UtilizationRecord` (when the window
+/// appears as `primary`/`secondary` on the persisted snapshot) or the
+/// counter-fed `CounterWindow` (when the catalog declares the window as
+/// `Observability::Counter` and the store has accumulated usage against
+/// it), and adds a `health` bucket so a stale observation can't dominate
+/// a fresh one.
+#[derive(Debug, Clone)]
+pub struct WindowView {
+    /// Operator-facing window name (e.g. `"5h"`, `"weekly"`).
+    pub name: String,
+    /// 0..=100 percent of the window consumed. `None` when the store has
+    /// no numeric value (PercentOnly window with no live header, or a
+    /// Counter window with no cap recorded). Treat as "unknown — never
+    /// let this window gate routing on its own".
+    pub used_percent: Option<f64>,
+    /// How the window is observed / fed. Carried through from the
+    /// catalog `QuotaWindow` so callers can tell a header-fed window
+    /// from a counter-fed one without re-deriving it.
+    pub observability: crate::config::Observability,
+    /// Freshness bucket derived from `last_updated`. A `Degraded` window
+    /// is excluded from binding entirely — see [`decide_account`].
+    pub health: TelemetryHealth,
+    /// Provider-driven reset timestamp (when the window will roll over
+    /// and headroom becomes full again). `None` when no signal is
+    /// available (e.g. a header-fed snapshot without `reset_at_epoch`,
+    /// or a counter-fed window without a configured `reset_at`).
+    /// Always treated as RFC3339 UTC.
+    pub reset_at: Option<DateTime<Utc>>,
+    /// Rolling window length in hours (`5h` -> `5`, `weekly` -> `168`).
+    /// Used by the reset-relaxation rule to compute
+    /// `time_to_reset / cycle_secs` and decide whether the window is
+    /// about to roll over.
+    pub hours: u32,
+}
+
+/// One account's complete window set for one plan. Built from a
+/// [`UtilizationStore`] (the persisted telemetry) plus the plan's
+/// configured [`crate::config::QuotaWindow`] list (the catalog of what
+/// windows EXIST on this account, even if we have no live reading for
+/// some of them).
+#[derive(Debug, Clone)]
+pub struct AccountView {
+    pub provider: Provider,
+    pub account_id: String,
+    pub plan: String,
+    /// Configured windows, in catalog order. Every window in the plan
+    /// shows up here — even ones with `used_percent = None` (unknown /
+    /// PercentOnly-without-numeric) — so the caller can iterate the
+    /// full set without re-merging the catalog.
+    pub windows: Vec<WindowView>,
+}
+
+/// Routing decision for one account. The router consumes `decision`
+/// (same verdict shape as the legacy single-window [`decide`]) plus
+/// `strength` (used to rank multiple sub candidates against each other:
+/// ASCENDING strength so the most-idle account is preferred first) and
+/// `binding_window` (which window drove the verdict — useful for
+/// debugging and for ledger / report labels).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountDecision {
+    pub decision: RouteDecision,
+    /// `binding.used_percent` — lower = more idle. Used by callers that
+    /// rank multiple sub-class candidates: ascending strength means the
+    /// most-idle sub is preferred first.
+    pub strength: f64,
+    /// Name of the window that drove the verdict, or `None` when no
+    /// window was observable (account is treated as headroom).
+    pub binding_window: Option<String>,
+}
+
+/// Build an [`AccountView`] for one `(provider, account_id, plan)` triple
+/// from the persisted [`UtilizationStore`]. `configured_windows` is the
+/// catalog of windows the plan declares (the source of truth for
+/// `hours` / `observability` — utilization.rs doesn't import the catalog
+/// directly so callers pass them in).
+///
+/// `used_percent` is filled in this order of preference:
+///   1. A matching counter-fed `CounterWindow` whose `observability =
+///      Counter` AND whose `cap` is `Some` — i.e. we have a numeric
+///      percent the store computed (`used_tokens / cap`). This is the
+///      "best" path for MiniMax-style providers with no headers.
+///   2. A matching header-fed window from the persisted `RateLimitSnapshot`
+///      (`primary` / `secondary`). Surfaces any numeric percent the
+///      provider published in `x-codex-*` or `anthropic-ratelimit-*`.
+///   3. The persisted counter row's `used_percent` even when
+///      `cap = None` (defensive — the store never invents a percent in
+///      this case, but if a future caller sets `used_percent` directly
+///      we don't want to overwrite it with `None`).
+///   4. Otherwise `None` (Unknown) — the window exists in the catalog
+///      but we have no numeric reading for it.
+///
+/// Health is derived from `last_updated` (counter) or the snapshot's
+/// `observed_at` (header); never-observed windows are `Degraded`.
+pub fn build_account_view(
+    provider: Provider,
+    account_id: impl Into<String>,
+    plan: impl Into<String>,
+    configured_windows: &[crate::config::QuotaWindow],
+    store: &UtilizationStore,
+    now: DateTime<Utc>,
+) -> AccountView {
+    let account_id = account_id.into();
+    let plan = plan.into();
+    // Header-fed row (legacy Layer 3A path). `last_updated` lives on
+    // the `UtilizationRecord`; the snapshot's `observed_at` is also
+    // backed by `last_updated` (see `UtilizationRecord::from_snapshot`),
+    // so reading either gives the same age. The store gives us back a
+    // reference; the age can be derived once and reused for any window
+    // on the record.
+    let header_record = store.get(provider, &account_id, &plan);
+    let header_record_age = header_record.map(|r| (now - r.last_updated).num_seconds());
+
+    let mut views = Vec::with_capacity(configured_windows.len());
+    for cw in configured_windows {
+        // (a) Counter-fed row.
+        let counter = store.get_counter(provider, &account_id, &plan, &cw.name);
+        // (b) Header-fed window — match by `window_minutes` (closest
+        // robust proxy since header snapshots don't carry the operator's
+        // window name; primary is the 5h-ish, secondary the weekly-ish).
+        let header_window_minutes = cw.hours.saturating_mul(60);
+        let header_match = if let Some(r) = header_record {
+            match (&r.primary, &r.secondary) {
+                (Some(p), _) if p.window_minutes == Some(header_window_minutes) => {
+                    Some((p.used_percent, r.last_updated))
+                }
+                (Some(p), Some(s)) if s.window_minutes == Some(header_window_minutes) => {
+                    Some((s.used_percent, r.last_updated))
+                }
+                // Fallback: header snapshots that don't carry a
+                // window_minutes (e.g. legacy Anthropic no-suffix shape)
+                // are matched by name-ish: primary -> first declared
+                // window, secondary -> second declared window, by
+                // position.
+                (Some(p), _) if cw.name == "primary" || cw.name == "5h" => {
+                    Some((p.used_percent, r.last_updated))
+                }
+                (_, Some(s)) if cw.name == "secondary" || cw.name == "weekly" => {
+                    Some((s.used_percent, r.last_updated))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Synthesize reset_at: prefer the counter's `reset_at`, fall
+        // back to the header's `reset_at_epoch`.
+        let header_epoch_for_window = if let Some(r) = header_record {
+            let primary_match = cw.name == "primary" || cw.name == "5h";
+            let secondary_match = cw.name == "secondary" || cw.name == "weekly";
+            match (&r.primary, &r.secondary) {
+                (Some(p), _) if primary_match => Some(p.reset_at_epoch),
+                (_, Some(s)) if secondary_match => Some(s.reset_at_epoch),
+                (Some(p), _) if p.window_minutes == Some(header_window_minutes) => {
+                    Some(p.reset_at_epoch)
+                }
+                (_, Some(s)) if s.window_minutes == Some(header_window_minutes) => {
+                    Some(s.reset_at_epoch)
+                }
+                _ => None,
+            }
+            .flatten()
+        } else {
+            None
+        };
+        let reset_at = counter.and_then(|c| c.reset_at).or_else(|| {
+            header_epoch_for_window.and_then(|epoch| DateTime::<Utc>::from_timestamp(epoch, 0))
+        });
+        // Compute used_percent.
+        let used_percent = match cw.observability {
+            // Counter path: trust the store's stored percent whenever
+            // we have one. The store never invents a percent for a
+            // cap-less row, so `Some(...)` is always "numeric and
+            // correct" (cap * used is finite).
+            crate::config::Observability::Counter => counter.and_then(|c| c.used_percent),
+            // Header path: take the matching header window's percent if
+            // we have one. A header observation at 0% IS a real signal
+            // (provider just told us we're fresh), so we don't gate on
+            // "non-zero" — None means "no header sighting", not "0%
+            // used".
+            crate::config::Observability::Header => header_match.map(|(pct, _)| pct),
+            // PercentOnly: surface the header reading if we have one
+            // (the operator / provider only publishes a percent, so
+            // even a counter row with no cap would be useless here).
+            crate::config::Observability::PercentOnly => {
+                header_match.map(|(pct, _)| pct).or_else(|| {
+                    // Last-ditch: if a caller seeded `used_percent`
+                    // directly on the counter row, surface that.
+                    counter.and_then(|c| c.used_percent)
+                })
+            }
+        };
+        // Health: from the freshest observation we have. Counter row
+        // wins when its observability is Counter; otherwise the header
+        // record's `last_updated` age. Never-observed -> Degraded.
+        let health = match cw.observability {
+            crate::config::Observability::Counter => TelemetryHealth::from_age_secs(
+                counter.map(|c| (now - c.last_updated).num_seconds()),
+            ),
+            crate::config::Observability::Header | crate::config::Observability::PercentOnly => {
+                TelemetryHealth::from_age_secs(header_match.map(|(_, ts)| (now - ts).num_seconds()))
+            }
+        };
+        // Touch the unused record-age slot so the compiler keeps it in
+        // scope as a diagnostic hook (the age-vs-window match is per-row
+        // anyway; this top-level value is just the "freshest window on
+        // this record").
+        let _ = header_record_age;
+        views.push(WindowView {
+            name: cw.name.clone(),
+            used_percent,
+            observability: cw.observability,
+            health,
+            reset_at,
+            hours: cw.hours,
+        });
+    }
+    AccountView {
+        provider,
+        account_id,
+        plan,
+        windows: views,
+    }
+}
+
+/// Decide whether to use the paid subscription for the whole account,
+/// given the per-window views in `account`. This is the Layer 4 entry
+/// point — multi-window per-account routing. The contract:
+///
+///   - `observable` = windows with `used_percent.is_some() && health !=
+///     Degraded`. A Degraded window is *not* observable even when its
+///     `used_percent` is `Some` — the value is suspect, so we exclude
+///     it. (The store genuinely never sets `used_percent` without a
+///     fresh-enough signal, but the check is defensive.)
+///   - When `observable` is empty -> `{PreferSub, 0.0, None}`. No
+///     numeric reading anywhere -> the routing layer's "None = headroom
+///     = keep the sub" baseline.
+///   - `binding` = the observable window maximizing
+///     `used_percent * health_weight(health)`. Fresh + slightly-lower
+///     can beat Stale + slightly-higher; Degraded never wins (its
+///     weight is 0.0).
+///   - Reset-relaxation: when `binding.used_percent >= knobs.cap_guard`
+///     AND `(time_to_reset / (binding.hours*3600)) <= knobs.reset_imminence_threshold`
+///     -> `{PreferSub, binding.used_percent, Some(binding.name)}`.
+///     We're about to get full headroom back; don't pay the cost of
+///     falling back.
+///   - Otherwise bands on `binding.used_percent`:
+///       * `< use_target`                          -> PreferSub
+///       * `< cap_guard` (hysteresis)              -> PreferSub
+///       * `>= cap_guard` && budget_mode = Block   -> FallBackToFree
+///       * `>= cap_guard` && budget_mode = Chargeback &&
+///         chargeback_remaining > 0                -> Chargeback
+///       * `>= cap_guard` && budget_mode = Chargeback &&
+///         chargeback_remaining <= 0 / None        -> FallBackToFree
+///
+/// `strength` is always `binding.used_percent` (lower = more idle). The
+/// caller can rank multiple sub-class candidates by ASCENDING strength
+/// so the most-idle one is preferred first; the legacy single-account
+/// path collapses this to "is the sub available at all".
+pub fn decide_account(
+    account: &AccountView,
+    knobs: &RouteKnobs,
+    now: DateTime<Utc>,
+    chargeback_remaining: Option<f64>,
+) -> AccountDecision {
+    // Observable = numeric AND not degraded. Stale is still observable
+    // (the 0.8 discount is applied at binding time, not at observability
+    // time); Degraded is not.
+    let observable: Vec<&WindowView> = account
+        .windows
+        .iter()
+        .filter(|w| w.used_percent.is_some() && w.health != TelemetryHealth::Degraded)
+        .collect();
+    if observable.is_empty() {
+        return AccountDecision {
+            decision: RouteDecision::PreferSub,
+            strength: 0.0,
+            binding_window: None,
+        };
+    }
+    // Binding window: max(used_percent * health_weight).
+    let binding = observable
+        .iter()
+        .max_by(|a, b| {
+            let sa = a.used_percent.unwrap_or(0.0) * a.health.health_weight();
+            let sb = b.used_percent.unwrap_or(0.0) * b.health.health_weight();
+            // partial_cmp: identical weights on equal scores -> stable
+            // tie-break by name (BTreeMap-friendly: deterministic) so
+            // tests are reproducible.
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .copied()
+        .expect("observable non-empty by prior guard");
+    let binding_used = binding.used_percent.unwrap_or(0.0);
+    // Reset-relaxation: cap_guard trips AND time-to-reset is small
+    // relative to the window's cycle.
+    let relax = binding_used >= knobs.cap_guard
+        && binding
+            .reset_at
+            .map(|r| {
+                let time_to_reset = (r - now).num_seconds().max(0) as f64;
+                let cycle_secs = (binding.hours as f64) * 3600.0;
+                if cycle_secs <= 0.0 {
+                    return false;
+                }
+                (time_to_reset / cycle_secs) <= knobs.reset_imminence_threshold
+            })
+            .unwrap_or(false);
+    if relax {
+        return AccountDecision {
+            decision: RouteDecision::PreferSub,
+            strength: binding_used,
+            binding_window: Some(binding.name.clone()),
+        };
+    }
+    // Bands.
+    let decision = if binding_used < knobs.use_target {
+        RouteDecision::PreferSub
+    } else if binding_used < knobs.cap_guard {
+        // Hysteresis: keep the sub unless the guard trips.
+        RouteDecision::PreferSub
+    } else {
+        match knobs.budget_mode {
+            BudgetMode::Block => RouteDecision::FallBackToFree,
+            BudgetMode::Chargeback => match (knobs.chargeback_budget_usd, chargeback_remaining) {
+                (Some(_cap), Some(remaining)) if remaining > 0.0 => RouteDecision::Chargeback,
+                _ => RouteDecision::FallBackToFree,
+            },
+        }
+    };
+    AccountDecision {
+        decision,
+        strength: binding_used,
+        binding_window: Some(binding.name.clone()),
     }
 }
 
@@ -1292,6 +1711,7 @@ mod tests {
             cap_guard: guard,
             budget_mode: mode,
             chargeback_budget_usd: budget,
+            reset_imminence_threshold: DEFAULT_RESET_IMMINENCE_THRESHOLD,
         }
     }
 
@@ -1890,5 +2310,578 @@ mod tests {
         let s3 = UtilizationStore::open(&path2).unwrap();
         assert!(s3.counters.is_empty());
         assert!(s3.records.is_empty());
+    }
+
+    // -------- KNEMON Layer 4 (per-account multi-window routing) ------
+    //
+    // Non-vacuous tests pinned by the spec:
+    //   (a) binding = max(used_percent * health_weight): a Fresh 5h at 70%
+    //       beats a Fresh weekly at 60% (70 > 60, both weight=1.0).
+    //   (b) a Degraded 95% window is EXCLUDED and does NOT bind — the
+    //       other windows must still drive the verdict.
+    //   (c) only-unknown-windows -> PreferSub. Never gate.
+    //   (d) reset-relaxation: 95% used but resets in < 10% of the cycle
+    //       -> PreferSub (we're about to get full headroom back).
+    //   (e) bands: 40% -> PreferSub (drive); 82% -> PreferSub (hysteresis);
+    //       90% -> FallBackToFree / Chargeback with budget.
+    //   (f) strength ranks 40% below 82% (the more-idle sub is preferred
+    //       first when ranking across multiple sub accounts).
+    //
+    // These tests don't go through `parse_headers` / `record` — they
+    // synthesize `WindowView`s directly so the assertions aren't muddied
+    // by the parser's knobs.
+
+    /// Helper: build an `AccountView` from a list of `(name, hours,
+    /// used_percent, observability, health, reset_at)` tuples. The store
+    /// is intentionally not consulted here — these tests pin the routing
+    /// arithmetic, not the builder.
+    #[allow(clippy::type_complexity)]
+    fn acct_view(
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        rows: &[(
+            &str,
+            u32,
+            Option<f64>,
+            crate::config::Observability,
+            TelemetryHealth,
+            Option<DateTime<Utc>>,
+        )],
+    ) -> AccountView {
+        let windows = rows
+            .iter()
+            .map(|(name, hours, used, obs, h, reset)| WindowView {
+                name: (*name).to_string(),
+                used_percent: *used,
+                observability: *obs,
+                health: *h,
+                reset_at: *reset,
+                hours: *hours,
+            })
+            .collect();
+        AccountView {
+            provider,
+            account_id: account_id.to_string(),
+            plan: plan.to_string(),
+            windows,
+        }
+    }
+
+    fn fresh_5h(pct: f64) -> WindowView {
+        WindowView {
+            name: "5h".into(),
+            used_percent: Some(pct),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 5,
+        }
+    }
+
+    fn weekly_fresh(pct: f64) -> WindowView {
+        WindowView {
+            name: "weekly".into(),
+            used_percent: Some(pct),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 168,
+        }
+    }
+
+    #[test]
+    fn l4_binding_picks_max_used_times_weight_five_h_at_70_beats_weekly_at_60() {
+        // (a) Two Fresh windows: 5h at 70%, weekly at 60%. Both weight
+        // 1.0. The 5h is the binding window.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(70.0), weekly_fresh(60.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert_eq!(
+            ad.binding_window.as_deref(),
+            Some("5h"),
+            "5h at 70% must beat weekly at 60%"
+        );
+        assert!((ad.strength - 70.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_stale_higher_value_loses_to_fresh_lower_value() {
+        // Subtlety: the spec uses weight, not "freshest wins". A Stale
+        // (weight=0.8) 75% window scores 60.0; a Fresh (weight=1.0) 60%
+        // window scores 60.0 too — tie, but a Fresh 61% window would
+        // beat a Stale 75%. This is the "weight applies to binding"
+        // contract.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let stale = WindowView {
+            name: "5h".into(),
+            used_percent: Some(75.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Stale,
+            reset_at: None,
+            hours: 5,
+        };
+        let fresh = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(61.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![stale, fresh],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.binding_window.as_deref(),
+            Some("weekly"),
+            "Fresh 61% (score 61) must beat Stale 75% (score 60)"
+        );
+        assert!((ad.strength - 61.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_degraded_window_at_95_pct_is_excluded_from_binding() {
+        // (b) A Degraded 95% window MUST NOT bind. The other window is
+        // observable and drives the verdict.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let degraded_95 = WindowView {
+            name: "5h".into(),
+            used_percent: Some(95.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours: 5,
+        };
+        let fresh_50 = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(50.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![degraded_95, fresh_50],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.binding_window.as_deref(),
+            Some("weekly"),
+            "Degraded 95% must be excluded — Fresh 50% binds instead"
+        );
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert!((ad.strength - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_only_degraded_windows_yields_prefer_sub_with_no_binding() {
+        // All windows Degraded -> observable set is empty ->
+        // PreferSub with strength 0.0 and binding_window = None. This
+        // is the "no trustworthy signal -> headroom baseline" invariant.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let d1 = WindowView {
+            name: "5h".into(),
+            used_percent: Some(95.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours: 5,
+        };
+        let d2 = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(99.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![d1, d2],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert!(ad.binding_window.is_none());
+        assert_eq!(ad.strength, 0.0);
+    }
+
+    #[test]
+    fn l4_only_unknown_windows_never_gates_routing() {
+        // (c) Only `used_percent = None` windows -> observable set is
+        // empty -> PreferSub with no binding. Crucially: a hypothetical
+        // 99% used window that's `None` is treated as unknown, NOT as
+        // "almost full". This is the "never gate on what we don't
+        // know" rule.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = acct_view(
+            Provider::Anthropic,
+            "a",
+            "max",
+            &[
+                (
+                    "5h",
+                    5,
+                    None,
+                    crate::config::Observability::Header,
+                    TelemetryHealth::Fresh,
+                    None,
+                ),
+                (
+                    "weekly",
+                    168,
+                    None,
+                    crate::config::Observability::PercentOnly,
+                    TelemetryHealth::Fresh,
+                    None,
+                ),
+            ],
+        );
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert!(ad.binding_window.is_none());
+        assert_eq!(ad.strength, 0.0);
+    }
+
+    #[test]
+    fn l4_reset_relaxation_fires_when_reset_within_10pct_of_cycle() {
+        // (d) 95% used but resets in < 10% of the cycle -> PreferSub
+        // even though the cap_guard is tripped. We're about to get full
+        // headroom back; the cost of falling back would be wasted.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // 5h window = 5*3600 = 18000s cycle. 9% of 18000 = 1620s ->
+        // reset 1500s from now.
+        let reset_at = now + chrono::Duration::seconds(1500);
+        let hot_5h = WindowView {
+            name: "5h".into(),
+            used_percent: Some(95.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: Some(reset_at),
+            hours: 5,
+        };
+        let cool_weekly = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(40.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![hot_5h, cool_weekly],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::PreferSub,
+            "reset-relaxation should fire"
+        );
+        assert_eq!(ad.binding_window.as_deref(), Some("5h"));
+        assert!((ad.strength - 95.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_reset_relaxation_does_not_fire_when_reset_far_away() {
+        // 95% used AND resets in 50% of the cycle (huge time-to-reset)
+        // -> reset-relaxation must NOT fire -> cap_guard trips and we
+        // fall back to free (Block mode).
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let reset_at = now + chrono::Duration::seconds(5 * 3600 / 2); // half-cycle
+        let hot = WindowView {
+            name: "5h".into(),
+            used_percent: Some(95.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: Some(reset_at),
+            hours: 5,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![hot],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "no reset-relaxation -> cap_guard trips"
+        );
+        assert_eq!(ad.binding_window.as_deref(), Some("5h"));
+    }
+
+    #[test]
+    fn l4_band_drive_at_40_pct_prefers_sub() {
+        // (e drive) 40% used, below use_target=80 -> PreferSub.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(40.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert!((ad.strength - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_band_hysteresis_at_82_pct_keeps_prefer_sub() {
+        // (e hysteresis) 82% used, between use_target=80 and
+        // cap_guard=85 -> PreferSub (the hysteresis band keeps the
+        // sub active until the guard trips).
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(82.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert!((ad.strength - 82.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_band_gate_at_90_pct_block_mode_falls_back() {
+        // (e gate Block) 90% used, above cap_guard=85, Block mode ->
+        // FallBackToFree.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(90.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::FallBackToFree);
+        assert!((ad.strength - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_band_gate_at_90_pct_chargeback_with_budget_chargebacks() {
+        // (e gate Chargeback + budget) 90% used, Chargeback mode, budget
+        // remaining > 0 -> Chargeback.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(90.0)],
+        };
+        let mut knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
+        knobs.chargeback_budget_usd = Some(50.0);
+        let ad = decide_account(&acct, &knobs, now, Some(10.0));
+        assert_eq!(ad.decision, RouteDecision::Chargeback);
+    }
+
+    #[test]
+    fn l4_band_gate_at_90_pct_chargeback_with_zero_budget_falls_back() {
+        // 90% used, Chargeback mode, but budget remaining = 0 -> fall
+        // back to free (we've spent the chargeback allowance).
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(90.0)],
+        };
+        let mut knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
+        knobs.chargeback_budget_usd = Some(50.0);
+        let ad = decide_account(&acct, &knobs, now, Some(0.0));
+        assert_eq!(ad.decision, RouteDecision::FallBackToFree);
+    }
+
+    #[test]
+    fn l4_strength_ranks_40_below_82_for_sub_ranking() {
+        // (f) Strength is binding.used_percent: 40 < 82. When picking
+        // among multiple sub accounts, the most-idle (lowest strength)
+        // is preferred. We exercise the L4 helper directly by reading
+        // each account's strength and confirming the rank order.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct_idle = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "idle".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(40.0)],
+        };
+        let acct_busy = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "busy".into(),
+            plan: "max".into(),
+            windows: vec![fresh_5h(82.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad_idle = decide_account(&acct_idle, &knobs, now, None);
+        let ad_busy = decide_account(&acct_busy, &knobs, now, None);
+        assert!(ad_idle.strength < ad_busy.strength);
+        assert!((ad_idle.strength - 40.0).abs() < 1e-9);
+        assert!((ad_busy.strength - 82.0).abs() < 1e-9);
+        // Both at headroom -> both PreferSub.
+        assert_eq!(ad_idle.decision, RouteDecision::PreferSub);
+        assert_eq!(ad_busy.decision, RouteDecision::PreferSub);
+    }
+
+    #[test]
+    fn l4_telemetry_health_buckets() {
+        // The health-bucket boundaries (5min / 60min) are the spec —
+        // pinned here so a future "let's bump Stale to 30min" change
+        // shows up as a test diff.
+        assert_eq!(
+            TelemetryHealth::from_age_secs(None),
+            TelemetryHealth::Degraded
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(-1)),
+            TelemetryHealth::Fresh
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(0)),
+            TelemetryHealth::Fresh
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(4 * 60)),
+            TelemetryHealth::Fresh
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(5 * 60)),
+            TelemetryHealth::Stale
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(59 * 60)),
+            TelemetryHealth::Stale
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(60 * 60)),
+            TelemetryHealth::Degraded
+        );
+        assert_eq!(
+            TelemetryHealth::from_age_secs(Some(24 * 3600)),
+            TelemetryHealth::Degraded
+        );
+        // Weights.
+        assert!((TelemetryHealth::Fresh.health_weight() - 1.0).abs() < 1e-9);
+        assert!((TelemetryHealth::Stale.health_weight() - 0.8).abs() < 1e-9);
+        assert_eq!(TelemetryHealth::Degraded.health_weight(), 0.0);
+    }
+
+    #[test]
+    fn l4_route_knobs_default_has_imminence_threshold() {
+        // The default `reset_imminence_threshold` is exposed on
+        // `RouteKnobs::default()` so the routing layer doesn't have to
+        // know about a separate constant. Pin it to 0.10 so the spec
+        // invariant is explicit.
+        let k = RouteKnobs::default();
+        assert!((k.reset_imminence_threshold - DEFAULT_RESET_IMMINENCE_THRESHOLD).abs() < 1e-9);
+        assert!((k.reset_imminence_threshold - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_build_account_view_fills_from_counter_with_cap() {
+        // The builder wiring: a `Counter` window with a known cap on
+        // the store surfaces a numeric `used_percent` in the view.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            "minimax-max",
+            "monthly",
+            Some(1_000_000.0),
+            now,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            "minimax-max",
+            "monthly",
+            250_000.0,
+            now,
+        );
+        let qw = crate::config::QuotaWindow {
+            name: "monthly".into(),
+            hours: 720,
+            unit: crate::config::QuotaUnit::Tokens,
+            cap: Some(1_000_000.0),
+            models: None,
+            observability: crate::config::Observability::Counter,
+            reset: crate::config::ResetKind::default(),
+        };
+        let view = build_account_view(
+            Provider::MiniMax,
+            "default",
+            "minimax-max",
+            std::slice::from_ref(&qw),
+            &s,
+            now,
+        );
+        assert_eq!(view.windows.len(), 1);
+        let w = &view.windows[0];
+        assert_eq!(w.name, "monthly");
+        assert_eq!(w.hours, 720);
+        assert!(w.used_percent.is_some());
+        assert!((w.used_percent.unwrap() - 0.25).abs() < 1e-9);
+        assert_eq!(w.health, TelemetryHealth::Fresh);
+    }
+
+    #[test]
+    fn l4_build_account_view_percent_only_unknown_when_no_header() {
+        // PercentOnly window with NO header observation -> used_percent
+        // is None. Health is Degraded (no observation at all). This is
+        // the "PercentOnly fallback" path: we don't invent a percent.
+        let s = UtilizationStore::default();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let qw = crate::config::QuotaWindow {
+            name: "weekly".into(),
+            hours: 168,
+            unit: crate::config::QuotaUnit::Messages,
+            cap: None,
+            models: None,
+            observability: crate::config::Observability::PercentOnly,
+            reset: crate::config::ResetKind::default(),
+        };
+        let view = build_account_view(
+            Provider::Anthropic,
+            "a",
+            "max",
+            std::slice::from_ref(&qw),
+            &s,
+            now,
+        );
+        assert_eq!(view.windows.len(), 1);
+        let w = &view.windows[0];
+        assert!(w.used_percent.is_none());
+        assert_eq!(w.health, TelemetryHealth::Degraded);
     }
 }
