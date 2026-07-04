@@ -261,6 +261,58 @@ pub struct Config {
     /// default (no caps). See [`crate::budget::Budget`].
     #[serde(default)]
     pub budget: crate::budget::Budget,
+    /// Routing scenario preference layer. The operator picks one of the four
+    /// built-in presets with `[routing].scenario` (default `balanced`); an
+    /// advanced user may override any preset under `[routing.scenarios.<name>]`.
+    /// Absent altogether => balanced defaults applied at load time
+    /// (`RoutingConfig::active()`), preserving the legacy free-only behavior.
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+/// Routing-scenario block from `config.json` / an overlay TOML. Mirrors the
+/// `[routing]` table; the actual scenario data lives in `scenarios`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Active scenario name (e.g. `economy`, `balanced`, `aggressive`,
+    /// `unlimited`). Defaults to `balanced`; an unknown name is a graceful
+    /// no-op (still resolves to `balanced`) so a typo doesn't break routing.
+    #[serde(default = "default_scenario_name")]
+    pub scenario: String,
+    /// Per-scenario overrides (fields omitted fall through to the preset).
+    /// The map keys are the preset names (`economy`, `balanced`, ...).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scenarios: BTreeMap<String, crate::scenarios::RouteScenario>,
+}
+
+fn default_scenario_name() -> String {
+    "balanced".into()
+}
+
+impl Default for RoutingConfig {
+    /// `RoutingConfig::default()` is the *absent* `[routing]` block — it
+    /// must behave exactly as if the operator had typed
+    /// `[routing]\nscenario = "balanced"` so a config-less host enjoys
+    /// the legacy free-only default without any explicit declaration.
+    fn default() -> Self {
+        Self {
+            scenario: default_scenario_name(),
+            scenarios: BTreeMap::new(),
+        }
+    }
+}
+
+impl RoutingConfig {
+    /// Resolve the currently-active scenario by name, layering any operator
+    /// override on top of the matching preset. Falls back to `balanced` for
+    /// an unknown name. Backward compatible: when the `[routing]` block is
+    /// absent the default-constructed `RoutingConfig` already names
+    /// `balanced`, so existing hosts behave exactly like a `balanced`-set
+    /// host with no overrides.
+    pub fn active(&self) -> crate::scenarios::RouteScenario {
+        let ovr = self.scenarios.get(&self.scenario);
+        crate::scenarios::resolve_active(&self.scenario, ovr)
+    }
 }
 
 fn default_free_hosts() -> Vec<String> {
@@ -466,6 +518,7 @@ impl Config {
             theme: Theme::default(),
             primary_model: None,
             budget: crate::budget::Budget::default(),
+            routing: RoutingConfig::default(),
         }
     }
 

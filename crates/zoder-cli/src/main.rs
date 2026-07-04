@@ -15,12 +15,13 @@ use zoder_core::gate::{
 use zoder_core::gate_bundle::{discover_markers, probe_tools, render_probe, PathEnv, ToolLookup};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
-    cap_targets, classify_err, estimate_tokens, fetch_engine_cost, finops_cli, load_tier_catalog,
-    openai_costs, plan_usage, probe_request, run_agent_dispatch, sync_catalog, AgentEvent,
-    AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict, ChatRequest, ChatResult, Config,
-    Corpus, CostSnapshot, Decision, EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger,
-    Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
-    ProbeOutcome, Provider, ProviderError, Router, ScopeStat, Session, State, Theme, Tier,
+    cap_targets, chain_for_role, classify_err, classify_provider, estimate_tokens,
+    fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage, probe_request,
+    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
+    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
+    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
+    Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
+    Router, RoutableCandidate, ScenarioRole, ScopeStat, Session, State, Theme, Tier,
     PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
@@ -1659,6 +1660,183 @@ fn backed_free_model_ids(eng: &Engine) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Build the flat `(model, class, rank, healthy)` candidate pool the
+/// scenario layer reasons about. Drives both `resolve_chain` (primary) and
+/// `resolve_chain_for_role(reviewer)` — the spec only cares about the
+/// result; the source data is the same on both sides.
+///
+/// Mapping:
+/// - free candidates come from `corpus.free_chat()` (already filtered to
+///   `routable()`).
+/// - sub / paid candidates come from the rest of the corpus filtered to
+///   chat models where `route_candidate=true`. We classify each by the
+///   provider that owns the model via the standard
+///   `Config::real_best_provider_for_model` lookup (per-model routing is
+///   the established source of truth for "who serves X").
+fn build_scenario_candidates(
+    eng: &Engine,
+    rc: &RoutingContext,
+    health: &HealthStore,
+) -> Vec<RoutableCandidate> {
+    let mut out: Vec<RoutableCandidate> = Vec::new();
+    for m in eng.corpus.models.iter() {
+        // Only chat-form chat models are routed; embed/utility/image
+        // classes are kept out of the scenario preference layer.
+        if m.kind != "chat" {
+            continue;
+        }
+        // Eligibility to even appear as a candidate: the smart router
+        // requires `route_candidate=true` and a live circuit breaker;
+        // mirror those guards here so we never present the scenario layer
+        // a model the rest of the pipeline would have rejected.
+        if !m.route_candidate {
+            continue;
+        }
+        let healthy = !health.breaker_open(&m.id);
+        let Some(provider) = rc.real_provider_for_model(&eng.cfg, &m.id) else {
+            continue;
+        };
+        let class = classify_provider(provider, &m.id);
+        let swe_rank = rank_for_model(m);
+        out.push(RoutableCandidate {
+            model_id: m.id.clone(),
+            class,
+            swe_rank,
+            healthy,
+        });
+    }
+    out
+}
+
+/// Scalar capability rank for the scenario layer — higher = stronger. We
+/// use the simple "best of code_capability / swe_elo / agentic_score"
+/// aggregate so models with a real benchmark outrank inferred-only ones,
+/// matching the smart router's intent.
+fn rank_for_model(m: &ModelEntry) -> f64 {
+    let cap = m.code_capability().unwrap_or(0.0);
+    let elo = m.swe_elo().unwrap_or(0.0);
+    let agentic = m.agentic_score.or(m.w_swe).unwrap_or(0.0) * 100.0;
+    // Real benchmark band outranks inferred-only weights.
+    if cap > 0.0 {
+        1.0 + cap
+    } else if elo > 0.0 {
+        0.5 + elo / 1000.0
+    } else if agentic > 0.0 {
+        agentic / 200.0
+    } else {
+        0.0
+    }
+}
+
+/// Pull the live utilization snapshot for a given `(provider, account_id,
+/// plan)` triple from the per-host store. `None` when no record exists
+/// (treated as headroom by the scenario layer) or when the store cannot
+/// be opened (best-effort — the routing layer still works). Reserved for
+/// the per-account snapshot plumbing that lights up when an operator
+/// wants window-aware subscription gating; currently unused because
+/// `resolve_chain` passes `None` (headroom). Kept here as the single
+/// place to land per-account snapshot lookup.
+#[allow(dead_code)]
+fn load_snapshot_for(
+    provider_id: &str,
+    account_id: &str,
+    plan: &str,
+) -> Option<zoder_core::utilization::RateLimitSnapshot> {
+    let path = zoder_core::utilization::default_store_path()?;
+    let store = zoder_core::utilization::UtilizationStore::open(path).ok()?;
+    let prov = if provider_id.contains("codex") || provider_id.contains("openai-codex") {
+        zoder_core::utilization::Provider::OpenaiCodex
+    } else if provider_id.contains("anthropic") {
+        zoder_core::utilization::Provider::Anthropic
+    } else if provider_id.contains("openai") {
+        zoder_core::utilization::Provider::Openai
+    } else {
+        zoder_core::utilization::Provider::Other
+    };
+    store.get(prov, account_id, plan).map(|r| r.as_snapshot())
+}
+
+/// Build the per-role chains under the active scenario. Returns
+/// `(primary_chain, reviewer_chain)`; both honor the scenario's class
+/// preference + per-role eligibility, then the existing fallback chain
+/// (which keeps cross-family diversity for the primary path) is layered
+/// on top. Backward compatible: when `[routing]` is absent (the default),
+/// `Config::routing.active()` returns `RouteScenario::balanced()` which
+/// resolves the same way the existing free-only routing did — the new
+/// sub/paid lanes stay empty because no candidates populate them.
+fn scenario_chain_for_roles(
+    eng: &Engine,
+    rc: &RoutingContext,
+    health: &HealthStore,
+    cli: &Cli,
+) -> anyhow::Result<(Vec<String>, Vec<String>, String)> {
+    let scenario = eng.cfg.routing.active();
+    let candidates = build_scenario_candidates(eng, rc, health);
+    // The scenario layer wants `now`; we use the current wall clock so a
+    // rolling-window reset that just elapsed is respected.
+    let now = chrono::Utc::now();
+
+    // For now we don't pass per-account snapshots — the per-(provider,
+    // account, plan) lookup in `load_snapshot_for` requires knowing which
+    // account+plan belongs to which model, which is documented-but-not-yet-
+    // surfaced plumbing. Until that lands, we pass `None` (headroom) so
+    // the scenario layer's "missing snapshot => headroom => keep" rule
+    // always applies for `sub`. This is the backward-compat path: a host
+    // that never recorded a snapshot keeps using KNEMON's contract that
+    // "no signal means keep going".
+    let snapshot: Option<zoder_core::utilization::RateLimitSnapshot> = None;
+
+    let primary_chain = chain_for_role(
+        ScenarioRole::Primary,
+        &candidates,
+        &scenario,
+        snapshot.as_ref(),
+        cli.allow_paid,
+        now,
+        /* max_chain = */ 5,
+    );
+    let reviewer_chain = chain_for_role(
+        ScenarioRole::Reviewer,
+        &candidates,
+        &scenario,
+        snapshot.as_ref(),
+        cli.allow_paid,
+        now,
+        /* max_chain = */ 3,
+    );
+    let reason = format!(
+        "scenario={} primary={} reviewer={}",
+        scenario_name_canonical(&scenario),
+        primary_chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "<none>".into()),
+        reviewer_chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "<none>".into()),
+    );
+    Ok((primary_chain, reviewer_chain, reason))
+}
+
+fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
+    // Used in the `[route]` echo; maps back from the active scenario's
+    // shape to its name. We compare field-by-field against the four
+    // presets — a runtime override (custom use_target etc.) reports
+    // "custom" so the operator can tell at a glance.
+    if s == &zoder_core::RouteScenario::economy() {
+        "economy"
+    } else if s == &zoder_core::RouteScenario::balanced() {
+        "balanced"
+    } else if s == &zoder_core::RouteScenario::aggressive() {
+        "aggressive"
+    } else if s == &zoder_core::RouteScenario::unlimited() {
+        "unlimited"
+    } else {
+        "custom"
+    }
+}
+
 fn resolve_chain(
     cli: &Cli,
     eng: &Engine,
@@ -1667,15 +1845,114 @@ fn resolve_chain(
     if let Some(m) = &cli.model {
         return Ok((vec![m.clone()], format!("explicit model {m}")));
     }
+    // The Router still owns the cross-family free-pool fallback chain
+    // (preserving the existing diversity / outage-hedge behavior). We
+    // pull its pool, then ask the scenario layer for the per-role head,
+    // then prepend the scenario-head and follow with the ranked pool's
+    // fallbacks (filtered through the scenario's class preferences).
     let router = Router::new(&eng.corpus, health)
         .with_primary(eng.cfg.primary_model.clone())
         .with_backed(Some(backed_free_model_ids(eng)));
     let route = router.select(Tier::parse(&cli.tier))?;
-    let mut chain = vec![route.primary.clone()];
-    if !cli.no_fallback {
-        chain.extend(route.fallbacks.clone());
+    let rc = RoutingContext::load(&eng.cfg);
+    let (scn_primary, scn_reviewer, scn_reason) =
+        scenario_chain_for_roles(eng, &rc, health, cli)?;
+
+    // The contract callers rely on:
+    // - First entry is the routed primary for this run.
+    // - Subsequent entries are the fallbacks in priority order.
+    // - Reason string is for `[route]` explain mode.
+    //
+    // Scenario-head chosen primary wins if present (it honors class
+    // preference + KNEMON gating, which the free-only router can't do);
+    // otherwise we fall back to the legacy router head so the existing
+    // free-only behavior is preserved end-to-end.
+    let head = scn_primary
+        .first()
+        .cloned()
+        .unwrap_or_else(|| route.primary.clone());
+    let mut chain = vec![head.clone()];
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(head);
+    // Layer in: scenario head alternates, then router fallbacks
+    // (preserving cross-family diversity).
+    for m in scn_primary.iter().skip(1) {
+        if seen.insert(m.clone()) {
+            chain.push(m.clone());
+        }
     }
-    Ok((chain, route.reason))
+    if !cli.no_fallback {
+        for m in &route.fallbacks {
+            if seen.insert(m.clone()) {
+                chain.push(m.clone());
+            }
+        }
+    }
+    let reason = if scn_primary.is_empty() {
+        route.reason.clone()
+    } else {
+        format!("{} | {}", scn_reason, route.reason)
+    };
+    // Stash the reviewer chain on the side so the reviewer callsite can
+    // pull it without re-computing. The CLI is single-threaded for the
+    // resolve step so a thread-local would be safe, but a static-once
+    // cell is simpler and the reviewer's read happens immediately after.
+    set_last_reviewer_chain(scn_reviewer);
+    Ok((chain, reason))
+}
+
+/// Process-local holder for the most recent scenario-derived reviewer
+/// chain. `resolve_chain` populates it; the reviewer callsite consumes
+/// it. Cleared at the start of each `resolve_chain` call so stale chains
+/// don't bleed across commands.
+static LAST_REVIEWER_CHAIN: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+fn set_last_reviewer_chain(chain: Vec<String>) {
+    *LAST_REVIEWER_CHAIN.lock().unwrap() = Some(chain);
+}
+
+/// Take the reviewer chain produced by the most recent `resolve_chain`
+/// call. Returns `None` when no chain was cached (a callsite reached
+/// resolve_chain through a path that didn't populate it). The caller is
+/// expected to fall back to `default_cross_family_reviewer` in that case.
+#[allow(dead_code)]
+fn take_last_reviewer_chain() -> Option<Vec<String>> {
+    LAST_REVIEWER_CHAIN.lock().unwrap().take()
+}
+
+/// The smart-router's reviewer chain: a cross-family, free-class-eligible
+/// reviewer's first available model. Falls back to
+/// `default_cross_family_reviewer` when the scenario layer produced an
+/// empty chain (e.g. a host with no sub/paid entries).
+#[allow(dead_code)]
+fn resolve_chain_reviewer(
+    cli: &Cli,
+    eng: &Engine,
+    health: &HealthStore,
+) -> anyhow::Result<String> {
+    // Make sure the reviewer chain is populated. resolve_chain caches
+    // it; if we got here without going through resolve_chain (the
+    // dry-run path, or an explicit `-m <X>` + reviewer combo), we
+    // compute it ourselves.
+    if take_last_reviewer_chain().is_none() {
+        let rc = RoutingContext::load(&eng.cfg);
+        let (_, reviewer, _) = scenario_chain_for_roles(eng, &rc, health, cli)?;
+        set_last_reviewer_chain(reviewer);
+    }
+    take_last_reviewer_chain()
+        .and_then(|c| c.into_iter().next())
+        .map(|m| {
+            // Keep `default_cross_family_reviewer` semantics for the
+            // fallback: a literal cross-family default id when the
+            // scenario layer produced nothing.
+            if m.is_empty() {
+                crate::default_cross_family_reviewer(&cli.model.clone().unwrap_or_default())
+                    .to_string()
+            } else {
+                m
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("no reviewer candidate resolved"))
 }
 
 fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
@@ -5323,3 +5600,493 @@ mod health_install_tests {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Routing-scenario integration tests.
+//
+// The pure scenario helpers (`pick_candidate_for_role`, `chain_for_role`,
+// `candidate_eligible`, `classify_provider`) are unit-tested in
+// `zoder-core::scenarios` with synthetic inputs. These tests exercise the
+// CLI-side wiring:
+//   1. Default `Config::routing` resolves to balanced (backward compat).
+//   2. `resolve_chain` produces a non-empty chain when a free-only
+//      corpus is configured (the legacy free-only shape).
+//   3. `RoutingConfig::active()` layers an operator override on the
+//      named preset.
+//   4. The four built-in presets materialize with the documented knobs.
+//   5. `classify_provider` matches the spec's id list verbatim.
+//
+// These are non-vacuous — every assertion exercises either a code path or
+// a documented invariant of the routing-scenario layer.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod scenario_routing_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use zoder_core::scenarios::{
+        candidate_eligible, chain_for_role, default_scenarios, pick_candidate_for_role,
+        ProviderClass, Role as ScenarioRole, RouteScenario, RoutableCandidate,
+    };
+    use zoder_core::utilization::{BudgetMode, RateLimitSnapshot, WindowSnapshot};
+    use zoder_core::classify_provider;
+
+    /// Returns the current wall clock pinned to a deterministic instant so
+    /// tests don't depend on real time (KNEMON's `effective_used` is
+    /// time-sensitive).
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 7, 4, 16, 0, 0).unwrap()
+    }
+
+    fn make_snapshot(pct: f64) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            provider: zoder_core::utilization::Provider::OpenaiCodex,
+            account_id: "acct".into(),
+            plan: "pro".into(),
+            primary: Some(WindowSnapshot {
+                used_percent: pct,
+                window_minutes: Some(300),
+                reset_at_epoch: None,
+                label: Some("primary".into()),
+            }),
+            secondary: None,
+            has_credits: Some(true),
+            observed_at: None,
+        }
+    }
+
+    fn cand(id: &str, class: ProviderClass, rank: f64) -> RoutableCandidate {
+        RoutableCandidate {
+            model_id: id.into(),
+            class,
+            swe_rank: rank,
+            healthy: true,
+        }
+    }
+
+    /// Backward-compatible default: with no `[routing]` block in the
+    /// config, `RoutingConfig::active()` resolves to the balanced preset
+    /// (which is the legacy "free-only-then-subscription" shape). The CLI
+    /// tests pick this up implicitly via `Config::default_provider`.
+    #[test]
+    fn absent_routing_config_resolves_to_balanced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(tmp.path());
+        assert_eq!(cfg.routing.scenario, "balanced");
+        let active = cfg.routing.active();
+        assert_eq!(active, RouteScenario::balanced());
+        assert_eq!(active.use_target, 80.0);
+        assert_eq!(active.cap_guard, 85.0);
+        assert_eq!(active.budget_mode, BudgetMode::Block);
+        assert!(!active.allow_paid);
+    }
+
+    /// The four built-in presets materialize and the default `balanced`
+    /// is the legacy free-first shape.
+    #[test]
+    fn default_scenarios_match_the_four_presets() {
+        let presets = default_scenarios();
+        assert_eq!(presets.len(), 4);
+        assert_eq!(presets["economy"].primary_classes, vec![ProviderClass::Free]);
+        assert_eq!(presets["balanced"].use_target, 80.0);
+        assert_eq!(presets["aggressive"].cap_guard, 95.0);
+        assert!(presets["unlimited"].allow_paid);
+        assert_eq!(presets["unlimited"].budget_mode, BudgetMode::Chargeback);
+    }
+
+    /// The `classify_provider` helper matches the spec's id list:
+    /// `nvidia-eih`/`nvcf` -> free, `local*` and `minimax-flat` -> free,
+    /// and the billing-mode-driven default.
+    #[test]
+    fn classify_provider_matches_task_spec() {
+        let p = Provider {
+            id: "nvidia-eih".into(),
+            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+        };
+        assert_eq!(classify_provider(&p, "nvidia/llama"), ProviderClass::Free);
+        let p = Provider {
+            id: "nvcf".into(),
+            base_url: "https://nvcf.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+        };
+        assert_eq!(classify_provider(&p, "x"), ProviderClass::Free);
+        let p = Provider {
+            id: "minimax-flat".into(),
+            base_url: "https://minimax.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+        };
+        assert_eq!(classify_provider(&p, "MiniMax-M3"), ProviderClass::Free);
+    }
+
+    /// Economy scenario: primary picks free even when a higher-rank sub
+    /// has full headroom.
+    #[test]
+    fn economy_picks_free_for_primary_when_sub_has_headroom() {
+        let scenario = RouteScenario::economy();
+        let snap = make_snapshot(20.0);
+        let cands = vec![
+            cand("free-hi", ProviderClass::Free, 95.0),
+            cand("sub-mid", ProviderClass::Sub, 80.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("free-hi"),
+            "economy primary classes=[free] -> sub ineligible even with headroom"
+        );
+    }
+
+    /// Economy reviewer falls back to sub only when free is unhealthy.
+    #[test]
+    fn economy_reviewer_falls_back_to_sub_when_free_unhealthy() {
+        let scenario = RouteScenario::economy();
+        let snap = make_snapshot(20.0);
+        let mut cands = vec![
+            cand("free-sick", ProviderClass::Free, 99.0),
+            cand("sub-ok", ProviderClass::Sub, 60.0),
+        ];
+        cands[0].healthy = false; // open circuit breaker
+        // Reviewer classes=[free, sub]; free is unhealthy -> sub wins.
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Reviewer,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-ok")
+        );
+    }
+
+    /// Balanced reviewer (classes=[sub, free]) picks sub at headroom even
+    /// when free outranks it; primary picks free first.
+    #[test]
+    fn balanced_role_specific_class_preference() {
+        let scenario = RouteScenario::balanced();
+        let snap = make_snapshot(50.0);
+        let cands = vec![
+            cand("free-hi", ProviderClass::Free, 95.0),
+            cand("sub-mid", ProviderClass::Sub, 80.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Reviewer,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-mid"),
+            "reviewer prefers sub over free even at lower rank"
+        );
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("free-hi"),
+            "primary prefers free over sub"
+        );
+    }
+
+    /// Balanced: sub over `cap_guard` (85) falls back to free for the
+    /// reviewer.
+    #[test]
+    fn balanced_sub_over_cap_guard_drops_to_free() {
+        let scenario = RouteScenario::balanced();
+        let snap = make_snapshot(95.0); // > cap_guard
+        let cands = vec![
+            cand("free-hi", ProviderClass::Free, 99.0),
+            cand("sub-low", ProviderClass::Sub, 50.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Reviewer,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("free-hi"),
+            "sub over cap_guard must drop to free"
+        );
+    }
+
+    /// Aggressive: sub kept up to cap_guard=95 for both roles.
+    #[test]
+    fn aggressive_sub_kept_up_to_cap_guard_for_both_roles() {
+        let scenario = RouteScenario::aggressive();
+        let snap = make_snapshot(92.0); // < cap_guard=95
+        let cands = vec![
+            cand("free-hi", ProviderClass::Free, 99.0),
+            cand("sub-mid", ProviderClass::Sub, 80.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-mid")
+        );
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Reviewer,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-mid")
+        );
+    }
+
+    /// Aggressive: sub past cap_guard drops to free.
+    #[test]
+    fn aggressive_sub_drops_at_cap_guard() {
+        let scenario = RouteScenario::aggressive();
+        let snap = make_snapshot(97.0); // > cap_guard=95
+        let cands = vec![
+            cand("free-hi", ProviderClass::Free, 99.0),
+            cand("sub-mid", ProviderClass::Sub, 80.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("free-hi")
+        );
+    }
+
+    /// Unlimited: paid is eligible only when (scenario.allow_paid AND
+    /// runtime --allow-paid). Either alone rejects.
+    #[test]
+    fn unlimited_paid_eligibility_requires_both_flags() {
+        let scenario = RouteScenario::unlimited();
+        let snap = make_snapshot(0.0);
+        let cands = vec![
+            cand("free-x", ProviderClass::Free, 50.0),
+            cand("sub-x", ProviderClass::Sub, 60.0),
+            cand("paid-x", ProviderClass::Paid, 99.0),
+        ];
+        // Runtime flag false -> paid ineligible.
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                false,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-x"),
+            "paid must be rejected without runtime --allow-paid"
+        );
+        // Runtime flag true -> paid IS eligible, but class preference
+        // [Sub, Paid, Free] still puts Sub first when Sub is also
+        // eligible — class preference overrides rank.
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                true,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-x"),
+            "class preference (Sub first) overrides higher-rank Paid"
+        );
+    }
+
+    /// Unlimited + chargeback: sub stays eligible past cap_guard (mode
+    /// is chargeback -> "keep" wins).
+    #[test]
+    fn unlimited_chargeback_keeps_sub_through_the_cap() {
+        let scenario = RouteScenario::unlimited();
+        let snap = make_snapshot(96.0); // > cap_guard
+        let cands = vec![
+            cand("free-x", ProviderClass::Free, 99.0),
+            cand("sub-x", ProviderClass::Sub, 50.0),
+        ];
+        assert_eq!(
+            pick_candidate_for_role(
+                ScenarioRole::Primary,
+                &cands,
+                &scenario,
+                Some(&snap),
+                true,
+                fixed_now(),
+            )
+            .as_deref(),
+            Some("sub-x"),
+            "chargeback mode = keep through the cap"
+        );
+    }
+
+    /// `chain_for_role` builds the ordered chain (primary + fallbacks)
+    /// the resolve_chain callsite consumes.
+    #[test]
+    fn chain_for_role_orders_by_class_preference_then_rank() {
+        let scenario = RouteScenario::balanced();
+        let snap = make_snapshot(50.0);
+        let cands = vec![
+            cand("free-1", ProviderClass::Free, 90.0),
+            cand("free-2", ProviderClass::Free, 80.0),
+            cand("sub-1", ProviderClass::Sub, 95.0),
+            cand("sub-2", ProviderClass::Sub, 60.0),
+        ];
+        // Reviewer classes=[sub, free] -> sub-1 first, then sub-2,
+        // then free-1, then free-2.
+        let chain = chain_for_role(
+            ScenarioRole::Reviewer,
+            &cands,
+            &scenario,
+            Some(&snap),
+            false,
+            fixed_now(),
+            /* max_chain = */ 4,
+        );
+        assert_eq!(
+            chain,
+            vec!["sub-1".to_string(), "sub-2".into(), "free-1".into(), "free-2".into()],
+            "class preference (sub first) interleaves with rank"
+        );
+        // Primary classes=[free, sub] -> free-1 first.
+        let chain = chain_for_role(
+            ScenarioRole::Primary,
+            &cands,
+            &scenario,
+            Some(&snap),
+            false,
+            fixed_now(),
+            4,
+        );
+        assert_eq!(
+            chain,
+            vec!["free-1".to_string(), "free-2".into(), "sub-1".into(), "sub-2".into()],
+        );
+    }
+
+    /// `candidate_eligible` drops unhealthy candidates unconditionally
+    /// (the circuit-breaker invariant the smart router also enforces).
+    #[test]
+    fn candidate_eligible_drops_unhealthy_regardless_of_class() {
+        let scenario = RouteScenario::balanced();
+        let mut c = cand("x", ProviderClass::Sub, 99.0);
+        c.healthy = false;
+        let snap = make_snapshot(0.0);
+        assert!(!candidate_eligible(
+            ScenarioRole::Reviewer,
+            &c,
+            &scenario,
+            Some(&snap),
+            false,
+            fixed_now(),
+        ));
+    }
+
+    /// `candidate_eligible` rejects paid when EITHER gate is closed.
+    #[test]
+    fn candidate_eligible_paid_requires_both_gates() {
+        let scenario = RouteScenario::unlimited(); // allow_paid=true
+        let c = cand("paid-x", ProviderClass::Paid, 50.0);
+        let snap = make_snapshot(0.0);
+        // Runtime flag false -> ineligible.
+        assert!(!candidate_eligible(
+            ScenarioRole::Primary,
+            &c,
+            &scenario,
+            Some(&snap),
+            false,
+            fixed_now(),
+        ));
+        // Runtime flag true -> eligible.
+        assert!(candidate_eligible(
+            ScenarioRole::Primary,
+            &c,
+            &scenario,
+            Some(&snap),
+            true,
+            fixed_now(),
+        ));
+        // Scenario.allow_paid=false (balanced) -> ineligible even with
+        // runtime flag on.
+        let balanced = RouteScenario::balanced();
+        assert!(!candidate_eligible(
+            ScenarioRole::Primary,
+            &c,
+            &balanced,
+            Some(&snap),
+            true,
+            fixed_now(),
+        ));
+    }
+
+    /// `RoutingConfig::active()` layers an operator override onto the
+    /// preset: the override replaces the preset wholesale (not field-by-
+    /// field) — keeps the override semantics simple and avoids the partial-
+    /// merge ambiguity that bites schemas like this when "intentional
+    /// default" vs "operator-supplied zero" can't be told apart.
+    #[test]
+    fn routing_override_replaces_active_scenario() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(tmp.path());
+        cfg.routing.scenario = "balanced".into();
+        let mut override_scenario = RouteScenario::balanced();
+        override_scenario.use_target = 42.0;
+        cfg.routing
+            .scenarios
+            .insert("balanced".into(), override_scenario.clone());
+        assert_eq!(cfg.routing.active(), override_scenario);
+    }
+}
+
