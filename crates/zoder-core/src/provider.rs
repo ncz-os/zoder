@@ -318,6 +318,15 @@ pub struct OpenAiProvider {
     /// for bearer styles, or a custom `api-key`-style header for enterprise
     /// gateways. `None` when the provider needs no credential.
     auth_header: Option<(String, String)>,
+    /// Provider id from the config (e.g. `"minimax"`). Used by the
+    /// counter-fed utilization wire-up to decide whether a response
+    /// belongs to a MiniMax provider (which publishes no rate-limit
+    /// headers, so its usage has to be counted locally).
+    provider_id: String,
+    /// Plan label used as the `plan` key in the utilization store. The
+    /// catalog tier when the provider has a `subscription.tier`; the
+    /// provider id otherwise. Always set so the store key is stable.
+    plan_label: String,
     client: reqwest::Client,
     request_timeout: Duration,
     idle_timeout: Duration,
@@ -325,10 +334,17 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(p: &Provider) -> anyhow::Result<Self> {
+        let plan_label = p
+            .subscription
+            .as_ref()
+            .and_then(|s| s.tier.clone())
+            .unwrap_or_else(|| p.id.clone());
         Ok(Self {
             base_url: p.base_url.trim_end_matches('/').to_string(),
             kind: p.kind.clone(),
             auth_header: p.auth.header_pair(),
+            provider_id: p.id.clone(),
+            plan_label,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -481,9 +497,32 @@ impl OpenAiProvider {
             });
         }
         if req.stream {
-            self.consume_stream(req, resp, telemetry, sink).await
+            let r = self.consume_stream(req, resp, telemetry, sink).await?;
+            // Counter-fed KNEMON capture (Layer 3B) runs after the body
+            // is consumed so we have prompt+completion to count. The
+            // header-fed capture above already ran on the response
+            // headers; for MiniMax that path is a clean no-op, so this
+            // is the only signal that provider contributes. Best-effort.
+            capture_counter_usage(
+                &self.provider_id,
+                &self.base_url,
+                &self.plan_label,
+                r.prompt_tokens,
+                r.completion_tokens,
+                chrono::Utc::now(),
+            );
+            Ok(r)
         } else {
-            self.consume_full(req, resp, telemetry, sink).await
+            let r = self.consume_full(req, resp, telemetry, sink).await?;
+            capture_counter_usage(
+                &self.provider_id,
+                &self.base_url,
+                &self.plan_label,
+                r.prompt_tokens,
+                r.completion_tokens,
+                chrono::Utc::now(),
+            );
+            Ok(r)
         }
     }
 
@@ -706,8 +745,9 @@ impl OpenAiProvider {
 /// always carries `anthropic-ratelimit-unified-*` / `anthropic-ratelimit-*`.
 /// `base_url` is only consulted when no known headroom header is present,
 /// in which case we fall back to a host-name lookup so a MiniMax response
-/// (no headroom headers — future work) still classifies correctly as
-/// `Other` rather than mis-filing under `Openai`.
+/// (no headroom headers at all) classifies correctly as
+/// `MiniMax` rather than collapsing into `Other` — the counter-fed wire-up
+/// keys off the typed variant.
 fn detect_utilization_provider(
     headers: &reqwest::header::HeaderMap,
     base_url: &str,
@@ -718,11 +758,12 @@ fn detect_utilization_provider(
         return Some(p);
     }
     let lowered = base_url.to_ascii_lowercase();
-    if lowered.contains("api.minimax.io") {
-        // MiniMax does not currently emit headroom headers; surface as
-        // `Other` so the load_snapshot_for() routing layer keeps it on the
-        // `None = headroom` path until token-counting telemetry lands.
-        return Some(crate::utilization::Provider::Other);
+    if lowered.contains("minimax") {
+        // MiniMax does not emit headroom headers; classify as the typed
+        // `MiniMax` variant so the counter-fed `record_counter` path
+        // can key utilization under its own `(provider, account, plan)`
+        // triple and the header-fed path is a clean no-op.
+        return Some(crate::utilization::Provider::MiniMax);
     }
     None
 }
@@ -772,6 +813,105 @@ fn capture_rate_limit_snapshot(headers: &reqwest::header::HeaderMap, base_url: &
     if !store.record(&snap, chrono::Utc::now()) {
         tracing::debug!(provider = ?snap.provider, "utilization snapshot had no windows");
     }
+}
+
+/// KNEMON Layer 3B — counter-fed capture for providers (MiniMax) that
+/// publish no rate-limit headers. Increment the running token total for
+/// the provider's monthly counter window and recompute `used_percent`
+/// from the persisted cap. The cap is looked up lazily from the bundled
+/// tier catalog on first sight and cached on the store; subsequent calls
+/// just increment.
+///
+/// BEST-EFFORT — never returns an error, never poisons the request. The
+/// header-fed [`capture_rate_limit_snapshot`] above runs first and is
+/// the path for codex/anthropic; this function is the counterpart that
+/// catches the no-header providers so they don't silently leak.
+///
+/// Only windows with `observability = Counter` are incremented;
+/// `PercentOnly` windows are intentionally untouched (the spec is
+/// explicit: "Only windows with observability=Counter accumulate token
+/// counts; PercentOnly windows are never locally computed").
+fn capture_counter_usage(
+    provider_id: &str,
+    base_url: &str,
+    plan: &str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    // Detection: "minimax" appears in the provider id OR the base_url.
+    // Either signal alone is enough; we OR them so an operator can
+    // configure the provider with any id and route via a base_url that
+    // names minimax, or vice versa.
+    let id_lc = provider_id.to_ascii_lowercase();
+    let url_lc = base_url.to_ascii_lowercase();
+    if !id_lc.contains("minimax") && !url_lc.contains("minimax") {
+        return;
+    }
+    // Total token count for this response. `usage.total_tokens` would
+    // win if it were available, but the wire-shape we currently parse
+    // only exposes prompt+completion — the spec explicitly handles this:
+    // "carries token usage (usage.total_tokens or prompt+completion)".
+    let total_tokens: f64 = match (prompt_tokens, completion_tokens) {
+        (Some(p), Some(c)) => (p as f64) + (c as f64),
+        (Some(p), None) => p as f64,
+        (None, Some(c)) => c as f64,
+        (None, None) => return, // No usage to count — the response just
+                                // didn't carry it (e.g. streaming without `stream_options.include_usage`).
+    };
+    if total_tokens <= 0.0 {
+        return;
+    }
+    let Some(path) = crate::utilization::default_store_path() else {
+        return;
+    };
+    let Ok(mut store) = crate::utilization::UtilizationStore::open(&path) else {
+        tracing::debug!(
+            ?path,
+            "utilization store open failed; skipping counter capture"
+        );
+        return;
+    };
+    // Cap resolution: look up the catalog once, find the Counter window
+    // for the configured plan, and seed the store with the cap. The set is
+    // idempotent (subsequent calls overwrite the same value, then
+    // `record_counter` recomputes percent from the latest used_tokens).
+    let catalog = crate::subscription_tiers::TierCatalog::bundled();
+    if let Some(entry) = catalog.tier("minimax", plan) {
+        for w in &entry.windows {
+            if matches!(w.observability, crate::config::Observability::Counter) {
+                store.set_counter_cap(
+                    crate::utilization::Provider::MiniMax,
+                    "default",
+                    plan,
+                    &w.name,
+                    w.cap,
+                    now,
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            plan,
+            "minimax plan not in catalog; counter capture will run cap-less"
+        );
+    }
+    // Increment the monthly window (the only Counter window the catalog
+    // declares for `minimax-max` per the Layer 3B spec). If a future
+    // catalog adds more Counter windows (e.g. a weekly counter), this
+    // call would need to iterate the same `windows` list the cap-loop
+    // just walked; today a single monthly window is enough.
+    store.record_counter(
+        crate::utilization::Provider::MiniMax,
+        "default",
+        plan,
+        "monthly",
+        total_tokens,
+        now,
+    );
+    // Best-effort persist. Mirror the header path: tolerate IO failure so
+    // a transient disk hiccup never breaks a chat call.
+    let _ = store.save();
 }
 
 #[cfg(test)]
