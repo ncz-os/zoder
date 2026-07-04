@@ -97,7 +97,11 @@ pub enum BillingMode {
     Subscription,
 }
 
-/// What a rolling rate-limit window counts.
+/// How a rolling rate-limit window counts. `Sessions` counts discrete
+/// agent/conversation sessions (e.g. Cursor / Windsurf-style caps) rather
+/// than tokens, requests, or message round-trips — declaring all three
+/// common shapes so any provider's flat-fee plan is expressible in config
+/// without code changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaUnit {
@@ -105,10 +109,47 @@ pub enum QuotaUnit {
     Tokens,
     Requests,
     Messages,
+    Sessions,
+}
+
+/// How a `QuotaWindow` is fed. `Header` means the rate-limit headers on the
+/// provider's HTTP response (the KNEMON "best" path — known exact values).
+/// `Counter` means a local counter (the legacy `quota.rs` model-plus-ledger
+/// path). `PercentOnly` means the cap itself is unknown and the window is
+/// observable only as a used-percent — never a headroom calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Observability {
+    #[default]
+    Header,
+    Counter,
+    PercentOnly,
+}
+
+/// How a `QuotaWindow` resets. `Rolling` is the legacy "trailing N hours"
+/// semantics already implemented in `quota.rs`. `CalendarMonthly` and
+/// `CalendarDaily` describe provider calendars (e.g. Codex weekly quota
+/// resets Mon 00:00 UTC); the window's `hours` is informational in those
+/// cases — the engine MUST look at the provider's reset signal, not the
+/// `hours`-based aging, when `reset != Rolling`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetKind {
+    #[default]
+    Rolling,
+    CalendarMonthly,
+    CalendarDaily,
 }
 
 /// A rolling rate-limit window on a subscription (e.g. a 5-hour cap or a weekly
-/// cap). Consumption is measured from the local ledger over `hours`.
+/// cap). Consumption is measured from the local ledger over `hours`, except
+/// when `reset` says the provider resets on a calendar boundary.
+///
+/// `cap = None` means the cap is **unknown** — the window is observable only as
+/// percent (an Anthropic dashboard-style "82% of weekly budget consumed" view
+/// without a raw token figure). When `cap = None`, `quota.rs` treats the
+/// window as permanently below cap (headroom), NEVER as saturated on the
+/// strength of a zero denominator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaWindow {
     /// Display name, e.g. "5h" or "weekly".
@@ -117,8 +158,28 @@ pub struct QuotaWindow {
     pub hours: u32,
     #[serde(default)]
     pub unit: QuotaUnit,
-    /// Cap value, in `unit`, over the rolling window.
-    pub cap: f64,
+    /// Cap value, in `unit`, over the rolling window. `None` = unknown /
+    /// percent-only — the window still exists but cannot drive a headroom or
+    /// "exhausted" decision on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<f64>,
+    /// Model-id glob patterns this window limits. `None` means "all models on
+    /// the provider" (the legacy single-cap shape). Set to a list of globs
+    /// (e.g. `["MiniMax-M3", "claude-opus-*"]`) to express a per-model cap —
+    /// Anthropic publishes Sonnet / Opus / Haiku as separately-capped models
+    /// on the same endpoint, and that's what this field is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    /// How this window's consumption is observed / fed. Defaults to `Header`
+    /// (KNEMON's "best" path), so a minimal config keeps the same semantics
+    /// it had before this field existed.
+    #[serde(default)]
+    pub observability: Observability,
+    /// How this window resets. Defaults to `Rolling` (legacy "trailing
+    /// `hours`" semantics). Set `CalendarMonthly` / `CalendarDaily` for
+    /// provider-driven reset signals.
+    #[serde(default)]
+    pub reset: ResetKind,
 }
 
 /// Subscription terms for a flat-fee provider (ChatGPT/Claude/Cursor-style).
@@ -1037,7 +1098,10 @@ mod tests {
                     name: "5h".into(),
                     hours: 5,
                     unit: QuotaUnit::Messages,
-                    cap: 900.0,
+                    cap: Some(900.0),
+                    models: None,
+                    observability: Observability::default(),
+                    reset: ResetKind::default(),
                 }],
                 tier: None,
             }),
@@ -1289,5 +1353,163 @@ auth = { type = "env", var = "ACME_KEY" }
             err.to_string().contains("duplicate provider id"),
             "overlay reusing base id 'default' must be rejected: {err}"
         );
+    }
+
+    // ---------- KNEMON declarative QuotaWindow round-trips ----------
+    //
+    // The whole point of the `models` / `observability` / `reset` /
+    // `Option<cap>` extension is that ANY subscription plan an operator
+    // dreams up is expressible in config and reachable from a JSON parse
+    // with no code change. These three tests pin the contract.
+    //
+    // 1. The maximal shape (every new field present, cap null) round-trips
+    //    exactly: any field a real provider needs is reachable.
+    // 2. The minimal shape (`{"name": ..., "hours": ...}` only) deserializes
+    //    with the documented defaults: `unit = Tokens`, `observability =
+    //    Header`, `reset = Rolling`, `cap = None`, `models = None`.
+    // 3. `QuotaUnit::Sessions` survives a round trip — the third common
+    //    "flat-fee plan" unit, alongside tokens/requests/messages, exists
+    //    so Cursor/Windsurf-style caps can be declared in config.
+
+    #[test]
+    fn quota_window_maximal_round_trip_with_null_cap() {
+        // Anthropic per-model cap: 5h of 200M tokens on opus-* models,
+        // observed via response headers (`observability: "header"`),
+        // rolling reset. The `cap` is intentionally `null` — the operator
+        // only knows it's not the headline 900-message cap; the real
+        // token cap is published as a percent later. This shape MUST
+        // deserialize cleanly and round-trip back to the same JSON so a
+        // TOML/JSON config the operator types by hand keeps every field.
+        let json = r#"{
+            "name": "5h-opus",
+            "hours": 5,
+            "unit": "tokens",
+            "cap": null,
+            "models": ["claude-opus-*", "claude-3-opus-*"],
+            "observability": "header",
+            "reset": "rolling"
+        }"#;
+        let w: QuotaWindow = serde_json::from_str(json).unwrap();
+        assert_eq!(w.name, "5h-opus");
+        assert_eq!(w.hours, 5);
+        assert_eq!(w.unit, QuotaUnit::Tokens);
+        assert_eq!(w.cap, None, "cap = null in JSON must deserialize to None");
+        assert_eq!(
+            w.models.as_deref(),
+            Some(&["claude-opus-*".to_string(), "claude-3-opus-*".to_string()][..])
+        );
+        assert_eq!(w.observability, Observability::Header);
+        assert_eq!(w.reset, ResetKind::Rolling);
+
+        // Round-trip back to JSON and confirm both `cap` and `models`
+        // skip cleanly (per the `skip_serializing_if = "Option::is_none"`
+        // policy on those fields — `None` = "all models" / "unknown
+        // cap", not "explicit zero").
+        let out = serde_json::to_string(&w).unwrap();
+        let re: QuotaWindow = serde_json::from_str(&out).unwrap();
+        assert_eq!(w.name, re.name);
+        assert_eq!(w.cap, re.cap);
+        assert_eq!(w.models, re.models);
+        assert_eq!(w.observability, re.observability);
+        assert_eq!(w.reset, re.reset);
+    }
+
+    #[test]
+    fn quota_window_minimal_uses_documented_defaults() {
+        // Bare minimum: name + hours. Everything else must collapse to
+        // the documented defaults so an operator who only knows the
+        // window's duration can still express the plan.
+        let json = r#"{"name": "5h", "hours": 5}"#;
+        let w: QuotaWindow = serde_json::from_str(json).unwrap();
+        assert_eq!(w.name, "5h");
+        assert_eq!(w.hours, 5);
+        assert_eq!(
+            w.unit,
+            QuotaUnit::default(),
+            "missing unit must default to QuotaUnit::default() (Tokens)"
+        );
+        assert_eq!(
+            w.cap, None,
+            "missing cap must default to None (percent-only / unknown)"
+        );
+        assert_eq!(
+            w.models, None,
+            "missing models must default to None (all models on provider)"
+        );
+        assert_eq!(
+            w.observability,
+            Observability::default(),
+            "missing observability must default to Header"
+        );
+        assert_eq!(
+            w.reset,
+            ResetKind::default(),
+            "missing reset must default to Rolling"
+        );
+
+        // Re-serialize: the minimal form must collapse back to the same
+        // shape so a defaulted config and a hand-typed config are
+        // indistinguishable on the wire.
+        let out = serde_json::to_string(&w).unwrap();
+        let re: QuotaWindow = serde_json::from_str(&out).unwrap();
+        assert_eq!(w.unit, re.unit);
+        assert_eq!(w.cap, re.cap);
+        assert_eq!(w.models, re.models);
+        assert_eq!(w.observability, re.observability);
+        assert_eq!(w.reset, re.reset);
+    }
+
+    #[test]
+    fn quota_unit_sessions_round_trips() {
+        // `Sessions` is the third flat-fee-plan unit shape (Cursor's
+        // "N active sessions at once", Windsurf / Codex session caps).
+        // It must survive a JSON round trip with the same
+        // `snake_case` rename the other variants already use.
+        let u: QuotaUnit = serde_json::from_str(r#""sessions""#).unwrap();
+        assert_eq!(u, QuotaUnit::Sessions);
+
+        let s = serde_json::to_string(&QuotaUnit::Sessions).unwrap();
+        assert_eq!(s, r#""sessions""#);
+
+        // And it MUST be distinct from the existing units so the rename
+        // collision doesn't quietly downgrade a Cursor session cap to a
+        // messages cap.
+        assert_ne!(QuotaUnit::Sessions, QuotaUnit::Tokens);
+        assert_ne!(QuotaUnit::Sessions, QuotaUnit::Requests);
+        assert_ne!(QuotaUnit::Sessions, QuotaUnit::Messages);
+    }
+
+    #[test]
+    fn quota_window_known_cap_with_models_calendar_monthly_observed_via_counter() {
+        // The realistic "second" window most operators will actually
+        // type: a CodeX / Anthropic-style monthly cap observed via a
+        // local counter (`observability = "counter"`) with a calendar
+        // monthly reset (`reset = "calendar_monthly"`) — both new
+        // fields, both `#[serde(default)]`, and a known cap value.
+        // Round-trips intacts.
+        let json = r#"{
+            "name": "monthly",
+            "hours": 720,
+            "unit": "messages",
+            "cap": 4000.0,
+            "observability": "counter",
+            "reset": "calendar_monthly"
+        }"#;
+        let w: QuotaWindow = serde_json::from_str(json).unwrap();
+        assert_eq!(w.name, "monthly");
+        assert_eq!(w.hours, 720);
+        assert_eq!(w.unit, QuotaUnit::Messages);
+        assert_eq!(w.cap, Some(4000.0));
+        assert_eq!(w.models, None);
+        assert_eq!(w.observability, Observability::Counter);
+        assert_eq!(w.reset, ResetKind::CalendarMonthly);
+
+        // Round-trip preserves every field by value.
+        let out = serde_json::to_string(&w).unwrap();
+        let re: QuotaWindow = serde_json::from_str(&out).unwrap();
+        assert_eq!(re.name, "monthly");
+        assert_eq!(re.cap, Some(4000.0));
+        assert_eq!(re.observability, Observability::Counter);
+        assert_eq!(re.reset, ResetKind::CalendarMonthly);
     }
 }

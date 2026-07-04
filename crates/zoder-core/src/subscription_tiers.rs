@@ -35,7 +35,7 @@
 //! windows survived the resolution, with the existing engine path completely
 //! unchanged.
 
-use crate::config::{QuotaUnit, QuotaWindow, SubscriptionPlan};
+use crate::config::{Observability, QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -77,13 +77,28 @@ impl Confidence {
 /// One rolling rate-limit window on a subscription, as declared in the
 /// catalog. Mirrors [`QuotaWindow`] but carries the confidence tag the
 /// operator needs to read numbers honestly.
+///
+/// `cap = None` means the catalog row is "percent-only" — the cap value
+/// is unknown but the window still exists (matches the on-disk shape the
+/// engine now accepts from operator config).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierWindow {
     pub name: String,
     pub hours: u32,
     #[serde(default)]
     pub unit: QuotaUnit,
-    pub cap: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<f64>,
+    /// Model-id glob patterns this window limits; `None` = all models on
+    /// the provider (mirrors [`QuotaWindow::models`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    /// How this window is fed (mirrors [`QuotaWindow::observability`]).
+    #[serde(default)]
+    pub observability: Observability,
+    /// How this window resets (mirrors [`QuotaWindow::reset`]).
+    #[serde(default)]
+    pub reset: ResetKind,
 }
 
 impl TierWindow {
@@ -94,6 +109,9 @@ impl TierWindow {
             hours: self.hours,
             unit: self.unit,
             cap: self.cap,
+            models: self.models,
+            observability: self.observability,
+            reset: self.reset,
         }
     }
 }
@@ -467,7 +485,10 @@ mod tests {
             name: name.into(),
             hours,
             unit,
-            cap,
+            cap: Some(cap),
+            models: None,
+            observability: crate::config::Observability::default(),
+            reset: crate::config::ResetKind::default(),
         }
     }
 
@@ -476,7 +497,10 @@ mod tests {
             name: name.into(),
             hours,
             unit,
-            cap,
+            cap: Some(cap),
+            models: None,
+            observability: crate::config::Observability::default(),
+            reset: crate::config::ResetKind::default(),
         }
     }
 
@@ -521,7 +545,7 @@ mod tests {
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
         assert_eq!(r.source, ResolveSource::Explicit);
         assert_eq!(r.windows.len(), 1);
-        assert_eq!(r.windows[0].cap, 100.0);
+        assert_eq!(r.windows[0].cap, Some(100.0));
     }
 
     #[test]
@@ -543,8 +567,8 @@ mod tests {
         assert_eq!(r.windows.len(), 2);
         let by_name: std::collections::HashMap<_, _> =
             r.windows.iter().map(|x| (x.name.as_str(), x)).collect();
-        assert_eq!(by_name["5h"].cap, 900.0);
-        assert_eq!(by_name["weekly"].cap, 8000.0);
+        assert_eq!(by_name["5h"].cap, Some(900.0));
+        assert_eq!(by_name["weekly"].cap, Some(8000.0));
         assert_eq!(by_name["5h"].hours, 5);
     }
 
@@ -575,11 +599,11 @@ mod tests {
         let by_name: std::collections::HashMap<_, _> =
             r.windows.iter().map(|x| (x.name.as_str(), x)).collect();
         // 5h: overridden.
-        assert_eq!(by_name["5h"].cap, 1500.0);
+        assert_eq!(by_name["5h"].cap, Some(1500.0));
         // weekly: untouched.
-        assert_eq!(by_name["weekly"].cap, 8000.0);
+        assert_eq!(by_name["weekly"].cap, Some(8000.0));
         // daily: appended (not in the preset).
-        assert_eq!(by_name["daily"].cap, 500.0);
+        assert_eq!(by_name["daily"].cap, Some(500.0));
         assert_eq!(by_name["daily"].hours, 24);
         assert_eq!(r.windows.len(), 3);
     }
@@ -602,7 +626,7 @@ mod tests {
         }
         // Fallback: explicit windows survive untouched.
         assert_eq!(r.windows.len(), 1);
-        assert_eq!(r.windows[0].cap, 250.0);
+        assert_eq!(r.windows[0].cap, Some(250.0));
     }
 
     #[test]
@@ -642,7 +666,7 @@ mod tests {
             other => panic!("expected UnknownTier, got {other:?}"),
         }
         assert_eq!(r.windows.len(), 1);
-        assert_eq!(r.windows[0].cap, 1.0);
+        assert_eq!(r.windows[0].cap, Some(1.0));
     }
 
     #[test]
@@ -681,7 +705,7 @@ mod tests {
             other => panic!("expected UnknownTier, got {other:?}"),
         }
         assert_eq!(r.windows.len(), 1);
-        assert_eq!(r.windows[0].cap, 42.0);
+        assert_eq!(r.windows[0].cap, Some(42.0));
     }
 
     #[test]
@@ -749,8 +773,8 @@ mod tests {
                 );
                 for w in &entry.windows {
                     assert!(
-                        w.cap > 0.0,
-                        "{provider}/{tier_id}/{} cap must be > 0",
+                        w.cap.map(|c| c > 0.0).unwrap_or(false),
+                        "{provider}/{tier_id}/{} cap must be > 0 when set",
                         w.name
                     );
                     assert!(
