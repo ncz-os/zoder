@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-07-03",
-  "generated": "2026-07-03",
-  "count": 2558,
+  "arena_date": "2026-07-04",
+  "generated": "2026-07-04",
+  "count": 2561,
   "routable": 61,
-  "scored": 1391,
+  "scored": 1394,
   "models": [
     {
       "id": "ai21.j2-mid-v1",
@@ -1212,8 +1212,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.784,
@@ -2650,8 +2650,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.3000000000000003,
-        "output_usd_per_mtok": 16.5,
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -6494,8 +6494,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.784,
@@ -12487,6 +12487,51 @@
       }
     },
     {
+      "id": "bedrock_mantle/xai.grok-4.3",
+      "host": "bedrock_mantle",
+      "leaf": "xai.grok-4.3",
+      "family": "bedrock_mantle",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.25,
+        "output_usd_per_mtok": 2.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.574,
+      "w_swe": 0.857,
+      "capability": {
+        "swe_verified": {
+          "acc": 71.4,
+          "cost_per_test": 0.2226,
+          "latency_s": 117.8,
+          "source": "vals.ai"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.78,
+        "grind": 0.62
+      },
+      "arena_coding_elo": 1363.0,
+      "arena_webdev_elo": 1363.0,
+      "preference": {
+        "arena_agent": {
+          "rank": 25,
+          "score": -0.0941,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 58,
+          "rating": 1363.0,
+          "source": "arena.ai",
+          "votes": 6838
+        }
+      }
+    },
+    {
       "id": "bytedance-seed/seed-1.6",
       "host": "bytedance-seed",
       "leaf": "seed-1.6",
@@ -13714,8 +13759,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.784,
@@ -19367,8 +19412,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.3000000000000003,
-        "output_usd_per_mtok": 16.5,
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -28262,8 +28307,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -33012,8 +33057,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.3000000000000003,
-        "output_usd_per_mtok": 16.5,
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -54296,6 +54341,91 @@
       }
     },
     {
+      "id": "tencent/deepseek-v4-flash",
+      "host": "tencent",
+      "leaf": "deepseek-v4-flash",
+      "family": "tencent",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.14,
+        "output_usd_per_mtok": 0.28,
+        "source": "litellm"
+      },
+      "agentic_score": 0.237,
+      "w_swe": 0.619,
+      "capability": {
+        "swe_verified": {
+          "acc": 70.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "preference": {
+        "arena_agent": {
+          "rank": 10,
+          "score": 0.0427,
+          "source": "arena.ai"
+        }
+      }
+    },
+    {
+      "id": "tencent/deepseek-v4-pro",
+      "host": "tencent",
+      "leaf": "deepseek-v4-pro",
+      "family": "tencent",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.435,
+        "output_usd_per_mtok": 0.87,
+        "source": "litellm"
+      },
+      "agentic_score": 0.488,
+      "w_swe": 0.797,
+      "capability": {
+        "scale_seal": {
+          "acc": 27.15,
+          "source": "scale-seal"
+        },
+        "swe_verified": {
+          "acc": 77.4,
+          "cost_per_test": 0.4368,
+          "latency_s": 634.6,
+          "source": "vals.ai"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "arena_coding_elo": 1456.6,
+      "arena_webdev_elo": 1456.6,
+      "preference": {
+        "arena_agent": {
+          "rank": 22,
+          "score": -0.0501,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 26,
+          "rating": 1456.6,
+          "source": "arena.ai",
+          "votes": 7330
+        }
+      }
+    },
+    {
       "id": "tencent/hunyuan-a13b-instruct",
       "host": "tencent",
       "leaf": "hunyuan-a13b-instruct",
@@ -56493,8 +56623,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.3000000000000003,
-        "output_usd_per_mtok": 16.5,
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -60260,8 +60390,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.784,
@@ -60300,8 +60430,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 3.0,
-        "output_usd_per_mtok": 15.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
       "agentic_score": 0.77,
@@ -64843,8 +64973,8 @@
       "paid": false,
       "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
       "economics": {
-        "input_usd_per_mtok": 0.9299999999999999,
-        "output_usd_per_mtok": 3.0,
+        "input_usd_per_mtok": 0.9099999999999999,
+        "output_usd_per_mtok": 2.8600000000000003,
         "source": "openrouter"
       },
       "agentic_score": 0.665,
