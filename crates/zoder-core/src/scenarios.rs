@@ -430,7 +430,6 @@ pub fn pick_candidate_for_role(
     allow_paid_runtime: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    let now = now;
     let classes = scenario.classes_for(role);
     for class in classes {
         // Highest-rank candidate of this class.
