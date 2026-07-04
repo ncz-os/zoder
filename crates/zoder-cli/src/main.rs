@@ -5089,11 +5089,19 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
                     .as_deref()
                     .map(|c| format!(" [est:{}]", c))
                     .unwrap_or_default();
+                // `cap = None` means percent-only: render as "?" so the
+                // operator isn't misled into reading "used / 0" as "you
+                // are at the cap". Headroom semantics still apply (the
+                // smart router won't trip `exhausted` on this row).
+                let cap_str = match w.cap {
+                    Some(c) => format!("{c:.0}"),
+                    None => "?".to_string(),
+                };
                 println!(
-                    "             {:>7} window: {:.0}/{:.0} {} ({:.0}% of cap){}{}{}",
+                    "             {:>7} window: {:.0}/{} {} ({:.0}% of cap){}{}{}",
                     w.name,
                     w.used,
-                    w.cap,
+                    cap_str,
                     w.unit,
                     w.pct * 100.0,
                     reset,

@@ -30,7 +30,11 @@ pub struct WindowUsage {
     pub hours: u32,
     pub unit: String,
     pub used: f64,
-    pub cap: f64,
+    /// Cap value, in `unit`, over the rolling window. `None` = unknown /
+    /// percent-only — the window exists but the cap value isn't known
+    /// locally. `pct` against `None` is always 0 (treated as headroom,
+    /// never as exhausted).
+    pub cap: Option<f64>,
     /// Fraction of the cap consumed (0..=1; can exceed 1 when over cap).
     pub pct: f64,
     /// When the next relief arrives in this rolling window: the oldest in-window
@@ -58,7 +62,13 @@ pub struct WindowUsage {
 fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
     match unit {
         QuotaUnit::Tokens => (e.tokens_in + e.tokens_out) as f64,
-        QuotaUnit::Requests | QuotaUnit::Messages => 1.0,
+        // Requests, Messages, and Sessions each contribute one to the
+        // rolling-window counter for the matching ledger entry. Distinct
+        // semantically (a single agent turn counts one in each unit), but
+        // the per-Entry contribution is the same: 1 per matching row.
+        // Multi-turn sessions would need an Entry-level `session_id`
+        // field that's out of scope for the declarative-config change.
+        QuotaUnit::Requests | QuotaUnit::Messages | QuotaUnit::Sessions => 1.0,
     }
 }
 
@@ -88,13 +98,30 @@ pub fn window_usage(
         used += unit_amount(e, w.unit);
         oldest = Some(oldest.map_or(e.ts_utc, |o| o.min(e.ts_utc)));
     }
-    let pct = if w.cap > 0.0 { used / w.cap } else { 0.0 };
+    let pct = match w.cap {
+        // Unknown cap → observable only as a percent on the *provider*'s
+        // side; locally we treat this window as permanently below cap
+        // (headroom) so it never falsely flips a subscription to
+        // "exhausted" and demotes it from the smart router. The contract
+        // documented on `QuotaWindow::cap` is exactly this — `None` means
+        // headroom, never zero.
+        None => 0.0,
+        // A known positive cap is the normal math. `cap = 0.0` (operator
+        // typo) is treated as "no headroom" rather than dividing by zero
+        // so a bad config doesn't make `pct` explode to `inf`.
+        Some(c) if c > 0.0 => used / c,
+        Some(_) => 0.0,
+    };
     let next_reset_utc = oldest.map(|o| (o + Duration::hours(w.hours as i64)).to_rfc3339());
     WindowUsage {
         name: w.name.clone(),
         hours: w.hours,
         unit: format!("{:?}", w.unit).to_ascii_lowercase(),
         used,
+        // Pass the cap (or `None`) through verbatim — the report JSON
+        // surfaces "unknown" as a JSON `null` instead of a fake `0`,
+        // which would mislead downstream consumers into reading "used /
+        // unknown" as a perfectly fine integer.
         cap: w.cap,
         pct,
         next_reset_utc,
@@ -212,7 +239,10 @@ mod tests {
             name: name.into(),
             hours,
             unit,
-            cap,
+            cap: Some(cap),
+            models: None,
+            observability: crate::config::Observability::default(),
+            reset: crate::config::ResetKind::default(),
         }
     }
 
@@ -221,7 +251,10 @@ mod tests {
             name: name.into(),
             hours,
             unit,
-            cap,
+            cap: Some(cap),
+            models: None,
+            observability: crate::config::Observability::default(),
+            reset: crate::config::ResetKind::default(),
         }
     }
 
@@ -331,17 +364,17 @@ mod tests {
         );
         // Override cap must reach the usage row (operator's value, not the
         // catalog's 900).
-        assert_eq!(by_n["5h"].cap, 1500.0);
+        assert_eq!(by_n["5h"].cap, Some(1500.0));
 
         // weekly: untouched preset row → catalog provenance intact.
         assert_eq!(by_n["weekly"].confidence.as_deref(), Some("observed"));
         assert_eq!(by_n["weekly"].source.as_deref(), Some("observed"));
-        assert_eq!(by_n["weekly"].cap, 8000.0);
+        assert_eq!(by_n["weekly"].cap, Some(8000.0));
 
         // daily: appended → operator.
         assert_eq!(by_n["daily"].confidence, None);
         assert_eq!(by_n["daily"].source.as_deref(), Some("operator"));
-        assert_eq!(by_n["daily"].cap, 500.0);
+        assert_eq!(by_n["daily"].cap, Some(500.0));
     }
 
     #[test]
@@ -360,7 +393,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, None);
         assert_eq!(out[0].source.as_deref(), Some("operator"));
-        assert_eq!(out[0].cap, 250.0);
+        assert_eq!(out[0].cap, Some(250.0));
     }
 
     #[test]
