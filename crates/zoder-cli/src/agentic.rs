@@ -1,4 +1,4 @@
-//! Codex-compatible command surface: `review`, `adversarial-review`, `rescue`,
+//! zoder's agentic command surface (a drop-in for codex `exec`/`review`): `review`, `adversarial-review`, `rescue`,
 //! `transfer`, and a file-backed background job registry (`status`/`result`/
 //! `cancel`). Reviews run as single completions over a chosen model (the diff is
 //! embedded), with optional multi-reviewer fan-out; `rescue` is an agentic,
@@ -325,6 +325,218 @@ fn cap_diff(diff: &str, max: usize) -> String {
     let head = &diff[..max * 3 / 4];
     let tail = &diff[diff.len() - max / 4..];
     format!("{head}\n\n...[diff truncated for length]...\n\n{tail}")
+}
+
+// ---------------------------------------------------------------------------
+// Diff-substance anti-gaming guard.
+//
+// The accept branches in `cmd_loop` used to gate only on `diff_lines > 0`,
+// which an over-eager author can trivially game: a "green" iteration whose
+// diff is empty-after-headers, only whitespace, only comments, or only churns
+// test files was still treated as substantive work and resolved the loop.
+// `classify_diff_substance` returns the strictest bucket that fits the diff
+// (Empty > WhitespaceOnly > CommentOnly > TestOnly > Substantive). The accept
+// branches then demand `Substantive` OR (with a warning) `TestOnly`, and
+// reject the rest as non-substantive noise — closing that gaming surface
+// without weakening the review gate or the check gate.
+// ---------------------------------------------------------------------------
+
+/// What a unified diff is *actually* changing, beyond "did anything move".
+/// Ordered so that the most permissive bucket a diff qualifies for is the one
+/// returned (see [`classify_diff_substance`] precedence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffSubstance {
+    /// No `+`/`-` content lines at all (only file headers).
+    Empty,
+    /// Every `+`/`-` content line reduces to whitespace after stripping the
+    /// leading marker and trimming.
+    WhitespaceOnly,
+    /// Every `+`/`-` content line is either empty or begins with a comment
+    /// marker (`//`, `#`, `/*`, `*`, `*/`, `--`, `<!--`, `"""`, `'''`).
+    CommentOnly,
+    /// At least one substantive content line, but every changed file path
+    /// matches a test pattern (see [`classify_diff_substance`]).
+    TestOnly,
+    /// Real source change — accept-eligible without warning.
+    Substantive,
+}
+
+/// `true` for buckets the loop may resolve on. `TestOnly` is allowed but
+/// emits a warning at the call site; the rest of the buckets are
+/// explicitly rejected as anti-gaming.
+pub(crate) fn substance_accept_eligible(s: &DiffSubstance) -> bool {
+    matches!(s, DiffSubstance::Substantive | DiffSubstance::TestOnly)
+}
+
+/// Comment markers that mean "this line is a comment in some language".
+/// Order matters only for readability — matching is prefix-based.
+const COMMENT_MARKERS: &[&str] = &["//", "#", "/*", "*/", "*", "--", "<!--", "\"\"\"", "'''"];
+
+/// True if `path` (a file path from a `+++ b/...` or `diff --git` header)
+/// matches the test-file patterns we recognize. A `path` of `/dev/null`
+/// (file deletion / addition outside any tree) is never a test file.
+fn is_test_path(path: &str) -> bool {
+    if path.is_empty() || path == "/dev/null" {
+        return false;
+    }
+    let p = path.replace('\\', "/");
+    // Path-segment matches anywhere in the path.
+    if p.contains("/tests/") || p.contains("/test/") {
+        return true;
+    }
+    let basename = std::path::Path::new(p.as_str())
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p.as_str())
+        .to_string();
+    // Plain Perl-style test files (`foo.t`).
+    if basename == "t" || basename.ends_with(".t") {
+        return true;
+    }
+    // Glob patterns we recognize.
+    let b = basename.as_str();
+    b.starts_with("test_")
+        || b.ends_with("_test.")
+        || b.ends_with("_test.rs")
+        || b.ends_with("_test.py")
+        || b.ends_with("_test.go")
+        || b.ends_with("_test.js")
+        || b.ends_with("_test.ts")
+        || b.ends_with("_spec.")
+        || b.ends_with("_spec.rs")
+        || b.ends_with("_spec.py")
+        || b.ends_with("_spec.go")
+        || b.ends_with("_spec.js")
+        || b.ends_with("_spec.ts")
+        || b.contains(".test.")
+        || b.contains(".spec.")
+}
+
+/// Classify a unified-diff string by what its `+`/`-` content lines actually
+/// change. Pure & deterministic — operates on the already-captured diff text
+/// and makes no git calls.
+///
+/// Precedence (strictest first wins):
+///   1. `Empty` — no `+`/`-` content lines at all.
+///   2. `WhitespaceOnly` — every content line is empty/whitespace.
+///   3. `CommentOnly` — every content line is empty or starts with a comment marker.
+///   4. `TestOnly` — at least one substantive content line AND every changed
+///      file path matches a test pattern.
+///   5. `Substantive` — anything else.
+///
+/// "Content lines" are lines beginning with `+` or `-` that are NOT the
+/// `+++ ` / `--- ` file headers. Changed file paths are read from `+++ b/...`
+/// (preferred, mirrors the post-image) and, as a fallback, from
+/// `diff --git a/... b/...` headers.
+pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
+    let mut content_lines: Vec<&str> = Vec::new();
+    // Track every path that appears as the *new* side of a file header.
+    // Either source is fine: `+++ b/PATH` is the post-image, and on
+    // `diff --git a/A b/B` we treat B (the post-image) as the canonical
+    // path and fall back to A if B is /dev/null.
+    let mut changed_paths: Vec<String> = Vec::new();
+
+    for line in diff.lines() {
+        // File headers first — we need to collect paths even when there are
+        // no content lines (so an "Empty" diff still records its files,
+        // though it won't matter for the Empty bucket).
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            // `+++ b/path` form (most common from `git diff`).
+            let path = rest.trim_start_matches("b/").trim();
+            if !path.is_empty() && path != "/dev/null" {
+                changed_paths.push(path.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            // `--- a/path` — only useful if we somehow see the `---` of a
+            // brand-new file (where `+++ /dev/null` shows up). Skip; the
+            // `+++` line is the authoritative path.
+            let _ = rest;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `diff --git a/A b/B` — pick the post-image (B), or A if B is
+            // /dev/null (file deletion).
+            let halves = rest.split_whitespace().collect::<Vec<_>>();
+            // halves[0] is "a/A", halves[1] is "b/B" — be defensive in case
+            // either side is missing.
+            let post = halves
+                .get(1)
+                .and_then(|s| s.strip_prefix("b/"))
+                .or_else(|| halves.first().and_then(|s| s.strip_prefix("a/")))
+                .unwrap_or("")
+                .to_string();
+            if !post.is_empty() && post != "/dev/null" {
+                changed_paths.push(post);
+            }
+            continue;
+        }
+        if line.starts_with("Index: ") || line.starts_with("index ") {
+            continue;
+        }
+
+        // Content lines: lines starting with '+' or '-' but NOT `+++`/`---`.
+        // The `starts_with("+++")`/`starts_with("---")` checks above are
+        // subsumed by the file-header strip_prefix blocks already handled,
+        // but we still guard here for safety against edge cases.
+        if line.starts_with("+++ ") || line.starts_with("--- ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            content_lines.push(rest);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            content_lines.push(rest);
+            continue;
+        }
+        // Hunk headers ("@@ ... @@"), context lines (" foo"), and any
+        // other lines are ignored for substance purposes.
+    }
+
+    if content_lines.is_empty() {
+        return DiffSubstance::Empty;
+    }
+
+    // Step 1: WhitespaceOnly — every line is blank after trimming.
+    let all_blank = content_lines.iter().all(|l| l.trim().is_empty());
+    if all_blank {
+        return DiffSubstance::WhitespaceOnly;
+    }
+
+    // Step 2: CommentOnly — every non-blank line starts with a comment marker.
+    let all_comment_or_blank = content_lines.iter().all(|l| {
+        let t = l.trim();
+        t.is_empty() || COMMENT_MARKERS.iter().any(|m| t.starts_with(m))
+    });
+    if all_comment_or_blank {
+        return DiffSubstance::CommentOnly;
+    }
+
+    // Step 3: TestOnly — at least one substantive line + every changed
+    // path is a test path. (A diff with no recognizable file headers,
+    // e.g. a hand-crafted snippet, is treated as NOT test-only — we can't
+    // prove the changed files are tests, so be conservative.)
+    let has_substantive_line = content_lines.iter().any(|l| {
+        !l.trim().is_empty()
+            && !COMMENT_MARKERS
+                .iter()
+                .any(|m| l.trim_start().starts_with(m))
+    });
+    if has_substantive_line {
+        // Filter paths: skip empty / dev/null, then require every remaining
+        // path to look like a test file.
+        let real_paths: Vec<&String> = changed_paths
+            .iter()
+            .filter(|p| !p.is_empty() && p.as_str() != "/dev/null")
+            .collect();
+        if !real_paths.is_empty() && real_paths.iter().all(|p| is_test_path(p.as_str())) {
+            return DiffSubstance::TestOnly;
+        }
+    }
+
+    DiffSubstance::Substantive
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1186,13 @@ pub(crate) async fn cmd_loop(
     // diff is an editor failure mode, not an engine failure mode.
     let mut dead_streak = 0usize;
     let mut check_timeout_streak = 0usize;
+    // Consecutive iterations that produced NO NEW progress (identical diff, still
+    // unresolved). A single no-op turn is NOT fatal — the author may just need a
+    // firmer nudge (or a harder blocker to chew on). Only give up after this many
+    // consecutive stalls, mirroring `dead_streak`. Prevents one empty author turn
+    // from terminating a task that is genuinely still converging.
+    let mut stall_streak = 0usize;
+    const STALL_LIMIT: usize = 3;
 
     for i in 1..=max_iters {
         // 1. Author turn — continue the SAME engine session for memory.
@@ -1045,6 +1264,14 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // 2. Capture the working-tree diff (whatever edits actually landed).
         let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
         let diff_lines = diff.lines().count();
+        // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
+        // diff-after-headers, whitespace-only churn, comment-only changes,
+        // test-file-only churn used to resolve the loop). `diff_substance`
+        // classifies what the +/- lines actually do; the accept branches
+        // below require `Substantive` (clean accept) or `TestOnly`
+        // (accept with a warning). Anything less is rejected and the loop
+        // continues to the next iteration.
+        let diff_substance = classify_diff_substance(&diff);
 
         // 3. Validate (build/test) if a check command was given. The check is
         // its own child process (a shell) and historically had NO watchdog —
@@ -1197,6 +1424,7 @@ nits).\n",
             "tool_calls": tool_calls,
             "author_outcome": author_outcome,
             "diff_lines": diff_lines,
+            "substance": format!("{:?}", diff_substance),
             "check": check.as_deref(),
             "check_passed": check_passed,
             "check_phase_timed_out": check_timed_out,
@@ -1211,10 +1439,50 @@ nits).\n",
         let objective_ok = green;
         let check_green = check_passed == Some(true); // an actual --check that passed
         let review_ok = review.verdict == "approve" || blocking == 0;
+        // Anti-gaming guard: `diff_lines > 0` is trivially gameable (a
+        // "green" iteration whose diff is empty-after-headers, only
+        // whitespace, only comments, or only churns test files used to
+        // resolve the loop). `substance_ok` is the strict replacement:
+        // `Substantive` and `TestOnly` are accept-eligible; everything
+        // else is explicitly rejected as non-substantive noise.
+        let substance_ok = substance_accept_eligible(&diff_substance);
+
+        // Anti-gaming guard rail: if the check is green but the diff is
+        // not substantive, the iteration MUST NOT resolve. Emit a clear
+        // reason, record it in the iter record (the `substance` field
+        // added above), and continue to the next iteration — same
+        // control flow as a failed check. This closes the gaming surface
+        // where an over-eager author could "pass" the loop with whitespace
+        // churn or comment-only edits.
+        if (check_green || objective_ok) && !substance_ok {
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: REJECTED green — diff is {diff_substance:?}, \
+ not substantive work (anti-gaming guard)"
+                );
+            }
+            prev_diff = diff.clone();
+            continue;
+        }
+
+        // Test-only warning: the diff is acceptable (it touches test files
+        // that build/test is green for) but the author did NOT actually
+        // change any non-test source — exactly the shape of a gaming
+        // attempt that slipped past the reviewer. Warn loudly so the
+        // operator sees why a "no real code change" iteration resolved.
+        if matches!(diff_substance, DiffSubstance::TestOnly)
+            && (check_green || objective_ok)
+            && !cli.quiet
+        {
+            eprintln!(
+                "[loop] iter {i}: WARNING accepting a test-only diff \
+ (no non-test source changed)"
+            );
+        }
 
         // Escape hatch: `--accept-on-green` treats a passing objective check as
         // sufficient, with reviewer findings advisory (for over-strict reviewers).
-        if accept_on_green && check_green && diff_lines > 0 {
+        if accept_on_green && check_green && substance_ok {
             resolved = true;
             if !cli.quiet {
                 eprintln!(
@@ -1225,7 +1493,7 @@ reviewer advisory, verdict={}, blocking={blocking})",
             }
             break;
         }
-        if objective_ok && review_ok && diff_lines > 0 {
+        if objective_ok && review_ok && substance_ok {
             resolved = true;
             if !cli.quiet {
                 eprintln!(
@@ -1238,11 +1506,12 @@ reviewer advisory, verdict={}, blocking={blocking})",
 
         // No-progress guard (2nd iteration on): an identical diff that still
         // isn't accepted. (Never trips on iter 1, where prev_diff is empty.)
-        if i > 1 && diff == prev_diff {
+        let no_new_progress = i > 1 && diff == prev_diff;
+        if no_new_progress {
             // Stalemate breaker: the objective check is GREEN but the reviewer
             // keeps blocking the SAME diff. Rather than discard a verified fix,
             // resolve with the findings recorded as warnings.
-            if check_green && diff_lines > 0 && !review_ok {
+            if check_green && substance_ok && !review_ok {
                 resolved = true;
                 if !cli.quiet {
                     eprintln!(
@@ -1252,10 +1521,28 @@ reviewer keeps blocking an unchanged diff ({blocking} blocking finding(s) record
                 }
                 break;
             }
-            if !cli.quiet {
-                eprintln!("[loop] iter {i}: no progress (diff unchanged); stopping.");
+            // A single no-op turn is not fatal: the author may just need a firmer
+            // nudge (see the escalated feedback below). Only give up after
+            // STALL_LIMIT consecutive stalls — otherwise keep grinding.
+            stall_streak += 1;
+            if stall_streak >= STALL_LIMIT {
+                if !cli.quiet {
+                    eprintln!(
+                        "[loop] iter {i}: no new progress for {stall_streak} consecutive \
+iteration(s); stopping."
+                    );
+                }
+                break;
             }
-            break;
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: no new progress ({stall_streak}/{STALL_LIMIT}); \
+re-prompting the author with a firmer directive."
+                );
+            }
+            // fall through: compose escalated feedback and try again.
+        } else {
+            stall_streak = 0;
         }
         prev_diff = diff.clone();
 
@@ -1273,6 +1560,17 @@ prioritize making the validation command pass.\n\n"
                 "You made NO changes to the repository in the previous turn. You MUST actually \
 edit the source files using your file/shell tools (e.g. write to src/lib.rs), not just describe \
 the fix. Apply the changes now.\n\n",
+            );
+        } else if no_new_progress {
+            // The author left the diff identical to last turn yet the task is
+            // still unresolved. Push harder, and give it a legitimate way to say
+            // it's blocked (rather than silently producing nothing again).
+            fb.push_str(
+                "Your previous turn produced NO NEW edits, yet the validation still fails. Do NOT \
+repeat prior work or stop — make ADDITIONAL, different changes this turn to clear the remaining \
+blocker shown below. If (and only if) the required fix genuinely lies OUTSIDE the files/scope you \
+were told to edit, respond on the FIRST line with `BLOCKED: <exactly what change is needed and \
+where>` and stop; otherwise keep editing until the check passes.\n\n",
             );
         }
         if check_passed == Some(false) {
@@ -1855,5 +2153,156 @@ mod tests {
         assert_eq!(u.dead_streak, 0);
         assert_eq!(u.check_timeout_streak, 0);
         assert!(!u.abort);
+    }
+
+    // `classify_diff_substance` — the anti-gaming guard's pure classifier.
+    //
+    // Each fixture below pins one of the five `DiffSubstance` variants so a
+    // future regression in precedence or marker handling is caught here
+    // instead of in production. Fixtures are intentionally small: the
+    // classifier only looks at +/- content lines and `+++ b/...` headers.
+    // -----------------------------------------------------------------------
+
+    /// An empty diff (only `diff --git` + `+++`/`---` headers, no content)
+    /// must classify as `Empty`.
+    #[test]
+    fn classify_diff_substance_empty_diff_is_empty() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    index 0000..1111 100644\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Empty);
+    }
+
+    /// A diff whose only +/- lines are blank/whitespace must classify as
+    /// `WhitespaceOnly`, even though the file path is non-test. (Pins
+    /// precedence: WhitespaceOnly beats TestOnly in a non-test file
+    /// scenario anyway, but mainly pins that blank lines are stripped of
+    /// their marker AND trimmed.)
+    #[test]
+    fn classify_diff_substance_whitespace_only_added_lines() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,1 +1,2 @@\n\
+                     fn existing() {}\n\
+                    +\n\
+                    +   \n\
+                    +\t\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::WhitespaceOnly);
+    }
+
+    /// A diff whose +/- lines are only Rust `// ...` comments must
+    /// classify as `CommentOnly`. Also pins that the file path being a
+    /// non-test source does NOT lift it out of CommentOnly.
+    #[test]
+    fn classify_diff_substance_comment_only_rust_hunk() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,2 +1,4 @@\n\
+                     fn existing() {}\n\
+                    +// TODO: explain this later\n\
+                    +// another comment\n\
+                    +\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::CommentOnly);
+    }
+
+    /// A diff whose +/- lines are only Python `# ...` comments must
+    /// classify as `CommentOnly` (the classifier is language-agnostic and
+    /// recognizes `#` as a comment marker across languages).
+    #[test]
+    fn classify_diff_substance_comment_only_python_hunk() {
+        let diff = "diff --git a/scripts/run.py b/scripts/run.py\n\
+                    --- a/scripts/run.py\n\
+                    +++ b/scripts/run.py\n\
+                    @@ -10,3 +10,6 @@ def helper():\n\
+                         return 0\n\
+                    +# header note\n\
+                    +# body note\n\
+                    +# trailing note\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::CommentOnly);
+    }
+
+    /// A diff with at least one substantive content line, where every
+    /// changed file path matches a recognized test-file pattern, must
+    /// classify as `TestOnly`. This pins the `/tests/` path-segment rule.
+    #[test]
+    fn classify_diff_substance_test_only_under_tests_dir() {
+        let diff = "diff --git a/crates/foo/tests/bar.rs b/crates/foo/tests/bar.rs\n\
+                    --- a/crates/foo/tests/bar.rs\n\
+                    +++ b/crates/foo/tests/bar.rs\n\
+                    @@ -1,1 +1,3 @@\n\
+                     #[test]\n\
+                    +fn new_thing() {\n\
+                    +    assert_eq!(2 + 2, 4);\n\
+                    +}\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::TestOnly);
+    }
+
+    /// A test-only diff can also live in a file matched by basename glob
+    /// (`*_test.*`, `*.test.*`, `*_spec.*`, `*.spec.*`). Pin that here so
+    /// the glob half of `is_test_path` doesn't silently rot.
+    #[test]
+    fn classify_diff_substance_test_only_basename_glob() {
+        let diff = "diff --git a/src/lib_test.rs b/src/lib_test.rs\n\
+                    --- a/src/lib_test.rs\n\
+                    +++ b/src/lib_test.rs\n\
+                    @@ -1,1 +1,3 @@\n\
+                     pub fn helper() {}\n\
+                    +#[test]\n\
+                    +fn smoke() { assert!(true); }\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::TestOnly);
+    }
+
+    /// A diff with real code in `src/lib.rs` (and no test-file changes)
+    /// must classify as `Substantive`. This is the accept-without-warning
+    /// path.
+    #[test]
+    fn classify_diff_substance_substantive_real_code() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,1 +1,3 @@\n\
+                     pub fn existing() {}\n\
+                    +pub fn added() {\n\
+                    +    println!(\"hi\");\n\
+                    +}\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
+    }
+
+    /// A diff that mixes a non-test source change AND a test change must
+    /// classify as `Substantive` (NOT TestOnly): the test-pattern rule
+    /// only applies when EVERY changed file path is a test path.
+    #[test]
+    fn classify_diff_substance_substantive_when_mixed_paths() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    index 1111..2222 100644\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,1 +1,3 @@\n\
+                     pub fn existing() {}\n\
+                    +pub fn added() {\n\
+                    +    let _ = 1;\n\
+                    +}\n\
+                    diff --git a/crates/foo/tests/bar.rs b/crates/foo/tests/bar.rs\n\
+                    --- a/crates/foo/tests/bar.rs\n\
+                    +++ b/crates/foo/tests/bar.rs\n\
+                    @@ -1,1 +1,2 @@\n\
+                     #[test]\n\
+                    +fn smoke() { assert!(true); }\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
+    }
+
+    /// Truth table for the accept-eligibility predicate. `Substantive`
+    /// and `TestOnly` resolve on green (with a warning for TestOnly);
+    /// the rest is explicitly rejected as anti-gaming.
+    #[test]
+    fn substance_accept_eligible_truth_table() {
+        assert!(substance_accept_eligible(&DiffSubstance::Substantive));
+        assert!(substance_accept_eligible(&DiffSubstance::TestOnly));
+        assert!(!substance_accept_eligible(&DiffSubstance::Empty));
+        assert!(!substance_accept_eligible(&DiffSubstance::WhitespaceOnly));
+        assert!(!substance_accept_eligible(&DiffSubstance::CommentOnly));
     }
 }

@@ -3,7 +3,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-mod codex;
+mod agentic;
 mod goose;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
@@ -669,8 +669,8 @@ async fn main() {
     let res = run().await;
     // When this process is the detached worker of a background job, stamp the
     // job's terminal status from the outcome.
-    if let Some(dir) = codex::active_job_dir() {
-        codex::finalize_job(&dir, res.is_ok());
+    if let Some(dir) = agentic::active_job_dir() {
+        agentic::finalize_job(&dir, res.is_ok());
     }
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
@@ -754,7 +754,7 @@ async fn run() -> anyhow::Result<()> {
             panel,
             background,
         }) => {
-            codex::cmd_review(
+            agentic::cmd_review(
                 &cli,
                 base.clone(),
                 *scope,
@@ -772,7 +772,7 @@ async fn run() -> anyhow::Result<()> {
             background,
             focus,
         }) => {
-            codex::cmd_review(
+            agentic::cmd_review(
                 &cli,
                 base.clone(),
                 *scope,
@@ -783,10 +783,12 @@ async fn run() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Cmd::Rescue { task, background }) => codex::cmd_rescue(&cli, task, *background).await,
-        Some(Cmd::Status { job, all }) => codex::cmd_status(&cli, job.clone(), *all),
-        Some(Cmd::Result { job }) => codex::cmd_result(&cli, job.clone()),
-        Some(Cmd::Cancel { job }) => codex::cmd_cancel(&cli, job.clone()),
+        Some(Cmd::Rescue { task, background }) => {
+            agentic::cmd_rescue(&cli, task, *background).await
+        }
+        Some(Cmd::Status { job, all }) => agentic::cmd_status(&cli, job.clone(), *all),
+        Some(Cmd::Result { job }) => agentic::cmd_result(&cli, job.clone()),
+        Some(Cmd::Cancel { job }) => agentic::cmd_cancel(&cli, job.clone()),
         Some(Cmd::Loop {
             task,
             instructions,
@@ -798,7 +800,7 @@ async fn run() -> anyhow::Result<()> {
             accept_on_green,
             background,
         }) => {
-            codex::cmd_loop(
+            agentic::cmd_loop(
                 &cli,
                 task,
                 instructions.clone(),
@@ -813,7 +815,7 @@ async fn run() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Cmd::Transfer) => codex::cmd_transfer(&cli).await,
+        Some(Cmd::Transfer) => agentic::cmd_transfer(&cli).await,
         Some(Cmd::Session { args }) => cmd_tui(args),
         Some(Cmd::Run {
             text,
