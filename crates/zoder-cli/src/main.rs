@@ -597,6 +597,15 @@ impl Engine {
         let corpus = Corpus::load(&cfg.corpus_path)?;
         Ok(Self { cfg, corpus })
     }
+
+    /// Build an `Engine` from explicit in-memory parts — used by unit tests
+    /// to exercise `resolve_effective_primary` / `resolve_chain` against a
+    /// known `Config` + `Corpus` without touching `$ZODER_HOME`. Production
+    /// callers always use [`Engine::load`].
+    #[cfg(test)]
+    fn from_parts(cfg: Config, corpus: Corpus) -> Self {
+        Self { cfg, corpus }
+    }
 }
 
 /// Quota-aware routing context: a snapshot of (ledger entries, tier catalog)
@@ -1792,10 +1801,12 @@ fn scenario_chain_for_roles(
     // subscription traffic falls through to `decide()`'s headroom path
     // = keep, matching the pre-feed KNEMON contract).
     let snapshot: Option<zoder_core::utilization::RateLimitSnapshot> = (|| {
-        let primary_model = cli
-            .model
-            .clone()
-            .or_else(|| eng.cfg.primary_model.clone())?;
+        // Honor the full precedence (`-m` → per-agent → `primary_model`):
+        // the snapshot's job is to feed KNEMON real headroom for whichever
+        // primary is going to actually run. Using only `cli.model` would
+        // miss the per-agent pin — see the 2026-07-04 regression in
+        // `resolve_chain` / `agentic_turn`.
+        let primary_model = resolve_effective_primary(cli, eng)?;
         let provider = rc.real_provider_for_model(&eng.cfg, &primary_model)?;
         load_snapshot_for(&provider.id, "default", "default")
     })();
@@ -1851,14 +1862,82 @@ fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
     }
 }
 
+/// Resolve the effective PRIMARY model id for the CLI invocation, applying
+/// the precedence order so a per-agent pin or `-m` override ALWAYS wins
+/// over the global `primary_model`. The router then uses this resolved id
+/// as its `pinned_primary` — so the chain it produces (`Route.primary`
+/// followed by `Route.fallbacks`) automatically reflects the precedence.
+///
+/// Resolution precedence (highest first) — regression fix for the
+/// 2026-07-04 bug where `primary_model` globally overrode
+/// `[agents.X].model`:
+///
+///   1. explicit `-m <model>` (per-invocation) wins,
+///   2. `[agents.<alias>].model` for the resolved alias (per-agent pin),
+///   3. `Config::primary_model` (the fallback DEFAULT — never overrides
+///      a per-invocation or per-agent pin),
+///   4. capability/health-ranked auto routing (no pin anywhere).
+///
+/// Returning owned `String` (rather than `&str`) keeps the call site
+/// `let m: Option<String>`-friendly without a clone on the success path
+/// and lets the resolver short-circuit cleanly on each step.
+pub(crate) fn resolve_effective_primary(cli: &Cli, eng: &Engine) -> Option<String> {
+    if let Some(m) = &cli.model {
+        return Some(m.clone());
+    }
+    if let Some(m) = eng.cfg.agent_model(cli.agent.as_deref()) {
+        return Some(m);
+    }
+    eng.cfg.primary_model.clone()
+}
+
+/// `true` when a higher-priority pin (`-m` or `[agents.X].model`) resolved
+/// for this invocation. Used by `agentic_turn` to decide whether to set
+/// `AgentOptions::model_override` so the engine is forced onto the
+/// operator's choice (a non-`Some` model_override would let the alias
+/// fall through to its own default model).
+pub(crate) fn has_explicit_primary_pin(cli: &Cli, eng: &Engine) -> bool {
+    resolve_effective_primary(cli, eng).is_some()
+}
+
 fn resolve_chain(
     cli: &Cli,
     eng: &Engine,
     health: &HealthStore,
 ) -> anyhow::Result<(Vec<String>, String)> {
-    if let Some(m) = &cli.model {
-        return Ok((vec![m.clone()], format!("explicit model {m}")));
+    // Pin precedence (highest first): -m -> [agents.X].model ->
+    // primary_model -> None. `resolve_effective_primary` collapses the
+    // first three into a single owned `Option<String>`.
+    //
+    // When an operator pin is set (per-invocation `-m` or per-agent
+    // `[agents.<alias>].model`) we honor it as the chain head and skip
+    // the scenario layer's candidate rewrite — the operator's pin is
+    // authoritative for the head. The legacy `-m`-only short-circuit is
+    // preserved behaviorally (chain = `[pin]`); this expands it so
+    // `[agents.X].model` is honored identically. The router's
+    // `primary_model` pin still feeds `Route.primary` so the scenario
+    // layer's head replacement cannot overwrite the pin.
+    if let Some(pin) = resolve_effective_primary(cli, eng) {
+        // Track the source so operators can tell WHY a model was chosen
+        // when debugging routing decisions. `primary_model` shows up
+        // here only when no higher-priority pin is set; this branch is
+        // gated by that, so the source annotation is always one of the
+        // higher-priority sources — `primary_model` fallback.
+        let src = if cli.model.is_some() {
+            "explicit -m"
+        } else if eng.cfg.agent_model(cli.agent.as_deref()).is_some() {
+            "per-agent [agents.<alias>].model override"
+        } else {
+            "primary_model fallback"
+        };
+        // No router-driven fallback rewriting under an explicit pin;
+        // match the historical `-m` short-circuit shape so callers that
+        // rely on `chain.len() == 1` keep their contract.
+        let reason = format!("pinned {pin} ({src})");
+        set_last_reviewer_chain(Vec::new()); // reviewer selection is independent
+        return Ok((vec![pin], reason));
     }
+
     // The Router still owns the cross-family free-pool fallback chain
     // (preserving the existing diversity / outage-hedge behavior). We
     // pull its pool, then ask the scenario layer for the per-role head,
@@ -2750,11 +2829,20 @@ pub(crate) async fn agentic_turn(
         EngineKind::Goose => None,
     };
 
-    // Force the daemon to use the operator's explicit choice — an `-m` model or
-    // a configured `primary_model` pin — rather than letting the agent alias
-    // fall through to its own default model. Pure-auto routing (no `-m`, no pin)
-    // keeps `None` so the alias picks its default as before.
-    let model_override = if cli.model.is_some() || eng.cfg.primary_model.is_some() {
+    // Force the daemon to use the operator's explicit choice — `-m`, a
+    // `[agents.<alias>].model` per-agent pin, or a configured `primary_model`
+    // fallback — rather than letting the agent alias fall through to its own
+    // default model. Pure-auto routing (no `-m`, no per-agent override, no
+    // `primary_model`) keeps `None` so the alias picks its default as before.
+    //
+    // `resolve_effective_primary` is the single source of truth for the
+    // precedence order (`-m` → per-agent → `primary_model`); using it here
+    // keeps `agentic_turn` consistent with the chain we already built
+    // above. Regression fix 2026-07-04: the previous
+    // `cli.model.is_some() || primary_model.is_some()` test IGNORED
+    // `[agents.<alias>].model`, so `zoder exec --agent codex` ran the
+    // pinned primary model instead of `[agents.codex].model`.
+    let model_override = if has_explicit_primary_pin(cli, &eng) {
         Some(primary.clone())
     } else {
         None
@@ -6756,6 +6844,418 @@ mod subscription_utilization_render_tests {
         assert!(
             out.contains("as_of="),
             "missing as_of= prefix on disclaimer line in:\n{out}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model-selection precedence (regression 2026-07-04).
+//
+// `primary_model` in config.json must NOT silently override a per-agent
+// `[agents.<alias>].model` pin, and `-m <model>` must win over both. The
+// `reviewer_model` (per-agent + profile-level) must be INDEPENDENT of
+// `primary_model` so an operator can pin a strong cross-family reviewer
+// without touching the author default.
+//
+// These tests construct a minimal in-memory `Engine` via
+// `Engine::from_parts` and exercise `resolve_effective_primary` +
+// `resolve_chain` + `Config::agent_model` / `Config::agent_reviewer_model`
+// directly. They DO NOT touch `$ZODER_HOME` or the network.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use zoder_core::Auth as ProviderAuth;
+    use zoder_core::HealthStore;
+    use zoder_core::{AliasedAgentConfig, Provider};
+
+    /// Build a minimal `Config` with two providers serving different
+    /// prefixes, so `real_provider_for_model` returns a hit and the router
+    /// has non-trivial candidates. The `agents` map is empty by default;
+    /// callers populate it via [`build_cfg_with_agents`].
+    fn fixture_cfg(primary_model: Option<&str>, reviewer_model: Option<&str>) -> Config {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-model-sel-test"));
+        cfg.providers.push(Provider {
+            id: "minimax".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["minimax/".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "nvidia-eih".into(),
+            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec![
+                "nvidia/".into(),
+                "deepseek-ai/".into(),
+                "meta/llama-".into(),
+                "moonshotai/".into(),
+                "z-ai/".into(),
+            ],
+        });
+        cfg.primary_model = primary_model.map(|s| s.to_string());
+        cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
+        cfg
+    }
+
+    /// Build a `Config` with a populated `[agents]` block. `primary_model`
+    /// and `reviewer_model` come from the base fixture so they can be
+    /// set independently. `agents` is keyed by alias and mirrors what an
+    /// operator would write in `config.json`.
+    #[allow(dead_code)]
+    fn build_cfg_with_agents(
+        primary_model: Option<&str>,
+        reviewer_model: Option<&str>,
+        agents: BTreeMap<String, AliasedAgentConfig>,
+    ) -> Config {
+        let mut cfg = fixture_cfg(primary_model, reviewer_model);
+        cfg.agents = agents;
+        cfg
+    }
+
+    /// Build a `Corpus` with three routable free models so the router has
+    /// candidates to fall back to. None are flagged as needing paid — the
+    /// precedence tests don't care about billing, only about which id
+    /// the resolver picks.
+    fn fixture_corpus() -> Corpus {
+        let mk = |id: &str| ModelEntry {
+            id: id.into(),
+            host: "example.com".into(),
+            kind: "chat".into(),
+            free: true,
+            route_candidate: true,
+            agentic_score: Some(0.9),
+            ..Default::default()
+        };
+        Corpus {
+            count: 3,
+            models: vec![
+                mk("minimax/MiniMax-M3"),
+                mk("nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+                mk("deepseek-ai/deepseek-r1"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// `Config::agent_model` returns the per-agent pin when present, `None`
+    /// when the alias has no entry, and `None` when `alias` is `None`. The
+    /// whole point of the regression: this lookup must exist so the
+    /// resolver can apply precedence (2).
+    #[test]
+    fn agent_model_lookup_returns_per_agent_pin_only() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "reviewer-bot".into(),
+            AliasedAgentConfig {
+                model: Some("deepseek-ai/deepseek-r1".into()),
+                ..Default::default()
+            },
+        );
+        cfg.agents = agents;
+
+        // Per-agent pin wins for the matching alias.
+        assert_eq!(
+            cfg.agent_model(Some("codex")).as_deref(),
+            Some("nvidia/llama-3.3-nemotron-super-49b-v1.5")
+        );
+        assert_eq!(
+            cfg.agent_model(Some("reviewer-bot")).as_deref(),
+            Some("deepseek-ai/deepseek-r1")
+        );
+        // Unknown alias: no per-agent pin → caller falls back to
+        // `primary_model`.
+        assert_eq!(cfg.agent_model(Some("nope")), None);
+        // No alias: caller falls back to `primary_model`.
+        assert_eq!(cfg.agent_model(None), None);
+    }
+
+    /// PRIMARY precedence (regression test):
+    ///   `[agents.codex].model` MUST win over `primary_model` when `-m` is
+    ///   unset. Without this, `primary_model` globally overrides every
+    ///   agent's own model (the 2026-07-04 bug). The full chain produced
+    ///   by `resolve_chain` MUST lead with the per-agent pin, not with
+    ///   `primary_model` — the engine receives the chain head, so a
+    ///   mismatch here is the exact regression.
+    #[test]
+    fn primary_agent_model_overrides_primary_model_in_config() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
+                ..Default::default()
+            },
+        );
+        cfg.agents = agents;
+
+        // No `-m`, `--agent codex` — per-agent pin wins over `primary_model`.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "codex"]).unwrap();
+        let eng = Engine::from_parts(cfg.clone(), fixture_corpus());
+        let picked =
+            resolve_effective_primary(&cli, &eng).expect("per-agent override must resolve to Some");
+        assert_eq!(
+            picked, "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+            "per-agent pin must win over primary_model; got {picked}"
+        );
+
+        // The full chain must LEAD with the per-agent pin too — this is
+        // what the engine actually receives (not just what we tagged as
+        // the head).
+        let health = HealthStore::default();
+        let (chain, _) = resolve_chain(&cli, &eng, &health).unwrap();
+        assert_eq!(
+            chain.first().map(|s| s.as_str()),
+            Some("nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+            "resolve_chain must lead with per-agent pin; got chain={chain:?}"
+        );
+    }
+
+    /// PRIMARY precedence (regression test):
+    ///   explicit `-m <model>` MUST win over BOTH the per-agent pin and
+    ///   the `primary_model` fallback (precedence step 1, the highest).
+    #[test]
+    fn primary_minus_m_overrides_per_agent_and_primary_model() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
+                ..Default::default()
+            },
+        );
+        cfg.agents = agents;
+
+        // `-m deepseek-ai/deepseek-r1` with `--agent codex` (which has
+        // its own per-agent pin): -m MUST win.
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--agent",
+            "codex",
+            "-m",
+            "deepseek-ai/deepseek-r1",
+        ])
+        .unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let picked = resolve_effective_primary(&cli, &eng).expect("-m must always resolve to Some");
+        assert_eq!(
+            picked, "deepseek-ai/deepseek-r1",
+            "-m must override per-agent pin AND primary_model; got {picked}"
+        );
+
+        let health = HealthStore::default();
+        let (chain, _) = resolve_chain(&cli, &eng, &health).unwrap();
+        assert_eq!(
+            chain.first().map(|s| s.as_str()),
+            Some("deepseek-ai/deepseek-r1"),
+            "resolve_chain must lead with -m; got chain={chain:?}"
+        );
+    }
+
+    /// PRIMARY precedence (regression test):
+    ///   `primary_model` is the FALLBACK default — when no `-m` and no
+    ///   `[agents.<alias>].model` is set, it wins. This pins the
+    ///   precedence ordering end-to-end: a missing per-agent pin still
+    ///   produces the operator's pinned primary.
+    #[test]
+    fn primary_primary_model_is_the_fallback_when_no_pin_elsewhere() {
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        // No `[agents.codex].model` — `primary_model` must still apply.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "codex"]).unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let picked = resolve_effective_primary(&cli, &eng)
+            .expect("primary_model must resolve when no higher-priority pin is set");
+        assert_eq!(picked, "minimax/MiniMax-M3");
+    }
+
+    /// SECONDARY / REVIEWER precedence (regression test):
+    ///   `[agents.<alias>].reviewer_model` MUST be independent of
+    ///   `primary_model`. An operator can pin a strong cross-family
+    ///   reviewer without touching the author default, and a per-agent
+    ///   reviewer pin wins over the profile-level `reviewer_model`.
+    ///
+    /// We exercise this through `Config::agent_reviewer_model` (the same
+    /// lookup the `complete_once` reviewer resolver uses).
+    #[test]
+    fn reviewer_model_is_independent_of_primary_model() {
+        let mut cfg = fixture_cfg(
+            Some("minimax/MiniMax-M3"),
+            Some("z-ai/glm-5.1"), // profile-level reviewer default
+        );
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
+                reviewer_model: Some("moonshotai/kimi-k2.6".into()),
+            },
+        );
+        cfg.agents = agents;
+
+        // PRIMARY side: per-agent model still wins over primary_model.
+        assert_eq!(
+            cfg.agent_model(Some("codex")).as_deref(),
+            Some("nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+            "primary pin still wins over primary_model"
+        );
+        // SECONDARY side: per-agent reviewer wins over the profile-level
+        // reviewer default, AND is independent of `primary_model`.
+        assert_eq!(
+            cfg.agent_reviewer_model(Some("codex")).as_deref(),
+            Some("moonshotai/kimi-k2.6"),
+            "per-agent reviewer must beat profile-level reviewer"
+        );
+        // Unknown alias: no per-agent reviewer pin.
+        assert_eq!(
+            cfg.agent_reviewer_model(Some("nope")),
+            None,
+            "unknown agent has no per-agent reviewer pin"
+        );
+        // Profile-level `reviewer_model` survives intact, INDEPENDENT of
+        // `primary_model`. The whole point of the fix: an operator can
+        // pin a cross-family reviewer without touching the author
+        // default.
+        assert_eq!(
+            cfg.reviewer_model.as_deref(),
+            Some("z-ai/glm-5.1"),
+            "profile-level reviewer_model stays independent of primary_model={:?}",
+            cfg.primary_model
+        );
+        // The two are NOT the same — primary_model and reviewer_model are
+        // deliberately separate channels.
+        assert_ne!(
+            cfg.primary_model, cfg.reviewer_model,
+            "primary_model and reviewer_model must stay independent"
+        );
+    }
+
+    /// JSON deserialization round-trips the new `agents` map + the
+    /// `reviewer_model` field from `config.json`. This is the wire-format
+    /// guarantee: an operator who writes
+    ///   { "agents": { "codex": { "model": "..." } },
+    ///     "reviewer_model": "..." }
+    /// gets the exact struct the resolver expects. We construct a
+    /// `Config` from defaults, mutate it to include the new fields, then
+    /// serialize + deserialize to prove the wire format survives a round
+    /// trip.
+    #[test]
+    fn config_json_round_trips_agents_and_reviewer_model() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), Some("z-ai/glm-5.1"));
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/gpt-5.5".into()),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "reviewer-bot".into(),
+            AliasedAgentConfig {
+                model: Some("deepseek-ai/deepseek-r1".into()),
+                reviewer_model: Some("moonshotai/kimi-k2.6".into()),
+            },
+        );
+        cfg.agents = agents;
+
+        // Round-trip: serialize, then parse back, then verify the same
+        // lookups succeed. This is the operator's config.json contract:
+        // `agents` and `reviewer_model` survive a write/read cycle.
+        let json = serde_json::to_string(&cfg).expect("serialize config");
+        let roundtripped: Config = serde_json::from_str(&json).expect("deserialize config.json");
+        assert_eq!(
+            roundtripped.primary_model.as_deref(),
+            Some("minimax/MiniMax-M3")
+        );
+        assert_eq!(roundtripped.reviewer_model.as_deref(), Some("z-ai/glm-5.1"));
+        assert_eq!(
+            roundtripped.agent_model(Some("codex")).as_deref(),
+            Some("nvidia/gpt-5.5"),
+            "[agents.codex].model must round-trip"
+        );
+        assert_eq!(
+            roundtripped
+                .agent_reviewer_model(Some("reviewer-bot"))
+                .as_deref(),
+            Some("moonshotai/kimi-k2.6"),
+            "[agents.reviewer-bot].reviewer_model must round-trip"
+        );
+        assert_eq!(
+            roundtripped.agent_model(Some("reviewer-bot")).as_deref(),
+            Some("deepseek-ai/deepseek-r1"),
+            "[agents.reviewer-bot].model must round-trip independently of reviewer_model"
+        );
+    }
+
+    /// `cmd_loop`'s author-turn decision must agree with `resolve_chain`'s
+    /// chain head: the model the engine actually drives is the model
+    /// `agentic_turn` forces via `model_override`, and they both come
+    /// from the same precedence-aware resolver. They cannot diverge
+    /// without re-introducing the 2026-07-04 regression (the bug where
+    /// `agentic_turn`'s `model_override` test was
+    /// `cli.model.is_some() || primary_model.is_some()` and ignored the
+    /// per-agent pin, so the engine received the per-agent pin while the
+    /// daemon was forced onto `primary_model`).
+    #[test]
+    fn cmd_loop_author_turn_resolves_to_per_agent_pin() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
+                ..Default::default()
+            },
+        );
+        cfg.agents = agents;
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "codex"]).unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let health = HealthStore::default();
+
+        // The model the engine actually receives:
+        let (chain, _) = resolve_chain(&cli, &eng, &health).unwrap();
+        let head = chain.first().expect("chain must have a head");
+
+        // The model `agentic_turn` would force via `model_override`:
+        let forced = resolve_effective_primary(&cli, &eng).expect("pin present");
+        let would_force_override = has_explicit_primary_pin(&cli, &eng);
+
+        assert!(
+            would_force_override,
+            "has_explicit_primary_pin must be true when a per-agent pin resolves"
+        );
+        assert_eq!(
+            head, &forced,
+            "chain head ({head:?}) and `agentic_turn`'s forced override \
+             ({forced:?}) MUST agree: both are downstream of \
+             `resolve_effective_primary`. Mismatch would mean the engine \
+             receives one model and the daemon forces another — a silent \
+             regression of the 2026-07-04 bug."
+        );
+        assert_eq!(
+            head, "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+            "head MUST be the per-agent pin, NOT primary_model; got {head:?}"
         );
     }
 }
