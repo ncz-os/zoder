@@ -1,5 +1,7 @@
 # zoder
 
+<p align="center"><img src="docs/img/zoder-logo.png" alt="zoder — pair code · dispatch · remember" width="380"></p>
+
 **The full-stack developer's AI pair-coding and headless coding-dispatch system —
 free-first, cost-governed, MNEMOS-first.**
 
