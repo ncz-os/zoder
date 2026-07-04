@@ -21,7 +21,50 @@ variables:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
-stages: [check, test, security, package, release]
+stages: [corpus, check, test, security, package, release]
+
+# ── corpus: daily model / pricing / bench sync (moved from GitHub Actions) ───────
+# Refreshes the public artifacts that zoder + the tokenomics plugins raw-pull from
+# master: corpus/model_corpus.json, pricing/catalog.json, bench/overlay.json.
+# GitLab is the SINGLE writer to master (source of truth) and mirrors to github, so
+# this must never run on github (its corpus-sync.yml was removed) — otherwise the two
+# masters diverge and the push-mirror stalls. Runs on the daily nightly schedule (and
+# on-demand from the web UI); commits with `-o ci.skip` + [skip ci] so the data commit
+# never re-triggers a pipeline. Needs a masked GITLAB_PUSH_TOKEN CI/CD variable
+# (write_repository) that is allowed to push to master.
+corpus-sync:
+  stage: corpus
+  image: python:3.12
+  needs: []
+  cache: {}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git
+    - pip install --quiet pyyaml
+  script:
+    - mkdir -p bench/raw
+    - |
+      run() { echo "== $1"; python3 "scripts/$1" "${@:2}" || echo "WARN: $1 failed — degrading coverage"; }
+      run fetch-vals-swebench.py   --json bench/raw/vals-swebench.json
+      run fetch-aider-polyglot.py  --json bench/raw/aider-polyglot.json
+      run fetch-arena.py           --out-dir bench/raw
+      run fetch-scale.py           --json bench/raw/scale-seal.json
+      run fetch-terminal-bench.py  --json bench/raw/terminal-bench.json
+    - python3 scripts/build-bench-overlay.py --out-dir .
+    - python3 scripts/build-public-corpus.py --out-dir .
+    - git config user.name "zoder corpus sync"
+    - git config user.email "jperlow@gmail.com"
+    - git add corpus/model_corpus.json pricing/catalog.json bench/overlay.json
+    - |
+      if git diff --cached --quiet; then echo "corpus/pricing unchanged — nothing to commit"; exit 0; fi
+      stamp="$(date -u +%Y-%m-%d)"
+      scored="$(python3 -c "import json;d=json.load(open('corpus/model_corpus.json'));print(d.get('scored','?'),d.get('routable','?'))")"
+      git commit -m "data(corpus): daily sync ${stamp} (scored/routable: ${scored}) [skip ci]"
+      git push -o ci.skip "https://oauth2:${GITLAB_PUSH_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
 
 fmt:
   stage: check
