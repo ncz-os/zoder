@@ -36,8 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{BillingMode, Provider};
 use crate::utilization::{
-    BudgetMode, RateLimitSnapshot, RouteDecision, RouteKnobs, DEFAULT_CAP_GUARD,
-    DEFAULT_USE_TARGET,
+    BudgetMode, RateLimitSnapshot, RouteDecision, RouteKnobs, DEFAULT_CAP_GUARD, DEFAULT_USE_TARGET,
 };
 
 // ---------------------------------------------------------------------------
@@ -392,12 +391,7 @@ pub fn candidate_eligible(
             // `chargeback` IS opting into keeping the sub past the cap,
             // and we should honor that opt-in even when we don't have a
             // remaining-dollar signal in hand.
-            let decision = crate::utilization::decide(
-                &snap,
-                &scenario.knobs(),
-                now,
-                None,
-            );
+            let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
             match decision {
                 RouteDecision::PreferSub | RouteDecision::Chargeback => true,
                 RouteDecision::FallBackToFree => {
@@ -475,10 +469,8 @@ pub fn chain_for_role(
         // Sort candidates of this class by swe_rank descending so we walk
         // them in capability order. Eligibility is per-(class, role); sub
         // candidates pass the KNEMON gate, paid requires both flags.
-        let mut ranked: Vec<&RoutableCandidate> = candidates
-            .iter()
-            .filter(|c| c.class == *class)
-            .collect();
+        let mut ranked: Vec<&RoutableCandidate> =
+            candidates.iter().filter(|c| c.class == *class).collect();
         ranked.sort_by(|a, b| {
             b.swe_rank
                 .partial_cmp(&a.swe_rank)
@@ -606,8 +598,14 @@ mod tests {
     #[test]
     fn balanced_is_the_default_and_matches_doc_spec() {
         let s = RouteScenario::balanced();
-        assert_eq!(s.primary_classes, vec![ProviderClass::Free, ProviderClass::Sub]);
-        assert_eq!(s.reviewer_classes, vec![ProviderClass::Sub, ProviderClass::Free]);
+        assert_eq!(
+            s.primary_classes,
+            vec![ProviderClass::Free, ProviderClass::Sub]
+        );
+        assert_eq!(
+            s.reviewer_classes,
+            vec![ProviderClass::Sub, ProviderClass::Free]
+        );
         assert_eq!(s.use_target, 80.0);
         assert_eq!(s.cap_guard, 85.0);
         assert_eq!(s.budget_mode, BudgetMode::Block);
@@ -619,7 +617,10 @@ mod tests {
     fn economy_preset_spec() {
         let s = RouteScenario::economy();
         assert_eq!(s.primary_classes, vec![ProviderClass::Free]);
-        assert_eq!(s.reviewer_classes, vec![ProviderClass::Free, ProviderClass::Sub]);
+        assert_eq!(
+            s.reviewer_classes,
+            vec![ProviderClass::Free, ProviderClass::Sub]
+        );
         assert_eq!(s.use_target, 50.0);
         assert_eq!(s.cap_guard, 60.0);
         assert!(!s.allow_paid);
@@ -628,7 +629,10 @@ mod tests {
     #[test]
     fn aggressive_preset_spec() {
         let s = RouteScenario::aggressive();
-        assert_eq!(s.primary_classes, vec![ProviderClass::Sub, ProviderClass::Free]);
+        assert_eq!(
+            s.primary_classes,
+            vec![ProviderClass::Sub, ProviderClass::Free]
+        );
         assert_eq!(s.use_target, 90.0);
         assert_eq!(s.cap_guard, 95.0);
         assert!(!s.allow_paid);
@@ -670,14 +674,8 @@ mod tests {
         ];
         // Primary: economy classes = [free] -> sub ineligible even with
         // headroom. The free candidate wins.
-        let pick = pick_candidate_for_role(
-            Role::Primary,
-            &cands,
-            &scenario,
-            Some(&snap),
-            false,
-            now(),
-        );
+        let pick =
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now());
         assert_eq!(pick.as_deref(), Some("free-a"));
     }
 
@@ -702,25 +700,13 @@ mod tests {
                 c
             })
             .collect();
-        let pick = pick_candidate_for_role(
-            Role::Primary,
-            &cands,
-            &scenario,
-            Some(&snap),
-            false,
-            now(),
-        );
+        let pick =
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now());
         // Economy primary classes = [free] -> sub is ineligible per role.
         // Reviewer role: economy allows sub, and free is unhealthy ->
         // sub wins.
-        let pick_reviewer = pick_candidate_for_role(
-            Role::Reviewer,
-            &cands,
-            &scenario,
-            Some(&snap),
-            false,
-            now(),
-        );
+        let pick_reviewer =
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now());
         assert_eq!(pick_reviewer.as_deref(), Some("sub-a"));
         assert_eq!(pick, None, "primary has no eligible free");
     }
@@ -736,28 +722,14 @@ mod tests {
         // Reviewer classes = [sub, free] -> sub wins even though a
         // higher-ranked free exists.
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("sub-a")
         );
         // Primary: free first -> wins on rank.
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("free-a")
         );
     }
@@ -773,15 +745,8 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 50.0), // higher swe_rank, but dropped
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("free-a"),
             "sub over cap_guard must fall back to free for reviewer"
         );
@@ -797,27 +762,13 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 80.0),
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("sub-a")
         );
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("sub-a")
         );
     }
@@ -832,15 +783,8 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 50.0),
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("free-a"),
             "sub over cap_guard must fall back to free"
         );
@@ -903,31 +847,15 @@ mod tests {
         // Reviewer classes for unlimited are [Sub, Paid, Free]. No Sub
         // and no Free in the candidate set -> Paid is the only eligible
         // class, so Paid wins.
-        let cands = vec![
-            candidate("paid-a", ProviderClass::Paid, 50.0),
-        ];
+        let cands = vec![candidate("paid-a", ProviderClass::Paid, 50.0)];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                true,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), true, now())
+                .as_deref(),
             Some("paid-a")
         );
         // Runtime flag false -> paid is ineligible -> None.
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            ),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now()),
             None
         );
     }
@@ -944,15 +872,8 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 50.0),
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&snap),
-                true,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), true, now())
+                .as_deref(),
             Some("sub-a"),
             "chargeback mode keeps the sub past cap_guard"
         );
@@ -969,15 +890,8 @@ mod tests {
         ];
         // Reviewer with no snapshot -> KNEMON returns headroom -> sub wins.
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                None,
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, None, false, now())
+                .as_deref(),
             Some("sub-a")
         );
     }
@@ -993,15 +907,8 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 80.0),
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&stale),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&stale), false, now())
+                .as_deref(),
             Some("sub-a"),
             "a past-reset snapshot must yield headroom"
         );
@@ -1022,15 +929,8 @@ mod tests {
         ];
         // Reviewer: sub wins because free is unhealthy.
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("sub-a")
         );
     }
@@ -1040,7 +940,7 @@ mod tests {
         let snap = snapshot_with_used(99.0, None); // sub at cap
         let cands = vec![
             candidate("free-a", ProviderClass::Free, 99.0), // not in primary classes
-            candidate("sub-a", ProviderClass::Sub, 50.0),    // dropped by KNEMON
+            candidate("sub-a", ProviderClass::Sub, 50.0),   // dropped by KNEMON
         ];
         // Primary role with economy has [free] only — wait, free IS in
         // primary classes, so free-a wins. Use a scenario with no free to
@@ -1050,14 +950,7 @@ mod tests {
             ..RouteScenario::economy()
         };
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Primary,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            ),
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now()),
             None
         );
     }
@@ -1073,15 +966,8 @@ mod tests {
             candidate("sub-a", ProviderClass::Sub, 80.0),
         ];
         assert_eq!(
-            pick_candidate_for_role(
-                Role::Reviewer,
-                &cands,
-                &scenario,
-                Some(&snap),
-                false,
-                now()
-            )
-            .as_deref(),
+            pick_candidate_for_role(Role::Reviewer, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
             Some("sub-a"),
             "reviewer class preference must override rank"
         );
