@@ -28,6 +28,7 @@ pub mod quota;
 pub mod reconcile;
 pub mod report;
 pub mod router;
+pub mod scenarios;
 pub mod session;
 pub mod subscription_tiers;
 pub mod update;
@@ -65,6 +66,11 @@ pub use quota::{amortized_per_call, plan_usage, window_usage, WindowUsage};
 pub use reconcile::{anthropic_costs, openai_costs, ReconResult};
 pub use report::{build_report, build_report_from_entries, Bucket, Gran, Report, RowByModel};
 pub use router::{Route, Router, Tier};
+pub use scenarios::{
+    chain_for_role, classify as classify_provider, default_scenarios, pick_candidate_for_role,
+    resolve_active, candidate_eligible, ProviderClass, Role as ScenarioRole, RouteScenario,
+    RoutableCandidate,
+};
 pub use session::Session;
 pub use subscription_tiers::{
     load_tier_catalog, resolve_plan_windows, Confidence, ProviderTiers, ResolveSource,
