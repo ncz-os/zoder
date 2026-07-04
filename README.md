@@ -160,9 +160,10 @@ Paid models are never reached by accident: they are off by default and require
 an explicit opt-in.
 
 To route a subscription model first and fall back to a *different* provider's
-free models (e.g. MiniMax-M3, then NVIDIA EIH's free open-weight NIMs), see
+free models (e.g. a subscription model first, then another provider's free
+open-weight endpoints), see
 [docs/PROVIDER-ROUTING.md](docs/PROVIDER-ROUTING.md): per-model `serves` routing,
-a pinned `primary_model`, and free-NIM ingestion via `zoder refresh`.
+a pinned `primary_model`, and free open-weight ingestion via `zoder refresh`.
 
 ---
 
@@ -212,26 +213,10 @@ doubling cost buys little on easy/medium work. Simultaneity is opt-in: a
 resilience fallback when one engine is degraded, or an ensemble for the hardest
 tasks.
 
-```
-                         ┌──────────────────────────────────────────────┐
-                         │  zoder — engine-agnostic governance layer      │
-                         │  corpus · free-first router · policy gate ·    │
-                         │  health · cost ledger · review/fix loop        │
-                         └───────────────┬──────────────────────────────┘
-                                         │  one ACP transport abstraction
-                       ┌─────────────────┴──────────────────┐
-                       │ --engine zeroclaw       --engine goose
-                       ▼                                     ▼
-        ┌───────────────────────────┐         ┌───────────────────────────┐
-        │ ZeroClaw engine (daemon)  │         │ Goose (`goose acp`)        │
-        │ ACP over Unix socket      │         │ ACP over stdio subprocess  │
-        │ resident sessions · agents│         │ MCP extensions · recipes   │
-        │ networked session backends│         │ Zed/JetBrains/VSCode interop│
-        └─────────────┬─────────────┘         └─────────────┬─────────────┘
-                      └──────────────┬──────────────────────┘
-                                     ▼
-                 free-first provider pool (MiniMax subscription → NVIDIA EIH NIMs → …)
-```
+The [**systems-architecture diagram**](#systems-architecture) below shows both
+engines sitting under zoder's one ACP transport abstraction: `--engine zeroclaw`
+(daemon, ACP over a Unix socket) and `--engine goose` (`goose acp`, ACP over a
+stdio subprocess), governed identically and fed by the free-first provider pool.
 
 ### Goose is bundled *core*, not the kitchen sink
 
@@ -270,9 +255,6 @@ widening (it is the gate that the feature set still drives a live turn).
 > Verified: goose core's own test suite passes on the lean feature set (1423/1423
 > library tests, ACP module included); the one feature-conditioned snapshot
 > (`code-mode`) passes once that feature is re-enabled.
-
-> The `docs/architecture.svg` asset predates the dual-engine work and still shows
-> a single engine; regenerate it to match the diagram above.
 
 ---
 
