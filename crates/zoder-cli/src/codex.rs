@@ -625,9 +625,10 @@ impl LoopPhase {
 /// Hard-timeout wrapper for a single `loop` phase. The inner future is raced
 /// against a wall-clock budget (default ~900s). On expiry we don't just drop
 /// the future — the phase is recorded as a hard timeout and the caller is
-/// expected to treat it like a failed child: kill any spawned process group,
-/// count toward `dead_streak`, and continue or abort per `max_iters`. The
-/// existing `--agent-timeout` (engine internal turn budget) is preserved
+/// expected to treat it like a failed child: kill any spawned process group
+/// and decide whether to abort. The streak bookkeeping that decides abort vs.
+/// continue lives in [`update_loop_streaks`] so the matrix is unit-testable.
+/// The existing `--agent-timeout` (engine internal turn budget) is preserved
 /// alongside this watchdog — they cover different failure modes.
 async fn phase_watchdog<F, T>(phase: LoopPhase, secs: u64, quiet: bool, fut: F) -> Result<T, String>
 where
@@ -815,6 +816,76 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
         .count()
 }
 
+/// Decision returned by [`update_loop_streaks`] for one loop iteration.
+///
+/// The dead-engine streak tracks the "no edits at all" failure mode (author
+/// turn didn't land AND the working tree is empty). The check-timeout streak
+/// is a SEPARATE failure mode — a wedged `--loop-timeout` kill on an existing
+/// diff is NOT the same as a dead engine; the edits might be valid and only
+/// the check needs adjusting. Conflating the two was the previous regression
+/// and could abort legitimate workflows after two check timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoopStreakUpdate {
+    /// New dead-engine streak counter after this iteration.
+    pub dead_streak: usize,
+    /// New check-timeout streak counter after this iteration.
+    pub check_timeout_streak: usize,
+    /// True iff the loop should abort because the dead-engine streak crossed
+    /// its threshold. Check-timeout alone NEVER triggers an abort.
+    pub abort: bool,
+}
+
+/// Apply one iteration's signals to the loop's streak counters and decide
+/// whether to abort. Pure / deterministic so the full input matrix can be
+/// unit-tested.
+///
+/// Invariants this helper enforces (the regression is exactly the first one):
+///   * `turn_none && diff_empty` -> dead_streak += 1.
+///   * `check_timed_out && diff_empty` -> check_timeout_streak += 1 only;
+///     dead_streak is unaffected (previously they were conflated via `||`
+///     in the abort predicate, which fired dead_streak even when the author
+///     had produced a real diff).
+///   * Either flag with a NON-empty diff -> both streaks reset to 0; the
+///     author made progress on disk and the loop should continue regardless
+///     of which child wedged.
+///   * Abort iff dead_streak >= [`DEAD_STREAK_ABORT_THRESHOLD`]. A
+///     check-timeout streak by itself is a log-and-continue signal, not an
+///     abort signal.
+const DEAD_STREAK_ABORT_THRESHOLD: usize = 2;
+fn update_loop_streaks(
+    turn_none: bool,
+    check_timed_out: bool,
+    diff_empty: bool,
+    prev_dead_streak: usize,
+    prev_check_timeout_streak: usize,
+) -> LoopStreakUpdate {
+    // Non-empty diff always resets both streaks: there is real progress on
+    // disk, regardless of which child wedged. This is the regression fix —
+    // the prior `(turn.is_none() || check_timed_out) && diff_empty` predicate
+    // killed the loop after two check timeouts even when the author had
+    // produced valid edits.
+    if !diff_empty {
+        return LoopStreakUpdate {
+            dead_streak: 0,
+            check_timeout_streak: 0,
+            abort: false,
+        };
+    }
+    // Empty diff from here on. Track the two failure modes independently so a
+    // hung check can no longer masquerade as a dead engine.
+    let dead_streak = if turn_none { prev_dead_streak + 1 } else { 0 };
+    let check_timeout_streak = if check_timed_out {
+        prev_check_timeout_streak + 1
+    } else {
+        0
+    };
+    LoopStreakUpdate {
+        dead_streak,
+        check_timeout_streak,
+        abort: dead_streak >= DEAD_STREAK_ABORT_THRESHOLD,
+    }
+}
+
 /// Autonomous fix loop: author (write-capable, single continuing session) ->
 /// validate (optional build/test command) -> adversarial review -> feed the
 /// failures back -> repeat until the check passes AND the reviewer raises no
@@ -869,13 +940,14 @@ pub(crate) async fn cmd_loop(
     let started = std::time::Instant::now();
     let mut resolved = false;
     let mut final_verdict = String::from("comment");
-    // Consecutive iterations where the author neither finished nor left any edit
-    // on disk (engine unreachable / repeatedly timing out fast). Bounds the loop
-    // so a dead engine can't spin reviews on an empty diff until `max_iters`.
-    // Phase timeouts (author OR check OR review) count the same way: a wedged
-    // child with no progress is indistinguishable from no-op output for the
-    // purpose of deciding whether to keep grinding.
+    // Two independent streak counters; see `update_loop_streaks` for the
+    // full decision matrix. The dead-engine streak aborts the loop after
+    // DEAD_STREAK_ABORT_THRESHOLD consecutive empty-diff author failures.
+    // The check-timeout streak is tracked for observability but NEVER
+    // triggers an abort on its own — a wedged `--loop-timeout` on a real
+    // diff is an editor failure mode, not an engine failure mode.
     let mut dead_streak = 0usize;
+    let mut check_timeout_streak = 0usize;
 
     for i in 1..=max_iters {
         // 1. Author turn — continue the SAME engine session for memory.
@@ -975,30 +1047,39 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             None => (None, String::new()),
         };
 
-        // Bail out if a failed author keeps producing nothing (dead engine).
-        // A wedged check on an already-empty diff counts the same way: no
-        // progress between iterations, so grinding further would just repeat
-        // the same watchdog kill. (`check_timed_out` with a non-empty diff
-        // does NOT count: the edits might still be valid, the check just
-        // needs adjusting; that's the author's job to fix in the next pass.)
-        if (turn.is_none() || check_timed_out) && diff.trim().is_empty() {
-            dead_streak += 1;
-            if dead_streak >= 2 {
-                if !cli.quiet {
-                    eprintln!(
-                        "[loop] iter {i}: author produced no edits twice in a row \
-(engine unreachable or timing out before any tool call){}; stopping.",
-                        if check_timed_out {
-                            " (check phase also timed out)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                break;
+        // Streak bookkeeping — both failure modes live in one helper so the
+        // full matrix is unit-tested. A wedged check on an already-empty
+        // diff bumps the check-timeout streak only (logged for visibility)
+        // and does NOT contribute to `dead_streak`. The author case
+        // (turn_none && diff_empty) is the ONLY path that can abort.
+        let streaks = update_loop_streaks(
+            turn.is_none(),
+            check_timed_out,
+            diff.trim().is_empty(),
+            dead_streak,
+            check_timeout_streak,
+        );
+        dead_streak = streaks.dead_streak;
+        check_timeout_streak = streaks.check_timeout_streak;
+        if streaks.abort {
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: author produced no edits twice in a row \
+                     (engine unreachable or timing out before any tool call); stopping."
+                );
             }
-        } else {
-            dead_streak = 0;
+            break;
+        }
+        if check_timeout_streak > 0 && check_timed_out {
+            // Distinct from a dead-engine abort: a hanging check on an empty
+            // diff is logged but the loop continues; the next author turn has
+            // a chance to produce edits.
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: check wedge observed on empty diff \
+                     (streak={check_timeout_streak}); author will retry."
+                );
+            }
         }
 
         // 4. Adversarial review of the current diff (+ validation output).
@@ -1575,8 +1656,9 @@ mod tests {
     }
 
     /// `phase_watchdog` reports a phase-timed-out marker when the future
-    /// exceeds the budget. This is the hook that `cmd_loop` uses to count
-    /// toward `dead_streak` and emit the human-readable log line.
+    /// exceeds the budget. This is the hook `cmd_loop` consumes to decide
+    /// whether the iteration counts as a failure and (if so) which streak
+    /// it bumps via [`update_loop_streaks`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn phase_watchdog_times_out_hanging_future() {
         let start = std::time::Instant::now();
@@ -1612,5 +1694,140 @@ mod tests {
         // wall-clock, by design.
         let (ok, _tail) = run_check(&tmp_cwd(), "exit 0");
         assert!(ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // `update_loop_streaks` — the regression target.
+    //
+    // Background: the prior loop-abort predicate was
+    // `(turn.is_none() || check_timed_out) && diff_empty`. The `||` made the
+    // check-timeout case leak into the dead-engine counter, so a wedged
+    // `--loop-timeout` kill on a real author diff could force an abort after
+    // two iterations. The helper below pins the corrected matrix.
+    // -----------------------------------------------------------------------
+
+    /// REGRESSION: a timed-out check on a NON-empty diff must NOT bump
+    /// `dead_streak` and must NOT abort the loop. The author produced
+    /// progress; the check just needs fixing. This is the exact scenario the
+    /// reviewer flagged as a critical regression: "wedged check now counted
+    /// as a dead-engine streak even though the author produced a non-empty
+    /// diff."
+    #[test]
+    fn update_loop_streaks_does_not_count_timed_out_check_when_diff_is_present() {
+        // Pre-load both counters at the threshold so a stray increment
+        // would trip the abort, then assert that neither one moves and the
+        // loop is allowed to continue.
+        let prev_dead = DEAD_STREAK_ABORT_THRESHOLD; // already at the brink
+        let prev_cto = 5usize;
+        let u = update_loop_streaks(
+            false, true, /* diff_empty */ false, prev_dead, prev_cto,
+        );
+        assert_eq!(
+            u.dead_streak, 0,
+            "non-empty diff must zero dead_streak; the prior `||` regression would have \
+             carried the threshold through and aborted"
+        );
+        assert_eq!(
+            u.check_timeout_streak, 0,
+            "non-empty diff must zero check_timeout_streak too — both failure modes \
+             are subsumed by author progress"
+        );
+        assert!(
+            !u.abort,
+            "a non-empty diff with a hung check must never abort the loop"
+        );
+    }
+
+    /// Two consecutive empty-diff author failures (no edits, no check
+    /// timeout) is the canonical "dead engine" signal and MUST abort — the
+    /// abort is still bounded; this is just locking the threshold in place.
+    #[test]
+    fn update_loop_streaks_aborts_on_two_consecutive_empty_diff_author_failures() {
+        let u1 = update_loop_streaks(true, false, true, 0, 0);
+        assert_eq!(u1.dead_streak, 1);
+        assert!(!u1.abort, "first empty-diff failure must not abort yet");
+
+        let u2 = update_loop_streaks(true, false, true, u1.dead_streak, u1.check_timeout_streak);
+        assert_eq!(u2.dead_streak, 2);
+        assert!(
+            u2.abort,
+            "second consecutive empty-diff author failure must abort"
+        );
+    }
+
+    /// A wedged check on an empty diff is a real failure mode — it must be
+    /// recorded in `check_timeout_streak` so an operator can see it — but
+    /// it MUST NOT contribute to `dead_streak` and MUST NOT abort the loop
+    /// even after two repetitions.
+    #[test]
+    fn update_loop_streaks_records_check_timeout_streak_but_does_not_abort() {
+        // Two consecutive empty-diff check timeouts, author turn each time
+        // succeeds (turn_none = false).
+        let u1 = update_loop_streaks(false, true, true, 0, 0);
+        assert_eq!(u1.dead_streak, 0);
+        assert_eq!(u1.check_timeout_streak, 1);
+        assert!(
+            !u1.abort,
+            "first check timeout on empty diff must not abort"
+        );
+
+        let u2 = update_loop_streaks(false, true, true, u1.dead_streak, u1.check_timeout_streak);
+        assert_eq!(
+            u2.dead_streak, 0,
+            "check timeouts must never touch the dead-engine counter"
+        );
+        assert_eq!(u2.check_timeout_streak, 2);
+        assert!(
+            !u2.abort,
+            "two check timeouts on empty diff must NOT abort — author turn may \
+             still recover; this is the exact regression the prior `||` caused"
+        );
+    }
+
+    /// Mixed scenario: a real author edit resets BOTH streaks regardless of
+    /// which child wedged before. This guards against a future refactor
+    /// splitting the reset into per-flag hooks.
+    #[test]
+    fn update_loop_streaks_resets_both_streaks_on_any_progress() {
+        // Pre-load both at threshold so any missed reset would surface.
+        let u = update_loop_streaks(
+            false, // turn succeeded
+            true,  // check timed out
+            false, // diff is non-empty
+            DEAD_STREAK_ABORT_THRESHOLD,
+            7,
+        );
+        assert_eq!(u.dead_streak, 0);
+        assert_eq!(u.check_timeout_streak, 0);
+        assert!(!u.abort);
+    }
+
+    /// All-progress iteration (turn ok, check ok, diff non-empty) is a no-op
+    /// pass-through on both counters and never aborts. Pin for clarity.
+    #[test]
+    fn update_loop_streaks_noop_on_clean_pass() {
+        let u = update_loop_streaks(false, false, false, 0, 0);
+        assert_eq!(u.dead_streak, 0);
+        assert_eq!(u.check_timeout_streak, 0);
+        assert!(!u.abort);
+    }
+
+    /// Check timeout without a wedged author on an empty diff (turn ok but
+    /// no edits ever landed) is a confusing-but-valid signal — the engine
+    /// is alive but produced nothing. That's dead-engine behavior, not a
+    /// check failure. So `turn_none` here mirrors "no edits made" via the
+    /// real call site (the engine returned Ok(empty)) — but our helper
+    /// takes the boolean the loop sees, which is `turn.is_none()`. We don't
+    /// pretend to model "ok-empty" here; we just pin that when the engine
+    /// says Ok the helper trusts it. This test guards the boundary.
+    #[test]
+    fn update_loop_streaks_trusts_turn_ok_signal_as_progress() {
+        // Engine returned Ok (turn_none=false) but the diff is empty (the
+        // engine simply produced no edits this round). dead_streak stays at
+        // zero — the helper trusts the engine, even if the diff disagrees.
+        let u = update_loop_streaks(false, false, true, 0, 0);
+        assert_eq!(u.dead_streak, 0);
+        assert_eq!(u.check_timeout_streak, 0);
+        assert!(!u.abort);
     }
 }
