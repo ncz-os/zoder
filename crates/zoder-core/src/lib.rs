@@ -67,9 +67,9 @@ pub use reconcile::{anthropic_costs, openai_costs, ReconResult};
 pub use report::{build_report, build_report_from_entries, Bucket, Gran, Report, RowByModel};
 pub use router::{Route, Router, Tier};
 pub use scenarios::{
-    chain_for_role, classify as classify_provider, default_scenarios, pick_candidate_for_role,
-    resolve_active, candidate_eligible, ProviderClass, Role as ScenarioRole, RouteScenario,
-    RoutableCandidate,
+    candidate_eligible, chain_for_role, classify as classify_provider, default_scenarios,
+    pick_candidate_for_role, resolve_active, ProviderClass, Role as ScenarioRole,
+    RoutableCandidate, RouteScenario,
 };
 pub use session::Session;
 pub use subscription_tiers::{

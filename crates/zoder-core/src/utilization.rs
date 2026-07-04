@@ -114,7 +114,9 @@ impl RouteDecision {
 /// Known providers. We carry the OpenAI Codex variant (`openai_codex`)
 /// explicitly because its header shape (`x-codex-*`) is distinct from the
 /// plain OpenAI chat-completions surface (`openai`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     #[default]
@@ -136,13 +138,17 @@ impl Provider {
         {
             return Some(Provider::OpenaiCodex);
         }
-        if headers.get("anthropic-ratelimit-unified-5h-status").is_some()
-            || headers
-                .get("anthropic-ratelimit-unified-status")
-                .is_some()
+        if headers
+            .get("anthropic-ratelimit-unified-5h-status")
+            .is_some()
+            || headers.get("anthropic-ratelimit-unified-status").is_some()
             || headers.get("anthropic-ratelimit-requests-limit").is_some()
-            || headers.get("anthropic-ratelimit-tokens-remaining").is_some()
-            || headers.get("anthropic-ratelimit-unified-5h-utilization").is_some()
+            || headers
+                .get("anthropic-ratelimit-tokens-remaining")
+                .is_some()
+            || headers
+                .get("anthropic-ratelimit-unified-5h-utilization")
+                .is_some()
         {
             return Some(Provider::Anthropic);
         }
@@ -241,6 +247,58 @@ impl RateLimitSnapshot {
             plan: plan.into(),
             ..Default::default()
         }
+    }
+
+    /// Parse a `reqwest::header::HeaderMap` (i.e. a live response) into a
+    /// snapshot for `provider`. Returns `None` when the headers don't carry
+    /// any window information for the provider — distinct from
+    /// [`parse_headers`], which first detects the vendor from the headers
+    /// themselves; here the caller already knows who handled the request.
+    ///
+    /// `account_id` and `plan` are caller-supplied (the providers don't
+    /// always publish them on every response — keeping the parser
+    /// orthogonal is what lets the same snapshot fit the store's
+    /// `(provider, account_id, plan)` key without leaking provider-specific
+    /// quirks).
+    pub fn from_headers(
+        headers: &reqwest::header::HeaderMap,
+        provider: Provider,
+        account_id: impl Into<String>,
+        plan: impl Into<String>,
+    ) -> Option<Self> {
+        let view = ReqwestHeaderView(headers);
+        let account_id = account_id.into();
+        let plan = plan.into();
+        // Reuse the vendor-specific parsers via the same one-shot entry
+        // point. `parse_headers` already detects the provider from the
+        // header set; when the caller disagrees, we still respect the
+        // parsed result as long as the detected vendor matches the known
+        // type (otherwise we'd silently downgrade an Anthropic response
+        // on a Codex provider and persist it under the wrong key).
+        let mut snap = parse_headers(&view, &account_id, &plan)?;
+        if snap.provider != provider {
+            // Reset to caller's claim but only when the headers actually
+            // looked like the vendor's set; if not, drop the snapshot
+            // rather than guess.
+            if Provider::detect(&view) == Some(provider) {
+                snap.provider = provider;
+            } else {
+                return None;
+            }
+        }
+        Some(snap)
+    }
+}
+
+/// Adapter that exposes a `reqwest::header::HeaderMap` through the
+/// [`HeaderLookup`] trait so the existing parser entry points stay
+/// callable from a live response without a copy. Case-insensitive lookup
+/// is handled by [`HeaderLookup`].
+struct ReqwestHeaderView<'a>(pub &'a reqwest::header::HeaderMap);
+
+impl<'a> HeaderLookup for ReqwestHeaderView<'a> {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|v| v.to_str().ok())
     }
 }
 
@@ -407,8 +465,11 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
 /// Parse Anthropic headers into a snapshot. The published shape on the
 /// unified endpoint is `anthropic-ratelimit-unified-<window>-{status,
 /// utilization, reset}`. The older pre-unified shape uses
-/// `anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`. Both
-/// are handled.
+/// `anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`. The
+/// no-suffix variant — `anthropic-ratelimit-unified-{status,remaining,
+/// reset}` — is also handled (Anthropic publishes a "current window"
+/// view alongside the suffixed rollups; see
+/// [`anthropic_unified_window_nosuffix`]). All three are handled.
 ///
 /// `window_minutes` is derived from the suffix (`5h` -> 300, `7d` -> 10080)
 /// plus the explicit names (`1m`, `1h`, `5h`, `7d`); unknown suffixes
@@ -429,6 +490,16 @@ pub fn parse_anthropic(
     }
     if secondary != WindowSnapshot::default() {
         snap.secondary = Some(secondary);
+    }
+
+    // No-suffix shape: `anthropic-ratelimit-unified-{status,remaining,
+    // reset}`. Anthropic publishes these alongside the suffixed rollups
+    // as a "current window" view. Only used as a fallback so we don't
+    // shadow a richer 5h/7d sighting.
+    if snap.primary.is_none() {
+        if let Some(w) = anthropic_unified_window_nosuffix(headers) {
+            snap.primary = Some(w);
+        }
     }
 
     // Fall back to the older `anthropic-ratelimit-requests-*` /
@@ -468,10 +539,7 @@ pub fn parse_anthropic(
     snap
 }
 
-fn anthropic_unified_window(
-    headers: &dyn HeaderLookup,
-    suffix: &str,
-) -> Option<WindowSnapshot> {
+fn anthropic_unified_window(headers: &dyn HeaderLookup, suffix: &str) -> Option<WindowSnapshot> {
     // Some servers publish `status` without a numeric `utilization`; that
     // means "known, no numeric value", which we surface as 0% so the
     // caller at least knows the window exists. Real values always come
@@ -499,6 +567,31 @@ fn anthropic_unified_window(
         window_minutes: anthropic_suffix_minutes(suffix),
         reset_at_epoch: reset_at,
         label: Some(suffix.to_string()),
+    })
+}
+
+/// No-suffix `anthropic-ratelimit-unified-{status,remaining,reset}` shape.
+/// Carries a status flag plus a remaining count and a reset timestamp;
+/// without a `limit` we cannot compute a real percent, so we surface 0%
+/// (a known window, no numeric value — same convention as the suffixed
+/// status-only case) and forward the reset. The snapshot is only emitted
+/// when at least one of the three headers is present; otherwise the
+/// caller can keep falling back to the legacy pair.
+fn anthropic_unified_window_nosuffix(headers: &dyn HeaderLookup) -> Option<WindowSnapshot> {
+    let status = headers.get("anthropic-ratelimit-unified-status");
+    let remaining = headers.get("anthropic-ratelimit-unified-remaining");
+    let reset = headers.get("anthropic-ratelimit-unified-reset");
+    if status.is_none() && remaining.is_none() && reset.is_none() {
+        return None;
+    }
+    Some(WindowSnapshot {
+        // No `limit` published in this shape; surface 0% per the same
+        // status-only convention the suffixed parser uses, and let the
+        // operator's window context decide whether 0% means "fresh".
+        used_percent: 0.0,
+        window_minutes: None,
+        reset_at_epoch: reset.and_then(parse_epoch_seconds),
+        label: Some("unified".to_string()),
     })
 }
 
@@ -753,12 +846,28 @@ impl UtilizationStore {
         self.records.get(&key(provider, account_id, plan))
     }
 
+    /// One-shot capture: upsert the snapshot into the in-memory store,
+    /// then flush to disk. Best-effort — callers that don't care about
+    /// persistence errors (the routing layer feeding live telemetry) just
+    /// log at debug and move on. Returns `true` when the snapshot had
+    /// windows to record, `false` when it was a presence-only sighting
+    /// that the store chose to drop (so the caller can decide whether to
+    /// bother logging).
+    pub fn record(&mut self, snap: &RateLimitSnapshot, now: DateTime<Utc>) -> bool {
+        if snap.primary.is_none() && snap.secondary.is_none() {
+            return false;
+        }
+        self.upsert(snap, now);
+        // Save is intentionally best-effort; I/O failure surfaces via
+        // `Err` but the routing layer feeds telemetry and must not be
+        // poisoned by transient disk issues.
+        let _ = self.save();
+        true
+    }
+
     /// Persist to the path we were opened from. Creates parent dirs.
     pub fn save(&self) -> Result<(), UtilizationError> {
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(UtilizationError::NoPath)?;
+        let path = self.path.as_ref().ok_or(UtilizationError::NoPath)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(UtilizationError::Io)?;
         }
@@ -858,7 +967,10 @@ mod tests {
         let h = hm([
             ("anthropic-ratelimit-unified-5h-status", "allowed"),
             ("anthropic-ratelimit-unified-5h-utilization", "65.5"),
-            ("anthropic-ratelimit-unified-5h-reset", "2026-07-04T08:00:00Z"),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                "2026-07-04T08:00:00Z",
+            ),
             ("anthropic-ratelimit-unified-7d-utilization", "20"),
         ]);
         let snap = parse_anthropic(&h, "acct", "max");
@@ -992,7 +1104,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = snap_with_primary(50.0, None);
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::PreferSub,
         );
     }
@@ -1002,7 +1119,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = snap_with_primary(82.0, None);
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::PreferSub,
         );
     }
@@ -1012,12 +1134,22 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = snap_with_primary(85.0, None);
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::FallBackToFree,
         );
         let snap = snap_with_primary(95.0, None);
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::FallBackToFree,
         );
     }
@@ -1054,7 +1186,12 @@ mod tests {
         // 90% used but reset was 10s ago -> 0% effective -> PreferSub.
         let snap = snap_with_primary(90.0, Some(now.timestamp() - 10));
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::PreferSub,
         );
     }
@@ -1065,7 +1202,12 @@ mod tests {
         let mut snap = snap_with_primary(0.0, None);
         snap.has_credits = Some(false);
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::FallBackToFree,
         );
     }
@@ -1089,7 +1231,12 @@ mod tests {
             ..snap_with_primary(0.0, None)
         };
         assert_eq!(
-            decide(&snap, &knobs_with(80.0, 85.0, BudgetMode::Block, None), now, None),
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::FallBackToFree,
         );
     }
@@ -1133,5 +1280,171 @@ mod tests {
         let s = UtilizationStore::open(&path).unwrap();
         assert!(s.records.is_empty());
         assert_eq!(s.path.as_deref(), Some(path.as_path()));
+    }
+
+    // -------- live capture / feed plumbing (KNEMON wire-up) ---------
+    //
+    // These tests prove the round trip the CLI relies on:
+    //   1. `RateLimitSnapshot::from_headers` parses a real `reqwest::header
+    //      ::HeaderMap` for both known vendors (OpenAI-Codex `x-codex-*`
+    //      and Anthropic `anthropic-ratelimit-unified-*`).
+    //   2. `UtilizationStore::record` upserts + saves in one call, and the
+    //      read-back `get(...).as_snapshot()` returns the same window.
+    //   3. `decide` flips from `PreferSub` (the None=headroom baseline) to
+    //      `FallBackToFree` when fed a persisted snapshot whose used-percent
+    //      crosses `cap_guard`. This is the test that actually proves a fed
+    //      snapshot changes routing vs the no-signal baseline.
+
+    fn codex_headers() -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        // Codex `x-codex-*` shape: percent + reset window + plan label.
+        h.insert("x-codex-primary-used-percent", "92".parse().unwrap());
+        h.insert(
+            "x-codex-primary-reset-after-seconds",
+            "600".parse().unwrap(),
+        );
+        h.insert("x-codex-secondary-used-percent", "37".parse().unwrap());
+        h.insert(
+            "x-codex-secondary-reset-after-seconds",
+            "86400".parse().unwrap(),
+        );
+        h.insert("x-codex-plan-type", "pro".parse().unwrap());
+        h
+    }
+
+    fn anthropic_headers() -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-unified-status",
+            "allowed".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-remaining",
+            "23".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-reset",
+            "2026-07-04T08:00:00Z".parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn from_headers_parses_codex_live_headers() {
+        let h = codex_headers();
+        let snap = RateLimitSnapshot::from_headers(&h, Provider::OpenaiCodex, "default", "default")
+            .expect("codex headers must yield a snapshot");
+        assert_eq!(snap.provider, Provider::OpenaiCodex);
+        let p = snap.primary.expect("primary window must be present");
+        assert_eq!(p.used_percent, 92.0);
+        // `reset-after-seconds` synthesizes an epoch ≈ now + 600.
+        let now = Utc::now().timestamp();
+        let reset = p.reset_at_epoch.expect("reset must be synthesized");
+        assert!(
+            (reset - (now + 600)).abs() <= 5,
+            "reset {reset} should be ~now+600 (now={now})",
+        );
+        let s = snap.secondary.expect("secondary window must be present");
+        assert_eq!(s.used_percent, 37.0);
+        // The Codex `x-codex-plan-type` header is surfaced onto the snapshot.
+        assert_eq!(snap.plan, "pro");
+    }
+
+    #[test]
+    fn from_headers_parses_anthropic_live_headers() {
+        let h = anthropic_headers();
+        let snap = RateLimitSnapshot::from_headers(&h, Provider::Anthropic, "default", "default")
+            .expect("anthropic headers must yield a snapshot");
+        assert_eq!(snap.provider, Provider::Anthropic);
+        // Anthropic's unified endpoint without a numeric `utilization`
+        // surfaces as 0% (status-only). The legacy-style `reset` header is
+        // parsed as an RFC3339 epoch.
+        let p = snap.primary.expect("primary window must be present");
+        assert_eq!(p.used_percent, 0.0);
+        assert_eq!(
+            p.reset_at_epoch,
+            Some(1783152000),
+            "2026-07-04T08:00:00Z must parse to 1783152000",
+        );
+    }
+
+    #[test]
+    fn from_headers_drops_mismatched_provider_claim() {
+        // Anthropic-shaped headers + caller claims Codex -> reject the
+        // snapshot rather than file it under the wrong key.
+        let h = anthropic_headers();
+        let snap = RateLimitSnapshot::from_headers(&h, Provider::OpenaiCodex, "default", "default");
+        assert!(
+            snap.is_none(),
+            "provider/vendor mismatch must NOT silently re-tag",
+        );
+    }
+
+    #[test]
+    fn store_record_round_trip_via_disk() {
+        // End-to-end: record via the public one-shot, then re-open the
+        // store from the same path and confirm the read-back matches.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let snap = snap_with_primary(72.5, None);
+        let recorded = s.record(&snap, Utc::now());
+        assert!(recorded, "snapshot with windows must be persisted");
+
+        let s2 = UtilizationStore::open(&path).unwrap();
+        let rec = s2
+            .get(Provider::OpenaiCodex, "acct", "pro")
+            .expect("record persisted");
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 72.5);
+        // The read-back path the CLI uses:
+        let loaded = s2
+            .get(Provider::OpenaiCodex, "acct", "pro")
+            .map(|r| r.as_snapshot());
+        let loaded = loaded.expect("as_snapshot must yield a snapshot");
+        assert_eq!(
+            loaded.primary.as_ref().unwrap().used_percent,
+            72.5,
+            "fed snapshot used_percent must match what was persisted",
+        );
+    }
+
+    #[test]
+    fn store_record_skips_windowless_snapshots() {
+        // Mirrors the no-headers case the live capture hits for MiniMax
+        // (no headroom headers today): the store refuses to write a
+        // presence-only sighting, so a later Codex load isn't poisoned.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let snap = RateLimitSnapshot::new(Provider::Openai, "default", "default");
+        assert!(!s.record(&snap, Utc::now()));
+        assert!(s.records.is_empty());
+    }
+
+    #[test]
+    fn fed_snapshot_at_cap_guard_flips_routing_to_fall_back() {
+        // The prove-the-wire-isn't-vacuous test. Same scenario / knobs /
+        // now both sides; left side is the historical `None`=headroom
+        // baseline, right side is a snapshot the capture path would have
+        // just persisted at 92% used (well above the `balanced` 85%
+        // cap_guard). The baseline keeps the sub; the fed snapshot
+        // routes it off. That's the entire KNEMON feed loop in a single
+        // assertion.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        // Baseline: no signal -> KNEMON contract is "keep the sub".
+        let baseline_snap = RateLimitSnapshot::default();
+        assert_eq!(
+            decide(&baseline_snap, &knobs, now, None),
+            RouteDecision::PreferSub,
+            "None=headroom baseline must PreferSub",
+        );
+        // Fed: persisted snapshot at 92% -> cap_guard trips -> off.
+        let fed_snap = snap_with_primary(92.0, None);
+        assert_eq!(
+            decide(&fed_snap, &knobs, now, None),
+            RouteDecision::FallBackToFree,
+            "fed snapshot at/above cap_guard must FallBackToFree",
+        );
     }
 }

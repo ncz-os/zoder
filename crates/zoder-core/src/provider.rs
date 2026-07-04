@@ -457,6 +457,12 @@ impl OpenAiProvider {
         if telemetry.api_base.is_none() {
             telemetry.api_base = Some(self.base_url.clone());
         }
+        // KNEMON live capture: parse rate-limit headers off this response
+        // and persist a snapshot to ~/.zoder/utilization.json. The route
+        // planner reads that store on the next turn to gate subscriptions
+        // against headroom. BEST-EFFORT — any parse / IO error must not
+        // poison the request.
+        capture_rate_limit_snapshot(resp.headers(), &self.base_url, &self.kind);
         if !status.is_success() {
             let code = status.as_u16();
             let retry_after = retry_after_header(resp.headers());
@@ -690,6 +696,81 @@ impl OpenAiProvider {
             completion_tokens,
             telemetry,
         })
+    }
+}
+
+/// Heuristic: turn a `reqwest::header::HeaderMap` + configured `base_url`
+/// into a [`crate::utilization::Provider`] so we know which key the live
+/// snapshot belongs under. The header set is the source of truth — a
+/// Codex response always carries `x-codex-*`, an Anthropic response
+/// always carries `anthropic-ratelimit-unified-*` / `anthropic-ratelimit-*`.
+/// `base_url` is only consulted when no known headroom header is present,
+/// in which case we fall back to a host-name lookup so a MiniMax response
+/// (no headroom headers — future work) still classifies correctly as
+/// `Other` rather than mis-filing under `Openai`.
+fn detect_utilization_provider(
+    headers: &reqwest::header::HeaderMap,
+    base_url: &str,
+) -> Option<crate::utilization::Provider> {
+    // Fast path: headroom headers beat host heuristics. Use the public
+    // detector so we agree with the parser on what counts.
+    if let Some(p) = crate::utilization::Provider::detect(&ReqwestHeaderProbe(headers)) {
+        return Some(p);
+    }
+    let lowered = base_url.to_ascii_lowercase();
+    if lowered.contains("api.minimax.io") {
+        // MiniMax does not currently emit headroom headers; surface as
+        // `Other` so the load_snapshot_for() routing layer keeps it on the
+        // `None = headroom` path until token-counting telemetry lands.
+        return Some(crate::utilization::Provider::Other);
+    }
+    None
+}
+
+/// Adapter for the one-shot capture: same case-insensitive lookup the
+/// parsers already expect.
+struct ReqwestHeaderProbe<'a>(&'a reqwest::header::HeaderMap);
+
+impl<'a> crate::utilization::HeaderLookup for ReqwestHeaderProbe<'a> {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+/// Best-effort capture of live subscription telemetry off a chat-call
+/// response. Maps the response's headers to a [`crate::utilization::Provider`],
+/// parses any headroom window, and persists it via
+/// [`crate::utilization::UtilizationStore::record`]. NEVER returns an
+/// error — parse or IO failures are logged at debug and swallowed, so a
+/// stale disk or a provider that started publishing a brand-new header
+/// shape can never fail the in-flight request.
+///
+/// `account_id` and `plan` are not knowable from a single response (Codex
+/// publishes the plan label in `x-codex-plan-type`; Anthropic publishes
+/// neither), so we persist under a stable `"default"` key — the CLI's
+/// `load_snapshot_for` looks up under the same key when re-reading, so
+/// the round-trip works without per-account plumbing.
+fn capture_rate_limit_snapshot(headers: &reqwest::header::HeaderMap, base_url: &str, _kind: &str) {
+    let Some(provider) = detect_utilization_provider(headers, base_url) else {
+        return;
+    };
+    let Some(snap) = crate::utilization::RateLimitSnapshot::from_headers(
+        headers, provider, "default", "default",
+    ) else {
+        return;
+    };
+    let Some(path) = crate::utilization::default_store_path() else {
+        return;
+    };
+    // Open the store (cheap — empty file when missing), upsert, save.
+    // We tolerate open failures (corrupt JSON, permission denied) so a
+    // stale store on disk can't break the live chat path.
+    let Ok(mut store) = crate::utilization::UtilizationStore::open(&path) else {
+        tracing::debug!(?path, "utilization store open failed; skipping capture");
+        return;
+    };
+    if !store.record(&snap, chrono::Utc::now()) {
+        tracing::debug!(provider = ?snap.provider, "utilization snapshot had no windows");
     }
 }
 

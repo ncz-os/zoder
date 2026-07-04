@@ -1729,14 +1729,14 @@ fn rank_for_model(m: &ModelEntry) -> f64 {
 }
 
 /// Pull the live utilization snapshot for a given `(provider, account_id,
-/// plan)` triple from the per-host store. `None` when no record exists
-/// (treated as headroom by the scenario layer) or when the store cannot
-/// be opened (best-effort — the routing layer still works). Reserved for
-/// the per-account snapshot plumbing that lights up when an operator
-/// wants window-aware subscription gating; currently unused because
-/// `resolve_chain` passes `None` (headroom). Kept here as the single
-/// place to land per-account snapshot lookup.
-#[allow(dead_code)]
+/// plan)` triple from the per-host store at `~/.zoder/utilization.json`.
+/// `None` when no record exists (treated as headroom by the scenario
+/// layer) or when the store cannot be opened (best-effort — the routing
+/// layer still works). Maps `provider_id` strings ("openai-codex",
+/// "anthropic", ...) to the typed [`zoder_core::utilization::Provider`]
+/// enum; the `codex` substring also matches ChatGPT-Subscriber-style
+/// overrides. Used by `scenario_chain_for_roles` to feed real headroom
+/// into KNEMON gating.
 fn load_snapshot_for(
     provider_id: &str,
     account_id: &str,
@@ -1776,15 +1776,22 @@ fn scenario_chain_for_roles(
     // rolling-window reset that just elapsed is respected.
     let now = chrono::Utc::now();
 
-    // For now we don't pass per-account snapshots — the per-(provider,
-    // account, plan) lookup in `load_snapshot_for` requires knowing which
-    // account+plan belongs to which model, which is documented-but-not-yet-
-    // surfaced plumbing. Until that lands, we pass `None` (headroom) so
-    // the scenario layer's "missing snapshot => headroom => keep" rule
-    // always applies for `sub`. This is the backward-compat path: a host
-    // that never recorded a snapshot keeps using KNEMON's contract that
-    // "no signal means keep going".
-    let snapshot: Option<zoder_core::utilization::RateLimitSnapshot> = None;
+    // Pull a live utilization snapshot for the primary model's provider,
+    // if any. The provider.rs capture path persists a fresh entry into
+    // ~/.zoder/utilization.json on every successful chat call (Codex
+    // `x-codex-*`, Anthropic `anthropic-ratelimit-unified-*`); we read it
+    // back here so the scenario layer's KNEMON gate sees real headroom.
+    // `None` when nothing has been recorded yet (a host with no
+    // subscription traffic falls through to `decide()`'s headroom path
+    // = keep, matching the pre-feed KNEMON contract).
+    let snapshot: Option<zoder_core::utilization::RateLimitSnapshot> = (|| {
+        let primary_model = cli
+            .model
+            .clone()
+            .or_else(|| eng.cfg.primary_model.clone())?;
+        let provider = rc.real_provider_for_model(&eng.cfg, &primary_model)?;
+        load_snapshot_for(&provider.id, "default", "default")
+    })();
 
     let primary_chain = chain_for_role(
         ScenarioRole::Primary,
