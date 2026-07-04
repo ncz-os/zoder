@@ -31,6 +31,7 @@ pub mod router;
 pub mod session;
 pub mod subscription_tiers;
 pub mod update;
+pub mod utilization;
 
 pub use acp_client::{
     new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket, AgentEvent,
