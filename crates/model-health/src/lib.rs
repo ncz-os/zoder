@@ -429,7 +429,6 @@ mod tests {
         // Round-trip through the persistence path.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.json");
-        let mut s = s;
         // bind path through save() trick: re-load from a written copy.
         let json = serde_json::to_string(&s).unwrap();
         std::fs::write(&path, &json).unwrap();
