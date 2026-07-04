@@ -124,6 +124,12 @@ pub enum Provider {
     Openai,
     OpenaiCodex,
     Anthropic,
+    /// MiniMax (no rate-limit headers; tracked via local counter). Has
+    /// no `parse_*` counterpart in the header-fed path because MiniMax
+    /// does not publish `x-codex-*` / `anthropic-ratelimit-*` headers;
+    /// the counter-fed path in `UtilizationStore::record_counter` is
+    /// what surfaces its utilization.
+    MiniMax,
 }
 
 impl Provider {
@@ -638,14 +644,67 @@ pub fn parse_headers(
     let mut snap = match provider {
         Provider::OpenaiCodex => parse_codex(headers, account_id, plan),
         Provider::Anthropic => parse_anthropic(headers, account_id, plan),
-        Provider::Openai | Provider::Other => {
+        Provider::Openai | Provider::Other | Provider::MiniMax => {
             // OpenAI plain chat-completions carries `x-ratelimit-*` but
             // no window structure; persist a presence-only marker.
+            // MiniMax has NO rate-limit headers at all — the
+            // counter-fed path in `record_counter` is the only signal
+            // we have for it; parsing headers here is a no-op.
             RateLimitSnapshot::new(provider, account_id, plan)
         }
     };
     snap.observed_at = Some(Utc::now());
     Some(snap)
+}
+
+// ---------------------------------------------------------------------------
+// Counter-fed utilization (KNEMON Layer 3B).
+// ---------------------------------------------------------------------------
+
+/// One counter-fed utilization window. Used for providers (MiniMax) that do
+/// NOT publish rate-limit headers and whose usage has to be measured locally
+/// by counting tokens off the chat-completion response. The store keeps a
+/// running `used_tokens` total, and recomputes `used_percent` whenever the
+/// cap is known.
+///
+/// `cap = None` is a valid state — it means "this window exists but we don't
+/// know its cap; surface the running token count but never compute a
+/// percent." PercentOnly subscription windows fall into this bucket by
+/// construction (the operator / provider only publishes a percent).
+///
+/// Reset is intentionally a free-form `Option<DateTime<Utc>>`: monthly
+/// calendar windows flip to zero at the next month boundary (caller's
+/// responsibility to detect + reset; the store just records the
+/// observation), and rolling windows in this layer are NOT supported
+/// because the whole point of counter-fed tracking is that there is no
+/// header-driven reset signal. The store records `last_updated` so callers
+/// can age out stale observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterWindow {
+    pub provider: Provider,
+    pub account_id: String,
+    pub plan: String,
+    pub window_name: String,
+    /// Running token count for this window. Only windows with
+    /// `observability = Counter` accumulate here.
+    pub used_tokens: f64,
+    /// Cap in tokens, if known. `None` = percent-only window
+    /// (`PercentOnly`), or "cap not yet recorded". When `None`,
+    /// `used_percent` is `None` too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<f64>,
+    /// `used_tokens / cap` when `cap.is_some() && cap > 0.0`. `None`
+    /// otherwise — never divide by zero, never claim a percent the store
+    /// can't actually compute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    /// Provider-driven reset signal (e.g. the next calendar-month boundary
+    /// for `reset: CalendarMonthly`). `None` when the provider has not
+    /// published one; the caller decides whether the window has aged out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<DateTime<Utc>>,
+    /// UTC observation timestamp of the most recent increment.
+    pub last_updated: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -742,16 +801,33 @@ pub fn default_store_path() -> Option<PathBuf> {
 
 /// Persistent store. Reads the on-disk JSON on open, serializes on save.
 /// Keyed by `(provider, account_id, plan)`.
+///
+/// In addition to the header-fed `records` (KNEMON Layer 3A — snapshots
+/// parsed from `x-codex-*` / `anthropic-ratelimit-*` response headers),
+/// the store carries `counters` (KNEMON Layer 3B — running token counts
+/// for providers that publish no rate-limit headers, e.g. MiniMax). Both
+/// are persisted to the same file so a single `~/.zoder/utilization.json`
+/// holds the whole utilization picture for the box.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UtilizationStore {
     #[serde(default)]
     pub records: BTreeMap<String, UtilizationRecord>,
+    /// Counter-fed windows (KNEMON Layer 3B). Keyed by
+    /// `(provider, account_id, plan, window_name)` — the `window_name`
+    /// segment disambiguates the `monthly` / `5h` / `weekly` windows the
+    /// catalog declares for the same `(provider, account, plan)`.
+    #[serde(default)]
+    pub counters: BTreeMap<String, CounterWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
 
 fn key(provider: Provider, account_id: &str, plan: &str) -> String {
     format!("{provider:?}::{account_id}::{plan}")
+}
+
+fn counter_key(provider: Provider, account_id: &str, plan: &str, window_name: &str) -> String {
+    format!("{provider:?}::{account_id}::{plan}::{window_name}")
 }
 
 impl UtilizationRecord {
@@ -798,6 +874,7 @@ impl UtilizationStore {
                 if bytes.is_empty() {
                     let store = Self {
                         records: BTreeMap::new(),
+                        counters: BTreeMap::new(),
                         path: Some(path.to_path_buf()),
                     };
                     return Ok(store);
@@ -809,6 +886,7 @@ impl UtilizationStore {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
                 records: BTreeMap::new(),
+                counters: BTreeMap::new(),
                 path: Some(path.to_path_buf()),
             }),
             Err(e) => Err(UtilizationError::Io(e)),
@@ -863,6 +941,141 @@ impl UtilizationStore {
         // poisoned by transient disk issues.
         let _ = self.save();
         true
+    }
+
+    /// Record a token-usage increment against a counter-fed window
+    /// (KNEMON Layer 3B). The persisted `used_tokens` is increased by
+    /// `tokens_used`, and `used_percent` is recomputed as
+    /// `used_tokens / cap` whenever the cap is known. When the cap is
+    /// `None` (a `PercentOnly` window, or any window whose cap has not yet
+    /// been recorded via [`set_counter_cap`]), `used_percent` stays
+    /// `None` — we never invent a percent.
+    ///
+    /// Window `reset_at` is preserved across increments when the
+    /// caller has already set it; otherwise it's left at `None`. The
+    /// caller is responsible for detecting a calendar boundary and
+    /// resetting `used_tokens` to zero (the store's contract is
+    /// "increment, never auto-reset" — auto-resetting on a misread clock
+    /// would silently destroy utilization data).
+    ///
+    /// Returns the new `used_tokens` after the increment. Best-effort:
+    /// callers that want the disk side-effect should pair this with
+    /// [`save`] and tolerate its error (mirrors the header-fed
+    /// [`record`] path).
+    pub fn record_counter(
+        &mut self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+        tokens_used: f64,
+        now: DateTime<Utc>,
+    ) -> f64 {
+        let k = counter_key(provider, account_id, plan, window_name);
+        let entry = self
+            .counters
+            .entry(k.clone())
+            .or_insert_with(|| CounterWindow {
+                provider,
+                account_id: account_id.to_string(),
+                plan: plan.to_string(),
+                window_name: window_name.to_string(),
+                used_tokens: 0.0,
+                cap: None,
+                used_percent: None,
+                reset_at: None,
+                last_updated: now,
+            });
+        // Defensive: a malformed / negative increment is a no-op, not a
+        // subtraction. A provider that occasionally reports 0 usage
+        // (streaming-usage off, usage field absent) still wants a row
+        // touch but never a negative balance.
+        if tokens_used.is_finite() && tokens_used > 0.0 {
+            entry.used_tokens += tokens_used;
+        }
+        // Recompute percent from the cap, if any. `cap = Some(0.0)` is
+        // treated as "no headroom" (0%, not NaN/inf) so a bad
+        // configuration never produces an exploded percent.
+        entry.used_percent = match entry.cap {
+            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
+            _ => None,
+        };
+        entry.last_updated = now;
+        entry.used_tokens
+    }
+
+    /// Set (or clear) the cap for one counter-fed window. The store only
+    /// stores the cap; it does NOT recompute `used_tokens` (the cap may
+    /// be recorded AFTER the first call to [`record_counter`] in the
+    /// same boot — e.g. the wire-up reads the catalog once at startup
+    /// and then records usage as it lands). Callers that need the
+    /// `used_percent` field refreshed after `set_counter_cap` should
+    /// re-read the entry: the next `record_counter` call will
+    /// recompute it. If the caller wants the percent immediately, see
+    /// [`recompute_counter_percent`].
+    pub fn set_counter_cap(
+        &mut self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+        cap: Option<f64>,
+        now: DateTime<Utc>,
+    ) {
+        let k = counter_key(provider, account_id, plan, window_name);
+        let entry = self.counters.entry(k).or_insert_with(|| CounterWindow {
+            provider,
+            account_id: account_id.to_string(),
+            plan: plan.to_string(),
+            window_name: window_name.to_string(),
+            used_tokens: 0.0,
+            cap: None,
+            used_percent: None,
+            reset_at: None,
+            last_updated: now,
+        });
+        entry.cap = cap;
+        entry.used_percent = match entry.cap {
+            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
+            _ => None,
+        };
+        entry.last_updated = now;
+    }
+
+    /// Recompute `used_percent` for one counter-fed window from its
+    /// currently-stored `used_tokens` and `cap`. Use after
+    /// [`set_counter_cap`] to surface the percent before the next
+    /// `record_counter` lands. Returns the new percent, or `None` when
+    /// the cap is unknown / non-positive.
+    pub fn recompute_counter_percent(
+        &mut self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+    ) -> Option<f64> {
+        let k = counter_key(provider, account_id, plan, window_name);
+        let entry = self.counters.get_mut(&k)?;
+        let pct = match entry.cap {
+            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
+            _ => None,
+        };
+        entry.used_percent = pct;
+        pct
+    }
+
+    /// Look up a counter-fed window. `None` when the window has never
+    /// been recorded (a fresh box that has not yet seen a counter-fed
+    /// response from this `(provider, account, plan)`).
+    pub fn get_counter(
+        &self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+    ) -> Option<&CounterWindow> {
+        self.counters
+            .get(&counter_key(provider, account_id, plan, window_name))
     }
 
     /// Persist to the path we were opened from. Creates parent dirs.
@@ -1446,5 +1659,236 @@ mod tests {
             RouteDecision::FallBackToFree,
             "fed snapshot at/above cap_guard must FallBackToFree",
         );
+    }
+
+    // -------- counter-fed (KNEMON Layer 3B) -----------------------
+    //
+    // MiniMax publishes NO rate-limit headers, so its utilization has to
+    // be measured locally by counting tokens off the chat-completion
+    // response and writing them to the store. These tests pin the
+    // contract:
+    //
+    //   (a) two responses of N tokens each accumulate to 2N, and the
+    //       monthly window's used_percent equals 2N / 5.1e9.
+    //   (b) a PercentOnly window is never given a computed percent by
+    //       the counter path — even if a caller somehow drives
+    //       `record_counter` against a PercentOnly window name, the
+    //       store refuses to invent a percent.
+    //   (c) the persisted counter window round-trips through the
+    //       on-disk JSON via `UtilizationStore::open` (the file the
+    //       live wire-up writes to).
+
+    /// Catalog tier id for the MiniMax plan the spec exercises. Mirrors
+    /// `subscriptions/tiers.json`; the live wire-up uses the same id.
+    const MM_PLAN: &str = "minimax-max";
+    /// Cap on the `monthly` window for `minimax-max`, copied from
+    /// `subscriptions/tiers.json`. Kept in sync on purpose — the spec
+    /// (a) asserts a specific numeric ratio, so the test must agree
+    /// with the catalog.
+    const MM_MONTHLY_CAP: f64 = 5_100_000_000.0;
+
+    #[test]
+    fn counter_two_responses_accumulate_to_2n_with_correct_percent() {
+        // (a) two responses of N tokens each accumulate to 2N in the
+        // monthly window, used_percent = 2N / 5.1e9. We use a
+        // small N (1234) so the arithmetic is exact and the percent
+        // is easy to verify by hand: 2*1234 / 5.1e9 = 4.839e-7.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+
+        // Seed the cap the way the live wire-up does (the wire-up
+        // pulls it from the catalog, then sets it on the store).
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(MM_MONTHLY_CAP),
+            now,
+        );
+        // First response: N tokens.
+        let n = 1234.0_f64;
+        let used_after_first =
+            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+        assert_eq!(used_after_first, n, "first response adds exactly N tokens");
+        // Second response: another N tokens.
+        let used_after_second =
+            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+        assert_eq!(used_after_second, 2.0 * n, "two responses accumulate to 2N");
+
+        // Read back via the typed accessor.
+        let w = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .expect("monthly counter window must persist");
+        assert_eq!(w.used_tokens, 2.0 * n);
+        let expected_pct = (2.0 * n) / MM_MONTHLY_CAP;
+        let got_pct = w
+            .used_percent
+            .expect("used_percent must be Some when cap is known");
+        assert!(
+            (got_pct - expected_pct).abs() < 1e-12,
+            "used_percent must equal 2N/5.1e9 = {expected_pct}, got {got_pct}",
+        );
+        // And the JSON on disk: round-trip.
+        s.save().unwrap();
+        let s2 = UtilizationStore::open(&path).unwrap();
+        let w2 = s2
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .expect("monthly counter window must round-trip through disk");
+        assert_eq!(w2.used_tokens, 2.0 * n);
+        assert_eq!(w2.used_percent, Some(expected_pct));
+        assert_eq!(w2.provider, Provider::MiniMax);
+        assert_eq!(w2.plan, MM_PLAN);
+    }
+
+    #[test]
+    fn counter_percent_only_window_never_gets_a_computed_percent() {
+        // (b) A PercentOnly window MUST stay percent-less under the
+        // counter path. We exercise the store directly with a
+        // PercentOnly-shaped window (cap = None). The wire-up skips
+        // PercentOnly windows entirely (`record_counter` is only
+        // called for Counter windows), but a defensive assertion
+        // here pins the contract: even if a caller calls
+        // `record_counter` against a percent-only window name with
+        // no cap set, the store never invents a percent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // No `set_counter_cap` call — cap stays None (PercentOnly).
+        // Simulate a response that fed N tokens into the `5h`
+        // PercentOnly window (the wire-up would never do this, but
+        // the store's contract must hold either way).
+        let n = 999.0_f64;
+        let used = s.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", n, now);
+        assert_eq!(used, n, "used_tokens still records the increment");
+        let w = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .expect("5h counter row must exist");
+        assert_eq!(
+            w.used_tokens, n,
+            "running counter must reflect the increment"
+        );
+        assert!(
+            w.used_percent.is_none(),
+            "PercentOnly window must never carry a computed percent: {:?}",
+            w.used_percent,
+        );
+        assert!(
+            w.cap.is_none(),
+            "cap stays None (never set on a PercentOnly window): {:?}",
+            w.cap,
+        );
+
+        // Now seed a cap LATER (simulating the catalog being
+        // refreshed) — recompute must still produce the right
+        // percent, and crucially only AFTER the cap is known. This
+        // is the part of the contract the wire-up depends on: a
+        // cap-less increment is safe; a percent is only emitted
+        // when the cap exists.
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "5h",
+            Some(10_000.0),
+            now,
+        );
+        // `set_counter_cap` recomputes used_percent from the
+        // existing used_tokens — verify that path.
+        let w = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        let pct = w
+            .used_percent
+            .expect("with cap set, used_percent must be Some");
+        assert!(
+            (pct - (n / 10_000.0)).abs() < 1e-12,
+            "after set_counter_cap, percent must be used/cap: got {pct}",
+        );
+
+        // And critically: a fresh `record_counter` on a DIFFERENT
+        // percent-only window (the `weekly` one) with no cap set
+        // MUST stay percent-less. This is the regression guard.
+        let used_w = s.record_counter(Provider::MiniMax, "default", MM_PLAN, "weekly", 500.0, now);
+        assert_eq!(used_w, 500.0);
+        let w_w = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "weekly")
+            .expect("weekly counter row must exist");
+        assert_eq!(w_w.used_tokens, 500.0);
+        assert!(
+            w_w.used_percent.is_none(),
+            "a percent-only window with no cap set must never get a percent: {:?}",
+            w_w.used_percent,
+        );
+    }
+
+    #[test]
+    fn counter_persists_round_trip_through_utilization_store() {
+        // (c) the persisted counter window round-trips through the
+        // on-disk JSON. This is the file-format contract: any
+        // `~/.zoder/utilization.json` written by a newer binary
+        // must be readable by an older one (the field is
+        // `#[serde(default)]`, so a missing `counters` key is
+        // accepted as "no counters" — that's the backward path).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // Write a rich record + a counter entry in one store, then
+        // re-open.
+        let mut s = UtilizationStore::open(&path).unwrap();
+        // A header-fed record (legacy Layer 3A path).
+        let snap = snap_with_primary(72.5, None);
+        s.record(&snap, now);
+        // A counter-fed entry (Layer 3B path).
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "acct-mm",
+            MM_PLAN,
+            "monthly",
+            Some(MM_MONTHLY_CAP),
+            now,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "acct-mm",
+            MM_PLAN,
+            "monthly",
+            2_500_000.0,
+            now,
+        );
+        s.save().unwrap();
+
+        // Re-open from the same path. Both the header record and
+        // the counter row survive.
+        let s2 = UtilizationStore::open(&path).unwrap();
+        let rec = s2
+            .get(Provider::OpenaiCodex, "acct", "pro")
+            .expect("header-fed record must round-trip");
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 72.5);
+        let cw = s2
+            .get_counter(Provider::MiniMax, "acct-mm", MM_PLAN, "monthly")
+            .expect("counter row must round-trip");
+        assert_eq!(cw.used_tokens, 2_500_000.0);
+        assert_eq!(cw.cap, Some(MM_MONTHLY_CAP));
+        assert_eq!(cw.used_percent, Some(2_500_000.0 / MM_MONTHLY_CAP));
+        assert_eq!(cw.provider, Provider::MiniMax);
+        assert_eq!(cw.plan, MM_PLAN);
+        assert_eq!(cw.window_name, "monthly");
+
+        // Backward-compat: a hand-edited file that omits the
+        // `counters` key entirely must still parse (this is the
+        // older-binary-vs-newer-file path). The `#[serde(default)]`
+        // on `counters` is what makes this work.
+        let legacy = r#"{
+            "records": {}
+        }"#;
+        let path2 = dir.path().join("legacy.json");
+        std::fs::write(&path2, legacy).unwrap();
+        let s3 = UtilizationStore::open(&path2).unwrap();
+        assert!(s3.counters.is_empty());
+        assert!(s3.records.is_empty());
     }
 }

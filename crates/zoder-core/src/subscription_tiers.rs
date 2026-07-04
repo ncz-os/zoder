@@ -773,7 +773,7 @@ mod tests {
                 );
                 for w in &entry.windows {
                     assert!(
-                        w.cap.map(|c| c > 0.0).unwrap_or(false),
+                        w.cap.map(|c| c > 0.0).unwrap_or(true),
                         "{provider}/{tier_id}/{} cap must be > 0 when set",
                         w.name
                     );
@@ -819,6 +819,84 @@ mod tests {
         }"#;
         let p: ProviderTiers = serde_json::from_str(json).unwrap();
         assert_eq!(p.tiers["x"].confidence, Confidence::Estimated);
+    }
+
+    // ----- KNEMON Layer 3B preset: minimax-max -----
+    //
+    // The MiniMax counter-fed path. MiniMax publishes no rate-limit
+    // headers, so its utilization must be measured locally by counting
+    // tokens. The `minimax-max` preset declares a monthly Counter
+    // window (known cap, Counter observability, CalendarMonthly reset)
+    // plus two PercentOnly windows (`5h`, `weekly`) whose caps are
+    // unknown — the report will show the running token count but no
+    // percent for those.
+
+    #[test]
+    fn minimax_max_preset_declares_counter_monthly_and_percent_only_others() {
+        use crate::config::{Observability, QuotaUnit, ResetKind};
+        let cat = TierCatalog::bundled();
+        let entry = cat
+            .tier("minimax", "minimax-max")
+            .expect("minimax-max preset must exist in the bundled catalog");
+        assert_eq!(entry.monthly_fee_usd, 200.0);
+
+        // Index by name for direct assertions.
+        let by_name: std::collections::HashMap<_, _> =
+            entry.windows.iter().map(|w| (w.name.as_str(), w)).collect();
+        assert_eq!(
+            by_name.len(),
+            3,
+            "minimax-max must declare exactly 3 windows"
+        );
+
+        // Monthly: Counter, CalendarMonthly reset, known cap = 5.1e9.
+        let m = by_name["monthly"];
+        assert_eq!(m.hours, 720);
+        assert_eq!(m.unit, QuotaUnit::Tokens);
+        assert_eq!(m.cap, Some(5_100_000_000.0));
+        assert_eq!(m.observability, Observability::Counter);
+        assert_eq!(m.reset, ResetKind::CalendarMonthly);
+
+        // 5h: PercentOnly, cap = None.
+        let w5 = by_name["5h"];
+        assert_eq!(w5.hours, 5);
+        assert_eq!(w5.unit, QuotaUnit::Tokens);
+        assert_eq!(w5.cap, None);
+        assert_eq!(w5.observability, Observability::PercentOnly);
+
+        // weekly: PercentOnly, cap = None.
+        let ww = by_name["weekly"];
+        assert_eq!(ww.hours, 168);
+        assert_eq!(ww.unit, QuotaUnit::Tokens);
+        assert_eq!(ww.cap, None);
+        assert_eq!(ww.observability, Observability::PercentOnly);
+
+        // Resolver path: a plan that names this tier must produce the
+        // same three windows.
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            windows: vec![],
+            tier: Some("minimax-max".into()),
+        };
+        let r = resolve_plan_windows(&plan, &cat, Some("minimax"));
+        assert_eq!(r.windows.len(), 3);
+        let resolved_by_name: std::collections::HashMap<_, _> = r
+            .windows
+            .iter()
+            .map(|w| (w.name.as_str(), w.clone()))
+            .collect();
+        assert_eq!(
+            resolved_by_name["monthly"].observability,
+            Observability::Counter
+        );
+        assert_eq!(
+            resolved_by_name["5h"].observability,
+            Observability::PercentOnly
+        );
+        assert_eq!(
+            resolved_by_name["weekly"].observability,
+            Observability::PercentOnly
+        );
     }
 
     // ----- per-window provenance tests (the BLOCKER fix) -----

@@ -102,6 +102,35 @@
             { "name": "5h",     "hours": 5,   "unit": "tokens", "cap": 50000000 },
             { "name": "weekly", "hours": 168, "unit": "tokens", "cap": 1500000000 }
           ]
+        },
+        "minimax-max": {
+          "monthly_fee_usd": 200,
+          "confidence": "estimated",
+          "source": "minimax_token_plan",
+          "windows": [
+            {
+              "name": "monthly",
+              "hours": 720,
+              "unit": "tokens",
+              "cap": 5100000000,
+              "observability": "counter",
+              "reset": "calendar_monthly"
+            },
+            {
+              "name": "5h",
+              "hours": 5,
+              "unit": "tokens",
+              "cap": null,
+              "observability": "percent_only"
+            },
+            {
+              "name": "weekly",
+              "hours": 168,
+              "unit": "tokens",
+              "cap": null,
+              "observability": "percent_only"
+            }
+          ]
         }
       }
     }
