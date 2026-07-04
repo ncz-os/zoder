@@ -315,8 +315,36 @@ pub struct Config {
     /// model). When set and the model is a known free candidate, the router's
     /// `select()` makes it the primary and ranks everything else as fallbacks.
     /// `None` keeps the pure capability-first ordering.
+    ///
+    /// Resolution precedence (highest first) on the CLI side:
+    ///   1. explicit `-m <model>` (per-invocation) wins,
+    ///   2. the selected agent's own `[agents.<alias>].model`,
+    ///   3. this `primary_model` (the fallback DEFAULT),
+    ///   4. capability/health-ranked auto routing.
+    ///
+    /// `primary_model` is intentionally a DEFAULT only — it must NOT silently
+    /// override a per-agent or per-invocation pin (regression 2026-07-04:
+    /// `primary_model="MiniMax-M3"` overrode `[agents.codex].model="gpt-5.5"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_model: Option<String>,
+    /// `adversarial-review` and the `loop` reviewer when neither
+    /// `--reviewer <model>` nor a `[agents.<alias>].reviewer_model` is set.
+    /// Independent of `primary_model` so an operator can pin a strong
+    /// cross-family reviewer without touching the author default. Falls
+    /// back to a strong CROSS-FAMILY model derived from the resolved
+    /// author model (see `zoder_core::default_cross_family_reviewer` from
+    /// the CLI side) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
+    /// Per-agent overrides keyed by zeroclaw agent alias (the value of
+    /// `--agent`). Each entry may pin its own `model` (primary author) and
+    /// `reviewer_model` (loop / `review` reviewer) so different agentic
+    /// roles can use different model ids without polluting the global
+    /// `primary_model` / `reviewer_model`. On the CLI, this is honored via
+    /// [`Config::agent_model`] / [`Config::agent_reviewer_model`],
+    /// consulted AFTER `-m` / `--reviewer` and BEFORE `primary_model`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AliasedAgentConfig>,
     /// Pre-call spend caps. A paid call whose *estimated* cost would breach a
     /// cap is gated behind the same confirmation as a paid model. Empty by
     /// default (no caps). See [`crate::budget::Budget`].
@@ -378,6 +406,36 @@ impl RoutingConfig {
 
 fn default_free_hosts() -> Vec<String> {
     vec!["example.com".into(), "free.example.com".into()]
+}
+
+/// Per-agent overrides under `[agents.<alias>]` in `config.json`. Both fields
+/// are optional and are honored independently of the global `primary_model`
+/// / `reviewer_model`: when set they win over the globals but lose to an
+/// explicit `-m` / `--reviewer` on the CLI (per-invocation overrides always
+/// win). This is the fix for the 2026-07-04 regression where `primary_model`
+/// was forcing every agent onto the same model regardless of its own
+/// config.
+///
+/// Both fields are `#[serde(default)]`-able: a config.json that omits
+/// `agents`, or a per-agent block that omits `reviewer_model`, parses
+/// cleanly into the missing-`None` shape so the existing single-pinned
+/// `Config::primary_model` deployment keeps working.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AliasedAgentConfig {
+    /// Primary (author) model id for this agent. When `Some`, takes
+    /// precedence over `Config::primary_model` but is overridden by `-m`
+    /// on the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reviewer / secondary model id for this agent. Independent of
+    /// `Config::primary_model`. When `Some`, takes precedence over
+    /// `Config::reviewer_model` but is overridden by `--reviewer` on the
+    /// CLI. May be `None` even when `model` is set, in which case the
+    /// loop / `review` call falls back to `Config::reviewer_model`, then
+    /// to the auto cross-family reviewer derived from the resolved author
+    /// model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
 }
 
 fn default_strict_free() -> bool {
@@ -578,6 +636,8 @@ impl Config {
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,
+            reviewer_model: None,
+            agents: BTreeMap::new(),
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
         }
@@ -722,6 +782,40 @@ impl Config {
         self.real_provider_for_model(model_id).is_some()
     }
 
+    /// Resolve the per-agent PRIMARY model id for `--agent <alias>`. Returns
+    /// `None` when no per-agent override is configured (no such alias, or
+    /// the alias has no `model` pin). The CLI precedence chains this with
+    /// `-m` (which wins first) and `primary_model` (which falls through
+    /// last); see [`crate::resolve_effective_primary`] in the CLI for the
+    /// canonical application of the order.
+    ///
+    /// Resolution precedence (highest first), as wired by the CLI side:
+    ///   1. explicit `-m <model>` (per-invocation) — caller short-circuits
+    ///      BEFORE this lookup,
+    ///   2. `[agents.<alias>].model` (this fn — when `alias` is `Some` and
+    ///      present in the map),
+    ///   3. `Config::primary_model` (the global default).
+    ///
+    /// This fn only returns the per-agent pin (step 2); the caller chains
+    /// it against `primary_model`. Returning owned `String` (rather than
+    /// `&str`) keeps the call site `let m: Option<String>`-friendly without
+    /// a clone on the success path.
+    pub fn agent_model(&self, alias: Option<&str>) -> Option<String> {
+        let alias = alias?;
+        self.agents.get(alias).and_then(|a| a.model.clone())
+    }
+
+    /// Resolve the per-agent REVIEWER / secondary model id for
+    /// `--agent <alias>`. Returns `None` when no per-agent reviewer override
+    /// is configured. Independent of `primary_model`: an agent may pin a
+    /// different reviewer from its own author model.
+    pub fn agent_reviewer_model(&self, alias: Option<&str>) -> Option<String> {
+        let alias = alias?;
+        self.agents
+            .get(alias)
+            .and_then(|a| a.reviewer_model.clone())
+    }
+
     /// Provider ids contributed by a given vendor overlay. Returns an empty
     /// vec for unknown vendors and for the synthetic "base" (providers from
     /// `config.json` / default config). Used by `--vendor <name>` filtering.
@@ -850,6 +944,13 @@ pub struct VendorProfile {
     /// wins, otherwise the alphabetically-last overlay that defines one.
     #[serde(default)]
     pub primary_model: Option<String>,
+    /// Pinned reviewer / secondary model id. Same precedence as
+    /// `primary_model` (default-claimer wins, else alphabetical-last).
+    /// Applied to `Config::reviewer_model` after overlay merge. Independent
+    /// of `primary_model` so an overlay can pin a strong cross-family
+    /// reviewer without owning the author default.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
 }
 
 /// Apply every `config.<vendor>.toml` in alphabetical order. Tracks the set of
@@ -894,6 +995,12 @@ fn apply_overlays_filtered(
     // primary_model wins, else the last (alphabetical) overlay that sets one.
     let mut default_primary: Option<String> = None;
     let mut fallback_primary: Option<String> = None;
+    // Pinned reviewer resolution mirrors the primary shape (default-claimer
+    // wins, else alphabetical-last). reviewer_model is INDEPENDENT of
+    // primary_model — an overlay can pin a strong cross-family reviewer
+    // without touching the author default.
+    let mut default_reviewer: Option<String> = None;
+    let mut fallback_reviewer: Option<String> = None;
 
     for (vendor, overlay) in overlays {
         for p in &overlay.providers {
@@ -918,6 +1025,9 @@ fn apply_overlays_filtered(
         if overlay.profile.primary_model.is_some() {
             fallback_primary = overlay.profile.primary_model.clone();
         }
+        if overlay.profile.reviewer_model.is_some() {
+            fallback_reviewer = overlay.profile.reviewer_model.clone();
+        }
         if overlay.profile.default {
             defaults_count += 1;
             if overlay.theme.is_some() {
@@ -925,6 +1035,9 @@ fn apply_overlays_filtered(
             }
             if overlay.profile.primary_model.is_some() {
                 default_primary = overlay.profile.primary_model.clone();
+            }
+            if overlay.profile.reviewer_model.is_some() {
+                default_reviewer = overlay.profile.reviewer_model.clone();
             }
             let new_default = overlay
                 .profile
@@ -961,6 +1074,13 @@ fn apply_overlays_filtered(
     // Apply the resolved pinned primary (default-claimer wins, else last set).
     if let Some(primary) = default_primary.or(fallback_primary) {
         cfg.primary_model = Some(primary);
+    }
+    // Apply the resolved pinned reviewer (default-claimer wins, else last
+    // set). Same precedence shape as primary, but the field is independent
+    // so a config can pin a cross-family reviewer without touching the
+    // author default.
+    if let Some(reviewer) = default_reviewer.or(fallback_reviewer) {
+        cfg.reviewer_model = Some(reviewer);
     }
     Ok(())
 }

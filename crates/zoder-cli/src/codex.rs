@@ -31,8 +31,25 @@ struct Completion {
     cost_usd: f64,
 }
 
-/// Run one non-streamed completion on `model_override` (else the routed/`-m`
-/// model), record it in the ledger, and return the text + cost.
+/// Run one non-streamed completion on `model_override` (else the resolved
+/// reviewer model), record it in the ledger, and return the text + cost.
+///
+/// Reviewer model precedence (highest first) — paired with the author
+/// precedence in [`crate::resolve_effective_primary`] so the SECONDARY
+/// model stays independent of the PRIMARY `primary_model`:
+///
+///   1. explicit `--reviewer` / `--panel` (`model_override`, per-invocation),
+///   2. `[agents.<alias>].reviewer_model` for the selected alias (per-agent
+///      pin; the alias is whichever `--agent` resolved to),
+///   3. `Config::reviewer_model` (profile-level fallback),
+///   4. strong CROSS-FAMILY model derived from the resolved author model
+///      (preserves the legacy default — never the author's own family).
+///
+/// The `cli.model` (`-m`) shortcut is intentionally NOT consulted here: `-m`
+/// is the AUTHOR pin. Treating it as a reviewer pin too would conflate
+/// primary and secondary, hiding operator intent. The reviewer gets its
+/// own pin (the `--reviewer` flag → `model_override`) so an operator can
+/// cross-family-pick it independently of `-m`.
 async fn complete_once(
     cli: &crate::Cli,
     model_override: Option<&str>,
@@ -44,9 +61,18 @@ async fn complete_once(
 
     let model = match model_override {
         Some(m) => m.to_string(),
-        None => match &cli.model {
-            Some(m) => m.clone(),
-            None => {
+        None => {
+            // Per-agent override first (`[agents.<alias>].reviewer_model`);
+            // falls back to the profile-level `Config::reviewer_model`; falls
+            // back to a CROSS-FAMILY default derived from the AUTHOR model
+            // (NOT from `primary_model` so the two stay independent — an
+            // operator can pin a strong reviewer without touching the
+            // author default).
+            if let Some(m) = eng.cfg.agent_reviewer_model(cli.agent.as_deref()) {
+                m
+            } else if let Some(m) = eng.cfg.reviewer_model.as_ref() {
+                m.clone()
+            } else {
                 // Default reviewer = a strong CROSS-FAMILY model, NOT the author's
                 // own. Self-review is weak; and routing the review to the author's
                 // flat-subscription provider (env-auth) 401s while the agentic
@@ -57,7 +83,7 @@ async fn complete_once(
                 let author = chain.first().cloned().unwrap_or_default();
                 crate::default_cross_family_reviewer(&author).to_string()
             }
-        },
+        }
     };
 
     // Per-model routing: resolve the provider that actually serves this model
