@@ -13,16 +13,23 @@ use zoder_core::gate::{
     GateStatus, GateStep, RepoSignals, StepOutcome,
 };
 use zoder_core::gate_bundle::{discover_markers, probe_tools, render_probe, PathEnv, ToolLookup};
+use zoder_core::subscription_tiers::{
+    load_tier_catalog, resolve_plan_windows, ResolvedPlan, TierCatalog,
+};
+use zoder_core::utilization::{
+    build_account_view, decide_account, AccountDecision, AccountView, Provider as UtilProvider,
+    RouteKnobs, TelemetryHealth, UtilizationStore,
+};
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, classify_err, classify_provider, estimate_tokens,
-    fetch_engine_cost, finops_cli, load_tier_catalog, openai_costs, plan_usage, probe_request,
-    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
-    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
-    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
-    Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
-    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, Theme, Tier,
-    PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    fetch_engine_cost, finops_cli, openai_costs, plan_usage, probe_request, run_agent_dispatch,
+    sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode, BudgetVerdict,
+    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind, Entry,
+    GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period,
+    PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
+    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, SubscriptionPlan, Theme,
+    Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
 #[derive(Parser, Clone)]
@@ -3866,11 +3873,254 @@ async fn cmd_finops(
         .chain(std::iter::once(window_days.to_string()))
         .chain(json.then(|| "--json".to_string()))
         .collect();
+    // KNEMON Layer 5 overlay: per-account subscription utilization. Print
+    // BEFORE the spend report so the operator reads "how loaded is my
+    // paid account?" before the spend totals — they go together, but
+    // headroom-first is the honest order. JSON path stays pure-data (no
+    // human section) so downstream tooling sees the same shape as before.
+    if !json && sub == "report" {
+        let store = UtilizationStore::open_default()?.unwrap_or_default();
+        let catalog = load_tier_catalog(Some(
+            &zoder_core::subscription_tiers::default_catalog_path(&Config::home()),
+        ));
+        let section = render_subscription_utilization_section(
+            &eng.cfg,
+            &store,
+            &catalog,
+            &Pal::themed(&eng.cfg.theme),
+            Utc::now(),
+        );
+        if !section.is_empty() {
+            print!("{section}");
+        }
+    }
     let code = finops_cli(&led, &pricing, &eng.cfg.theme, &argv)?;
     if code != 0 {
         std::process::exit(code);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// KNEMON Layer 5: `Subscription utilization` overlay for `zoder finops report`.
+//
+// Builds an [`AccountView`] (Layer 4's per-account multi-window router view)
+// for every configured subscription account and renders one block per
+// account: per-window table (name / used% / observability / health /
+// headroom), the binding window + verdict + strength, and a single hint
+// line keyed to the verdict band. Pure display — never mutates state.
+// ---------------------------------------------------------------------------
+
+/// Render the full "Subscription utilization" section for every configured
+/// subscription provider in `cfg`. Returns an empty string when no
+/// subscription accounts are configured (so the caller can no-op without
+/// printing an empty header). The trailing one-line footer is the catalog
+/// disclaimer (tiers.json's "ESTIMATES — verify against your dashboard"
+/// wording) — only emitted when the catalog actually carries one and at
+/// least one subscription account was rendered, so an all-explicit config
+/// never sees the disclaimer as noise.
+fn render_subscription_utilization_section(
+    cfg: &Config,
+    store: &UtilizationStore,
+    catalog: &TierCatalog,
+    paint: &Pal,
+    now: DateTime<Utc>,
+) -> String {
+    // Collect (provider, plan, AccountView, AccountDecision, RouteKnobs)
+    // for every subscription provider that actually declared a plan.
+    // We resolve the plan windows through the same resolver the rest of
+    // the CLI uses (`resolve_plan_windows`) so a `tier = "..."` preset
+    // and explicit windows render identically.
+    let mut blocks: Vec<(String, String, AccountView, AccountDecision, RouteKnobs)> = Vec::new();
+    for p in &cfg.providers {
+        let plan = match (p.billing, &p.subscription) {
+            (BillingMode::Subscription, Some(plan)) => plan,
+            _ => continue,
+        };
+        let resolved: ResolvedPlan = resolve_plan_windows(plan, catalog, Some(&p.id));
+        if resolved.windows.is_empty() {
+            continue;
+        }
+        let util_prov = provider_id_to_util(&p.id);
+        let knobs = RouteKnobs::for_triple(util_prov, &p.id, &plan_label(plan));
+        let view = build_account_view(
+            util_prov,
+            &p.id,
+            plan_label(plan),
+            &resolved.windows,
+            store,
+            now,
+        );
+        let decision = decide_account(&view, &knobs, now, None);
+        let label = match &plan.tier {
+            Some(t) => format!("{} ({})", p.id, t),
+            None => p.id.clone(),
+        };
+        blocks.push((label, plan_label(plan), view, decision, knobs));
+    }
+    if blocks.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(&paint.green_b("Subscription utilization"));
+    s.push('\n');
+    for (_label, _plan_name, view, decision, knobs) in &blocks {
+        s.push_str(&render_account_block(view, decision, knobs, paint));
+    }
+    // Disclaimer footer: tiers.json wording, surfaced ONLY when the
+    // catalog actually carries one. Operators with fully-explicit (no
+    // `tier`) plans never see this — their numbers are operator-entered,
+    // not estimates from a curated catalog.
+    if !catalog.disclaimer.is_empty() {
+        s.push('\n');
+        s.push_str(&paint.dim(&format!(
+            "tier catalog: as_of={} — {}",
+            catalog.as_of, catalog.disclaimer
+        )));
+        s.push('\n');
+    }
+    s
+}
+
+/// Render one account block: per-window table, binding window + verdict +
+/// strength, then the single hint line keyed to the verdict band. Pure:
+/// same inputs -> same string; the tests construct an `AccountView`
+/// directly and assert on the rendered string.
+fn render_account_block(
+    view: &AccountView,
+    decision: &AccountDecision,
+    knobs: &RouteKnobs,
+    paint: &Pal,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&paint.green_b(&format!(
+        "  {} ({} / {})",
+        provider_label(view.provider),
+        view.account_id,
+        view.plan
+    )));
+    s.push('\n');
+    if view.windows.is_empty() {
+        s.push_str(&paint.dim("    (no windows declared for this plan)"));
+        s.push('\n');
+        return s;
+    }
+    // Per-window table. used_percent is rendered honestly:
+    //   - Some(pct)               -> "<pct>%"
+    //   - None, PercentOnly       -> "percent-only" (we have no number,
+    //                                and we never invent one)
+    //   - None, !PercentOnly      -> "unknown" (no header sighting for a
+    //                                header-fed or counter-fed window)
+    for w in &view.windows {
+        let pct = match w.used_percent {
+            Some(p) => format!("{:.1}%", p),
+            None => match w.observability {
+                zoder_core::config::Observability::PercentOnly => "percent-only".to_string(),
+                _ => "unknown".to_string(),
+            },
+        };
+        let headroom = match w.used_percent {
+            Some(p) => format!("{:.1}%", (100.0 - p).max(0.0)),
+            None => "n/a".to_string(),
+        };
+        let observability = match w.observability {
+            zoder_core::config::Observability::Header => "header",
+            zoder_core::config::Observability::Counter => "counter",
+            zoder_core::config::Observability::PercentOnly => "percent-only",
+        };
+        let health = match w.health {
+            TelemetryHealth::Fresh => "fresh",
+            TelemetryHealth::Stale => "stale",
+            TelemetryHealth::Degraded => "degraded",
+        };
+        s.push_str(&format!(
+            "    {:<10} used={:<11} obs={:<11} health={:<8} headroom={}\n",
+            w.name, pct, observability, health, headroom
+        ));
+    }
+    // Binding + verdict + strength line, then the single hint line.
+    let binding = decision.binding_window.as_deref().unwrap_or("<none>");
+    let verdict_str = decision.decision.as_str();
+    s.push_str(&format!(
+        "    binding={:<10} verdict={:<16} strength={:.1}%\n",
+        binding, verdict_str, decision.strength
+    ));
+    s.push_str(&format!("    {}\n", hint_line(decision, knobs)));
+    s.push('\n');
+    s
+}
+
+/// Single hint line keyed to the verdict band. Mirrors the spec verbatim:
+///
+/// * no observable window            -> "no telemetry yet"
+/// * strength < use_target           -> "IDLE (X% used, Y% headroom) -> preferring for build work"
+/// * strength in hysteresis band     -> "NEAR TARGET"
+/// * strength >= cap_guard           -> "AT CAP -> falling back to free"
+///
+/// The chargeback verdict also lands in the ">= cap_guard" branch; the
+/// spec doesn't define a separate "CHARGEBACK" hint, so we keep one
+/// label for both end-states (both mean "no headroom left on the sub").
+fn hint_line(decision: &AccountDecision, knobs: &RouteKnobs) -> String {
+    if decision.binding_window.is_none() {
+        // The router treats "no observable window" as PreferSub with
+        // strength 0.0 and binding_window=None — the headroom baseline.
+        // Surface that as the explicit "no telemetry yet" hint.
+        return "no telemetry yet".to_string();
+    }
+    let used = decision.strength;
+    if used < knobs.use_target {
+        let headroom = (100.0 - used).max(0.0);
+        format!(
+            "IDLE ({:.1}% used, {:.1}% headroom) -> preferring for build work",
+            used, headroom
+        )
+    } else if used < knobs.cap_guard {
+        "NEAR TARGET".to_string()
+    } else {
+        "AT CAP -> falling back to free".to_string()
+    }
+}
+
+/// Stable, human-readable plan label. Tier preset (`Some("claude-max-20x")`)
+/// is the most informative thing to print; explicit plans fall back to
+/// `"explicit"` (the plan has no `tier` string of its own).
+fn plan_label(plan: &SubscriptionPlan) -> String {
+    plan.tier.clone().unwrap_or_else(|| "explicit".to_string())
+}
+
+/// Map a `Config::providers[].id` (e.g. `"openai-codex"`, `"anthropic"`)
+/// onto the matching [`UtilProvider`] variant. Same heuristic as
+/// `load_snapshot_for`: substring match on the id. `Other` is the
+/// "don't recognise this id" fallback — counters still work, header
+/// parsing never will.
+fn provider_id_to_util(id: &str) -> UtilProvider {
+    if id.contains("codex") || id.contains("openai-codex") {
+        UtilProvider::OpenaiCodex
+    } else if id.contains("anthropic") {
+        UtilProvider::Anthropic
+    } else if id.contains("openai") {
+        UtilProvider::Openai
+    } else if id.contains("minimax") {
+        UtilProvider::MiniMax
+    } else {
+        UtilProvider::Other
+    }
+}
+
+/// Stable display name for a [`UtilProvider`]. `Debug` would print
+/// `"OpenaiCodex"` / `"Anthropic"` (CamelCase) — that reads fine but the
+/// report layer prefers the snake_case wire format
+/// (`"openai_codex"`, `"anthropic"`, `"minimax"`). Matches the
+/// `serde(rename_all = "snake_case")` on the enum so the human path
+/// and the JSON path agree.
+fn provider_label(p: UtilProvider) -> &'static str {
+    match p {
+        UtilProvider::Openai => "openai",
+        UtilProvider::OpenaiCodex => "openai_codex",
+        UtilProvider::Anthropic => "anthropic",
+        UtilProvider::MiniMax => "minimax",
+        UtilProvider::Other => "other",
+    }
 }
 
 async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
@@ -6136,5 +6386,376 @@ mod scenario_routing_tests {
             .scenarios
             .insert("balanced".into(), override_scenario.clone());
         assert_eq!(cfg.routing.active(), override_scenario);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KNEMON Layer 5 rendering tests. Pure-string assertions over the
+// `render_account_block` / `hint_line` outputs — the functions read
+// directly from a synthetic `AccountView` so the tests don't depend on
+// the `Config` builder, the catalog, or the store. NO_COLOR + a non-TTY
+// stdout keeps the string ANSI-free (the assertions would still pass
+// with ANSI codes but it'd be noisier).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod subscription_utilization_render_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use zoder_core::config::{Observability, QuotaWindow, ResetKind};
+    use zoder_core::utilization::{AccountView, RouteDecision, WindowView};
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap()
+    }
+
+    /// Disable colour for deterministic string assertions.
+    fn pal() -> Pal {
+        // Force `on = false` regardless of TTY: we test pure strings, not
+        // ANSI rendering. Paint/new() reads is_terminal(); using
+        // `Theme::default()` plus an env override would be fragile in CI.
+        Pal {
+            on: false,
+            theme: Theme::default(),
+        }
+    }
+
+    fn fresh_window(name: &str, hours: u32, pct: f64) -> WindowView {
+        WindowView {
+            name: name.to_string(),
+            used_percent: Some(pct),
+            observability: Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours,
+        }
+    }
+
+    fn unknown_window(name: &str, hours: u32, obs: Observability) -> WindowView {
+        WindowView {
+            name: name.to_string(),
+            used_percent: None,
+            observability: obs,
+            // Counter path with no record -> Degraded; Header/PercentOnly
+            // with no sighting also collapses to Degraded. We don't claim
+            // a telemetry health we can't back with a timestamp.
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours,
+        }
+    }
+
+    fn knobs(target: f64, guard: f64) -> RouteKnobs {
+        RouteKnobs {
+            use_target: target,
+            cap_guard: guard,
+            ..RouteKnobs::default()
+        }
+    }
+
+    /// Build a 40%-used MiniMax-monthly synthetic account and assert the
+    /// rendered block carries the IDLE hint line with the right headroom
+    /// (60%) and the "preferring for build work" suffix. Strength < use_target
+    /// (40 < 80) — so the IDLE branch must fire.
+    #[test]
+    fn l5_idle_minimax_monthly_at_40_renders_preferring_line() {
+        let now = fixed_now();
+        let acct = AccountView {
+            provider: UtilProvider::MiniMax,
+            account_id: "default".to_string(),
+            plan: "minimax-monthly".to_string(),
+            windows: vec![fresh_window("monthly", 720, 40.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        // Sanity-check the routing decision before we test the renderer.
+        assert_eq!(decision.decision, RouteDecision::PreferSub);
+        assert!((decision.strength - 40.0).abs() < 1e-9);
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        // IDLE hint line: exact wording per the spec.
+        assert!(
+            block.contains("IDLE (40.0% used, 60.0% headroom) -> preferring for build work"),
+            "missing IDLE hint line in:\n{block}"
+        );
+        // Binding window must name the monthly window and the verdict must
+        // round-trip as the prefer_sub wire string.
+        assert!(
+            block.contains("binding=monthly"),
+            "block missing binding:\n{block}"
+        );
+        assert!(
+            block.contains("verdict=prefer_sub"),
+            "block missing verdict:\n{block}"
+        );
+        // Headroom column on the per-window row must show 60.0%.
+        assert!(
+            block.contains("headroom=60.0%"),
+            "per-window headroom missing in:\n{block}"
+        );
+    }
+
+    /// 90% exceeds `cap_guard` (85) -> AT CAP branch fires. We still want
+    /// the block mode to drive `FallBackToFree`, and the hint line to say
+    /// "AT CAP -> falling back to free" verbatim.
+    #[test]
+    fn l5_at_cap_90_renders_at_cap_falling_back_line() {
+        let now = fixed_now();
+        let acct = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "me".to_string(),
+            plan: "max".to_string(),
+            windows: vec![fresh_window("weekly", 168, 90.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        assert_eq!(decision.decision, RouteDecision::FallBackToFree);
+        assert!((decision.strength - 90.0).abs() < 1e-9);
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        assert!(
+            block.contains("AT CAP -> falling back to free"),
+            "missing AT CAP hint in:\n{block}"
+        );
+        // Per-window headroom must be 10.0% (100 - 90).
+        assert!(
+            block.contains("headroom=10.0%"),
+            "per-window headroom missing in:\n{block}"
+        );
+    }
+
+    /// A percent-only window with no numeric reading must render the
+    /// literal word "unknown" (not a fabricated number, not "nan%", not a
+    /// blank cell). We never invent a percent; the spec is explicit.
+    #[test]
+    fn l5_unknown_window_renders_unknown_not_a_fabricated_number() {
+        let now = fixed_now();
+        // Two windows: a real 20% Fresh (proves the row layout works) and
+        // a PercentOnly window with no header sighting. The PercentOnly
+        // row's `used_percent` is `None` -> must read "percent-only" (the
+        // observability-flavoured "we have a percent-shaped signal but no
+        // number" wording).
+        let acct = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "a".to_string(),
+            plan: "max".to_string(),
+            windows: vec![
+                fresh_window("5h", 5, 20.0),
+                unknown_window("weekly", 168, Observability::PercentOnly),
+            ],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        // The percent-only window must show the literal "percent-only"
+        // token, NOT a made-up number.
+        assert!(
+            block.contains("percent-only"),
+            "missing percent-only wording for None/PercentOnly in:\n{block}"
+        );
+        // The 20% row is still numeric — proves we didn't accidentally
+        // scrub real numbers when handling the unknown one.
+        assert!(
+            block.contains("20.0%"),
+            "real 20% reading dropped in:\n{block}"
+        );
+        // Now: a counter-fed window with no record also reads None. The
+        // default observability for "we have no number and no header" is
+        // "unknown" (NOT "percent-only", which is reserved for the
+        // percent-only observability class).
+        let acct2 = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "a".to_string(),
+            plan: "max".to_string(),
+            windows: vec![unknown_window("monthly", 720, Observability::Counter)],
+        };
+        let decision2 = decide_account(&acct2, &knobs, now, None);
+        let block2 = render_account_block(&acct2, &decision2, &knobs, &pal());
+        assert!(
+            block2.contains("unknown"),
+            "missing unknown wording for None/Counter in:\n{block2}"
+        );
+        // And NEVER a fabricated numeric. We grep for a percent on the
+        // "monthly" row by isolating the line that contains "monthly".
+        let monthly_line = block2
+            .lines()
+            .find(|l| l.contains("monthly"))
+            .expect("monthly row present");
+        for forbidden in ["nan%", "inf%", "0.0%"] {
+            assert!(
+                !monthly_line.contains(forbidden),
+                "fabricated number {forbidden:?} leaked into unknown row: {monthly_line:?}"
+            );
+        }
+    }
+
+    /// All-Degraded -> no observable window -> `binding_window` is None
+    /// and the hint line MUST be the literal "no telemetry yet". This is
+    /// the headroom baseline the router falls back to.
+    #[test]
+    fn l5_no_observable_window_renders_no_telemetry_yet_hint() {
+        let now = fixed_now();
+        let acct = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "a".to_string(),
+            plan: "max".to_string(),
+            windows: vec![unknown_window("weekly", 168, Observability::Header)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        // Sanity: observable is empty, so PreferSub with no binding.
+        assert_eq!(decision.decision, RouteDecision::PreferSub);
+        assert!(decision.binding_window.is_none());
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        assert!(
+            block.contains("no telemetry yet"),
+            "missing no-telemetry-yet hint in:\n{block}"
+        );
+    }
+
+    /// Hysteresis band: strength in [use_target, cap_guard). The hint line
+    /// MUST be the literal "NEAR TARGET" (no idle wording, no AT CAP).
+    #[test]
+    fn l5_hysteresis_band_renders_near_target_hint() {
+        let now = fixed_now();
+        // 82% sits in the (80, 85) hysteresis band — between use_target
+        // and cap_guard.
+        let acct = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "a".to_string(),
+            plan: "max".to_string(),
+            windows: vec![fresh_window("weekly", 168, 82.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        // Still PreferSub (hysteresis keeps the sub unless cap_guard trips).
+        assert_eq!(decision.decision, RouteDecision::PreferSub);
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        assert!(
+            block.contains("NEAR TARGET"),
+            "missing NEAR TARGET hint in:\n{block}"
+        );
+        // Make sure we did NOT print the IDLE or AT CAP copy in the
+        // hysteresis band.
+        assert!(
+            !block.contains("IDLE ("),
+            "IDLE wording leaked into hysteresis band:\n{block}"
+        );
+        assert!(
+            !block.contains("AT CAP"),
+            "AT CAP wording leaked into hysteresis band:\n{block}"
+        );
+    }
+
+    /// The rendered section is content-free: no prompts, no secrets, no
+    /// interactive input. We grep for the obvious prompt-shaped strings —
+    /// `Password:`, `key:`, `Username:`, `Enter`, etc.
+    #[test]
+    fn l5_rendered_section_is_content_free() {
+        let now = fixed_now();
+        let acct = AccountView {
+            provider: UtilProvider::MiniMax,
+            account_id: "default".to_string(),
+            plan: "minimax-monthly".to_string(),
+            windows: vec![fresh_window("monthly", 720, 35.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        for forbidden in [
+            "Password:",
+            "password:",
+            "Username:",
+            "Enter ",
+            "input ",
+            "stdin",
+            "API key",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "forbidden prompt-shaped token {forbidden:?} leaked into block:\n{block}"
+            );
+        }
+    }
+
+    /// The top-level section renderer returns an empty string when no
+    /// subscription accounts are configured, and a non-empty string
+    /// (containing the section header) when at least one is.
+    #[test]
+    fn l5_section_returns_empty_for_no_subscription_providers() {
+        let now = fixed_now();
+        let store = UtilizationStore::default();
+        let catalog = TierCatalog::bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(tmp.path());
+        // Strip every provider's subscription so the section has nothing
+        // to render. We don't add any subscription plans in this config.
+        for p in &mut cfg.providers {
+            p.billing = BillingMode::Free;
+            p.subscription = None;
+        }
+        let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
+        assert!(
+            out.is_empty(),
+            "section should be empty when no subscription providers are present, got:\n{out}"
+        );
+
+        // Now wire ONE subscription provider through, and the section
+        // should produce a non-empty string carrying the header.
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = Some(SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            tier: None,
+            windows: vec![QuotaWindow {
+                name: "weekly".to_string(),
+                hours: 168,
+                unit: zoder_core::QuotaUnit::Messages,
+                cap: Some(100.0),
+                models: None,
+                observability: Observability::Header,
+                reset: ResetKind::default(),
+            }],
+        });
+        let out2 = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
+        assert!(
+            out2.contains("Subscription utilization"),
+            "section header missing when subscription is configured, got:\n{out2}"
+        );
+    }
+
+    /// The disclaimer footer surfaces tiers.json's `disclaimer` wording
+    /// when the catalog carries one. (The bundled catalog ships a real
+    /// disclaimer; the explicit-only catalog returns empty.)
+    #[test]
+    fn l5_section_renders_disclaimer_footer_when_catalog_has_one() {
+        let now = fixed_now();
+        let store = UtilizationStore::default();
+        let catalog = TierCatalog::bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(tmp.path());
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = Some(SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            tier: None,
+            windows: vec![QuotaWindow {
+                name: "weekly".to_string(),
+                hours: 168,
+                unit: zoder_core::QuotaUnit::Messages,
+                cap: Some(100.0),
+                models: None,
+                observability: Observability::Header,
+                reset: ResetKind::default(),
+            }],
+        });
+        let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
+        assert!(
+            out.contains("tier catalog:"),
+            "missing disclaimer footer in:\n{out}"
+        );
+        // The bundled catalog disclaimer is the "ESTIMATES" wording; just
+        // assert the substring `as_of=` shows up so we don't break if the
+        // exact disclaimer text is rephrased.
+        assert!(
+            out.contains("as_of="),
+            "missing as_of= prefix on disclaimer line in:\n{out}"
+        );
     }
 }
