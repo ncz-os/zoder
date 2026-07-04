@@ -21,7 +21,7 @@ use zoder_core::{
     BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
     Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
     Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
-    Router, RoutableCandidate, ScenarioRole, ScopeStat, Session, State, Theme, Tier,
+    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, Theme, Tier,
     PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
@@ -1855,8 +1855,7 @@ fn resolve_chain(
         .with_backed(Some(backed_free_model_ids(eng)));
     let route = router.select(Tier::parse(&cli.tier))?;
     let rc = RoutingContext::load(&eng.cfg);
-    let (scn_primary, scn_reviewer, scn_reason) =
-        scenario_chain_for_roles(eng, &rc, health, cli)?;
+    let (scn_primary, scn_reviewer, scn_reason) = scenario_chain_for_roles(eng, &rc, health, cli)?;
 
     // The contract callers rely on:
     // - First entry is the routed primary for this run.
@@ -1897,6 +1896,32 @@ fn resolve_chain(
     // pull it without re-computing. The CLI is single-threaded for the
     // resolve step so a thread-local would be safe, but a static-once
     // cell is simpler and the reviewer's read happens immediately after.
+    // With an explicit --require-free, a pinned or scenario-chosen PAID
+    // primary (e.g. MiniMax-M3) must not head the chain: otherwise the
+    // downstream free guard bails ("not a known free model") instead of
+    // using the free fallbacks the router already ranked. Drop non-free
+    // links so `chain.first()` is guaranteed free. Only if NOTHING free
+    // survives do we leave the chain intact, so the caller's free guard
+    // can still report the real "no free model available" condition.
+    // NOTE: scoped to --require-free (explicit opt-in), NOT cfg.strict_free
+    // — the pinned primary stays the default so `strict_free`'s free-only
+    // semantics vs. a paid primary_model can be reconciled deliberately.
+    let (chain, reason) = if cli.require_free {
+        let backed = backed_free_model_ids(eng);
+        let is_free =
+            |m: &String| eng.corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m);
+        let free_chain: Vec<String> = chain.iter().filter(|m| is_free(m)).cloned().collect();
+        if free_chain.is_empty() || free_chain.len() == chain.len() {
+            (chain, reason)
+        } else {
+            (
+                free_chain,
+                format!("{reason} | strict-free: dropped non-free head(s)"),
+            )
+        }
+    } else {
+        (chain, reason)
+    };
     set_last_reviewer_chain(scn_reviewer);
     Ok((chain, reason))
 }
@@ -1925,11 +1950,7 @@ fn take_last_reviewer_chain() -> Option<Vec<String>> {
 /// `default_cross_family_reviewer` when the scenario layer produced an
 /// empty chain (e.g. a host with no sub/paid entries).
 #[allow(dead_code)]
-fn resolve_chain_reviewer(
-    cli: &Cli,
-    eng: &Engine,
-    health: &HealthStore,
-) -> anyhow::Result<String> {
+fn resolve_chain_reviewer(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Result<String> {
     // Make sure the reviewer chain is populated. resolve_chain caches
     // it; if we got here without going through resolve_chain (the
     // dry-run path, or an explicit `-m <X>` + reviewer combo), we
@@ -5623,12 +5644,12 @@ mod health_install_tests {
 mod scenario_routing_tests {
     use super::*;
     use chrono::TimeZone;
+    use zoder_core::classify_provider;
     use zoder_core::scenarios::{
         candidate_eligible, chain_for_role, default_scenarios, pick_candidate_for_role,
-        ProviderClass, Role as ScenarioRole, RouteScenario, RoutableCandidate,
+        ProviderClass, Role as ScenarioRole, RoutableCandidate, RouteScenario,
     };
     use zoder_core::utilization::{BudgetMode, RateLimitSnapshot, WindowSnapshot};
-    use zoder_core::classify_provider;
 
     /// Returns the current wall clock pinned to a deterministic instant so
     /// tests don't depend on real time (KNEMON's `effective_used` is
@@ -5686,7 +5707,10 @@ mod scenario_routing_tests {
     fn default_scenarios_match_the_four_presets() {
         let presets = default_scenarios();
         assert_eq!(presets.len(), 4);
-        assert_eq!(presets["economy"].primary_classes, vec![ProviderClass::Free]);
+        assert_eq!(
+            presets["economy"].primary_classes,
+            vec![ProviderClass::Free]
+        );
         assert_eq!(presets["balanced"].use_target, 80.0);
         assert_eq!(presets["aggressive"].cap_guard, 95.0);
         assert!(presets["unlimited"].allow_paid);
@@ -5768,7 +5792,7 @@ mod scenario_routing_tests {
             cand("sub-ok", ProviderClass::Sub, 60.0),
         ];
         cands[0].healthy = false; // open circuit breaker
-        // Reviewer classes=[free, sub]; free is unhealthy -> sub wins.
+                                  // Reviewer classes=[free, sub]; free is unhealthy -> sub wins.
         assert_eq!(
             pick_candidate_for_role(
                 ScenarioRole::Reviewer,
@@ -5997,7 +6021,12 @@ mod scenario_routing_tests {
         );
         assert_eq!(
             chain,
-            vec!["sub-1".to_string(), "sub-2".into(), "free-1".into(), "free-2".into()],
+            vec![
+                "sub-1".to_string(),
+                "sub-2".into(),
+                "free-1".into(),
+                "free-2".into()
+            ],
             "class preference (sub first) interleaves with rank"
         );
         // Primary classes=[free, sub] -> free-1 first.
@@ -6012,7 +6041,12 @@ mod scenario_routing_tests {
         );
         assert_eq!(
             chain,
-            vec!["free-1".to_string(), "free-2".into(), "sub-1".into(), "sub-2".into()],
+            vec![
+                "free-1".to_string(),
+                "free-2".into(),
+                "sub-1".into(),
+                "sub-2".into()
+            ],
         );
     }
 
@@ -6089,4 +6123,3 @@ mod scenario_routing_tests {
         assert_eq!(cfg.routing.active(), override_scenario);
     }
 }
-
