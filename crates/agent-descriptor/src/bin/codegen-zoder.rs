@@ -161,6 +161,7 @@ fn build_zoder_descriptor() -> AgentDescriptor {
             acp_capable: true,
             extensions: Default::default(),
         },
+        extensions: Default::default(),
     }
 }
 
