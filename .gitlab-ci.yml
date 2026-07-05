@@ -263,8 +263,13 @@ nightly:linux:
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-    - apt-get update && apt-get install -y gcc-aarch64-linux-gnu
+    # Both the C and C++ aarch64 cross toolchains: some engine (-sys) deps use
+    # cc-rs for C++ and need aarch64-linux-gnu-g++, not just gcc. Missing g++
+    # broke the vendored zeroclaw arm64 build (macos-arm64 builds native, so it
+    # was unaffected). Wire CC/CXX so cc-rs picks the cross compilers.
+    - apt-get update && apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+    - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
     - cargo build --release --locked --bin zoder --target x86_64-unknown-linux-gnu
     - cargo build --release --locked --bin zoder --target aarch64-unknown-linux-gnu
     - |
@@ -272,6 +277,7 @@ nightly:linux:
       # until both zoder AND zerocode/zeroclaw built successfully
       # (Finding #17: keep the rolling channel consistent).
       export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
       rm -rf .zc-src
       case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
       [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
