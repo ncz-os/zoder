@@ -29,10 +29,10 @@ pub struct FinOpsTags {
 
 /// Maximum number of consecutive non-UTF-8 bytes we'll tolerate in a
 /// single line before giving up. Used as the upper bound for
-/// `BufRead::read_until` so an attacker can't pin the parser on a
+/// incremental `BufRead::fill_buf` consumption so an attacker can't pin the parser on a
 /// multi-gigabyte garbage line; matches `provider.rs`'s
 /// `MAX_LINE_BYTES` for streaming SSE.
-const MAX_LEDGER_LINE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+const MAX_LEDGER_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -233,8 +233,8 @@ impl Ledger {
         // multi-MiB JSONL: one invalid UTF-8 byte in line 1 of a 50 MiB
         // file makes the whole `read_to_string` fail with InvalidData,
         // collapsing every entry to zero (Finding #10). Per-line
-        // `BufRead::read_until` recovers as much as possible and bounds
-        // memory via `MAX_LEDGER_LINE_BYTES`.
+        // incremental `fill_buf` processing recovers as much as possible and
+        // enforces `MAX_LEDGER_LINE_BYTES` before appending each chunk.
         let reader = BufReader::with_capacity(64 * 1024, f);
         let mut out = Vec::new();
         let mut line_no: usize = 0;
@@ -243,21 +243,35 @@ impl Ledger {
         loop {
             line_no += 1;
             buf.clear();
-            let n = match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    return Err(anyhow::Error::from(e).context(format!(
+            loop {
+                let available = reader.fill_buf().with_context(|| {
+                    format!(
                         "reading ledger at line {line_no} of {}",
                         self.path.display()
-                    )))
+                    )
+                })?;
+                if available.is_empty() {
+                    if buf.is_empty() {
+                        return Ok(out);
+                    }
+                    break;
                 }
-            };
-            if n > MAX_LEDGER_LINE_BYTES as usize {
-                return Err(anyhow::anyhow!(
-                    "ledger line {line_no} exceeds {} bytes; truncating early",
-                    MAX_LEDGER_LINE_BYTES
-                ));
+                let chunk_len = available
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(available.len(), |position| position + 1);
+                if buf.len().saturating_add(chunk_len) > MAX_LEDGER_LINE_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "ledger line {line_no} exceeds {} bytes; truncating early",
+                        MAX_LEDGER_LINE_BYTES
+                    ));
+                }
+                let has_newline = available[chunk_len - 1] == b'\n';
+                buf.extend_from_slice(&available[..chunk_len]);
+                reader.consume(chunk_len);
+                if has_newline {
+                    break;
+                }
             }
             // Trim the trailing newline (and any CR for CRLF safety) so
             // `serde_json::from_slice` doesn't see a trailing whitespace
@@ -281,7 +295,6 @@ impl Ledger {
                 }
             }
         }
-        Ok(out)
     }
 
     /// All entries, silently skipping malformed lines. For visibility into
@@ -613,6 +626,19 @@ mod tests {
             "exactly one line should be reported as malformed"
         );
         assert_eq!(dropped[0].0, 2, "the malformed line is line 2");
+    }
+
+    #[test]
+    fn oversized_line_is_rejected_at_the_streaming_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_LEDGER_LINE_BYTES as u64 + 1).unwrap();
+        drop(file);
+
+        let err = Ledger::new(&path).entries().unwrap_err().to_string();
+        assert!(err.contains("line 1 exceeds"), "{err}");
+        assert!(err.contains(&MAX_LEDGER_LINE_BYTES.to_string()), "{err}");
     }
 
     /// Finding #10: month_to_date_usd on a healthy ledger returns the

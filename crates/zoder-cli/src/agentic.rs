@@ -559,7 +559,7 @@ async fn complete_once(
             cost_unknown: unknown_cost,
             calls: 1,
             violation,
-            tags: zoder_core::ledger::FinOpsTags::default(),
+            tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         })
         .with_context(|| {
             format!(

@@ -33,6 +33,39 @@ use zoder_core::{
     SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
+fn finops_task(cli: &Cli) -> &'static str {
+    match cli.cmd.as_ref() {
+        Some(Cmd::Review { .. }) => "review",
+        Some(Cmd::AdversarialReview { .. }) => "adversarial-review",
+        Some(Cmd::Rescue { .. }) => "rescue",
+        Some(Cmd::Loop { .. }) => "loop",
+        _ => "exec",
+    }
+}
+
+fn cache_hit_ratio(prompt_tokens: u64, cached_prompt_tokens: Option<u64>) -> Option<f64> {
+    cached_prompt_tokens.map(|cached| {
+        if prompt_tokens == 0 {
+            0.0
+        } else {
+            cached.min(prompt_tokens) as f64 / prompt_tokens as f64
+        }
+    })
+}
+
+fn finops_tags(
+    cli: &Cli,
+    prompt_tokens: u64,
+    cached_prompt_tokens: Option<u64>,
+) -> zoder_core::ledger::FinOpsTags {
+    zoder_core::ledger::FinOpsTags {
+        caller: Some("zoder".to_string()),
+        task: Some(finops_task(cli).to_string()),
+        tier: Some(cli.tier.clone()),
+        cache_hit_ratio: cache_hit_ratio(prompt_tokens, cached_prompt_tokens),
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(
     name = "zoder",
@@ -2865,7 +2898,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         cost_unknown: unknown_cost,
         calls: 1,
         violation,
-        tags: zoder_core::ledger::FinOpsTags::default(),
+        tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
     })?;
     save_health(&health);
 
@@ -3437,7 +3470,7 @@ pub(crate) async fn agentic_turn(
         cost_unknown: !cost_known,
         calls: 1,
         violation,
-        tags: zoder_core::ledger::FinOpsTags::default(),
+        tags: finops_tags(cli, tokens_in, None),
     }) {
         eprintln!("zoder: warning: failed to record ledger entry: {e}");
     }

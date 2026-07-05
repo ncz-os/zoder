@@ -392,7 +392,7 @@ pub fn cheapest_equivalent_advisor(
         }
         let r = paid.entry(e.model.clone()).or_insert((0.0, 0, 0));
         r.0 = saturating_f64_add(r.0, e.cost_usd);
-        r.1 = r.1.saturating_add(1);
+        r.1 = r.1.saturating_add(e.calls);
         r.2 = r.2.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
     }
     if paid.is_empty() {
@@ -963,5 +963,39 @@ mod tests {
         let rendered = render_finops_text(&report, &Paint::new(&Theme::default()));
         assert!(rendered.contains("unknown cost:"));
         assert!(rendered.contains("excluded from spend and rates"));
+    }
+
+    #[test]
+    fn advisor_counts_underlying_calls_in_compacted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let mut compacted = Entry {
+            ts_utc: Utc::now(),
+            provider: "p".into(),
+            model: "paid/model".into(),
+            host: "paid".into(),
+            tokens_in: 700,
+            tokens_out: 300,
+            cost_usd: 1.0,
+            cost_unknown: false,
+            calls: 7,
+            violation: None,
+            tags: FinOpsTags::default(),
+        };
+        led.record(&compacted).unwrap();
+        compacted.calls = u64::MAX;
+        led.record(&compacted).unwrap();
+
+        let mut pricing = PricingCatalog::default();
+        pricing.models.insert(
+            "cheap/model".into(),
+            ModelPrice {
+                usd_per_mtok: 1.0,
+                ..Default::default()
+            },
+        );
+        let rows = cheapest_equivalent_advisor(&led, &pricing, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].calls, u64::MAX);
     }
 }

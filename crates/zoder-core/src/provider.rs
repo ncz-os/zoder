@@ -177,6 +177,9 @@ pub struct ChatResult {
     pub prompt_tokens: Option<u64>,
     /// Authoritative completion token count from the response `usage`, if present.
     pub completion_tokens: Option<u64>,
+    /// Prompt tokens served from a provider cache, when usage telemetry
+    /// reports them. This is a subset of `prompt_tokens`.
+    pub cached_prompt_tokens: Option<u64>,
     pub telemetry: CallTelemetry,
 }
 
@@ -207,6 +210,26 @@ struct Usage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Anthropic-compatible gateways commonly expose this at the usage root.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl Usage {
+    fn cached_prompt_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .or(self.cache_read_input_tokens)
+    }
 }
 
 #[derive(Deserialize)]
@@ -569,9 +592,12 @@ impl OpenAiProvider {
             let _ = s.write_all(content.as_bytes());
             let _ = s.flush();
         }
-        let (prompt_tokens, completion_tokens) = match parsed.usage {
-            Some(u) => (u.prompt_tokens, u.completion_tokens),
-            None => (None, None),
+        let (prompt_tokens, completion_tokens, cached_prompt_tokens) = match parsed.usage {
+            Some(u) => {
+                let cached_prompt_tokens = u.cached_prompt_tokens();
+                (u.prompt_tokens, u.completion_tokens, cached_prompt_tokens)
+            }
+            None => (None, None, None),
         };
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
@@ -579,6 +605,7 @@ impl OpenAiProvider {
             tokens_out,
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
             telemetry,
         })
     }
@@ -596,6 +623,7 @@ impl OpenAiProvider {
         let mut chunk_count: u64 = 0;
         let mut prompt_tokens: Option<u64> = None;
         let mut completion_tokens: Option<u64> = None;
+        let mut cached_prompt_tokens: Option<u64> = None;
         // True once answer bytes have been written to the sink: a retry of this
         // same model would duplicate visible output.
         let mut emitted = false;
@@ -701,6 +729,9 @@ impl OpenAiProvider {
                     if u.completion_tokens.is_some() {
                         completion_tokens = u.completion_tokens;
                     }
+                    if let Some(cached) = u.cached_prompt_tokens() {
+                        cached_prompt_tokens = Some(cached);
+                    }
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     let piece = pick_text(
@@ -733,6 +764,7 @@ impl OpenAiProvider {
             tokens_out,
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
             telemetry,
         })
     }
@@ -1008,5 +1040,22 @@ mod tests {
         assert!(r.contains("[REDACTED]"));
         let r2 = redact("prefix AKIAIOSFODNN7EXAMPLE0123456789 suffix");
         assert!(r2.contains("[REDACTED]") && r2.contains("prefix") && r2.contains("suffix"));
+    }
+
+    #[test]
+    fn usage_reads_cache_tokens_from_supported_shapes() {
+        let openai: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": { "cached_tokens": 75 }
+        }))
+        .unwrap();
+        assert_eq!(openai.cached_prompt_tokens(), Some(75));
+
+        let anthropic: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "cache_read_input_tokens": 60
+        }))
+        .unwrap();
+        assert_eq!(anthropic.cached_prompt_tokens(), Some(60));
     }
 }
