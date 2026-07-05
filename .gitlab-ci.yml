@@ -160,7 +160,7 @@ nightly:linux:
   stage: release
   <<: *nightly-rules
   needs: []
-  timeout: 40m
+  timeout: 90m
   script:
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
     - apt-get update && apt-get install -y gcc-aarch64-linux-gnu
@@ -181,13 +181,32 @@ nightly:linux:
           curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-$t.sha256"
         done
       done
+    - |
+      # Build + publish the version-matched TUI pair (zerocode + zeroclaw) from
+      # the zoder-integration fork, per linux target, so `zoder tui` installs
+      # from the nightly too. Same rolling+dated channels and checksums as zoder.
+      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      rm -rf .zc-src
+      git clone --depth 1 -b "${ZEROCLAW_REF:-zoder-integration}" "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" .zc-src
+      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
+        for name in zerocode zeroclaw; do
+          bin=".zc-src/target/$t/release/$name"
+          sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
+          for ch in master "$DATE"; do
+            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-$t"
+            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-$t.sha256"
+          done
+        done
+      done
 
 nightly:macos-arm64:
   stage: release
   <<: *nightly-rules
   needs: []
   tags: [fleet-macos-arm64]
-  timeout: 40m
+  timeout: 90m
   variables:
     GIT_STRATEGY: clone
   script:
@@ -200,6 +219,20 @@ nightly:macos-arm64:
       for ch in master "$DATE"; do
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin"
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin.sha256"
+      done
+    - |
+      # Native TUI pair (zerocode + zeroclaw) from the zoder-integration fork.
+      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      rm -rf .zc-src
+      git clone --depth 1 -b "${ZEROCLAW_REF:-zoder-integration}" "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" .zc-src
+      ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+      for name in zerocode zeroclaw; do
+        bin=".zc-src/target/release/$name"
+        shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
+        for ch in master "$DATE"; do
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-aarch64-apple-darwin"
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-aarch64-apple-darwin.sha256"
+        done
       done
 
 # ── prune: keep only the last 7 date-stamped nightly channels ────────────────
