@@ -1108,6 +1108,92 @@ pub fn build_account_view(
 /// caller can rank multiple sub-class candidates by ASCENDING strength
 /// so the most-idle one is preferred first; the legacy single-account
 /// path collapses this to "is the sub available at all".
+/// Confidence below which a [`WindowForecast`] MUST NOT influence routing.
+/// Confidence is `elapsed_fraction * health_weight`, so the default `0.5`
+/// means "at least half the window observed, on Fresh telemetry" before a
+/// forecast can pre-empt — conservative on purpose, to avoid over-reacting
+/// to a burst early in a long window.
+pub const FORECAST_CONFIDENCE_MIN: f64 = 0.5;
+
+/// KNEMON Layer 4b — a per-window burn-rate forecast.
+///
+/// Projects the window's `used_percent` forward to its `reset_at`, assuming
+/// usage accrued roughly linearly from 0 at the window's start (the natural
+/// model for a quota/counter window that resets to empty). Honest by
+/// construction: it only ever projects the OBSERVED percent forward — it
+/// never invents a cap or an absolute token count, so it is valid for
+/// `PercentOnly` windows too (we forecast the *percentage trajectory*, which
+/// the vendor already publishes, not a fabricated absolute).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WindowForecast {
+    /// Projected `used_percent` at `reset_at` (>= the current used-percent).
+    /// Clamped to a sane ceiling so a near-zero elapsed can't yield nonsense.
+    pub projected_used_percent: f64,
+    /// 0..=1: `elapsed_fraction * health_weight`. A forecast below
+    /// [`FORECAST_CONFIDENCE_MIN`] must not drive routing.
+    pub confidence: f64,
+    /// How far through the window we are, 0..=1.
+    pub elapsed_fraction: f64,
+}
+
+/// Forecast one window's used-percent at its reset. Returns `None` when the
+/// window has no numeric reading, no reset signal, no known duration, or has
+/// not started yet (clock skew) — i.e. there is nothing honest to project.
+pub fn forecast_window(w: &WindowView, now: DateTime<Utc>) -> Option<WindowForecast> {
+    let used = w.used_percent?;
+    let reset_at = w.reset_at?;
+    if w.hours == 0 {
+        return None;
+    }
+    let duration = w.hours as f64 * 3600.0;
+    if duration <= 0.0 {
+        return None;
+    }
+    // elapsed since the window opened = full cycle - time left on the clock.
+    let time_to_reset = (reset_at - now).num_seconds() as f64;
+    let elapsed = duration - time_to_reset;
+    if elapsed <= 0.0 {
+        // Window has not started (reset is a full cycle+ away) — nothing to
+        // project honestly.
+        return None;
+    }
+    let elapsed_fraction = (elapsed / duration).clamp(0.0, 1.0);
+    if elapsed_fraction <= 0.0 {
+        return None;
+    }
+    // Linear projection from 0 at window open: used-at-reset ~= used scaled
+    // up by the inverse of how far we are through the window. Never below the
+    // current reading (usage only accrues toward reset); ceiling-clamped.
+    // >= current reading (usage only accrues toward reset), ceiling-capped so
+    // a tiny elapsed can't yield nonsense. `.min().max()` (not `clamp`) so a
+    // pathological `used > 1000` can't panic on an inverted clamp range.
+    let projected = (used / elapsed_fraction).min(1000.0).max(used);
+    let confidence = (elapsed_fraction * w.health.health_weight()).clamp(0.0, 1.0);
+    Some(WindowForecast {
+        projected_used_percent: projected,
+        confidence,
+        elapsed_fraction,
+    })
+}
+
+/// Forecast the binding window of an account — the same tightest-window
+/// selection [`decide_account`] uses (max `used_percent * health_weight`
+/// among observable windows). `None` when no window is observable or none
+/// has enough signal to project. Handy for reports ("on pace for N% by
+/// reset") and for the router's pre-emption check.
+pub fn forecast_account(account: &AccountView, now: DateTime<Utc>) -> Option<WindowForecast> {
+    let binding = account
+        .windows
+        .iter()
+        .filter(|w| w.used_percent.is_some() && w.health != TelemetryHealth::Degraded)
+        .max_by(|a, b| {
+            let sa = a.used_percent.unwrap_or(0.0) * a.health.health_weight();
+            let sb = b.used_percent.unwrap_or(0.0) * b.health.health_weight();
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    forecast_window(binding, now)
+}
+
 pub fn decide_account(
     account: &AccountView,
     knobs: &RouteKnobs,
@@ -1164,13 +1250,19 @@ pub fn decide_account(
             binding_window: Some(binding.name.clone()),
         };
     }
+    // Forecast pre-emption (KNEMON Layer 4b): if any observable window is on a
+    // confident trajectory to breach `cap_guard` before its reset, fall back
+    // now — even if nothing has tripped the guard yet. This only ever TIGHTENS
+    // (PreferSub -> fall back / chargeback), never loosens, so it can't defeat
+    // the drive-utilization intent. Reset-relaxation already returned above, so
+    // a window about to roll over never triggers a spurious pre-emption here.
+    let forecast_breach = observable.iter().any(|w| {
+        forecast_window(w, now).is_some_and(|f| {
+            f.confidence >= FORECAST_CONFIDENCE_MIN && f.projected_used_percent >= knobs.cap_guard
+        })
+    });
     // Bands.
-    let decision = if binding_used < knobs.use_target {
-        RouteDecision::PreferSub
-    } else if binding_used < knobs.cap_guard {
-        // Hysteresis: keep the sub unless the guard trips.
-        RouteDecision::PreferSub
-    } else {
+    let decision = if binding_used >= knobs.cap_guard || forecast_breach {
         match knobs.budget_mode {
             BudgetMode::Block => RouteDecision::FallBackToFree,
             BudgetMode::Chargeback => match (knobs.chargeback_budget_usd, chargeback_remaining) {
@@ -1178,6 +1270,11 @@ pub fn decide_account(
                 _ => RouteDecision::FallBackToFree,
             },
         }
+    } else {
+        // Below the guard and not forecast to breach: keep the paid sub. Both
+        // the drive-utilization band (< use_target) and the hysteresis band
+        // (< cap_guard) prefer the subscription.
+        RouteDecision::PreferSub
     };
     AccountDecision {
         decision,
@@ -2883,5 +2980,213 @@ mod tests {
         let w = &view.windows[0];
         assert!(w.used_percent.is_none());
         assert_eq!(w.health, TelemetryHealth::Degraded);
+    }
+
+    // ---- KNEMON Layer 4b: burn-rate forecast + pre-emption ----
+
+    fn fc_win(
+        name: &str,
+        hours: u32,
+        used: f64,
+        health: TelemetryHealth,
+        reset_at: Option<DateTime<Utc>>,
+    ) -> WindowView {
+        WindowView {
+            name: name.into(),
+            used_percent: Some(used),
+            observability: crate::config::Observability::Counter,
+            health,
+            reset_at,
+            hours,
+        }
+    }
+
+    #[test]
+    fn forecast_projects_used_percent_at_reset() {
+        // 5h window, half elapsed (reset 2.5h out), 40% used -> ~80% projected.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let w = fc_win(
+            "5h",
+            5,
+            40.0,
+            TelemetryHealth::Fresh,
+            Some(now + chrono::Duration::seconds(9000)),
+        );
+        let f = forecast_window(&w, now).expect("forecastable");
+        assert!(
+            (f.elapsed_fraction - 0.5).abs() < 1e-6,
+            "elapsed {}",
+            f.elapsed_fraction
+        );
+        assert!(
+            (f.projected_used_percent - 80.0).abs() < 1e-6,
+            "proj {}",
+            f.projected_used_percent
+        );
+        assert!((f.confidence - 0.5).abs() < 1e-6, "conf {}", f.confidence);
+    }
+
+    #[test]
+    fn forecast_none_without_reset_signal() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        assert!(
+            forecast_window(&fc_win("5h", 5, 40.0, TelemetryHealth::Fresh, None), now).is_none()
+        );
+    }
+
+    #[test]
+    fn forecast_early_window_has_low_confidence() {
+        // Only 10% into the window -> confidence below the routing floor.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let w = fc_win(
+            "5h",
+            5,
+            30.0,
+            TelemetryHealth::Fresh,
+            Some(now + chrono::Duration::seconds(16200)),
+        );
+        let f = forecast_window(&w, now).unwrap();
+        assert!(
+            f.confidence < FORECAST_CONFIDENCE_MIN,
+            "conf {}",
+            f.confidence
+        );
+    }
+
+    #[test]
+    fn forecast_degraded_has_zero_confidence() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let w = fc_win(
+            "5h",
+            5,
+            40.0,
+            TelemetryHealth::Degraded,
+            Some(now + chrono::Duration::seconds(9000)),
+        );
+        assert_eq!(forecast_window(&w, now).unwrap().confidence, 0.0);
+    }
+
+    #[test]
+    fn forecast_percent_only_window_still_projects_the_percentage() {
+        // PercentOnly: forecasting the % trajectory is honest (no cap invented).
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut w = fc_win(
+            "weekly",
+            168,
+            50.0,
+            TelemetryHealth::Fresh,
+            Some(now + chrono::Duration::seconds(168 * 3600 / 2)),
+        );
+        w.observability = crate::config::Observability::PercentOnly;
+        let f = forecast_window(&w, now).unwrap();
+        assert!(
+            (f.projected_used_percent - 100.0).abs() < 1e-6,
+            "proj {}",
+            f.projected_used_percent
+        );
+    }
+
+    #[test]
+    fn decide_account_preempts_before_guard_on_confident_trajectory() {
+        // 60% now (< cap_guard 85), half elapsed -> projected 120% -> pre-empt.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fc_win(
+                "monthly",
+                720,
+                60.0,
+                TelemetryHealth::Fresh,
+                Some(now + chrono::Duration::seconds(720 * 3600 / 2)),
+            )],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        assert_eq!(
+            decide_account(&acct, &knobs, now, None).decision,
+            RouteDecision::FallBackToFree
+        );
+    }
+
+    #[test]
+    fn decide_account_drives_utilization_when_on_pace_under_guard() {
+        // 30% now, half elapsed -> projected 60% < guard -> keep the paid sub.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fc_win(
+                "monthly",
+                720,
+                30.0,
+                TelemetryHealth::Fresh,
+                Some(now + chrono::Duration::seconds(720 * 3600 / 2)),
+            )],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        assert_eq!(
+            decide_account(&acct, &knobs, now, None).decision,
+            RouteDecision::PreferSub
+        );
+    }
+
+    #[test]
+    fn decide_account_no_false_preempt_near_reset() {
+        // 80% now but 95% elapsed -> projected ~84% < 85 -> self-regulates, no pre-empt.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let reset = now + chrono::Duration::seconds((720.0 * 3600.0 * 0.05) as i64);
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![fc_win(
+                "monthly",
+                720,
+                80.0,
+                TelemetryHealth::Fresh,
+                Some(reset),
+            )],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        assert_eq!(
+            decide_account(&acct, &knobs, now, None).decision,
+            RouteDecision::PreferSub
+        );
+    }
+
+    #[test]
+    fn forecast_account_uses_binding_window() {
+        // Two windows; the higher-used one binds and drives the forecast.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![
+                fc_win(
+                    "5h",
+                    5,
+                    70.0,
+                    TelemetryHealth::Fresh,
+                    Some(now + chrono::Duration::seconds(9000)),
+                ),
+                fc_win(
+                    "weekly",
+                    168,
+                    40.0,
+                    TelemetryHealth::Fresh,
+                    Some(now + chrono::Duration::seconds(168 * 3600 / 2)),
+                ),
+            ],
+        };
+        let f = forecast_account(&acct, now).expect("binding forecastable");
+        // Binds on the 5h (70% > 40%): half elapsed -> ~140% projected.
+        assert!(
+            (f.projected_used_percent - 140.0).abs() < 1e-6,
+            "proj {}",
+            f.projected_used_percent
+        );
     }
 }
