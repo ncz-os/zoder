@@ -388,7 +388,8 @@ prune:nightly:
       PY
 
 # ── weekly container: full zoder stack (zoder + zerocode + zeroclaw + goose) ──
-# Scheduled weekly (pipeline schedule with WEEKLY_CONTAINER=1). kaniko builds the
+# Fired weekly by a pipeline TRIGGER TOKEN (WEEKLY_CONTAINER=1), driven from a
+# fleet cron — the schedule-variable API is 403 for the PAT. kaniko builds the
 # stack image from Containerfile (which runs scripts/package.sh) and pushes it to
 # the GitLab Container Registry; release:container-weekly then cuts a weekly
 # GitLab Release that links the image as an asset. WEEK is passed to the release
@@ -399,7 +400,7 @@ container:weekly:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $WEEKLY_CONTAINER == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && $WEEKLY_CONTAINER == "1"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
@@ -425,7 +426,7 @@ release:container-weekly:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:v0.18.0
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $WEEKLY_CONTAINER == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && $WEEKLY_CONTAINER == "1"'
   needs:
     - job: container:weekly
       artifacts: true
