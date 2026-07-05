@@ -614,7 +614,16 @@ pub(crate) async fn cmd_review(
             findings: vec![],
             next_steps: vec![],
         };
-        emit_reviews(cli, &[(String::from("n/a"), out)], 0.0);
+        emit_reviews(
+            cli,
+            &ReviewAggregate {
+                reviewers: &[(String::from("n/a"), out)],
+                cost_usd: 0.0,
+                requested: 1,
+                ok_models: 1,
+                failed_models: 0,
+            },
+        );
         return Ok(());
     }
 
@@ -674,11 +683,24 @@ pub(crate) async fn cmd_review(
     });
     let results = futures_util::future::join_all(futs).await;
 
+    // Outcome accounting:
+    //   * `ok_models`            - the models whose completions succeeded.
+    //   * `failed_against_solo`  - the synthetic "error" record only wins
+    //                              when EVERY requested reviewer failed
+    //                              (i.e. the model label is meaningless because
+    //                              nothing in the roster reviewed any code).
+    // The total failure -> bail-Ok bug fixed here: when `ok_models` is empty
+    // the aggregate verdict does NOT default to "comment" (which would have
+    // passed CI); the caller now sees a nonzero exit so a CI review gate
+    // cannot be silently green-lit by a single 401 or by every panel model
+    // timing out.
     let mut reviews: Vec<(String, ReviewOutput)> = Vec::new();
     let mut total_cost = 0.0;
+    let mut ok_models: usize = 0;
     for r in results {
         match r {
             Ok(c) => {
+                ok_models += 1;
                 total_cost += c.cost_usd;
                 reviews.push((c.model, parse_review(&c.content)));
             }
@@ -694,25 +716,110 @@ pub(crate) async fn cmd_review(
             }
         }
     }
+    let requested = models.len();
+    let failed_count = requested.saturating_sub(ok_models);
+    let aggregate = ReviewAggregate {
+        reviewers: &reviews,
+        cost_usd: total_cost,
+        requested,
+        ok_models,
+        failed_models: failed_count,
+    };
 
-    emit_reviews(cli, &reviews, total_cost);
+    emit_reviews(cli, &aggregate);
+
+    // Critical regression guard (Finding #14): when NO reviewer completed
+    // (e.g. the only configured reviewer 401'd, or every panel model timed
+    // out) the function used to return `Ok(())` with a synthetic "comment"
+    // verdict and CI gates saw "green". That hides a real failure and
+    // erases the very signal the review job exists to produce. Surface it
+    // as a nonzero exit so a CI `zoder review` job breaks the pipeline
+    // when every model fails — the same way every other Rust-bins in this
+    // workspace treat "no successful work happened" as a hard error.
+    //
+    // We do this AFTER emitting the payload (and writing result.json when
+    // running as a background job, via `emit_reviews`) so the operator still
+    // has a complete diagnostic trail — verdict, model-by-model status,
+    // and cost — to triage from.
+    if ok_models == 0 {
+        let requested_n = requested;
+        anyhow::bail!(
+            "review failed: 0/{requested_n} reviewers completed (all errors; see diagnostics above). \
+A review that no model produced must not be reported as success.",
+        );
+    }
+    if failed_count > 0 && !cli.quiet {
+        eprintln!(
+            "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
+        );
+    }
     Ok(())
 }
 
-/// Render the aggregated review(s) as JSON (machine) or text (human), and write
-/// `result.json` when running as a background job.
-fn emit_reviews(cli: &crate::Cli, reviews: &[(String, ReviewOutput)], cost: f64) {
-    // Aggregate verdict = worst across reviewers.
-    let agg = reviews
+/// Aggregated review payload state shared between the result-builder and the
+/// renderer. Captures both the per-reviewer records AND the bookkept counts
+/// so the rendered payload can be explicit about partial-panel failure
+/// instead of leaving the CI to guess whether the synthetic "comment" came
+/// from every reviewer failing or from a real reviewer rating the diff.
+struct ReviewAggregate<'a> {
+    reviewers: &'a [(String, ReviewOutput)],
+    cost_usd: f64,
+    /// Number of reviewer slots the caller asked for (1 + `--panel` entries).
+    requested: usize,
+    /// How many of those slots produced a structured completion.
+    ok_models: usize,
+    /// How many produced only an error record.
+    failed_models: usize,
+}
+
+/// Compute the aggregate verdict + per-reviewer view out of a list of
+/// (model, output) pairs, plus the success/failure counts so the payload
+/// can be explicit about partial-panel failure. Pure & deterministic so
+/// the matrix can be unit-tested (Finding #14: every-FAIL path must
+/// surface as `complete=false` + a non-`approve` verdict, never a silent
+/// "comment" that lets CI think the review ran).
+fn aggregate_review(
+    reviews: &[(String, ReviewOutput)],
+    cost_usd: f64,
+    requested: usize,
+    ok_models: usize,
+    failed_models: usize,
+) -> (String, bool, serde_json::Value) {
+    let all_failed = ok_models == 0;
+    // Aggregate verdict = worst across reviewers that ACTUALLY completed;
+    // a synthetic "error/comment" record (model == "error") does NOT count
+    // as a successful reviewer vote and must not lift the aggregate. If
+    // every record is an error, fall through to "request_changes" so the
+    // rendered verdict visibly disagrees with the silent-Ok() CI exit.
+    let worst_rank = reviews
         .iter()
+        .filter(|(m, _)| m.as_str() != "error")
         .map(|(_, r)| r.verdict.as_str())
-        .max_by_key(|v| verdict_rank(v))
-        .unwrap_or("approve")
-        .to_string();
+        .map(verdict_rank)
+        .max()
+        .unwrap_or(0);
+    let agg = if worst_rank >= 2 {
+        "request_changes"
+    } else if all_failed {
+        // No real reviewer vote to carry the verdict — surface a block so
+        // a CI gate that reads `verdict` rather than the process exit code
+        // also sees the failure. The bail() in `cmd_review` remains the
+        // authoritative signal: a total-failure review exits nonzero.
+        "request_changes"
+    } else if worst_rank >= 1 {
+        "comment"
+    } else {
+        "approve"
+    }
+    .to_string();
 
     let payload = json!({
         "verdict": agg,
-        "cost_usd": cost,
+        "complete": !all_failed,
+        "requested": requested,
+        "ok_models": ok_models,
+        "failed_models": failed_models,
+        "cost_usd": cost_usd,
         "reviewers": reviews.iter().map(|(m, r)| json!({
             "model": m,
             "verdict": r.verdict,
@@ -721,6 +828,23 @@ fn emit_reviews(cli: &crate::Cli, reviews: &[(String, ReviewOutput)], cost: f64)
             "next_steps": r.next_steps,
         })).collect::<Vec<_>>(),
     });
+
+    (agg, all_failed, payload)
+}
+
+/// Render the aggregated review(s) as JSON (machine) or text (human), and write
+/// `result.json` when running as a background job. `aggregate.ok_models == 0`
+/// is reflected in the payload as `complete: false` so downstream consumers
+/// (CI gates, dashboards) can distinguish a real "comment" verdict from a
+/// total-failure no-reviewer-actually-ran episode.
+fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) {
+    let (agg, all_failed, payload) = aggregate_review(
+        aggregate.reviewers,
+        aggregate.cost_usd,
+        aggregate.requested,
+        aggregate.ok_models,
+        aggregate.failed_models,
+    );
 
     if let Some(dir) = active_job_dir() {
         let _ = std::fs::write(
@@ -737,8 +861,25 @@ fn emit_reviews(cli: &crate::Cli, reviews: &[(String, ReviewOutput)], cost: f64)
         return;
     }
 
-    println!("verdict: {agg}   (${cost:.4})\n");
-    for (model, r) in reviews {
+    let status = if all_failed {
+        format!("INCOMPLETE (0/{} reviewers completed)", aggregate.requested)
+    } else if aggregate.failed_models > 0 {
+        format!(
+            "PARTIAL ({}/{} reviewers; {} failed)",
+            aggregate.ok_models, aggregate.requested, aggregate.failed_models
+        )
+    } else {
+        format!(
+            "complete ({} reviewer{})",
+            aggregate.requested,
+            if aggregate.requested == 1 { "" } else { "s" }
+        )
+    };
+    println!(
+        "verdict: {agg}   (${cost:.4})   [{status}]\n",
+        cost = aggregate.cost_usd
+    );
+    for (model, r) in aggregate.reviewers {
         println!("── {model} :: {} ──", r.verdict);
         if !r.summary.is_empty() {
             println!("{}", r.summary);
@@ -2366,5 +2507,143 @@ mod tests {
         assert!(!substance_accept_eligible(&DiffSubstance::Empty));
         assert!(!substance_accept_eligible(&DiffSubstance::WhitespaceOnly));
         assert!(!substance_accept_eligible(&DiffSubstance::CommentOnly));
+    }
+
+    // -----------------------------------------------------------------------
+    // `aggregate_review` — the per-reviewer -> aggregate-verdict / payload
+    // builder used by `cmd_review` / `emit_reviews`. The regression here is
+    // the Finding #14 silent-success bug: if every reviewer 401s (or every
+    // `--panel` model times out) the OLD code emitted a synthetic `comment`
+    // verdict and `cmd_review` returned `Ok(())`. CI therefore saw a green
+    // review even though no model had actually reviewed any code. The new
+    // contract is: `complete: false`, never `approve`, `bail()` when
+    // `ok_models == 0` — and a partial panel must be explicitly flagged.
+    //
+    // Each fixture covers one cell of the (ok_count, includes_blocking_verdict)
+    // matrix, plus the payload-shape pins. The matrix keeps these honest; a
+    // future regression that re-introduces the silent-success path trips one
+    // of the next two tests.
+    // -----------------------------------------------------------------------
+
+    fn rro(verdict: &str) -> ReviewOutput {
+        ReviewOutput {
+            verdict: verdict.into(),
+            summary: String::new(),
+            findings: vec![],
+            next_steps: vec![],
+        }
+    }
+
+    /// REGRESSION (Finding #14): when EVERY reviewer fails (e.g. the lone
+    /// reviewer 401s, or every `--panel` model times out) the aggregate must
+    /// surface `complete: false` and a NON-`approve` verdict. The old code
+    /// produced `comment` here, which let CI believe the review ran.
+    #[test]
+    fn aggregate_review_marks_complete_false_when_every_reviewer_fails() {
+        let reviews = vec![(
+            "error".into(),
+            ReviewOutput {
+                verdict: "comment".into(),
+                summary: "reviewer failed: 401 Unauthorized".into(),
+                ..Default::default()
+            },
+        )];
+        let (agg, all_failed, payload) = aggregate_review(&reviews, 0.0, 1, 0, 1);
+        assert!(all_failed, "ok_models=0 must flag all_failed");
+        assert_ne!(
+            agg, "approve",
+            "total-failure aggregate must NOT be approve (Finding #14 regression)"
+        );
+        assert_eq!(
+            payload["complete"].as_bool(),
+            Some(false),
+            "payload must carry complete=false on total failure"
+        );
+        assert_eq!(payload["requested"].as_u64(), Some(1));
+        assert_eq!(payload["ok_models"].as_u64(), Some(0));
+        assert_eq!(payload["failed_models"].as_u64(), Some(1));
+    }
+
+    /// REGRESSION (Finding #14): an explicit `comment` verdict from a
+    /// SUCCESSFUL reviewer (i.e. a real response, not an error record)
+    /// keeps the aggregate at `comment` — the synthetic "error/comment"
+    /// record from a failed reviewer must NOT lift the aggregate. The
+    /// fix ensures the worst-rank walk SKIPS the "error" model label.
+    #[test]
+    fn aggregate_review_ignores_error_records_when_computing_worst_verdict() {
+        // One real `approve` reviewer; one failed reviewer (synthetic "error/comment").
+        // The aggregate must be `approve`, NOT `comment`.
+        let reviews = vec![
+            ("real-model".into(), rro("approve")),
+            (
+                "error".into(),
+                ReviewOutput {
+                    verdict: "comment".into(),
+                    summary: "reviewer failed: timeout".into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let (agg, all_failed, payload) = aggregate_review(&reviews, 0.01, 2, 1, 1);
+        assert!(!all_failed, "one successful reviewer -> not all-failed");
+        assert_eq!(
+            agg, "approve",
+            "the 'error' record must NOT lift the aggregate out of approve"
+        );
+        assert_eq!(payload["complete"].as_bool(), Some(true));
+        assert_eq!(payload["requested"].as_u64(), Some(2));
+        assert_eq!(payload["ok_models"].as_u64(), Some(1));
+        assert_eq!(payload["failed_models"].as_u64(), Some(1));
+    }
+
+    /// A blocking review from a successful reviewer still wins — the worst
+    /// rank walk is correct, just it ignores the synthetic "error" slots.
+    /// When one reviewer votes `request_changes` and another fails, the
+    /// aggregate must reflect the real blocking verdict.
+    #[test]
+    fn aggregate_review_takes_worst_verdict_from_real_reviewers_only() {
+        let reviews = vec![
+            ("real-a".into(), rro("request_changes")),
+            (
+                "error".into(),
+                ReviewOutput {
+                    verdict: "comment".into(),
+                    summary: "reviewer failed: 5xx".into(),
+                    ..Default::default()
+                },
+            ),
+            ("real-b".into(), rro("approve")),
+        ];
+        let (agg, _, payload) = aggregate_review(&reviews, 0.0, 3, 2, 1);
+        assert_eq!(
+            agg, "request_changes",
+            "blocking review from real model wins aggregate"
+        );
+        // Cost is reported verbatim so CI can use it as a budget signal.
+        assert_eq!(payload["cost_usd"].as_f64(), Some(0.0));
+    }
+
+    /// `complete: true` only when at least one model reported a real
+    /// reviewer response. The flag exists precisely so downstream CI gates
+    /// can stop trusting a `comment` aggregate verdict when `complete=false`.
+    #[test]
+    fn aggregate_review_complete_true_when_any_reviewer_succeeds() {
+        let reviews = vec![("solo".into(), rro("comment"))];
+        let (_, all_failed, payload) = aggregate_review(&reviews, 0.0, 1, 1, 0);
+        assert!(!all_failed);
+        assert_eq!(payload["complete"].as_bool(), Some(true));
+    }
+
+    /// Empty reviewer list is treated like a total failure (no real
+    /// reviewer response). This guards the degenerate "0/0 reviewers"
+    /// case so the bail() path in `cmd_review` still fires — `cmd_review`
+    /// always has at least the default reviewer slot, so reaching this
+    /// case requires a caller bug, not user error.
+    #[test]
+    fn aggregate_review_empty_reviewer_list_is_all_failed() {
+        let (agg, all_failed, payload) = aggregate_review(&[], 0.0, 0, 0, 0);
+        assert!(all_failed);
+        assert_ne!(agg, "approve");
+        assert_eq!(payload["complete"].as_bool(), Some(false));
     }
 }

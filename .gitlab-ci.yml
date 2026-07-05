@@ -3,8 +3,10 @@
 # GitLab CI is free under the ncz-os OSS license, so this linux gate runs the full
 # zeroclaw-shape battery (fmt, clippy -D warnings, check all/no-default, nextest,
 # cargo-deny). The OS matrix lives in the GitHub gate (gitlab.com shared runners
-# are linux-only). nextest + cargo-deny are installed as PREBUILT binaries so the
-# gate works on MSRV-pinned toolchains (cargo-install-from-source needs rustc>=1.91).
+# are linux-only). nextest + cargo-deny are installed as PREBUILT binaries via
+# scripts/ci/ci-prepare-tools.sh so the gate works on MSRV-pinned toolchains
+# (cargo-install-from-source needs rustc>=1.91) AND so we never fetch from a
+# moving URL while job credentials are present (Finding #15).
 # Toolchain pinned to 1.94.1.
 default:
   image: rust:1.94
@@ -16,6 +18,10 @@ default:
     - export PATH="$CARGO_HOME/bin:$PATH"
     - mkdir -p "$CARGO_HOME/bin"
 
+# Variables scoped to jobs that need them. The sensitive GITLAB_PUSH_TOKEN is
+# NOT declared here — it lives on the corpus-sync job alone (Finding #15:
+# minimize credential exposure; a project-level CI/CD variable is readable
+# by every job in the pipeline, so per-job scope reduces the attack surface).
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CARGO_TERM_COLOR: always
@@ -30,8 +36,11 @@ stages: [corpus, check, test, security, package, release]
 # this must never run on github (its corpus-sync.yml was removed) — otherwise the two
 # masters diverge and the push-mirror stalls. Runs on the daily nightly schedule (and
 # on-demand from the web UI); commits with `-o ci.skip` + [skip ci] so the data commit
-# never re-triggers a pipeline. Needs a masked GITLAB_PUSH_TOKEN CI/CD variable
-# (write_repository) that is allowed to push to master.
+# never re-triggers a pipeline.
+#
+# Per-job `GITLAB_PUSH_TOKEN` keeps the write_repository credential scoped to
+# this one job (Finding #15). Pinning pyyaml's version + sha256 keeps the
+# python install reproducible and tamper-evident (Finding #15).
 corpus-sync:
   stage: corpus
   image: python:3.12
@@ -42,20 +51,31 @@ corpus-sync:
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
+  variables:
+    # Write_repository token, scoped HERE only — not exposed to fmt/clippy/test/
+    # security/package/release jobs that don't need it. (See the variables:
+    # block above; GITLAB_PUSH_TOKEN is intentionally NOT in it.)
+    GITLAB_PUSH_TOKEN: "${GITLAB_PUSH_TOKEN}"
   before_script:
     - apt-get update -qq && apt-get install -y -qq git
-    - pip install --quiet pyyaml
+    - pip install --require-hashes -r scripts/ci/corpus-requirements.txt
   script:
     - mkdir -p bench/raw
     - |
-      run() { echo "== $1"; python3 "scripts/$1" "${@:2}" || echo "WARN: $1 failed — degrading coverage"; }
-      run fetch-vals-swebench.py   --json bench/raw/vals-swebench.json
-      run fetch-aider-polyglot.py  --json bench/raw/aider-polyglot.json
-      run fetch-arena.py           --out-dir bench/raw
-      run fetch-scale.py           --json bench/raw/scale-seal.json
-      run fetch-terminal-bench.py  --json bench/raw/terminal-bench.json
-    - python3 scripts/build-bench-overlay.py --out-dir .
-    - python3 scripts/build-public-corpus.py --out-dir .
+      # Per-fetch-exit-code handling (Finding #16): a corpus-source outage
+      # used to convert failed fetches into warnings and then write a
+      # reduced/empty overlay to master. The script now:
+      #   1. records the EXISTING fresh overlay (last-known-good) for diffing
+      #   2. aborts the build if any source reduced coverage by >25% from LKG
+      #   3. only commits the new overlay if every source either succeeded
+      #      or stayed at-or-above its threshold; a degraded run is loud
+      #      and never silently overwrites a fresh one.
+      python3 scripts/ci/corpus-fetch-and-overlay.py
+    - |
+      # corpus-sync also enforces the freshness threshold before pushing —
+      # a transient upstream outage MUST NOT erase routing scores from the
+      # authoritative corpus (Finding #16).
+      python3 scripts/ci/corpus-freshness-check.py
     - git config user.name "zoder corpus sync"
     - git config user.email "jperlow@gmail.com"
     - git add corpus/model_corpus.json pricing/catalog.json bench/overlay.json
@@ -87,32 +107,59 @@ check:
 test:
   stage: test
   script:
-    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$CARGO_HOME/bin"
+    # Pinned nextest install — IMmutable GitHub release tag + triply-pinned
+    # SHA256. Replaces the prior `get.nexte.st/latest/linux` moving URL
+    # (Finding #15). The helper script downloads + verifies + extracts.
+    - scripts/ci/ci-prepare-tools.sh nextest
     - cargo nextest run --workspace --locked --all-features
     - cargo test --workspace --locked --all-features --doc
 
 security:
   stage: security
   script:
-    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    # Pinned cargo-binstall install — replaces the prior
+    # `curl ... install-from-binstall-release.sh | bash` (Finding #15).
+    # Helper script downloads + verifies + extracts an immutable asset.
+    - scripts/ci/ci-prepare-tools.sh binstall
     - cargo binstall -y cargo-deny
     - cargo deny check
     - cargo fetch --locked
 
 # ── package: version-matched trio (zoder + zerocode + zeroclaw) per arch ─────────
 # Each fleet runner builds its NATIVE target via scripts/package.sh.
+#
+# Finding #17: the prior pipeline built zerocode/zeroclaw from
+# ZEROCLAW_REF="zoder-integration" (a mutable branch). Each architecture
+# cloned its own copy at job time, so a force-push mid-pipeline could
+# produce a release whose three binaries were built against three
+# different engine revisions. We now:
+#   - Pin ZEROCLAW_REF to an immutable SHA so every runner agrees on
+#     the engine source (verified in a manifest emitted into dist/).
+#   - Build zerocode/zeroclaw BEFORE uploading zoder into the rolling
+#     channel — if the trio build fails on any arch, the prior zoder
+#     binary stays intact.
+#   - Use --locked + record all source SHAs in a manifest.
 .trio: &trio
   stage: package
   rules:
     - if: '$CI_COMMIT_TAG'      # tag push → full release build
     - when: manual              # otherwise on-demand (don't burn runners every push)
   variables:
+    # Pinned to an immutable SHA so all three architectures build against
+    # the same engine source. Bump intentionally, never "let it float".
+    #
+    # `ZEROCLAW_PINNED_SHA` is a project-level CI/CD variable holding an
+    # exact SHA (40 hex chars). package.sh will refuse to fetch any
+    # non-SHA value at runtime; the placeholder below means "set this
+    # in CI/CD variables" (Finding #17). The trio build will fail
+    # loudly if no SHA is configured.
+    ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
-    ZEROCLAW_REF: "zoder-integration"
     CARGO_PROFILE_RELEASE_DEBUG: "0"
   script:
     - rm -rf .zeroclaw-src dist
     - scripts/package.sh
+    - scripts/ci/assert-trio-manifest.sh  # verify all SHAs + bundles present
   artifacts:
     name: "zoder-trio-$CI_COMMIT_REF_SLUG"
     paths: [dist/]
@@ -123,32 +170,79 @@ trio:macos-arm64:  { <<: *trio, tags: [fleet-macos-arm64] }  # ULTRA   → aarch
 trio:linux-arm64:  { <<: *trio, tags: [fleet-linux-arm64] }  # ULTRA   → aarch64-unknown-linux-gnu (arm64 rust container)
 
 # ── release: publish the per-arch trio tarballs to the project Releases page ─────
+# Finding #28: switch from the moving `release-cli:latest` image to a
+# specific, glab-carrying CLI image. With `glab` on PATH we can both
+# upload via glab (authoritative) AND verify the package URLs landed in
+# the package registry before publishing the GitLab Release.
 release:trio:
   stage: release
   rules: [{ if: '$CI_COMMIT_TAG' }]
-  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  # Pinned glab CLI image (immutable tag — no `:latest`). glab is on PATH,
+  # which matches the current GitLab release-job contract. Pin note:
+  # `cli:v1.39.0` is the immutable tag; bump by replacing the tag and
+  # re-running the pipeline.
+  image: registry.gitlab.com/gitlab-org/cli:v1.39.0
   needs: ["trio:x86-linux", "trio:macos-arm64", "trio:linux-arm64"]
   variables: { GIT_STRATEGY: none }
   script:
     - |
-      for f in dist/*.tar.gz; do
+      set -euo pipefail
+      TAG="${CI_COMMIT_TAG}"
+      V="${TAG#v}"
+      BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${TAG}"
+      # Upload every artifact (tarball + sibling .sha256) via the
+      # package-registry HTTP API. The previous job-step uploaded only
+      # *.tar.gz, leaving package.sh's .sha256 files inaccessible from
+      # the Releases page (Finding #28). The glab image is in PATH per
+      # GitLab's release-job contract; we additionally `curl`-upload
+      # because glab api does not (yet) expose multipart file POSTs.
+      for f in dist/*.tar.gz dist/*.sha256; do
+        [ -e "$f" ] || continue
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/$(basename "$f")"
+          "${BASE}/$(basename "${f}")"
+      done
+      # Verify the URLs we'll publish exist + return 200. A tag pipeline
+      # used to upload packages and then fail to create the Release
+      # silently; this gate prevents that (Finding #28).
+      for triple in x86_64-unknown-linux-gnu aarch64-apple-darwin aarch64-unknown-linux-gnu; do
+        url="${BASE}/zoder-${V}-${triple}.tar.gz"
+        status="$(curl -fsSI -o /dev/null -w '%{http_code}' "$url" || true)"
+        [ "$status" = "200" ] || { echo "missing artifact at $url (status=$status)" >&2; exit 1; }
+        # Also verify the sibling .sha256 is reachable so the published
+        # Release really carries reproducible-build hashes.
+        shaurl="${BASE}/zoder-${V}-${triple}.tar.gz.sha256"
+        shastatus="$(curl -fsSI -o /dev/null -w '%{http_code}' "$shaurl" || true)"
+        [ "$shastatus" = "200" ] || { echo "missing checksum at $shaurl (status=$shastatus)" >&2; exit 1; }
       done
   release:
     tag_name: "$CI_COMMIT_TAG"
     description: "zoder trio (zoder + zerocode + zeroclaw) — multi-arch binaries built by fleet CI."
     assets:
       links:
-        - { name: "x86_64-linux",   url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-x86_64-unknown-linux-gnu.tar.gz" }
-        - { name: "aarch64-darwin", url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-apple-darwin.tar.gz" }
-        - { name: "aarch64-linux",  url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz" }
+        - { name: "x86_64-linux tar",     url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-x86_64-unknown-linux-gnu.tar.gz" }
+        - { name: "x86_64-linux sha256",  url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-x86_64-unknown-linux-gnu.tar.gz.sha256" }
+        - { name: "aarch64-darwin tar",   url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-apple-darwin.tar.gz" }
+        - { name: "aarch64-darwin sha256",url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-apple-darwin.tar.gz.sha256" }
+        - { name: "aarch64-linux tar",    url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz" }
+        - { name: "aarch64-linux sha256", url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz.sha256" }
 
 # ── nightly: rolling "master of the day" binaries ────────────────────────────
 # Linux builds on GitLab shared runners (x86_64 native + aarch64 cross-compiled);
 # macOS arm64 builds on ULTRA via the fleet-macos-arm64 runner. Both publish to
 # the rolling `zoder-nightly/master` generic package (overwritten each night).
 # Driven by a pipeline schedule with NIGHTLY=1; also runnable manually from web.
+#
+# Finding #17: the prior pipeline uploaded the NEW `zoder` binary BEFORE
+# cloning+building the matching zerocode/zeroclaw TUI pair. If the
+# zeroclaw build failed (or each architecture pulled a different ref
+# because ZEROCLAW_REF was a mutable branch) the rolling `master`
+# channel ended up with new zoder + OLD zerocode/zeroclaw — a
+# broken-trio nightly. We now:
+#   - Pin ZEROCLAW_REF to an immutable SHA (set by the nightly
+#     cron — see the NIGHTLY_ZEROCLAW_SHA project variable).
+#   - Build zerocode/zeroclaw FIRST; only after both succeed do we
+#     publish new zoder + new TUI pair to the rolling `master` channel.
+#   - Use --locked for reproducible source pinning across runners.
 .nightly-rules: &nightly-rules
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
@@ -161,42 +255,54 @@ nightly:linux:
   <<: *nightly-rules
   needs: []
   timeout: 90m
+  variables:
+    # Pinned immutable SHA so this runner agrees with macos-arm64.
+    # NIGHTLY_ZEROCLAW_SHA is a project-level CI variable (a real SHA
+    # frozen by the nightly rotation job or by hand). Bump intentionally.
+    ZEROCLAW_REF: "${NIGHTLY_ZEROCLAW_SHA}"
+    ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
     - apt-get update && apt-get install -y gcc-aarch64-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-    - cargo build --release --bin zoder --target x86_64-unknown-linux-gnu
-    - cargo build --release --bin zoder --target aarch64-unknown-linux-gnu
+    - cargo build --release --locked --bin zoder --target x86_64-unknown-linux-gnu
+    - cargo build --release --locked --bin zoder --target aarch64-unknown-linux-gnu
     - |
-      # Publish to the rolling `master` channel AND a date-stamped channel
-      # (kept for a week by prune:nightly) so a specific nightly is reproducible:
-      #   install.sh --channel 2026-07-04   pins that build.
-      # Date comes from CI_PIPELINE_CREATED_AT so all jobs in one pipeline agree.
+      # Build the TUI pair FIRST — do NOT touch the rolling channel
+      # until both zoder AND zerocode/zeroclaw built successfully
+      # (Finding #17: keep the rolling channel consistent).
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      rm -rf .zc-src
+      git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
+      ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
+      ZC_SHA=$(git -C .zc-src rev-parse HEAD)
+      echo "nightly using zeroclaw SHA=$ZC_SHA"
+      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+        ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
+      done
+      # Now safe to upload: all three binaries built successfully and
+      # the engine SHA is pinned for this nightly. Publish zoder +
+      # TUI pair to BOTH the rolling `master` channel AND a
+      # date-stamped channel (kept a week by prune:nightly) so
+      # `install.sh --channel 2026-07-04` pins the build.
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         bin="target/$t/release/zoder"
         sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
-        for ch in master "$DATE"; do
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-$t"
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-$t.sha256"
-        done
-      done
-    - |
-      # Build + publish the version-matched TUI pair (zerocode + zeroclaw) from
-      # the zoder-integration fork, per linux target, so `zoder tui` installs
-      # from the nightly too. Same rolling+dated channels and checksums as zoder.
-      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
-      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-      rm -rf .zc-src
-      git clone --depth 1 -b "${ZEROCLAW_REF:-zoder-integration}" "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" .zc-src
-      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
-        for name in zerocode zeroclaw; do
-          bin=".zc-src/target/$t/release/$name"
-          sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
+        for name in zoder zerocode zeroclaw; do
+          if [ "$name" = zoder ]; then
+            src="$bin"; shasrc="$bin.sha256"
+            dst="zoder-$t"
+          else
+            src=".zc-src/target/$t/release/$name"
+            shasrc="$src.sha256"
+            sha256sum "$src" | awk '{print $1}' > "$shasrc"
+            dst="${name}-$t"
+          fi
           for ch in master "$DATE"; do
-            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-$t"
-            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-$t.sha256"
+            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$src" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}"
+            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$shasrc" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}.sha256"
           done
         done
       done
@@ -209,25 +315,28 @@ nightly:macos-arm64:
   timeout: 90m
   variables:
     GIT_STRATEGY: clone
+    ZEROCLAW_REF: "${NIGHTLY_ZEROCLAW_SHA}"
+    ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
     - rustup target add aarch64-apple-darwin
-    - cargo build --release --bin zoder --target aarch64-apple-darwin
+    - cargo build --release --locked --bin zoder --target aarch64-apple-darwin
     - |
-      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
-      bin="target/aarch64-apple-darwin/release/zoder"
-      shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
-      for ch in master "$DATE"; do
-        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin"
-        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin.sha256"
-      done
-    - |
-      # Native TUI pair (zerocode + zeroclaw) from the zoder-integration fork.
-      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      # Build the TUI pair FIRST on the macOS runner using the same
+      # pinned SHA — both nightlies use NIGHTLY_ZEROCLAW_SHA so the
+      # engine revision is identical across architectures.
       rm -rf .zc-src
-      git clone --depth 1 -b "${ZEROCLAW_REF:-zoder-integration}" "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" .zc-src
-      ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
-      for name in zerocode zeroclaw; do
-        bin=".zc-src/target/release/$name"
+      git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
+      ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
+      ZC_SHA=$(git -C .zc-src rev-parse HEAD)
+      ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
+      for name in zoder zerocode zeroclaw; do
+        if [ "$name" = zoder ]; then
+          bin="target/aarch64-apple-darwin/release/zoder"
+        else
+          bin=".zc-src/target/release/$name"
+        fi
         shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
         for ch in master "$DATE"; do
           curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-aarch64-apple-darwin"

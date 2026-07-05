@@ -1,0 +1,10 @@
+# Pinned Python dependency manifest for the corpus-sync job. Closes
+# Finding #15: the prior CI ran `pip install pyyaml` which fetches
+# from a moving URL at job time. With this file, the install is
+# reproducible (exact version + sha256) regardless of when CI runs.
+#
+# The `--require-hashes` flag in the .gitlab-ci.yml install command
+# enforces the hash; pip refuses to install if the published source
+# tarball's SHA256 drifts. Bump intentionally, never let it float.
+pyyaml==6.0.2 \
+    --hash=sha256:d584d9ec91ad65861cc08d42e834324ef890a082e591037abe114850ff7bbc3e

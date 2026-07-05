@@ -99,6 +99,12 @@ sha256_of() { # $1 = file -> writes $1.sha256
 # Honors ZEROCLAW_SRC_DIR (an existing checkout, used as-is); otherwise clones
 # ZEROCLAW_REPO@ZEROCLAW_REF into .zeroclaw-src. All progress goes to stderr so
 # the echoed path on stdout stays clean for command substitution.
+#
+# Finding #17: require ZEROCLAW_REF to look like an immutable SHA when cloning
+# fresh (override via ZEROCLAW_ALLOW_BRANCH=1 if you really want a branch — CI
+# uses an explicit pinned SHA). The runner that lands first records the SHA in
+# dist/manifest.json; the assert-trio-manifest.sh CI step refuses to publish a
+# release whose three architectures disagree on the engine source.
 ensure_zeroclaw() {
   if [ -n "$ZEROCLAW_SRC_DIR" ]; then
     [ -d "$ZEROCLAW_SRC_DIR" ] || { echo "package.sh: ZEROCLAW_SRC_DIR=$ZEROCLAW_SRC_DIR not found" >&2; return 1; }
@@ -106,9 +112,22 @@ ensure_zeroclaw() {
   fi
   local zc=".zeroclaw-src"
   if [ ! -d "$zc/.git" ]; then
-    git clone --depth 1 -b "$ZEROCLAW_REF" "$ZEROCLAW_REPO" "$zc" >&2
+    # Reject mutable refs unless the operator overrode the safety. CI sets
+    # ZEROCLAW_PINNED_SHA (an exact SHA) so every architecture in the pipeline
+    # builds against the same engine source.
+    if [ "${ZEROCLAW_ALLOW_BRANCH:-0}" != 1 ]; then
+      case "$ZEROCLAW_REF" in
+        *[!0-9a-fA-F]*|"") echo "package.sh: ZEROCLAW_REF must be an immutable SHA in CI; got '$ZEROCLAW_REF'. Set ZEROCLAW_ALLOW_BRANCH=1 to override." >&2; return 1 ;;
+      esac
+      [ "${#ZEROCLAW_REF}" -ge 40 ] || { echo "package.sh: ZEROCLAW_REF must be a full SHA (>=40 hex chars); got '$ZEROCLAW_REF'." >&2; return 1; }
+    fi
+    git clone --depth 1 "$ZEROCLAW_REPO" "$zc" >&2
+    ( cd "$zc" && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD ) >&2
   fi
-  ( cd "$zc" && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD ) >&2
+  # Record the resolved SHA in the build manifest (used by assert-trio-manifest.sh).
+  local sha
+  sha="$(git -C "$zc" rev-parse HEAD)"
+  printf '%s\n' "$sha" > "$DIST/.zeroclaw-sha"
   echo "$zc"
 }
 
@@ -140,8 +159,8 @@ package_target() {
     tflag=(--target "$tgt"); reldir="target/$tgt/release"
   fi
 
-  echo ">> [$tgt] build $BIN ($b)"
-  "$b" build --release --bin "$BIN" ${tflag[@]+"${tflag[@]}"}
+  echo ">> [$tgt] build $BIN ($b) (--locked for reproducible source pins)"
+  "$b" build --release --locked --bin "$BIN" ${tflag[@]+"${tflag[@]}"}
 
   local stage="$DIST/${BIN}-${VERSION}-${tgt}"
   rm -rf "$stage"; mkdir -p "$stage"
@@ -150,8 +169,11 @@ package_target() {
   if [ "${ZODER_SKIP_TUI:-0}" != 1 ] && [ "$(target_os "$tgt")" != Windows ]; then
     local zcsrc; zcsrc="$(ensure_zeroclaw)"
     local feat=(); [ -n "${ZEROCLAW_BUILD_FEATURES:-}" ] && feat=(--features "$ZEROCLAW_BUILD_FEATURES")
-    echo ">> [$tgt] build zerocode + zeroclaw ($b) from $zcsrc"
-    ( cd "$zcsrc" && "$b" build --release -p "$ZEROCLAW_BIN_PKG" -p "$ZEROCODE_BIN_PKG" --bin zeroclaw --bin zerocode ${tflag[@]+"${tflag[@]}"} ${feat[@]+"${feat[@]}"} )
+    echo ">> [$tgt] build zerocode + zeroclaw ($b) from $zcsrc (--locked for reproducible source pins)"
+    # --locked so the zeroclaw workspace's Cargo.lock pins transitive deps;
+    # a release built without --locked can drift between architectures
+    # (Finding #17).
+    ( cd "$zcsrc" && "$b" build --release --locked -p "$ZEROCLAW_BIN_PKG" -p "$ZEROCODE_BIN_PKG" --bin zeroclaw --bin zerocode ${tflag[@]+"${tflag[@]}"} ${feat[@]+"${feat[@]}"} )
     cp "$zcsrc/$reldir/zerocode" "$stage/zerocode"
     cp "$zcsrc/$reldir/zeroclaw" "$stage/zeroclaw"
   fi
@@ -164,8 +186,10 @@ package_target() {
       echo ">> [$tgt] skip goose (cross build of the goose workspace unsupported; build natively per-target)" >&2
     else
       local gsrc; gsrc="$(ensure_goose)"
-      echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF"
-      ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose \
+      # Record the goose SHA for the manifest too.
+      ( git -C "$gsrc" rev-parse HEAD > "$DIST/.goose-sha" ) 2>/dev/null || true
+      echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF (--locked)"
+      ( cd "$gsrc" && "$b" build --release --locked -p "$GOOSE_BIN_PKG" --bin goose \
           --no-default-features --features "$GOOSE_FEATURES" \
           --config 'profile.release.strip="symbols"' \
           --config 'profile.release.lto="thin"' \
@@ -205,9 +229,30 @@ TXT
   echo ">> [$tgt] -> $DIST/$tar"
 }
 
+# Emit a build manifest that records every source SHA used for this build
+# (Finding #17). The assert-trio-manifest.sh CI step refuses to publish a
+# release whose three architectures disagreed on ZEROCLAW_REF / GOOSE_REF /
+# zoder HEAD, so a force-push mid-pipeline can never silently produce a
+# release whose trio was built against three different engine revisions.
+write_manifest() {
+  {
+    echo "{"
+    printf '  "zoder": {"head": "%s", "version": "%s"},\n' \
+      "$(git rev-parse HEAD 2>/dev/null || echo unknown)" "$VERSION"
+    printf '  "zeroclaw": {"sha": "%s"},\n' \
+      "$(cat "$DIST/.zeroclaw-sha" 2>/dev/null || echo unknown)"
+    printf '  "goose": {"sha": "%s", "ref": "%s"}\n' \
+      "$(cat "$DIST/.goose-sha" 2>/dev/null || echo unknown)" \
+      "$GOOSE_REF"
+    echo "}"
+  } > "$DIST/manifest.json"
+  echo ">> manifest -> $DIST/manifest.json"
+}
+
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
   TARGETS=("$(rustc -vV | awk '/^host:/{print $2}')")
 fi
 for t in "${TARGETS[@]}"; do package_target "$t"; done
+write_manifest
 echo "OK -> $DIST/"
