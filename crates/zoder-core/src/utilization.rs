@@ -76,6 +76,16 @@ pub const DEFAULT_RESET_IMMINENCE_THRESHOLD: f64 = 0.10;
 const FRESH_MAX_AGE_SECS: i64 = 5 * 60; // <  5 min
 const STALE_MAX_AGE_SECS: i64 = 60 * 60; // < 60 min
 
+/// Tolerance for future-dated observations. A record whose `observed_at`
+/// is in the future by no more than this many seconds is treated as
+/// Fresh (small NTP drift / clock skew); a larger future offset means
+/// the clock has rolled back and the record can't be trusted.
+///
+/// Without this constant, the original code collapsed ANY negative age
+/// to Fresh, which let a clock rollback persist as "Fresh 90%" and gate
+/// routing until the wall clock caught up (Finding #6).
+const FUTURE_TIMESTAMP_TOLERANCE_SECS: i64 = 60;
+
 /// On-disk filename under `$ZODER_HOME` (or `~/.zoder`).
 pub const UTILIZATION_FILENAME: &str = "utilization.json";
 
@@ -114,10 +124,13 @@ impl TelemetryHealth {
     pub fn from_age_secs(age_secs: Option<i64>) -> Self {
         match age_secs {
             None => TelemetryHealth::Degraded,
-            // Negative ages (clock skew, future-dated record) collapse to
-            // Fresh — the record is "newer than now", which we trust at
-            // face value rather than misclassifying as Degraded.
-            Some(s) if s < 0 => TelemetryHealth::Fresh,
+            // Negative ages: small NTP drift / clock skew within
+            // `FUTURE_TIMESTAMP_TOLERANCE_SECS` is treated as Fresh;
+            // a larger future offset means the clock has rolled back
+            // and the record can't be trusted (Finding #6 — collapse to
+            // Degraded rather than letting the future-dated reading
+            // gate routing until the wall clock catches up).
+            Some(s) if s < -FUTURE_TIMESTAMP_TOLERANCE_SECS => TelemetryHealth::Degraded,
             Some(s) if s < FRESH_MAX_AGE_SECS => TelemetryHealth::Fresh,
             Some(s) if s < STALE_MAX_AGE_SECS => TelemetryHealth::Stale,
             Some(_) => TelemetryHealth::Degraded,
@@ -274,11 +287,23 @@ impl HeaderLookup for BTreeMap<String, String> {
 /// header set. Either percent-based (Codex) or limit/remaining/reset
 /// (Anthropic); both shapes project to a unified `used_percent` +
 /// `window_minutes` + `reset_at_epoch` view.
+///
+/// `used_percent` is `Option<f64>` (Finding #5): a status-only header set
+/// (Anthropic's `unified-{status,remaining,reset}` with no `limit`, or
+/// Codex's bare `x-codex-plan-type: pro`) is no longer materialized as a
+/// "0% used" window — instead, the parser only constructs a window when
+/// an actual numeric reading or a valid `limit`/`remaining` pair is
+/// present, and `used_percent = None` means "known to exist, no number
+/// yet". The routing layer treats `None` like an unknown window: it
+/// contributes no signal and cannot bind.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowSnapshot {
     /// 0..=100 percent of the window consumed. May exceed 100 when over.
+    /// `None` when the window is known to exist but no numeric value
+    /// was available (status-only / remaining-only header sets) — never
+    /// fabricates a `0.0` reading.
     #[serde(default)]
-    pub used_percent: f64,
+    pub used_percent: Option<f64>,
     /// Window length in minutes, if the provider reports it.
     #[serde(default)]
     pub window_minutes: Option<u32>,
@@ -501,11 +526,11 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
         .get("x-codex-credits-has-credits")
         .and_then(parse_bool_loose);
 
+    let primary_used = headers
+        .get("x-codex-primary-used-percent")
+        .and_then(parse_pct);
     let primary = WindowSnapshot {
-        used_percent: headers
-            .get("x-codex-primary-used-percent")
-            .and_then(parse_pct)
-            .unwrap_or(0.0),
+        used_percent: primary_used,
         window_minutes: headers
             .get("x-codex-primary-window-minutes")
             .and_then(parse_u32),
@@ -522,11 +547,11 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
             }),
         label: Some("primary".to_string()),
     };
+    let secondary_used = headers
+        .get("x-codex-secondary-used-percent")
+        .and_then(parse_pct);
     let secondary = WindowSnapshot {
-        used_percent: headers
-            .get("x-codex-secondary-used-percent")
-            .and_then(parse_pct)
-            .unwrap_or(0.0),
+        used_percent: secondary_used,
         window_minutes: headers
             .get("x-codex-secondary-window-minutes")
             .and_then(parse_u32),
@@ -542,8 +567,19 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
         label: Some("secondary".to_string()),
     };
 
-    snap.primary = Some(primary);
-    snap.secondary = Some(secondary);
+    // Finding #5: a Codex response that only carries `x-codex-plan-type`
+    // (no percent, no reset, no window length) used to materialize both
+    // primary and secondary windows at a fabricated 0%. We now leave
+    // `primary` / `secondary` as `None` unless there's an actual numeric
+    // reading OR a reset signal — a bare plan label isn't a window.
+    let primary_present = primary.used_percent.is_some() || primary.reset_at_epoch.is_some();
+    let secondary_present = secondary.used_percent.is_some() || secondary.reset_at_epoch.is_some();
+    snap.primary = if primary_present { Some(primary) } else { None };
+    snap.secondary = if secondary_present {
+        Some(secondary)
+    } else {
+        None
+    };
     snap
 }
 
@@ -600,7 +636,7 @@ pub fn parse_anthropic(
         };
         if let Some(p) = pct {
             snap.primary = Some(WindowSnapshot {
-                used_percent: p,
+                used_percent: Some(p),
                 window_minutes: None,
                 reset_at_epoch: reset,
                 label: Some("requests".to_string()),
@@ -613,7 +649,7 @@ pub fn parse_anthropic(
         };
         if let Some(p) = pct {
             snap.secondary = Some(WindowSnapshot {
-                used_percent: p,
+                used_percent: Some(p),
                 window_minutes: None,
                 reset_at_epoch: reset,
                 label: Some("tokens".to_string()),
@@ -625,22 +661,23 @@ pub fn parse_anthropic(
 }
 
 fn anthropic_unified_window(headers: &dyn HeaderLookup, suffix: &str) -> Option<WindowSnapshot> {
-    // Some servers publish `status` without a numeric `utilization`; that
-    // means "known, no numeric value", which we surface as 0% so the
-    // caller at least knows the window exists. Real values always come
-    // with a `utilization` field. We don't gate on `status` here so a
-    // `utilization`-only header set still parses.
-    let _status = headers.get(&format!("anthropic-ratelimit-unified-{suffix}-status"));
+    // Finding #5: a server that publishes `status` (or just `utilization`)
+    // without a numeric value used to fabricate a 0% reading. We now
+    // leave `used_percent = None` when no numeric utilization was
+    // available — the window is still recorded (status-only IS a
+    // signal that the window exists), but it contributes no percent.
+    // We don't gate on `status` here so a `utilization`-only header set
+    // still parses.
+    let status = headers.get(&format!("anthropic-ratelimit-unified-{suffix}-status"));
     let util = headers
         .get(&format!("anthropic-ratelimit-unified-{suffix}-utilization"))
-        .and_then(parse_pct)
-        .unwrap_or(0.0);
+        .and_then(parse_pct);
     let reset_at = headers
         .get(&format!("anthropic-ratelimit-unified-{suffix}-reset"))
         .and_then(parse_epoch_seconds);
     // If the caller sent no unified-* headers at all for this suffix,
-    // return None so the caller doesn't fall back to a fake 0%.
-    if _status.is_none()
+    // return None so the caller doesn't fall back to a fake window.
+    if status.is_none()
         && headers
             .get(&format!("anthropic-ratelimit-unified-{suffix}-utilization"))
             .is_none()
@@ -657,11 +694,11 @@ fn anthropic_unified_window(headers: &dyn HeaderLookup, suffix: &str) -> Option<
 
 /// No-suffix `anthropic-ratelimit-unified-{status,remaining,reset}` shape.
 /// Carries a status flag plus a remaining count and a reset timestamp;
-/// without a `limit` we cannot compute a real percent, so we surface 0%
-/// (a known window, no numeric value — same convention as the suffixed
-/// status-only case) and forward the reset. The snapshot is only emitted
-/// when at least one of the three headers is present; otherwise the
-/// caller can keep falling back to the legacy pair.
+/// without a `limit` we cannot compute a real percent, so we surface
+/// `used_percent = None` (Finding #5 — never fabricate a numeric reading
+/// that the headers didn't actually publish) and forward the reset. The
+/// snapshot is only emitted when at least one of the three headers is
+/// present; otherwise the caller can keep falling back to the legacy pair.
 fn anthropic_unified_window_nosuffix(headers: &dyn HeaderLookup) -> Option<WindowSnapshot> {
     let status = headers.get("anthropic-ratelimit-unified-status");
     let remaining = headers.get("anthropic-ratelimit-unified-remaining");
@@ -670,10 +707,11 @@ fn anthropic_unified_window_nosuffix(headers: &dyn HeaderLookup) -> Option<Windo
         return None;
     }
     Some(WindowSnapshot {
-        // No `limit` published in this shape; surface 0% per the same
-        // status-only convention the suffixed parser uses, and let the
-        // operator's window context decide whether 0% means "fresh".
-        used_percent: 0.0,
+        // No `limit` published in this shape and no numeric utilization —
+        // honest representation is "known window, no number". The caller
+        // treats `None` like an unknown reading: this window contributes
+        // no signal and cannot bind (degraded headroom baseline).
+        used_percent: None,
         window_minutes: None,
         reset_at_epoch: reset.and_then(parse_epoch_seconds),
         label: Some("unified".to_string()),
@@ -772,9 +810,13 @@ pub struct CounterWindow {
     /// `used_percent` is `None` too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<f64>,
-    /// `used_tokens / cap` when `cap.is_some() && cap > 0.0`. `None`
-    /// otherwise — never divide by zero, never claim a percent the store
-    /// can't actually compute.
+    /// `(used_tokens / cap) * 100.0` when `cap.is_some() && cap > 0.0`,
+    /// in the same 0..=100 percent scale as [`WindowSnapshot::used_percent`]
+    /// and [`WindowView::used_percent`] (Finding #3). The pre-fix
+    /// implementation stored the bare ratio (0.85 for 85%); the router
+    /// then compared it against `cap_guard = 85` and would not gate
+    /// until 85x the cap. `None` otherwise — never divide by zero,
+    /// never claim a percent the store can't actually compute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
     /// Provider-driven reset signal (e.g. the next calendar-month boundary
@@ -782,6 +824,16 @@ pub struct CounterWindow {
     /// published one; the caller decides whether the window has aged out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<DateTime<Utc>>,
+    /// Calendar window identity for `CounterWindow` rows that have a
+    /// calendar-shaped reset (Finding #4). Format depends on the
+    /// catalog: monthly windows use `"YYYY-MM"`, daily windows use
+    /// `"YYYY-MM-DD"`. When this row's `period_id` disagrees with the
+    /// period computed from `now`, [`record_counter`] atomically resets
+    /// `used_tokens` (and `used_percent`) before applying the new
+    /// increment. `None` for rolling (non-calendar) windows — those
+    /// never reset on a calendar boundary, by construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_id: Option<String>,
     /// UTC observation timestamp of the most recent increment.
     pub last_updated: DateTime<Utc>,
 }
@@ -793,12 +845,20 @@ pub struct CounterWindow {
 /// Effective used-percent for the snapshot, taking `reset_at_epoch` into
 /// account. When the provider-published reset time is in the past, the
 /// window has rolled over and headroom is full again.
+///
+/// `WindowSnapshot.used_percent` is `Option<f64>` (Finding #5): a window
+/// known to exist but with no numeric value (status-only Anthropic
+/// headers) returns 0% here so the legacy [`decide`] path doesn't trip
+/// its own cap_guard on a fabricated 0%. The L4 path filters `None`
+/// windows out of `observable` entirely, so a status-only window there
+/// contributes no signal — both paths agree that "no numeric reading"
+/// is never a reason to gate routing on a 0%.
 pub fn effective_used(snap: &RateLimitSnapshot, now: DateTime<Utc>) -> f64 {
     let now_epoch = now.timestamp();
     let pct = |w: &WindowSnapshot| -> f64 {
         match w.reset_at_epoch {
             Some(t) if t <= now_epoch => 0.0,
-            _ => w.used_percent,
+            _ => w.used_percent.unwrap_or(0.0),
         }
     };
     match (&snap.primary, &snap.secondary) {
@@ -814,6 +874,24 @@ pub fn effective_used(snap: &RateLimitSnapshot, now: DateTime<Utc>) -> f64 {
 /// budget in chargeback mode; pass `None` when not applicable. Callers
 /// that want the same behavior regardless of time should set `now` to a
 /// fixed [`DateTime`] in tests.
+///
+/// Freshness gate (Finding #6): the legacy path used to ignore
+/// `observed_at` entirely, so a two-hour-old 90% snapshot kept gating
+/// routing even though the equivalent [`AccountView`] would mark it
+/// Degraded and exclude it from binding. We now derive
+/// [`TelemetryHealth`] from `observed_at` whenever the caller actually
+/// sets it (the live wire-up via [`parse_headers`] always does), and
+/// refuse to fall back on anything Degraded — the same trust nothing
+/// more than 60 minutes old or with a missing clock invariant
+/// [`decide_account`] already honors. Material future-dated
+/// `observed_at` (more than [`FUTURE_TIMESTAMP_TOLERANCE_SECS`] ahead
+/// of `now`) is treated as clock-skewed Degraded rather than Fresh.
+///
+/// A snapshot with `observed_at = None` is trusted at face value (no
+/// freshness inference): the live wire-up always sets `observed_at`
+/// (so this branch only hits synthetic test fixtures / internal
+/// callers that know what they're doing — same trust contract as the
+/// pre-fix code).
 pub fn decide(
     snap: &RateLimitSnapshot,
     knobs: &RouteKnobs,
@@ -826,6 +904,17 @@ pub fn decide(
     // No credits (Codex-specific) -> we can't spend what we don't have.
     if snap.has_credits == Some(false) {
         return RouteDecision::FallBackToFree;
+    }
+
+    // Freshness gate: only applied when the caller supplied an
+    // `observed_at`. The live capture path always does; tests / internal
+    // callers that pass `observed_at = None` keep the legacy trust
+    // contract.
+    if let Some(observed_at) = snap.observed_at {
+        let snap_age = (now - observed_at).num_seconds();
+        if TelemetryHealth::from_age_secs(Some(snap_age)) == TelemetryHealth::Degraded {
+            return RouteDecision::PreferSub;
+        }
     }
 
     if used < knobs.use_target {
@@ -1019,23 +1108,33 @@ pub fn build_account_view(
             header_epoch_for_window.and_then(|epoch| DateTime::<Utc>::from_timestamp(epoch, 0))
         });
         // Compute used_percent.
-        let used_percent = match cw.observability {
+        //
+        // `HeaderMatch` carries `(Option<f64>, DateTime)` now that
+        // `WindowSnapshot.used_percent` is `Option<f64>` (Finding #5):
+        // a header observation at 0% is `Some(0.0)`; a status-only
+        // Anthropic window is `None`. We forward both as-is so the
+        // downstream `decide_account` filter
+        // (`used_percent.is_some() && health != Degraded`) naturally
+        // excludes the no-number windows from binding. A header
+        // observation at 0% IS a real signal (provider just told us
+        // we're fresh), so we don't gate on "non-zero" — None means
+        // "no header sighting" or "no numeric value", not "0% used".
+        let used_percent: Option<f64> = match cw.observability {
             // Counter path: trust the store's stored percent whenever
             // we have one. The store never invents a percent for a
             // cap-less row, so `Some(...)` is always "numeric and
             // correct" (cap * used is finite).
             crate::config::Observability::Counter => counter.and_then(|c| c.used_percent),
-            // Header path: take the matching header window's percent if
-            // we have one. A header observation at 0% IS a real signal
-            // (provider just told us we're fresh), so we don't gate on
-            // "non-zero" — None means "no header sighting", not "0%
-            // used".
-            crate::config::Observability::Header => header_match.map(|(pct, _)| pct),
+            // Header path: take the matching header window's percent
+            // if we have one (Some = real reading, None = no numeric
+            // value). Either is forwarded unchanged.
+            crate::config::Observability::Header => header_match.and_then(|(pct, _)| pct),
             // PercentOnly: surface the header reading if we have one
             // (the operator / provider only publishes a percent, so
             // even a counter row with no cap would be useless here).
             crate::config::Observability::PercentOnly => {
-                header_match.map(|(pct, _)| pct).or_else(|| {
+                let from_header = header_match.and_then(|(pct, _)| pct);
+                from_header.or_else(|| {
                     // Last-ditch: if a caller seeded `used_percent`
                     // directly on the counter row, surface that.
                     counter.and_then(|c| c.used_percent)
@@ -1232,18 +1331,37 @@ pub fn decide_account(
     let binding_used = binding.used_percent.unwrap_or(0.0);
     // Reset-relaxation: cap_guard trips AND time-to-reset is small
     // relative to the window's cycle.
-    let relax = binding_used >= knobs.cap_guard
-        && binding
-            .reset_at
-            .map(|r| {
+    //
+    // Finding #7: the original implementation only looked at the
+    // BINDING window, so a fresh 5h at 90% with reset in 5 minutes
+    // returned PreferSub immediately, ignoring that the weekly
+    // window on the same account was also at/above the guard with a
+    // reset still 5 days away. The relax-only-when-every-at-guard-
+    // window-is-itself-imminently-resetting rule below closes that
+    // hole: we relax only when every observable window currently at
+    // or above `cap_guard` has its own `time_to_reset / cycle_secs`
+    // within `reset_imminence_threshold`. A window without a reset
+    // signal can't be confirmed-imminent, so it counts as
+    // NOT-relaxable — better to fall back than to overshoot a cap
+    // we can't actually see rolling over.
+    let is_window_imminently_resetting = |w: &WindowView| -> bool {
+        let cycle_secs = (w.hours as f64) * 3600.0;
+        if cycle_secs <= 0.0 {
+            return false;
+        }
+        match w.reset_at {
+            None => false,
+            Some(r) => {
                 let time_to_reset = (r - now).num_seconds().max(0) as f64;
-                let cycle_secs = (binding.hours as f64) * 3600.0;
-                if cycle_secs <= 0.0 {
-                    return false;
-                }
                 (time_to_reset / cycle_secs) <= knobs.reset_imminence_threshold
-            })
-            .unwrap_or(false);
+            }
+        }
+    };
+    let relax = binding_used >= knobs.cap_guard
+        && observable
+            .iter()
+            .filter(|w| w.used_percent.unwrap_or(0.0) >= knobs.cap_guard)
+            .all(|w| is_window_imminently_resetting(w));
     if relax {
         return AccountDecision {
             decision: RouteDecision::PreferSub,
@@ -1335,6 +1453,19 @@ pub fn default_store_path() -> Option<PathBuf> {
 /// serialize cleanly: A's `open` blocks until B's `save` drops the lock,
 /// A reads B's updated JSON, A applies its own delta, A saves. The
 /// flock is automatically released if the process dies.
+/// On-disk schema version for [`UtilizationStore`]. Bumped when a
+/// persisted field's interpretation changes in a way that requires
+/// migration of existing files. See [`default_schema_version`] and the
+/// per-version migration code in `UtilizationStore::open`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// Default schema version for files written before the field existed.
+/// Files without an explicit `schema_version` are treated as `1`
+/// (legacy fraction storage) and migrated on load.
+pub const fn default_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UtilizationStore {
     #[serde(default)]
@@ -1345,6 +1476,14 @@ pub struct UtilizationStore {
     /// catalog declares for the same `(provider, account, plan)`.
     #[serde(default)]
     pub counters: BTreeMap<String, CounterWindow>,
+    /// On-disk schema version. `1` = legacy fraction storage (used_percent
+    /// in `[0, 1]`), `2` = the current percentage storage
+    /// (`used_percent` in `[0, 100]`). Missing fields deserialize as
+    /// `Default::default()` (= `1`) so files written before this field
+    /// existed migrate cleanly on first load. After load the store
+    /// re-emits `schema_version = CURRENT_SCHEMA_VERSION` on save.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     /// Sidecar lockfile. Held for the lifetime of the store; Drop
@@ -1381,6 +1520,7 @@ impl Default for UtilizationStore {
         Self {
             records: BTreeMap::new(),
             counters: BTreeMap::new(),
+            schema_version: CURRENT_SCHEMA_VERSION,
             path: None,
             lock: None,
         }
@@ -1393,6 +1533,49 @@ fn key(provider: Provider, account_id: &str, plan: &str) -> String {
 
 fn counter_key(provider: Provider, account_id: &str, plan: &str, window_name: &str) -> String {
     format!("{provider:?}::{account_id}::{plan}::{window_name}")
+}
+
+/// Compute the calendar-period identity for `now`, suitable for
+/// persisting on a [`CounterWindow`] and comparing on subsequent
+/// `record_counter` calls (Finding #4). Returns `None` for callers
+/// that don't want calendar-boundary handling; the corresponding
+/// `CounterWindow` rows have `period_id = None` and never reset.
+pub fn period_id_for(now: DateTime<Utc>) -> Option<String> {
+    Some(now.format("%Y-%m").to_string())
+}
+
+/// Recompute `used_percent` from `used_tokens` and `cap` in the unified
+/// 0..=100 scale (Finding #3). The previous implementation returned the
+/// raw `used_tokens / cap` ratio (e.g. 0.85 for 85%), which the router
+/// then compared against `cap_guard = 85` — silently 85× too lenient.
+/// Callers inside this module use this helper rather than open-coding
+/// the multiply so the rounding / cap-zero rule lives in one place.
+fn compute_used_percent(used_tokens: f64, cap: Option<f64>) -> Option<f64> {
+    match cap {
+        Some(c) if c > 0.0 => Some((used_tokens / c) * 100.0),
+        _ => None,
+    }
+}
+
+/// Detect-and-migrate legacy fractional `CounterWindow.used_percent`
+/// rows written by an older binary (Finding #3). The pre-fix code
+/// stored `used_tokens / cap` (a fraction in [0, 1]); the new code
+/// stores the same value times 100 (a percentage in [0, 100]). Any
+/// row that arrives with a `used_percent` in `(0, 1)` and a positive
+/// `cap` is treated as a v1 fractional row and multiplied by 100 in
+/// place. Rows already in the new scale (used_percent >= 1, or
+/// used_percent == 0 with a positive cap) are left alone. The
+/// `cap.is_some()` and `c > 0.0` guards prevent false-positives from
+/// a row that legitimately was `0.5%` on a fresh window — there
+/// can't be such a row in v1 because the legacy code never produced
+/// a value > 0 without a positive cap, and even if one did slip in,
+/// the guard excludes it from migration.
+fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
+    if let (Some(p), Some(c)) = (cw.used_percent, cw.cap) {
+        if c > 0.0 && p > 0.0 && p < 1.0 {
+            cw.used_percent = Some(p * 100.0);
+        }
+    }
 }
 
 impl UtilizationRecord {
@@ -1464,6 +1647,7 @@ impl UtilizationStore {
                     Ok(Self {
                         records: BTreeMap::new(),
                         counters: BTreeMap::new(),
+                        schema_version: CURRENT_SCHEMA_VERSION,
                         path: Some(path.to_path_buf()),
                         lock: Some(lock),
                     })
@@ -1472,12 +1656,28 @@ impl UtilizationStore {
                         serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
                     store.path = Some(path.to_path_buf());
                     store.lock = Some(lock);
+                    // Migrate legacy fractional `CounterWindow.used_percent`
+                    // rows in place (Finding #3) — but ONLY for files that
+                    // predate the percentage fix. The fix is gated on the
+                    // persisted `schema_version` field so a brand-new row
+                    // whose `used_percent` happens to land in (0, 1)
+                    // (perfectly legitimate when the cap is enormous, e.g.
+                    // MiniMax's 5.1B monthly cap with low real usage)
+                    // doesn't get falsely re-multiplied by 100 and rendered
+                    // as e.g. "4.9%" instead of "0.049%".
+                    if store.schema_version < 2 {
+                        for cw in store.counters.values_mut() {
+                            migrate_fractional_counter_percent(cw);
+                        }
+                        store.schema_version = CURRENT_SCHEMA_VERSION;
+                    }
                     Ok(store)
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
                 records: BTreeMap::new(),
                 counters: BTreeMap::new(),
+                schema_version: CURRENT_SCHEMA_VERSION,
                 path: Some(path.to_path_buf()),
                 lock: Some(lock),
             }),
@@ -1499,6 +1699,7 @@ impl UtilizationStore {
                     Ok(Self {
                         records: BTreeMap::new(),
                         counters: BTreeMap::new(),
+                        schema_version: CURRENT_SCHEMA_VERSION,
                         path: Some(path.to_path_buf()),
                         lock: None,
                     })
@@ -1507,12 +1708,25 @@ impl UtilizationStore {
                         serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
                     store.path = Some(path.to_path_buf());
                     store.lock = None;
+                    // Same legacy-fraction migration as `open()` —
+                    // read-only paths still want consistent 0..=100
+                    // percents so reports / forecasts never render a
+                    // fractional row as "0.9%" again. Gated on
+                    // `schema_version < 2` for the same reason: a real
+                    // 0.049% reading must not be silently re-multiplied.
+                    if store.schema_version < 2 {
+                        for cw in store.counters.values_mut() {
+                            migrate_fractional_counter_percent(cw);
+                        }
+                        store.schema_version = CURRENT_SCHEMA_VERSION;
+                    }
                     Ok(store)
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
                 records: BTreeMap::new(),
                 counters: BTreeMap::new(),
+                schema_version: CURRENT_SCHEMA_VERSION,
                 path: Some(path.to_path_buf()),
                 lock: None,
             }),
@@ -1597,17 +1811,25 @@ impl UtilizationStore {
     /// Record a token-usage increment against a counter-fed window
     /// (KNEMON Layer 3B). The persisted `used_tokens` is increased by
     /// `tokens_used`, and `used_percent` is recomputed as
-    /// `used_tokens / cap` whenever the cap is known. When the cap is
-    /// `None` (a `PercentOnly` window, or any window whose cap has not yet
-    /// been recorded via [`set_counter_cap`]), `used_percent` stays
-    /// `None` — we never invent a percent.
+    /// `(used_tokens / cap) * 100.0` whenever the cap is known (the
+    /// 0..=100 scale that `cap_guard` and the renderer both use —
+    /// Finding #3). When the cap is `None` (a `PercentOnly` window,
+    /// or any window whose cap has not yet been recorded via
+    /// [`set_counter_cap`]), `used_percent` stays `None` — we never
+    /// invent a percent.
+    ///
+    /// Calendar reset (Finding #4): when this row was created with
+    /// `period_id = Some(...)` (by the catalog-aware wire-up in
+    /// [`crate::provider::capture_counter_usage`]) and the period
+    /// computed from `now` differs, we atomically zero `used_tokens`
+    /// (and `used_percent`) BEFORE applying the new increment — so
+    /// June usage cannot survive into July, and the percentage unit
+    /// bug never compounds across the boundary. Rows without a
+    /// `period_id` (legacy / non-calendar windows) never reset here;
+    /// the caller is responsible for any rolling-window semantics.
     ///
     /// Window `reset_at` is preserved across increments when the
-    /// caller has already set it; otherwise it's left at `None`. The
-    /// caller is responsible for detecting a calendar boundary and
-    /// resetting `used_tokens` to zero (the store's contract is
-    /// "increment, never auto-reset" — auto-resetting on a misread clock
-    /// would silently destroy utilization data).
+    /// caller has already set it; otherwise it's left at `None`.
     ///
     /// Returns the new `used_tokens` after the increment. Best-effort:
     /// callers that want the disk side-effect should pair this with
@@ -1635,8 +1857,28 @@ impl UtilizationStore {
                 cap: None,
                 used_percent: None,
                 reset_at: None,
+                // Calendar windows get a `period_id` seeded lazily on the
+                // first increment so subsequent increments can detect a
+                // boundary cross; non-calendar windows stay None.
+                period_id: None,
                 last_updated: now,
             });
+        // Calendar-boundary reset (Finding #4): when the caller has
+        // bound the window to a period_id (set via the catalog-aware
+        // wire-up in `provider::capture_counter_usage` — see
+        // `set_counter_period_id`) and the period derived from `now`
+        // differs from the persisted one, zero out the window BEFORE
+        // applying the new increment. This is the atomic reset the
+        // store previously lacked: June usage cannot bleed into
+        // July, even though `record_counter` is the only mutator.
+        if let Some(stored_period) = entry.period_id.clone() {
+            let current_period = period_id_for(now).unwrap_or_default();
+            if stored_period != current_period {
+                entry.used_tokens = 0.0;
+                entry.used_percent = None;
+                entry.period_id = Some(current_period);
+            }
+        }
         // Defensive: a malformed / negative increment is a no-op, not a
         // subtraction. A provider that occasionally reports 0 usage
         // (streaming-usage off, usage field absent) still wants a row
@@ -1646,13 +1888,45 @@ impl UtilizationStore {
         }
         // Recompute percent from the cap, if any. `cap = Some(0.0)` is
         // treated as "no headroom" (0%, not NaN/inf) so a bad
-        // configuration never produces an exploded percent.
-        entry.used_percent = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        // configuration never produces an exploded percent. Finding
+        // #3: percent is in the 0..=100 scale, not the bare ratio.
+        entry.used_percent = compute_used_percent(entry.used_tokens, entry.cap);
         entry.last_updated = now;
         entry.used_tokens
+    }
+
+    /// Bind a `CounterWindow` row to a calendar-period identity
+    /// (Finding #4). Called by the catalog-aware wire-up after the
+    /// store has been opened and the window's `ResetKind` has been
+    /// resolved. A row without a `period_id` (legacy / non-calendar)
+    /// never triggers a reset on `record_counter`. Setting
+    /// `period_id = None` is the way to opt a previously-periodic
+    /// window back out of automatic reset (e.g. operator changed the
+    /// catalog from `CalendarMonthly` to `Rolling`).
+    pub fn set_counter_period_id(
+        &mut self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+        period_id: Option<String>,
+        now: DateTime<Utc>,
+    ) {
+        let k = counter_key(provider, account_id, plan, window_name);
+        let entry = self.counters.entry(k).or_insert_with(|| CounterWindow {
+            provider,
+            account_id: account_id.to_string(),
+            plan: plan.to_string(),
+            window_name: window_name.to_string(),
+            used_tokens: 0.0,
+            cap: None,
+            used_percent: None,
+            reset_at: None,
+            period_id: period_id.clone(),
+            last_updated: now,
+        });
+        entry.period_id = period_id;
+        entry.last_updated = now;
     }
 
     /// Set (or clear) the cap for one counter-fed window. The store only
@@ -1683,21 +1957,21 @@ impl UtilizationStore {
             cap: None,
             used_percent: None,
             reset_at: None,
+            period_id: None,
             last_updated: now,
         });
         entry.cap = cap;
-        entry.used_percent = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        // Finding #3: percent is in the 0..=100 scale.
+        entry.used_percent = compute_used_percent(entry.used_tokens, entry.cap);
         entry.last_updated = now;
     }
 
     /// Recompute `used_percent` for one counter-fed window from its
     /// currently-stored `used_tokens` and `cap`. Use after
     /// [`set_counter_cap`] to surface the percent before the next
-    /// `record_counter` lands. Returns the new percent, or `None` when
-    /// the cap is unknown / non-positive.
+    /// `record_counter` lands. Returns the new percent (in the
+    /// 0..=100 scale — Finding #3), or `None` when the cap is
+    /// unknown / non-positive.
     pub fn recompute_counter_percent(
         &mut self,
         provider: Provider,
@@ -1707,10 +1981,7 @@ impl UtilizationStore {
     ) -> Option<f64> {
         let k = counter_key(provider, account_id, plan, window_name);
         let entry = self.counters.get_mut(&k)?;
-        let pct = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        let pct = compute_used_percent(entry.used_tokens, entry.cap);
         entry.used_percent = pct;
         pct
     }
@@ -1845,12 +2116,12 @@ mod tests {
         assert_eq!(snap.plan, "pro");
         assert_eq!(snap.has_credits, Some(true));
         let p = snap.primary.unwrap();
-        assert_eq!(p.used_percent, 42.0);
+        assert_eq!(p.used_percent, Some(42.0));
         assert_eq!(p.window_minutes, Some(300));
         // `reset-at` wins over the synthesized `reset-after-seconds`.
         assert_eq!(p.reset_at_epoch, Some(1783159200));
         let s = snap.secondary.unwrap();
-        assert_eq!(s.used_percent, 12.0);
+        assert_eq!(s.used_percent, Some(12.0));
         assert_eq!(s.window_minutes, Some(10080));
     }
 
@@ -1862,7 +2133,7 @@ mod tests {
         ]);
         let snap = parse_codex(&h, "acct-1", "pro");
         let p = snap.primary.unwrap();
-        assert_eq!(p.used_percent, 5.0);
+        assert_eq!(p.used_percent, Some(5.0));
         let now = Utc::now().timestamp();
         let reset = p.reset_at_epoch.expect("reset must be synthesized");
         assert!(
@@ -1895,11 +2166,11 @@ mod tests {
         let snap = parse_anthropic(&h, "acct", "max");
         assert_eq!(snap.provider, Provider::Anthropic);
         let p = snap.primary.unwrap();
-        assert_eq!(p.used_percent, 65.5);
+        assert_eq!(p.used_percent, Some(65.5));
         assert_eq!(p.window_minutes, Some(300));
         assert_eq!(p.label.as_deref(), Some("5h"));
         let s = snap.secondary.unwrap();
-        assert_eq!(s.used_percent, 20.0);
+        assert_eq!(s.used_percent, Some(20.0));
         assert_eq!(s.window_minutes, Some(10080));
     }
 
@@ -1915,11 +2186,11 @@ mod tests {
         let snap = parse_anthropic(&h, "acct", "max");
         // Primary is derived from `requests` pair: 80% used.
         let p = snap.primary.unwrap();
-        assert!((p.used_percent - 80.0).abs() < 1e-9);
+        assert!((p.used_percent.unwrap() - 80.0).abs() < 1e-9);
         assert_eq!(p.label.as_deref(), Some("requests"));
         // Secondary from `tokens` pair: 50% used.
         let s = snap.secondary.unwrap();
-        assert!((s.used_percent - 50.0).abs() < 1e-9);
+        assert!((s.used_percent.unwrap() - 50.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1952,13 +2223,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = RateLimitSnapshot {
             primary: Some(WindowSnapshot {
-                used_percent: 30.0,
+                used_percent: Some(30.0),
                 window_minutes: Some(300),
                 reset_at_epoch: None,
                 label: Some("primary".into()),
             }),
             secondary: Some(WindowSnapshot {
-                used_percent: 90.0,
+                used_percent: Some(90.0),
                 window_minutes: Some(10080),
                 reset_at_epoch: None,
                 label: Some("secondary".into()),
@@ -1973,13 +2244,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = RateLimitSnapshot {
             primary: Some(WindowSnapshot {
-                used_percent: 99.0,
+                used_percent: Some(99.0),
                 window_minutes: Some(300),
                 reset_at_epoch: Some(now.timestamp() - 10), // 10s ago
                 label: Some("primary".into()),
             }),
             secondary: Some(WindowSnapshot {
-                used_percent: 10.0,
+                used_percent: Some(10.0),
                 window_minutes: Some(10080),
                 reset_at_epoch: None,
                 label: Some("secondary".into()),
@@ -2008,7 +2279,7 @@ mod tests {
             account_id: "acct".into(),
             plan: "pro".into(),
             primary: Some(WindowSnapshot {
-                used_percent: pct,
+                used_percent: Some(pct),
                 window_minutes: Some(300),
                 reset_at_epoch: reset_at,
                 label: Some("primary".into()),
@@ -2137,13 +2408,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let snap = RateLimitSnapshot {
             primary: Some(WindowSnapshot {
-                used_percent: 20.0,
+                used_percent: Some(20.0),
                 window_minutes: Some(300),
                 reset_at_epoch: None,
                 label: Some("primary".into()),
             }),
             secondary: Some(WindowSnapshot {
-                used_percent: 90.0,
+                used_percent: Some(90.0),
                 window_minutes: Some(10080),
                 reset_at_epoch: None,
                 label: Some("secondary".into()),
@@ -2181,7 +2452,7 @@ mod tests {
         let rec = s2
             .get(Provider::OpenaiCodex, "acct", "pro")
             .expect("record persisted");
-        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 42.0);
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, Some(42.0));
         assert_eq!(rec.plan, "pro");
     }
 
@@ -2258,7 +2529,7 @@ mod tests {
             .expect("codex headers must yield a snapshot");
         assert_eq!(snap.provider, Provider::OpenaiCodex);
         let p = snap.primary.expect("primary window must be present");
-        assert_eq!(p.used_percent, 92.0);
+        assert_eq!(p.used_percent, Some(92.0));
         // `reset-after-seconds` synthesizes an epoch ≈ now + 600.
         let now = Utc::now().timestamp();
         let reset = p.reset_at_epoch.expect("reset must be synthesized");
@@ -2267,7 +2538,7 @@ mod tests {
             "reset {reset} should be ~now+600 (now={now})",
         );
         let s = snap.secondary.expect("secondary window must be present");
-        assert_eq!(s.used_percent, 37.0);
+        assert_eq!(s.used_percent, Some(37.0));
         // The Codex `x-codex-plan-type` header is surfaced onto the snapshot.
         assert_eq!(snap.plan, "pro");
     }
@@ -2279,10 +2550,12 @@ mod tests {
             .expect("anthropic headers must yield a snapshot");
         assert_eq!(snap.provider, Provider::Anthropic);
         // Anthropic's unified endpoint without a numeric `utilization`
-        // surfaces as 0% (status-only). The legacy-style `reset` header is
-        // parsed as an RFC3339 epoch.
+        // surfaces as None (status-only — known window, no number).
+        // Finding #5: we no longer fabricate a 0% reading when the
+        // headers don't carry one. The legacy-style `reset` header is
+        // still parsed as an RFC3339 epoch.
         let p = snap.primary.expect("primary window must be present");
-        assert_eq!(p.used_percent, 0.0);
+        assert_eq!(p.used_percent, None);
         assert_eq!(
             p.reset_at_epoch,
             Some(1783152000),
@@ -2319,7 +2592,7 @@ mod tests {
         let rec = s2
             .get(Provider::OpenaiCodex, "acct", "pro")
             .expect("record persisted");
-        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 72.5);
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, Some(72.5));
         // The read-back path the CLI uses:
         let loaded = s2
             .get(Provider::OpenaiCodex, "acct", "pro")
@@ -2327,7 +2600,7 @@ mod tests {
         let loaded = loaded.expect("as_snapshot must yield a snapshot");
         assert_eq!(
             loaded.primary.as_ref().unwrap().used_percent,
-            72.5,
+            Some(72.5),
             "fed snapshot used_percent must match what was persisted",
         );
     }
@@ -2437,13 +2710,14 @@ mod tests {
                 .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
                 .expect("monthly counter window must persist");
             assert_eq!(w.used_tokens, 2.0 * n);
-            expected_pct = (2.0 * n) / MM_MONTHLY_CAP;
+            // Finding #3: used_percent is on the 0..=100 scale.
+            expected_pct = (2.0 * n) / MM_MONTHLY_CAP * 100.0;
             let got_pct = w
                 .used_percent
                 .expect("used_percent must be Some when cap is known");
             assert!(
-                (got_pct - expected_pct).abs() < 1e-12,
-                "used_percent must equal 2N/5.1e9 = {expected_pct}, got {got_pct}",
+                (got_pct - expected_pct).abs() < 1e-9,
+                "used_percent must equal (2N/cap)*100 = {expected_pct}, got {got_pct}",
             );
             // Flush to disk before the next open.
             s.save().unwrap();
@@ -2521,9 +2795,10 @@ mod tests {
         let pct = w
             .used_percent
             .expect("with cap set, used_percent must be Some");
+        // Finding #3: percent is in 0..=100 — n=999, cap=10_000 -> 9.99%.
         assert!(
-            (pct - (n / 10_000.0)).abs() < 1e-12,
-            "after set_counter_cap, percent must be used/cap: got {pct}",
+            (pct - (n / 10_000.0) * 100.0).abs() < 1e-12,
+            "after set_counter_cap, percent must be (used/cap)*100: got {pct}",
         );
 
         // And critically: a fresh `record_counter` on a DIFFERENT
@@ -2586,13 +2861,17 @@ mod tests {
         let rec = s2
             .get(Provider::OpenaiCodex, "acct", "pro")
             .expect("header-fed record must round-trip");
-        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 72.5);
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, Some(72.5));
         let cw = s2
             .get_counter(Provider::MiniMax, "acct-mm", MM_PLAN, "monthly")
             .expect("counter row must round-trip");
         assert_eq!(cw.used_tokens, 2_500_000.0);
         assert_eq!(cw.cap, Some(MM_MONTHLY_CAP));
-        assert_eq!(cw.used_percent, Some(2_500_000.0 / MM_MONTHLY_CAP));
+        // Finding #3: stored percent is in 0..=100, not the bare ratio.
+        assert_eq!(
+            cw.used_percent,
+            Some((2_500_000.0 / MM_MONTHLY_CAP) * 100.0)
+        );
         assert_eq!(cw.provider, Provider::MiniMax);
         assert_eq!(cw.plan, MM_PLAN);
         assert_eq!(cw.window_name, "monthly");
@@ -3153,7 +3432,8 @@ mod tests {
         assert_eq!(w.name, "monthly");
         assert_eq!(w.hours, 720);
         assert!(w.used_percent.is_some());
-        assert!((w.used_percent.unwrap() - 0.25).abs() < 1e-9);
+        // Finding #3: percent is in 0..=100 — 250_000 / 1_000_000 = 25%.
+        assert!((w.used_percent.unwrap() - 25.0).abs() < 1e-9);
         assert_eq!(w.health, TelemetryHealth::Fresh);
     }
 

@@ -947,7 +947,7 @@ mod tests {
             account_id: "acct".into(),
             plan: "pro".into(),
             primary: Some(crate::utilization::WindowSnapshot {
-                used_percent: pct,
+                used_percent: Some(pct),
                 window_minutes: Some(300),
                 reset_at_epoch: reset_at,
                 label: Some("primary".into()),

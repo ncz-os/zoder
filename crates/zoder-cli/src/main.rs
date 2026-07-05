@@ -6301,7 +6301,7 @@ mod scenario_routing_tests {
             account_id: "acct".into(),
             plan: "pro".into(),
             primary: Some(WindowSnapshot {
-                used_percent: pct,
+                used_percent: Some(pct),
                 window_minutes: Some(300),
                 reset_at_epoch: None,
                 label: Some("primary".into()),
