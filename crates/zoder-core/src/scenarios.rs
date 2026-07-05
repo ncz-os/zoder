@@ -1493,6 +1493,7 @@ mod tests {
             provider,
             account_id: account_id.to_string(),
             plan: plan.to_string(),
+            has_credits: None,
             windows,
         }
     }

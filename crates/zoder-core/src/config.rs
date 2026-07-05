@@ -927,6 +927,12 @@ impl Config {
                     p.id
                 ));
             }
+            if p.billing == BillingMode::Subscription && p.subscription.is_none() {
+                errs.push(format!(
+                    "provider {}: billing=subscription requires subscription terms",
+                    p.id
+                ));
+            }
             if let Some(plan) = &p.subscription {
                 if !plan.monthly_fee_usd.is_finite() || plan.monthly_fee_usd < 0.0 {
                     errs.push(format!(
@@ -1882,6 +1888,19 @@ auth = { type = "env", var = "ACME_KEY" }
         let errs = cfg.validate().join("\n");
         assert!(errs.contains("does not resolve"), "{errs}");
         assert!(errs.contains("chatgpt-pr0"), "{errs}");
+    }
+
+    #[test]
+    fn validate_rejects_subscription_billing_without_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = None;
+        let errors = cfg.validate().join("\n");
+        assert!(
+            errors.contains("billing=subscription requires subscription terms"),
+            "{errors}"
+        );
     }
 
     #[test]

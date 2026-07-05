@@ -41,7 +41,7 @@
           "confidence": "observed",
           "source": "observed",
           "windows": [
-            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 80 },
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 80 },
             { "name": "weekly", "hours": 168, "unit": "messages", "cap": 800 }
           ]
         },
@@ -50,7 +50,7 @@
           "confidence": "observed",
           "source": "observed",
           "windows": [
-            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 200 },
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 200 },
             { "name": "weekly", "hours": 168, "unit": "messages", "cap": 4000 }
           ]
         },
@@ -59,7 +59,7 @@
           "confidence": "observed",
           "source": "observed",
           "windows": [
-            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 100 },
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 100 },
             { "name": "weekly", "hours": 168, "unit": "messages", "cap": 1000 }
           ]
         },
@@ -68,7 +68,7 @@
           "confidence": "estimated",
           "source": "observed",
           "windows": [
-            { "name": "3h",     "hours": 3,   "unit": "messages", "cap": 200 },
+            { "name": "5h",     "hours": 5,   "unit": "messages", "cap": 200 },
             { "name": "weekly", "hours": 168, "unit": "messages", "cap": 4000 }
           ]
         }

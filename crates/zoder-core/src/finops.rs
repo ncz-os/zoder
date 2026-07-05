@@ -72,6 +72,8 @@ pub struct SpendGroup {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub calls: u64,
+    pub unknown_cost_tokens: u64,
+    pub unknown_cost_calls: u64,
 }
 
 /// Effective $/1M tok, computed from actual ledger entries.
@@ -83,6 +85,8 @@ pub struct ModelRealized {
     pub tokens_out: u64,
     pub tokens: u64,
     pub calls: u64,
+    pub unknown_cost_tokens: u64,
+    pub unknown_cost_calls: u64,
     /// None if no tokens (serialized as null in JSON).
     pub realized_usd_per_mtok: Option<f64>,
 }
@@ -135,6 +139,8 @@ pub struct FinOpsReport {
     pub total_cost_usd: f64,
     pub total_tokens: u64,
     pub total_calls: u64,
+    pub unknown_cost_tokens: u64,
+    pub unknown_cost_calls: u64,
     pub by_caller: Vec<SpendGroup>,
     pub by_task: Vec<SpendGroup>,
     /// Spend grouped by model publisher host (e.g. `meta`, `anthropic`),
@@ -245,7 +251,16 @@ pub fn spend_by_dimension(
             tokens_in: 0,
             tokens_out: 0,
             calls: 0,
+            unknown_cost_tokens: 0,
+            unknown_cost_calls: 0,
         });
+        if e.cost_unknown {
+            entry.unknown_cost_tokens = entry
+                .unknown_cost_tokens
+                .saturating_add(e.tokens_in.saturating_add(e.tokens_out));
+            entry.unknown_cost_calls = entry.unknown_cost_calls.saturating_add(e.calls);
+            continue;
+        }
         entry.cost_usd = saturating_f64_add(entry.cost_usd, e.cost_usd);
         entry.tokens_in = entry.tokens_in.saturating_add(e.tokens_in);
         entry.tokens_out = entry.tokens_out.saturating_add(e.tokens_out);
@@ -278,8 +293,15 @@ pub fn realized_rate_by_model(
             tokens_out: 0,
             tokens: 0,
             calls: 0,
+            unknown_cost_tokens: 0,
+            unknown_cost_calls: 0,
             realized_usd_per_mtok: None,
         });
+        if e.cost_unknown {
+            r.unknown_cost_tokens = r.unknown_cost_tokens.saturating_add(tot);
+            r.unknown_cost_calls = r.unknown_cost_calls.saturating_add(e.calls);
+            continue;
+        }
         r.cost_usd = saturating_f64_add(r.cost_usd, e.cost_usd);
         r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
         r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
@@ -311,6 +333,9 @@ pub fn cache_savings_by_model(
     let entries = ledger.entries_in(since, until)?;
     let mut rows: BTreeMap<String, CacheSavingsRow> = BTreeMap::new();
     for e in entries {
+        if e.cost_unknown {
+            continue;
+        }
         let tags = parse_tags(&e);
         let hit = tags.cache_hit_ratio.unwrap_or(0.0);
         if hit <= 0.0 {
@@ -363,7 +388,7 @@ pub fn cheapest_equivalent_advisor(
     let entries = ledger.entries_in(since, until)?;
     let mut paid: BTreeMap<String, (f64, u64, u64)> = BTreeMap::new();
     for e in entries {
-        if e.cost_usd <= 0.0 {
+        if e.cost_unknown || e.cost_usd <= 0.0 {
             continue;
         }
         let r = paid.entry(e.model.clone()).or_insert((0.0, 0, 0));
@@ -437,6 +462,9 @@ pub fn forecast_burn(
     let entries = ledger.entries_in(Some(since), Some(until))?;
     let mut daily: BTreeMap<String, f64> = BTreeMap::new();
     for e in entries {
+        if e.cost_unknown {
+            continue;
+        }
         let k = day_key(&e.ts_utc);
         let total = daily.entry(k).or_insert(0.0);
         *total = saturating_f64_add(*total, e.cost_usd);
@@ -479,7 +507,15 @@ pub fn build_finops_report(
     let mut cost = 0.0;
     let mut tokens = 0u64;
     let mut calls = 0u64;
+    let mut unknown_cost_tokens = 0u64;
+    let mut unknown_cost_calls = 0u64;
     for e in entries {
+        if e.cost_unknown {
+            unknown_cost_tokens =
+                unknown_cost_tokens.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
+            unknown_cost_calls = unknown_cost_calls.saturating_add(e.calls);
+            continue;
+        }
         cost = saturating_f64_add(cost, e.cost_usd);
         tokens = tokens.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
         calls = calls.saturating_add(e.calls);
@@ -491,6 +527,8 @@ pub fn build_finops_report(
         total_cost_usd: cost,
         total_tokens: tokens,
         total_calls: calls,
+        unknown_cost_tokens,
+        unknown_cost_calls,
         by_caller: spend_by_dimension(ledger, Dimension::Caller, Some(since), Some(until))?,
         by_task: spend_by_dimension(ledger, Dimension::Task, Some(since), Some(until))?,
         by_host: spend_by_dimension(ledger, Dimension::Host, Some(since), Some(until))?,
@@ -520,14 +558,21 @@ fn render_finops_text(rep: &FinOpsReport, p: &Paint) -> String {
     s.push_str(&p.header(&format!("FinOps report — {since_short} → {until_short}")));
     s.push('\n');
     s.push_str(&format!(
-        "  total calls:     {}\n",
+        "  known-cost calls: {}\n",
         fmt_count(rep.total_calls)
     ));
-    s.push_str(&format!("  total tokens:    {}\n", rep.total_tokens));
+    s.push_str(&format!("  known-cost tokens: {}\n", rep.total_tokens));
     s.push_str(&format!(
-        "  total cost:      {}\n",
+        "  known total cost: {}\n",
         p.warn(&format!("${:.2}", rep.total_cost_usd))
     ));
+    if rep.unknown_cost_calls > 0 {
+        s.push_str(&format!(
+            "  unknown cost:     {} calls / {} tokens (excluded from spend and rates)\n",
+            fmt_count(rep.unknown_cost_calls),
+            fmt_count(rep.unknown_cost_tokens)
+        ));
+    }
     s.push('\n');
     if !rep.by_caller.is_empty() {
         s.push_str(&p.dim("  by caller:"));
@@ -822,5 +867,72 @@ mod tests {
         let pricing = PricingCatalog::default();
         let rep = build_finops_report(&led, &pricing, since, until, 30).unwrap();
         assert!(rep.by_host.iter().any(|g| g.key == "meta" && g.calls == 2));
+    }
+
+    #[test]
+    fn finops_segregates_unknown_cost_from_totals_and_realized_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        rec(
+            &led,
+            "2026-06-10 10:00:00",
+            "p",
+            "known/model",
+            1.0,
+            750,
+            250,
+        );
+        let unknown = Entry {
+            ts_utc: chrono::NaiveDateTime::parse_from_str(
+                "2026-06-11 10:00:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap()
+            .and_utc(),
+            provider: "p".into(),
+            model: "unknown/model".into(),
+            host: "unknown".into(),
+            tokens_in: 1_500,
+            tokens_out: 500,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
+        };
+        led.record(&unknown).unwrap();
+        let since = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let until = chrono::NaiveDate::from_ymd_opt(2026, 7, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let report =
+            build_finops_report(&led, &PricingCatalog::default(), since, until, 30).unwrap();
+        assert_eq!(report.total_cost_usd, 1.0);
+        assert_eq!(report.total_tokens, 1_000);
+        assert_eq!(report.total_calls, 1);
+        assert_eq!(report.unknown_cost_tokens, 2_000);
+        assert_eq!(report.unknown_cost_calls, 1);
+        let unknown_rate = report
+            .by_model_realized
+            .iter()
+            .find(|row| row.model == "unknown/model")
+            .unwrap();
+        assert_eq!(unknown_rate.realized_usd_per_mtok, None);
+        assert_eq!(unknown_rate.unknown_cost_tokens, 2_000);
+        let known_rate = report
+            .by_model_realized
+            .iter()
+            .find(|row| row.model == "known/model")
+            .unwrap();
+        assert_eq!(known_rate.realized_usd_per_mtok, Some(1_000.0));
+        let rendered = render_finops_text(&report, &Paint::new(&Theme::default()));
+        assert!(rendered.contains("unknown cost:"));
+        assert!(rendered.contains("excluded from spend and rates"));
     }
 }

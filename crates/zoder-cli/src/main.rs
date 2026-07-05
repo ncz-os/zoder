@@ -637,7 +637,104 @@ impl RoutingContext {
     /// dual-billing). Returns `None` for unbacked models so the caller can
     /// hard-error with a clear message instead of dialing the placeholder.
     fn real_provider_for_model<'a>(&self, cfg: &'a Config, model_id: &str) -> Option<&'a Provider> {
-        cfg.real_best_provider_for_model(model_id, &self.entries, &self.catalog)
+        let ledger_choice =
+            cfg.real_best_provider_for_model(model_id, &self.entries, &self.catalog);
+        let store = zoder_core::utilization::default_store_path()
+            .and_then(|path| zoder_core::utilization::UtilizationStore::open_unlocked(path).ok());
+        self.real_provider_for_model_with_store(
+            cfg,
+            model_id,
+            ledger_choice,
+            store.as_ref(),
+            chrono::Utc::now(),
+        )
+    }
+
+    fn real_provider_for_model_with_store<'a>(
+        &self,
+        cfg: &'a Config,
+        model_id: &str,
+        ledger_choice: Option<&'a Provider>,
+        store: Option<&zoder_core::utilization::UtilizationStore>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<&'a Provider> {
+        let Some(store) = store else {
+            return ledger_choice;
+        };
+        let mut matching: Vec<&Provider> = cfg
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .serves
+                    .iter()
+                    .any(|prefix| !prefix.is_empty() && model_id.starts_with(prefix))
+            })
+            .collect();
+        matching.sort_by_key(|provider| {
+            std::cmp::Reverse(
+                provider
+                    .serves
+                    .iter()
+                    .filter(|prefix| model_id.starts_with(prefix.as_str()))
+                    .map(String::len)
+                    .max()
+                    .unwrap_or(0),
+            )
+        });
+
+        let mut live_subscription_fell_back = false;
+        for provider in matching
+            .iter()
+            .copied()
+            .filter(|provider| provider.billing == BillingMode::Subscription)
+        {
+            let Some(plan) = provider.subscription.as_ref() else {
+                continue;
+            };
+            let namespace = plan
+                .tier
+                .as_deref()
+                .and_then(|tier| self.catalog.provider_namespace(provider, tier))
+                .unwrap_or_else(|| provider.id.clone());
+            let windows: Vec<_> = zoder_core::subscription_tiers::resolve_plan_windows(
+                plan,
+                &self.catalog,
+                Some(&namespace),
+            )
+            .windows
+            .into_iter()
+            .filter(|window| quota_window_applies_to_model(window, model_id))
+            .collect();
+            if windows.is_empty() {
+                continue;
+            }
+            let (util_provider, plan_label) = agentic::utilization_key(provider);
+            let view =
+                build_account_view(util_provider, "default", plan_label, &windows, store, now);
+            let has_live_signal = view.has_credits.is_some()
+                || view.windows.iter().any(|window| {
+                    window.used_percent.is_some()
+                        && window.health != zoder_core::utilization::TelemetryHealth::Degraded
+                });
+            if !has_live_signal {
+                continue;
+            }
+            match decide_account(&view, &cfg.routing.active().knobs(), now, None).decision {
+                RouteDecision::PreferSub | RouteDecision::Chargeback => return Some(provider),
+                RouteDecision::FallBackToFree => live_subscription_fell_back = true,
+            }
+        }
+
+        if live_subscription_fell_back {
+            return matching.into_iter().find(|provider| {
+                provider.billing != BillingMode::Subscription
+                    && !provider
+                        .base_url
+                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+            });
+        }
+        ledger_choice
     }
 }
 
@@ -3019,6 +3116,49 @@ pub(crate) struct TurnResult {
 /// `cli.session` is used. Set `stream_output` to mirror text/tool events to the
 /// terminal (off for `--json` and for the inner turns of `loop`). This function
 /// does NOT print the final summary — the caller owns presentation.
+fn evaluate_default_exec_budget(
+    cfg: &Config,
+    pricing: &PricingCatalog,
+    model: &str,
+    prompt: &str,
+    month_spent: impl FnOnce() -> anyhow::Result<f64>,
+) -> BudgetVerdict {
+    cfg.budget.evaluate_call(
+        pricing,
+        model,
+        estimate_tokens(prompt),
+        cfg.budget.est_output_tokens,
+        Some(chrono::Utc::now()),
+        month_spent,
+    )
+}
+
+#[cfg(test)]
+mod default_exec_budget_tests {
+    use super::*;
+
+    #[test]
+    fn configured_per_call_cap_gates_default_agentic_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.budget.max_cost_per_call_usd = Some(0.01);
+        cfg.budget.est_output_tokens = 1_000;
+        let mut pricing = PricingCatalog::default();
+        pricing.models.insert(
+            "paid-model".into(),
+            zoder_core::pricing::ModelPrice {
+                usd_per_mtok: 100.0,
+                ..Default::default()
+            },
+        );
+        let verdict =
+            evaluate_default_exec_budget(&cfg, &pricing, "paid-model", "agentic prompt", || {
+                Ok(0.0)
+            });
+        assert!(matches!(verdict, BudgetVerdict::Confirm(_)));
+    }
+}
+
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
@@ -3092,6 +3232,21 @@ pub(crate) async fn agentic_turn(
     {
         if !confirm_paid(&msg)? {
             anyhow::bail!("paid model use declined");
+        }
+    }
+
+    // Default agentic execution uses the same fail-closed pre-call budget
+    // classification as --oneshot. Agent dispatch must not bypass unknown
+    // pricing, per-call caps, or month-to-date caps.
+    if !cli.allow_paid {
+        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let verdict = evaluate_default_exec_budget(&eng.cfg, &pricing, &primary, &prompt, || {
+            Ledger::new(&eng.cfg.ledger_path).month_to_date_usd()
+        });
+        if let BudgetVerdict::Confirm(msg) = verdict {
+            if !confirm_paid(&msg)? {
+                anyhow::bail!("call declined: over budget");
+            }
         }
     }
 
@@ -3180,9 +3335,16 @@ pub(crate) async fn agentic_turn(
     // `engine_kind` is parsed and validated by the caller (cmd_exec_agentic),
     // before any daemon setup, so a Goose request never starts zeroclaw and an
     // unknown value surfaces as a parse error up front.
+    let agentic_usage = std::cell::Cell::new(0_u64);
     let run = run_agent_dispatch(engine_kind, &opts, |ev| {
         if let AgentEvent::Utilization { headers } = &ev {
             agentic::persist_agentic_utilization(&routed_provider, headers);
+        }
+        if let AgentEvent::Usage { input_tokens } = &ev {
+            // ACP usage updates are cumulative context totals. Retain the
+            // largest observed value and record it once after the turn so
+            // repeated updates cannot double-count the same real tokens.
+            agentic_usage.set(agentic_usage.get().max(*input_tokens));
         }
         if !stream_output {
             return;
@@ -3207,6 +3369,7 @@ pub(crate) async fn agentic_turn(
         }
     })
     .await?;
+    agentic::persist_agentic_counter(&routed_provider, agentic_usage.get());
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
 
@@ -3262,11 +3425,10 @@ pub(crate) async fn agentic_turn(
         ts_utc: chrono::Utc::now(),
         // Attribute to the provider that serves the model the engine actually
         // ran (per-model routing), not the default provider.
-        provider: eng
-            .cfg
-            .provider_for_model(&model_used)
+        provider: routing
+            .real_provider_for_model(&eng.cfg, &model_used)
             .map(|p| p.id.clone())
-            .unwrap_or_else(|| eng.cfg.default_provider.clone()),
+            .unwrap_or_else(|| routed_provider.id.clone()),
         model: model_used.clone(),
         host: zoder_core::ledger::host_of_model(&model_used),
         tokens_in,
@@ -7056,11 +7218,12 @@ mod subscription_utilization_render_tests {
     /// (40 < 80) — so the IDLE branch must fire.
     #[test]
     fn l5_idle_minimax_monthly_at_40_renders_preferring_line() {
-        let now = fixed_now();
+        let now = chrono::Utc::now();
         let acct = AccountView {
             provider: UtilProvider::MiniMax,
             account_id: "default".to_string(),
             plan: "minimax-monthly".to_string(),
+            has_credits: None,
             windows: vec![fresh_window("monthly", 720, 40.0)],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7107,6 +7270,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "me".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![fresh_window("weekly", 168, 90.0)],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7159,6 +7323,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![window],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7210,6 +7375,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![
                 fresh_window("5h", 5, 20.0),
                 unknown_window("weekly", 168, Observability::PercentOnly),
@@ -7244,6 +7410,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![unknown_window("monthly", 720, Observability::Counter)],
         };
         let decision2 = decide_account(&acct2, &knobs, now, None);
@@ -7281,6 +7448,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![unknown_window("weekly", 168, Observability::Header)],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7311,6 +7479,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![fresh_window("weekly", 168, 82.0)],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7349,6 +7518,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::MiniMax,
             account_id: "default".to_string(),
             plan: "minimax-monthly".to_string(),
+            has_credits: None,
             windows: vec![fresh_window("monthly", 720, 35.0)],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7395,6 +7565,7 @@ mod subscription_utilization_render_tests {
             provider: UtilProvider::Anthropic,
             account_id: "a".to_string(),
             plan: "max".to_string(),
+            has_credits: None,
             windows: vec![window],
         };
         let knobs = knobs(80.0, 85.0);
@@ -7458,7 +7629,7 @@ mod subscription_utilization_render_tests {
         cfg.providers[0].subscription = Some(SubscriptionPlan {
             monthly_fee_usd: 0.0,
             tier: None,
-            windows: vec![QuotaWindow {
+            windows: vec![zoder_core::config::QuotaWindow {
                 name: "weekly".to_string(),
                 hours: 168,
                 unit: zoder_core::QuotaUnit::Messages,
@@ -8244,5 +8415,104 @@ mod model_selection_tests {
                 "candidate {i} has a view in the no-store test environment (got {v:?})"
             );
         }
+    }
+
+    #[test]
+    fn fresh_knemon_subscription_overrides_ledger_demotion_for_dual_billing() {
+        let now = chrono::Utc::now();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        let plan = zoder_core::config::SubscriptionPlan {
+            monthly_fee_usd: 20.0,
+            tier: None,
+            windows: vec![zoder_core::config::QuotaWindow {
+                name: "5h".into(),
+                hours: 5,
+                unit: zoder_core::config::QuotaUnit::Messages,
+                cap: Some(10.0),
+                models: None,
+                observability: zoder_core::config::Observability::Header,
+                reset: zoder_core::config::ResetKind::Rolling,
+            }],
+        };
+        cfg.providers = vec![
+            Provider {
+                id: "openai-sub".into(),
+                base_url: "https://chatgpt.com/backend-api/codex".into(),
+                kind: "openai-responses".into(),
+                auth: zoder_core::Auth::None,
+                paid: false,
+                billing: BillingMode::Subscription,
+                subscription: Some(plan),
+                serves: vec!["gpt-".into()],
+            },
+            Provider {
+                id: "openai-metered".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                kind: "openai-responses".into(),
+                auth: zoder_core::Auth::None,
+                paid: true,
+                billing: BillingMode::Metered,
+                subscription: None,
+                serves: vec!["gpt-".into()],
+            },
+        ];
+        cfg.default_provider = "openai-sub".into();
+        let exhausted_entry = Entry {
+            ts_utc: now,
+            provider: "openai-sub".into(),
+            model: "gpt-test".into(),
+            host: String::new(),
+            tokens_in: 1,
+            tokens_out: 1,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+        };
+        let entries = vec![exhausted_entry; 10];
+        let rc = RoutingContext {
+            entries,
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        let usage = zoder_core::plan_usage_for_catalog_provider(
+            &rc.entries,
+            "openai-sub",
+            cfg.providers[0].subscription.as_ref().unwrap(),
+            &rc.catalog,
+            "openai-sub",
+        );
+        assert_eq!(usage[0].used, 10.0);
+        assert_eq!(usage[0].pct, 1.0);
+        let ledger_choice = cfg.real_best_provider_for_model("gpt-test", &rc.entries, &rc.catalog);
+        assert_eq!(ledger_choice.unwrap().id, "openai-metered");
+
+        let mut store = zoder_core::utilization::UtilizationStore::default();
+        store.upsert(
+            &zoder_core::utilization::RateLimitSnapshot {
+                provider: zoder_core::utilization::Provider::Openai,
+                account_id: "default".into(),
+                plan: "explicit".into(),
+                primary: Some(zoder_core::utilization::WindowSnapshot {
+                    used_percent: Some(20.0),
+                    reset_at_epoch: None,
+                    window_minutes: Some(300),
+                    label: Some("primary".into()),
+                }),
+                secondary: None,
+                has_credits: Some(true),
+                observed_at: Some(now),
+            },
+            now,
+        );
+        let selected = rc.real_provider_for_model_with_store(
+            &cfg,
+            "gpt-test",
+            ledger_choice,
+            Some(&store),
+            now,
+        );
+        assert_eq!(selected.unwrap().id, "openai-sub");
     }
 }
