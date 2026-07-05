@@ -397,6 +397,28 @@ prune:nightly:
 # the GitLab Container Registry; release:container-weekly then cuts a weekly
 # GitLab Release that links the image as an asset. WEEK is passed to the release
 # keyword via a dotenv artifact (the release: section can't see plain shell vars).
+# Resolve zoder-integration to an immutable commit SHA (package.sh requires a SHA
+# in CI). The kaniko-debug image has no git, so resolve here and hand it to
+# container:weekly via dotenv, giving a reproducible, SHA-pinned weekly image.
+resolve:zeroclaw-sha:
+  stage: package
+  image: rust:1.94
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  cache: {}
+  needs: []
+  script:
+    - ZEROCLAW_PINNED_SHA="$(git ls-remote "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" refs/heads/zoder-integration | cut -f1)"
+    - '[ -n "$ZEROCLAW_PINNED_SHA" ] || { echo "failed to resolve zoder-integration SHA" >&2; exit 1; }'
+    - echo "pinned zeroclaw SHA -> $ZEROCLAW_PINNED_SHA"
+    - echo "ZEROCLAW_PINNED_SHA=$ZEROCLAW_PINNED_SHA" > sha.env
+  artifacts:
+    reports:
+      dotenv: sha.env
+
 container:weekly:
   stage: package
   image:
@@ -409,7 +431,9 @@ container:weekly:
       allow_failure: true
   timeout: 150m
   cache: {}
-  needs: []
+  needs:
+    - job: resolve:zeroclaw-sha
+      artifacts: true
   script:
     - export WEEK="$(date -u +%G-W%V)"
     - mkdir -p /kaniko/.docker
