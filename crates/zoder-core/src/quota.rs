@@ -61,7 +61,7 @@ pub struct WindowUsage {
 
 fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
     match unit {
-        QuotaUnit::Tokens => (e.tokens_in + e.tokens_out) as f64,
+        QuotaUnit::Tokens => e.tokens_in.saturating_add(e.tokens_out) as f64,
         // Requests, Messages, and Sessions each contribute one to the
         // rolling-window counter for the matching ledger entry. Distinct
         // semantically (a single agent turn counts one in each unit), but

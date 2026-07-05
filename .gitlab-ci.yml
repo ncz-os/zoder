@@ -9,7 +9,7 @@
 # moving URL while job credentials are present (Finding #15).
 # Toolchain pinned to 1.94.1.
 default:
-  image: rust:1.94
+  image: rust:1.94.1
   cache:
     key:
       files: [Cargo.lock]
@@ -18,10 +18,8 @@ default:
     - export PATH="$CARGO_HOME/bin:$PATH"
     - mkdir -p "$CARGO_HOME/bin"
 
-# Variables scoped to jobs that need them. The sensitive GITLAB_PUSH_TOKEN is
-# NOT declared here — it lives on the corpus-sync job alone (Finding #15:
-# minimize credential exposure; a project-level CI/CD variable is readable
-# by every job in the pipeline, so per-job scope reduces the attack surface).
+# Non-secret shared build variables. The protected repository push credential is
+# managed in GitLab settings rather than declared in this file.
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CARGO_TERM_COLOR: always
@@ -38,9 +36,10 @@ stages: [corpus, check, test, security, package, release]
 # on-demand from the web UI); commits with `-o ci.skip` + [skip ci] so the data commit
 # never re-triggers a pipeline.
 #
-# Per-job `GITLAB_PUSH_TOKEN` keeps the write_repository credential scoped to
-# this one job (Finding #15). Pinning pyyaml's version + sha256 keeps the
-# python install reproducible and tamper-evident (Finding #15).
+# Pinning pyyaml's version + sha256 keeps the python install reproducible and
+# tamper-evident. GITLAB_PUSH_TOKEN remains a protected project variable because
+# CI_JOB_TOKEN repository pushes require a project-level setting that is not
+# portable across mirrors/installations.
 corpus-sync:
   stage: corpus
   image: python:3.12
@@ -51,11 +50,6 @@ corpus-sync:
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
-  variables:
-    # Write_repository token, scoped HERE only — not exposed to fmt/clippy/test/
-    # security/package/release jobs that don't need it. (See the variables:
-    # block above; GITLAB_PUSH_TOKEN is intentionally NOT in it.)
-    GITLAB_PUSH_TOKEN: "${GITLAB_PUSH_TOKEN}"
   before_script:
     - apt-get update -qq && apt-get install -y -qq git
     - pip install --require-hashes -r scripts/ci/corpus-requirements.txt
@@ -273,9 +267,12 @@ nightly:linux:
       # (Finding #17: keep the rolling channel consistent).
       export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
       rm -rf .zc-src
+      case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
+      [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
       git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
       ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
       ZC_SHA=$(git -C .zc-src rev-parse HEAD)
+      [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
       echo "nightly using zeroclaw SHA=$ZC_SHA"
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
@@ -286,6 +283,7 @@ nightly:linux:
       # date-stamped channel (kept a week by prune:nightly) so
       # `install.sh --channel 2026-07-04` pins the build.
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      mkdir -p dist
       echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         bin="target/$t/release/zoder"
@@ -325,11 +323,15 @@ nightly:macos-arm64:
       # pinned SHA — both nightlies use NIGHTLY_ZEROCLAW_SHA so the
       # engine revision is identical across architectures.
       rm -rf .zc-src
+      case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
+      [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
       git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
       ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
       ZC_SHA=$(git -C .zc-src rev-parse HEAD)
+      [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
       ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
+      mkdir -p dist
       echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
       for name in zoder zerocode zeroclaw; do
         if [ "$name" = zoder ]; then
@@ -416,6 +418,7 @@ container:weekly:
         --context "${CI_PROJECT_DIR}"
         --dockerfile "${CI_PROJECT_DIR}/Containerfile"
         --build-arg "ZEROCLAW_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
+        --build-arg "ZEROCLAW_REF=${ZEROCLAW_PINNED_SHA}"
         --destination "${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
         --destination "${CI_REGISTRY_IMAGE}:latest"
     - echo "WEEK=${WEEK}" > week.env

@@ -14,7 +14,8 @@ fn load_drops_invalid_models_keeps_valid() {
         "good":   {"input_usd_per_mtok": 0.15, "output_usd_per_mtok": 0.60},
         "neg":    {"input_usd_per_mtok": -1.0},
         "notobj": 42,
-        "free":   {"input_usd_per_mtok": 0.0}
+        "free":   {"input_usd_per_mtok": 0.0, "output_usd_per_mtok": 0.0},
+        "partial":{"input_usd_per_mtok": 0.1}
       }
     }"#;
     std::fs::write(&path, json).unwrap();
@@ -22,6 +23,7 @@ fn load_drops_invalid_models_keeps_valid() {
     let cat = PricingCatalog::load(&path);
     assert!(cat.models.contains_key("good"));
     assert!(cat.models.contains_key("free")); // explicit 0 is a valid rate
+    assert!(!cat.models.contains_key("partial")); // missing output rate is unknown, not $0
     assert!(!cat.models.contains_key("neg")); // negative field dropped -> no rate -> skipped
     assert!(!cat.models.contains_key("notobj"));
     assert!((cat.baseline_usd_per_mtok - 1.5).abs() < 1e-9);

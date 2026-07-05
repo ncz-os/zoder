@@ -26,11 +26,11 @@ use zoder_core::{
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
     estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, probe_request,
     run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
-    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, Decision, EngineKind,
-    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
-    Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
-    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, SubscriptionPlan, Theme,
-    Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, CostVerdict, Decision,
+    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
+    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
+    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
+    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
 #[derive(Parser, Clone)]
@@ -1762,7 +1762,8 @@ fn load_snapshot_for(
     plan: &str,
 ) -> Option<zoder_core::utilization::RateLimitSnapshot> {
     let path = zoder_core::utilization::default_store_path()?;
-    let store = zoder_core::utilization::UtilizationStore::open(path).ok()?;
+    let store = zoder_core::utilization::UtilizationStore::open_unlocked(path).ok()?;
+    let provider_id = provider_id.to_ascii_lowercase();
     let prov = if provider_id.contains("codex") || provider_id.contains("openai-codex") {
         zoder_core::utilization::Provider::OpenaiCodex
     } else if provider_id.contains("anthropic") {
@@ -1825,7 +1826,12 @@ fn scenario_chain_for_roles(
         // `resolve_chain` / `agentic_turn`.
         let primary_model = resolve_effective_primary(cli, eng)?;
         let provider = rc.real_provider_for_model(&eng.cfg, &primary_model)?;
-        load_snapshot_for(&provider.id, "default", "default")
+        let plan = provider
+            .subscription
+            .as_ref()
+            .map(plan_label)
+            .unwrap_or_else(|| "default".to_string());
+        load_snapshot_for(&provider.id, "default", &plan)
     })();
 
     // Fix #1 (Layer 4 wiring): build per-candidate `AccountView`s from
@@ -1934,8 +1940,8 @@ fn build_account_views_for_candidates(
     let catalog = load_tier_catalog(Some(&zoder_core::subscription_tiers::default_catalog_path(
         &Config::home(),
     )));
-    let store: Option<UtilizationStore> =
-        zoder_core::utilization::default_store_path().and_then(|p| UtilizationStore::open(p).ok());
+    let store: Option<UtilizationStore> = zoder_core::utilization::default_store_path()
+        .and_then(|p| UtilizationStore::open_unlocked(p).ok());
 
     let Some(store) = store else {
         return vec![None; candidates.len()];
@@ -1960,7 +1966,7 @@ fn build_account_views_for_candidates(
             let plan_label = plan_label(plan);
             Some(build_av(
                 util_prov,
-                &provider.id,
+                "default",
                 plan_label,
                 &resolved.windows,
                 &store,
@@ -2705,10 +2711,22 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // uses the configured off-peak rate, not peak — Finding #23.
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
-    let cost = res
-        .telemetry
-        .cost_usd
-        .unwrap_or_else(|| pricing.cost_at(&used_model, tokens_in, tokens_out, Some(ts_utc)));
+    let (cost, unknown_cost) = match res.telemetry.cost_usd {
+        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
+        _ => match pricing.classify_cost(&used_model, tokens_in, tokens_out, Some(ts_utc)) {
+            CostVerdict::Priced(cost) => (cost, false),
+            CostVerdict::Free => (0.0, false),
+            CostVerdict::Unknown => (0.0, true),
+        },
+    };
+    let mut violation = verify.as_ref().err().cloned();
+    if unknown_cost {
+        let msg = format!("cost unknown: no valid telemetry or catalog price for {used_model}");
+        violation = Some(match violation {
+            Some(existing) => format!("{existing}; {msg}"),
+            None => msg,
+        });
+    }
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     ledger.record(&Entry {
         ts_utc,
@@ -2719,7 +2737,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         tokens_out,
         cost_usd: cost,
         calls: 1,
-        violation: verify.as_ref().err().cloned(),
+        violation,
         tags: zoder_core::ledger::FinOpsTags::default(),
     })?;
     save_health(&health);
@@ -2883,14 +2901,15 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Authoritative per-run cost/tokens from the engine's cost tracker, scoped to
-/// `[from, now)` and the agent alias. Falls back to `(0, 0, 0, fallback_model)`
-/// when the engine has no record yet.
+/// `[from, now)` and the agent alias. The boolean is false when the engine
+/// could not supply an authoritative result; callers must mark that ledger row
+/// unknown rather than treating the numeric placeholder as verified $0.
 async fn agentic_cost(
     socket: &std::path::Path,
     from: chrono::DateTime<chrono::Utc>,
     alias: &str,
     fallback_model: &str,
-) -> (f64, u64, u64, String) {
+) -> (f64, u64, u64, String, bool) {
     match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
         Ok(sum) => {
             let cost = sum.window_cost_usd();
@@ -2902,11 +2921,21 @@ async fn agentic_cost(
                 .map(|m| m.model.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| fallback_model.to_string());
-            let tin: u64 = sum.by_model.values().map(|m| m.input_tokens).sum();
-            let tout: u64 = sum.by_model.values().map(|m| m.output_tokens).sum();
-            (cost, tin, tout, model)
+            let tin = sum
+                .by_model
+                .values()
+                .fold(0_u64, |acc, m| acc.saturating_add(m.input_tokens));
+            let tout = sum
+                .by_model
+                .values()
+                .fold(0_u64, |acc, m| acc.saturating_add(m.output_tokens));
+            if cost.is_finite() && cost >= 0.0 {
+                (cost, tin, tout, model, true)
+            } else {
+                (0.0, tin, tout, model, false)
+            }
         }
-        Err(_) => (0.0, 0, 0, fallback_model.to_string()),
+        Err(_) => (0.0, 0, 0, fallback_model.to_string(), false),
     }
 }
 
@@ -3126,17 +3155,18 @@ pub(crate) async fn agentic_turn(
     // Cost reconciliation is zeroclaw-specific (it talks to the daemon's
     // `cost/query` endpoint over the Unix socket). Goose doesn't expose that,
     // and we deliberately never started the zeroclaw daemon for the goose
-    // path, so there is no authoritative cost to harvest. Record zeros +
-    // attribute to the routed model so the ledger still gets a row for the
-    // run, but skip the post-verify paid-gate check (the corpus_paid test
+    // path, so there is no authoritative cost to harvest. The numeric field
+    // remains zero for rollup compatibility, but the ledger row is explicitly
+    // marked `cost unknown` so it cannot be mistaken for a verified-free call.
+    // Skip the post-verify paid-gate check (the corpus_paid test
     // also implicitly assumes the daemon reported the actual billed model,
     // which we don't have here).
-    let (cost, tokens_in, tokens_out, model_used) = match engine_kind {
+    let (cost, tokens_in, tokens_out, model_used, cost_known) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             agentic_cost(&socket2, start_ts, &alias, &primary).await
         }
-        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone()),
+        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false),
     };
 
     // Post-verify: the engine (via the agent alias) may have run a different —
@@ -3151,7 +3181,11 @@ pub(crate) async fn agentic_turn(
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    let violation = if !cli.allow_paid
+    let violation = if !cost_known {
+        Some(format!(
+            "cost unknown: {engine_kind:?} returned no authoritative cost telemetry"
+        ))
+    } else if !cli.allow_paid
         && engine_kind == EngineKind::Zeroclaw
         && (cost > 0.0 || model_used_paid)
     {
@@ -4233,7 +4267,7 @@ fn render_subscription_utilization_section(
         let knobs = RouteKnobs::for_triple(util_prov, &p.id, &plan_label(plan));
         let view = build_account_view(
             util_prov,
-            &p.id,
+            "default",
             plan_label(plan),
             &resolved.windows,
             store,
@@ -4461,6 +4495,7 @@ fn plan_label(plan: &SubscriptionPlan) -> String {
 /// "don't recognise this id" fallback — counters still work, header
 /// parsing never will.
 fn provider_id_to_util(id: &str) -> UtilProvider {
+    let id = id.to_ascii_lowercase();
     if id.contains("codex") || id.contains("openai-codex") {
         UtilProvider::OpenaiCodex
     } else if id.contains("anthropic") {
@@ -6365,7 +6400,7 @@ mod scenario_routing_tests {
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
             paid: false,
-            billing: BillingMode::Metered,
+            billing: BillingMode::Free,
             subscription: None,
             serves: Vec::new(),
         };
@@ -6387,7 +6422,7 @@ mod scenario_routing_tests {
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
             paid: false,
-            billing: BillingMode::Metered,
+            billing: BillingMode::Free,
             subscription: None,
             serves: Vec::new(),
         };
@@ -6608,10 +6643,10 @@ mod scenario_routing_tests {
         );
     }
 
-    /// Unlimited + chargeback: sub stays eligible past cap_guard (mode
-    /// is chargeback -> "keep" wins).
+    /// Unlimited + chargeback without a remaining-budget signal fails closed
+    /// for the subscription and reaches the next eligible class.
     #[test]
-    fn unlimited_chargeback_keeps_sub_through_the_cap() {
+    fn unlimited_unknown_chargeback_budget_falls_through_sub() {
         let scenario = RouteScenario::unlimited();
         let snap = make_snapshot(96.0); // > cap_guard
         let cands = vec![
@@ -6628,8 +6663,8 @@ mod scenario_routing_tests {
                 fixed_now(),
             )
             .as_deref(),
-            Some("sub-x"),
-            "chargeback mode = keep through the cap"
+            Some("free-x"),
+            "unknown chargeback budget must not keep a capped subscription"
         );
     }
 

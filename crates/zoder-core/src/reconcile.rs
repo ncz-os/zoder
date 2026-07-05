@@ -54,11 +54,20 @@ pub async fn openai_costs(admin_key: &str, days: i64) -> anyhow::Result<ReconRes
         for b in buckets {
             if let Some(results) = b.get("results").and_then(|r| r.as_array()) {
                 for r in results {
-                    total += r
+                    let amount = r
                         .get("amount")
                         .and_then(|a| a.get("value"))
                         .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("OpenAI cost result is missing a numeric amount.value")
+                        })?;
+                    if !amount.is_finite() || amount < 0.0 {
+                        anyhow::bail!("OpenAI cost result contains an invalid amount: {amount}");
+                    }
+                    total += amount;
+                    if !total.is_finite() {
+                        anyhow::bail!("OpenAI cost total overflowed");
+                    }
                 }
             }
         }
@@ -95,11 +104,22 @@ pub async fn anthropic_costs(admin_key: &str, days: i64) -> anyhow::Result<Recon
         for b in buckets {
             if let Some(results) = b.get("results").and_then(|r| r.as_array()) {
                 for r in results {
-                    cents += match r.get("amount") {
-                        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0.0),
-                        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-                        _ => 0.0,
+                    let amount: f64 = match r.get("amount") {
+                        Some(serde_json::Value::String(s)) => s.parse().map_err(|_| {
+                            anyhow::anyhow!("Anthropic cost result has invalid amount {s:?}")
+                        })?,
+                        Some(serde_json::Value::Number(n)) => n.as_f64().ok_or_else(|| {
+                            anyhow::anyhow!("Anthropic cost result has non-f64 amount {n}")
+                        })?,
+                        _ => anyhow::bail!("Anthropic cost result is missing amount"),
                     };
+                    if !amount.is_finite() || amount < 0.0 {
+                        anyhow::bail!("Anthropic cost result contains invalid amount: {amount}");
+                    }
+                    cents += amount;
+                    if !cents.is_finite() {
+                        anyhow::bail!("Anthropic cost total overflowed");
+                    }
                 }
             }
         }

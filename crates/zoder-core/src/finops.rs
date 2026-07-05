@@ -15,6 +15,15 @@ use crate::pricing::{ModelPrice, PricingCatalog};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
+
+fn saturating_f64_add(a: f64, b: f64) -> f64 {
+    let sum = a + b;
+    if sum.is_finite() {
+        sum
+    } else {
+        f64::MAX
+    }
+}
 use std::io::IsTerminal;
 
 /// Minimal themed colorizer for FinOps text output. Mirrors the CLI `Pal`:
@@ -237,10 +246,10 @@ pub fn spend_by_dimension(
             tokens_out: 0,
             calls: 0,
         });
-        entry.cost_usd += e.cost_usd;
-        entry.tokens_in += e.tokens_in;
-        entry.tokens_out += e.tokens_out;
-        entry.calls += e.calls;
+        entry.cost_usd = saturating_f64_add(entry.cost_usd, e.cost_usd);
+        entry.tokens_in = entry.tokens_in.saturating_add(e.tokens_in);
+        entry.tokens_out = entry.tokens_out.saturating_add(e.tokens_out);
+        entry.calls = entry.calls.saturating_add(e.calls);
     }
     let mut v: Vec<SpendGroup> = acc.into_values().collect();
     v.sort_by(|a, b| {
@@ -261,7 +270,7 @@ pub fn realized_rate_by_model(
     let entries = ledger.entries_in(since, until)?;
     let mut acc: BTreeMap<String, ModelRealized> = BTreeMap::new();
     for e in entries {
-        let tot = e.tokens_in + e.tokens_out;
+        let tot = e.tokens_in.saturating_add(e.tokens_out);
         let r = acc.entry(e.model.clone()).or_insert(ModelRealized {
             model: e.model.clone(),
             cost_usd: 0.0,
@@ -271,11 +280,11 @@ pub fn realized_rate_by_model(
             calls: 0,
             realized_usd_per_mtok: None,
         });
-        r.cost_usd += e.cost_usd;
-        r.tokens_in += e.tokens_in;
-        r.tokens_out += e.tokens_out;
-        r.tokens += tot;
-        r.calls += e.calls;
+        r.cost_usd = saturating_f64_add(r.cost_usd, e.cost_usd);
+        r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
+        r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
+        r.tokens = r.tokens.saturating_add(tot);
+        r.calls = r.calls.saturating_add(e.calls);
     }
     for r in acc.values_mut() {
         r.realized_usd_per_mtok = if r.tokens > 0 {
@@ -331,10 +340,10 @@ pub fn cache_savings_by_model(
             input_usd_per_mtok: input_rate,
             cache_read_usd_per_mtok: cache_rate,
         });
-        r.calls += e.calls;
-        r.tokens_in += e.tokens_in;
-        r.est_cached_tokens += cached_tokens;
-        r.est_savings_usd += savings;
+        r.calls = r.calls.saturating_add(e.calls);
+        r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
+        r.est_cached_tokens = saturating_f64_add(r.est_cached_tokens, cached_tokens);
+        r.est_savings_usd = saturating_f64_add(r.est_savings_usd, savings);
     }
     let mut v: Vec<CacheSavingsRow> = rows.into_values().collect();
     v.sort_by(|a, b| {
@@ -358,9 +367,9 @@ pub fn cheapest_equivalent_advisor(
             continue;
         }
         let r = paid.entry(e.model.clone()).or_insert((0.0, 0, 0));
-        r.0 += e.cost_usd;
-        r.1 += 1;
-        r.2 += e.tokens_in + e.tokens_out;
+        r.0 = saturating_f64_add(r.0, e.cost_usd);
+        r.1 = r.1.saturating_add(1);
+        r.2 = r.2.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
     }
     if paid.is_empty() {
         return Ok(Vec::new());
@@ -429,7 +438,8 @@ pub fn forecast_burn(
     let mut daily: BTreeMap<String, f64> = BTreeMap::new();
     for e in entries {
         let k = day_key(&e.ts_utc);
-        *daily.entry(k).or_insert(0.0) += e.cost_usd;
+        let total = daily.entry(k).or_insert(0.0);
+        *total = saturating_f64_add(*total, e.cost_usd);
     }
     let mut keys: Vec<String> = daily.keys().cloned().collect();
     keys.sort();
@@ -470,9 +480,9 @@ pub fn build_finops_report(
     let mut tokens = 0u64;
     let mut calls = 0u64;
     for e in entries {
-        cost += e.cost_usd;
-        tokens += e.tokens_in + e.tokens_out;
-        calls += e.calls;
+        cost = saturating_f64_add(cost, e.cost_usd);
+        tokens = tokens.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
+        calls = calls.saturating_add(e.calls);
     }
     Ok(FinOpsReport {
         generated: Utc::now().to_rfc3339(),

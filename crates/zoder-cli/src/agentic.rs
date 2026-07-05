@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use zoder_core::{
-    BillingMode, ChatRequest, Config, Decision, Entry, HealthStore, Ledger, Message, ModelEntry,
-    OpenAiProvider, PolicyGate, PricingCatalog,
+    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Ledger, Message,
+    ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog,
 };
 
 use crate::{Engine, ReviewScope};
@@ -166,13 +166,24 @@ async fn complete_once(
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-    let cost = res
-        .telemetry
-        .cost_usd
-        .unwrap_or_else(|| pricing.cost_at(&model, tokens_in, tokens_out, Some(Utc::now())));
+    let (cost, unknown_cost) = match res.telemetry.cost_usd {
+        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
+        _ => match pricing.classify_cost(&model, tokens_in, tokens_out, Some(Utc::now())) {
+            CostVerdict::Priced(cost) => (cost, false),
+            CostVerdict::Free => (0.0, false),
+            CostVerdict::Unknown => (0.0, true),
+        },
+    };
     // Post-verify the reviewer call was actually served free (catch a free->paid
     // fallback) and record any violation in the ledger rather than marking clean.
-    let violation = gate.verify_free(&model_entry, &res.telemetry).err();
+    let mut violation = gate.verify_free(&model_entry, &res.telemetry).err();
+    if unknown_cost {
+        let msg = format!("cost unknown: no valid telemetry or catalog price for {model}");
+        violation = Some(match violation {
+            Some(existing) => format!("{existing}; {msg}"),
+            None => msg,
+        });
+    }
     if let Some(v) = &violation {
         eprintln!("zoder: POLICY VIOLATION (reviewer): {v}");
     }
