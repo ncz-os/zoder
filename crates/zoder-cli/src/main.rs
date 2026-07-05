@@ -6743,21 +6743,38 @@ mod scenario_routing_tests {
     }
 
     /// `RoutingConfig::active()` layers an operator override onto the
-    /// preset: the override replaces the preset wholesale (not field-by-
-    /// field) — keeps the override semantics simple and avoids the partial-
-    /// merge ambiguity that bites schemas like this when "intentional
-    /// default" vs "operator-supplied zero" can't be told apart.
+    /// preset FIELD-BY-FIELD, not wholesale (the Finding #8 fix): every
+    /// field is `Option<T>`, so a config that only sets `use_target` keeps
+    /// the preset's `primary_classes`, `cap_guard`, `budget_mode`, and
+    /// `allow_paid`. Setting only `use_target = 42.0` therefore yields a
+    /// scenario whose `use_target` is 42.0 but whose `cap_guard` is the
+    /// preset's 85.0 — NOT a balanced-default-rebuilt scenario.
     #[test]
-    fn routing_override_replaces_active_scenario() {
+    fn routing_override_layers_field_by_field() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default_provider(tmp.path());
         cfg.routing.scenario = "balanced".into();
-        let mut override_scenario = RouteScenario::balanced();
-        override_scenario.use_target = 42.0;
+        let sparse_override = zoder_core::scenarios::RouteScenarioOverride {
+            use_target: Some(42.0),
+            ..zoder_core::scenarios::RouteScenarioOverride::default()
+        };
         cfg.routing
             .scenarios
-            .insert("balanced".into(), override_scenario.clone());
-        assert_eq!(cfg.routing.active(), override_scenario);
+            .insert("balanced".into(), sparse_override);
+        let active = cfg.routing.active();
+        assert_eq!(active.use_target, 42.0, "supplied use_target wins");
+        // Preset fields that the override did NOT touch must fall through
+        // unchanged — not silently flip to a generic default.
+        assert_eq!(
+            active.cap_guard,
+            RouteScenario::balanced().cap_guard,
+            "cap_guard must inherit from the preset, not silently default",
+        );
+        assert_eq!(
+            active.primary_classes,
+            RouteScenario::balanced().primary_classes,
+        );
+        assert_eq!(active.budget_mode, RouteScenario::balanced().budget_mode,);
     }
 }
 
