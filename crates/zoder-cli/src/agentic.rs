@@ -50,9 +50,20 @@ struct Completion {
 /// primary and secondary, hiding operator intent. The reviewer gets its
 /// own pin (the `--reviewer` flag → `model_override`) so an operator can
 /// cross-family-pick it independently of `-m`.
+///
+/// `reviewer_chain` is the scenario-routed reviewer candidate pool from
+/// `crate::resolve_chain` — populated independently of `model_override`
+/// so balanced routing's reviewer lane (sub-first) and KNEMON gating
+/// can drive the default reviewer without a per-invocation pin. The pool
+/// is passed through explicitly (no process-global cache — see fix for
+/// Finding #19). When non-empty and `model_override == None`, the first
+/// eligible entry in `reviewer_chain` is used as the reviewer; when
+/// empty, the resolver falls through to the per-agent/profile-level
+/// pin and finally to `default_cross_family_reviewer`.
 async fn complete_once(
     cli: &crate::Cli,
     model_override: Option<&str>,
+    reviewer_chain: &[String],
     system: &str,
     user: &str,
     max_tokens: u32,
@@ -62,26 +73,39 @@ async fn complete_once(
     let model = match model_override {
         Some(m) => m.to_string(),
         None => {
-            // Per-agent override first (`[agents.<alias>].reviewer_model`);
-            // falls back to the profile-level `Config::reviewer_model`; falls
-            // back to a CROSS-FAMILY default derived from the AUTHOR model
-            // (NOT from `primary_model` so the two stay independent — an
-            // operator can pin a strong reviewer without touching the
-            // author default).
-            if let Some(m) = eng.cfg.agent_reviewer_model(cli.agent.as_deref()) {
-                m
-            } else if let Some(m) = eng.cfg.reviewer_model.as_ref() {
-                m.clone()
+            // Scenario-routed reviewer chain (preferred when non-empty).
+            // The chain is built from `chain_for_role(Reviewer, ..)` under
+            // the active scenario, so balanced routing's "sub-first
+            // reviewer" preference and KNEMON gating are honored without
+            // any per-invocation reviewer pin. An empty chain (no
+            // sub/paid candidates, all healthy) means the router has no
+            // reviewer-class-eligible subscription; fall through to the
+            // legacy path so an explicit per-agent pin or the cross-
+            // family default still serves.
+            if let Some(first) = reviewer_chain.first().cloned() {
+                first
             } else {
-                // Default reviewer = a strong CROSS-FAMILY model, NOT the author's
-                // own. Self-review is weak; and routing the review to the author's
-                // flat-subscription provider (env-auth) 401s while the agentic
-                // engine authed fine (field report 2026-06-30). A cross-family EIH
-                // reviewer routes to the working-auth provider.
-                let health = HealthStore::load(&eng.cfg.health_path);
-                let (chain, _) = crate::resolve_chain(cli, &eng, &health)?;
-                let author = chain.first().cloned().unwrap_or_default();
-                crate::default_cross_family_reviewer(&author).to_string()
+                // Per-agent override first (`[agents.<alias>].reviewer_model`);
+                // falls back to the profile-level `Config::reviewer_model`; falls
+                // back to a CROSS-FAMILY default derived from the AUTHOR model
+                // (NOT from `primary_model` so the two stay independent — an
+                // operator can pin a strong reviewer without touching the
+                // author default).
+                if let Some(m) = eng.cfg.agent_reviewer_model(cli.agent.as_deref()) {
+                    m
+                } else if let Some(m) = eng.cfg.reviewer_model.as_ref() {
+                    m.clone()
+                } else {
+                    // Default reviewer = a strong CROSS-FAMILY model, NOT the author's
+                    // own. Self-review is weak; and routing the review to the author's
+                    // flat-subscription provider (env-auth) 401s while the agentic
+                    // engine authed fine (field report 2026-06-30). A cross-family EIH
+                    // reviewer routes to the working-auth provider.
+                    let health = HealthStore::load(&eng.cfg.health_path);
+                    let routes = crate::resolve_chain(cli, &eng, &health)?;
+                    let author = routes.primary.first().cloned().unwrap_or_default();
+                    crate::default_cross_family_reviewer(&author).to_string()
+                }
             }
         }
     };
@@ -619,12 +643,34 @@ pub(crate) async fn cmd_review(
         }
     }
 
+    // Scenario-routed reviewer chain: loaded once and passed to every
+    // `complete_once` call so the default reviewer (the "head" of the
+    // roster, before any `--panel` entries) honors the active scenario
+    // and KNEMON gating. Pin precedence inside `complete_once` is
+    // unchanged: explicit `model_override` (per `--panel`) wins, then
+    // the first scenario-eligible reviewer, then the legacy fallback.
+    let eng = Engine::load().ok();
+    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let reviewer_chain: Vec<String> = match (&eng, &health) {
+        (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
+            .map(|r| r.reviewer)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
     // Fan out concurrently on this task (no spawn: the completion future borrows
     // a non-Send sink type, so we poll them together via join_all instead).
     let max_tokens = cli.max_tokens.max(2048);
-    let futs = models
-        .iter()
-        .map(|m| complete_once(cli, m.as_deref(), system, &user, max_tokens));
+    let futs = models.iter().map(|m| {
+        complete_once(
+            cli,
+            m.as_deref(),
+            &reviewer_chain,
+            system,
+            &user,
+            max_tokens,
+        )
+    });
     let results = futures_util::future::join_all(futs).await;
 
     let mut reviews: Vec<(String, ReviewOutput)> = Vec::new();
@@ -1372,6 +1418,20 @@ nits).\n",
             eprintln!("[loop] iter {i}: adversarial review…");
         }
         let max_tokens = cli.max_tokens.max(2048);
+        // Resolve a fresh scenario-routed reviewer chain per review
+        // pass so KNEMON's "most-idle sub first" view reflects the
+        // current cycle's actual readings (not the chain as it stood at
+        // iteration 1). The chain is plumbed into `complete_once` via
+        // its new `reviewer_chain` argument.
+        let reviewer_chain: Vec<String> = match Engine::load() {
+            Ok(eng) => {
+                let health = HealthStore::load(&eng.cfg.health_path);
+                crate::resolve_chain(cli, &eng, &health)
+                    .map(|r| r.reviewer)
+                    .unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        };
         let review = match phase_watchdog(
             LoopPhase::Review,
             loop_timeout_secs,
@@ -1379,6 +1439,7 @@ nits).\n",
             complete_once(
                 cli,
                 reviewer.as_deref(),
+                &reviewer_chain,
                 ADVERSARIAL_SYSTEM,
                 &review_user,
                 max_tokens,
