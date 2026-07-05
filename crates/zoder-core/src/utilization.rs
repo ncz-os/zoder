@@ -799,13 +799,10 @@ pub fn parse_headers(
 /// percent." PercentOnly subscription windows fall into this bucket by
 /// construction (the operator / provider only publishes a percent).
 ///
-/// Reset is intentionally a free-form `Option<DateTime<Utc>>`: monthly
-/// calendar windows flip to zero at the next month boundary (caller's
-/// responsibility to detect + reset; the store just records the
-/// observation), and rolling windows in this layer are NOT supported
-/// because the whole point of counter-fed tracking is that there is no
-/// header-driven reset signal. The store records `last_updated` so callers
-/// can age out stale observations.
+/// Calendar windows reset at their next period boundary. Rolling windows
+/// persist timestamped increments and retain only the trailing configured
+/// number of hours, so locally observed usage ages out without a provider
+/// reset signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterWindow {
     pub provider: Provider,
@@ -844,8 +841,23 @@ pub struct CounterWindow {
     /// never reset on a calendar boundary, by construction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period_id: Option<String>,
+    /// Rolling-window length. `None` for calendar windows and legacy
+    /// unconfigured counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_hours: Option<u32>,
+    /// Timestamped token increments used to recompute a trailing rolling
+    /// window. Older stores have no buckets; configuration migrates their
+    /// aggregate into one bucket at the row's previous `last_updated`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub increments: Vec<CounterIncrement>,
     /// UTC observation timestamp of the most recent increment.
     pub last_updated: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterIncrement {
+    pub observed_at: DateTime<Utc>,
+    pub tokens: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,7 +1161,7 @@ pub fn build_account_view(
             // cap-less row, so `Some(...)` is always "numeric and
             // correct" (cap * used is finite).
             crate::config::Observability::Counter if counter_is_current => {
-                counter.and_then(|c| c.used_percent)
+                counter.and_then(|c| effective_counter_percent(c, now))
             }
             crate::config::Observability::Counter => Some(0.0),
             // Header path: take the matching header window's percent
@@ -1164,7 +1176,7 @@ pub fn build_account_view(
                 from_header.or_else(|| {
                     // Last-ditch: if a caller seeded `used_percent`
                     // directly on the counter row, surface that.
-                    counter.and_then(|c| c.used_percent)
+                    counter.and_then(|c| effective_counter_percent(c, now))
                 })
             }
         };
@@ -1179,11 +1191,6 @@ pub fn build_account_view(
                 TelemetryHealth::from_age_secs(header_match.map(|(_, ts)| (now - ts).num_seconds()))
             }
         };
-        // Touch the unused record-age slot so the compiler keeps it in
-        // scope as a diagnostic hook (the age-vs-window match is per-row
-        // anyway; this top-level value is just the "freshest window on
-        // this record").
-        let _ = header_record_age;
         views.push(WindowView {
             name: cw.name.clone(),
             used_percent,
@@ -1197,7 +1204,11 @@ pub fn build_account_view(
         provider,
         account_id,
         plan,
-        has_credits: header_record.and_then(|record| record.has_credits),
+        has_credits: header_record.and_then(|record| {
+            (TelemetryHealth::from_age_secs(header_record_age) != TelemetryHealth::Degraded)
+                .then_some(record.has_credits)
+                .flatten()
+        }),
         windows: views,
     }
 }
@@ -1603,6 +1614,22 @@ fn compute_used_percent(used_tokens: f64, cap: Option<f64>) -> Option<f64> {
     }
 }
 
+fn effective_counter_percent(counter: &CounterWindow, now: DateTime<Utc>) -> Option<f64> {
+    let used_tokens = match counter.rolling_hours {
+        Some(hours) => {
+            let cutoff = now - chrono::Duration::hours(i64::from(hours));
+            counter
+                .increments
+                .iter()
+                .filter(|increment| increment.observed_at >= cutoff)
+                .map(|increment| increment.tokens)
+                .sum()
+        }
+        None => counter.used_tokens,
+    };
+    compute_used_percent(used_tokens, counter.cap)
+}
+
 /// Detect-and-migrate legacy fractional `CounterWindow.used_percent`
 /// rows written by an older binary (Finding #3). The pre-fix code
 /// stored `used_tokens / cap` (a fraction, commonly in [0, 1] but greater
@@ -1900,6 +1927,8 @@ impl UtilizationStore {
                 // first increment so subsequent increments can detect a
                 // boundary cross; non-calendar windows stay None.
                 period_id: None,
+                rolling_hours: None,
+                increments: Vec::new(),
                 last_updated: now,
             });
         // Calendar-boundary reset (Finding #4): when the caller has
@@ -1916,13 +1945,31 @@ impl UtilizationStore {
                 entry.used_tokens = 0.0;
                 entry.used_percent = None;
                 entry.period_id = Some(current_period);
+                entry.increments.clear();
             }
         }
         // Defensive: a malformed / negative increment is a no-op, not a
         // subtraction. A provider that occasionally reports 0 usage
         // (streaming-usage off, usage field absent) still wants a row
         // touch but never a negative balance.
-        if tokens_used.is_finite() && tokens_used > 0.0 {
+        if let Some(hours) = entry.rolling_hours {
+            let cutoff = now - chrono::Duration::hours(i64::from(hours));
+            entry
+                .increments
+                .retain(|increment| increment.observed_at >= cutoff);
+            if tokens_used.is_finite() && tokens_used > 0.0 {
+                entry.increments.push(CounterIncrement {
+                    observed_at: now,
+                    tokens: tokens_used,
+                });
+            }
+            entry.used_tokens = entry
+                .increments
+                .iter()
+                .map(|increment| increment.tokens)
+                .sum::<f64>()
+                .min(f64::MAX);
+        } else if tokens_used.is_finite() && tokens_used > 0.0 {
             entry.used_tokens = (entry.used_tokens + tokens_used).min(f64::MAX);
         }
         // Recompute percent from the cap, if any. `cap = Some(0.0)` is
@@ -1962,6 +2009,8 @@ impl UtilizationStore {
             used_percent: None,
             reset_at: None,
             period_id: period_id.clone(),
+            rolling_hours: None,
+            increments: Vec::new(),
             last_updated: now,
         });
         match period_id {
@@ -1976,6 +2025,45 @@ impl UtilizationStore {
             None => entry.period_id = None,
         }
         entry.last_updated = now;
+    }
+
+    /// Configure trailing-window accounting for a counter. Existing rows from
+    /// schema versions that predate timestamped increments are conservatively
+    /// migrated as one increment at their last observation time.
+    pub fn set_counter_rolling_hours(
+        &mut self,
+        provider: Provider,
+        account_id: &str,
+        plan: &str,
+        window_name: &str,
+        rolling_hours: Option<u32>,
+        now: DateTime<Utc>,
+    ) {
+        let k = counter_key(provider, account_id, plan, window_name);
+        let entry = self.counters.entry(k).or_insert_with(|| CounterWindow {
+            provider,
+            account_id: account_id.to_string(),
+            plan: plan.to_string(),
+            window_name: window_name.to_string(),
+            used_tokens: 0.0,
+            cap: None,
+            used_percent: None,
+            reset_at: None,
+            period_id: None,
+            rolling_hours,
+            increments: Vec::new(),
+            last_updated: now,
+        });
+        if rolling_hours.is_some() && entry.increments.is_empty() && entry.used_tokens > 0.0 {
+            entry.increments.push(CounterIncrement {
+                observed_at: entry.last_updated,
+                tokens: entry.used_tokens,
+            });
+        }
+        entry.rolling_hours = rolling_hours;
+        if rolling_hours.is_none() {
+            entry.increments.clear();
+        }
     }
 
     /// Set (or clear) the cap for one counter-fed window. The store only
@@ -2007,6 +2095,8 @@ impl UtilizationStore {
             used_percent: None,
             reset_at: None,
             period_id: None,
+            rolling_hours: None,
+            increments: Vec::new(),
             last_updated: now,
         });
         entry.cap = cap;
@@ -2894,6 +2984,43 @@ mod tests {
             "a percent-only window with no cap set must never get a percent: {:?}",
             w_w.used_percent,
         );
+    }
+
+    #[test]
+    fn rolling_counter_discards_increments_outside_trailing_window() {
+        let mut store = UtilizationStore::default();
+        let start = Utc.with_ymd_and_hms(2026, 7, 4, 0, 0, 0).unwrap();
+        store.set_counter_rolling_hours(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "5h",
+            Some(5),
+            start,
+        );
+        store.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "5h",
+            Some(100.0),
+            start,
+        );
+        assert_eq!(
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 90.0, start),
+            90.0
+        );
+
+        let later = start + chrono::Duration::hours(6);
+        assert_eq!(
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 10.0, later),
+            10.0
+        );
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        assert_eq!(counter.used_percent, Some(10.0));
+        assert_eq!(counter.increments.len(), 1);
     }
 
     #[test]
@@ -3797,6 +3924,36 @@ mod tests {
         assert_eq!(
             decide_account(&view, &RouteKnobs::default(), now, None).decision,
             RouteDecision::FallBackToFree
+        );
+    }
+
+    #[test]
+    fn degraded_credits_false_does_not_pin_l4_to_fallback() {
+        let observed = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut store = UtilizationStore::default();
+        let snapshot = RateLimitSnapshot {
+            provider: Provider::OpenaiCodex,
+            account_id: "default".into(),
+            plan: "chatgpt-pro".into(),
+            primary: None,
+            secondary: None,
+            has_credits: Some(false),
+            observed_at: Some(observed),
+        };
+        store.upsert(&snapshot, observed);
+        let now = observed + chrono::Duration::hours(2);
+        let view = build_account_view(
+            Provider::OpenaiCodex,
+            "default",
+            "chatgpt-pro",
+            &[],
+            &store,
+            now,
+        );
+        assert_eq!(view.has_credits, None);
+        assert_eq!(
+            decide_account(&view, &RouteKnobs::default(), now, None).decision,
+            RouteDecision::PreferSub
         );
     }
 

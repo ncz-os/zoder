@@ -898,6 +898,14 @@ fn capture_counter_usage(
     if let Some(entry) = catalog.tier("minimax", plan) {
         for w in &entry.windows {
             if matches!(w.observability, crate::config::Observability::Counter) {
+                store.set_counter_rolling_hours(
+                    crate::utilization::Provider::MiniMax,
+                    "default",
+                    plan,
+                    &w.name,
+                    (w.reset == crate::config::ResetKind::Rolling).then_some(w.hours),
+                    now,
+                );
                 store.set_counter_cap(
                     crate::utilization::Provider::MiniMax,
                     "default",
