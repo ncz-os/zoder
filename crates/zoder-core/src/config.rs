@@ -151,6 +151,7 @@ pub enum ResetKind {
 /// window as permanently below cap (headroom), NEVER as saturated on the
 /// strength of a zero denominator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaWindow {
     /// Display name, e.g. "5h" or "weekly".
     pub name: String,
@@ -192,6 +193,7 @@ pub struct QuotaWindow {
 ///   3. **Preset + overrides**: both are set → preset windows, then explicit
 ///      windows override by `name` (operator tunes one cap).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionPlan {
     /// Flat monthly fee in USD (used only to amortize an effective per-call $).
     #[serde(default)]
@@ -212,6 +214,7 @@ pub struct SubscriptionPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     pub id: String,
     pub base_url: String,
@@ -250,7 +253,7 @@ fn default_kind() -> String {
 /// — colour is still suppressed entirely when stdout is not a TTY or `NO_COLOR`
 /// is set, so a themed deployment stays pipe-safe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Theme {
     /// Bold accent for section headers and headline figures.
     pub header: String,
@@ -869,6 +872,9 @@ impl Config {
     /// human-readable problems; empty means valid.
     pub fn validate(&self) -> Vec<String> {
         let mut errs = Vec::new();
+        let tier_catalog = crate::subscription_tiers::load_tier_catalog(Some(
+            &crate::subscription_tiers::default_catalog_path(&Self::home()),
+        ));
         if self.providers.is_empty() {
             errs.push("no providers configured".into());
         }
@@ -921,6 +927,14 @@ impl Config {
                         "provider {}: subscription tier must not be empty",
                         p.id
                     ));
+                }
+                if let Some(tier) = plan.tier.as_deref().filter(|tier| !tier.trim().is_empty()) {
+                    if tier_catalog.tier(&p.id, tier).is_none() {
+                        errs.push(format!(
+                            "provider {}: subscription tier {:?} does not resolve in the tier catalog for this provider",
+                            p.id, tier
+                        ));
+                    }
                 }
                 let mut window_names = std::collections::HashSet::new();
                 for w in &plan.windows {
@@ -1024,6 +1038,7 @@ impl Config {
 /// those come from the base `config.json` / default config — so a vendor
 /// profile is purely additive: it adds routes, it doesn't change semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VendorOverlay {
     /// Optional profile metadata. `name` is informational (the loader already
     /// knows it from the filename). `default = true` selects this overlay's
@@ -1043,6 +1058,7 @@ pub struct VendorOverlay {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VendorProfile {
     #[serde(default)]
     pub name: Option<String>,
@@ -1802,5 +1818,48 @@ auth = { type = "env", var = "ACME_KEY" }
         });
         let err = serde_json::from_value::<Config>(value).unwrap_err();
         assert!(err.to_string().contains("cap_gaurd"), "{err}");
+    }
+
+    #[test]
+    fn nested_operational_config_rejects_unknown_fields() {
+        let raw = serde_json::json!({
+            "id": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "kind": "openai-responses",
+            "auth": {"type": "none"},
+            "billing": "subscription",
+            "subscription": {
+                "tier": "chatgpt-pro",
+                "windows": [{
+                    "name": "5h",
+                    "hours": 5,
+                    "observabilty": "header"
+                }]
+            }
+        });
+        let err = serde_json::from_value::<Provider>(raw).unwrap_err();
+        assert!(err.to_string().contains("observabilty"), "{err}");
+
+        let overlay_err =
+            toml::from_str::<VendorOverlay>("[profile]\nname = 'acme'\ndefualt = true\n")
+                .unwrap_err();
+        assert!(overlay_err.to_string().contains("defualt"), "{overlay_err}");
+    }
+
+    #[test]
+    fn validate_rejects_unresolved_provider_tier_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].id = "openai".into();
+        cfg.default_provider = "openai".into();
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = Some(SubscriptionPlan {
+            monthly_fee_usd: 200.0,
+            tier: Some("chatgpt-pr0".into()),
+            windows: Vec::new(),
+        });
+        let errs = cfg.validate().join("\n");
+        assert!(errs.contains("does not resolve"), "{errs}");
+        assert!(errs.contains("chatgpt-pr0"), "{errs}");
     }
 }

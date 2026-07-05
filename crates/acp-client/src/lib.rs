@@ -428,6 +428,52 @@ pub enum AgentEvent {
     Approval { tool: String, approved: bool },
     /// Per-LLM-call context/token usage.
     Usage { input_tokens: u64 },
+    /// Rate-limit response metadata attached to an engine usage update.
+    /// Only known utilization header families are forwarded; credentials and
+    /// unrelated response headers never cross the ACP boundary.
+    Utilization { headers: Vec<(String, String)> },
+}
+
+/// Recursively collect the small, non-secret response-header vocabulary used
+/// by KNEMON. Engines differ in whether metadata lives directly on the usage
+/// update or under `headers` / `_meta`, so walking the update is more robust
+/// than binding to one engine-specific envelope.
+fn utilization_headers(value: &Value) -> Vec<(String, String)> {
+    fn visit(value: &Value, out: &mut std::collections::BTreeMap<String, String>) {
+        match value {
+            Value::Object(map) => {
+                for (name, value) in map {
+                    let lower = name.to_ascii_lowercase();
+                    let recognized = lower.starts_with("x-codex-")
+                        || lower.starts_with("x-ratelimit-")
+                        || lower.starts_with("anthropic-ratelimit-");
+                    if recognized {
+                        let scalar = match value {
+                            Value::String(s) => Some(s.clone()),
+                            Value::Number(n) => Some(n.to_string()),
+                            Value::Bool(b) => Some(b.to_string()),
+                            _ => None,
+                        };
+                        if let Some(scalar) = scalar {
+                            out.insert(lower, scalar);
+                        }
+                    } else {
+                        visit(value, out);
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut headers = std::collections::BTreeMap::new();
+    visit(value, &mut headers);
+    headers.into_iter().collect()
 }
 
 /// Outcome of an agentic turn.
@@ -671,6 +717,10 @@ async fn drive<F: FnMut(AgentEvent)>(
             Ok(v) => v,
             Err(_) => continue,
         };
+        let headers = utilization_headers(&frame);
+        if !headers.is_empty() {
+            on_event(AgentEvent::Utilization { headers });
+        }
 
         // A JSON-RPC error response on our prompt id is fatal.
         if frame.get("id").and_then(Value::as_str) == Some("prompt") {
@@ -1367,6 +1417,10 @@ where
             Ok(v) => v,
             Err(_) => continue,
         };
+        let headers = utilization_headers(&frame);
+        if !headers.is_empty() {
+            on_event(AgentEvent::Utilization { headers });
+        }
 
         // --- A) The `session/prompt` RESPONSE carries the terminal
         //        stopReason and ends the turn.
@@ -1729,6 +1783,29 @@ mod tests {
             ApprovalPolicy::Allowlist,
             "readonly_exfil"
         ));
+    }
+
+    #[test]
+    fn utilization_metadata_extracts_only_known_header_families() {
+        let update = json!({
+            "type": "context_usage",
+            "_meta": {
+                "response_headers": {
+                    "X-Codex-Primary-Used-Percent": 93,
+                    "x-codex-plan-type": "pro",
+                    "authorization": "Bearer must-not-escape",
+                    "x-request-id": "not-utilization"
+                }
+            }
+        });
+        let headers = utilization_headers(&update);
+        assert_eq!(
+            headers,
+            vec![
+                ("x-codex-plan-type".into(), "pro".into()),
+                ("x-codex-primary-used-percent".into(), "93".into()),
+            ]
+        );
     }
 
     #[test]

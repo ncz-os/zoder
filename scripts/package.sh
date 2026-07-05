@@ -122,7 +122,7 @@ ensure_zeroclaw() {
       [ "${#ZEROCLAW_REF}" -ge 40 ] || { echo "package.sh: ZEROCLAW_REF must be a full SHA (>=40 hex chars); got '$ZEROCLAW_REF'." >&2; return 1; }
     fi
     git clone --depth 1 "$ZEROCLAW_REPO" "$zc" >&2
-    ( cd "$zc" && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD ) >&2
+    ( cd "$zc" && git fetch -q --depth 1 origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD ) >&2
   fi
   # Record the resolved SHA in the build manifest (used by assert-trio-manifest.sh).
   local sha
@@ -140,7 +140,10 @@ ensure_goose() {
   fi
   local gs=".goose-src"
   if [ ! -d "$gs/.git" ]; then
-    git clone --depth 1 -b "$GOOSE_REF" "$GOOSE_REPO" "$gs" >&2
+    # `git clone --branch` only accepts a branch or tag, not the immutable
+    # commit SHA used by release builds. Clone the repository first, then
+    # fetch the exact ref just like ensure_zeroclaw does below.
+    git clone --depth 1 "$GOOSE_REPO" "$gs" >&2
   fi
   ( cd "$gs" && git fetch -q --depth 1 origin "$GOOSE_REF" && git checkout -q FETCH_HEAD ) >&2
   echo "$gs"

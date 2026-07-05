@@ -178,8 +178,54 @@ fn smoke_test_is_fatal_and_rolls_back() {
         "successful smoke must print a clear verification line"
     );
     assert!(
-        src.contains("backup-${b}") && src.contains("rollback_installed"),
+        src.contains("backup-${b}") && src.contains("rollback_install"),
         "rollback must restore pre-existing binaries, not merely delete them"
+    );
+    let smoke = src
+        .find("Smoke verified:")
+        .expect("successful smoke marker");
+    let commit = src[smoke..]
+        .find("transaction_active=0")
+        .map(|offset| smoke + offset)
+        .expect("transaction commit after smoke");
+    assert!(
+        commit > smoke,
+        "the install transaction must remain active through seeding and smoke"
+    );
+    assert!(
+        src.contains("seeding failed; install was rolled back"),
+        "a corpus/pricing seed failure must abort while rollback is active"
+    );
+}
+
+#[test]
+fn package_script_fetches_commit_sha_after_branchless_clone() {
+    let path = workspace_root().join("scripts/package.sh");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let goose = src.split("ensure_goose() {").nth(1).expect("ensure_goose");
+    let goose = goose.split("package_target() {").next().unwrap();
+    assert!(
+        !goose.contains("git clone --depth 1 -b")
+            && !goose.contains("git clone --depth 1 --branch"),
+        "ensure_goose must not pass an arbitrary commit SHA to git clone --branch"
+    );
+    assert!(
+        goose.contains("git fetch -q --depth 1 origin \"$GOOSE_REF\"")
+            && goose.contains("git checkout -q FETCH_HEAD"),
+        "ensure_goose must fetch and check out the exact pinned ref"
+    );
+    let zeroclaw = src
+        .split("ensure_zeroclaw() {")
+        .nth(1)
+        .expect("ensure_zeroclaw")
+        .split("ensure_goose() {")
+        .next()
+        .unwrap();
+    assert!(
+        !zeroclaw.contains("git clone --depth 1 -b")
+            && zeroclaw.contains("git fetch -q --depth 1 origin \"$ZEROCLAW_REF\"")
+            && zeroclaw.contains("git checkout -q FETCH_HEAD"),
+        "ensure_zeroclaw must retain the same SHA-safe clone/fetch/checkout flow"
     );
 }
 

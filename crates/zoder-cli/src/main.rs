@@ -1757,23 +1757,15 @@ fn rank_for_model(m: &ModelEntry) -> f64 {
 /// overrides. Used by `scenario_chain_for_roles` to feed real headroom
 /// into KNEMON gating.
 fn load_snapshot_for(
-    provider_id: &str,
+    provider: UtilProvider,
     account_id: &str,
     plan: &str,
 ) -> Option<zoder_core::utilization::RateLimitSnapshot> {
     let path = zoder_core::utilization::default_store_path()?;
     let store = zoder_core::utilization::UtilizationStore::open_unlocked(path).ok()?;
-    let provider_id = provider_id.to_ascii_lowercase();
-    let prov = if provider_id.contains("codex") || provider_id.contains("openai-codex") {
-        zoder_core::utilization::Provider::OpenaiCodex
-    } else if provider_id.contains("anthropic") {
-        zoder_core::utilization::Provider::Anthropic
-    } else if provider_id.contains("openai") {
-        zoder_core::utilization::Provider::Openai
-    } else {
-        zoder_core::utilization::Provider::Other
-    };
-    store.get(prov, account_id, plan).map(|r| r.as_snapshot())
+    store
+        .get(provider, account_id, plan)
+        .map(|r| r.as_snapshot())
 }
 
 /// Build the per-role chains under the active scenario. Returns
@@ -1826,12 +1818,8 @@ fn scenario_chain_for_roles(
         // `resolve_chain` / `agentic_turn`.
         let primary_model = resolve_effective_primary(cli, eng)?;
         let provider = rc.real_provider_for_model(&eng.cfg, &primary_model)?;
-        let plan = provider
-            .subscription
-            .as_ref()
-            .map(plan_label)
-            .unwrap_or_else(|| "default".to_string());
-        load_snapshot_for(&provider.id, "default", &plan)
+        let (util_provider, plan) = agentic::utilization_key(provider);
+        load_snapshot_for(util_provider, "default", &plan)
     })();
 
     // Fix #1 (Layer 4 wiring): build per-candidate `AccountView`s from
@@ -1967,8 +1955,7 @@ fn build_account_views_for_candidates(
             if windows.is_empty() {
                 return None;
             }
-            let util_prov = provider_id_to_util(&provider.id);
-            let plan_label = plan_label(plan);
+            let (util_prov, plan_label) = agentic::utilization_key(provider);
             Some(build_av(
                 util_prov, "default", plan_label, &windows, &store, now,
             ))
@@ -3037,8 +3024,9 @@ pub(crate) async fn agentic_turn(
     // transparently demoted to its metered sibling, so this guard only fires
     // when NEITHER path has a real backing provider.
     let routing = RoutingContext::load(&eng.cfg);
-    routing
+    let routed_provider = routing
         .real_provider_for_model(&eng.cfg, &primary)
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no real provider is configured for model '{primary}' — it would fall through to the \
@@ -3068,14 +3056,9 @@ pub(crate) async fn agentic_turn(
     // A Subscription-or-Free serving provider is $0-marginal — the call is
     // cost-neutral even if the corpus has the model non-free, so we let it
     // through (paid must still confirm).
-    let provider_paid = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .map(|p| p.paid || p.billing == BillingMode::Metered)
-        .unwrap_or(false);
-    let provider_cost_neutral = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .map(|p| !p.paid && p.billing != BillingMode::Metered)
-        .unwrap_or(false);
+    let provider_paid = routed_provider.paid || routed_provider.billing == BillingMode::Metered;
+    let provider_cost_neutral =
+        !routed_provider.paid && routed_provider.billing != BillingMode::Metered;
     if let Decision::NeedConfirm(msg) =
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
@@ -3132,18 +3115,16 @@ pub(crate) async fn agentic_turn(
     // We only build this on the goose path — zeroclaw handles its own
     // auth and never sees these vars.
     let goose_provider = if matches!(engine_kind, EngineKind::Goose) {
-        routing
-            .real_provider_for_model(&eng.cfg, &primary)
-            .map(|p| GooseProviderEnv {
-                provider_id: p.id.clone(),
-                kind: p.kind.clone(),
-                base_url: p.base_url.clone(),
-                // Resolve the credential the SAME way the engine bridge
-                // does (auth.resolve() reads env vars or returns the
-                // inline bearer — never log this value; it is redacted
-                // by `GooseProviderEnv`'s Debug impl above).
-                api_key: p.auth.resolve(),
-            })
+        Some(GooseProviderEnv {
+            provider_id: routed_provider.id.clone(),
+            kind: routed_provider.kind.clone(),
+            base_url: routed_provider.base_url.clone(),
+            // Resolve the credential the SAME way the engine bridge
+            // does (auth.resolve() reads env vars or returns the
+            // inline bearer — never log this value; it is redacted
+            // by `GooseProviderEnv`'s Debug impl above).
+            api_key: routed_provider.auth.resolve(),
+        })
     } else {
         None
     };
@@ -3172,6 +3153,9 @@ pub(crate) async fn agentic_turn(
     // before any daemon setup, so a Goose request never starts zeroclaw and an
     // unknown value surfaces as a parse error up front.
     let run = run_agent_dispatch(engine_kind, &opts, |ev| {
+        if let AgentEvent::Utilization { headers } = &ev {
+            agentic::persist_agentic_utilization(&routed_provider, headers);
+        }
         if !stream_output {
             return;
         }
@@ -3191,6 +3175,7 @@ pub(crate) async fn agentic_turn(
                 eprintln!("[approve:{}] {tool}", if approved { "ok" } else { "deny" });
             }
             AgentEvent::Usage { .. } => {}
+            AgentEvent::Utilization { .. } => {}
         }
     })
     .await?;
@@ -4345,12 +4330,12 @@ fn render_subscription_utilization_section(
         if resolved.windows.is_empty() {
             continue;
         }
-        let util_prov = provider_id_to_util(&p.id);
+        let (util_prov, plan_key) = agentic::utilization_key(p);
         let knobs = RouteKnobs::for_triple(util_prov, &p.id, &plan_label(plan));
         let view = build_account_view(
             util_prov,
             "default",
-            plan_label(plan),
+            plan_key,
             &resolved.windows,
             store,
             now,
@@ -4569,26 +4554,6 @@ fn hint_line(decision: &AccountDecision, knobs: &RouteKnobs) -> String {
 /// `"explicit"` (the plan has no `tier` string of its own).
 fn plan_label(plan: &SubscriptionPlan) -> String {
     plan.tier.clone().unwrap_or_else(|| "explicit".to_string())
-}
-
-/// Map a `Config::providers[].id` (e.g. `"openai-codex"`, `"anthropic"`)
-/// onto the matching [`UtilProvider`] variant. Same heuristic as
-/// `load_snapshot_for`: substring match on the id. `Other` is the
-/// "don't recognise this id" fallback — counters still work, header
-/// parsing never will.
-fn provider_id_to_util(id: &str) -> UtilProvider {
-    let id = id.to_ascii_lowercase();
-    if id.contains("codex") || id.contains("openai-codex") {
-        UtilProvider::OpenaiCodex
-    } else if id.contains("anthropic") {
-        UtilProvider::Anthropic
-    } else if id.contains("openai") {
-        UtilProvider::Openai
-    } else if id.contains("minimax") {
-        UtilProvider::MiniMax
-    } else {
-        UtilProvider::Other
-    }
 }
 
 /// Stable display name for a [`UtilProvider`]. `Debug` would print

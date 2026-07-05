@@ -20,6 +20,150 @@ use zoder_core::{
 
 use crate::{Engine, ReviewScope};
 
+/// The exact utilization-store identity used by both agentic capture and the
+/// routing reader. ChatGPT subscription tiers use Codex's `x-codex-*` header
+/// family even when the configured provider id is simply `openai`; include the
+/// tier in classification so those writes cannot land under `OpenaiCodex`
+/// while reads look under `Openai` (or vice versa).
+pub(crate) fn utilization_key(
+    provider: &zoder_core::config::Provider,
+) -> (zoder_core::utilization::Provider, String) {
+    use zoder_core::utilization::Provider as UtilProvider;
+
+    let id = provider.id.to_ascii_lowercase();
+    let plan = provider
+        .subscription
+        .as_ref()
+        .map(|plan| plan.tier.clone().unwrap_or_else(|| "explicit".to_string()))
+        .unwrap_or_else(|| provider.id.clone());
+    let tier = plan.to_ascii_lowercase();
+    let util_provider = if id.contains("codex") || tier.starts_with("chatgpt-") {
+        UtilProvider::OpenaiCodex
+    } else if id.contains("anthropic") || tier.starts_with("claude-") {
+        UtilProvider::Anthropic
+    } else if id.contains("minimax") || tier.starts_with("token-plan-") {
+        UtilProvider::MiniMax
+    } else if id.contains("openai") {
+        UtilProvider::Openai
+    } else {
+        UtilProvider::Other
+    };
+    (util_provider, plan)
+}
+
+struct AgenticHeaderView<'a>(&'a [(String, String)]);
+
+impl zoder_core::utilization::HeaderLookup for AgenticHeaderView<'_> {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Persist one ACP response's rate-limit metadata under the configured tuple
+/// that `build_account_view` reads. Parsing remains header-driven, but storage
+/// identity is configuration-driven: vendor plan labels such as `pro` are
+/// display metadata and must not replace a configured `chatgpt-pro` key.
+fn persist_agentic_utilization_at(
+    provider: &zoder_core::config::Provider,
+    headers: &[(String, String)],
+    path: &Path,
+    now: DateTime<Utc>,
+) -> bool {
+    let view = AgenticHeaderView(headers);
+    let Some(mut snapshot) = zoder_core::utilization::parse_headers(&view, "default", "default")
+    else {
+        return false;
+    };
+    let (util_provider, plan) = utilization_key(provider);
+    snapshot.provider = util_provider;
+    snapshot.account_id = "default".to_string();
+    snapshot.plan = plan;
+    snapshot.observed_at = Some(now);
+
+    let Ok(mut store) = zoder_core::utilization::UtilizationStore::open(path) else {
+        return false;
+    };
+    store.record(&snapshot, now)
+}
+
+/// Best-effort production wrapper. Telemetry persistence must never turn a
+/// successful agentic response into a failed user request.
+pub(crate) fn persist_agentic_utilization(
+    provider: &zoder_core::config::Provider,
+    headers: &[(String, String)],
+) -> bool {
+    let Some(path) = zoder_core::utilization::default_store_path() else {
+        return false;
+    };
+    persist_agentic_utilization_at(provider, headers, &path, Utc::now())
+}
+
+#[cfg(test)]
+mod agentic_utilization_tests {
+    use super::*;
+    use zoder_core::config::{Auth, Observability, QuotaUnit, QuotaWindow, ResetKind};
+    use zoder_core::utilization::{
+        build_account_view, decide_account, RouteDecision, RouteKnobs, UtilizationStore,
+    };
+
+    #[test]
+    fn agentic_codex_telemetry_round_trips_into_routing_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let provider = zoder_core::config::Provider {
+            id: "openai".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            kind: "openai-responses".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(zoder_core::config::SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: Some("chatgpt-pro".into()),
+                windows: Vec::new(),
+            }),
+            serves: vec!["gpt-".into()],
+        };
+        let headers = vec![
+            ("x-codex-plan-type".into(), "pro".into()),
+            ("x-codex-primary-used-percent".into(), "95".into()),
+            ("x-codex-primary-window-minutes".into(), "300".into()),
+            ("x-codex-primary-reset-after-seconds".into(), "14400".into()),
+        ];
+        let now = Utc::now();
+
+        assert!(persist_agentic_utilization_at(
+            &provider, &headers, &path, now
+        ));
+
+        let store = UtilizationStore::open_unlocked(&path).unwrap();
+        let (util_provider, plan) = utilization_key(&provider);
+        assert_eq!(
+            util_provider,
+            zoder_core::utilization::Provider::OpenaiCodex
+        );
+        assert_eq!(plan, "chatgpt-pro");
+        assert!(store.get(util_provider, "default", &plan).is_some());
+
+        let windows = vec![QuotaWindow {
+            name: "5h".into(),
+            hours: 5,
+            unit: QuotaUnit::Tokens,
+            cap: None,
+            models: None,
+            observability: Observability::Header,
+            reset: ResetKind::Rolling,
+        }];
+        let view = build_account_view(util_provider, "default", &plan, &windows, &store, now);
+        let decision = decide_account(&view, &RouteKnobs::default(), now, None);
+        assert_eq!(decision.decision, RouteDecision::FallBackToFree);
+        assert_eq!(decision.strength, 95.0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Single completion (used by review/adversarial-review).
 // ---------------------------------------------------------------------------
