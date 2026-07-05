@@ -17,8 +17,8 @@ use zoder_core::subscription_tiers::{
     load_tier_catalog, resolve_plan_windows, ResolvedPlan, TierCatalog,
 };
 use zoder_core::utilization::{
-    build_account_view, decide_account, forecast_account, AccountDecision, AccountView,
-    Provider as UtilProvider, RouteKnobs, TelemetryHealth, UtilizationStore,
+    build_account_view, decide_account, forecast_account, forecast_window, AccountDecision,
+    AccountView, Provider as UtilProvider, RouteKnobs, TelemetryHealth, UtilizationStore,
     FORECAST_CONFIDENCE_MIN,
 };
 use zoder_core::{
@@ -4056,7 +4056,7 @@ fn render_subscription_utilization_section(
     s.push_str(&paint.green_b("Subscription utilization"));
     s.push('\n');
     for (_label, _plan_name, view, decision, knobs) in &blocks {
-        s.push_str(&render_account_block(view, decision, knobs, paint));
+        s.push_str(&render_account_block(view, decision, knobs, paint, now));
         // KNEMON Layer 4b forecast note: project the binding window forward to
         // its reset. Only surfaced above the routing-confidence floor, so a
         // noisy/early window stays silent rather than showing a shaky number.
@@ -4106,6 +4106,7 @@ fn render_account_block(
     decision: &AccountDecision,
     knobs: &RouteKnobs,
     paint: &Pal,
+    now: DateTime<Utc>,
 ) -> String {
     let mut s = String::new();
     s.push_str(&paint.green_b(&format!(
@@ -4148,9 +4149,21 @@ fn render_account_block(
             TelemetryHealth::Stale => "stale",
             TelemetryHealth::Degraded => "degraded",
         };
+        // Per-window forecast (KNEMON Layer 4b, surfaced inline so the
+        // operator sees on-pace-by-reset next to the current reading).
+        // Below the routing-confidence floor (or no forecast at all —
+        // no numeric reading / no reset signal / clock skew) we render
+        // the em-dash "—" rather than inventing a number. The block-level
+        // summary line below still uses `forecast_account` unchanged.
+        let forecast = match forecast_window(w, now) {
+            Some(f) if f.confidence >= FORECAST_CONFIDENCE_MIN => {
+                format!("{:.0}%", f.projected_used_percent)
+            }
+            _ => "\u{2014}".to_string(),
+        };
         s.push_str(&format!(
-            "    {:<10} used={:<11} obs={:<11} health={:<8} headroom={}\n",
-            w.name, pct, observability, health, headroom
+            "    {:<10} used={:<11} obs={:<11} health={:<8} headroom={} forecast={}\n",
+            w.name, pct, observability, health, headroom, forecast
         ));
     }
     // Binding + verdict + strength line, then the single hint line.
@@ -6586,7 +6599,7 @@ mod subscription_utilization_render_tests {
         // Sanity-check the routing decision before we test the renderer.
         assert_eq!(decision.decision, RouteDecision::PreferSub);
         assert!((decision.strength - 40.0).abs() < 1e-9);
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         // IDLE hint line: exact wording per the spec.
         assert!(
             block.contains("IDLE (40.0% used, 60.0% headroom) -> preferring for build work"),
@@ -6607,6 +6620,12 @@ mod subscription_utilization_render_tests {
             block.contains("headroom=60.0%"),
             "per-window headroom missing in:\n{block}"
         );
+        // forecast=— : no `reset_at` in the test window, so we render the
+        // em-dash placeholder, NOT a fabricated numeric.
+        assert!(
+            block.contains("forecast=\u{2014}"),
+            "per-window forecast=\u{2014} missing in:\n{block}"
+        );
     }
 
     /// 90% exceeds `cap_guard` (85) -> AT CAP branch fires. We still want
@@ -6625,7 +6644,7 @@ mod subscription_utilization_render_tests {
         let decision = decide_account(&acct, &knobs, now, None);
         assert_eq!(decision.decision, RouteDecision::FallBackToFree);
         assert!((decision.strength - 90.0).abs() < 1e-9);
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         assert!(
             block.contains("AT CAP -> falling back to free"),
             "missing AT CAP hint in:\n{block}"
@@ -6634,6 +6653,11 @@ mod subscription_utilization_render_tests {
         assert!(
             block.contains("headroom=10.0%"),
             "per-window headroom missing in:\n{block}"
+        );
+        // forecast=— : no `reset_at` -> em-dash placeholder, not a number.
+        assert!(
+            block.contains("forecast=\u{2014}"),
+            "per-window forecast=\u{2014} missing in:\n{block}"
         );
     }
 
@@ -6659,7 +6683,7 @@ mod subscription_utilization_render_tests {
         };
         let knobs = knobs(80.0, 85.0);
         let decision = decide_account(&acct, &knobs, now, None);
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         // The percent-only window must show the literal "percent-only"
         // token, NOT a made-up number.
         assert!(
@@ -6672,6 +6696,12 @@ mod subscription_utilization_render_tests {
             block.contains("20.0%"),
             "real 20% reading dropped in:\n{block}"
         );
+        // Both windows in this test have `reset_at: None` -> both rows
+        // render forecast=— (the em-dash), NOT a fabricated projection.
+        assert!(
+            block.contains("forecast=\u{2014}"),
+            "first block forecast=\u{2014} missing in:\n{block}"
+        );
         // Now: a counter-fed window with no record also reads None. The
         // default observability for "we have no number and no header" is
         // "unknown" (NOT "percent-only", which is reserved for the
@@ -6683,10 +6713,15 @@ mod subscription_utilization_render_tests {
             windows: vec![unknown_window("monthly", 720, Observability::Counter)],
         };
         let decision2 = decide_account(&acct2, &knobs, now, None);
-        let block2 = render_account_block(&acct2, &decision2, &knobs, &pal());
+        let block2 = render_account_block(&acct2, &decision2, &knobs, &pal(), now);
         assert!(
             block2.contains("unknown"),
             "missing unknown wording for None/Counter in:\n{block2}"
+        );
+        // Second block also has reset_at=None -> forecast=— (em-dash).
+        assert!(
+            block2.contains("forecast=\u{2014}"),
+            "second block forecast=\u{2014} missing in:\n{block2}"
         );
         // And NEVER a fabricated numeric. We grep for a percent on the
         // "monthly" row by isolating the line that contains "monthly".
@@ -6719,10 +6754,15 @@ mod subscription_utilization_render_tests {
         // Sanity: observable is empty, so PreferSub with no binding.
         assert_eq!(decision.decision, RouteDecision::PreferSub);
         assert!(decision.binding_window.is_none());
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         assert!(
             block.contains("no telemetry yet"),
             "missing no-telemetry-yet hint in:\n{block}"
+        );
+        // No `reset_at` (and no numeric reading) -> forecast=— placeholder.
+        assert!(
+            block.contains("forecast=\u{2014}"),
+            "per-window forecast=\u{2014} missing in:\n{block}"
         );
     }
 
@@ -6743,7 +6783,7 @@ mod subscription_utilization_render_tests {
         let decision = decide_account(&acct, &knobs, now, None);
         // Still PreferSub (hysteresis keeps the sub unless cap_guard trips).
         assert_eq!(decision.decision, RouteDecision::PreferSub);
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         assert!(
             block.contains("NEAR TARGET"),
             "missing NEAR TARGET hint in:\n{block}"
@@ -6757,6 +6797,11 @@ mod subscription_utilization_render_tests {
         assert!(
             !block.contains("AT CAP"),
             "AT CAP wording leaked into hysteresis band:\n{block}"
+        );
+        // `reset_at: None` in the test window -> forecast=— (em-dash).
+        assert!(
+            block.contains("forecast=\u{2014}"),
+            "per-window forecast=\u{2014} missing in:\n{block}"
         );
     }
 
@@ -6774,7 +6819,7 @@ mod subscription_utilization_render_tests {
         };
         let knobs = knobs(80.0, 85.0);
         let decision = decide_account(&acct, &knobs, now, None);
-        let block = render_account_block(&acct, &decision, &knobs, &pal());
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
         for forbidden in [
             "Password:",
             "password:",
@@ -6789,6 +6834,66 @@ mod subscription_utilization_render_tests {
                 "forbidden prompt-shaped token {forbidden:?} leaked into block:\n{block}"
             );
         }
+    }
+
+    /// KNEMON Layer 4b — when a window has a numeric reading AND a
+    /// `reset_at` ahead of `now`, the per-window row MUST render a numeric
+    /// `forecast=` (the projected percent at reset), not the em-dash
+    /// placeholder. The window here: Fresh health, 168h, 30% used,
+    /// `reset_at = now + 84h` (i.e. exactly half the window elapsed). The
+    /// linear projection doubles the observed rate, so the row should
+    /// show `forecast=60%` and the placeholder MUST NOT appear.
+    #[test]
+    fn l5_forecastable_window_renders_numeric_forecast_column() {
+        let now = fixed_now();
+        let hours: u32 = 168;
+        let used_pct = 30.0_f64;
+        let half = chrono::Duration::hours(hours as i64 / 2);
+        let window = WindowView {
+            name: "weekly".to_string(),
+            used_percent: Some(used_pct),
+            observability: Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: Some(now + half),
+            hours,
+        };
+        let acct = AccountView {
+            provider: UtilProvider::Anthropic,
+            account_id: "a".to_string(),
+            plan: "max".to_string(),
+            windows: vec![window],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
+        // Sanity: forecast_window must produce a numeric projection here
+        // (elapsed_fraction = 0.5, health_weight = 1.0 -> confidence = 0.5,
+        // which meets the routing-confidence floor of 0.5).
+        let f = forecast_window(&acct.windows[0], now)
+            .expect("forecast_window returns Some for half-elapsed Fresh window");
+        assert!(
+            f.confidence >= FORECAST_CONFIDENCE_MIN,
+            "confidence {confidence} below floor",
+            confidence = f.confidence
+        );
+        // Locate the per-window row and verify the forecast cell is numeric
+        // and matches the projected percent. We pin to {:.0} formatting
+        // (no decimals) so 60.0 -> "60%".
+        let row = block
+            .lines()
+            .find(|l| l.contains("weekly") && l.contains("used="))
+            .expect("weekly row present");
+        let expected = format!("forecast={:.0}%", f.projected_used_percent);
+        assert!(
+            row.contains(&expected),
+            "expected numeric {expected:?} on row, got: {row:?}"
+        );
+        // And the em-dash placeholder MUST NOT appear — we have a real
+        // projection to show.
+        assert!(
+            !row.contains("forecast=\u{2014}"),
+            "forecast=\u{2014} leaked onto a forecastable row: {row:?}"
+        );
     }
 
     /// The top-level section renderer returns an empty string when no
