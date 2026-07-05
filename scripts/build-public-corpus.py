@@ -94,10 +94,12 @@ def from_litellm(litellm):
             continue
         if m.get("mode") != "chat" or _is_sku_noise(mid):
             continue
-        has_in = "input_cost_per_token" in m
-        has_out = "output_cost_per_token" in m
-        inp = (m.get("input_cost_per_token") or 0.0) * PER_TOK_TO_MTOK
-        out = (m.get("output_cost_per_token") or 0.0) * PER_TOK_TO_MTOK
+        has_in = m.get("input_cost_per_token") is not None
+        has_out = m.get("output_cost_per_token") is not None
+        if not (has_in and has_out):
+            continue
+        inp = float(m["input_cost_per_token"]) * PER_TOK_TO_MTOK
+        out = float(m["output_cost_per_token"]) * PER_TOK_TO_MTOK
         # explicit_zero: both keys present and zero — a real free-tier/local model,
         # not an unpriced placeholder.
         explicit_zero = has_in and has_out and inp == 0.0 and out == 0.0
@@ -106,7 +108,7 @@ def from_litellm(litellm):
             "output_usd_per_mtok": out,
             "source": "litellm",
             "_explicit_zero": explicit_zero,
-            "_priced": has_in or has_out,
+            "_priced": True,
         }
     return econ
 
@@ -124,12 +126,20 @@ def overlay_openrouter(econ):
         pricing = m.get("pricing") or {}
         if not mid or mid in econ:
             continue
+        if pricing.get("prompt") is None or pricing.get("completion") is None:
+            continue
         try:
-            inp = float(pricing.get("prompt", 0) or 0) * PER_TOK_TO_MTOK
-            out = float(pricing.get("completion", 0) or 0) * PER_TOK_TO_MTOK
+            inp = float(pricing["prompt"]) * PER_TOK_TO_MTOK
+            out = float(pricing["completion"]) * PER_TOK_TO_MTOK
         except (TypeError, ValueError):
             continue
-        econ[mid] = {"input_usd_per_mtok": inp, "output_usd_per_mtok": out, "source": "openrouter"}
+        econ[mid] = {
+            "input_usd_per_mtok": inp,
+            "output_usd_per_mtok": out,
+            "source": "openrouter",
+            "_explicit_zero": inp == 0.0 and out == 0.0,
+            "_priced": True,
+        }
         added += 1
     print(f"  openrouter: +{added} models", file=sys.stderr)
     return econ

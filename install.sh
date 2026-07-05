@@ -266,9 +266,38 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-
 mkdir -p "$BIN_DIR"
+txn_dir=$(mktemp -d "${BIN_DIR}/.zoder-install.XXXXXX")
+transaction_active=0
+installed_names=""
+
+rollback_install() {
+  for name in $installed_names; do
+    if [ -f "${txn_dir}/backup-${name}" ]; then
+      mv -f "${txn_dir}/backup-${name}" "${BIN_DIR}/${name}" || true
+    else
+      rm -f "${BIN_DIR}/${name}"
+    fi
+  done
+}
+
+# Kept as the explicit post-install smoke rollback entrypoint. Signal/error
+# cleanup uses `rollback_install` directly while the transaction is active.
+rollback_installed() {
+  rollback_install
+}
+
+cleanup_install() {
+  status=$?
+  trap - EXIT INT TERM HUP
+  if [ "$transaction_active" = 1 ]; then
+    rollback_install
+  fi
+  rm -rf "$tmp" "$txn_dir"
+  exit "$status"
+}
+trap cleanup_install EXIT INT TERM HUP
+
 installed=0
 
 # Two-phase install: stage (download + verify) all binaries into "$tmp", then
@@ -347,31 +376,36 @@ for b in $BIN_OPTIONAL; do
   fi
 done
 
-# Install each staged binary. New `install -m 0755` overwrites the prior
-# binary in place so any older copies (e.g. an existing zerocode from a
-# previous install) are replaced consistently rather than left as orphans.
-installed_names=""
-rollback_installed() {
-  for name in $installed_names; do
-    if [ -f "${tmp}/backup-${name}" ]; then
-      cp -p "${tmp}/backup-${name}" "${BIN_DIR}/${name}" || true
-    else
-      rm -f "${BIN_DIR}/${name}"
-    fi
-  done
-}
+# Prepare every replacement in a hidden directory on the destination
+# filesystem. Each final `mv` is atomic; the active transaction trap restores
+# the complete previous set on any error, signal, or interruption.
 for b in $BIN_REQUIRED $BIN_OPTIONAL; do
-  [ -f "${tmp}/${b}" ] || continue
+  if [ -f "${tmp}/${b}" ]; then
+    install -m 0755 "${tmp}/${b}" "${txn_dir}/new-${b}" ||
+      die "failed to stage ${b} for install"
+  fi
   if [ -f "${BIN_DIR}/${b}" ]; then
-    cp -p "${BIN_DIR}/${b}" "${tmp}/backup-${b}"
+    cp -p "${BIN_DIR}/${b}" "${txn_dir}/backup-${b}" ||
+      die "failed to back up existing ${b}"
   fi
   installed_names="${installed_names} ${b}"
-  if ! install -m 0755 "${tmp}/${b}" "${BIN_DIR}/${b}"; then
-    rollback_installed
-    die "failed to install ${b}; previous binaries restored"
-  fi
-  installed=$((installed + 1))
 done
+
+transaction_active=1
+for b in $BIN_REQUIRED $BIN_OPTIONAL; do
+  if [ -f "${txn_dir}/new-${b}" ]; then
+    mv -f "${txn_dir}/new-${b}" "${BIN_DIR}/${b}" ||
+      die "failed to install ${b}; previous binary set will be restored"
+    installed=$((installed + 1))
+  else
+    # The trio describes one release. If an optional member is absent from
+    # this release, remove an older copy transactionally rather than leave a
+    # stale zerocode/zeroclaw next to the newly installed zoder.
+    rm -f "${BIN_DIR}/${b}" ||
+      die "failed to remove stale optional ${b}; previous set will be restored"
+  fi
+done
+transaction_active=0
 [ "$installed" -gt 0 ] || die "nothing installed"
 info "Installed $installed binar$([ "$installed" = 1 ] && echo y || echo ies) to ${BIN_DIR}"
 

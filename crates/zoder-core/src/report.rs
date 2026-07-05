@@ -73,6 +73,9 @@ pub struct RowByModel {
     /// Derived from recorded spend, never from a fuzzy catalog match, so free
     /// free-tier models are never mislabeled paid.
     pub billed: bool,
+    /// At least one contributing ledger row had no authoritative cost. Such a
+    /// row must not be displayed in the verified-free section.
+    pub cost_unknown: bool,
     /// Catalog input rate in USD per 1M tokens. Populated only for `billed`
     /// models (kept at 0 for free models so the split stays unambiguous).
     pub input_usd_per_mtok: f64,
@@ -94,6 +97,7 @@ pub struct RowByHost {
     pub calls: u64,
     /// True when any call attributed to this host actually incurred a charge.
     pub billed: bool,
+    pub cost_unknown: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -117,6 +121,8 @@ pub struct Report {
     /// Tokens served at $0 chargeback (free-tier).
     pub free_tokens: u64,
     pub billed_tokens: u64,
+    /// Tokens whose cost could not be established; neither free nor billed.
+    pub unknown_cost_tokens: u64,
     /// Free tokens valued at the frontier baseline (avoided external spend).
     pub avoided_usd: f64,
     /// Counterfactual: ALL tokens (free + billed) valued at the frontier
@@ -181,8 +187,8 @@ pub fn build_report_from_entries(
         // it reflects how the call was billed (free/subscription providers record
         // $0; metered providers record their charge). The pricing catalog is used
         // only for the counterfactual baseline below, never to re-bill free usage.
-        let cost = e.cost_usd;
-        let billed = e.cost_usd > 0.0;
+        let cost = if e.cost_unknown { 0.0 } else { e.cost_usd };
+        let billed = !e.cost_unknown && e.cost_usd > 0.0;
         let tok = e.tokens_in.saturating_add(e.tokens_out);
 
         let key = gran.key(&e.ts_utc);
@@ -201,6 +207,7 @@ pub fn build_report_from_entries(
         m.tokens_out = m.tokens_out.saturating_add(e.tokens_out);
         m.calls = m.calls.saturating_add(e.calls);
         m.billed |= billed;
+        m.cost_unknown |= e.cost_unknown;
 
         // Per-publisher-host rollup (publisher prefix of the model id). Skipped
         // for un-prefixed model ids so a bare `gpt-4o` doesn't create a "" host.
@@ -214,12 +221,18 @@ pub fn build_report_from_entries(
             h.tokens_out = h.tokens_out.saturating_add(e.tokens_out);
             h.calls = h.calls.saturating_add(e.calls);
             h.billed |= billed;
+            h.cost_unknown |= e.cost_unknown;
         }
 
         add_cost(&mut rep.total_cost_usd, cost)?;
         rep.total_tokens = rep.total_tokens.saturating_add(tok);
         rep.total_calls = rep.total_calls.saturating_add(e.calls);
-        if billed {
+        if e.cost_unknown {
+            // Unknown is neither paid nor free. Keep usage/call totals and the
+            // counterfactual, but exclude the placeholder numeric cost from
+            // spend and never inflate the verified-free token count.
+            rep.unknown_cost_tokens = rep.unknown_cost_tokens.saturating_add(tok);
+        } else if billed {
             rep.billed_tokens = rep.billed_tokens.saturating_add(tok);
         } else {
             rep.free_tokens = rep.free_tokens.saturating_add(tok);

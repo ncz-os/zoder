@@ -21,10 +21,41 @@ fn entry(t: &str, provider: &str, model: &str, cost: f64, tin: u64, tout: u64) -
         tokens_in: tin,
         tokens_out: tout,
         cost_usd: cost,
+        cost_unknown: false,
         calls: 1,
         violation: None,
         tags: FinOpsTags::default(),
     }
+}
+
+#[test]
+fn unknown_cost_is_neither_free_nor_spend() {
+    let mut unknown = entry(
+        "2026-06-10 10:00:00",
+        "unpriced-provider",
+        "unpriced/model",
+        0.0,
+        400,
+        600,
+    );
+    unknown.cost_unknown = true;
+    let pricing = PricingCatalog::default();
+    let report = build_report_from_entries(
+        &[unknown],
+        &pricing,
+        ts("2026-06-01 00:00:00"),
+        ts("2026-07-01 00:00:00"),
+        Gran::Day,
+        "June",
+    )
+    .unwrap();
+    assert_eq!(report.total_tokens, 1_000);
+    assert_eq!(report.total_calls, 1);
+    assert_eq!(report.total_cost_usd, 0.0);
+    assert_eq!(report.free_tokens, 0);
+    assert_eq!(report.billed_tokens, 0);
+    assert_eq!(report.unknown_cost_tokens, 1_000);
+    assert!(report.by_model[0].cost_unknown);
 }
 
 /// With no pricing catalog, the avoided-spend / counterfactual baseline is

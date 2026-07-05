@@ -1581,20 +1581,17 @@ fn compute_used_percent(used_tokens: f64, cap: Option<f64>) -> Option<f64> {
 
 /// Detect-and-migrate legacy fractional `CounterWindow.used_percent`
 /// rows written by an older binary (Finding #3). The pre-fix code
-/// stored `used_tokens / cap` (a fraction in [0, 1]); the new code
+/// stored `used_tokens / cap` (a fraction, commonly in [0, 1] but greater
+/// than 1 once a cap was exceeded); the new code
 /// stores the same value times 100 (a percentage in [0, 100]). Any
-/// row that arrives with a `used_percent` in `(0, 1)` and a positive
-/// `cap` is treated as a v1 fractional row and multiplied by 100 in
-/// place. Rows already in the new scale (used_percent >= 1, or
-/// used_percent == 0 with a positive cap) are left alone. The
-/// `cap.is_some()` and `c > 0.0` guards prevent false-positives from
-/// a row that legitimately was `0.5%` on a fresh window — there
-/// can't be such a row in v1 because the legacy code never produced
-/// a value > 0 without a positive cap, and even if one did slip in,
-/// the guard excludes it from migration.
+/// v1 row in the legacy fractional range `0..=2` is multiplied by 100 in
+/// place. The upper bound covers exhausted legacy counters such as `1.2`
+/// (120%) while leaving obvious percentage-scale values such as `85` alone.
+/// The caller additionally gates this migration on the persisted schema
+/// version, preventing legitimate sub-2% values in v2 from being corrupted.
 fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
     if let (Some(p), Some(c)) = (cw.used_percent, cw.cap) {
-        if c > 0.0 && p > 0.0 && p < 1.0 {
+        if c.is_finite() && c > 0.0 && p.is_finite() && (0.0..=2.0).contains(&p) {
             cw.used_percent = Some(p * 100.0);
         }
     }
@@ -3034,6 +3031,60 @@ mod tests {
         let s3 = UtilizationStore::open(&path2).unwrap();
         assert!(s3.counters.is_empty());
         assert!(s3.records.is_empty());
+    }
+
+    #[test]
+    fn legacy_counter_percent_migration_rescales_full_and_exhausted_fractions_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = "2026-07-04T12:00:00Z";
+        let counter = |name: &str, used_percent: f64| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": used_percent * 1000.0,
+                "cap": 1000.0,
+                "used_percent": used_percent,
+                "last_updated": now
+            })
+        };
+        let legacy_path = dir.path().join("legacy-v1.json");
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    "full": counter("full", 1.0),
+                    "exhausted": counter("exhausted", 1.2),
+                    "already_percent": counter("already_percent", 85.0)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        assert_eq!(migrated.counters["full"].used_percent, Some(100.0));
+        assert_eq!(migrated.counters["exhausted"].used_percent, Some(120.0));
+        assert_eq!(
+            migrated.counters["already_percent"].used_percent,
+            Some(85.0)
+        );
+
+        let current_path = dir.path().join("current-v2.json");
+        std::fs::write(
+            &current_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "records": {},
+                "counters": {"small": counter("small", 1.2)}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let current = UtilizationStore::open_unlocked(&current_path).unwrap();
+        assert_eq!(current.counters["small"].used_percent, Some(1.2));
     }
 
     // -------- KNEMON Layer 4 (per-account multi-window routing) ------

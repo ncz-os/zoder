@@ -159,6 +159,7 @@ impl Role {
 /// `[routing.scenarios.<name>]`. All fields are public so an operator can
 /// inspect what their active scenario is doing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteScenario {
     /// Class preference order for the author role. Earlier = preferred.
     /// The router keeps the candidate ranking (capability × health) and
@@ -202,6 +203,7 @@ pub struct RouteScenario {
 /// in `config.json` / overlay TOMLs. Use [`RouteScenarioOverride::apply`]
 /// (or [`resolve_active`]) to fold an override onto a preset.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteScenarioOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_classes: Option<Vec<ProviderClass>>,

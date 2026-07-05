@@ -281,6 +281,7 @@ impl Default for Theme {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub providers: Vec<Provider>,
     /// Default provider id for routed (`auto`) requests.
@@ -362,6 +363,7 @@ pub struct Config {
 /// Routing-scenario block from `config.json` / an overlay TOML. Mirrors the
 /// `[routing]` table; the actual scenario data lives in `scenarios`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     /// Active scenario name (e.g. `economy`, `balanced`, `aggressive`,
     /// `unlimited`). Defaults to `balanced`; an unknown name is a graceful
@@ -1385,6 +1387,7 @@ mod tests {
                 tokens_in: 0,
                 tokens_out: 0,
                 cost_usd: 0.0,
+                cost_unknown: false,
                 calls: 1,
                 violation: None,
                 tags: crate::ledger::FinOpsTags::default(),
@@ -1788,5 +1791,16 @@ auth = { type = "env", var = "ACME_KEY" }
         assert!(errs.contains("empty name"), "{errs}");
         assert!(errs.contains("hours must"), "{errs}");
         assert!(errs.contains("cap must"), "{errs}");
+    }
+
+    #[test]
+    fn config_deserialization_rejects_misspelled_scenario_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(Config::default_provider(dir.path())).unwrap();
+        value["routing"]["scenarios"] = serde_json::json!({
+            "balanced": {"cap_gaurd": 50.0}
+        });
+        let err = serde_json::from_value::<Config>(value).unwrap_err();
+        assert!(err.to_string().contains("cap_gaurd"), "{err}");
     }
 }

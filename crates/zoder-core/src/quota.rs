@@ -450,6 +450,7 @@ mod tests {
             tokens_in: 0,
             tokens_out: 0,
             cost_usd: 0.0,
+            cost_unknown: false,
             calls,
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),

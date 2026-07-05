@@ -196,6 +196,7 @@ async fn complete_once(
         tokens_in,
         tokens_out,
         cost_usd: cost,
+        cost_unknown: unknown_cost,
         calls: 1,
         violation,
         tags: zoder_core::ledger::FinOpsTags::default(),
@@ -972,16 +973,22 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
                 "ok": ok,
                 "content": t.run.content,
                 "tool_calls": t.run.tool_calls,
-                "cost_usd": t.cost_usd,
+                "cost_usd": (!t.cost_unknown).then_some(t.cost_usd),
+                "cost_unknown": t.cost_unknown,
                 "duration_ms": t.elapsed_ms,
             })
         );
     } else {
         println!();
         if !cli.quiet {
+            let cost_label = if t.cost_unknown {
+                "unknown".to_string()
+            } else {
+                format!("${:.4}", t.cost_usd)
+            };
             eprintln!(
-                "[zoder] rescue {} via {}  {} tools  ${:.4}  {:.0}ms  [{}]",
-                t.model, t.alias, t.run.tool_calls, t.cost_usd, t.elapsed_ms, t.run.outcome
+                "[zoder] rescue {} via {}  {} tools  {}  {:.0}ms  [{}]",
+                t.model, t.alias, t.run.tool_calls, cost_label, t.elapsed_ms, t.run.outcome
             );
             if timed_out {
                 eprintln!(
@@ -1014,7 +1021,8 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
                 "session_id": t.run.session_id,
                 "model": t.model,
                 "tool_calls": t.run.tool_calls,
-                "cost_usd": t.cost_usd,
+                "cost_usd": (!t.cost_unknown).then_some(t.cost_usd),
+                "cost_unknown": t.cost_unknown,
                 "duration_ms": t.elapsed_ms,
             })
             .to_string(),

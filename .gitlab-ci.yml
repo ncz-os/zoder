@@ -90,7 +90,7 @@ clippy:
   stage: check
   script:
     - rustup component add clippy
-    - cargo clippy --workspace --all-targets --all-features -- -D warnings
+    - cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
 check:
   stage: check
@@ -115,7 +115,7 @@ security:
     # `curl ... install-from-binstall-release.sh | bash` (Finding #15).
     # Helper script downloads + verifies + extracts an immutable asset.
     - scripts/ci/ci-prepare-tools.sh binstall
-    - cargo binstall -y cargo-deny
+    - cargo binstall -y cargo-deny@0.16.2
     - cargo deny check
     - cargo fetch --locked
 
