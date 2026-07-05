@@ -4,9 +4,11 @@
 
 use anyhow::Context;
 use chrono::{DateTime, Datelike, IsoWeek, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Optional FinOps tags attached to a ledger entry at ingestion time.
@@ -33,6 +35,11 @@ pub struct FinOpsTags {
 /// multi-gigabyte garbage line; matches `provider.rs`'s
 /// `MAX_LINE_BYTES` for streaming SSE.
 const MAX_LEDGER_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// Space allocated before a billable call. The completed entry is written into
+/// this already-allocated region, so a full filesystem cannot strand spend
+/// after dispatch. Ledger entries contain metadata, not prompts/responses; 64
+/// KiB leaves ample reconciliation headroom while keeping the bound explicit.
+const BILLABLE_RESERVATION_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -90,7 +97,8 @@ impl Entry {
 }
 
 fn entry_numbers_valid(e: &Entry) -> bool {
-    e.cost_usd.is_finite()
+    e.calls > 0
+        && e.cost_usd.is_finite()
         && e.cost_usd >= 0.0
         && e.tags
             .cache_hit_ratio
@@ -177,6 +185,69 @@ pub struct Ledger {
     path: PathBuf,
 }
 
+/// Exclusive, preallocated accounting transaction for one billable dispatch.
+/// If dropped without reconciliation, its valid unknown-cost row remains in
+/// the ledger, forcing subsequent budget/reporting decisions to fail closed.
+pub struct BillableReservation {
+    file: File,
+    offset: u64,
+    slot_bytes: usize,
+    month_to_date: Result<f64, String>,
+    armed: bool,
+}
+
+impl BillableReservation {
+    /// Month-to-date known spend from the strict snapshot protected by this
+    /// reservation's exclusive lock.
+    pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.month_to_date
+            .as_ref()
+            .copied()
+            .map_err(|message| anyhow::anyhow!(message.clone()))
+    }
+
+    /// Mark the reservation as immediately preceding dispatch. Before this is
+    /// called, dropping the guard cancels the slot (for example when a user
+    /// declines a budget prompt); afterward, an unreconciled slot is retained
+    /// as unknown spend so failures cannot become unaccounted retries.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Replace the preallocated unknown-cost reservation with the final entry.
+    /// No allocation or append is needed after the provider has been called.
+    pub fn reconcile(mut self, entry: &Entry) -> anyhow::Result<()> {
+        self.armed = true;
+        if !entry_numbers_valid(entry) {
+            anyhow::bail!("ledger entry contains invalid cost, calls, or cache-hit telemetry");
+        }
+        let json = serde_json::to_vec(entry)?;
+        if json.len() + 1 > self.slot_bytes {
+            anyhow::bail!(
+                "ledger entry is {} bytes, exceeding the {}-byte preallocated reconciliation slot",
+                json.len() + 1,
+                self.slot_bytes
+            );
+        }
+        let mut line = vec![b' '; self.slot_bytes];
+        line[..json.len()].copy_from_slice(&json);
+        line[self.slot_bytes - 1] = b'\n';
+        self.file.seek(SeekFrom::Start(self.offset))?;
+        self.file.write_all(&line)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+}
+
+impl Drop for BillableReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            let _ = self.file.set_len(self.offset);
+            let _ = self.file.sync_data();
+        }
+    }
+}
+
 impl Ledger {
     pub fn new(path: &Path) -> Self {
         Self {
@@ -186,10 +257,11 @@ impl Ledger {
 
     pub fn record(&self, e: &Entry) -> anyhow::Result<()> {
         if !entry_numbers_valid(e) {
-            anyhow::bail!("ledger entry contains invalid cost or cache-hit telemetry");
+            anyhow::bail!("ledger entry contains invalid cost, calls, or cache-hit telemetry");
         }
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating ledger directory {}", parent.display()))?;
         }
         // Serialize record + newline into one buffer and emit it with a single
         // write_all. With O_APPEND this is one syscall, so concurrent writers
@@ -198,10 +270,78 @@ impl Ledger {
         line.push('\n');
         let mut f = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(&self.path)?;
+        f.lock_exclusive()?;
+        self.entries_strict_unlocked()?;
+        f.seek(SeekFrom::End(0))?;
         f.write_all(line.as_bytes())?;
+        f.sync_data()?;
         Ok(())
+    }
+
+    /// Lock, strictly validate, and preallocate the durable row that will be
+    /// reconciled after one external billable dispatch. Callers must acquire
+    /// this before their budget check and retain it through `reconcile`.
+    pub fn reserve_billable(&self) -> anyhow::Result<BillableReservation> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!("opening ledger for reservation at {}", self.path.display())
+            })?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
+        let entries = self.entries_strict_unlocked()?;
+        let month_to_date = month_to_date_from_entries(&entries).map_err(|error| error.to_string());
+
+        let offset = file.seek(SeekFrom::End(0))?;
+        let pending = Entry {
+            ts_utc: Utc::now(),
+            provider: "__zoder_reservation__".to_string(),
+            model: "__pending_billable_call__".to_string(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: Some("billable call reserved but not reconciled".to_string()),
+            tags: FinOpsTags::default(),
+        };
+        let json = serde_json::to_vec(&pending)?;
+        debug_assert!(json.len() < BILLABLE_RESERVATION_BYTES);
+        let mut slot = vec![b' '; BILLABLE_RESERVATION_BYTES];
+        slot[..json.len()].copy_from_slice(&json);
+        slot[BILLABLE_RESERVATION_BYTES - 1] = b'\n';
+        file.write_all(&slot).with_context(|| {
+            format!(
+                "preallocating billable ledger entry at {}",
+                self.path.display()
+            )
+        })?;
+        file.sync_data().with_context(|| {
+            format!(
+                "syncing billable ledger reservation at {}",
+                self.path.display()
+            )
+        })?;
+        Ok(BillableReservation {
+            file,
+            offset,
+            slot_bytes: BILLABLE_RESERVATION_BYTES,
+            month_to_date,
+            armed: false,
+        })
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -310,6 +450,20 @@ impl Ledger {
     /// malformed. Quota and budget decisions must use this stricter view: a
     /// skipped row may contain spend, so continuing would be fail-open.
     pub fn entries_strict(&self) -> anyhow::Result<Vec<Entry>> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("opening ledger at {}", self.path.display())))
+            }
+        };
+        FileExt::lock_shared(&file)
+            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
+        self.entries_strict_unlocked()
+    }
+
+    fn entries_strict_unlocked(&self) -> anyhow::Result<Vec<Entry>> {
         let mut malformed_lines = Vec::new();
         let entries = self
             .entries_observed(|line_no, _| malformed_lines.push(line_no))
@@ -335,7 +489,7 @@ impl Ledger {
         until: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<Entry>> {
         Ok(self
-            .entries()?
+            .entries_strict()?
             .into_iter()
             .filter(|e| since.map(|s| e.ts_utc >= s).unwrap_or(true))
             .filter(|e| until.map(|u| e.ts_utc <= u).unwrap_or(true))
@@ -378,23 +532,7 @@ impl Ledger {
     /// any read failure into `0.0` is what let a corrupted ledger under-
     /// report spend to $0 and bypass the monthly cap (Finding #10).
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
-        let bucket = Utc::now().format("%Y-%m").to_string();
-        let entries = self.entries_strict()?;
-
-        let mut rollup = Rollup::default();
-        for entry in entries
-            .iter()
-            .filter(|entry| Period::Month.bucket(&entry.ts_utc) == bucket)
-        {
-            accumulate_rollup(&mut rollup, entry)?;
-        }
-        if rollup.unknown_cost_calls > 0 {
-            anyhow::bail!(
-                "month-to-date spend contains {} call(s) with unknown cost",
-                rollup.unknown_cost_calls
-            );
-        }
-        Ok(rollup.cost_usd)
+        month_to_date_from_entries(&self.entries_strict()?)
     }
 
     /// Spend rolled up by period bucket within an optional date window.
@@ -457,6 +595,24 @@ impl Ledger {
         }
         Ok(out)
     }
+}
+
+fn month_to_date_from_entries(entries: &[Entry]) -> anyhow::Result<f64> {
+    let bucket = Utc::now().format("%Y-%m").to_string();
+    let mut rollup = Rollup::default();
+    for entry in entries
+        .iter()
+        .filter(|entry| Period::Month.bucket(&entry.ts_utc) == bucket)
+    {
+        accumulate_rollup(&mut rollup, entry)?;
+    }
+    if rollup.unknown_cost_calls > 0 {
+        anyhow::bail!(
+            "month-to-date spend contains {} call(s) with unknown cost",
+            rollup.unknown_cost_calls
+        );
+    }
+    Ok(rollup.cost_usd)
 }
 
 #[cfg(test)]
@@ -722,5 +878,42 @@ mod tests {
         let err = led.month_to_date_usd().unwrap_err().to_string();
         assert!(err.contains("malformed"), "{err}");
         assert!(err.contains("line(s) 2"), "{err}");
+    }
+
+    #[test]
+    fn zero_call_entry_is_rejected_by_record_and_strict_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut invalid = entry("2026-07-01 10:00:00", "m", 0.0, 10, 5, 0);
+        invalid.cost_unknown = true;
+        assert!(Ledger::new(&path).record(&invalid).is_err());
+
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let error = Ledger::new(&path).entries_strict().unwrap_err().to_string();
+        assert!(error.contains("malformed"), "{error}");
+    }
+
+    #[test]
+    fn reservation_reconciles_into_one_final_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let reservation = ledger.reserve_billable().unwrap();
+        reservation
+            .reconcile(&entry("2026-07-01 10:00:00", "m", 0.25, 10, 5, 1))
+            .unwrap();
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cost_usd, 0.25);
+        assert!(!entries[0].cost_unknown);
+    }
+
+    #[test]
+    fn unarmed_reservation_is_cancelled_without_a_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        drop(ledger.reserve_billable().unwrap());
+        assert!(ledger.entries_strict().unwrap().is_empty());
     }
 }

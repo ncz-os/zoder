@@ -218,10 +218,20 @@ pub fn spend_by_dimension(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Vec<SpendGroup>> {
-    let entries = ledger.entries_in(since, until)?;
+    let entries = ledger.entries_strict()?;
+    Ok(spend_by_dimension_from_entries(
+        entries_in(&entries, since, until),
+        dim,
+    ))
+}
+
+fn spend_by_dimension_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    dim: Dimension,
+) -> Vec<SpendGroup> {
     let mut acc: BTreeMap<String, SpendGroup> = BTreeMap::new();
     for e in entries {
-        let tags = parse_tags(&e);
+        let tags = parse_tags(e);
         let key_opt: Option<String> = match dim {
             Dimension::Caller => tags.caller.clone(),
             Dimension::Task => tags.task.clone(),
@@ -267,7 +277,7 @@ pub fn spend_by_dimension(
             .partial_cmp(&a.cost_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(v)
+    v
 }
 
 /// Realized $/Mtok per model — what you actually paid per million tokens,
@@ -277,7 +287,15 @@ pub fn realized_rate_by_model(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Vec<ModelRealized>> {
-    let entries = ledger.entries_in(since, until)?;
+    let entries = ledger.entries_strict()?;
+    Ok(realized_rate_from_entries(entries_in(
+        &entries, since, until,
+    )))
+}
+
+fn realized_rate_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+) -> Vec<ModelRealized> {
     let mut acc: BTreeMap<String, ModelRealized> = BTreeMap::new();
     for e in entries {
         let tot = e.tokens_in.saturating_add(e.tokens_out);
@@ -316,7 +334,7 @@ pub fn realized_rate_by_model(
             .partial_cmp(&a.cost_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(v)
+    v
 }
 
 pub fn cache_savings_by_model(
@@ -325,13 +343,23 @@ pub fn cache_savings_by_model(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Vec<CacheSavingsRow>> {
-    let entries = ledger.entries_in(since, until)?;
+    let entries = ledger.entries_strict()?;
+    Ok(cache_savings_from_entries(
+        entries_in(&entries, since, until),
+        pricing,
+    ))
+}
+
+fn cache_savings_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    pricing: &PricingCatalog,
+) -> Vec<CacheSavingsRow> {
     let mut rows: BTreeMap<String, CacheSavingsRow> = BTreeMap::new();
     for e in entries {
         if e.cost_unknown {
             continue;
         }
-        let tags = parse_tags(&e);
+        let tags = parse_tags(e);
         let hit = tags.cache_hit_ratio.unwrap_or(0.0);
         if hit <= 0.0 {
             continue;
@@ -371,7 +399,7 @@ pub fn cache_savings_by_model(
             .partial_cmp(&a.est_savings_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(v)
+    v
 }
 
 pub fn cheapest_equivalent_advisor(
@@ -380,7 +408,17 @@ pub fn cheapest_equivalent_advisor(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Vec<AdvisorRow>> {
-    let entries = ledger.entries_in(since, until)?;
+    let entries = ledger.entries_strict()?;
+    Ok(advisor_from_entries(
+        entries_in(&entries, since, until),
+        pricing,
+    ))
+}
+
+fn advisor_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    pricing: &PricingCatalog,
+) -> Vec<AdvisorRow> {
     let mut paid: BTreeMap<String, (f64, u64, u64)> = BTreeMap::new();
     for e in entries {
         if e.cost_unknown || e.cost_usd <= 0.0 {
@@ -392,7 +430,7 @@ pub fn cheapest_equivalent_advisor(
         r.2 = r.2.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
     }
     if paid.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut rates: Vec<(String, f64)> = pricing
         .models
@@ -445,11 +483,20 @@ pub fn cheapest_equivalent_advisor(
             .partial_cmp(&a.potential_savings_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(out)
+    out
 }
 
 pub fn forecast_burn(
     ledger: &Ledger,
+    window_days: u32,
+    until: DateTime<Utc>,
+) -> anyhow::Result<BurnForecast> {
+    let entries = ledger.entries_strict()?;
+    forecast_burn_from_entries(&entries, window_days, until)
+}
+
+fn forecast_burn_from_entries(
+    entries: &[Entry],
     window_days: u32,
     until: DateTime<Utc>,
 ) -> anyhow::Result<BurnForecast> {
@@ -472,9 +519,8 @@ pub fn forecast_burn(
         .and_hms_opt(0, 0, 0)
         .expect("midnight is always a valid time")
         .and_utc();
-    let entries = ledger.entries_in(Some(since), Some(until))?;
     let mut daily = vec![0.0; window_days as usize];
-    for e in entries {
+    for e in entries_in(entries, Some(since), Some(until)) {
         if e.cost_unknown {
             continue;
         }
@@ -514,13 +560,26 @@ pub fn build_finops_report(
     until: DateTime<Utc>,
     window_days: u32,
 ) -> anyhow::Result<FinOpsReport> {
-    let entries = ledger.entries_in(Some(since), Some(until))?;
+    // One strict, shared-lock-protected snapshot feeds every section. This
+    // prevents concurrent appends from producing internally inconsistent totals.
+    let snapshot = ledger.entries_strict()?;
+    build_finops_report_from_entries(&snapshot, pricing, since, until, window_days)
+}
+
+fn build_finops_report_from_entries(
+    snapshot: &[Entry],
+    pricing: &PricingCatalog,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    window_days: u32,
+) -> anyhow::Result<FinOpsReport> {
+    let entries: Vec<&Entry> = entries_in(snapshot, Some(since), Some(until)).collect();
     let mut cost = 0.0;
     let mut tokens = 0u64;
     let mut calls = 0u64;
     let mut unknown_cost_tokens = 0u64;
     let mut unknown_cost_calls = 0u64;
-    for e in entries {
+    for e in &entries {
         if e.cost_unknown {
             unknown_cost_tokens =
                 unknown_cost_tokens.saturating_add(e.tokens_in.saturating_add(e.tokens_out));
@@ -540,14 +599,25 @@ pub fn build_finops_report(
         total_calls: calls,
         unknown_cost_tokens,
         unknown_cost_calls,
-        by_caller: spend_by_dimension(ledger, Dimension::Caller, Some(since), Some(until))?,
-        by_task: spend_by_dimension(ledger, Dimension::Task, Some(since), Some(until))?,
-        by_host: spend_by_dimension(ledger, Dimension::Host, Some(since), Some(until))?,
-        by_model_realized: realized_rate_by_model(ledger, Some(since), Some(until))?,
-        cache_savings: cache_savings_by_model(ledger, pricing, Some(since), Some(until))?,
-        advisor: cheapest_equivalent_advisor(ledger, pricing, Some(since), Some(until))?,
-        forecast: forecast_burn(ledger, window_days, until)?,
+        by_caller: spend_by_dimension_from_entries(entries.iter().copied(), Dimension::Caller),
+        by_task: spend_by_dimension_from_entries(entries.iter().copied(), Dimension::Task),
+        by_host: spend_by_dimension_from_entries(entries.iter().copied(), Dimension::Host),
+        by_model_realized: realized_rate_from_entries(entries.iter().copied()),
+        cache_savings: cache_savings_from_entries(entries.iter().copied(), pricing),
+        advisor: advisor_from_entries(entries.iter().copied(), pricing),
+        forecast: forecast_burn_from_entries(snapshot, window_days, until)?,
     })
+}
+
+fn entries_in(
+    entries: &[Entry],
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> impl Iterator<Item = &Entry> {
+    entries
+        .iter()
+        .filter(move |entry| since.is_none_or(|value| entry.ts_utc >= value))
+        .filter(move |entry| until.is_none_or(|value| entry.ts_utc <= value))
 }
 
 fn fmt_count(n: u64) -> String {
@@ -791,6 +861,7 @@ fn parse_date(s: String) -> anyhow::Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn rec(led: &Ledger, ts: &str, provider: &str, model: &str, cost: f64, tin: u64, tout: u64) {
         let ts_utc = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
@@ -915,6 +986,50 @@ mod tests {
         let tasks = spend_by_dimension(&led, Dimension::Task, None, None).unwrap();
         assert_eq!(tasks[0].key, "review");
         assert_eq!(parse_tags(&entry).cache_hit_ratio, Some(0.5));
+    }
+
+    #[test]
+    fn strict_reporting_refuses_malformed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let led = Ledger::new(&path);
+        rec(&led, "2026-06-10 10:00:00", "p", "m", 1.0, 10, 5);
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"{\"truncated\":\n").unwrap();
+        let error = spend_by_dimension(&led, Dimension::Model, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("malformed"), "{error}");
+    }
+
+    #[test]
+    fn report_sections_derive_from_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        rec(&led, "2026-06-10 10:00:00", "p", "m", 1.0, 10, 5);
+        let snapshot = led.entries_strict().unwrap();
+        rec(&led, "2026-06-11 10:00:00", "p", "m", 2.0, 20, 10);
+        let since = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let until = chrono::NaiveDate::from_ymd_opt(2026, 6, 30)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc();
+        let report = build_finops_report_from_entries(
+            &snapshot,
+            &PricingCatalog::default(),
+            since,
+            until,
+            30,
+        )
+        .unwrap();
+        assert_eq!(report.total_cost_usd, 1.0);
+        assert_eq!(report.by_model_realized[0].cost_usd, report.total_cost_usd);
+        assert_eq!(report.by_model_realized[0].calls, report.total_calls);
     }
 
     #[test]

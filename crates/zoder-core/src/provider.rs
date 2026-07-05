@@ -17,6 +17,10 @@ const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
 /// Max bytes buffered without a line terminator before we bail.
 const MAX_BUFFER_BYTES: usize = 16 << 20; // 16 MiB
+/// Maximum wire bytes accepted on any provider response path.
+const MAX_RESPONSE_BYTES: usize = 16 << 20; // 16 MiB
+/// Independent ceiling for decoded answer text accumulated across SSE frames.
+const MAX_CONTENT_BYTES: usize = 8 << 20; // 8 MiB
 
 fn env_secs(var: &str, default: u64) -> u64 {
     std::env::var(var)
@@ -390,6 +394,47 @@ impl OpenAiProvider {
         endpoint_url(&self.base_url, &self.kind, suffix)
     }
 
+    async fn read_limited_body(
+        &self,
+        resp: reqwest::Response,
+        label: &str,
+    ) -> Result<Vec<u8>, ProviderError> {
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                format!("{label} exceeded {MAX_RESPONSE_BYTES} byte response ceiling"),
+            ));
+        }
+        let deadline = Instant::now() + self.request_timeout;
+        let mut stream = resp.bytes_stream();
+        let mut body = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ProviderError::new(
+                    ErrKind::Timeout,
+                    format!("request timeout reading {label}"),
+                ));
+            }
+            let next = timeout(remaining, stream.next()).await.map_err(|_| {
+                ProviderError::new(ErrKind::Timeout, format!("request timeout reading {label}"))
+            })?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(classify_reqwest)?;
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(ProviderError::new(
+                    ErrKind::Decode,
+                    format!("{label} exceeded {MAX_RESPONSE_BYTES} byte response ceiling"),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     /// Fetch the live set of served model ids from the provider's models route.
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         let mut rb = self.client.get(self.endpoint("models"));
@@ -417,8 +462,8 @@ impl OpenAiProvider {
                 emitted: false,
             });
         }
-        let body = resp.text().await.map_err(classify_reqwest)?;
-        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        let body = self.read_limited_body(resp, "models list").await?;
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
             ProviderError::new(ErrKind::Decode, format!("malformed models list: {e}"))
         })?;
         let ids = v
@@ -510,7 +555,11 @@ impl OpenAiProvider {
                 500..=599 => ErrKind::Server,
                 _ => ErrKind::Http,
             };
-            let body = resp.text().await.unwrap_or_default();
+            let body = self
+                .read_limited_body(resp, "HTTP error body")
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|error| format!("[{}]", error.message));
             return Err(ProviderError {
                 message: format!("provider HTTP {status}: {}", redact(&body)),
                 kind,
@@ -557,20 +606,8 @@ impl OpenAiProvider {
         telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
-        let body = match timeout(self.request_timeout, resp.text()).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return Err(classify_reqwest(e)),
-            Err(_) => {
-                return Err(ProviderError::new(
-                    ErrKind::Timeout,
-                    format!(
-                        "request timeout reading body after {:?}",
-                        self.request_timeout
-                    ),
-                ))
-            }
-        };
-        let parsed: ChatCompletion = serde_json::from_str(&body).map_err(|e| {
+        let body = self.read_limited_body(resp, "chat completion").await?;
+        let parsed: ChatCompletion = serde_json::from_slice(&body).map_err(|e| {
             ProviderError::new(
                 ErrKind::Decode,
                 format!("malformed chat-completion response: {e}"),
@@ -588,6 +625,12 @@ impl OpenAiProvider {
             msg.reasoning,
             req.show_reasoning,
         );
+        if content.len() > MAX_CONTENT_BYTES {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                format!("decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"),
+            ));
+        }
         if let Some(s) = sink {
             let _ = s.write_all(content.as_bytes());
             let _ = s.flush();
@@ -628,6 +671,7 @@ impl OpenAiProvider {
         // same model would duplicate visible output.
         let mut emitted = false;
         let mut stream = resp.bytes_stream();
+        let mut response_bytes = 0usize;
         // Accumulate raw bytes; split on the 0x0A byte so multibyte UTF-8 chars
         // that straddle network chunks are never corrupted.
         let mut buf: Vec<u8> = Vec::new();
@@ -675,6 +719,14 @@ impl OpenAiProvider {
                 pe.emitted = emitted;
                 pe
             })?;
+            response_bytes = response_bytes.saturating_add(bytes.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
+                return Err(fail(
+                    ErrKind::Decode,
+                    format!("stream exceeded {MAX_RESPONSE_BYTES} byte response ceiling"),
+                    emitted,
+                ));
+            }
             buf.extend_from_slice(&bytes);
             if buf.len() > MAX_BUFFER_BYTES {
                 return Err(fail(
@@ -741,6 +793,15 @@ impl OpenAiProvider {
                         req.show_reasoning,
                     );
                     if !piece.is_empty() {
+                        if content.len().saturating_add(piece.len()) > MAX_CONTENT_BYTES {
+                            return Err(fail(
+                                ErrKind::Decode,
+                                format!(
+                                    "decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"
+                                ),
+                                emitted,
+                            ));
+                        }
                         chunk_count += 1;
                         content.push_str(&piece);
                         if let Some(s) = sink.as_deref_mut() {

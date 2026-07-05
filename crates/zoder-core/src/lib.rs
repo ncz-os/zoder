@@ -54,7 +54,7 @@ pub use finops::{
     cli_run as finops_cli, forecast_burn, realized_rate_by_model, spend_by_dimension, AdvisorRow,
     BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, ModelRealized, SpendGroup,
 };
-pub use ledger::{Entry, FinOpsTags, Ledger, Period, Rollup};
+pub use ledger::{BillableReservation, Entry, FinOpsTags, Ledger, Period, Rollup};
 pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{CostVerdict, ModelPrice, PricingCatalog};

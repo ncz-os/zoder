@@ -26,12 +26,13 @@ use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
     estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, probe_request,
-    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
-    BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, CostVerdict, Decision,
-    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
-    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
-    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
-    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy,
+    BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult, Config, Corpus,
+    CostSnapshot, CostVerdict, Decision, EngineKind, Entry, GooseProviderEnv, Gran, HealthStore,
+    Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
+    ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat,
+    Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
+    PROBE_PING_TIMEOUT_SECS,
 };
 
 fn finops_task(cli: &Cli) -> &'static str {
@@ -71,13 +72,13 @@ fn finops_tags(
 /// accounting is a quota-control boundary, so every caller must propagate a
 /// write failure instead of allowing an unrecorded paid turn to succeed.
 pub(crate) fn record_turn_entry(
-    ledger_path: &Path,
+    reservation: BillableReservation,
     entry: &Entry,
     turn_kind: &str,
 ) -> anyhow::Result<()> {
-    Ledger::new(ledger_path)
-        .record(entry)
-        .with_context(|| format!("recording {turn_kind} spend in {}", ledger_path.display()))
+    reservation
+        .reconcile(entry)
+        .with_context(|| format!("reconciling reserved {turn_kind} spend"))
 }
 
 #[derive(Parser, Clone)]
@@ -2688,6 +2689,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     let prompt = read_prompt(prompt)?;
 
+    // Serialize the authoritative budget snapshot with dispatch and reserve
+    // durable space for reconciliation before any provider can incur spend.
+    let mut ledger_reservation = Ledger::new(&eng.cfg.ledger_path)
+        .reserve_billable()
+        .with_context(|| "reserving ledger entry before oneshot dispatch")?;
+
     // Pre-call budget guard: project this call's cost from the prompt size and
     // the configured output estimate, then gate against the per-call and
     // month-to-date caps. A `Free` (explicit-zero) or `Unknown` (missing
@@ -2707,7 +2714,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             estimate_tokens(&prompt),
             u64::from(cli.max_tokens),
             Some(now),
-            || Ledger::new(&eng.cfg.ledger_path).month_to_date_usd(),
+            || ledger_reservation.month_to_date_usd(),
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
@@ -2835,6 +2842,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // the chain-wide elapsed time (which would fold in prior models' time
         // plus retry backoff and skew the router's latency EWMA).
         let model_started = std::time::Instant::now();
+        ledger_reservation.arm();
         match try_model(provider, &req, cli.json, cli.retries, cli.quiet).await {
             Ok(res) => {
                 // Defer the winning model's health recording until after the
@@ -2908,7 +2916,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         });
     }
     record_turn_entry(
-        &eng.cfg.ledger_path,
+        ledger_reservation,
         &Entry {
             ts_utc,
             provider: used_provider_id.clone(),
@@ -3237,13 +3245,19 @@ mod ledger_integrity_tests {
     }
 
     #[test]
-    fn unrecorded_write_fails_the_turn() {
+    fn non_writable_ledger_blocks_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         // Opening a directory as the append-only ledger file always fails,
         // independent of the test runner's user/permission model.
-        let err = record_turn_entry(dir.path(), &test_entry(), "agentic turn")
-            .expect_err("an unrecorded paid turn must not report success");
-        assert!(err.to_string().contains("recording agentic turn spend"));
+        let dispatched = std::cell::Cell::new(false);
+        let result = Ledger::new(dir.path())
+            .reserve_billable()
+            .map(|reservation| {
+                dispatched.set(true);
+                record_turn_entry(reservation, &test_entry(), "agentic turn")
+            });
+        assert!(result.is_err(), "reservation must fail before dispatch");
+        assert!(!dispatched.get(), "provider dispatch must never be reached");
     }
 
     #[test]
@@ -3336,13 +3350,19 @@ pub(crate) async fn agentic_turn(
         }
     }
 
+    // The reservation lock covers the budget decision, engine dispatch, and
+    // final reconciliation. A non-appendable ledger stops the call here.
+    let mut ledger_reservation = Ledger::new(&eng.cfg.ledger_path)
+        .reserve_billable()
+        .with_context(|| "reserving ledger entry before agentic dispatch")?;
+
     // Default agentic execution uses the same fail-closed pre-call budget
     // classification as --oneshot. Agent dispatch must not bypass unknown
     // pricing, per-call caps, or month-to-date caps.
     if !cli.allow_paid {
         let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
         let verdict = evaluate_default_exec_budget(&eng.cfg, &pricing, &primary, &prompt, || {
-            Ledger::new(&eng.cfg.ledger_path).month_to_date_usd()
+            ledger_reservation.month_to_date_usd()
         });
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
@@ -3437,6 +3457,7 @@ pub(crate) async fn agentic_turn(
     // before any daemon setup, so a Goose request never starts zeroclaw and an
     // unknown value surfaces as a parse error up front.
     let agentic_usage = std::cell::Cell::new(0_u64);
+    ledger_reservation.arm();
     let run = run_agent_dispatch(engine_kind, &opts, |ev| {
         if let AgentEvent::Utilization { headers } = &ev {
             agentic::persist_agentic_utilization(&routed_provider, headers);
@@ -3522,7 +3543,7 @@ pub(crate) async fn agentic_turn(
     };
 
     record_turn_entry(
-        &eng.cfg.ledger_path,
+        ledger_reservation,
         &Entry {
             ts_utc: chrono::Utc::now(),
             // Attribute to the provider that serves the model the engine actually
