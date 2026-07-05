@@ -64973,8 +64973,8 @@
       "paid": false,
       "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
       "economics": {
-        "input_usd_per_mtok": 0.728,
-        "output_usd_per_mtok": 2.288,
+        "input_usd_per_mtok": 0.5740000000000001,
+        "output_usd_per_mtok": 1.804,
         "source": "openrouter"
       },
       "agentic_score": 0.665,
