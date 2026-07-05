@@ -17,8 +17,9 @@ use zoder_core::subscription_tiers::{
     load_tier_catalog, resolve_plan_windows, ResolvedPlan, TierCatalog,
 };
 use zoder_core::utilization::{
-    build_account_view, decide_account, AccountDecision, AccountView, Provider as UtilProvider,
-    RouteKnobs, TelemetryHealth, UtilizationStore,
+    build_account_view, decide_account, forecast_account, AccountDecision, AccountView,
+    Provider as UtilProvider, RouteKnobs, TelemetryHealth, UtilizationStore,
+    FORECAST_CONFIDENCE_MIN,
 };
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
@@ -4056,6 +4057,30 @@ fn render_subscription_utilization_section(
     s.push('\n');
     for (_label, _plan_name, view, decision, knobs) in &blocks {
         s.push_str(&render_account_block(view, decision, knobs, paint));
+        // KNEMON Layer 4b forecast note: project the binding window forward to
+        // its reset. Only surfaced above the routing-confidence floor, so a
+        // noisy/early window stays silent rather than showing a shaky number.
+        if let Some(f) = forecast_account(view, now) {
+            if f.confidence >= FORECAST_CONFIDENCE_MIN {
+                let projected = f.projected_used_percent;
+                let msg = if projected >= knobs.cap_guard {
+                    format!(
+                        "    forecast: on pace for {:.0}% by reset — will breach the {:.0}% cap guard; pre-empting to free",
+                        projected, knobs.cap_guard
+                    )
+                } else if projected < knobs.use_target {
+                    format!(
+                        "    forecast: on pace for {:.0}% by reset — ~{:.0}% of paid capacity left idle",
+                        projected,
+                        (100.0 - projected).max(0.0)
+                    )
+                } else {
+                    format!("    forecast: on pace for {:.0}% by reset", projected)
+                };
+                s.push_str(&paint.dim(&msg));
+                s.push('\n');
+            }
+        }
     }
     // Disclaimer footer: tiers.json wording, surfaced ONLY when the
     // catalog actually carries one. Operators with fully-explicit (no
