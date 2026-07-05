@@ -136,17 +136,18 @@ security:
 .trio: &trio
   stage: package
   rules:
-    - if: '$CI_COMMIT_TAG'      # tag push → full release build
-    - when: manual              # otherwise on-demand (don't burn runners every push)
+    - if: '$CI_COMMIT_TAG'                        # tag push → full release build
+    - if: '$CI_PIPELINE_SOURCE == "web"'          # on-demand from web (resolve is present)
+      when: manual                                # don't burn runners on every branch push
+  needs:
+    - job: resolve:zeroclaw-sha
+      artifacts: true
   variables:
-    # Pinned to an immutable SHA so all three architectures build against
-    # the same engine source. Bump intentionally, never "let it float".
-    #
-    # `ZEROCLAW_PINNED_SHA` is a project-level CI/CD variable holding an
-    # exact SHA (40 hex chars). package.sh will refuse to fetch any
-    # non-SHA value at runtime; the placeholder below means "set this
-    # in CI/CD variables" (Finding #17). The trio build will fail
-    # loudly if no SHA is configured.
+    # `ZEROCLAW_PINNED_SHA` is resolved fresh by resolve:zeroclaw-sha
+    # (ncz-os/zeroclaw:zoder-integration HEAD) and inherited via its dotenv
+    # artifact, so all three architectures build the SAME engine source with no
+    # hand-maintained project variable. package.sh refuses any non-40-hex value
+    # at runtime (Finding #17); the resolve job pre-validates it too.
     ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
     CARGO_PROFILE_RELEASE_DEBUG: "0"
@@ -232,11 +233,13 @@ release:trio:
 # because ZEROCLAW_REF was a mutable branch) the rolling `master`
 # channel ended up with new zoder + OLD zerocode/zeroclaw — a
 # broken-trio nightly. We now:
-#   - Pin ZEROCLAW_REF to an immutable SHA (set by the nightly
-#     cron — see the NIGHTLY_ZEROCLAW_SHA project variable).
+#   - Pin ZEROCLAW_REF to an immutable SHA resolved fresh each run by
+#     resolve:zeroclaw-sha (inherited via its dotenv artifact).
 #   - Build zerocode/zeroclaw FIRST; only after both succeed do we
 #     publish new zoder + new TUI pair to the rolling `master` channel.
-#   - Use --locked for reproducible source pinning across runners.
+#   - Reproducibility across runners = one pinned zoder-integration SHA
+#     (resolve:zeroclaw-sha), not the fork's drifting Cargo.lock. zoder's
+#     own build keeps --locked; the vendored engine build does not.
 .nightly-rules: &nightly-rules
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
@@ -247,13 +250,16 @@ release:trio:
 nightly:linux:
   stage: release
   <<: *nightly-rules
-  needs: []
+  needs:
+    - job: resolve:zeroclaw-sha
+      artifacts: true
   timeout: 90m
   variables:
-    # Pinned immutable SHA so this runner agrees with macos-arm64.
-    # NIGHTLY_ZEROCLAW_SHA is a project-level CI variable (a real SHA
-    # frozen by the nightly rotation job or by hand). Bump intentionally.
-    ZEROCLAW_REF: "${NIGHTLY_ZEROCLAW_SHA}"
+    # ZEROCLAW_PINNED_SHA is resolved fresh each run by resolve:zeroclaw-sha
+    # (ncz-os/zeroclaw:zoder-integration HEAD) and inherited via the dotenv
+    # artifact above, so this runner builds the SAME engine SHA as macos-arm64
+    # with no hand-maintained project variable. "master of the day", every day.
+    ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
@@ -275,7 +281,11 @@ nightly:linux:
       [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
       echo "nightly using zeroclaw SHA=$ZC_SHA"
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
+        # No --locked on the vendored engine: reproducibility comes from the
+        # pinned zoder-integration SHA (resolve:zeroclaw-sha), not the fork's
+        # checked-in Cargo.lock, which drifts (git deps) and breaks --locked.
+        # Matches scripts/package.sh. zoder's own build above stays --locked.
+        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
       done
       # Now safe to upload: all three binaries built successfully and
       # the engine SHA is pinned for this nightly. Publish zoder +
@@ -308,20 +318,24 @@ nightly:linux:
 nightly:macos-arm64:
   stage: release
   <<: *nightly-rules
-  needs: []
+  needs:
+    - job: resolve:zeroclaw-sha
+      artifacts: true
   tags: [fleet-macos-arm64]
   timeout: 90m
   variables:
     GIT_STRATEGY: clone
-    ZEROCLAW_REF: "${NIGHTLY_ZEROCLAW_SHA}"
+    # Same resolved SHA as nightly:linux (inherited from resolve:zeroclaw-sha's
+    # dotenv) — both nightlies build one identical engine revision per run.
+    ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
     - rustup target add aarch64-apple-darwin
     - cargo build --release --locked --bin zoder --target aarch64-apple-darwin
     - |
       # Build the TUI pair FIRST on the macOS runner using the same
-      # pinned SHA — both nightlies use NIGHTLY_ZEROCLAW_SHA so the
-      # engine revision is identical across architectures.
+      # resolved SHA — both nightlies inherit ZEROCLAW_PINNED_SHA from
+      # resolve:zeroclaw-sha so the engine revision is identical across arches.
       rm -rf .zc-src
       case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
       [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
@@ -329,7 +343,9 @@ nightly:macos-arm64:
       ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
       ZC_SHA=$(git -C .zc-src rev-parse HEAD)
       [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
-      ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+      # No --locked on the vendored engine (see nightly:linux) — reproducibility
+      # is the pinned zoder-integration SHA, matching scripts/package.sh.
+      ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
       mkdir -p dist
       echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
@@ -400,11 +416,22 @@ prune:nightly:
 # Resolve zoder-integration to an immutable commit SHA (package.sh requires a SHA
 # in CI). The kaniko-debug image has no git, so resolve here and hand it to
 # container:weekly via dotenv, giving a reproducible, SHA-pinned weekly image.
+# ── resolve: single source of truth for the engine SHA ──────────────────────
+# Every engine-consuming job (nightly, trio, container) builds against ONE
+# freshly-resolved ncz-os/zeroclaw:zoder-integration commit, so all three
+# architectures agree and nobody has to hand-maintain a NIGHTLY_ZEROCLAW_SHA /
+# ZEROCLAW_PINNED_SHA project variable (an unset var was silently failing every
+# scheduled nightly on the 40-hex guard). The resolved SHA is exported as the
+# `ZEROCLAW_PINNED_SHA` dotenv variable and inherited by downstream jobs via
+# `needs: [{job: resolve:zeroclaw-sha, artifacts: true}]`. Runs automatically on
+# schedule/trigger/tag; manual on web.
 resolve:zeroclaw-sha:
   stage: package
   image: rust:1.94@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c
   rules:
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG'
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
@@ -413,6 +440,8 @@ resolve:zeroclaw-sha:
   script:
     - ZEROCLAW_PINNED_SHA="$(git ls-remote "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git" refs/heads/zoder-integration | cut -f1)"
     - '[ -n "$ZEROCLAW_PINNED_SHA" ] || { echo "failed to resolve zoder-integration SHA" >&2; exit 1; }'
+    - 'case "$ZEROCLAW_PINNED_SHA" in *[!0-9a-fA-F]*|"") echo "resolved SHA is not 40-hex: $ZEROCLAW_PINNED_SHA" >&2; exit 1;; esac'
+    - '[ "${#ZEROCLAW_PINNED_SHA}" -eq 40 ] || { echo "resolved SHA is not 40 chars: $ZEROCLAW_PINNED_SHA" >&2; exit 1; }'
     - echo "pinned zeroclaw SHA -> $ZEROCLAW_PINNED_SHA"
     - echo "ZEROCLAW_PINNED_SHA=$ZEROCLAW_PINNED_SHA" > sha.env
   artifacts:
