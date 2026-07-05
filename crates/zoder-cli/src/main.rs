@@ -1959,21 +1959,58 @@ fn build_account_views_for_candidates(
                 None => return None,
             };
             let resolved = resolve_plan_windows(plan, &catalog, Some(&provider.id));
-            if resolved.windows.is_empty() {
+            let windows: Vec<_> = resolved
+                .windows
+                .into_iter()
+                .filter(|window| quota_window_applies_to_model(window, &c.model_id))
+                .collect();
+            if windows.is_empty() {
                 return None;
             }
             let util_prov = provider_id_to_util(&provider.id);
             let plan_label = plan_label(plan);
             Some(build_av(
-                util_prov,
-                "default",
-                plan_label,
-                &resolved.windows,
-                &store,
-                now,
+                util_prov, "default", plan_label, &windows, &store, now,
             ))
         })
         .collect()
+}
+
+fn quota_window_applies_to_model(window: &zoder_core::config::QuotaWindow, model_id: &str) -> bool {
+    window.models.as_ref().is_none_or(|patterns| {
+        patterns
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, model_id))
+    })
+}
+
+/// Match the small glob vocabulary used by quota model scopes: `*` matches
+/// any sequence and `?` matches one character.
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut p, mut v) = (0, 0);
+    let (mut star, mut star_value) = (None, 0);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            star_value = v;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            star_value += 1;
+            v = star_value;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
@@ -2736,6 +2773,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         tokens_in,
         tokens_out,
         cost_usd: cost,
+        cost_unknown: unknown_cost,
         calls: 1,
         violation,
         tags: zoder_core::ledger::FinOpsTags::default(),
@@ -2775,7 +2813,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "content": res.content,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "cost_usd": cost,
+                "cost_usd": (!unknown_cost).then_some(cost),
+                "cost_unknown": unknown_cost,
                 "served_by": res.telemetry.api_base,
                 "key_spend": res.telemetry.key_spend,
                 "duration_ms": res.telemetry.duration_ms,
@@ -2785,7 +2824,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     } else {
         println!();
         if !cli.quiet {
-            eprintln!("[zoder] {used_model}  {tokens_out} tok  ${cost:.4}  {elapsed_ms:.0}ms");
+            let cost_label = if unknown_cost {
+                "unknown".to_string()
+            } else {
+                format!("${cost:.4}")
+            };
+            eprintln!("[zoder] {used_model}  {tokens_out} tok  {cost_label}  {elapsed_ms:.0}ms");
         }
     }
     Ok(())
@@ -2947,6 +2991,7 @@ pub(crate) struct TurnResult {
     pub model: String,
     pub alias: String,
     pub cost_usd: f64,
+    pub cost_unknown: bool,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub elapsed_ms: f64,
@@ -3214,6 +3259,7 @@ pub(crate) async fn agentic_turn(
         tokens_in,
         tokens_out,
         cost_usd: cost,
+        cost_unknown: !cost_known,
         calls: 1,
         violation,
         tags: zoder_core::ledger::FinOpsTags::default(),
@@ -3236,6 +3282,7 @@ pub(crate) async fn agentic_turn(
         model: model_used,
         alias,
         cost_usd: cost,
+        cost_unknown: !cost_known,
         tokens_in,
         tokens_out,
         elapsed_ms,
@@ -3282,7 +3329,8 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "content": t.run.content,
                 "tokens_in": t.tokens_in,
                 "tokens_out": t.tokens_out,
-                "cost_usd": t.cost_usd,
+                "cost_usd": (!t.cost_unknown).then_some(t.cost_usd),
+                "cost_unknown": t.cost_unknown,
                 "tool_calls": t.run.tool_calls,
                 "cwd": agentic_cwd(cli)?.to_string_lossy(),
                 "duration_ms": t.elapsed_ms,
@@ -3291,9 +3339,14 @@ async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     } else {
         println!();
         if !cli.quiet {
+            let cost_label = if t.cost_unknown {
+                "unknown".to_string()
+            } else {
+                format!("${:.4}", t.cost_usd)
+            };
             eprintln!(
-                "[zoder] {} via {}  {} tools  ${:.4}  {:.0}ms  [{}]",
-                t.model, t.alias, t.run.tool_calls, t.cost_usd, t.elapsed_ms, t.run.outcome
+                "[zoder] {} via {}  {} tools  {}  {:.0}ms  [{}]",
+                t.model, t.alias, t.run.tool_calls, cost_label, t.elapsed_ms, t.run.outcome
             );
         }
     }
@@ -3902,8 +3955,17 @@ async fn cmd_report(
         }
     };
 
-    let paid: Vec<&_> = rep.by_model.iter().filter(|r| r.billed).collect();
-    let free: Vec<&_> = rep.by_model.iter().filter(|r| !r.billed).collect();
+    let paid: Vec<&_> = rep
+        .by_model
+        .iter()
+        .filter(|r| r.billed && !r.cost_unknown)
+        .collect();
+    let free: Vec<&_> = rep
+        .by_model
+        .iter()
+        .filter(|r| !r.billed && !r.cost_unknown)
+        .collect();
+    let unknown: Vec<&_> = rep.by_model.iter().filter(|r| r.cost_unknown).collect();
     let paid_tok: u64 = paid.iter().map(|r| r.tokens).sum();
     let free_tok: u64 = free.iter().map(|r| r.tokens).sum();
     let pct = |t: u64, total: u64| {
@@ -3920,7 +3982,7 @@ async fn cmd_report(
         p.dim("billed cloud usage — real $ (input/output per Mtok)")
     );
     if paid.is_empty() {
-        println!("  {}", p.dim("(none — all usage ran on free models)"));
+        println!("  {}", p.dim("(none)"));
     } else {
         let rate = |v: f64| {
             if v > 0.0 {
@@ -3959,6 +4021,26 @@ async fn cmd_report(
                 p.dim(&format!("… {} more paid (use --top 0)", paid.len() - top))
             );
         }
+    }
+
+    if !unknown.is_empty() {
+        println!(
+            "\n{}  {}",
+            p.amber("Unknown-cost models"),
+            p.dim("excluded from both spend and verified-free usage")
+        );
+        let mut t = Table::new(
+            &p,
+            vec![("model", Al::L), ("tokens(M)", Al::R), ("calls", Al::R)],
+        );
+        for r in unknown.iter().take(limit(unknown.len())) {
+            t.row(vec![
+                Cell::amber(name_cell(&r.model)),
+                Cell::new(format!("{:.1}", mtok(r.tokens))),
+                Cell::new(fmt_count(r.calls)),
+            ]);
+        }
+        t.print();
     }
 
     println!("\n{}  {}", p.green_b("Free models"), p.dim("$0 chargeback"));
@@ -4020,7 +4102,7 @@ async fn cmd_report(
             ],
         );
         for h in rep.by_host.iter().take(limit(rep.by_host.len())) {
-            let host_cell = if h.billed {
+            let host_cell = if h.billed || h.cost_unknown {
                 Cell::amber(h.host.clone())
             } else {
                 Cell::green(h.host.clone())
@@ -6317,6 +6399,7 @@ mod scenario_routing_tests {
     use super::*;
     use chrono::TimeZone;
     use zoder_core::classify_provider;
+    use zoder_core::config::{QuotaWindow, ResetKind};
     use zoder_core::scenarios::{
         candidate_eligible, chain_for_role, default_scenarios, pick_candidate_for_role,
         ProviderClass, Role as ScenarioRole, RoutableCandidate, RouteScenario,
@@ -6774,6 +6857,28 @@ mod scenario_routing_tests {
             Some(&snap),
             true,
             fixed_now(),
+        ));
+    }
+
+    #[test]
+    fn quota_window_model_scope_excludes_unrelated_candidates() {
+        let opus_only = QuotaWindow {
+            name: "opus".into(),
+            hours: 168,
+            unit: zoder_core::config::QuotaUnit::Messages,
+            cap: Some(100.0),
+            models: Some(vec!["claude-opus-*".into()]),
+            observability: zoder_core::config::Observability::Counter,
+            reset: ResetKind::Rolling,
+        };
+        assert!(quota_window_applies_to_model(&opus_only, "claude-opus-4"));
+        assert!(!quota_window_applies_to_model(
+            &opus_only,
+            "claude-sonnet-4"
+        ));
+        assert!(!quota_window_applies_to_model(
+            &opus_only,
+            "claude-haiku-3.5"
         ));
     }
 

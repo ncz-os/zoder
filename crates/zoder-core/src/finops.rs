@@ -744,6 +744,7 @@ mod tests {
             tokens_in: tin,
             tokens_out: tout,
             cost_usd: cost,
+            cost_unknown: false,
             calls: 1,
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),

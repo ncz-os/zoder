@@ -19,10 +19,18 @@ fn entry(t: &str, model: &str, cost: f64, tin: u64, tout: u64) -> Entry {
         tokens_in: tin,
         tokens_out: tout,
         cost_usd: cost,
+        cost_unknown: false,
         calls: 1,
         violation: None,
         tags: FinOpsTags::default(),
     }
+}
+
+#[test]
+fn legacy_entry_without_unknown_flag_defaults_to_known_cost() {
+    let raw = r#"{"ts_utc":"2026-01-01T00:00:00Z","provider":"p","model":"m","tokens_in":1,"tokens_out":2,"cost_usd":0.0}"#;
+    let parsed: Entry = serde_json::from_str(raw).unwrap();
+    assert!(!parsed.cost_unknown);
 }
 
 #[test]

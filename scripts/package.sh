@@ -48,7 +48,7 @@ ZEROCODE_BIN_PKG="${ZEROCODE_BIN_PKG:-zerocode}"      # owns the `zerocode` TUI 
 # (-p goose-cli --bin goose), never the Tauri desktop. PINNED ref — bump only
 # when the acp-client real-goose integration test stays green (the contract test).
 GOOSE_REPO="${GOOSE_REPO:-https://github.com/aaif-goose/goose.git}"
-GOOSE_REF="${GOOSE_REF:-v1.39.0}"
+GOOSE_REF="${GOOSE_REF:-b00a99a430d3b3dbcae989d9b9c665a5d6537f67}"
 GOOSE_SRC_DIR="${GOOSE_SRC_DIR:-}"
 GOOSE_BIN_PKG="${GOOSE_BIN_PKG:-goose-cli}"  # owns the `goose` CLI bin (has `goose acp`)
 # LEAN by default: --no-default-features drops goose's local-inference ML runtime

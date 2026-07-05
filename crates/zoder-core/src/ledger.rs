@@ -50,6 +50,12 @@ pub struct Entry {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
+    /// True when no authoritative telemetry or catalog price was available.
+    /// The numeric field remains for wire compatibility, but reports must not
+    /// interpret its placeholder zero as a verified-free call. Missing on
+    /// historical rows means the recorded numeric cost was known.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cost_unknown: bool,
     /// Underlying calls this row represents (1 = per-call; >1 = rollup). Legacy = 1.
     #[serde(default = "one_call")]
     pub calls: u64,
@@ -420,6 +426,7 @@ mod tests {
             tokens_in: tin,
             tokens_out: tout,
             cost_usd: cost,
+            cost_unknown: false,
             calls,
             violation: None,
             tags: FinOpsTags::default(),
