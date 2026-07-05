@@ -876,7 +876,17 @@ fn capture_counter_usage(
     // for the configured plan, and seed the store with the cap. The set is
     // idempotent (subsequent calls overwrite the same value, then
     // `record_counter` recomputes percent from the latest used_tokens).
+    //
+    // Calendar reset wiring (Finding #4): for every Counter window
+    // declared by the catalog, also bind a `period_id` derived from
+    // `now` so a later `record_counter` call that crosses a calendar
+    // boundary atomically zeros `used_tokens` before applying the
+    // increment. We compute the period for the SAME `now` the increment
+    // uses (no clock skew between seed and increment), and we honor
+    // the catalog's `ResetKind` — only calendar windows are period-
+    // bound; rolling windows stay un-bound and never auto-reset.
     let catalog = crate::subscription_tiers::TierCatalog::bundled();
+    let current_period = crate::utilization::period_id_for(now);
     if let Some(entry) = catalog.tier("minimax", plan) {
         for w in &entry.windows {
             if matches!(w.observability, crate::config::Observability::Counter) {
@@ -886,6 +896,19 @@ fn capture_counter_usage(
                     plan,
                     &w.name,
                     w.cap,
+                    now,
+                );
+                let period_id = match w.reset {
+                    crate::config::ResetKind::CalendarMonthly
+                    | crate::config::ResetKind::CalendarDaily => current_period.clone(),
+                    crate::config::ResetKind::Rolling => None,
+                };
+                store.set_counter_period_id(
+                    crate::utilization::Provider::MiniMax,
+                    "default",
+                    plan,
+                    &w.name,
+                    period_id,
                     now,
                 );
             }
