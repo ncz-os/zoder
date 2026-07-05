@@ -83,3 +83,7 @@ required-features = ["integration-tests"]
 name = "session"
 path = "tests/session.rs"
 required-features = ["integration-tests"]
+[[test]]
+name = "install_script"
+path = "tests/install_script.rs"
+required-features = ["integration-tests"]
