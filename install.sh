@@ -111,10 +111,50 @@ done
 
 # ── Downloader ────────────────────────────────────────────────────
 
+# dl URL OUTFILE — non-atomic plain download. Used for artifact payloads (which
+# curl/wget write straight from the network). Corpus/pricing JSON uses
+# `dl_atomic` below so a partial body never poisons the canonical catalog file.
 dl() { # dl URL OUTFILE
   if have curl; then curl -fsSL "$1" -o "$2"
   elif have wget; then wget -qO "$2" "$1"
   else die "need curl or wget"; fi
+}
+
+# Print the SHA256 hex of FILE (64 chars) using whatever tool is available.
+# Emits an empty string if no tool is installed; callers in the verify path
+# MUST treat that empty result as fatal when verification is required.
+sha256_file() {
+  if have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else printf ''
+  fi
+}
+
+# dl_atomic URL OUTFILE MIN_BYTES — download to a sibling `.part` file, reject
+# anything shorter than MIN_BYTES (so curl can't silently leave a 0-byte file
+# behind when the response is truncated mid-flight), then rename into place.
+# Caller is responsible for gating on "[ -f OUTFILE ]" beforehand if it wants
+# the "leave existing file alone" semantics.
+dl_atomic() {
+  url="$1"; out="$2"; min="${3:-1}"
+  part="${out}.part.$$"
+  rm -f "$part"
+  if ! dl "$url" "$part" 2>/dev/null; then
+    rm -f "$part"
+    return 1
+  fi
+  if [ ! -s "$part" ]; then
+    rm -f "$part"
+    return 1
+  fi
+  size=$(wc -c <"$part" 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "${size:-0}" -lt "$min" ]; then
+    rm -f "$part"
+    return 1
+  fi
+  mkdir -p "$(dirname "$out")"
+  mv "$part" "$out"
+  return 0
 }
 
 # ── Platform / target triple detection ───────────────────────────
@@ -215,35 +255,91 @@ trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$BIN_DIR"
 installed=0
-for b in $BIN_REQUIRED $BIN_OPTIONAL; do
+
+# Two-phase install: stage (download + verify) all binaries into "$tmp", then
+# install the whole set in one shot. If anything required fails or the smoke
+# test trips, we drop the staged copy and never overwrite anything in BIN_DIR.
+# This makes the install effectively transactional for the trio we care about.
+required_failed=0
+required_staged=0
+for b in $BIN_REQUIRED; do
+  asset="${b}-${triple}"
+  url="${pkg_base}/${asset}"
+  rm -f "${tmp}/${b}" "${tmp}/${b}.sha256"
+  if ! dl "$url" "${tmp}/${b}" 2>/dev/null; then
+    required_failed=$((required_failed + 1))
+    warn "could not download ${asset}"
+    continue
+  fi
+
+  # Mandatory checksum for required binaries. A HTTP-200 body that isn't
+  # exactly 64 hex chars, a missing checksum tool, or a missing checksum file
+  # is fatal — install an unverified binary is worse than refuse.
+  if [ "$NO_VERIFY" = "1" ]; then
+    warn "checksum verification disabled for ${b} (--no-verify / ZODER_NO_VERIFY=1)"
+  elif dl "${url}.sha256" "${tmp}/${b}.sha256" 2>/dev/null; then
+    want=$(tr -cd '0-9a-fA-F' <"${tmp}/${b}.sha256" | cut -c1-64)
+    if [ "${#want}" -ne 64 ]; then
+      die "malformed checksum for ${asset}: want exactly 64 hex chars (got ${#want}); refusing to install unverified binary"
+    fi
+    got=$(sha256_file "${tmp}/${b}")
+    [ -n "$got" ] || die "no sha256 tool available on this system; cannot verify ${asset} (re-run with --no-verify to override)"
+    [ "$got" = "$want" ] || die "checksum mismatch for ${asset} — download may be corrupt. Expected ${want}, got ${got}"
+    info "Checksum verified: ${b}"
+  else
+    die "no checksum published for ${asset}; refusing to install unverified binary (re-run with --no-verify to override)"
+  fi
+  required_staged=$((required_staged + 1))
+done
+
+if [ "$required_failed" -gt 0 ]; then
+  die "no nightly build for ${triple} (channel ${CHANNEL}). The nightly builds x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and aarch64-apple-darwin; musl and Intel macOS are not published."
+fi
+[ "$required_staged" -gt 0 ] || die "nothing staged for install"
+
+# Optional binaries: best-effort. A missing nightly artifact or bad/missing
+# checksum is a warn-and-skip — never blocks the install of `zoder` itself.
+for b in $BIN_OPTIONAL; do
   asset="${b}-${triple}"
   url="${pkg_base}/${asset}"
   if ! dl "$url" "${tmp}/${b}" 2>/dev/null; then
-    case " $BIN_REQUIRED " in
-    *" $b "*)
-      die "no nightly build for ${triple} (channel ${CHANNEL}). The nightly builds x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and aarch64-apple-darwin; musl and Intel macOS are not published." ;;
-    *) continue ;; # optional binary not in this nightly — skip silently
-    esac
+    info "optional binary ${asset} not in this nightly; skipping"
+    continue
   fi
 
-  # Optional checksum: <pkg_base>/<asset>.sha256 holds the bare sha256 hex.
   if [ "$NO_VERIFY" = "1" ]; then
-    warn "checksum verification disabled (--no-verify / ZODER_NO_VERIFY=1)"
+    warn "checksum verification disabled for optional ${b} (--no-verify / ZODER_NO_VERIFY=1)"
   elif dl "${url}.sha256" "${tmp}/${b}.sha256" 2>/dev/null; then
     want=$(tr -cd '0-9a-fA-F' <"${tmp}/${b}.sha256" | cut -c1-64)
-    if have sha256sum; then got=$(sha256sum "${tmp}/${b}" | awk '{print $1}')
-    elif have shasum; then got=$(shasum -a 256 "${tmp}/${b}" | awk '{print $1}')
-    else got=""; fi
-    if [ -n "$got" ] && [ -n "$want" ]; then
-      [ "$got" = "$want" ] || die "checksum mismatch for ${asset} — download may be corrupt. Expected ${want}, got ${got}"
-      info "Checksum verified: ${b}"
-    else
-      warn "no checksum tool available; installed ${b} without verification"
+    if [ "${#want}" -ne 64 ]; then
+      warn "malformed checksum for optional ${asset}; skipping (not installed)"
+      rm -f "${tmp}/${b}"
+      continue
     fi
+    got=$(sha256_file "${tmp}/${b}")
+    if [ -z "$got" ]; then
+      warn "no sha256 tool available; skipping optional ${b} (not installed)"
+      rm -f "${tmp}/${b}"
+      continue
+    fi
+    if [ "$got" != "$want" ]; then
+      warn "checksum mismatch for optional ${asset}; skipping (not installed)"
+      rm -f "${tmp}/${b}"
+      continue
+    fi
+    info "Checksum verified (optional): ${b}"
   else
-    warn "no checksum published for ${asset}; skipping verify"
+    warn "no checksum published for optional ${asset}; skipping (not installed)"
+    rm -f "${tmp}/${b}"
+    continue
   fi
+done
 
+# Install each staged binary. New `install -m 0755` overwrites the prior
+# binary in place so any older copies (e.g. an existing zerocode from a
+# previous install) are replaced consistently rather than left as orphans.
+for b in $BIN_REQUIRED $BIN_OPTIONAL; do
+  [ -f "${tmp}/${b}" ] || continue
   install -m 0755 "${tmp}/${b}" "${BIN_DIR}/${b}"
   installed=$((installed + 1))
 done
@@ -253,30 +349,41 @@ info "Installed $installed binar$([ "$installed" = 1 ] && echo y || echo ies) to
 # ── Seed the public corpus + pricing ──────────────────────────────
 # Best-effort: a failed fetch (offline/proxy) never fails the install — zoder
 # also self-heals these on first run. Existing files are left in place so a
-# local `zoder refresh` / `zoder pricing sync` is never clobbered.
+# local `zoder refresh` / `zoder pricing sync` is never clobbered. Downloads
+# are atomic (`.part` then `mv`) so a curl that's killed mid-response can
+# never leave a truncated JSON file at the canonical path the CLI loads from.
 seed_corpus() {
   [ "$NO_CORPUS" = "1" ] && {
     warn "corpus seeding skipped (--no-corpus / ZODER_NO_CORPUS=1)"
     return 0
   }
-  mkdir -p "$ZODER_HOME/data"
-  if [ ! -f "$ZODER_HOME/model_corpus.json" ]; then
-    if dl "${CORPUS_BASE}/corpus/model_corpus.json" "$ZODER_HOME/model_corpus.json" 2>/dev/null; then
-      info "Seeded routing corpus → $ZODER_HOME/model_corpus.json"
-    else
-      warn "could not fetch corpus (zoder will self-heal on first run)"
-    fi
-  else
+  mkdir -p "$ZODER_HOME"
+
+  # Corpus goes to the SAME path the CLI resolves via `Config::corpus_path`
+  # (=$ZODER_HOME/model_corpus.json). The corpus file is a megabyte-class
+  # JSON document; enforce a 1 KiB minimum so an empty HTTP/204 body or a
+  # truncated response is rejected as a failed seed, not a quiet one.
+  if [ -f "$ZODER_HOME/model_corpus.json" ]; then
     info "Corpus already present at $ZODER_HOME/model_corpus.json (left as-is)"
-  fi
-  if [ ! -f "$ZODER_HOME/data/pricing.json" ]; then
-    if dl "${CORPUS_BASE}/pricing/catalog.json" "$ZODER_HOME/data/pricing.json" 2>/dev/null; then
-      info "Seeded pricing catalog → $ZODER_HOME/data/pricing.json"
-    else
-      warn "could not fetch pricing catalog (run 'zoder pricing sync' later)"
-    fi
+  elif dl_atomic "${CORPUS_BASE}/corpus/model_corpus.json" \
+      "$ZODER_HOME/model_corpus.json" 1024 2>/dev/null; then
+    info "Seeded routing corpus → $ZODER_HOME/model_corpus.json"
   else
+    warn "could not fetch corpus (zoder will self-heal on first run)"
+  fi
+
+  # Pricing goes to the SAME path the CLI loads via `Config::home().join(
+  # "pricing.json")` (=$ZODER_HOME/pricing.json). A prior installer revision
+  # wrote this catalog under a `data/` subdirectory that the CLI never
+  # reads, so fresh installs ended up with an empty catalog. Same 1 KiB
+  # minimum as the corpus.
+  if [ -f "$ZODER_HOME/pricing.json" ]; then
     info "Pricing catalog already present (left as-is)"
+  elif dl_atomic "${CORPUS_BASE}/pricing/catalog.json" \
+      "$ZODER_HOME/pricing.json" 1024 2>/dev/null; then
+    info "Seeded pricing catalog → $ZODER_HOME/pricing.json"
+  else
+    warn "could not fetch pricing catalog (run 'zoder pricing sync' later)"
   fi
 }
 seed_corpus
@@ -292,5 +399,25 @@ case ":$PATH:" in
 esac
 
 echo
-"${BIN_DIR}/zoder" --version 2>/dev/null || true
+# Smoke test the freshly-installed `zoder` and roll back on failure: the
+# smoke MUST be fatal. A non-fatal version check masks a broken binary
+# (`bad CPU type`, broken shared lib, corrupt payload that bypassed a
+# checksum mismatch) and prints "Done." on top of a non-working install.
+smoke_failed=0
+if ! "${BIN_DIR}/zoder" --version >/dev/null 2>&1; then
+  smoke_failed=1
+  warn "zoder --version failed after install; rolling back ${BIN_DIR}/zoder"
+fi
+if [ "$smoke_failed" -eq 1 ]; then
+  # Roll back: remove only the files we (re)installed in this run. If a
+  # pre-existing zoder was in place, it has already been overwritten by
+  # `install -m 0755 "${tmp}/${b}"`, so removing it is the safest move —
+  # `zoder --version` reported the failure, so leaving it would be a lie.
+  rm -f "${BIN_DIR}/zoder"
+  for b in $BIN_OPTIONAL; do
+    [ -f "${tmp}/${b}" ] && rm -f "${BIN_DIR}/${b}"
+  done
+  die "zoder --version check failed after install; install was rolled back"
+fi
+info "Smoke verified: ${BIN_DIR}/zoder reports a version"
 printf "%s\n" "$(bold "Done.") Run $(bold zoder) to start, or $(bold "zoder tui") for the TUI."
