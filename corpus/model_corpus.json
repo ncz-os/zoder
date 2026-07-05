@@ -1,7 +1,7 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-07-04",
-  "generated": "2026-07-04",
+  "arena_date": "2026-07-05",
+  "generated": "2026-07-05",
   "count": 2561,
   "routable": 61,
   "scored": 1394,
@@ -64973,8 +64973,8 @@
       "paid": false,
       "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
       "economics": {
-        "input_usd_per_mtok": 0.9086,
-        "output_usd_per_mtok": 2.8556,
+        "input_usd_per_mtok": 0.7546,
+        "output_usd_per_mtok": 2.3716,
         "source": "openrouter"
       },
       "agentic_score": 0.665,
