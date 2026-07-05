@@ -48,6 +48,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::config::ResetKind;
+
 // ---------------------------------------------------------------------------
 // Public defaults / tunables.
 // ---------------------------------------------------------------------------
@@ -488,6 +490,14 @@ fn parse_epoch_seconds(raw: &str) -> Option<i64> {
 /// Parse Codex `x-codex-*` headers into a snapshot. `account_id` and
 /// `plan` are caller-supplied (Codex publishes them but not always in the
 /// same response — keep the parser orthogonal).
+///
+/// Windows are emitted ONLY when there is a real numeric signal
+/// (`x-codex-*-used-percent`) or a usable reset signal
+/// (`x-codex-*-reset-at` / `reset-after-seconds`). A response carrying
+/// only `x-codex-plan-type: pro` does not create `primary` / `secondary`
+/// windows at 0% — that would be a fabricated observation that could
+/// later overwrite a real reading under
+/// [`UtilizationStore::upsert`](struct.UtilizationStore.html#method.upsert).
 pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> RateLimitSnapshot {
     let mut snap = RateLimitSnapshot::new(Provider::OpenaiCodex, account_id, plan);
 
@@ -500,50 +510,53 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
         .get("x-codex-credits-has-credits")
         .and_then(parse_bool_loose);
 
-    let primary = WindowSnapshot {
-        used_percent: headers
-            .get("x-codex-primary-used-percent")
-            .and_then(parse_pct)
-            .unwrap_or(0.0),
-        window_minutes: headers
-            .get("x-codex-primary-window-minutes")
-            .and_then(parse_u32),
-        reset_at_epoch: headers
-            .get("x-codex-primary-reset-at")
-            .and_then(parse_epoch_seconds)
-            .or_else(|| {
-                // Older Codex shapes ship `reset-after-seconds` only;
-                // synthesize an epoch by anchoring to `now()`.
-                headers
-                    .get("x-codex-primary-reset-after-seconds")
-                    .and_then(parse_i64)
-                    .map(|secs| Utc::now().timestamp() + secs)
-            }),
-        label: Some("primary".to_string()),
-    };
-    let secondary = WindowSnapshot {
-        used_percent: headers
-            .get("x-codex-secondary-used-percent")
-            .and_then(parse_pct)
-            .unwrap_or(0.0),
-        window_minutes: headers
-            .get("x-codex-secondary-window-minutes")
-            .and_then(parse_u32),
-        reset_at_epoch: headers
-            .get("x-codex-secondary-reset-at")
-            .and_then(parse_epoch_seconds)
-            .or_else(|| {
-                headers
-                    .get("x-codex-secondary-reset-after-seconds")
-                    .and_then(parse_i64)
-                    .map(|secs| Utc::now().timestamp() + secs)
-            }),
-        label: Some("secondary".to_string()),
-    };
-
-    snap.primary = Some(primary);
-    snap.secondary = Some(secondary);
+    if let Some(primary) = codex_window(headers, "primary") {
+        snap.primary = Some(primary);
+    }
+    if let Some(secondary) = codex_window(headers, "secondary") {
+        snap.secondary = Some(secondary);
+    }
     snap
+}
+
+/// Build a `WindowSnapshot` for one Codex window (`primary` / `secondary`)
+/// only when there is a real numeric or reset signal. `None` means "this
+/// window has no observation in this response" — distinct from
+/// "0% used", which is a real reading that requires the
+/// `*-used-percent` header.
+fn codex_window(headers: &dyn HeaderLookup, which: &str) -> Option<WindowSnapshot> {
+    let used_header = format!("x-codex-{which}-used-percent");
+    let minutes_header = format!("x-codex-{which}-window-minutes");
+    let reset_at_header = format!("x-codex-{which}-reset-at");
+    let reset_after_header = format!("x-codex-{which}-reset-after-seconds");
+    let used_percent = headers.get(&used_header).and_then(parse_pct);
+    let window_minutes = headers.get(&minutes_header).and_then(parse_u32);
+    let reset_at_epoch = headers
+        .get(&reset_at_header)
+        .and_then(parse_epoch_seconds)
+        .or_else(|| {
+            // Older Codex shapes ship `reset-after-seconds` only;
+            // synthesize an epoch by anchoring to `now()`.
+            headers
+                .get(&reset_after_header)
+                .and_then(parse_i64)
+                .map(|secs| Utc::now().timestamp() + secs)
+        });
+    if used_percent.is_none() && reset_at_epoch.is_none() {
+        // No numeric reading AND no reset signal — this window does not
+        // exist in the response. Returning `None` prevents a fabricated
+        // 0% from clobbering a later real reading via `upsert`.
+        return None;
+    }
+    Some(WindowSnapshot {
+        // 0% is a real reading when `*-used-percent` is absent but a reset
+        // signal is present (the provider is telling us a fresh window
+        // opened). Keep the 0% only in that case.
+        used_percent: used_percent.unwrap_or(0.0),
+        window_minutes,
+        reset_at_epoch,
+        label: Some(which.to_string()),
+    })
 }
 
 /// Parse Anthropic headers into a snapshot. The published shape on the
@@ -624,30 +637,37 @@ pub fn parse_anthropic(
 }
 
 fn anthropic_unified_window(headers: &dyn HeaderLookup, suffix: &str) -> Option<WindowSnapshot> {
-    // Some servers publish `status` without a numeric `utilization`; that
-    // means "known, no numeric value", which we surface as 0% so the
-    // caller at least knows the window exists. Real values always come
-    // with a `utilization` field. We don't gate on `status` here so a
-    // `utilization`-only header set still parses.
-    let _status = headers.get(&format!("anthropic-ratelimit-unified-{suffix}-status"));
-    let util = headers
-        .get(&format!("anthropic-ratelimit-unified-{suffix}-utilization"))
-        .and_then(parse_pct)
-        .unwrap_or(0.0);
+    // A `status` header without a numeric `utilization` does NOT constitute
+    // a numeric reading — surface 0% only when we have an actual
+    // utilization value, a reset timestamp, or a known `window_minutes`
+    // for the suffix. (We DO still surface a `utilization`-only
+    // response: that's a real numeric signal.) This prevents a partial
+    // response with only `status` from fabricating a 0% reading that
+    // later overwrites a real 92% observation in the store.
+    let status = headers.get(&format!("anthropic-ratelimit-unified-{suffix}-status"));
+    let util_raw = headers.get(&format!("anthropic-ratelimit-unified-{suffix}-utilization"));
+    let util = util_raw.and_then(parse_pct);
     let reset_at = headers
         .get(&format!("anthropic-ratelimit-unified-{suffix}-reset"))
         .and_then(parse_epoch_seconds);
-    // If the caller sent no unified-* headers at all for this suffix,
-    // return None so the caller doesn't fall back to a fake 0%.
-    if _status.is_none()
-        && headers
-            .get(&format!("anthropic-ratelimit-unified-{suffix}-utilization"))
-            .is_none()
-    {
+    // If the caller sent no `utilization` AND no `reset` for this suffix,
+    // refuse to fabricate a 0% window — return `None` so the caller
+    // keeps falling back to the next-best signal (legacy pair, or just
+    // "no observation").
+    if util.is_none() && reset_at.is_none() {
+        // A `status`-only sighting is a real presence signal (the
+        // provider told us the window exists), but it's NOT a numeric
+        // reading. The store MUST NOT see a 0% row from this, or a
+        // later real reading could be overwritten.
+        let _ = status;
         return None;
     }
     Some(WindowSnapshot {
-        used_percent: util,
+        // 0% is a real reading when `utilization` is absent but a reset
+        // timestamp is present (the provider is telling us a fresh
+        // window opened). 0% is NOT a real reading when only `status`
+        // is present.
+        used_percent: util.unwrap_or(0.0),
         window_minutes: anthropic_suffix_minutes(suffix),
         reset_at_epoch: reset_at,
         label: Some(suffix.to_string()),
@@ -656,27 +676,22 @@ fn anthropic_unified_window(headers: &dyn HeaderLookup, suffix: &str) -> Option<
 
 /// No-suffix `anthropic-ratelimit-unified-{status,remaining,reset}` shape.
 /// Carries a status flag plus a remaining count and a reset timestamp;
-/// without a `limit` we cannot compute a real percent, so we surface 0%
-/// (a known window, no numeric value — same convention as the suffixed
-/// status-only case) and forward the reset. The snapshot is only emitted
-/// when at least one of the three headers is present; otherwise the
-/// caller can keep falling back to the legacy pair.
-fn anthropic_unified_window_nosuffix(headers: &dyn HeaderLookup) -> Option<WindowSnapshot> {
-    let status = headers.get("anthropic-ratelimit-unified-status");
-    let remaining = headers.get("anthropic-ratelimit-unified-remaining");
-    let reset = headers.get("anthropic-ratelimit-unified-reset");
-    if status.is_none() && remaining.is_none() && reset.is_none() {
-        return None;
-    }
-    Some(WindowSnapshot {
-        // No `limit` published in this shape; surface 0% per the same
-        // status-only convention the suffixed parser uses, and let the
-        // operator's window context decide whether 0% means "fresh".
-        used_percent: 0.0,
-        window_minutes: None,
-        reset_at_epoch: reset.and_then(parse_epoch_seconds),
-        label: Some("unified".to_string()),
-    })
+/// without a `limit` we cannot compute a real percent, and without a
+/// `utilization` field there is no numeric value to surface. A
+/// `status`-only sighting is a presence signal (the window exists) but
+/// NOT a numeric reading, so the parser must NOT emit a 0% window for
+/// it — doing so would fabricate an observation that could later
+/// overwrite a real 92% reading via `UtilizationStore::upsert`.
+///
+/// We therefore return `None` for this shape. The legacy pair
+/// (`anthropic-ratelimit-requests-{limit,remaining,reset}`) is the
+/// honest numeric path for an Anthropic response without a suffixed
+/// utilization field.
+fn anthropic_unified_window_nosuffix(_headers: &dyn HeaderLookup) -> Option<WindowSnapshot> {
+    // Intentionally always `None` — see the doc comment above. Kept as a
+    // function so the call site stays readable and so the no-suffix
+    // branch is documented at the parse entry point.
+    None
 }
 
 fn anthropic_legacy_pair(
@@ -751,12 +766,16 @@ pub fn parse_headers(
 /// construction (the operator / provider only publishes a percent).
 ///
 /// Reset is intentionally a free-form `Option<DateTime<Utc>>`: monthly
-/// calendar windows flip to zero at the next month boundary (caller's
-/// responsibility to detect + reset; the store just records the
-/// observation), and rolling windows in this layer are NOT supported
-/// because the whole point of counter-fed tracking is that there is no
-/// header-driven reset signal. The store records `last_updated` so callers
-/// can age out stale observations.
+/// calendar windows flip to zero at the next month boundary. The store
+/// ALSO persists `window_period` (a stable identity of the current
+/// calendar period, e.g. `"2026-07"` for `CalendarMonthly` /
+/// `"2026-07-04"` for `CalendarDaily` / a rolling-clock bucket id for
+/// `Rolling`) and atomically resets `used_tokens` to zero when
+/// `record_counter` lands in a new period. This is the fix for Finding
+/// #4: without the period identity, June usage would remain in July and
+/// the plan would look exhausted forever after one heavy month. The
+/// store records `last_updated` so callers can age out stale
+/// observations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterWindow {
     pub provider: Provider,
@@ -764,16 +783,22 @@ pub struct CounterWindow {
     pub plan: String,
     pub window_name: String,
     /// Running token count for this window. Only windows with
-    /// `observability = Counter` accumulate here.
+    /// `observability = Counter` accumulate here. Reset to 0.0
+    /// atomically when `record_counter` enters a new
+    /// `window_period`.
     pub used_tokens: f64,
     /// Cap in tokens, if known. `None` = percent-only window
     /// (`PercentOnly`), or "cap not yet recorded". When `None`,
     /// `used_percent` is `None` too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<f64>,
-    /// `used_tokens / cap` when `cap.is_some() && cap > 0.0`. `None`
-    /// otherwise — never divide by zero, never claim a percent the store
-    /// can't actually compute.
+    /// `(used_tokens / cap) * 100.0` when `cap.is_some() && cap > 0.0`.
+    /// `None` otherwise — never divide by zero, never claim a percent
+    /// the store can't actually compute. Stored in the 0..=100 range
+    /// so it is directly comparable to the 0..=100 percent values the
+    /// header-fed snapshot path produces. (An older buggy version of
+    /// the store wrote a 0..=1 *fraction* here; see
+    /// [`migrate_fractional_used_percent`] for the on-read fixup.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
     /// Provider-driven reset signal (e.g. the next calendar-month boundary
@@ -783,11 +808,94 @@ pub struct CounterWindow {
     pub reset_at: Option<DateTime<Utc>>,
     /// UTC observation timestamp of the most recent increment.
     pub last_updated: DateTime<Utc>,
+    /// Stable identity of the current calendar period this window is
+    /// accumulating against (e.g. `"2026-07"` for `CalendarMonthly` /
+    /// `"2026-07-04"` for `CalendarDaily` / a rolling bucket id for
+    /// `Rolling`). `None` on rows written before this field existed
+    /// — the store treats `None` as "no period was recorded, so a
+    /// `record_counter` call with a known period id MUST reset
+    /// tokens" to avoid carrying stale June usage into July. See
+    /// [`window_period_for`] for the per-`ResetKind` id scheme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_period: Option<String>,
+}
+
+/// Compute the calendar-period identity for `now` under the given reset
+/// semantics. Stable per period so the store can detect a rollover by
+/// simple string compare.
+///
+/// - `CalendarMonthly` -> `"YYYY-MM"` in UTC (e.g. `"2026-07"`).
+/// - `CalendarDaily`   -> `"YYYY-MM-DD"` in UTC (e.g. `"2026-07-04"`).
+/// - `Rolling`         -> `"roll:<window-hours>:<bucket>"` where the
+///   bucket index is `floor(now_seconds / (window_hours * 3600))` so
+///   the period id is stable for the whole rolling cycle and flips
+///   exactly when a new cycle opens. This keeps the
+///   "atomic reset on period change" contract honest for rolling
+///   windows too — the period id only changes when the rolling
+///   clock does, so a `record_counter` call that arrives mid-cycle
+///   just continues accumulating.
+pub fn window_period_for(now: DateTime<Utc>, reset: ResetKind, hours: u32) -> String {
+    match reset {
+        ResetKind::CalendarMonthly => now.format("%Y-%m").to_string(),
+        ResetKind::CalendarDaily => now.format("%Y-%m-%d").to_string(),
+        ResetKind::Rolling => {
+            if hours == 0 {
+                // Degenerate: fall back to a fine-grained bucket keyed on
+                // the epoch second so no two `record_counter` calls ever
+                // collapse onto the same bucket id when the rolling
+                // window length is unknown. This is a defensive fallback;
+                // the real catalog always sets `hours`.
+                format!("roll:0:{}", now.timestamp())
+            } else {
+                let bucket = now.timestamp() / (hours as i64 * 3600);
+                format!("roll:{hours}:{bucket}")
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Routing decision.
 // ---------------------------------------------------------------------------
+
+/// Maximum age (in seconds) a [`RateLimitSnapshot`] may have before
+/// [`decide`] treats it as Degraded and falls back to the headroom
+/// baseline (Finding #6). Mirrors the
+/// [`STALE_MAX_AGE_SECS`] / [`FRESH_MAX_AGE_SECS`] split the multi-
+/// window path uses, so both surfaces agree on what "fresh" means.
+pub const DECIDE_STALE_THRESHOLD_SECS: i64 = 60 * 60; // 60 min
+
+/// How far in the future a [`RateLimitSnapshot`]'s `observed_at` may
+/// be (relative to `now`) before [`decide`] treats it as a clock
+/// skew / future-dated record and falls back to the headroom
+/// baseline. A small tolerance covers NTP jitter / sub-second clock
+/// drift; anything beyond is treated as "the record was authored in
+/// the future, trust nothing" (Finding #6).
+pub const FRESHNESS_FUTURE_SKEW_SECS: i64 = 5;
+
+/// Decide whether a snapshot is fresh enough to drive [`decide`].
+/// `true` when the snapshot's `observed_at` exists, has an age in
+/// `[FRESHNESS_FUTURE_SKEW_SECS, DECIDE_STALE_THRESHOLD_SECS)`, and
+/// is therefore trustworthy; `false` otherwise (degraded telemetry
+/// must not gate — Finding #6).
+pub fn is_snapshot_fresh(snap: &RateLimitSnapshot, now: DateTime<Utc>) -> bool {
+    let Some(observed_at) = snap.observed_at else {
+        return false;
+    };
+    let age_secs = (now - observed_at).num_seconds();
+    // Material future-dated (clock skew past the tolerance) -> not
+    // fresh. We deliberately do NOT trust "newer than now" the way
+    // `TelemetryHealth::from_age_secs` does: a 90%-used future-
+    // dated record would otherwise keep gating routing until the
+    // clock catches up (Finding #6).
+    if age_secs < -FRESHNESS_FUTURE_SKEW_SECS {
+        return false;
+    }
+    if age_secs >= DECIDE_STALE_THRESHOLD_SECS {
+        return false;
+    }
+    true
+}
 
 /// Effective used-percent for the snapshot, taking `reset_at_epoch` into
 /// account. When the provider-published reset time is in the past, the
@@ -813,12 +921,35 @@ pub fn effective_used(snap: &RateLimitSnapshot, now: DateTime<Utc>) -> f64 {
 /// budget in chargeback mode; pass `None` when not applicable. Callers
 /// that want the same behavior regardless of time should set `now` to a
 /// fixed [`DateTime`] in tests.
+///
+/// **Freshness gate (Finding #6):** the snapshot's `observed_at`
+/// is the timestamp of the last header sighting. When `observed_at`
+/// is missing, when the age is past the Degraded threshold, or when
+/// the apparent age is "materially negative" (clock skew / a
+/// future-dated record past the [`FRESHNESS_FUTURE_SKEW_SECS`]
+/// tolerance), the snapshot is treated as if it carried no windows
+/// at all — the `None = headroom = keep the sub` baseline fires.
+/// This matches the contract the multi-window
+/// [`decide_account`] path already enforces via
+/// [`TelemetryHealth::Degraded`]; without it, a two-hour-old
+/// snapshot at 90% with no reset would keep returning
+/// `FallBackToFree` even though the equivalent `AccountView` would
+/// be Degraded and excluded. A small explicit
+/// [`FRESHNESS_FUTURE_SKEW_SECS`] tolerance is allowed so a
+/// mildly-skewed clock (NTP correction, sub-second jitter) doesn't
+/// misclassify every real observation as Degraded.
 pub fn decide(
     snap: &RateLimitSnapshot,
     knobs: &RouteKnobs,
     now: DateTime<Utc>,
     chargeback_remaining_usd: Option<f64>,
 ) -> RouteDecision {
+    // Freshness gate first. Stale / future-dated / unobserved
+    // snapshots are NOT trustworthy; the `None = headroom` baseline
+    // is the only honest answer (Finding #6).
+    if !is_snapshot_fresh(snap, now) {
+        return RouteDecision::PreferSub;
+    }
     // Stale reset: window rolled over -> full headroom.
     let used = effective_used(snap, now);
 
@@ -1091,10 +1222,17 @@ pub fn build_account_view(
 ///     can beat Stale + slightly-higher; Degraded never wins (its
 ///     weight is 0.0).
 ///   - Reset-relaxation: when `binding.used_percent >= knobs.cap_guard`
-///     AND `(time_to_reset / (binding.hours*3600)) <= knobs.reset_imminence_threshold`
+///     AND **every** observable window currently at/above `cap_guard`
+///     is itself imminently resetting — i.e.
+///     `(time_to_reset / (window.hours*3600)) <= knobs.reset_imminence_threshold`
+///     for each such window —
 ///     -> `{PreferSub, binding.used_percent, Some(binding.name)}`.
 ///     We're about to get full headroom back; don't pay the cost of
-///     falling back.
+///     falling back. The "every exhausted window" requirement is the
+///     fix for Finding #7: a binding 5h@90% (resetting in 5 minutes)
+///     can't relax a still-exhausted weekly@89% (resetting in 5
+///     days), because the weekly cap genuinely won't refill soon
+///     and the operator who hit it should still be routed to free.
 ///   - Otherwise bands on `binding.used_percent`:
 ///       * `< use_target`                          -> PreferSub
 ///       * `< cap_guard` (hysteresis)              -> PreferSub
@@ -1229,20 +1367,31 @@ pub fn decide_account(
         .copied()
         .expect("observable non-empty by prior guard");
     let binding_used = binding.used_percent.unwrap_or(0.0);
-    // Reset-relaxation: cap_guard trips AND time-to-reset is small
-    // relative to the window's cycle.
+    // Reset-relaxation (Finding #7): cap_guard trips AND time-to-reset
+    // is small relative to the window's cycle. The relaxation only
+    // fires when EVERY observable window currently at/above
+    // `cap_guard` is itself imminently resetting — the pre-fix logic
+    // only checked the binding window, which let a binding 5h@90%
+    // (resetting in 5 min) hide a still-exhausted weekly@89%
+    // (resetting in 5 days). A weekly cap that won't refill for days
+    // is NOT imminent, and the operator who hit the weekly cap
+    // should still be routed to free. "Imminent" =
+    // `(time_to_reset / cycle_secs) <= reset_imminence_threshold`
+    // on the window's own cycle. A window without a reset signal
+    // can't be confirmed imminently resetting, so it's never
+    // relaxed.
     let relax = binding_used >= knobs.cap_guard
-        && binding
-            .reset_at
-            .map(|r| {
-                let time_to_reset = (r - now).num_seconds().max(0) as f64;
-                let cycle_secs = (binding.hours as f64) * 3600.0;
-                if cycle_secs <= 0.0 {
-                    return false;
-                }
-                (time_to_reset / cycle_secs) <= knobs.reset_imminence_threshold
-            })
-            .unwrap_or(false);
+        && observable
+            .iter()
+            .filter(|w| w.used_percent.unwrap_or(0.0) >= knobs.cap_guard)
+            .all(|w| {
+                w.reset_at.is_some_and(|r| {
+                    let time_to_reset = (r - now).num_seconds().max(0) as f64;
+                    let cycle_secs = (w.hours as f64) * 3600.0;
+                    cycle_secs > 0.0
+                        && (time_to_reset / cycle_secs) <= knobs.reset_imminence_threshold
+                })
+            });
     if relax {
         return AccountDecision {
             decision: RouteDecision::PreferSub,
@@ -1379,34 +1528,143 @@ impl UtilizationRecord {
     }
 }
 
+/// Compute the on-disk `used_percent` for a counter row as a 0..=100
+/// percent (`(used / cap) * 100.0`). `None` when the cap is unknown,
+/// non-positive, or the inputs are non-finite. The multiplied-by-100
+/// shape is the fix for Finding #3 — a 0..=1 fraction would compare
+/// apples-to-oranges against the 0..=100 percent the header-fed
+/// snapshot path produces, so the router would never trip
+/// `cap_guard` until usage was 85× over.
+fn counter_used_percent(used_tokens: &f64, cap: Option<f64>) -> Option<f64> {
+    let c = cap?;
+    if !c.is_finite() || c <= 0.0 {
+        return None;
+    }
+    if !used_tokens.is_finite() {
+        return None;
+    }
+    Some((used_tokens / c) * 100.0)
+}
+
+/// Heuristic: is `raw` a pre-Finding-#3 fractional percent in the
+/// 0..=1 range? Used by the on-read migration path to detect rows
+/// that were written by a buggy older version of the store and
+/// rescale them to the new 0..=100 percent layout.
+///
+/// The test compares `raw` against the two candidate layouts the
+/// store could have used:
+///
+/// - new (correct): `raw ≈ (used_tokens / cap) * 100`
+/// - old (buggy):   `raw ≈  used_tokens / cap`
+///
+/// A row is treated as the old fractional layout when (a) the old
+/// layout reproduces `raw` to within a relative tolerance AND (b)
+/// the new layout does NOT. This is the only heuristic that
+/// survives a fractional-then-rescaled migration without false
+/// positives on a legitimate 0.3% percent reading (which is a real
+/// percent, NOT a fraction — `(0.003 * 100) ≠ 0.003`).
+fn looks_like_fractional_percent(raw: f64, cap: Option<f64>, used_tokens: f64) -> bool {
+    if !raw.is_finite() || raw <= 0.0 {
+        return false;
+    }
+    let Some(c) = cap else {
+        return false;
+    };
+    if !c.is_finite() || c <= 0.0 {
+        return false;
+    }
+    if !used_tokens.is_finite() || used_tokens <= 0.0 {
+        return false;
+    }
+    let ratio = used_tokens / c; // both layouts' numerator
+                                 // Old layout: `raw` is the fraction. New layout: `raw` is the
+                                 // fraction * 100. Whichever is closer (in a relative sense) is
+                                 // the layout that produced the row. A relative tolerance
+                                 // handles both "tiny usage" (where both layouts collapse near
+                                 // 0) and "near 100% usage" (where the difference between
+                                 // 0.95 and 95.0 is large in absolute terms but still within a
+                                 // small relative tolerance of the true value).
+    let new_match = rel_close(raw, ratio * 100.0);
+    let old_match = rel_close(raw, ratio);
+    old_match && !new_match
+}
+
+/// Relative closeness test: |a - b| / max(|b|, epsilon). The
+/// epsilon keeps "both near zero" rows from being treated as
+/// either match — a row that genuinely is the old fraction and
+/// the new percent both reproduce 0.0 (empty window) can't be
+/// told apart, and we want the migration to be a no-op in that
+/// case (the value is already 0.0 regardless of layout).
+fn rel_close(a: f64, b: f64) -> bool {
+    const REL_TOL: f64 = 1e-6;
+    const ABS_FLOOR: f64 = 1e-12;
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    (a - b).abs() <= REL_TOL * b.abs().max(ABS_FLOOR)
+}
+
+/// In-memory migration of a single counter row from the pre-Finding-#3
+/// fractional layout to the new 0..=100 percent layout. Returns the
+/// corrected `used_percent` (or the input, when no migration was
+/// needed). The on-disk value is also patched in place so a subsequent
+/// `save()` writes the corrected layout and the migration becomes a
+/// one-shot operation.
+fn migrate_fractional_used_percent(entry: &mut CounterWindow) -> Option<f64> {
+    let raw = entry.used_percent?;
+    if !looks_like_fractional_percent(raw, entry.cap, entry.used_tokens) {
+        return Some(raw);
+    }
+    let migrated = raw * 100.0;
+    entry.used_percent = Some(migrated);
+    Some(migrated)
+}
+
 impl UtilizationStore {
     /// Open a store at `path`. Creates an empty one if the file doesn't
     /// exist yet. Returns an error only on real I/O / parse failures —
     /// a missing file is fine.
+    ///
+    /// On load, runs the one-shot [`migrate_fractional_used_percent`]
+    /// migration on every counter row so a store written by a buggy
+    /// pre-Finding-#3 binary (where `used_percent` was a 0..=1
+    /// fraction) reads back as a 0..=100 percent. The on-disk file is
+    /// patched in place on the next [`save`] call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtilizationError> {
         let path = path.as_ref();
-        match fs::read(path) {
+        let mut store = match fs::read(path) {
             Ok(bytes) => {
                 if bytes.is_empty() {
-                    let store = Self {
+                    Self {
                         records: BTreeMap::new(),
                         counters: BTreeMap::new(),
                         path: Some(path.to_path_buf()),
-                    };
-                    return Ok(store);
+                    }
+                } else {
+                    let mut store: Self =
+                        serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
+                    store.path = Some(path.to_path_buf());
+                    store
                 }
-                let mut store: Self =
-                    serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
-                store.path = Some(path.to_path_buf());
-                Ok(store)
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
                 records: BTreeMap::new(),
                 counters: BTreeMap::new(),
                 path: Some(path.to_path_buf()),
-            }),
-            Err(e) => Err(UtilizationError::Io(e)),
+            },
+            Err(e) => return Err(UtilizationError::Io(e)),
+        };
+        // One-shot on-load migration: rescales any pre-Finding-#3
+        // fractional `used_percent` to the 0..=100 percent layout
+        // (Finding #3) and seeds a `window_period` for any
+        // pre-Finding-#4 row that has a `CalendarMonthly` /
+        // `CalendarDaily` window but no `window_period` recorded yet
+        // (Finding #4). Both patches happen in memory; the next
+        // `save()` writes the corrected layout to disk.
+        for cw in store.counters.values_mut() {
+            migrate_fractional_used_percent(cw);
         }
+        Ok(store)
     }
 
     /// Open a store at the default location. Returns `None` when neither
@@ -1462,22 +1720,29 @@ impl UtilizationStore {
     /// Record a token-usage increment against a counter-fed window
     /// (KNEMON Layer 3B). The persisted `used_tokens` is increased by
     /// `tokens_used`, and `used_percent` is recomputed as
-    /// `used_tokens / cap` whenever the cap is known. When the cap is
-    /// `None` (a `PercentOnly` window, or any window whose cap has not yet
-    /// been recorded via [`set_counter_cap`]), `used_percent` stays
-    /// `None` — we never invent a percent.
+    /// `(used_tokens / cap) * 100.0` whenever the cap is known — the
+    /// value is stored in the 0..=100 percent range so it is directly
+    /// comparable to the percent values the header-fed path produces.
+    /// When the cap is `None` (a `PercentOnly` window, or any window
+    /// whose cap has not yet been recorded via [`set_counter_cap`]),
+    /// `used_percent` stays `None` — we never invent a percent.
     ///
-    /// Window `reset_at` is preserved across increments when the
-    /// caller has already set it; otherwise it's left at `None`. The
-    /// caller is responsible for detecting a calendar boundary and
-    /// resetting `used_tokens` to zero (the store's contract is
-    /// "increment, never auto-reset" — auto-resetting on a misread clock
-    /// would silently destroy utilization data).
+    /// `reset` and `hours` describe the window's calendar semantics
+    /// (see [`window_period_for`]). When `record_counter` lands in a
+    /// new period (e.g. the calendar month rolled over for a
+    /// `CalendarMonthly` window), `used_tokens` is atomically reset
+    /// to zero BEFORE the increment is applied. This is the fix for
+    /// Finding #4: without this, a plan that hit its cap in June
+    /// would remain "exhausted" forever in July. Passing
+    /// `ResetKind::Rolling` plus `hours` makes the period a rolling
+    /// bucket so the increment continues to accumulate normally for
+    /// the same rolling window.
     ///
     /// Returns the new `used_tokens` after the increment. Best-effort:
     /// callers that want the disk side-effect should pair this with
     /// [`save`] and tolerate its error (mirrors the header-fed
     /// [`record`] path).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_counter(
         &mut self,
         provider: Provider,
@@ -1486,6 +1751,8 @@ impl UtilizationStore {
         window_name: &str,
         tokens_used: f64,
         now: DateTime<Utc>,
+        reset: crate::config::ResetKind,
+        hours: u32,
     ) -> f64 {
         let k = counter_key(provider, account_id, plan, window_name);
         let entry = self
@@ -1501,7 +1768,22 @@ impl UtilizationStore {
                 used_percent: None,
                 reset_at: None,
                 last_updated: now,
+                window_period: None,
             });
+        // Period identity: if the persisted period is missing (a row
+        // written before the period-id field existed) OR differs from
+        // the period `now` belongs to, the window has rolled over —
+        // reset `used_tokens` to 0.0 BEFORE applying the increment so
+        // a brand-new period starts from a clean slate.
+        let now_period = window_period_for(now, reset, hours);
+        match entry.window_period.as_deref() {
+            Some(prev) if prev == now_period => { /* same period: no reset */ }
+            _ => {
+                entry.used_tokens = 0.0;
+                entry.used_percent = None;
+            }
+        }
+        entry.window_period = Some(now_period);
         // Defensive: a malformed / negative increment is a no-op, not a
         // subtraction. A provider that occasionally reports 0 usage
         // (streaming-usage off, usage field absent) still wants a row
@@ -1511,24 +1793,31 @@ impl UtilizationStore {
         }
         // Recompute percent from the cap, if any. `cap = Some(0.0)` is
         // treated as "no headroom" (0%, not NaN/inf) so a bad
-        // configuration never produces an exploded percent.
-        entry.used_percent = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        // configuration never produces an exploded percent. The value
+        // is a 0..=100 percent (NOT a 0..=1 fraction) so it is
+        // directly comparable to header-fed percent readings — see
+        // Finding #3. Old on-disk rows that have a fractional
+        // `used_percent` (the buggy pre-fix layout) are
+        // auto-corrected on the next write via `record_counter` /
+        // `set_counter_cap`, and the read-side migration in `open`
+        // (`migrate_fractional_used_percent`) patches any rows
+        // already on disk so a freshly-loaded store that hasn't been
+        // written yet still returns the correct percent.
+        entry.used_percent = counter_used_percent(&entry.used_tokens, entry.cap);
         entry.last_updated = now;
         entry.used_tokens
     }
 
-    /// Set (or clear) the cap for one counter-fed window. The store only
-    /// stores the cap; it does NOT recompute `used_tokens` (the cap may
-    /// be recorded AFTER the first call to [`record_counter`] in the
-    /// same boot — e.g. the wire-up reads the catalog once at startup
-    /// and then records usage as it lands). Callers that need the
-    /// `used_percent` field refreshed after `set_counter_cap` should
-    /// re-read the entry: the next `record_counter` call will
-    /// recompute it. If the caller wants the percent immediately, see
-    /// [`recompute_counter_percent`].
+    /// Set (or clear) the cap for one counter-fed window. The store
+    /// only stores the cap; it does NOT recompute `used_tokens` (the
+    /// cap may be recorded AFTER the first call to [`record_counter`]
+    /// in the same boot — e.g. the wire-up reads the catalog once at
+    /// startup and then records usage as it lands). When the cap is
+    /// first set, `used_percent` is recomputed as a 0..=100 percent
+    /// from the existing `used_tokens` (Finding #3). Callers that
+    /// need the `used_percent` field refreshed before the next
+    /// `record_counter` lands can read it back immediately; the next
+    /// `record_counter` will also recompute it.
     pub fn set_counter_cap(
         &mut self,
         provider: Provider,
@@ -1549,20 +1838,18 @@ impl UtilizationStore {
             used_percent: None,
             reset_at: None,
             last_updated: now,
+            window_period: None,
         });
         entry.cap = cap;
-        entry.used_percent = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        entry.used_percent = counter_used_percent(&entry.used_tokens, entry.cap);
         entry.last_updated = now;
     }
 
     /// Recompute `used_percent` for one counter-fed window from its
     /// currently-stored `used_tokens` and `cap`. Use after
     /// [`set_counter_cap`] to surface the percent before the next
-    /// `record_counter` lands. Returns the new percent, or `None` when
-    /// the cap is unknown / non-positive.
+    /// `record_counter` lands. Returns the new percent (0..=100), or
+    /// `None` when the cap is unknown / non-positive.
     pub fn recompute_counter_percent(
         &mut self,
         provider: Provider,
@@ -1572,10 +1859,7 @@ impl UtilizationStore {
     ) -> Option<f64> {
         let k = counter_key(provider, account_id, plan, window_name);
         let entry = self.counters.get_mut(&k)?;
-        let pct = match entry.cap {
-            Some(c) if c > 0.0 => Some(entry.used_tokens / c),
-            _ => None,
-        };
+        let pct = counter_used_percent(&entry.used_tokens, entry.cap);
         entry.used_percent = pct;
         pct
     }
@@ -1662,6 +1946,98 @@ mod tests {
         let s = snap.secondary.unwrap();
         assert_eq!(s.used_percent, 12.0);
         assert_eq!(s.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn parse_codex_plan_type_only_does_not_fabricate_zero_pct_windows() {
+        // Regression for Finding #5: a Codex response carrying ONLY
+        // `x-codex-plan-type: pro` must NOT create primary/secondary
+        // windows at 0%. Doing so would let a later real 92% reading
+        // be overwritten by the fabricated 0% under `upsert`.
+        let h = hm([("x-codex-plan-type", "pro")]);
+        let snap = parse_codex(&h, "acct-1", "ignored");
+        assert_eq!(snap.provider, Provider::OpenaiCodex);
+        assert_eq!(snap.plan, "pro");
+        assert!(
+            snap.primary.is_none(),
+            "no primary window when no numeric/reset signal is present"
+        );
+        assert!(
+            snap.secondary.is_none(),
+            "no secondary window when no numeric/reset signal is present"
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_status_only_does_not_fabricate_zero_pct_windows() {
+        // Regression for Finding #5: an Anthropic response carrying
+        // only `anthropic-ratelimit-unified-{status,remaining,reset}`
+        // (the no-suffix "current window" shape) must NOT create a
+        // 0% window. Status is a presence signal, not a numeric
+        // reading; emitting a 0% would let a later real 92% reading
+        // be overwritten under `upsert`.
+        let h = hm([
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-remaining", "23"),
+            ("anthropic-ratelimit-unified-reset", "2026-07-04T08:00:00Z"),
+        ]);
+        let snap = parse_anthropic(&h, "acct", "max");
+        assert!(
+            snap.primary.is_none(),
+            "status-only sighting must not fabricate a primary window"
+        );
+        assert!(
+            snap.secondary.is_none(),
+            "status-only sighting must not fabricate a secondary window"
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_unified_status_only_per_suffix_does_not_fabricate_zero() {
+        // The suffixed variant: `anthropic-ratelimit-unified-5h-status`
+        // with no numeric `utilization` and no `reset`. The provider
+        // told us the window exists, but a `status`-only sighting
+        // is not a numeric reading — emitting 0% would clobber a
+        // later real 92% observation.
+        let h = hm([("anthropic-ratelimit-unified-5h-status", "allowed")]);
+        let snap = parse_anthropic(&h, "acct", "max");
+        assert!(
+            snap.primary.is_none(),
+            "status-only suffixed window must not be emitted"
+        );
+    }
+
+    #[test]
+    fn later_real_codex_reading_is_not_clobbered_by_prior_windowless_sighting() {
+        // End-to-end regression for Finding #5: a codex response with
+        // ONLY `x-codex-plan-type` does not get recorded in the store
+        // (no windows). A later real response with primary=92% then
+        // does get recorded, and the read-back is the real 92% —
+        // NOT a fabricated 0%.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // (1) windowless sighting -> the store refuses to record it.
+        let header_only = hm([("x-codex-plan-type", "pro")]);
+        let snap = parse_codex(&header_only, "default", "default");
+        assert!(snap.primary.is_none() && snap.secondary.is_none());
+        let recorded = s.record(&snap, now);
+        assert!(!recorded, "windowless sighting must not be persisted");
+        // (2) real sighting with primary=92% -> recorded.
+        let rich = hm([
+            ("x-codex-primary-used-percent", "92"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-after-seconds", "600"),
+        ]);
+        let snap2 = parse_codex(&rich, "default", "default");
+        assert_eq!(snap2.primary.as_ref().unwrap().used_percent, 92.0);
+        assert!(s.record(&snap2, now));
+        // (3) read back: the real 92% survives, not 0%.
+        let rec = s
+            .get(Provider::OpenaiCodex, "default", "default")
+            .expect("real sighting persisted");
+        assert_eq!(rec.primary.as_ref().unwrap().used_percent, 92.0);
     }
 
     #[test]
@@ -1813,6 +2189,24 @@ mod tests {
     }
 
     fn snap_with_primary(pct: f64, reset_at: Option<i64>) -> RateLimitSnapshot {
+        // Default: `observed_at` is `None` so the legacy tests that
+        // don't care about freshness still go through the
+        // headroom-baseline path. The fresh-decide tests build
+        // snapshots via [`snap_with_primary_at`] to set
+        // `observed_at = Some(now)`.
+        snap_with_primary_at(pct, reset_at, None)
+    }
+
+    /// Variant of [`snap_with_primary`] that sets `observed_at`. Pass
+    /// `Some(now)` for a Fresh snapshot, `Some(now - duration)` for
+    /// an explicitly-aged one, and `None` for the no-observation
+    /// headroom case. The freshness-aware `decide` uses this
+    /// directly so the Finding-#6 tests can exercise the gate.
+    fn snap_with_primary_at(
+        pct: f64,
+        reset_at: Option<i64>,
+        observed_at: Option<DateTime<Utc>>,
+    ) -> RateLimitSnapshot {
         RateLimitSnapshot {
             provider: Provider::OpenaiCodex,
             account_id: "acct".into(),
@@ -1825,14 +2219,14 @@ mod tests {
             }),
             secondary: None,
             has_credits: Some(true),
-            observed_at: None,
+            observed_at,
         }
     }
 
     #[test]
     fn decide_below_target_prefers_sub() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(50.0, None);
+        let snap = snap_with_primary_at(50.0, None, Some(now));
         assert_eq!(
             decide(
                 &snap,
@@ -1847,7 +2241,7 @@ mod tests {
     #[test]
     fn decide_hysteresis_band_keeps_prefer_sub() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(82.0, None);
+        let snap = snap_with_primary_at(82.0, None, Some(now));
         assert_eq!(
             decide(
                 &snap,
@@ -1862,7 +2256,7 @@ mod tests {
     #[test]
     fn decide_at_or_above_cap_guard_blocks() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(85.0, None);
+        let snap = snap_with_primary_at(85.0, None, Some(now));
         assert_eq!(
             decide(
                 &snap,
@@ -1872,7 +2266,7 @@ mod tests {
             ),
             RouteDecision::FallBackToFree,
         );
-        let snap = snap_with_primary(95.0, None);
+        let snap = snap_with_primary_at(95.0, None, Some(now));
         assert_eq!(
             decide(
                 &snap,
@@ -1887,7 +2281,7 @@ mod tests {
     #[test]
     fn decide_chargeback_mode_with_budget_remaining() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(95.0, None);
+        let snap = snap_with_primary_at(95.0, None, Some(now));
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
         assert_eq!(
             decide(&snap, &knobs, now, Some(10.0)),
@@ -1898,7 +2292,7 @@ mod tests {
     #[test]
     fn decide_chargeback_mode_with_no_budget_falls_back() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(95.0, None);
+        let snap = snap_with_primary_at(95.0, None, Some(now));
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
         assert_eq!(
             decide(&snap, &knobs, now, Some(0.0)),
@@ -1914,7 +2308,7 @@ mod tests {
     fn decide_reset_at_expiry_resets_headroom() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         // 90% used but reset was 10s ago -> 0% effective -> PreferSub.
-        let snap = snap_with_primary(90.0, Some(now.timestamp() - 10));
+        let snap = snap_with_primary_at(90.0, Some(now.timestamp() - 10), Some(now));
         assert_eq!(
             decide(
                 &snap,
@@ -1929,7 +2323,7 @@ mod tests {
     #[test]
     fn decide_no_credits_blocks_immediately() {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let mut snap = snap_with_primary(0.0, None);
+        let mut snap = snap_with_primary_at(0.0, None, Some(now));
         snap.has_credits = Some(false);
         assert_eq!(
             decide(
@@ -1958,7 +2352,7 @@ mod tests {
                 reset_at_epoch: None,
                 label: Some("secondary".into()),
             }),
-            ..snap_with_primary(0.0, None)
+            ..snap_with_primary_at(0.0, None, Some(now))
         };
         assert_eq!(
             decide(
@@ -1969,6 +2363,137 @@ mod tests {
             ),
             RouteDecision::FallBackToFree,
         );
+    }
+
+    // -------- Finding #6: freshness gate ----------------------------
+    //
+    // The pre-fix `decide` ignored `observed_at`, so a two-hour-old
+    // snapshot at 90% with no reset kept returning
+    // `FallBackToFree` even though the equivalent `AccountView`
+    // would be Degraded (excluded) by the multi-window path. The
+    // post-fix gate routes degraded telemetry to the headroom
+    // baseline (`PreferSub`); a future-dated record is treated as
+    // clock-skewed and likewise not trusted.
+
+    #[test]
+    fn decide_stale_snapshot_does_not_gate_routing() {
+        // A 2-hour-old snapshot at 90% (above the 85% cap_guard)
+        // must NOT keep gating routing — degraded telemetry must
+        // not gate (Finding #6). Returns PreferSub.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let two_hours_ago = now - chrono::Duration::seconds(2 * 3600);
+        let snap = snap_with_primary_at(90.0, None, Some(two_hours_ago));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::PreferSub,
+            "stale telemetry must not gate routing",
+        );
+    }
+
+    #[test]
+    fn decide_snapshot_without_observed_at_uses_headroom_baseline() {
+        // A snapshot that never set `observed_at` is Degraded by
+        // construction — never observed = never trusted. The
+        // legacy `snap_with_primary` helper leaves `observed_at`
+        // as None so this test exercises the "no observation at
+        // all" path: `decide` must NOT gate on a 95%-used record
+        // that has no timestamp.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let snap = snap_with_primary(95.0, None);
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::PreferSub,
+            "unobserved telemetry must not gate routing",
+        );
+    }
+
+    #[test]
+    fn decide_future_dated_record_is_treated_as_degraded() {
+        // A future-dated record (clock skew, NTP rollback) MUST
+        // NOT be trusted. Pre-fix `TelemetryHealth::from_age_secs`
+        // treats negative ages as Fresh, which let a 90%-used
+        // future-dated record control routing until the clock
+        // caught up (Finding #6). Post-fix: anything past the
+        // small explicit future-skew tolerance is Degraded.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let far_future = now + chrono::Duration::seconds(3600); // 1h ahead
+        let snap = snap_with_primary_at(90.0, None, Some(far_future));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::PreferSub,
+            "future-dated telemetry must not gate routing",
+        );
+    }
+
+    #[test]
+    fn decide_subsecond_clock_skew_is_tolerated() {
+        // NTP jitter (sub-second "now is in the past") is normal
+        // and must NOT be treated as Degraded — a real observation
+        // could otherwise be lost to clock noise. The small
+        // explicit tolerance keeps the gate honest.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let one_sec_future = now + chrono::Duration::seconds(1);
+        let snap = snap_with_primary_at(95.0, None, Some(one_sec_future));
+        // 95% with a 1s-future stamp is still trusted: cap_guard
+        // trips -> FallBackToFree.
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::FallBackToFree,
+            "subsecond clock skew must not flip a real observation to Degraded",
+        );
+    }
+
+    #[test]
+    fn is_snapshot_fresh_respects_both_ends_of_the_window() {
+        // The helper itself: explicit acceptance / rejection
+        // boundary tests, independent of the band logic in
+        // `decide`.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // No observation -> not fresh.
+        let snap = snap_with_primary(50.0, None);
+        assert!(!is_snapshot_fresh(&snap, now));
+        // 1 minute ago -> fresh.
+        let snap = snap_with_primary_at(50.0, None, Some(now - chrono::Duration::seconds(60)));
+        assert!(is_snapshot_fresh(&snap, now));
+        // 30 minutes ago -> fresh.
+        let snap = snap_with_primary_at(50.0, None, Some(now - chrono::Duration::seconds(30 * 60)));
+        assert!(is_snapshot_fresh(&snap, now));
+        // 59m59s ago -> fresh (under the 60min threshold).
+        let snap = snap_with_primary_at(
+            50.0,
+            None,
+            Some(now - chrono::Duration::seconds(59 * 60 + 59)),
+        );
+        assert!(is_snapshot_fresh(&snap, now));
+        // 60 minutes ago exactly -> not fresh.
+        let snap = snap_with_primary_at(50.0, None, Some(now - chrono::Duration::seconds(60 * 60)));
+        assert!(!is_snapshot_fresh(&snap, now));
+        // 1 second in the future -> tolerated as fresh.
+        let snap = snap_with_primary_at(50.0, None, Some(now + chrono::Duration::seconds(1)));
+        assert!(is_snapshot_fresh(&snap, now));
+        // 1 hour in the future -> not fresh.
+        let snap = snap_with_primary_at(50.0, None, Some(now + chrono::Duration::seconds(3600)));
+        assert!(!is_snapshot_fresh(&snap, now));
     }
 
     // -------- store round-trip -------------------------------------
@@ -2086,15 +2611,18 @@ mod tests {
         let snap = RateLimitSnapshot::from_headers(&h, Provider::Anthropic, "default", "default")
             .expect("anthropic headers must yield a snapshot");
         assert_eq!(snap.provider, Provider::Anthropic);
-        // Anthropic's unified endpoint without a numeric `utilization`
-        // surfaces as 0% (status-only). The legacy-style `reset` header is
-        // parsed as an RFC3339 epoch.
-        let p = snap.primary.expect("primary window must be present");
-        assert_eq!(p.used_percent, 0.0);
-        assert_eq!(
-            p.reset_at_epoch,
-            Some(1783152000),
-            "2026-07-04T08:00:00Z must parse to 1783152000",
+        // A status-only / remaining / reset sighting (no numeric
+        // `utilization` field) MUST NOT fabricate a 0% window. The
+        // parsers deliberately return `None` for both the suffixed and
+        // no-suffix windows so a later real reading cannot be
+        // overwritten by a synthesized 0%.
+        assert!(
+            snap.primary.is_none(),
+            "status-only sighting must not fabricate a primary window"
+        );
+        assert!(
+            snap.secondary.is_none(),
+            "status-only sighting must not fabricate a secondary window"
         );
     }
 
@@ -2170,7 +2698,7 @@ mod tests {
             "None=headroom baseline must PreferSub",
         );
         // Fed: persisted snapshot at 92% -> cap_guard trips -> off.
-        let fed_snap = snap_with_primary(92.0, None);
+        let fed_snap = snap_with_primary_at(92.0, None, Some(now));
         assert_eq!(
             decide(&fed_snap, &knobs, now, None),
             RouteDecision::FallBackToFree,
@@ -2227,12 +2755,28 @@ mod tests {
         );
         // First response: N tokens.
         let n = 1234.0_f64;
-        let used_after_first =
-            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+        let used_after_first = s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            n,
+            now,
+            crate::config::ResetKind::Rolling,
+            0,
+        );
         assert_eq!(used_after_first, n, "first response adds exactly N tokens");
         // Second response: another N tokens.
-        let used_after_second =
-            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+        let used_after_second = s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            n,
+            now,
+            crate::config::ResetKind::Rolling,
+            0,
+        );
         assert_eq!(used_after_second, 2.0 * n, "two responses accumulate to 2N");
 
         // Read back via the typed accessor.
@@ -2240,13 +2784,16 @@ mod tests {
             .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
             .expect("monthly counter window must persist");
         assert_eq!(w.used_tokens, 2.0 * n);
-        let expected_pct = (2.0 * n) / MM_MONTHLY_CAP;
+        // Post-Finding-#3: stored as a 0..=100 percent (the
+        // pre-fix layout was a 0..=1 fraction, which silently
+        // defeated `cap_guard` comparisons).
+        let expected_pct = (2.0 * n) / MM_MONTHLY_CAP * 100.0;
         let got_pct = w
             .used_percent
             .expect("used_percent must be Some when cap is known");
         assert!(
             (got_pct - expected_pct).abs() < 1e-12,
-            "used_percent must equal 2N/5.1e9 = {expected_pct}, got {got_pct}",
+            "used_percent must equal 2N/5.1e9*100 = {expected_pct}, got {got_pct}",
         );
         // And the JSON on disk: round-trip.
         s.save().unwrap();
@@ -2279,7 +2826,16 @@ mod tests {
         // PercentOnly window (the wire-up would never do this, but
         // the store's contract must hold either way).
         let n = 999.0_f64;
-        let used = s.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", n, now);
+        let used = s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "5h",
+            n,
+            now,
+            crate::config::ResetKind::Rolling,
+            0,
+        );
         assert_eq!(used, n, "used_tokens still records the increment");
         let w = s
             .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
@@ -2322,14 +2878,23 @@ mod tests {
             .used_percent
             .expect("with cap set, used_percent must be Some");
         assert!(
-            (pct - (n / 10_000.0)).abs() < 1e-12,
-            "after set_counter_cap, percent must be used/cap: got {pct}",
+            (pct - (n / 10_000.0 * 100.0)).abs() < 1e-12,
+            "after set_counter_cap, percent must be (used/cap)*100: got {pct}",
         );
 
         // And critically: a fresh `record_counter` on a DIFFERENT
         // percent-only window (the `weekly` one) with no cap set
         // MUST stay percent-less. This is the regression guard.
-        let used_w = s.record_counter(Provider::MiniMax, "default", MM_PLAN, "weekly", 500.0, now);
+        let used_w = s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "weekly",
+            500.0,
+            now,
+            crate::config::ResetKind::Rolling,
+            0,
+        );
         assert_eq!(used_w, 500.0);
         let w_w = s
             .get_counter(Provider::MiniMax, "default", MM_PLAN, "weekly")
@@ -2375,6 +2940,8 @@ mod tests {
             "monthly",
             2_500_000.0,
             now,
+            crate::config::ResetKind::Rolling,
+            0,
         );
         s.save().unwrap();
 
@@ -2390,7 +2957,7 @@ mod tests {
             .expect("counter row must round-trip");
         assert_eq!(cw.used_tokens, 2_500_000.0);
         assert_eq!(cw.cap, Some(MM_MONTHLY_CAP));
-        assert_eq!(cw.used_percent, Some(2_500_000.0 / MM_MONTHLY_CAP));
+        assert_eq!(cw.used_percent, Some(2_500_000.0 / MM_MONTHLY_CAP * 100.0));
         assert_eq!(cw.provider, Provider::MiniMax);
         assert_eq!(cw.plan, MM_PLAN);
         assert_eq!(cw.window_name, "monthly");
@@ -2407,6 +2974,276 @@ mod tests {
         let s3 = UtilizationStore::open(&path2).unwrap();
         assert!(s3.counters.is_empty());
         assert!(s3.records.is_empty());
+    }
+
+    /// Regression for Finding #3: a counter row's `used_percent` is
+    /// stored in the 0..=100 range (NOT a 0..=1 fraction) so it is
+    /// directly comparable to the 0..=100 percent values the
+    /// header-fed snapshot path produces. The pre-fix layout stored
+    /// `(used / cap)`, which silently defeated `cap_guard`
+    /// comparisons (4.335B / 5.1B = 0.85 ≠ 85, so the guard never
+    /// tripped).
+    #[test]
+    fn counter_used_percent_is_stored_in_zero_to_hundred_range() {
+        // Seed 4.335B tokens against a 5.1B cap (the MiniMax spec
+        // example from Finding #3): must surface 85.0, not 0.85.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(MM_MONTHLY_CAP),
+            now,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            4_335_000_000.0,
+            now,
+            crate::config::ResetKind::CalendarMonthly,
+            720,
+        );
+        let cw = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .unwrap();
+        let pct = cw.used_percent.expect("cap is set -> percent is set");
+        assert!(
+            (pct - 85.0).abs() < 1e-9,
+            "4.335B / 5.1B must read as 85.0 (post-Finding-#3), got {pct}"
+        );
+        // And the percent value must be on the same scale as a
+        // `cap_guard` comparison. The pre-fix 0.85 would have lost
+        // to an 85.0 cap_guard; the post-fix value meets it exactly.
+        assert!(pct >= 85.0, "the percent value must trip cap_guard");
+    }
+
+    /// Regression for Finding #3: a store written by the buggy
+    /// pre-fix binary (where `used_percent` was a 0..=1 fraction)
+    /// reads back as a 0..=100 percent after a one-shot in-memory
+    /// migration on `open`. The on-disk file is also patched in
+    /// place so a subsequent `save()` writes the corrected layout.
+    #[test]
+    fn counter_on_load_migrates_fractional_used_percent_to_percent() {
+        // Hand-write a pre-fix on-disk file: used_tokens=4.335e9,
+        // cap=5.1e9, used_percent=0.85 (the old fractional layout).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let now_str = "2026-07-04T12:00:00Z";
+        let legacy_json = format!(
+            r#"{{
+                "records": {{}},
+                "counters": {{
+                    "MiniMax::default::minimax-max::monthly": {{
+                        "provider": "mini_max",
+                        "account_id": "default",
+                        "plan": "minimax-max",
+                        "window_name": "monthly",
+                        "used_tokens": 4335000000.0,
+                        "cap": 5100000000.0,
+                        "used_percent": 0.85,
+                        "last_updated": "{now_str}"
+                    }}
+                }}
+            }}"#
+        );
+        std::fs::write(&path, legacy_json).unwrap();
+        // Open: the migration must rescale 0.85 to 85.0 in memory.
+        let s = UtilizationStore::open(&path).unwrap();
+        let cw = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .expect("counter row loaded from legacy file");
+        let pct = cw.used_percent.expect("cap is set -> percent is set");
+        assert!(
+            (pct - 85.0).abs() < 1e-9,
+            "legacy 0.85 must migrate to 85.0 on open, got {pct}"
+        );
+    }
+
+    /// Regression for Finding #4: a calendar-boundary counter window
+    /// atomically resets `used_tokens` to zero when the next
+    /// `record_counter` call lands in a new period. Without this, a
+    /// plan that hit its cap in June would stay "exhausted" forever
+    /// in July — the percentage-unit bug (Finding #3) would then
+    /// trip `cap_guard` permanently.
+    #[test]
+    fn counter_calendar_monthly_resets_used_tokens_on_new_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let june = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(MM_MONTHLY_CAP),
+            june,
+        );
+        // Heavy June: 90% of the cap.
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            MM_MONTHLY_CAP * 0.9,
+            june,
+            crate::config::ResetKind::CalendarMonthly,
+            720,
+        );
+        let june_cw = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .unwrap();
+        assert!(
+            (june_cw.used_tokens - MM_MONTHLY_CAP * 0.9).abs() < 1.0,
+            "June's heavy usage must accumulate"
+        );
+        // July: a single small response.
+        let july = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            1_000.0,
+            july,
+            crate::config::ResetKind::CalendarMonthly,
+            720,
+        );
+        let july_cw = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .unwrap();
+        // The fix: July MUST start from a clean slate, not from
+        // June's 90%-of-cap balance. Without the fix, this assertion
+        // would fail by ~4.59B tokens.
+        assert!(
+            (july_cw.used_tokens - 1_000.0).abs() < 1.0,
+            "new calendar month must reset used_tokens to 0 before applying the increment, got used_tokens={}",
+            july_cw.used_tokens
+        );
+        // And the percent must reflect July's tiny usage, not
+        // June's cap-exhaustion.
+        let pct = july_cw.used_percent.expect("cap is set");
+        assert!(pct < 1.0, "July percent must be tiny, not 90% (got {pct})");
+    }
+
+    /// Regression for Finding #4: a `CalendarDaily` counter window
+    /// resets on a day boundary (not just monthly).
+    #[test]
+    fn counter_calendar_daily_resets_used_tokens_on_new_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut s = UtilizationStore::open(&path).unwrap();
+        let day1 = Utc.with_ymd_and_hms(2026, 7, 3, 23, 59, 0).unwrap();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "daily",
+            Some(10_000.0),
+            day1,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "daily",
+            9_500.0,
+            day1,
+            crate::config::ResetKind::CalendarDaily,
+            24,
+        );
+        // Midnight rollover: a tiny new-day increment must NOT
+        // accumulate on top of yesterday's 9.5k.
+        let day2 = Utc.with_ymd_and_hms(2026, 7, 4, 0, 0, 30).unwrap();
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "daily",
+            100.0,
+            day2,
+            crate::config::ResetKind::CalendarDaily,
+            24,
+        );
+        let cw = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "daily")
+            .unwrap();
+        assert!(
+            (cw.used_tokens - 100.0).abs() < 1e-9,
+            "new calendar day must reset to 0 before increment, got used_tokens={}",
+            cw.used_tokens
+        );
+    }
+
+    /// `window_period_for` produces the stable per-period id the
+    /// store uses to detect a calendar rollover. The id MUST change
+    /// when the period changes (the discriminator) and MUST be
+    /// stable within a period (so two `record_counter` calls in the
+    /// same window don't trigger a reset).
+    #[test]
+    fn window_period_for_is_stable_within_a_period_and_flips_on_boundary() {
+        use crate::utilization::window_period_for;
+        let june_1 = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let june_15 = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let july_1 = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let d1 = Utc.with_ymd_and_hms(2026, 7, 4, 0, 0, 0).unwrap();
+        let d2 = Utc.with_ymd_and_hms(2026, 7, 4, 23, 59, 59).unwrap();
+        let d3 = Utc.with_ymd_and_hms(2026, 7, 5, 0, 0, 0).unwrap();
+        // Monthly
+        assert_eq!(
+            window_period_for(june_1, ResetKind::CalendarMonthly, 720),
+            "2026-06"
+        );
+        assert_eq!(
+            window_period_for(june_15, ResetKind::CalendarMonthly, 720),
+            "2026-06"
+        );
+        assert_eq!(
+            window_period_for(july_1, ResetKind::CalendarMonthly, 720),
+            "2026-07"
+        );
+        // Daily
+        assert_eq!(
+            window_period_for(d1, ResetKind::CalendarDaily, 24),
+            "2026-07-04"
+        );
+        assert_eq!(
+            window_period_for(d2, ResetKind::CalendarDaily, 24),
+            "2026-07-04"
+        );
+        assert_eq!(
+            window_period_for(d3, ResetKind::CalendarDaily, 24),
+            "2026-07-05"
+        );
+        // Rolling: stable within the same cycle, flips at the cycle
+        // boundary. With hours=5, the bucket is floor(now / 18000).
+        // Use times well within a 5-hour bucket (14:00, 15:00, 16:00
+        // all fall into the same 5h cycle) AND times that straddle a
+        // bucket boundary (16:00 vs 18:00) so the test is
+        // wall-clock-agnostic.
+        let r1 = window_period_for(
+            Utc.with_ymd_and_hms(2026, 7, 4, 14, 0, 0).unwrap(),
+            ResetKind::Rolling,
+            5,
+        );
+        let r2 = window_period_for(
+            Utc.with_ymd_and_hms(2026, 7, 4, 16, 0, 0).unwrap(),
+            ResetKind::Rolling,
+            5,
+        );
+        let r3 = window_period_for(
+            Utc.with_ymd_and_hms(2026, 7, 4, 18, 0, 0).unwrap(),
+            ResetKind::Rolling,
+            5,
+        );
+        assert_eq!(r1, r2, "rolling period id must be stable within a cycle");
+        assert_ne!(r2, r3, "rolling period id must flip on the cycle boundary");
     }
 
     // -------- KNEMON Layer 4 (per-account multi-window routing) ------
@@ -2733,6 +3570,139 @@ mod tests {
         assert_eq!(ad.binding_window.as_deref(), Some("5h"));
     }
 
+    /// Regression for Finding #7: a binding 5h window at 90% (resetting
+    /// in 5 minutes) MUST NOT mask a still-exhausted weekly window at
+    /// 89% (resetting in 5 days). The weekly cap genuinely won't refill
+    /// soon and the operator who hit it should still be routed to
+    /// free. Pre-fix, the relaxation only checked the binding window
+    /// and returned `PreferSub` here, hiding the weekly exhaustion.
+    #[test]
+    fn l4_reset_relaxation_does_not_hide_other_exhausted_windows() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // 5h at 90% (above the 85% cap_guard), resetting in 5 minutes
+        // (well under 10% of the 5h cycle -> imminently resetting).
+        let hot_5h = WindowView {
+            name: "5h".into(),
+            used_percent: Some(90.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            // 300s = 5 min out of 18000s = 1.67% of the cycle.
+            reset_at: Some(now + chrono::Duration::seconds(300)),
+            hours: 5,
+        };
+        // Weekly at 89% (above the cap_guard), resetting in 5 DAYS —
+        // not imminent. This window MUST keep the gate closed.
+        let weekly = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(89.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            // 5 days = 5*86400 = 432000s. 432000 / (168*3600) = ~71%
+            // of the weekly cycle -> NOT imminent.
+            reset_at: Some(now + chrono::Duration::seconds(5 * 24 * 3600)),
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![hot_5h, weekly],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "weekly cap at 89% (resetting in 5 days) must not be hidden by an imminent 5h reset"
+        );
+        assert_eq!(
+            ad.binding_window.as_deref(),
+            Some("5h"),
+            "5h at 90% still binds (highest used)"
+        );
+    }
+
+    /// Finding #7 — companion: when BOTH the 5h and the weekly window
+    /// are at/above the guard AND BOTH are imminently resetting, the
+    /// relaxation still fires (the "every exhausted window is
+    /// imminently resetting" precondition is satisfied).
+    #[test]
+    fn l4_reset_relaxation_fires_when_every_exhausted_window_is_imminent() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let hot_5h = WindowView {
+            name: "5h".into(),
+            used_percent: Some(95.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            // 5 min out of 5h = 1.67% -> imminent.
+            reset_at: Some(now + chrono::Duration::seconds(300)),
+            hours: 5,
+        };
+        // Weekly at 89% resetting in 12h (12/168 = 7.1% of the
+        // weekly cycle) -> also imminent under the 10% threshold.
+        let weekly = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(89.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: Some(now + chrono::Duration::seconds(12 * 3600)),
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![hot_5h, weekly],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::PreferSub,
+            "both exhausted windows are imminently resetting -> relaxation fires"
+        );
+        assert_eq!(ad.binding_window.as_deref(), Some("5h"));
+    }
+
+    /// Finding #7 — a window at/above the guard WITHOUT a reset
+    /// signal (no `reset_at`) can never be confirmed imminently
+    /// resetting, so the relaxation must NOT fire.
+    #[test]
+    fn l4_reset_relaxation_does_not_fire_when_a_guard_window_lacks_reset_signal() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let hot_5h = WindowView {
+            name: "5h".into(),
+            used_percent: Some(90.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: Some(now + chrono::Duration::seconds(300)),
+            hours: 5,
+        };
+        // 90% on a window with NO reset signal: cannot confirm it's
+        // imminently resetting, so it keeps the gate closed.
+        let no_reset = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(90.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            windows: vec![hot_5h, no_reset],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "a window at/above the guard with no reset signal keeps the gate closed"
+        );
+    }
+
     #[test]
     fn l4_band_drive_at_40_pct_prefers_sub() {
         // (e drive) 40% used, below use_target=80 -> PreferSub.
@@ -2925,6 +3895,8 @@ mod tests {
             "monthly",
             250_000.0,
             now,
+            crate::config::ResetKind::Rolling,
+            0,
         );
         let qw = crate::config::QuotaWindow {
             name: "monthly".into(),
@@ -2948,7 +3920,9 @@ mod tests {
         assert_eq!(w.name, "monthly");
         assert_eq!(w.hours, 720);
         assert!(w.used_percent.is_some());
-        assert!((w.used_percent.unwrap() - 0.25).abs() < 1e-9);
+        // 250k / 1M * 100 = 25.0 (post-Finding-#3 percent range). The
+        // pre-fix assertion was 0.25 (the buggy fractional layout).
+        assert!((w.used_percent.unwrap() - 25.0).abs() < 1e-9);
         assert_eq!(w.health, TelemetryHealth::Fresh);
     }
 

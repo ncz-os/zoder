@@ -866,6 +866,10 @@ mod tests {
     }
 
     fn snapshot_with_used(pct: f64, reset_at: Option<i64>) -> RateLimitSnapshot {
+        // Default: set `observed_at = Some(now())` so the freshness
+        // gate (Finding #6) lets the snapshot drive routing. The
+        // freshness-degraded tests use a separate helper that
+        // leaves `observed_at = None`.
         RateLimitSnapshot {
             provider: crate::utilization::Provider::OpenaiCodex,
             account_id: "acct".into(),
@@ -878,7 +882,7 @@ mod tests {
             }),
             secondary: None,
             has_credits: Some(true),
-            observed_at: None,
+            observed_at: Some(now()),
         }
     }
 
