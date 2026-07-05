@@ -1234,7 +1234,9 @@ pub fn build_account_view(
 ///     -> `{PreferSub, binding.used_percent, Some(binding.name)}`.
 ///     We're about to get full headroom back; don't pay the cost of
 ///     falling back.
-///   - Otherwise bands on `binding.used_percent`:
+///   - Hard cap gating uses the raw percentage of every observable window;
+///     health-weighted binding is only for ranking and diagnostics.
+///   - Otherwise bands on the observable windows:
 ///       * `< use_target`                          -> PreferSub
 ///       * `< cap_guard` (hysteresis)              -> PreferSub
 ///       * `>= cap_guard` && budget_mode = Block   -> FallBackToFree
@@ -1375,6 +1377,14 @@ pub fn decide_account(
         .copied()
         .expect("observable non-empty by prior guard");
     let binding_used = binding.used_percent.unwrap_or(0.0);
+    // A health discount may influence which window is most useful for ranking
+    // and diagnostics, but it must never turn an observed cap breach into
+    // headroom. For example, Stale 100% scores 80 while Fresh 84% scores 84;
+    // the latter may remain the binding diagnostic, while the former still
+    // hard-gates the account.
+    let hard_cap_breach = observable
+        .iter()
+        .any(|w| w.used_percent.unwrap_or(0.0) >= knobs.cap_guard);
     // Reset-relaxation: cap_guard trips AND time-to-reset is small
     // relative to the window's cycle.
     //
@@ -1403,7 +1413,7 @@ pub fn decide_account(
             }
         }
     };
-    let relax = binding_used >= knobs.cap_guard
+    let relax = hard_cap_breach
         && observable
             .iter()
             .filter(|w| w.used_percent.unwrap_or(0.0) >= knobs.cap_guard)
@@ -1427,7 +1437,7 @@ pub fn decide_account(
         })
     });
     // Bands.
-    let decision = if binding_used >= knobs.cap_guard || forecast_breach {
+    let decision = if hard_cap_breach || forecast_breach {
         match knobs.budget_mode {
             BudgetMode::Block => RouteDecision::FallBackToFree,
             BudgetMode::Chargeback => match (knobs.chargeback_budget_usd, chargeback_remaining) {
@@ -3425,6 +3435,43 @@ mod tests {
             "Fresh 61% (score 61) must beat Stale 75% (score 60)"
         );
         assert!((ad.strength - 61.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cap_breach_overrides_health_weight() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let stale_weekly = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(100.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Stale,
+            reset_at: None,
+            hours: 168,
+        };
+        let fresh_5h = WindowView {
+            name: "5h".into(),
+            used_percent: Some(84.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Fresh,
+            reset_at: None,
+            hours: 5,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            has_credits: None,
+            windows: vec![stale_weekly, fresh_5h],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::FallBackToFree);
+        assert_eq!(
+            ad.binding_window.as_deref(),
+            Some("5h"),
+            "health weighting remains diagnostic, but cannot mask the weekly cap breach"
+        );
+        assert!((ad.strength - 84.0).abs() < 1e-9);
     }
 
     #[test]

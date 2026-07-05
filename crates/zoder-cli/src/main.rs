@@ -3,6 +3,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 mod agentic;
 mod goose;
 
@@ -64,6 +65,19 @@ fn finops_tags(
         tier: Some(cli.tier.clone()),
         cache_hit_ratio: cache_hit_ratio(prompt_tokens, cached_prompt_tokens),
     }
+}
+
+/// Persist a completed turn before it can be reported as successful. Ledger
+/// accounting is a quota-control boundary, so every caller must propagate a
+/// write failure instead of allowing an unrecorded paid turn to succeed.
+pub(crate) fn record_turn_entry(
+    ledger_path: &Path,
+    entry: &Entry,
+    turn_kind: &str,
+) -> anyhow::Result<()> {
+    Ledger::new(ledger_path)
+        .record(entry)
+        .with_context(|| format!("recording {turn_kind} spend in {}", ledger_path.display()))
 }
 
 #[derive(Parser, Clone)]
@@ -655,12 +669,19 @@ struct RoutingContext {
 }
 
 impl RoutingContext {
-    fn load(cfg: &Config) -> Self {
-        let entries = Ledger::new(&cfg.ledger_path).entries().unwrap_or_default();
+    fn load(cfg: &Config) -> anyhow::Result<Self> {
+        let entries = Ledger::new(&cfg.ledger_path)
+            .entries_strict()
+            .with_context(|| {
+                format!(
+                    "loading quota-routing ledger from {}",
+                    cfg.ledger_path.display()
+                )
+            })?;
         let catalog = load_tier_catalog(Some(
             &zoder_core::subscription_tiers::default_catalog_path(&Config::home()),
         ));
-        Self { entries, catalog }
+        Ok(Self { entries, catalog })
     }
 
     /// Quota-aware variant of [`Config::real_provider_for_model`]. The CLI
@@ -2244,7 +2265,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // reviewer chain is unconditional — even an explicit `-m` keeps the
     // reviewer's per-role preference lane, because balanced routing
     // (sub-first reviewer) is independent of the author's choice.
-    let rc = RoutingContext::load(&eng.cfg);
+    let rc = RoutingContext::load(&eng.cfg)?;
     let (scn_primary, scn_reviewer, scn_reason) = scenario_chain_for_roles(eng, &rc, health, cli)?;
 
     // Precedence step (1): an operator-chosen pin collapses the chain to
@@ -2583,7 +2604,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // metered sibling) claim the same prefix, it picks the cost-neutral one
     // while the subscription's rolling window has headroom and transparently
     // falls through to the metered path when the window is exhausted.
-    let routing = RoutingContext::load(&eng.cfg);
+    let routing = RoutingContext::load(&eng.cfg)?;
     let provider_cfg = routing
         .real_provider_for_model(&eng.cfg, &primary)
         .ok_or_else(|| {
@@ -2886,20 +2907,23 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             None => msg,
         });
     }
-    let ledger = Ledger::new(&eng.cfg.ledger_path);
-    ledger.record(&Entry {
-        ts_utc,
-        provider: used_provider_id.clone(),
-        model: used_model.clone(),
-        host: zoder_core::ledger::host_of_model(&used_model),
-        tokens_in,
-        tokens_out,
-        cost_usd: cost,
-        cost_unknown: unknown_cost,
-        calls: 1,
-        violation,
-        tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
-    })?;
+    record_turn_entry(
+        &eng.cfg.ledger_path,
+        &Entry {
+            ts_utc,
+            provider: used_provider_id.clone(),
+            model: used_model.clone(),
+            host: zoder_core::ledger::host_of_model(&used_model),
+            tokens_in,
+            tokens_out,
+            cost_usd: cost,
+            cost_unknown: unknown_cost,
+            calls: 1,
+            violation,
+            tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+        },
+        "oneshot turn",
+    )?;
     save_health(&health);
 
     // C1: a violation is fatal -> stderr message + non-zero exit.
@@ -3192,6 +3216,50 @@ mod default_exec_budget_tests {
     }
 }
 
+#[cfg(test)]
+mod ledger_integrity_tests {
+    use super::*;
+
+    fn test_entry() -> Entry {
+        Entry {
+            ts_utc: Utc::now(),
+            provider: "paid-provider".into(),
+            model: "paid/model".into(),
+            host: "paid".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.01,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+        }
+    }
+
+    #[test]
+    fn unrecorded_write_fails_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Opening a directory as the append-only ledger file always fails,
+        // independent of the test runner's user/permission model.
+        let err = record_turn_entry(dir.path(), &test_entry(), "agentic turn")
+            .expect_err("an unrecorded paid turn must not report success");
+        assert!(err.to_string().contains("recording agentic turn spend"));
+    }
+
+    #[test]
+    fn ledger_read_failure_demotes_subscription_by_failing_routing_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        // A directory at the ledger path is unreadable as JSONL. Previously
+        // this became an empty ledger, making a subscription look unused.
+        cfg.ledger_path = dir.path().to_path_buf();
+        let err = RoutingContext::load(&cfg)
+            .err()
+            .expect("routing must not select a subscription without ledger integrity");
+        assert!(err.to_string().contains("loading quota-routing ledger"));
+    }
+}
+
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
@@ -3224,7 +3292,7 @@ pub(crate) async fn agentic_turn(
     // Quota-aware variant: a subscription provider with a saturated window is
     // transparently demoted to its metered sibling, so this guard only fires
     // when NEITHER path has a real backing provider.
-    let routing = RoutingContext::load(&eng.cfg);
+    let routing = RoutingContext::load(&eng.cfg)?;
     let routed_provider = routing
         .real_provider_for_model(&eng.cfg, &primary)
         .cloned()
@@ -3453,27 +3521,28 @@ pub(crate) async fn agentic_turn(
         None
     };
 
-    let ledger = Ledger::new(&eng.cfg.ledger_path);
-    if let Err(e) = ledger.record(&Entry {
-        ts_utc: chrono::Utc::now(),
-        // Attribute to the provider that serves the model the engine actually
-        // ran (per-model routing), not the default provider.
-        provider: routing
-            .real_provider_for_model(&eng.cfg, &model_used)
-            .map(|p| p.id.clone())
-            .unwrap_or_else(|| routed_provider.id.clone()),
-        model: model_used.clone(),
-        host: zoder_core::ledger::host_of_model(&model_used),
-        tokens_in,
-        tokens_out,
-        cost_usd: cost,
-        cost_unknown: !cost_known,
-        calls: 1,
-        violation,
-        tags: finops_tags(cli, tokens_in, None),
-    }) {
-        eprintln!("zoder: warning: failed to record ledger entry: {e}");
-    }
+    record_turn_entry(
+        &eng.cfg.ledger_path,
+        &Entry {
+            ts_utc: chrono::Utc::now(),
+            // Attribute to the provider that serves the model the engine actually
+            // ran (per-model routing), not the default provider.
+            provider: routing
+                .real_provider_for_model(&eng.cfg, &model_used)
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| routed_provider.id.clone()),
+            model: model_used.clone(),
+            host: zoder_core::ledger::host_of_model(&model_used),
+            tokens_in,
+            tokens_out,
+            cost_usd: cost,
+            cost_unknown: !cost_known,
+            calls: 1,
+            violation,
+            tags: finops_tags(cli, tokens_in, None),
+        },
+        "agentic turn",
+    )?;
     // A timed-out (or otherwise non-completed) turn still returns a TurnResult so
     // the caller can preserve partial output — but it is NOT a success: record it
     // as a failure so latency/health-aware routing learns this model couldn't
@@ -6031,8 +6100,13 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
         );
     }
     let entries = Ledger::new(&eng.cfg.ledger_path)
-        .entries()
-        .unwrap_or_default();
+        .entries_strict()
+        .with_context(|| {
+            format!(
+                "loading subscription usage from {}",
+                eng.cfg.ledger_path.display()
+            )
+        })?;
     for p in &eng.cfg.providers {
         let auth = p.auth.resolve().map(|_| "ok").unwrap_or("MISSING");
         // Subscription plan header: declare the tier name + `as_of` +
@@ -8419,7 +8493,7 @@ mod model_selection_tests {
         use chrono::TimeZone;
         let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
         let eng = Engine::from_parts(cfg, fixture_corpus());
-        let rc = RoutingContext::load(&eng.cfg);
+        let rc = RoutingContext::load(&eng.cfg).unwrap();
         let health = HealthStore::default();
         let candidates = build_scenario_candidates(&eng, &rc, &health);
         // Sanity: the candidate pool isn't empty (fixture has 3 models).

@@ -306,6 +306,28 @@ impl Ledger {
         self.entries_observed(|_, _| {})
     }
 
+    /// Read every valid entry and reject the ledger if any non-empty row is
+    /// malformed. Quota and budget decisions must use this stricter view: a
+    /// skipped row may contain spend, so continuing would be fail-open.
+    pub fn entries_strict(&self) -> anyhow::Result<Vec<Entry>> {
+        let mut malformed_lines = Vec::new();
+        let entries = self
+            .entries_observed(|line_no, _| malformed_lines.push(line_no))
+            .with_context(|| format!("reading ledger from {}", self.path.display()))?;
+        if !malformed_lines.is_empty() {
+            anyhow::bail!(
+                "cannot establish ledger integrity: {} contains malformed non-empty row(s) at line(s) {}",
+                self.path.display(),
+                malformed_lines
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(entries)
+    }
+
     /// Entries within an optional [since, until] window (inclusive).
     pub fn entries_in(
         &self,
@@ -357,21 +379,7 @@ impl Ledger {
     /// report spend to $0 and bypass the monthly cap (Finding #10).
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         let bucket = Utc::now().format("%Y-%m").to_string();
-        let mut malformed_lines = Vec::new();
-        let entries = self
-            .entries_observed(|line_no, _| malformed_lines.push(line_no))
-            .with_context(|| format!("reading month-to-date spend from {}", self.path.display()))?;
-        if !malformed_lines.is_empty() {
-            anyhow::bail!(
-                "cannot determine month-to-date spend: ledger {} contains malformed non-empty row(s) at line(s) {}",
-                self.path.display(),
-                malformed_lines
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        let entries = self.entries_strict()?;
 
         let mut rollup = Rollup::default();
         for entry in entries

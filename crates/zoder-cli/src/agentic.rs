@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use zoder_core::{
-    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Ledger, Message,
+    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Message,
     ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog,
 };
 
@@ -469,7 +469,7 @@ async fn complete_once(
     // Per-model routing: resolve the provider that actually serves this model
     // (e.g. a pinned MiniMax-M3 -> the minimax provider), not always the default
     // provider — otherwise a reviewer model could be sent to the wrong endpoint.
-    let routing = crate::RoutingContext::load(&eng.cfg);
+    let routing = crate::RoutingContext::load(&eng.cfg)?;
     let provider_cfg = routing
         .real_provider_for_model(&eng.cfg, &model)
         .ok_or_else(|| {
@@ -546,9 +546,9 @@ async fn complete_once(
     if let Some(v) = &violation {
         eprintln!("zoder: POLICY VIOLATION (reviewer): {v}");
     }
-    let ledger = Ledger::new(&eng.cfg.ledger_path);
-    ledger
-        .record(&Entry {
+    crate::record_turn_entry(
+        &eng.cfg.ledger_path,
+        &Entry {
             ts_utc: Utc::now(),
             provider: provider_cfg.id.clone(),
             model: model.clone(),
@@ -560,13 +560,9 @@ async fn complete_once(
             calls: 1,
             violation,
             tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
-        })
-        .with_context(|| {
-            format!(
-                "recording reviewer spend in {}",
-                eng.cfg.ledger_path.display()
-            )
-        })?;
+        },
+        "reviewer turn",
+    )?;
 
     Ok(Completion {
         model,
