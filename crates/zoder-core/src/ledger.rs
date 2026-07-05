@@ -2,6 +2,7 @@
 //! (ts_utc, provider, model, tokens_in, tokens_out, cost_usd), with
 //! day/week/month/year rollups. SQLite is a drop-in later via the same shape.
 
+use anyhow::Context;
 use chrono::{DateTime, Datelike, IsoWeek, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -343,20 +344,36 @@ impl Ledger {
     /// report spend to $0 and bypass the monthly cap (Finding #10).
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         let bucket = Utc::now().format("%Y-%m").to_string();
-        match self.rollup(Period::Month) {
-            Ok(m) => match m.get(&bucket) {
-                Some(r) if r.unknown_cost_calls > 0 => anyhow::bail!(
-                    "month-to-date spend contains {} call(s) with unknown cost",
-                    r.unknown_cost_calls
-                ),
-                Some(r) => Ok(r.cost_usd),
-                None => Ok(0.0),
-            },
-            Err(e) => Err(e.context(format!(
-                "reading month-to-date spend from {}",
-                self.path.display()
-            ))),
+        let mut malformed_lines = Vec::new();
+        let entries = self
+            .entries_observed(|line_no, _| malformed_lines.push(line_no))
+            .with_context(|| format!("reading month-to-date spend from {}", self.path.display()))?;
+        if !malformed_lines.is_empty() {
+            anyhow::bail!(
+                "cannot determine month-to-date spend: ledger {} contains malformed non-empty row(s) at line(s) {}",
+                self.path.display(),
+                malformed_lines
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
+
+        let mut rollup = Rollup::default();
+        for entry in entries
+            .iter()
+            .filter(|entry| Period::Month.bucket(&entry.ts_utc) == bucket)
+        {
+            accumulate_rollup(&mut rollup, entry)?;
+        }
+        if rollup.unknown_cost_calls > 0 {
+            anyhow::bail!(
+                "month-to-date spend contains {} call(s) with unknown cost",
+                rollup.unknown_cost_calls
+            );
+        }
+        Ok(rollup.cost_usd)
     }
 
     /// Spend rolled up by period bucket within an optional date window.
@@ -646,5 +663,30 @@ mod tests {
         };
         led.record(&unknown).unwrap();
         assert!(led.month_to_date_usd().is_err());
+    }
+
+    #[test]
+    fn month_to_date_fails_closed_on_malformed_non_empty_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let led = Ledger::new(&path);
+        led.record(&entry(
+            &Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            "m",
+            1.0,
+            10,
+            10,
+            1,
+        ))
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"ts_utc\":\"truncated\"\n").unwrap();
+
+        let err = led.month_to_date_usd().unwrap_err().to_string();
+        assert!(err.contains("malformed"), "{err}");
+        assert!(err.contains("line(s) 2"), "{err}");
     }
 }

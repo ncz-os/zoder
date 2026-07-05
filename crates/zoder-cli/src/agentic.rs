@@ -140,6 +140,14 @@ fn persist_agentic_counter_at(
         return false;
     };
     for window in counter_windows {
+        store.set_counter_rolling_hours(
+            util_provider,
+            "default",
+            &plan_label,
+            &window.name,
+            (window.reset == zoder_core::config::ResetKind::Rolling).then_some(window.hours),
+            now,
+        );
         store.set_counter_cap(
             util_provider,
             "default",
@@ -461,14 +469,17 @@ async fn complete_once(
     // Per-model routing: resolve the provider that actually serves this model
     // (e.g. a pinned MiniMax-M3 -> the minimax provider), not always the default
     // provider — otherwise a reviewer model could be sent to the wrong endpoint.
-    let provider_cfg = eng.cfg.real_provider_for_model(&model).ok_or_else(|| {
-        anyhow!(
+    let routing = crate::RoutingContext::load(&eng.cfg);
+    let provider_cfg = routing
+        .real_provider_for_model(&eng.cfg, &model)
+        .ok_or_else(|| {
+            anyhow!(
             "no real provider is configured for reviewer model '{model}' — it would fall through \
              to the {host} placeholder and fail. Configure a provider that serves it, or pass a \
              backed reviewer via `--reviewer <model>`.",
             host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
         )
-    })?;
+        })?;
 
     // Gate the reviewer/panel model. Reviewers run non-interactively (panel +
     // fix loop), so a PAID reviewer is REJECTED rather than prompted — pass
@@ -536,19 +547,26 @@ async fn complete_once(
         eprintln!("zoder: POLICY VIOLATION (reviewer): {v}");
     }
     let ledger = Ledger::new(&eng.cfg.ledger_path);
-    let _ = ledger.record(&Entry {
-        ts_utc: Utc::now(),
-        provider: provider_cfg.id.clone(),
-        model: model.clone(),
-        host: zoder_core::ledger::host_of_model(&model),
-        tokens_in,
-        tokens_out,
-        cost_usd: cost,
-        cost_unknown: unknown_cost,
-        calls: 1,
-        violation,
-        tags: zoder_core::ledger::FinOpsTags::default(),
-    });
+    ledger
+        .record(&Entry {
+            ts_utc: Utc::now(),
+            provider: provider_cfg.id.clone(),
+            model: model.clone(),
+            host: zoder_core::ledger::host_of_model(&model),
+            tokens_in,
+            tokens_out,
+            cost_usd: cost,
+            cost_unknown: unknown_cost,
+            calls: 1,
+            violation,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+        })
+        .with_context(|| {
+            format!(
+                "recording reviewer spend in {}",
+                eng.cfg.ledger_path.display()
+            )
+        })?;
 
     Ok(Completion {
         model,

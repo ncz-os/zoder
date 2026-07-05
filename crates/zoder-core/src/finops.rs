@@ -201,8 +201,7 @@ fn median(nums: &[f64]) -> f64 {
 }
 
 fn parse_tags(e: &Entry) -> FinOpsTags {
-    serde_json::from_value(serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
-        .unwrap_or_default()
+    e.tags.clone()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -867,6 +866,36 @@ mod tests {
         let pricing = PricingCatalog::default();
         let rep = build_finops_report(&led, &pricing, since, until, 30).unwrap();
         assert!(rep.by_host.iter().any(|g| g.key == "meta" && g.calls == 2));
+    }
+
+    #[test]
+    fn finops_dimensions_read_nested_entry_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let mut entry = Entry {
+            ts_utc: Utc::now(),
+            provider: "p".into(),
+            model: "vendor/model".into(),
+            host: "vendor".into(),
+            tokens_in: 100,
+            tokens_out: 20,
+            cost_usd: 0.5,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: FinOpsTags::default(),
+        };
+        entry.tags.caller = Some("ci".into());
+        entry.tags.task = Some("review".into());
+        entry.tags.cache_hit_ratio = Some(0.5);
+        led.record(&entry).unwrap();
+
+        let callers = spend_by_dimension(&led, Dimension::Caller, None, None).unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].key, "ci");
+        let tasks = spend_by_dimension(&led, Dimension::Task, None, None).unwrap();
+        assert_eq!(tasks[0].key, "review");
+        assert_eq!(parse_tags(&entry).cache_hit_ratio, Some(0.5));
     }
 
     #[test]

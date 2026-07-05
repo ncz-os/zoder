@@ -2651,7 +2651,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             &pricing,
             &primary,
             estimate_tokens(&prompt),
-            eng.cfg.budget.est_output_tokens,
+            u64::from(cli.max_tokens),
             Some(now),
             || Ledger::new(&eng.cfg.ledger_path).month_to_date_usd(),
         );
