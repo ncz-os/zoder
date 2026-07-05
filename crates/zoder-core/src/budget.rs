@@ -5,6 +5,9 @@
 //! spend (from the ledger), and [`Budget::evaluate`] returns a verdict. The CLI
 //! wires it in just after the prompt is read, before the model call.
 
+use crate::ledger::Ledger;
+use crate::pricing::{CostVerdict, PricingCatalog};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Approximate token count for a piece of text — a deliberately simple
@@ -95,6 +98,74 @@ impl Budget {
             BudgetVerdict::Confirm(format!("BUDGET: {}", reasons.join("; ")))
         }
     }
+
+    /// Catalog-aware pre-call decision. Distinct from [`Budget::evaluate`]
+    /// in three ways:
+    ///
+    /// 1. The estimate comes from [`PricingCatalog::classify_cost`], so
+    ///    the verdict is informed by the `Free` vs `Unknown` distinction
+    ///    (Finding #11): a metered custom model with no catalog entry is
+    ///    treated as "could not price" and the gate fails closed with a
+    ///    `Confirm` rather than silently approving $0.
+    /// 2. The cost honors the off-peak window when a timestamp is
+    ///    supplied (Finding #23): a DeepSeek call at 20:00 UTC uses the
+    ///    configured off-peak rate, not peak.
+    /// 3. The month-to-date spend is read via a closure that returns
+    ///    `anyhow::Result<f64>`; any I/O error fails closed (Finding
+    ///    #10) with a `Confirm` rather than collapsing to $0.
+    ///
+    /// `month_spent` is a closure so this function stays pure (no I/O
+    /// inside `Budget`); the CLI supplies `|| Ledger::new(...).month_to_date_usd()`.
+    pub fn evaluate_call(
+        &self,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        ts: Option<DateTime<Utc>>,
+        month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    ) -> BudgetVerdict {
+        // Step 1: cost verdict. Unknown = could not price = fail closed.
+        let verdict = pricing.classify_cost(model, tokens_in, tokens_out, ts);
+        let estimate_usd = match verdict {
+            CostVerdict::Priced(v) => v,
+            CostVerdict::Free => return BudgetVerdict::WithinBudget,
+            CostVerdict::Unknown => {
+                // The pre-call gate fails closed: an unknown cost for a
+                // would-be-metred call must be confirmed by the user.
+                // We carry the cap-trip reasons in the same string so a
+                // user who says "yes" still gets a clean audit trail.
+                let mut msg = format!(
+                    "BUDGET: catalog has no rate for model {model:?}; treating cost as \
+                     unknown — confirm to proceed"
+                );
+                if let Some(cap) = self.max_cost_per_call_usd {
+                    msg.push_str(&format!(" (per-call cap ${cap:.2} cannot be evaluated)"));
+                }
+                return BudgetVerdict::Confirm(msg);
+            }
+        };
+        // Step 2: month-to-date spend. Fail closed on I/O errors so a
+        // corrupted / permission-denied ledger can never bypass the cap.
+        let month_spent_usd = match month_spent() {
+            Ok(v) => v,
+            Err(e) => {
+                return BudgetVerdict::Confirm(format!(
+                    "BUDGET: could not read month-to-date spend from the ledger ({e}); \
+                     confirm to proceed"
+                ));
+            }
+        };
+        self.evaluate(estimate_usd, month_spent_usd)
+    }
+}
+
+/// Convenience helper: read month-to-date spend with a configurable
+/// fallback to `0.0` when the ledger is missing vs `Err` when the
+/// ledger exists but is unreadable. Wraps [`Ledger::month_to_date_usd`]
+/// so CLI call sites don't repeat the `Err` → "confirm" decision.
+pub fn read_month_spent_or_default(ledger: &Ledger) -> anyhow::Result<f64> {
+    ledger.month_to_date_usd()
 }
 
 #[cfg(test)]

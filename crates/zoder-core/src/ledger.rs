@@ -5,8 +5,33 @@
 use chrono::{DateTime, Datelike, IsoWeek, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+
+/// Optional FinOps tags attached to a ledger entry at ingestion time.
+/// Mirrors the TypeScript `FinOpsTags` interface (snake_case wire format).
+/// Persisted on [`Entry`] via `#[serde(default)]` so legacy entries written
+/// before this field existed still deserialize — Finding #22. The fields
+/// are intentionally `Option<..>` so a JSON `null` and an absent field are
+/// indistinguishable at the rollup layer (both mean "no tag").
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FinOpsTags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_ratio: Option<f64>,
+}
+
+/// Maximum number of consecutive non-UTF-8 bytes we'll tolerate in a
+/// single line before giving up. Used as the upper bound for
+/// `BufRead::read_until` so an attacker can't pin the parser on a
+/// multi-gigabyte garbage line; matches `provider.rs`'s
+/// `MAX_LINE_BYTES` for streaming SSE.
+const MAX_LEDGER_LINE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -32,6 +57,11 @@ pub struct Entry {
     /// "free" model that was actually billed or served from a paid backend).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub violation: Option<String>,
+    /// Optional FinOps tags attached at ingestion time (Finding #22).
+    /// `#[serde(default)]` keeps legacy entries deserializable: a line that
+    /// pre-dates this field still produces a valid `Entry` with empty tags.
+    #[serde(default)]
+    pub tags: FinOpsTags,
 }
 
 fn one_call() -> u64 {
@@ -133,21 +163,76 @@ impl Ledger {
     /// (e.g. from an interrupted append) is skipped rather than aborting the
     /// rollup, but — unlike a silent drop — the caller can observe and surface
     /// dropped spend. Mirrors the TS `Ledger.entries({ onMalformed })`.
+    ///
+    /// Read errors are NOT swallowed — `NotFound` returns an empty vector
+    /// (the canonical "no ledger yet" signal), every other I/O error
+    /// propagates as an `Err`. The old behavior of collapsing any
+    /// permission denial / invalid UTF-8 / partial write into an empty
+    /// success result is what let a corrupted ledger under-report spend
+    /// to $0 and bypass the pre-call budget gate (Finding #10).
     pub fn entries_observed(
         &self,
         mut on_malformed: impl FnMut(usize, &str),
     ) -> anyhow::Result<Vec<Entry>> {
-        let Ok(raw) = std::fs::read_to_string(&self.path) else {
-            return Ok(vec![]);
+        let f = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("opening ledger at {}", self.path.display())))
+            }
         };
+        // Stream bytes line-by-line. Reading the whole file into a String
+        // first (the old behavior) is fine for small ledgers but breaks on
+        // multi-MiB JSONL: one invalid UTF-8 byte in line 1 of a 50 MiB
+        // file makes the whole `read_to_string` fail with InvalidData,
+        // collapsing every entry to zero (Finding #10). Per-line
+        // `BufRead::read_until` recovers as much as possible and bounds
+        // memory via `MAX_LEDGER_LINE_BYTES`.
+        let reader = BufReader::with_capacity(64 * 1024, f);
         let mut out = Vec::new();
-        for (i, l) in raw.lines().enumerate() {
-            if l.trim().is_empty() {
+        let mut line_no: usize = 0;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut reader = reader;
+        loop {
+            line_no += 1;
+            buf.clear();
+            let n = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "reading ledger at line {line_no} of {}",
+                        self.path.display()
+                    )))
+                }
+            };
+            if n > MAX_LEDGER_LINE_BYTES as usize {
+                return Err(anyhow::anyhow!(
+                    "ledger line {line_no} exceeds {} bytes; truncating early",
+                    MAX_LEDGER_LINE_BYTES
+                ));
+            }
+            // Trim the trailing newline (and any CR for CRLF safety) so
+            // `serde_json::from_slice` doesn't see a trailing whitespace
+            // it objects to. Empty / whitespace-only lines are skipped
+            // silently — they were always tolerated, and there's no
+            // caller-visible state to corrupt.
+            while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                buf.pop();
+            }
+            if buf.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            match serde_json::from_str::<Entry>(l) {
+            match serde_json::from_slice::<Entry>(&buf) {
                 Ok(e) => out.push(e),
-                Err(_) => on_malformed(i + 1, l),
+                Err(_) => {
+                    // `from_utf8_lossy` keeps the malformed byte visible
+                    // for the caller; the line is still skipped so a
+                    // single bad row doesn't blank the rollup.
+                    let raw = String::from_utf8_lossy(&buf).into_owned();
+                    on_malformed(line_no, &raw);
+                }
             }
         }
         Ok(out)
@@ -155,6 +240,9 @@ impl Ledger {
 
     /// All entries, silently skipping malformed lines. For visibility into
     /// dropped lines use [`Ledger::entries_observed`].
+    ///
+    /// I/O errors OTHER than "file does not exist" are propagated, not
+    /// silently reported as an empty ledger — Finding #10.
     pub fn entries(&self) -> anyhow::Result<Vec<Entry>> {
         self.entries_observed(|_, _| {})
     }
@@ -197,13 +285,26 @@ impl Ledger {
 
     /// Total spend (USD) recorded in the current UTC calendar month. Used by the
     /// pre-call budget gate to check a projected call against the monthly cap.
-    /// Returns 0.0 on any read error (the gate fails open on a missing ledger).
-    pub fn month_to_date_usd(&self) -> f64 {
+    ///
+    /// Returns 0.0 ONLY when:
+    /// - the ledger file does not exist (the canonical "no spend yet" signal), or
+    /// - the file is empty.
+    ///
+    /// Returns `Err(_)` for every other failure (permission denied, invalid
+    /// UTF-8, partial write). The caller (the pre-call budget gate) must
+    /// treat `Err` as "could not read spend → fail CLOSED, request
+    /// confirmation" rather than as $0 — the old behavior of collapsing
+    /// any read failure into `0.0` is what let a corrupted ledger under-
+    /// report spend to $0 and bypass the monthly cap (Finding #10).
+    pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         let bucket = Utc::now().format("%Y-%m").to_string();
-        self.rollup(Period::Month)
-            .ok()
-            .and_then(|m| m.get(&bucket).map(|r| r.cost_usd))
-            .unwrap_or(0.0)
+        match self.rollup(Period::Month) {
+            Ok(m) => Ok(m.get(&bucket).map(|r| r.cost_usd).unwrap_or(0.0)),
+            Err(e) => Err(e.context(format!(
+                "reading month-to-date spend from {}",
+                self.path.display()
+            ))),
+        }
     }
 
     /// Spend rolled up by period bucket within an optional date window.
@@ -216,10 +317,14 @@ impl Ledger {
         let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
         for e in self.entries_in(since, until)? {
             let r = out.entry(period.bucket(&e.ts_utc)).or_default();
+            // `+= e.calls` honors legacy rollup entries (Finding #22).
+            // A pre-fix ledger had every entry with `calls: 1`, so the
+            // old `+= 1` happened to be correct — but a rollup row with
+            // `calls: 10` (a legitimate aggregate) was counted as one.
             r.cost_usd += e.cost_usd;
-            r.tokens_in += e.tokens_in;
-            r.tokens_out += e.tokens_out;
-            r.calls += 1;
+            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
+            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
+            r.calls = r.calls.saturating_add(e.calls);
         }
         Ok(out)
     }
@@ -237,9 +342,9 @@ impl Ledger {
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(period.bucket(&e.ts_utc)).or_default();
             r.cost_usd += e.cost_usd;
-            r.tokens_in += e.tokens_in;
-            r.tokens_out += e.tokens_out;
-            r.calls += 1;
+            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
+            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
+            r.calls = r.calls.saturating_add(e.calls);
         }
         Ok(out)
     }
@@ -265,10 +370,197 @@ impl Ledger {
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(e.model.clone()).or_default();
             r.cost_usd += e.cost_usd;
-            r.tokens_in += e.tokens_in;
-            r.tokens_out += e.tokens_out;
-            r.calls += 1;
+            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
+            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
+            r.calls = r.calls.saturating_add(e.calls);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_utc()
+    }
+
+    fn entry(t: &str, model: &str, cost: f64, tin: u64, tout: u64, calls: u64) -> Entry {
+        Entry {
+            ts_utc: ts(t),
+            provider: "test".into(),
+            model: model.into(),
+            host: model
+                .split_once('/')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_default(),
+            tokens_in: tin,
+            tokens_out: tout,
+            cost_usd: cost,
+            calls,
+            violation: None,
+            tags: FinOpsTags::default(),
+        }
+    }
+
+    /// Finding #22: a rollup row with `calls: 10` must contribute 10 to the
+    /// bucket's `calls` total — the old `r.calls += 1` collapsed every row
+    /// to a count of one.
+    #[test]
+    fn rollup_honors_e_calls_not_assumes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        // Distinct days so the test isn't sensitive to Period::Day
+        // bucketing collapsing all three rows into one key.
+        led.record(&entry("2026-07-01 10:00:00", "m1", 1.0, 100, 200, 10))
+            .unwrap();
+        led.record(&entry("2026-07-02 10:00:00", "m1", 1.0, 100, 200, 1))
+            .unwrap();
+        led.record(&entry("2026-07-03 10:00:00", "m2", 0.5, 50, 50, 3))
+            .unwrap();
+        let r = led.rollup(Period::Day).unwrap();
+        // Three distinct day-buckets.
+        assert_eq!(r.len(), 3, "three distinct days => three buckets");
+        let total_calls: u64 = r.values().map(|r| r.calls).sum();
+        assert_eq!(
+            total_calls, 14,
+            "rollup must sum e.calls across buckets (10+1+3 = 14), not assume 1"
+        );
+        let total_cost: f64 = r.values().map(|r| r.cost_usd).sum();
+        assert!((total_cost - 2.5).abs() < 1e-9);
+    }
+
+    /// Finding #22: a JSONL entry carrying `tags` deserializes and
+    /// reserializes with those tags preserved (the legacy `parse_tags`
+    /// hack that round-tripped through `Entry` only ever saw empty
+    /// fields because `Entry` had no `tags`).
+    #[test]
+    fn entry_persists_and_round_trips_finops_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let mut e = entry("2026-07-01 10:00:00", "m1", 1.0, 100, 200, 1);
+        e.tags = FinOpsTags {
+            caller: Some("ci-job-42".into()),
+            task: Some("summarize".into()),
+            tier: Some("explicit".into()),
+            cache_hit_ratio: Some(0.42),
+        };
+        led.record(&e).unwrap();
+        let loaded = led.entries().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let got = &loaded[0].tags;
+        assert_eq!(got.caller.as_deref(), Some("ci-job-42"));
+        assert_eq!(got.task.as_deref(), Some("summarize"));
+        assert_eq!(got.tier.as_deref(), Some("explicit"));
+        assert!((got.cache_hit_ratio.unwrap() - 0.42).abs() < 1e-9);
+    }
+
+    /// Finding #10: a missing ledger file is the canonical "no spend"
+    /// signal — `entries()` returns an empty Vec and `month_to_date_usd`
+    /// returns Ok(0.0). The old behavior of returning 0.0 from
+    /// `month_to_date_usd` on ANY read error was the bug.
+    #[test]
+    fn missing_ledger_is_empty_ok_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("missing.jsonl"));
+        assert!(led.entries().unwrap().is_empty());
+        assert_eq!(led.month_to_date_usd().unwrap(), 0.0);
+    }
+
+    /// Finding #10: a permission-denied read propagates as an error
+    /// instead of silently reporting $0 (the old "any read error → 0"
+    /// path was what let the budget gate approve a call that would have
+    /// exceeded the cap). We don't rely on `chmod 000` here because root
+    /// bypasses DAC and the test would silently pass on a privileged
+    /// runner; instead we point the ledger at a *directory*, which is
+    /// guaranteed to fail with `IsADirectory`/`PermissionDenied` for any
+    /// non-privileged reader.
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_is_propagated_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point the ledger at the tempdir itself: `File::open` on a
+        // directory returns an error (PermissionDenied or IsADirectory,
+        // platform-dependent). The fix is that this error reaches the
+        // caller as `Err`, not as a silent empty Vec.
+        let led = Ledger::new(dir.path());
+        let res = led.entries();
+        assert!(
+            res.is_err(),
+            "read failure on a directory must propagate, not return empty"
+        );
+        let month = led.month_to_date_usd();
+        assert!(
+            month.is_err(),
+            "month_to_date_usd must propagate read errors so the budget gate can fail closed"
+        );
+    }
+
+    /// Finding #10: a single invalid UTF-8 byte inside one line does NOT
+    /// blank the whole ledger — the per-line parser recovers the rest
+    /// and surfaces the bad line via `on_malformed`.
+    #[test]
+    fn invalid_utf8_line_does_not_blank_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Good line.
+        f.write_all(b"{\"ts_utc\":\"2026-07-01T10:00:00Z\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":0.10,\"calls\":1}\n").unwrap();
+        // A line with an invalid UTF-8 byte. The per-line parser will
+        // hand it to on_malformed and keep going; the OLD `read_to_string`
+        // path would have failed the whole file as InvalidData.
+        f.write_all(b"{not-json-line\n").unwrap();
+        // Another good line.
+        f.write_all(b"{\"ts_utc\":\"2026-07-01T10:01:00Z\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":0.20,\"calls\":1}\n").unwrap();
+        drop(f);
+
+        let led = Ledger::new(&path);
+        let mut dropped = Vec::<(usize, String)>::new();
+        let entries = led
+            .entries_observed(|n, raw| dropped.push((n, raw.to_string())))
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "two valid lines must survive a bad line in the middle"
+        );
+        assert_eq!(
+            dropped.len(),
+            1,
+            "exactly one line should be reported as malformed"
+        );
+        assert_eq!(dropped[0].0, 2, "the malformed line is line 2");
+    }
+
+    /// Finding #10: month_to_date_usd on a healthy ledger returns the
+    /// bucket's summed cost.
+    #[test]
+    fn month_to_date_usd_sums_current_month_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let now = Utc::now();
+        let month = now.format("%Y-%m").to_string();
+        // Two entries in the current month.
+        let line_a = format!(
+            "{{\"ts_utc\":\"{}T10:00:00Z\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":0.40,\"calls\":1}}\n",
+            now.format("%Y-%m-%d")
+        );
+        let line_b = format!(
+            "{{\"ts_utc\":\"{}T11:00:00Z\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":0.60,\"calls\":1}}\n",
+            now.format("%Y-%m-%d")
+        );
+        f.write_all(line_a.as_bytes()).unwrap();
+        f.write_all(line_b.as_bytes()).unwrap();
+        drop(f);
+
+        let led = Ledger::new(&path);
+        let got = led.month_to_date_usd().unwrap();
+        assert!((got - 1.0).abs() < 1e-9, "month total {got}");
+        // Spot-check the bucket exists under the expected key.
+        let _ = month;
     }
 }

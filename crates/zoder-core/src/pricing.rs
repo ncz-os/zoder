@@ -9,6 +9,7 @@
 //! report a billed cost itself, and it powers the avoided-spend headline in
 //! `zoder report`.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -77,13 +78,28 @@ impl ModelPrice {
 
     /// Cost in USD for an input/output token split. Uses the component rates
     /// when present, otherwise the blended rate over the combined token count.
+    /// Operands are widened to `u128` so extreme token counts (e.g.
+    /// `u64::MAX`) cannot panic with overflow checks or wrap to zero in
+    /// release mode; cost is `f64` so the wider intermediate is just a
+    /// defense against arithmetic overflow. Returns `0.0` for empty token
+    /// splits (the catalog's "no work, no charge" convention).
     pub fn cost_io(&self, tokens_in: u64, tokens_out: u64) -> f64 {
+        // Empty input/output = no work; charge zero rather than treating
+        // the call as a free passthrough at a paid rate. Free models
+        // (input=output=0) and explicit-zero entries both yield 0 here.
+        if tokens_in == 0 && tokens_out == 0 {
+            return 0.0;
+        }
         if self.input_usd_per_mtok > 0.0 || self.output_usd_per_mtok > 0.0 {
-            (tokens_in as f64 * self.input_usd_per_mtok
-                + tokens_out as f64 * self.output_usd_per_mtok)
-                / 1_000_000.0
+            let in_part = (tokens_in as u128) as f64 * self.input_usd_per_mtok;
+            let out_part = (tokens_out as u128) as f64 * self.output_usd_per_mtok;
+            (in_part + out_part) / 1_000_000.0
         } else {
-            self.usd_per_mtok * (tokens_in + tokens_out) as f64 / 1_000_000.0
+            // Blended rate is per-token; convert the token total via u128
+            // first so an overflow on the sum can't wrap and silently bill
+            // $0 for a u64::MAX-sized call.
+            let total = (tokens_in as u128).saturating_add(tokens_out as u128);
+            self.usd_per_mtok * (total as f64) / 1_000_000.0
         }
     }
 
@@ -94,9 +110,9 @@ impl ModelPrice {
             if op.active_at(utc_min)
                 && (op.input_usd_per_mtok > 0.0 || op.output_usd_per_mtok > 0.0)
             {
-                return (tokens_in as f64 * op.input_usd_per_mtok
-                    + tokens_out as f64 * op.output_usd_per_mtok)
-                    / 1_000_000.0;
+                let in_part = (tokens_in as u128) as f64 * op.input_usd_per_mtok;
+                let out_part = (tokens_out as u128) as f64 * op.output_usd_per_mtok;
+                return (in_part + out_part) / 1_000_000.0;
             }
         }
         self.cost_io(tokens_in, tokens_out)
@@ -206,6 +222,29 @@ pub struct PricingCatalog {
     pub baseline_usd_per_mtok: f64,
     #[serde(default)]
     pub baseline_model: String,
+}
+
+/// Stable verdict from [`PricingCatalog::classify_cost`]: separates "free
+/// because the catalog explicitly says so" from "free because we have no
+/// data". Treating unknown metered models as free silently (the old
+/// `cost()` -> `0.0` behavior) lets a paid custom model whose catalog
+/// entry has been deleted, renamed, or never written slip past the
+/// pre-call budget gate as $0 — Finding #11. The enum forces the
+/// caller to acknowledge the difference: `Free` is honest; `Unknown`
+/// means "could not price, do not charge, do not trust as free".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CostVerdict {
+    /// Catalog has an explicit non-zero rate and the math came out
+    /// finite and non-negative.
+    Priced(f64),
+    /// Catalog entry has all-zero rates — the model is documented as
+    /// free (free-tier, internal, OpenAI free preview, etc.).
+    Free,
+    /// Either no catalog entry, or the rate(s) were malformed enough
+    /// to not pin a value. Cost is reported as 0 to keep the math
+    /// safe, but the caller MUST NOT treat this as Free — the
+    /// pre-call budget gate fails closed on `Unknown`.
+    Unknown,
 }
 
 impl PricingCatalog {
@@ -318,6 +357,47 @@ impl PricingCatalog {
         Ok(())
     }
 
+    /// Classify the cost of a single call. Distinct from
+    /// [`PricingCatalog::cost`] (which collapses everything to `f64`)
+    /// because `Unknown` must be visible: a metered custom model absent
+    /// from the catalog returns `Unknown`, and only an explicit
+    /// all-zero entry returns `Free`. Cost is `0.0` in both the `Free`
+    /// and `Unknown` branches so callers that only care about the
+    /// number still get something safe to log; callers that need to
+    /// gate on it must check the enum tag.
+    pub fn classify_cost(
+        &self,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        ts: Option<DateTime<Utc>>,
+    ) -> CostVerdict {
+        let Some(p) = self.lookup(model) else {
+            return CostVerdict::Unknown;
+        };
+        // Explicit zero: a catalog entry is present but every
+        // component is zero. Document this as `Free` (not
+        // `Unknown`) — the operator deliberately wrote the entry to
+        // pin the model at $0.
+        let has_rate =
+            p.usd_per_mtok > 0.0 || p.input_usd_per_mtok > 0.0 || p.output_usd_per_mtok > 0.0;
+        if !has_rate {
+            return CostVerdict::Free;
+        }
+        let cost = match ts {
+            Some(t) => p.cost_io_at(tokens_in, tokens_out, minutes_of_day_utc(t)),
+            None => p.cost_io(tokens_in, tokens_out),
+        };
+        // Validate the arithmetic: a NaN/inf cost is a bug we must
+        // not surface as Priced — Finding #24. Negative cost would
+        // be a refund-shaped error; treat as Unknown so the budget
+        // gate fails closed rather than treating it as a credit.
+        if !cost.is_finite() || cost < 0.0 {
+            return CostVerdict::Unknown;
+        }
+        CostVerdict::Priced(cost)
+    }
+
     /// Look up a model price, tolerating id vs display-name drift: exact,
     /// then case-insensitive, then leaf/suffix match (`host/leaf` -> `leaf`).
     pub fn lookup(&self, model: &str) -> Option<&ModelPrice> {
@@ -336,12 +416,29 @@ impl PricingCatalog {
         })
     }
 
-    /// Chargeback for a call. Unknown/unpriced model → $0 (free-tier): we never
-    /// invent a cost, so the ledger stays honest and the model stays free.
+    /// Chargeback for a call (legacy `f64` interface — collapses
+    /// `Free`/`Unknown` to `0.0`). New code should use
+    /// [`PricingCatalog::classify_cost`] so the unknown-vs-free
+    /// distinction is observable at the budget gate (Finding #11).
     pub fn cost(&self, model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
-        self.lookup(model)
-            .map(|p| p.cost_io(tokens_in, tokens_out))
-            .unwrap_or(0.0)
+        self.cost_at(model, tokens_in, tokens_out, None)
+    }
+
+    /// Time-of-day-aware chargeback. When `ts` is `Some`, the off-peak
+    /// window (if any) is honored so a DeepSeek call at 20:00 UTC uses
+    /// the configured $0.14/$0.21 off-peak rates instead of always
+    /// charging peak — Finding #23.
+    pub fn cost_at(
+        &self,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        ts: Option<DateTime<Utc>>,
+    ) -> f64 {
+        match self.classify_cost(model, tokens_in, tokens_out, ts) {
+            CostVerdict::Priced(v) => v,
+            CostVerdict::Free | CostVerdict::Unknown => 0.0,
+        }
     }
 
     /// True when the model has a non-zero chargeback rate (a paid cloud model).
@@ -356,9 +453,24 @@ impl PricingCatalog {
     }
 }
 
+/// Minutes-of-day UTC in `[0, 1440)` for a timestamp. Used by
+/// [`PricingCatalog::classify_cost`] to pick the off-peak rate when one
+/// is configured. Defined at module scope so the public surface stays
+/// inside `PricingCatalog::classify_cost` (callers don't need to know
+/// the conversion).
+fn minutes_of_day_utc(ts: DateTime<Utc>) -> u32 {
+    let secs = ts.timestamp();
+    if secs < 0 {
+        0
+    } else {
+        ((secs as u64 % 86_400) / 60) as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn deepseek_chat() -> ModelPrice {
         ModelPrice {
@@ -400,5 +512,94 @@ mod tests {
             ..Default::default()
         };
         assert!((flat.cost_io_at(1_000_000, 0, 1200) - 1.0).abs() < 1e-9);
+    }
+
+    /// Finding #11: explicit zero = `Free`, missing model = `Unknown`.
+    /// Only the unknown-shaped verdict has to fail the budget gate closed;
+    /// a deliberately-zeroed entry is an honest "this is free" statement.
+    #[test]
+    fn classify_cost_distinguishes_free_from_unknown() {
+        let mut cat = PricingCatalog::default();
+        // Explicit zero entry: every component is zero → Free.
+        cat.models.insert(
+            "free-preview".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.0,
+                output_usd_per_mtok: 0.0,
+                ..Default::default()
+            },
+        );
+        // Paid entry: a metered custom model the catalog knows about.
+        cat.models.insert(
+            "metered-paid".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cat.classify_cost("free-preview", 1_000_000, 0, None),
+            CostVerdict::Free
+        );
+        assert_eq!(
+            cat.classify_cost("metered-paid", 1_000_000, 1_000_000, None),
+            CostVerdict::Priced(3.0)
+        );
+        // Missing from the catalog → Unknown, not Free.
+        assert_eq!(
+            cat.classify_cost("metered-but-missing", 1_000_000, 0, None),
+            CostVerdict::Unknown
+        );
+        // The legacy `cost()` collapses Unknown and Free to 0.0 so old
+        // callers keep their behavior; the new `classify_cost` returns
+        // the tagged verdict so the gate can fail closed.
+        assert_eq!(cat.cost("metered-but-missing", 1_000_000, 0), 0.0);
+        assert_eq!(cat.cost("free-preview", 1_000_000, 0), 0.0);
+        assert_eq!(cat.cost("metered-paid", 1_000_000, 0), 1.0);
+    }
+
+    /// Finding #23: `cost_at` honors the configured off-peak window so
+    /// a DeepSeek-style call inside the window uses off-peak rates, not
+    /// peak. `cost()` always uses peak.
+    #[test]
+    fn cost_at_honors_off_peak_window_per_timestamp() {
+        let mut cat = PricingCatalog::default();
+        cat.models
+            .insert("deepseek/deepseek-chat".to_string(), deepseek_chat());
+        // 20:00 UTC → off-peak window active.
+        let t_off = Utc.with_ymd_and_hms(2026, 7, 5, 20, 0, 0).unwrap();
+        // 10:00 UTC → daytime peak.
+        let t_peak = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let off = cat.cost_at("deepseek/deepseek-chat", 1_000_000, 1_000_000, Some(t_off));
+        let peak = cat.cost_at("deepseek/deepseek-chat", 1_000_000, 1_000_000, Some(t_peak));
+        assert!((off - 0.35).abs() < 1e-9, "off-peak {off}");
+        assert!((peak - 0.70).abs() < 1e-9, "peak {peak}");
+        // `cost()` (no timestamp) always uses peak — the legacy contract.
+        assert!((cat.cost("deepseek/deepseek-chat", 1_000_000, 1_000_000) - 0.70).abs() < 1e-9);
+    }
+
+    /// Finding #24: blended pricing on `tokens_in = u64::MAX`,
+    /// `tokens_out = 1` must not panic (overflow checks) or wrap to $0
+    /// in release mode. The `u128` intermediate forces saturation at the
+    /// arithmetic boundary, but the resulting `f64` cost may be
+    /// non-finite — in which case `classify_cost` reports `Unknown` so
+    /// the gate fails closed rather than billing $0.
+    #[test]
+    fn blended_pricing_does_not_overflow_or_wrap_extreme_tokens() {
+        let p = ModelPrice {
+            usd_per_mtok: 1.0,
+            ..Default::default()
+        };
+        let c = p.cost_io(u64::MAX, 1);
+        // The exact f64 may be huge or non-finite depending on the
+        // rounding path; what we MUST guarantee is that it's not
+        // silently zero. Either a non-zero finite value (the cost is
+        // huge but the math didn't lie) or a non-finite value (which
+        // classify_cost reports as Unknown so the gate fails closed).
+        assert!(
+            c > 0.0 || !c.is_finite(),
+            "cost must not silently wrap to zero (got {c})"
+        );
     }
 }

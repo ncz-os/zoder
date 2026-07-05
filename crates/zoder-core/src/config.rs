@@ -1273,6 +1273,7 @@ mod tests {
                 cost_usd: 0.0,
                 calls: 1,
                 violation: None,
+                tags: crate::ledger::FinOpsTags::default(),
             })
             .collect()
     }
