@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use zoder_core::{
-    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Message,
+    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Ledger, Message,
     ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog,
 };
 
@@ -506,6 +506,15 @@ async fn complete_once(
         );
     }
 
+    // Reserve and lock accounting before the reviewer request. Panel calls may
+    // run concurrently, so this also serializes their authoritative snapshots.
+    let ledger_path = eng.cfg.ledger_path.clone();
+    let mut ledger_reservation =
+        tokio::task::spawn_blocking(move || Ledger::new(&ledger_path).reserve_billable())
+            .await
+            .context("joining reviewer ledger reservation task")?
+            .with_context(|| "reserving ledger entry before reviewer dispatch")?;
+
     let messages = vec![Message::new("system", system), Message::new("user", user)];
     let req = ChatRequest {
         model: model.clone(),
@@ -517,6 +526,7 @@ async fn complete_once(
         reasoning_effort: cli.reasoning.clone(),
     };
     let provider = OpenAiProvider::new(provider_cfg)?;
+    ledger_reservation.arm();
     let res = provider
         .stream_chat(&req, None)
         .await
@@ -547,7 +557,7 @@ async fn complete_once(
         eprintln!("zoder: POLICY VIOLATION (reviewer): {v}");
     }
     crate::record_turn_entry(
-        &eng.cfg.ledger_path,
+        ledger_reservation,
         &Entry {
             ts_utc: Utc::now(),
             provider: provider_cfg.id.clone(),

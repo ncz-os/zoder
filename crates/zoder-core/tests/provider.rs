@@ -125,6 +125,78 @@ async fn list_models_extracts_ids() {
     assert_eq!(ids, vec!["a/one".to_string(), "b/two".to_string()]);
 }
 
+#[tokio::test]
+async fn response_size_ceiling_covers_completions_models_and_error_bodies() {
+    for (method_name, route, status, stream) in [
+        ("POST", "/v1/chat/completions", 200, false),
+        ("GET", "/v1/models", 200, false),
+        ("POST", "/v1/chat/completions", 500, true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method(method_name))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(vec![b'x'; 16_777_217]))
+            .mount(&server)
+            .await;
+        let provider = provider(&server.uri());
+        let error = if route.ends_with("models") {
+            provider.list_models().await.unwrap_err()
+        } else {
+            provider
+                .stream_chat(&req("m", stream), None)
+                .await
+                .unwrap_err()
+        };
+        assert!(error.message.contains("response ceiling"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn cumulative_streamed_content_has_independent_ceiling() {
+    let server = MockServer::start().await;
+    let piece = "x".repeat(1024);
+    let mut body = String::new();
+    for _ in 0..8_193 {
+        body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"");
+        body.push_str(&piece);
+        body.push_str("\"}}]}\n");
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("decoded content exceeded"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_wire_bytes_have_total_response_ceiling() {
+    let server = MockServer::start().await;
+    let mut body = Vec::with_capacity(16_778_000);
+    let comment = vec![b'x'; 1023];
+    while body.len() <= 16_777_216 {
+        body.extend_from_slice(&comment);
+        body.push(b'\n');
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("stream exceeded"), "{error}");
+}
+
 #[test]
 fn backoff_honors_retry_after_floor() {
     // With a 10s server hint, the delay must be at least 10s regardless of attempt.
