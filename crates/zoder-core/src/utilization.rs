@@ -405,6 +405,7 @@ impl<'a> HeaderLookup for ReqwestHeaderView<'a> {
 
 /// Routing knobs for one `(provider, account_id, plan)` triple.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteKnobs {
     /// Below this used-percent, route to the paid subscription.
     /// Default: [`DEFAULT_USE_TARGET`].
@@ -1130,12 +1131,24 @@ pub fn build_account_view(
         // observation at 0% IS a real signal (provider just told us
         // we're fresh), so we don't gate on "non-zero" — None means
         // "no header sighting" or "no numeric value", not "0% used".
+        let counter_is_current = counter.is_none_or(|c| match cw.reset {
+            crate::config::ResetKind::Rolling => true,
+            crate::config::ResetKind::CalendarMonthly => {
+                c.period_id.as_deref() == Some(now.format("%Y-%m").to_string().as_str())
+            }
+            crate::config::ResetKind::CalendarDaily => {
+                c.period_id.as_deref() == Some(now.format("%Y-%m-%d").to_string().as_str())
+            }
+        });
         let used_percent: Option<f64> = match cw.observability {
             // Counter path: trust the store's stored percent whenever
             // we have one. The store never invents a percent for a
             // cap-less row, so `Some(...)` is always "numeric and
             // correct" (cap * used is finite).
-            crate::config::Observability::Counter => counter.and_then(|c| c.used_percent),
+            crate::config::Observability::Counter if counter_is_current => {
+                counter.and_then(|c| c.used_percent)
+            }
+            crate::config::Observability::Counter => Some(0.0),
             // Header path: take the matching header window's percent
             // if we have one (Some = real reading, None = no numeric
             // value). Either is forwarded unchanged.
@@ -2931,6 +2944,59 @@ mod tests {
     }
 
     #[test]
+    fn routing_sees_expired_monthly_counter_as_full_headroom_before_increment() {
+        let mut store = UtilizationStore::default();
+        let june = Utc.with_ymd_and_hms(2026, 6, 30, 23, 59, 0).unwrap();
+        let july = Utc.with_ymd_and_hms(2026, 7, 1, 0, 1, 0).unwrap();
+        store.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(1_000.0),
+            june,
+        );
+        store.set_counter_period_id(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            period_id_for(june),
+            june,
+        );
+        store.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            900.0,
+            june,
+        );
+        let window = crate::config::QuotaWindow {
+            name: "monthly".into(),
+            hours: 720,
+            unit: crate::config::QuotaUnit::Tokens,
+            cap: Some(1_000.0),
+            models: None,
+            observability: crate::config::Observability::Counter,
+            reset: crate::config::ResetKind::CalendarMonthly,
+        };
+        let view = build_account_view(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            &[window],
+            &store,
+            july,
+        );
+        assert_eq!(view.windows[0].used_percent, Some(0.0));
+        assert_eq!(
+            decide_account(&view, &RouteKnobs::default(), july, None).decision,
+            RouteDecision::PreferSub
+        );
+    }
+
+    #[test]
     fn daily_counter_resets_on_day_boundary_not_only_month_boundary() {
         let mut s = UtilizationStore::default();
         let day_one = Utc.with_ymd_and_hms(2026, 7, 4, 23, 59, 0).unwrap();
@@ -3578,6 +3644,19 @@ mod tests {
         let k = RouteKnobs::default();
         assert!((k.reset_imminence_threshold - DEFAULT_RESET_IMMINENCE_THRESHOLD).abs() < 1e-9);
         assert!((k.reset_imminence_threshold - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn route_knobs_reject_unknown_policy_fields() {
+        let err = serde_json::from_value::<RouteKnobs>(serde_json::json!({
+            "use_target": 70.0,
+            "cap_guard": 85.0,
+            "budget_mode": "block",
+            "chargeback_budget_usd": null,
+            "cap_gaurd": 90.0
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("cap_gaurd"), "{err}");
     }
 
     #[test]

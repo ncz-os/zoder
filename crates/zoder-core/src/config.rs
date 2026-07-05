@@ -434,6 +434,7 @@ fn default_free_hosts() -> Vec<String> {
 /// cleanly into the missing-`None` shape so the existing single-pinned
 /// `Config::primary_model` deployment keeps working.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AliasedAgentConfig {
     /// Primary (author) model id for this agent. When `Some`, takes
     /// precedence over `Config::primary_model` but is overridden by `-m`
@@ -531,7 +532,18 @@ fn subscription_window_exhausted(
     let Some(plan) = p.subscription.as_ref() else {
         return false;
     };
-    let usage = crate::quota::plan_usage(entries, &p.id, plan, catalog);
+    let catalog_provider = plan
+        .tier
+        .as_deref()
+        .and_then(|tier| catalog.provider_namespace(p, tier))
+        .unwrap_or_else(|| p.id.clone());
+    let usage = crate::quota::plan_usage_for_catalog_provider(
+        entries,
+        &p.id,
+        plan,
+        catalog,
+        &catalog_provider,
+    );
     if usage.is_empty() {
         return false;
     }
@@ -929,7 +941,7 @@ impl Config {
                     ));
                 }
                 if let Some(tier) = plan.tier.as_deref().filter(|tier| !tier.trim().is_empty()) {
-                    if tier_catalog.tier(&p.id, tier).is_none() {
+                    if tier_catalog.provider_namespace(p, tier).is_none() {
                         errs.push(format!(
                             "provider {}: subscription tier {:?} does not resolve in the tier catalog for this provider",
                             p.id, tier
@@ -1821,6 +1833,15 @@ auth = { type = "env", var = "ACME_KEY" }
     }
 
     #[test]
+    fn config_deserialization_rejects_misspelled_budget_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(Config::default_provider(dir.path())).unwrap();
+        value["budget"] = serde_json::json!({"monthly_cap_usd_typo": 25.0});
+        let err = serde_json::from_value::<Config>(value).unwrap_err();
+        assert!(err.to_string().contains("monthly_cap_usd_typo"), "{err}");
+    }
+
+    #[test]
     fn nested_operational_config_rejects_unknown_fields() {
         let raw = serde_json::json!({
             "id": "openai",
@@ -1861,5 +1882,43 @@ auth = { type = "env", var = "ACME_KEY" }
         let errs = cfg.validate().join("\n");
         assert!(errs.contains("does not resolve"), "{errs}");
         assert!(errs.contains("chatgpt-pr0"), "{errs}");
+    }
+
+    #[test]
+    fn validate_resolves_tiers_by_provider_classification_not_arbitrary_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        cfg.providers.push(Provider {
+            id: "openai-codex".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            kind: "openai-responses".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: Some("chatgpt-pro".into()),
+                windows: Vec::new(),
+            }),
+            serves: vec!["gpt-".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "minimax-sub".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: Some("minimax-max".into()),
+                windows: Vec::new(),
+            }),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.default_provider = "openai-codex".into();
+        let errs = cfg.validate();
+        assert!(errs.is_empty(), "{}", errs.join("\n"));
     }
 }

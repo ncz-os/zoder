@@ -104,16 +104,11 @@ pub(crate) fn persist_agentic_utilization(
 #[cfg(test)]
 mod agentic_utilization_tests {
     use super::*;
-    use zoder_core::config::{Auth, Observability, QuotaUnit, QuotaWindow, ResetKind};
-    use zoder_core::utilization::{
-        build_account_view, decide_account, RouteDecision, RouteKnobs, UtilizationStore,
-    };
+    use zoder_core::config::Auth;
+    use zoder_core::utilization::UtilizationStore;
 
-    #[test]
-    fn agentic_codex_telemetry_round_trips_into_routing_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("utilization.json");
-        let provider = zoder_core::config::Provider {
+    fn test_provider() -> zoder_core::config::Provider {
+        zoder_core::config::Provider {
             id: "openai".into(),
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             kind: "openai-responses".into(),
@@ -126,18 +121,21 @@ mod agentic_utilization_tests {
                 windows: Vec::new(),
             }),
             serves: vec!["gpt-".into()],
-        };
-        let headers = vec![
-            ("x-codex-plan-type".into(), "pro".into()),
-            ("x-codex-primary-used-percent".into(), "95".into()),
-            ("x-codex-primary-window-minutes".into(), "300".into()),
-            ("x-codex-primary-reset-after-seconds".into(), "14400".into()),
-        ];
+        }
+    }
+
+    #[test]
+    fn pure_acp_without_subscription_headers_leaves_utilization_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let provider = test_provider();
         let now = Utc::now();
 
-        assert!(persist_agentic_utilization_at(
-            &provider, &headers, &path, now
-        ));
+        // Real Goose `usage_update {used,size}` and Zeroclaw
+        // `context_usage` frames contain no subscription-quota headers. The
+        // ACP driver surfaces those as AgentEvent::Usage, so this persistence
+        // path receives no header event and must not invent a percentage.
+        assert!(!persist_agentic_utilization_at(&provider, &[], &path, now));
 
         let store = UtilizationStore::open_unlocked(&path).unwrap();
         let (util_provider, plan) = utilization_key(&provider);
@@ -146,21 +144,79 @@ mod agentic_utilization_tests {
             zoder_core::utilization::Provider::OpenaiCodex
         );
         assert_eq!(plan, "chatgpt-pro");
-        assert!(store.get(util_provider, "default", &plan).is_some());
+        assert!(store.get(util_provider, "default", &plan).is_none());
+    }
 
-        let windows = vec![QuotaWindow {
-            name: "5h".into(),
-            hours: 5,
-            unit: QuotaUnit::Tokens,
-            cap: None,
-            models: None,
-            observability: Observability::Header,
-            reset: ResetKind::Rolling,
-        }];
-        let view = build_account_view(util_provider, "default", &plan, &windows, &store, now);
-        let decision = decide_account(&view, &RouteKnobs::default(), now, None);
-        assert_eq!(decision.decision, RouteDecision::FallBackToFree);
-        assert_eq!(decision.strength, 95.0);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_zeroclaw_dispatch_context_usage_does_not_create_quota_telemetry() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let store_path = dir.path().join("utilization.json");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let _init = lines.next_line().await.unwrap().unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n")
+                .await
+                .unwrap();
+            let _new = lines.next_line().await.unwrap().unwrap();
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"new\",\"result\":{\"session_id\":\"s1\"}}\n",
+                )
+                .await
+                .unwrap();
+            let _prompt = lines.next_line().await.unwrap().unwrap();
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"context_usage\",\"input_tokens\":95000}}\n",
+                )
+                .await
+                .unwrap();
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\",\"outcome\":\"completed\"}}\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let provider = test_provider();
+        let mut opts = zoder_core::AgentOptions::new(&socket, "codex", dir.path(), "hello");
+        opts.timeout = std::time::Duration::from_secs(2);
+        let mut saw_usage = false;
+        let run =
+            zoder_core::run_agent_dispatch(zoder_core::EngineKind::Zeroclaw, &opts, |event| {
+                match event {
+                    zoder_core::AgentEvent::Usage { input_tokens } => {
+                        saw_usage = true;
+                        assert_eq!(input_tokens, 95_000);
+                    }
+                    zoder_core::AgentEvent::Utilization { headers } => {
+                        persist_agentic_utilization_at(
+                            &provider,
+                            &headers,
+                            &store_path,
+                            Utc::now(),
+                        );
+                    }
+                    _ => {}
+                }
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(run.succeeded());
+        assert!(saw_usage);
+        let store = UtilizationStore::open_unlocked(&store_path).unwrap();
+        let (util_provider, plan) = utilization_key(&provider);
+        assert!(store.get(util_provider, "default", &plan).is_none());
     }
 }
 

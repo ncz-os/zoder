@@ -7,10 +7,10 @@
 //! fee, so the report can show "62% of the 5h window" instead of a misleading
 //! per-token dollar figure.
 
-use crate::config::{QuotaUnit, QuotaWindow, SubscriptionPlan};
+use crate::config::{QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan};
 use crate::ledger::Entry;
 use crate::subscription_tiers::{resolve_plan_windows, TierCatalog, WindowProvenance};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 /// Distinct `source` value for operator-entered windows in serialized reports.
@@ -87,13 +87,30 @@ pub fn window_usage(
     confidence: Option<&str>,
     source: Option<&str>,
 ) -> WindowUsage {
-    let now = Utc::now();
-    let since = now - Duration::hours(w.hours as i64);
+    window_usage_at(entries, provider_id, w, confidence, source, Utc::now())
+}
+
+/// Clock-injected form used by routing and boundary tests. Calendar windows
+/// count only the active UTC calendar period; `hours` applies only to rolling
+/// windows.
+pub fn window_usage_at(
+    entries: &[Entry],
+    provider_id: &str,
+    w: &QuotaWindow,
+    confidence: Option<&str>,
+    source: Option<&str>,
+    now: DateTime<Utc>,
+) -> WindowUsage {
+    let in_active_window = |ts: DateTime<Utc>| match w.reset {
+        ResetKind::Rolling => ts >= now - Duration::hours(w.hours as i64),
+        ResetKind::CalendarMonthly => ts.year() == now.year() && ts.month() == now.month(),
+        ResetKind::CalendarDaily => ts.date_naive() == now.date_naive(),
+    };
     let mut used = 0.0;
     let mut oldest: Option<DateTime<Utc>> = None;
     for e in entries
         .iter()
-        .filter(|e| e.provider == provider_id && e.ts_utc >= since && e.ts_utc <= now)
+        .filter(|e| e.provider == provider_id && e.ts_utc <= now && in_active_window(e.ts_utc))
     {
         used += unit_amount(e, w.unit);
         oldest = Some(oldest.map_or(e.ts_utc, |o| o.min(e.ts_utc)));
@@ -112,7 +129,29 @@ pub fn window_usage(
         Some(c) if c > 0.0 => used / c,
         Some(_) => 0.0,
     };
-    let next_reset_utc = oldest.map(|o| (o + Duration::hours(w.hours as i64)).to_rfc3339());
+    let next_reset = match w.reset {
+        ResetKind::Rolling => oldest.map(|o| o + Duration::hours(w.hours as i64)),
+        ResetKind::CalendarDaily => Some(
+            Utc.from_utc_datetime(
+                &(now.date_naive() + Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight is valid"),
+            ),
+        ),
+        ResetKind::CalendarMonthly => {
+            let (year, month) = if now.month() == 12 {
+                (now.year() + 1, 1)
+            } else {
+                (now.year(), now.month() + 1)
+            };
+            Some(
+                Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+                    .single()
+                    .expect("first of month is valid"),
+            )
+        }
+    };
+    let next_reset_utc = next_reset.map(|reset| reset.to_rfc3339());
     WindowUsage {
         name: w.name.clone(),
         hours: w.hours,
@@ -163,7 +202,19 @@ pub fn plan_usage(
     plan: &SubscriptionPlan,
     catalog: &TierCatalog,
 ) -> Vec<WindowUsage> {
-    let resolved = resolve_plan_windows(plan, catalog, Some(provider_id));
+    plan_usage_for_catalog_provider(entries, provider_id, plan, catalog, provider_id)
+}
+
+/// Resolve a plan through a canonical catalog namespace while continuing to
+/// account ledger rows under the operator's arbitrary provider id.
+pub fn plan_usage_for_catalog_provider(
+    entries: &[Entry],
+    ledger_provider_id: &str,
+    plan: &SubscriptionPlan,
+    catalog: &TierCatalog,
+    catalog_provider_id: &str,
+) -> Vec<WindowUsage> {
+    let resolved = resolve_plan_windows(plan, catalog, Some(catalog_provider_id));
     debug_assert_eq!(
         resolved.windows.len(),
         resolved.provenance.len(),
@@ -182,7 +233,7 @@ pub fn plan_usage(
                 }
                 WindowProvenance::Operator => (None, Some(SOURCE_OPERATOR)),
             };
-            window_usage(entries, provider_id, w, confidence, source)
+            window_usage(entries, ledger_provider_id, w, confidence, source)
         })
         .collect()
 }
@@ -231,7 +282,7 @@ mod tests {
     use crate::subscription_tiers::{
         Confidence, ProviderTiers, TierCatalog, TierEntry, TierWindow,
     };
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use std::collections::BTreeMap;
 
     fn w(name: &str, hours: u32, cap: f64, unit: QuotaUnit) -> QuotaWindow {
@@ -291,6 +342,41 @@ mod tests {
 
     fn by_name(usage: &[WindowUsage]) -> std::collections::HashMap<String, WindowUsage> {
         usage.iter().map(|w| (w.name.clone(), w.clone())).collect()
+    }
+
+    #[test]
+    fn calendar_monthly_window_has_full_headroom_after_month_boundary() {
+        let june = Utc.with_ymd_and_hms(2026, 6, 30, 23, 0, 0).unwrap();
+        let july = Utc.with_ymd_and_hms(2026, 7, 1, 0, 1, 0).unwrap();
+        let entry = Entry {
+            ts_utc: june,
+            provider: "minimax-sub".into(),
+            model: "MiniMax-M3".into(),
+            host: "api.minimax.io".into(),
+            tokens_in: 100,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
+        };
+        let window = QuotaWindow {
+            name: "monthly".into(),
+            hours: 720,
+            unit: QuotaUnit::Tokens,
+            cap: Some(100.0),
+            models: None,
+            observability: crate::config::Observability::Counter,
+            reset: crate::config::ResetKind::CalendarMonthly,
+        };
+        let usage = window_usage_at(&[entry], "minimax-sub", &window, None, None, july);
+        assert_eq!(usage.used, 0.0);
+        assert_eq!(usage.pct, 0.0);
+        assert_eq!(
+            usage.next_reset_utc.as_deref(),
+            Some("2026-08-01T00:00:00+00:00")
+        );
     }
 
     #[test]

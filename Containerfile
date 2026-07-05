@@ -9,7 +9,7 @@
 # Build args let CI inject a job-token clone URL for the (possibly private)
 # zeroclaw fork; goose is public.
 
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -26,7 +26,7 @@ RUN bash scripts/package.sh x86_64-unknown-linux-gnu \
     && tar -xzf dist/zoder-*-x86_64-unknown-linux-gnu.tar.gz -C /out --strip-components=1 \
     && ls -l /out/zoder /out/zerocode /out/zeroclaw /out/goose
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 LABEL org.opencontainers.image.source="https://gitlab.com/ncz-os/zoder" \
       org.opencontainers.image.title="zoder-stack" \
       org.opencontainers.image.description="zoder + zerocode + zeroclaw + goose — free-first agentic coding stack" \

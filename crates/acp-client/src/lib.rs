@@ -2591,17 +2591,23 @@ mod tests {
         let mut text_count = 0;
         let mut tool_count = 0;
         let mut usage_count = 0;
+        let mut utilization_count = 0;
         for ev in &events {
             match ev {
                 AgentEvent::Text(_) => text_count += 1,
                 AgentEvent::ToolCall { name } if name == "shell" => tool_count += 1,
                 AgentEvent::Usage { .. } => usage_count += 1,
+                AgentEvent::Utilization { .. } => utilization_count += 1,
                 _ => {}
             }
         }
         assert_eq!(text_count, 2);
         assert_eq!(tool_count, 1);
         assert_eq!(usage_count, 1);
+        assert_eq!(
+            utilization_count, 0,
+            "Goose context-window usage is not subscription-quota telemetry"
+        );
     }
 
     #[tokio::test]

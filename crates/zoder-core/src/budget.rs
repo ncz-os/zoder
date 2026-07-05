@@ -30,6 +30,7 @@ fn default_est_output_tokens() -> u64 {
 /// overlay. The caps gate *paid* calls only — a $0 (free-model) estimate is
 /// always within budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     /// Per-call estimated-cost ceiling (USD). A call estimated above this needs
     /// confirmation (or `--allow-paid`). `None` = no per-call cap.
