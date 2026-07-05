@@ -277,3 +277,58 @@ prune:nightly:
               kept += 1
       print(f"prune done: kept {kept}, pruned {pruned}")
       PY
+
+# ── weekly container: full zoder stack (zoder + zerocode + zeroclaw + goose) ──
+# Scheduled weekly (pipeline schedule with WEEKLY_CONTAINER=1). kaniko builds the
+# stack image from Containerfile (which runs scripts/package.sh) and pushes it to
+# the GitLab Container Registry; release:container-weekly then cuts a weekly
+# GitLab Release that links the image as an asset. WEEK is passed to the release
+# keyword via a dotenv artifact (the release: section can't see plain shell vars).
+container:weekly:
+  stage: package
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $WEEKLY_CONTAINER == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  timeout: 150m
+  cache: {}
+  needs: []
+  script:
+    - export WEEK="$(date -u +%G-W%V)"
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"username\":\"${CI_REGISTRY_USER}\",\"password\":\"${CI_REGISTRY_PASSWORD}\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}"
+        --dockerfile "${CI_PROJECT_DIR}/Containerfile"
+        --build-arg "ZEROCLAW_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
+        --destination "${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
+        --destination "${CI_REGISTRY_IMAGE}:latest"
+    - echo "WEEK=${WEEK}" > week.env
+  artifacts:
+    reports:
+      dotenv: week.env
+
+release:container-weekly:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:v0.18.0
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $WEEKLY_CONTAINER == "1"'
+  needs:
+    - job: container:weekly
+      artifacts: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "cutting release stack-${WEEK} for ${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
+  release:
+    tag_name: "stack-${WEEK}"
+    description: "Weekly zoder stack container — zoder + zerocode + zeroclaw + goose (${WEEK}). Pull: docker pull ${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
+    assets:
+      links:
+        - name: "container image (weekly-${WEEK})"
+          url: "${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
+          link_type: "image"
