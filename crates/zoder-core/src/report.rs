@@ -12,6 +12,15 @@ use chrono::{DateTime, Datelike, IsoWeek, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+fn add_cost(total: &mut f64, cost: f64) -> anyhow::Result<()> {
+    let next = *total + cost;
+    if !next.is_finite() {
+        anyhow::bail!("report cost total overflowed; refusing to render a misleading value");
+    }
+    *total = next;
+    Ok(())
+}
+
 /// Bucket granularity for a report's time series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gran {
@@ -174,23 +183,23 @@ pub fn build_report_from_entries(
         // only for the counterfactual baseline below, never to re-bill free usage.
         let cost = e.cost_usd;
         let billed = e.cost_usd > 0.0;
-        let tok = e.tokens_in + e.tokens_out;
+        let tok = e.tokens_in.saturating_add(e.tokens_out);
 
         let key = gran.key(&e.ts_utc);
         let b = buckets.entry(key.clone()).or_default();
         b.key = key;
-        b.cost_usd += cost;
-        b.tokens_in += e.tokens_in;
-        b.tokens_out += e.tokens_out;
-        b.calls += e.calls;
+        add_cost(&mut b.cost_usd, cost)?;
+        b.tokens_in = b.tokens_in.saturating_add(e.tokens_in);
+        b.tokens_out = b.tokens_out.saturating_add(e.tokens_out);
+        b.calls = b.calls.saturating_add(e.calls);
 
         let m = models.entry(e.model.clone()).or_default();
         m.model = e.model.clone();
-        m.cost_usd += cost;
-        m.tokens += tok;
-        m.tokens_in += e.tokens_in;
-        m.tokens_out += e.tokens_out;
-        m.calls += e.calls;
+        add_cost(&mut m.cost_usd, cost)?;
+        m.tokens = m.tokens.saturating_add(tok);
+        m.tokens_in = m.tokens_in.saturating_add(e.tokens_in);
+        m.tokens_out = m.tokens_out.saturating_add(e.tokens_out);
+        m.calls = m.calls.saturating_add(e.calls);
         m.billed |= billed;
 
         // Per-publisher-host rollup (publisher prefix of the model id). Skipped
@@ -199,21 +208,21 @@ pub fn build_report_from_entries(
         if !host.is_empty() {
             let h = hosts.entry(host.clone()).or_default();
             h.host = host;
-            h.cost_usd += cost;
-            h.tokens += tok;
-            h.tokens_in += e.tokens_in;
-            h.tokens_out += e.tokens_out;
-            h.calls += e.calls;
+            add_cost(&mut h.cost_usd, cost)?;
+            h.tokens = h.tokens.saturating_add(tok);
+            h.tokens_in = h.tokens_in.saturating_add(e.tokens_in);
+            h.tokens_out = h.tokens_out.saturating_add(e.tokens_out);
+            h.calls = h.calls.saturating_add(e.calls);
             h.billed |= billed;
         }
 
-        rep.total_cost_usd += cost;
-        rep.total_tokens += tok;
-        rep.total_calls += e.calls;
+        add_cost(&mut rep.total_cost_usd, cost)?;
+        rep.total_tokens = rep.total_tokens.saturating_add(tok);
+        rep.total_calls = rep.total_calls.saturating_add(e.calls);
         if billed {
-            rep.billed_tokens += tok;
+            rep.billed_tokens = rep.billed_tokens.saturating_add(tok);
         } else {
-            rep.free_tokens += tok;
+            rep.free_tokens = rep.free_tokens.saturating_add(tok);
         }
     }
 

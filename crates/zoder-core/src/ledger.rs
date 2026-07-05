@@ -82,6 +82,23 @@ impl Entry {
     }
 }
 
+fn entry_numbers_valid(e: &Entry) -> bool {
+    e.cost_usd.is_finite()
+        && e.cost_usd >= 0.0
+        && e.tags
+            .cache_hit_ratio
+            .is_none_or(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+}
+
+fn add_cost(total: &mut f64, cost: f64) -> anyhow::Result<()> {
+    let next = *total + cost;
+    if !next.is_finite() {
+        anyhow::bail!("ledger cost rollup overflowed; refusing to report a misleading total");
+    }
+    *total = next;
+    Ok(())
+}
+
 /// Derive the publisher host from a model id: the segment before the first `/`
 /// (`meta/llama-3.3-70b-instruct` -> `meta`). Returns "" for un-prefixed ids.
 pub fn host_of_model(model: &str) -> String {
@@ -142,6 +159,9 @@ impl Ledger {
     }
 
     pub fn record(&self, e: &Entry) -> anyhow::Result<()> {
+        if !entry_numbers_valid(e) {
+            anyhow::bail!("ledger entry contains invalid cost or cache-hit telemetry");
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -225,8 +245,8 @@ impl Ledger {
                 continue;
             }
             match serde_json::from_slice::<Entry>(&buf) {
-                Ok(e) => out.push(e),
-                Err(_) => {
+                Ok(e) if entry_numbers_valid(&e) => out.push(e),
+                _ => {
                     // `from_utf8_lossy` keeps the malformed byte visible
                     // for the caller; the line is still skipped so a
                     // single bad row doesn't blank the rollup.
@@ -321,7 +341,7 @@ impl Ledger {
             // A pre-fix ledger had every entry with `calls: 1`, so the
             // old `+= 1` happened to be correct — but a rollup row with
             // `calls: 10` (a legitimate aggregate) was counted as one.
-            r.cost_usd += e.cost_usd;
+            add_cost(&mut r.cost_usd, e.cost_usd)?;
             r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
             r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
             r.calls = r.calls.saturating_add(e.calls);
@@ -341,7 +361,7 @@ impl Ledger {
         let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(period.bucket(&e.ts_utc)).or_default();
-            r.cost_usd += e.cost_usd;
+            add_cost(&mut r.cost_usd, e.cost_usd)?;
             r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
             r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
             r.calls = r.calls.saturating_add(e.calls);
@@ -369,7 +389,7 @@ impl Ledger {
         let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(e.model.clone()).or_default();
-            r.cost_usd += e.cost_usd;
+            add_cost(&mut r.cost_usd, e.cost_usd)?;
             r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
             r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
             r.calls = r.calls.saturating_add(e.calls);

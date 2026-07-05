@@ -177,4 +177,19 @@ fn smoke_test_is_fatal_and_rolls_back() {
         src.contains("Smoke verified:"),
         "successful smoke must print a clear verification line"
     );
+    assert!(
+        src.contains("backup-${b}") && src.contains("rollback_installed"),
+        "rollback must restore pre-existing binaries, not merely delete them"
+    );
+}
+
+#[test]
+fn checksum_parser_requires_exact_digest_body() {
+    let src = read_install_sh();
+    assert!(src.contains("read_checksum"));
+    assert!(src.contains("*[!0-9a-fA-F]*"));
+    assert!(
+        !src.contains("tr -cd '0-9a-fA-F'"),
+        "checksum verification must not manufacture a digest by stripping arbitrary response text"
+    );
 }

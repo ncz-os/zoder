@@ -191,12 +191,14 @@ impl HealthStore {
 
     pub fn record_success(&mut self, model: &str, latency_ms: f64) {
         let h = self.models.entry(model.to_string()).or_default();
-        h.calls += 1;
+        h.calls = h.calls.saturating_add(1);
         h.consecutive_failures = 0;
-        h.ewma_latency_ms = Some(match h.ewma_latency_ms {
-            Some(prev) => 0.7 * prev + 0.3 * latency_ms,
-            None => latency_ms,
-        });
+        if latency_ms.is_finite() && latency_ms >= 0.0 {
+            h.ewma_latency_ms = Some(match h.ewma_latency_ms.filter(|v| v.is_finite()) {
+                Some(prev) => 0.7 * prev + 0.3 * latency_ms,
+                None => latency_ms,
+            });
+        }
         h.checked_at_unix = Some(now_unix());
     }
 
@@ -212,20 +214,22 @@ impl HealthStore {
         classification: Classification,
     ) {
         let h = self.models.entry(model.to_string()).or_default();
-        h.calls += 1;
+        h.calls = h.calls.saturating_add(1);
         h.consecutive_failures = 0;
-        h.ewma_latency_ms = Some(match h.ewma_latency_ms {
-            Some(prev) => 0.7 * prev + 0.3 * latency_ms,
-            None => latency_ms,
-        });
+        if latency_ms.is_finite() && latency_ms >= 0.0 {
+            h.ewma_latency_ms = Some(match h.ewma_latency_ms.filter(|v| v.is_finite()) {
+                Some(prev) => 0.7 * prev + 0.3 * latency_ms,
+                None => latency_ms,
+            });
+        }
         h.mark_checked(provider_id, classification);
     }
 
     pub fn record_failure(&mut self, model: &str, err: &str) {
         let h = self.models.entry(model.to_string()).or_default();
-        h.calls += 1;
-        h.failures += 1;
-        h.consecutive_failures += 1;
+        h.calls = h.calls.saturating_add(1);
+        h.failures = h.failures.saturating_add(1);
+        h.consecutive_failures = h.consecutive_failures.saturating_add(1);
         h.last_error = Some(err.chars().take(160).collect());
         h.last_failure_unix = Some(now_unix());
         h.checked_at_unix = Some(now_unix());
@@ -243,9 +247,9 @@ impl HealthStore {
         classification: Classification,
     ) {
         let h = self.models.entry(model.to_string()).or_default();
-        h.calls += 1;
-        h.failures += 1;
-        h.consecutive_failures += 1;
+        h.calls = h.calls.saturating_add(1);
+        h.failures = h.failures.saturating_add(1);
+        h.consecutive_failures = h.consecutive_failures.saturating_add(1);
         h.last_error = Some(err.chars().take(160).collect());
         h.last_failure_unix = Some(now_unix());
         if !provider_id.is_empty() {

@@ -175,9 +175,8 @@ pub enum RouteDecision {
     PreferSub,
     /// Use the free-tier fallback for this request.
     FallBackToFree,
-    /// Subscription is exhausted; we are operating inside a chargeback
-    /// budget and the dollar budget is also gone — same effect as
-    /// `FallBackToFree` but tagged so the ledger can record the cause.
+    /// Subscription is at its guard, but a configured chargeback budget still
+    /// has room, so the caller may continue on the explicitly paid path.
     Chargeback,
 }
 
@@ -473,7 +472,11 @@ impl RouteKnobs {
 // ---------------------------------------------------------------------------
 
 fn parse_pct(raw: &str) -> Option<f64> {
-    raw.trim().trim_end_matches('%').parse::<f64>().ok()
+    raw.trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
 }
 
 fn parse_u32(raw: &str) -> Option<u32> {
@@ -543,7 +546,8 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
                 headers
                     .get("x-codex-primary-reset-after-seconds")
                     .and_then(parse_i64)
-                    .map(|secs| Utc::now().timestamp() + secs)
+                    .filter(|secs| *secs >= 0)
+                    .and_then(|secs| Utc::now().timestamp().checked_add(secs))
             }),
         label: Some("primary".to_string()),
     };
@@ -562,7 +566,8 @@ pub fn parse_codex(headers: &dyn HeaderLookup, account_id: &str, plan: &str) -> 
                 headers
                     .get("x-codex-secondary-reset-after-seconds")
                     .and_then(parse_i64)
-                    .map(|secs| Utc::now().timestamp() + secs)
+                    .filter(|secs| *secs >= 0)
+                    .and_then(|secs| Utc::now().timestamp().checked_add(secs))
             }),
         label: Some("secondary".to_string()),
     };
@@ -631,7 +636,9 @@ pub fn parse_anthropic(
     if snap.primary.is_none() {
         let (limit, remaining, reset) = anthropic_legacy_pair(headers, "requests");
         let pct = match (limit, remaining) {
-            (Some(l), Some(r)) if l > 0 => Some(((l - r) as f64 / l as f64) * 100.0),
+            (Some(l), Some(r)) if l > 0 && (0..=l).contains(&r) => {
+                Some(((l - r) as f64 / l as f64) * 100.0)
+            }
             _ => None,
         };
         if let Some(p) = pct {
@@ -644,7 +651,9 @@ pub fn parse_anthropic(
         }
         let (limit, remaining, reset) = anthropic_legacy_pair(headers, "tokens");
         let pct = match (limit, remaining) {
-            (Some(l), Some(r)) if l > 0 => Some(((l - r) as f64 / l as f64) * 100.0),
+            (Some(l), Some(r)) if l > 0 && (0..=l).contains(&r) => {
+                Some(((l - r) as f64 / l as f64) * 100.0)
+            }
             _ => None,
         };
         if let Some(p) = pct {
@@ -901,11 +910,6 @@ pub fn decide(
     // Stale reset: window rolled over -> full headroom.
     let used = effective_used(snap, now);
 
-    // No credits (Codex-specific) -> we can't spend what we don't have.
-    if snap.has_credits == Some(false) {
-        return RouteDecision::FallBackToFree;
-    }
-
     // Freshness gate: only applied when the caller supplied an
     // `observed_at`. The live capture path always does; tests / internal
     // callers that pass `observed_at = None` keep the legacy trust
@@ -915,6 +919,13 @@ pub fn decide(
         if TelemetryHealth::from_age_secs(Some(snap_age)) == TelemetryHealth::Degraded {
             return RouteDecision::PreferSub;
         }
+    }
+
+    // No credits (Codex-specific) is a gating signal only while the snapshot
+    // itself is trustworthy. A degraded `false` may have rolled over or been
+    // replenished and must not pin routing away from the subscription.
+    if snap.has_credits == Some(false) {
+        return RouteDecision::FallBackToFree;
     }
 
     if used < knobs.use_target {
@@ -1544,6 +1555,14 @@ pub fn period_id_for(now: DateTime<Utc>) -> Option<String> {
     Some(now.format("%Y-%m").to_string())
 }
 
+fn current_period_for_stored_id(now: DateTime<Utc>, stored: &str) -> String {
+    if stored.len() == 10 {
+        now.format("%Y-%m-%d").to_string()
+    } else {
+        now.format("%Y-%m").to_string()
+    }
+}
+
 /// Recompute `used_percent` from `used_tokens` and `cap` in the unified
 /// 0..=100 scale (Finding #3). The previous implementation returned the
 /// raw `used_tokens / cap` ratio (e.g. 0.85 for 85%), which the router
@@ -1552,7 +1571,10 @@ pub fn period_id_for(now: DateTime<Utc>) -> Option<String> {
 /// the multiply so the rounding / cap-zero rule lives in one place.
 fn compute_used_percent(used_tokens: f64, cap: Option<f64>) -> Option<f64> {
     match cap {
-        Some(c) if c > 0.0 => Some((used_tokens / c) * 100.0),
+        Some(c) if used_tokens.is_finite() && used_tokens >= 0.0 && c.is_finite() && c > 0.0 => {
+            let percent = (used_tokens / c) * 100.0;
+            percent.is_finite().then_some(percent)
+        }
         _ => None,
     }
 }
@@ -1872,7 +1894,7 @@ impl UtilizationStore {
         // store previously lacked: June usage cannot bleed into
         // July, even though `record_counter` is the only mutator.
         if let Some(stored_period) = entry.period_id.clone() {
-            let current_period = period_id_for(now).unwrap_or_default();
+            let current_period = current_period_for_stored_id(now, &stored_period);
             if stored_period != current_period {
                 entry.used_tokens = 0.0;
                 entry.used_percent = None;
@@ -1884,7 +1906,7 @@ impl UtilizationStore {
         // (streaming-usage off, usage field absent) still wants a row
         // touch but never a negative balance.
         if tokens_used.is_finite() && tokens_used > 0.0 {
-            entry.used_tokens += tokens_used;
+            entry.used_tokens = (entry.used_tokens + tokens_used).min(f64::MAX);
         }
         // Recompute percent from the cap, if any. `cap = Some(0.0)` is
         // treated as "no headroom" (0%, not NaN/inf) so a bad
@@ -1925,7 +1947,17 @@ impl UtilizationStore {
             period_id: period_id.clone(),
             last_updated: now,
         });
-        entry.period_id = period_id;
+        match period_id {
+            Some(period_id) => {
+                // Preserve an existing period until `record_counter` sees it.
+                // Overwriting June with July here would erase the only signal
+                // that the following increment must reset the counter first.
+                if entry.period_id.is_none() {
+                    entry.period_id = Some(period_id);
+                }
+            }
+            None => entry.period_id = None,
+        }
         entry.last_updated = now;
     }
 
@@ -2202,6 +2234,19 @@ mod tests {
     }
 
     #[test]
+    fn parsers_reject_non_finite_negative_and_inconsistent_utilization() {
+        for raw in ["NaN", "inf", "-1"] {
+            let h = hm([("x-codex-primary-used-percent", raw)]);
+            assert!(parse_codex(&h, "acct", "pro").primary.is_none());
+        }
+        let h = hm([
+            ("anthropic-ratelimit-requests-limit", "100"),
+            ("anthropic-ratelimit-requests-remaining", "101"),
+        ]);
+        assert!(parse_anthropic(&h, "acct", "max").primary.is_none());
+    }
+
+    #[test]
     fn parse_headers_detects_vendor() {
         let h = hm([("x-codex-primary-used-percent", "10")]);
         let s = parse_headers(&h, "acct", "pro").unwrap();
@@ -2400,6 +2445,23 @@ mod tests {
                 None
             ),
             RouteDecision::FallBackToFree,
+        );
+    }
+
+    #[test]
+    fn degraded_no_credits_signal_does_not_gate() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut snap = snap_with_primary(99.0, None);
+        snap.has_credits = Some(false);
+        snap.observed_at = Some(now - chrono::Duration::hours(2));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::PreferSub,
         );
     }
 
@@ -2814,6 +2876,87 @@ mod tests {
             w_w.used_percent.is_none(),
             "a percent-only window with no cap set must never get a percent: {:?}",
             w_w.used_percent,
+        );
+    }
+
+    #[test]
+    fn calendar_counter_binding_preserves_old_period_until_increment_resets() {
+        let mut s = UtilizationStore::default();
+        let june = Utc.with_ymd_and_hms(2026, 6, 30, 23, 59, 0).unwrap();
+        let july = Utc.with_ymd_and_hms(2026, 7, 1, 0, 1, 0).unwrap();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(1_000.0),
+            june,
+        );
+        s.set_counter_period_id(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            period_id_for(june),
+            june,
+        );
+        assert_eq!(
+            s.record_counter(
+                Provider::MiniMax,
+                "default",
+                MM_PLAN,
+                "monthly",
+                900.0,
+                june
+            ),
+            900.0
+        );
+
+        // This mirrors the live capture order: bind current period first,
+        // then record. The binding call must not erase the persisted June id.
+        s.set_counter_period_id(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            period_id_for(july),
+            july,
+        );
+        assert_eq!(
+            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", 10.0, july),
+            10.0
+        );
+        let w = s
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .unwrap();
+        assert_eq!(w.period_id.as_deref(), Some("2026-07"));
+        assert_eq!(w.used_percent, Some(1.0));
+    }
+
+    #[test]
+    fn daily_counter_resets_on_day_boundary_not_only_month_boundary() {
+        let mut s = UtilizationStore::default();
+        let day_one = Utc.with_ymd_and_hms(2026, 7, 4, 23, 59, 0).unwrap();
+        let day_two = Utc.with_ymd_and_hms(2026, 7, 5, 0, 1, 0).unwrap();
+        s.set_counter_period_id(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "daily",
+            Some("2026-07-04".into()),
+            day_one,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "daily",
+            50.0,
+            day_one,
+        );
+        assert_eq!(
+            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "daily", 2.0, day_two),
+            2.0
         );
     }
 

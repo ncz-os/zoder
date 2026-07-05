@@ -130,6 +130,21 @@ sha256_file() {
   fi
 }
 
+# Read the checksum file in the exact format produced by CI: one 64-character
+# hexadecimal digest, optionally followed by a final newline. Reject HTML,
+# filenames, signatures, and other bodies instead of stripping characters out
+# until something digest-shaped appears.
+read_checksum() {
+  # Command substitution removes trailing newlines but preserves any embedded
+  # newline, which the non-hex check below rejects.
+  value=$(cat "$1" 2>/dev/null || true)
+  [ "${#value}" -eq 64 ] || return 1
+  case "$value" in
+  *[!0-9a-fA-F]*) return 1 ;;
+  esac
+  printf '%s' "$value"
+}
+
 # dl_atomic URL OUTFILE MIN_BYTES — download to a sibling `.part` file, reject
 # anything shorter than MIN_BYTES (so curl can't silently leave a 0-byte file
 # behind when the response is truncated mid-flight), then rename into place.
@@ -278,10 +293,8 @@ for b in $BIN_REQUIRED; do
   if [ "$NO_VERIFY" = "1" ]; then
     warn "checksum verification disabled for ${b} (--no-verify / ZODER_NO_VERIFY=1)"
   elif dl "${url}.sha256" "${tmp}/${b}.sha256" 2>/dev/null; then
-    want=$(tr -cd '0-9a-fA-F' <"${tmp}/${b}.sha256" | cut -c1-64)
-    if [ "${#want}" -ne 64 ]; then
-      die "malformed checksum for ${asset}: want exactly 64 hex chars (got ${#want}); refusing to install unverified binary"
-    fi
+    want=$(read_checksum "${tmp}/${b}.sha256") ||
+      die "malformed checksum for ${asset}: expected exactly one 64-character hex digest"
     got=$(sha256_file "${tmp}/${b}")
     [ -n "$got" ] || die "no sha256 tool available on this system; cannot verify ${asset} (re-run with --no-verify to override)"
     [ "$got" = "$want" ] || die "checksum mismatch for ${asset} — download may be corrupt. Expected ${want}, got ${got}"
@@ -310,8 +323,7 @@ for b in $BIN_OPTIONAL; do
   if [ "$NO_VERIFY" = "1" ]; then
     warn "checksum verification disabled for optional ${b} (--no-verify / ZODER_NO_VERIFY=1)"
   elif dl "${url}.sha256" "${tmp}/${b}.sha256" 2>/dev/null; then
-    want=$(tr -cd '0-9a-fA-F' <"${tmp}/${b}.sha256" | cut -c1-64)
-    if [ "${#want}" -ne 64 ]; then
+    if ! want=$(read_checksum "${tmp}/${b}.sha256"); then
       warn "malformed checksum for optional ${asset}; skipping (not installed)"
       rm -f "${tmp}/${b}"
       continue
@@ -338,9 +350,26 @@ done
 # Install each staged binary. New `install -m 0755` overwrites the prior
 # binary in place so any older copies (e.g. an existing zerocode from a
 # previous install) are replaced consistently rather than left as orphans.
+installed_names=""
+rollback_installed() {
+  for name in $installed_names; do
+    if [ -f "${tmp}/backup-${name}" ]; then
+      cp -p "${tmp}/backup-${name}" "${BIN_DIR}/${name}" || true
+    else
+      rm -f "${BIN_DIR}/${name}"
+    fi
+  done
+}
 for b in $BIN_REQUIRED $BIN_OPTIONAL; do
   [ -f "${tmp}/${b}" ] || continue
-  install -m 0755 "${tmp}/${b}" "${BIN_DIR}/${b}"
+  if [ -f "${BIN_DIR}/${b}" ]; then
+    cp -p "${BIN_DIR}/${b}" "${tmp}/backup-${b}"
+  fi
+  installed_names="${installed_names} ${b}"
+  if ! install -m 0755 "${tmp}/${b}" "${BIN_DIR}/${b}"; then
+    rollback_installed
+    die "failed to install ${b}; previous binaries restored"
+  fi
   installed=$((installed + 1))
 done
 [ "$installed" -gt 0 ] || die "nothing installed"
@@ -409,14 +438,7 @@ if ! "${BIN_DIR}/zoder" --version >/dev/null 2>&1; then
   warn "zoder --version failed after install; rolling back ${BIN_DIR}/zoder"
 fi
 if [ "$smoke_failed" -eq 1 ]; then
-  # Roll back: remove only the files we (re)installed in this run. If a
-  # pre-existing zoder was in place, it has already been overwritten by
-  # `install -m 0755 "${tmp}/${b}"`, so removing it is the safest move —
-  # `zoder --version` reported the failure, so leaving it would be a lie.
-  rm -f "${BIN_DIR}/zoder"
-  for b in $BIN_OPTIONAL; do
-    [ -f "${tmp}/${b}" ] && rm -f "${BIN_DIR}/${b}"
-  done
+  rollback_installed
   die "zoder --version check failed after install; install was rolled back"
 fi
 info "Smoke verified: ${BIN_DIR}/zoder reports a version"

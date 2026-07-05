@@ -164,14 +164,21 @@ fn validate_model_price(
         }
     }
     let mut price = ModelPrice::default();
-    let mut has_rate = false;
+    let mut blended_present = false;
+    let mut input_present = false;
+    let mut output_present = false;
     for f in NUMERIC_PRICE_FIELDS {
         match obj.get(f) {
             None | Some(serde_json::Value::Null) => {}
             Some(v) => match v.as_f64() {
                 Some(n) if n.is_finite() && n >= 0.0 => {
-                    has_rate = true;
                     set_price_field(&mut price, f, n);
+                    match f {
+                        "usd_per_mtok" => blended_present = true,
+                        "input_usd_per_mtok" => input_present = true,
+                        "output_usd_per_mtok" => output_present = true,
+                        _ => {}
+                    }
                 }
                 // A finite negative value is the catalog's "unpriced / unknown"
                 // sentinel (e.g. -1000000.0 for models with no published rate).
@@ -184,9 +191,11 @@ fn validate_model_price(
             },
         }
     }
-    if !has_rate {
+    let complete_component_pair = input_present && output_present;
+    let partial_component_pair = input_present != output_present;
+    if partial_component_pair || (!complete_component_pair && !blended_present) {
         warn(format!(
-            "model \"{model_id}\": no valid rate fields remain, skipping model"
+            "model \"{model_id}\": no complete input/output pair or blended rate, skipping model"
         ));
         return None;
     }
@@ -408,7 +417,8 @@ impl PricingCatalog {
         let leaf = ml.rsplit('/').next().unwrap_or(&ml);
         self.models.iter().find_map(|(k, v)| {
             let kl = k.to_ascii_lowercase();
-            if kl == ml || kl == leaf || ml.ends_with(&kl) || kl.ends_with(leaf) {
+            let key_leaf = kl.rsplit('/').next().unwrap_or(&kl);
+            if kl == ml || key_leaf == leaf {
                 Some(v)
             } else {
                 None
@@ -557,6 +567,24 @@ mod tests {
         assert_eq!(cat.cost("metered-but-missing", 1_000_000, 0), 0.0);
         assert_eq!(cat.cost("free-preview", 1_000_000, 0), 0.0);
         assert_eq!(cat.cost("metered-paid", 1_000_000, 0), 1.0);
+    }
+
+    #[test]
+    fn lookup_does_not_suffix_match_a_different_model_name() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "gpt-4o".into(),
+            ModelPrice {
+                input_usd_per_mtok: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(cat.lookup("openai/gpt-4o").is_some());
+        assert!(cat.lookup("custom/cheap-gpt-4o").is_none());
+        assert_eq!(
+            cat.classify_cost("custom/cheap-gpt-4o", 1_000, 0, None),
+            CostVerdict::Unknown
+        );
     }
 
     /// Finding #23: `cost_at` honors the configured off-peak window so

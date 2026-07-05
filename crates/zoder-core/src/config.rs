@@ -582,6 +582,13 @@ impl Config {
         let home = Self::home();
         let mut cfg = Self::default_provider(&home);
         apply_overlays_filtered(&mut cfg, &home, Some(vendor))?;
+        let problems = cfg.validate();
+        if !problems.is_empty() {
+            anyhow::bail!(
+                "invalid zoder configuration:\n  - {}",
+                problems.join("\n  - ")
+            );
+        }
         Ok(cfg)
     }
 
@@ -891,6 +898,60 @@ impl Config {
                     ));
                 }
             }
+            if p.kind.trim().is_empty() {
+                errs.push(format!("provider {}: kind must not be empty", p.id));
+            }
+            if p.billing != BillingMode::Subscription && p.subscription.is_some() {
+                errs.push(format!(
+                    "provider {}: subscription terms require billing=subscription",
+                    p.id
+                ));
+            }
+            if let Some(plan) = &p.subscription {
+                if !plan.monthly_fee_usd.is_finite() || plan.monthly_fee_usd < 0.0 {
+                    errs.push(format!(
+                        "provider {}: monthly_fee_usd must be finite and non-negative",
+                        p.id
+                    ));
+                }
+                if plan.tier.as_ref().is_some_and(|t| t.trim().is_empty()) {
+                    errs.push(format!(
+                        "provider {}: subscription tier must not be empty",
+                        p.id
+                    ));
+                }
+                let mut window_names = std::collections::HashSet::new();
+                for w in &plan.windows {
+                    if w.name.trim().is_empty() {
+                        errs.push(format!("provider {}: quota window has an empty name", p.id));
+                    } else if !window_names.insert(w.name.as_str()) {
+                        errs.push(format!(
+                            "provider {}: duplicate quota window name {:?}",
+                            p.id, w.name
+                        ));
+                    }
+                    if w.hours == 0 {
+                        errs.push(format!(
+                            "provider {} window {}: hours must be greater than zero",
+                            p.id, w.name
+                        ));
+                    }
+                    if w.cap.is_some_and(|c| !c.is_finite() || c <= 0.0) {
+                        errs.push(format!(
+                            "provider {} window {}: cap must be finite and positive",
+                            p.id, w.name
+                        ));
+                    }
+                    if w.models.as_ref().is_some_and(|models| {
+                        models.is_empty() || models.iter().any(|m| m.trim().is_empty())
+                    }) {
+                        errs.push(format!(
+                            "provider {} window {}: models must contain non-empty patterns",
+                            p.id, w.name
+                        ));
+                    }
+                }
+            }
         }
         if self.provider(&self.default_provider).is_none() {
             errs.push(format!(
@@ -902,6 +963,51 @@ impl Config {
             errs.push(
                 "strict_free is on but free_api_hosts is empty (every call would violate)".into(),
             );
+        }
+        for (name, cap) in [
+            ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
+            ("monthly_cap_usd", self.budget.monthly_cap_usd),
+        ] {
+            if cap.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                errs.push(format!("budget.{name} must be finite and non-negative"));
+            }
+        }
+
+        let presets = crate::scenarios::default_scenarios();
+        if !presets.contains_key(&self.routing.scenario) {
+            errs.push(format!(
+                "unknown routing scenario {:?} (expected economy, balanced, aggressive, or unlimited)",
+                self.routing.scenario
+            ));
+        }
+        for name in self.routing.scenarios.keys() {
+            if !presets.contains_key(name) {
+                errs.push(format!("routing override names unknown scenario {name:?}"));
+            }
+        }
+        for name in presets.keys() {
+            let scenario = crate::scenarios::resolve_active(name, self.routing.scenarios.get(name));
+            if !scenario.use_target.is_finite()
+                || !scenario.cap_guard.is_finite()
+                || !(0.0..=100.0).contains(&scenario.use_target)
+                || !(0.0..=100.0).contains(&scenario.cap_guard)
+                || scenario.use_target > scenario.cap_guard
+            {
+                errs.push(format!(
+                    "routing scenario {name}: use_target/cap_guard must be finite percentages with 0 <= use_target <= cap_guard <= 100"
+                ));
+            }
+            for (role, classes) in [
+                ("primary_classes", &scenario.primary_classes),
+                ("reviewer_classes", &scenario.reviewer_classes),
+            ] {
+                let unique: std::collections::HashSet<_> = classes.iter().collect();
+                if classes.is_empty() || unique.len() != classes.len() {
+                    errs.push(format!(
+                        "routing scenario {name}: {role} must be non-empty and contain no duplicates"
+                    ));
+                }
+            }
         }
         errs
     }
@@ -1640,5 +1746,47 @@ auth = { type = "env", var = "ACME_KEY" }
         assert_eq!(re.cap, Some(4000.0));
         assert_eq!(re.observability, Observability::Counter);
         assert_eq!(re.reset, ResetKind::CalendarMonthly);
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_budget_and_routing_percentages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.budget.monthly_cap_usd = Some(f64::NAN);
+        cfg.routing
+            .scenarios
+            .entry("balanced".into())
+            .or_default()
+            .cap_guard = Some(f64::INFINITY);
+        let errs = cfg.validate().join("\n");
+        assert!(errs.contains("budget.monthly_cap_usd"), "{errs}");
+        assert!(errs.contains("use_target/cap_guard"), "{errs}");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_subscription_windows_and_scenario_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.routing.scenario = "balnced".into();
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = Some(SubscriptionPlan {
+            monthly_fee_usd: -1.0,
+            tier: None,
+            windows: vec![QuotaWindow {
+                name: "".into(),
+                hours: 0,
+                unit: QuotaUnit::Tokens,
+                cap: Some(f64::NAN),
+                models: None,
+                observability: Observability::Counter,
+                reset: ResetKind::Rolling,
+            }],
+        });
+        let errs = cfg.validate().join("\n");
+        assert!(errs.contains("unknown routing scenario"), "{errs}");
+        assert!(errs.contains("monthly_fee_usd"), "{errs}");
+        assert!(errs.contains("empty name"), "{errs}");
+        assert!(errs.contains("hours must"), "{errs}");
+        assert!(errs.contains("cap must"), "{errs}");
     }
 }

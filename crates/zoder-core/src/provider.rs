@@ -337,7 +337,7 @@ impl OpenAiProvider {
         let plan_label = p
             .subscription
             .as_ref()
-            .and_then(|s| s.tier.clone())
+            .map(|s| s.tier.clone().unwrap_or_else(|| "explicit".to_string()))
             .unwrap_or_else(|| p.id.clone());
         Ok(Self {
             base_url: p.base_url.trim_end_matches('/').to_string(),
@@ -478,7 +478,7 @@ impl OpenAiProvider {
         // planner reads that store on the next turn to gate subscriptions
         // against headroom. BEST-EFFORT — any parse / IO error must not
         // poison the request.
-        capture_rate_limit_snapshot(resp.headers(), &self.base_url, &self.kind);
+        capture_rate_limit_snapshot(resp.headers(), &self.base_url, &self.kind, &self.plan_label);
         if !status.is_success() {
             let code = status.as_u16();
             let retry_after = retry_after_header(resp.headers());
@@ -786,20 +786,29 @@ impl<'a> crate::utilization::HeaderLookup for ReqwestHeaderProbe<'a> {
 /// stale disk or a provider that started publishing a brand-new header
 /// shape can never fail the in-flight request.
 ///
-/// `account_id` and `plan` are not knowable from a single response (Codex
-/// publishes the plan label in `x-codex-plan-type`; Anthropic publishes
-/// neither), so we persist under a stable `"default"` key — the CLI's
-/// `load_snapshot_for` looks up under the same key when re-reading, so
-/// the round-trip works without per-account plumbing.
-fn capture_rate_limit_snapshot(headers: &reqwest::header::HeaderMap, base_url: &str, _kind: &str) {
+/// The account is not knowable from a single response, so it uses the stable
+/// `"default"` key. The configured plan label is passed by `OpenAiProvider`
+/// and normalized after parsing so capture and scenario/report lookup use the
+/// same tuple even when Codex publishes a different display label.
+fn capture_rate_limit_snapshot(
+    headers: &reqwest::header::HeaderMap,
+    base_url: &str,
+    _kind: &str,
+    plan: &str,
+) {
     let Some(provider) = detect_utilization_provider(headers, base_url) else {
         return;
     };
-    let Some(snap) = crate::utilization::RateLimitSnapshot::from_headers(
-        headers, provider, "default", "default",
-    ) else {
+    let Some(mut snap) =
+        crate::utilization::RateLimitSnapshot::from_headers(headers, provider, "default", plan)
+    else {
         return;
     };
+    // Codex may publish its own plan label. The utilization-store key must
+    // nevertheless use the configured subscription tier, which is what the
+    // scenario/report readers resolve. Keep the provider value in the window
+    // data, but normalize the storage key to the configured plan.
+    snap.plan = plan.to_string();
     let Some(path) = crate::utilization::default_store_path() else {
         return;
     };
@@ -886,7 +895,6 @@ fn capture_counter_usage(
     // the catalog's `ResetKind` — only calendar windows are period-
     // bound; rolling windows stay un-bound and never auto-reset.
     let catalog = crate::subscription_tiers::TierCatalog::bundled();
-    let current_period = crate::utilization::period_id_for(now);
     if let Some(entry) = catalog.tier("minimax", plan) {
         for w in &entry.windows {
             if matches!(w.observability, crate::config::Observability::Counter) {
@@ -899,8 +907,12 @@ fn capture_counter_usage(
                     now,
                 );
                 let period_id = match w.reset {
-                    crate::config::ResetKind::CalendarMonthly
-                    | crate::config::ResetKind::CalendarDaily => current_period.clone(),
+                    crate::config::ResetKind::CalendarMonthly => {
+                        crate::utilization::period_id_for(now)
+                    }
+                    crate::config::ResetKind::CalendarDaily => {
+                        Some(now.format("%Y-%m-%d").to_string())
+                    }
                     crate::config::ResetKind::Rolling => None,
                 };
                 store.set_counter_period_id(

@@ -60,17 +60,20 @@ async fn fetch(c: &reqwest::Client, url: &str) -> anyhow::Result<String> {
 }
 
 /// LiteLLM stores numeric `$ / token`.
-fn num(v: &serde_json::Value, key: &str) -> f64 {
-    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
+fn num(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key)
+        .and_then(|x| x.as_f64())
+        .filter(|n| n.is_finite() && *n >= 0.0)
 }
 
 /// OpenRouter stores `$ / token` as strings (to avoid float drift).
-fn strnum(v: &serde_json::Value, key: &str) -> f64 {
-    match v.get(key) {
-        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0.0),
-        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
-    }
+fn strnum(v: &serde_json::Value, key: &str) -> Option<f64> {
+    let parsed = match v.get(key) {
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        _ => None,
+    };
+    parsed.filter(|n: &f64| n.is_finite() && *n >= 0.0)
 }
 
 fn merge_litellm(models: &mut HashMap<String, ModelPrice>, body: &str) -> anyhow::Result<usize> {
@@ -83,13 +86,23 @@ fn merge_litellm(models: &mut HashMap<String, ModelPrice>, body: &str) -> anyhow
         if id == "sample_spec" || !m.is_object() {
             continue;
         }
+        let input = num(m, "input_cost_per_token");
+        let output = num(m, "output_cost_per_token");
+        // Both primary rates must actually be published. A missing output
+        // component cannot honestly be treated as $0 for output-only usage.
+        if input.is_none() || output.is_none() {
+            continue;
+        }
         let price = ModelPrice {
             usd_per_mtok: 0.0,
-            input_usd_per_mtok: num(m, "input_cost_per_token") * PER_TOK_TO_MTOK,
-            output_usd_per_mtok: num(m, "output_cost_per_token") * PER_TOK_TO_MTOK,
-            cache_read_usd_per_mtok: num(m, "cache_read_input_token_cost") * PER_TOK_TO_MTOK,
-            cache_write_usd_per_mtok: num(m, "cache_creation_input_token_cost") * PER_TOK_TO_MTOK,
-            reasoning_usd_per_mtok: num(m, "output_cost_per_reasoning_token") * PER_TOK_TO_MTOK,
+            input_usd_per_mtok: input.unwrap_or(0.0) * PER_TOK_TO_MTOK,
+            output_usd_per_mtok: output.unwrap_or(0.0) * PER_TOK_TO_MTOK,
+            cache_read_usd_per_mtok: num(m, "cache_read_input_token_cost").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
+            cache_write_usd_per_mtok: num(m, "cache_creation_input_token_cost").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
+            reasoning_usd_per_mtok: num(m, "output_cost_per_reasoning_token").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
             source: "litellm".into(),
             off_peak: None,
         };
@@ -121,13 +134,21 @@ fn merge_openrouter(
         if !overwrite && models.contains_key(&key) {
             continue;
         }
+        let input = strnum(pricing, "prompt");
+        let output = strnum(pricing, "completion");
+        if input.is_none() || output.is_none() {
+            continue;
+        }
         let price = ModelPrice {
             usd_per_mtok: 0.0,
-            input_usd_per_mtok: strnum(pricing, "prompt") * PER_TOK_TO_MTOK,
-            output_usd_per_mtok: strnum(pricing, "completion") * PER_TOK_TO_MTOK,
-            cache_read_usd_per_mtok: strnum(pricing, "input_cache_read") * PER_TOK_TO_MTOK,
-            cache_write_usd_per_mtok: strnum(pricing, "input_cache_write") * PER_TOK_TO_MTOK,
-            reasoning_usd_per_mtok: strnum(pricing, "internal_reasoning") * PER_TOK_TO_MTOK,
+            input_usd_per_mtok: input.unwrap_or(0.0) * PER_TOK_TO_MTOK,
+            output_usd_per_mtok: output.unwrap_or(0.0) * PER_TOK_TO_MTOK,
+            cache_read_usd_per_mtok: strnum(pricing, "input_cache_read").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
+            cache_write_usd_per_mtok: strnum(pricing, "input_cache_write").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
+            reasoning_usd_per_mtok: strnum(pricing, "internal_reasoning").unwrap_or(0.0)
+                * PER_TOK_TO_MTOK,
             source: "openrouter".into(),
             off_peak: None,
         };
@@ -207,4 +228,37 @@ pub async fn sync_catalog(
     }
     stats.total = cat.models.len();
     Ok((cat, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_skips_missing_or_malformed_primary_rates_but_keeps_explicit_zero() {
+        let body = r#"{
+            "missing": {"mode": "chat"},
+            "partial": {"input_cost_per_token": 0.000001},
+            "bad": {"input_cost_per_token": -1, "output_cost_per_token": 0.000002},
+            "free": {"input_cost_per_token": 0, "output_cost_per_token": 0}
+        }"#;
+        let mut models = HashMap::new();
+        assert_eq!(merge_litellm(&mut models, body).unwrap(), 1);
+        assert_eq!(models.len(), 1);
+        assert!(models.contains_key("free"));
+    }
+
+    #[test]
+    fn openrouter_sync_does_not_turn_invalid_strings_into_free_rates() {
+        let body = r#"{"data":[
+            {"id":"bad","pricing":{"prompt":"NaN","completion":"bogus"}},
+            {"id":"partial","pricing":{"prompt":"0.1"}},
+            {"id":"free","pricing":{"prompt":"0","completion":"0"}}
+        ]}"#;
+        let mut models = HashMap::new();
+        assert_eq!(merge_openrouter(&mut models, body, true).unwrap(), 1);
+        assert!(models.contains_key("free"));
+        assert!(!models.contains_key("bad"));
+        assert!(!models.contains_key("partial"));
+    }
 }

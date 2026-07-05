@@ -107,6 +107,13 @@ pub fn classify(provider: &Provider, _model_id: &str) -> ProviderClass {
     if id == "nvidia-eih" || id == "nvcf" {
         return ProviderClass::Free;
     }
+    // Billing is authoritative for heuristic names. A custom metered provider
+    // named `something-local` or `minimax-flat-proxy` must never become free
+    // and bypass the paid gate. The exact NVCF ids above are the sole policy
+    // exceptions because they identify the public free-tier endpoint.
+    if provider.billing == BillingMode::Metered {
+        return ProviderClass::Paid;
+    }
     if id.contains("local") || id.contains("minimax-flat") {
         return ProviderClass::Free;
     }
@@ -462,23 +469,15 @@ pub fn candidate_eligible(
             //   * `Chargeback`    -> keep (scenario opted in)
             //   * `FallBackToFree`-> drop (cap tripped + block mode)
             //
-            // The wrinkle: in `chargeback` mode with `None` remaining,
-            // `decide()` conservatively returns `FallBackToFree`. The
-            // spec explicitly says "Chargeback=keep only if
-            // budget_mode=chargeback" — i.e. an operator who selected
-            // `chargeback` IS opting into keeping the sub past the cap,
-            // and we should honor that opt-in even when we don't have a
-            // remaining-dollar signal in hand.
+            // With no remaining-budget signal, chargeback mode must fail
+            // closed. The next class (Paid or Free) can still be selected;
+            // pretending an unknown budget has headroom would bypass the
+            // budget gate and also prevent the Paid fallback from being
+            // reached.
             let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
             match decision {
                 RouteDecision::PreferSub | RouteDecision::Chargeback => true,
-                RouteDecision::FallBackToFree => {
-                    // Scenario-level override: chargeback mode means
-                    // "keep through the cap". If `decide()` couldn't see
-                    // a remaining-budget signal but the scenario's mode
-                    // IS chargeback, honor the operator's choice.
-                    matches!(scenario.budget_mode, BudgetMode::Chargeback)
-                }
+                RouteDecision::FallBackToFree => false,
             }
         }
         ProviderClass::Paid => {
@@ -615,22 +614,14 @@ pub fn candidate_eligible_with_account(
                 let verdict = crate::utilization::decide_account(view, &knobs, now, None);
                 match verdict.decision {
                     RouteDecision::PreferSub | RouteDecision::Chargeback => true,
-                    RouteDecision::FallBackToFree => {
-                        // Same scenario-mode override as the legacy
-                        // path: when the scenario opted into
-                        // chargeback, keep the sub even if the
-                        // account-level verdict dropped it.
-                        matches!(scenario.budget_mode, BudgetMode::Chargeback)
-                    }
+                    RouteDecision::FallBackToFree => false,
                 }
             } else {
                 let snap = snapshot.cloned().unwrap_or_default();
                 let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
                 match decision {
                     RouteDecision::PreferSub | RouteDecision::Chargeback => true,
-                    RouteDecision::FallBackToFree => {
-                        matches!(scenario.budget_mode, BudgetMode::Chargeback)
-                    }
+                    RouteDecision::FallBackToFree => false,
                 }
             }
         }
@@ -975,10 +966,18 @@ mod tests {
 
     #[test]
     fn classify_local_and_minimax_flat_are_free() {
-        let p = provider("local-llama", BillingMode::Metered);
+        let p = provider("local-llama", BillingMode::Free);
         assert_eq!(classify(&p, "x"), ProviderClass::Free);
-        let p = provider("minimax-flat", BillingMode::Metered);
+        let p = provider("minimax-flat", BillingMode::Free);
         assert_eq!(classify(&p, "MiniMax-M3"), ProviderClass::Free);
+    }
+
+    #[test]
+    fn metered_provider_name_cannot_spoof_a_free_heuristic() {
+        let p = provider("customer-local-proxy", BillingMode::Metered);
+        assert_eq!(classify(&p, "x"), ProviderClass::Paid);
+        let p = provider("minimax-flat-metered", BillingMode::Metered);
+        assert_eq!(classify(&p, "MiniMax-M3"), ProviderClass::Paid);
     }
 
     #[test]
@@ -1363,11 +1362,11 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_chargeback_keeps_sub_above_cap_guard() {
+    fn unlimited_without_budget_signal_falls_through_sub_at_cap_guard() {
         let scenario = RouteScenario::unlimited();
         // 96% used -> above cap_guard (85 in default, but with budget_mode
-        // Chargeback, knemon::decide returns Chargeback, NOT
-        // FallBackToFree -> sub is eligible.
+        // Chargeback has no remaining-budget signal at this layer, so it
+        // fails closed and the free fallback wins.
         let snap = snapshot_with_used(96.0, None);
         let cands = vec![
             candidate("free-a", ProviderClass::Free, 99.0),
@@ -1376,8 +1375,8 @@ mod tests {
         assert_eq!(
             pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), true, now())
                 .as_deref(),
-            Some("sub-a"),
-            "chargeback mode keeps the sub past cap_guard"
+            Some("free-a"),
+            "unknown chargeback budget must not keep the sub past cap_guard"
         );
     }
 
