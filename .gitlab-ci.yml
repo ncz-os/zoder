@@ -169,7 +169,10 @@ nightly:linux:
     - cargo build --release --bin zoder --target aarch64-unknown-linux-gnu
     - |
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "target/$t/release/zoder" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t"
+        bin="target/$t/release/zoder"
+        sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t"
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t.sha256"
       done
 
 nightly:macos-arm64:
@@ -183,4 +186,8 @@ nightly:macos-arm64:
   script:
     - rustup target add aarch64-apple-darwin
     - cargo build --release --bin zoder --target aarch64-apple-darwin
-    - 'curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file target/aarch64-apple-darwin/release/zoder "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin"'
+    - |
+      bin="target/aarch64-apple-darwin/release/zoder"
+      shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
+      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin"
+      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin.sha256"
