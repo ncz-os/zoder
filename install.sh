@@ -2,39 +2,52 @@
 set -eu
 
 # ── zoder installer ──────────────────────────────────────────────
-# Installs the version-matched trio (zoder + zerocode + zeroclaw) from the
-# pre-built GitHub release for your platform. POSIX sh — no bash required.
-# Works on Debian, Alpine-glibc, macOS (Apple Silicon), everywhere with curl.
+# Installs the latest nightly "master" build of zoder from GitLab — the
+# canonical, authoritative home of the project. GitLab CI rebuilds master every
+# night and publishes a per-platform binary to a rolling generic package; this
+# script fetches the one for your platform. POSIX sh — no bash required. Works
+# on Debian, Alpine-glibc, macOS (Apple Silicon), everywhere with curl.
 #
-# Interactive:
-#   curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh | sh
+# Interactive (canonical, GitLab):
+#   curl -fsSL https://gitlab.com/ncz-os/zoder/-/raw/master/install.sh | sh
+#
+# The same script is mirrored on GitHub for convenience — it still pulls the
+# binaries from GitLab:
+#   curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 #
 # Agent / non-interactive (no prompts, machine-readable failures):
-#   curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh \
-#     | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR="$HOME/.local/bin" sh
+#   curl -fsSL https://gitlab.com/ncz-os/zoder/-/raw/master/install.sh \
+#     | ZODER_BIN_DIR="$HOME/.local/bin" sh
 #
 # Knobs (env or flags):
-#   ZODER_VERSION   / --version <tag>   release tag to install   (default: latest)
+#   ZODER_CHANNEL   / --channel <name>  nightly channel          (default: master)
 #   ZODER_BIN_DIR   / --bin-dir <dir>   install dir              (default: $HOME/.local/bin)
-#   ZODER_REPO      / --repo <o/r>      owner/repo               (default: ncz-os/zoder)
+#   ZODER_REPO      / --repo <o/r>      owner/repo (GitLab path) (default: ncz-os/zoder)
+#   ZODER_HOST      / --host <host>     GitLab host              (default: gitlab.com)
 #   ZODER_NO_VERIFY / --no-verify       skip checksum verify     (not recommended)
+#   ZODER_NO_CORPUS / --no-corpus       don't seed corpus + pricing
 #                     --dry-run         show actions, change nothing
 #                     --help
 
 REPO="${ZODER_REPO:-ncz-os/zoder}"
-VERSION="${ZODER_VERSION:-latest}"
+HOST="${ZODER_HOST:-gitlab.com}"
+CHANNEL="${ZODER_CHANNEL:-master}"
 BIN_DIR="${ZODER_BIN_DIR:-$HOME/.local/bin}"
 NO_VERIFY="${ZODER_NO_VERIFY:-0}"
 ZODER_HOME="${ZODER_HOME:-$HOME/.zoder}"
 NO_CORPUS="${ZODER_NO_CORPUS:-0}"
 DRY_RUN=false
-BINS="zoder zerocode zeroclaw"
 
-# Public, self-serve corpus + pricing (rebuilt daily from public price data;
-# raw-fetched from the repo's main branch). Seeding these at install means a
-# fresh zoder routes immediately instead of failing on a missing corpus, and it
-# never depends on any private corpus-build process.
-CORPUS_BASE="https://raw.githubusercontent.com/${REPO}/main"
+# zoder is the product. zerocode + zeroclaw (the TUI trio) are installed too when
+# the nightly publishes them; today the nightly ships `zoder` alone, so those are
+# best-effort and skipped silently when absent (forward-compatible).
+BIN_REQUIRED="zoder"
+BIN_OPTIONAL="zerocode zeroclaw"
+
+# Public, self-serve corpus + pricing, raw-fetched from GitLab master (the single
+# source of truth). Seeding at install means a fresh zoder routes immediately
+# instead of failing on a missing corpus, independent of any build process.
+CORPUS_BASE="https://${HOST}/${REPO}/-/raw/master"
 
 # ── Output helpers (terminal-aware) ──────────────────────────────
 
@@ -57,22 +70,24 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
   cat <<EOF
-$(bold "zoder installer") — version-matched trio (zoder + zerocode + zeroclaw)
+$(bold "zoder installer") — latest nightly master build (from GitLab)
 
 Usage: install.sh [options]
 
 Options:
-  --version <tag>   Release tag to install (default: latest)
+  --channel <name>  Nightly channel (default: master)
   --bin-dir <dir>   Install directory (default: \$HOME/.local/bin)
-  --repo <owner/r>  Source repository (default: ncz-os/zoder)
+  --repo <owner/r>  Source repository, GitLab path (default: ncz-os/zoder)
+  --host <host>     GitLab host (default: gitlab.com)
   --no-verify       Skip SHA256 checksum verification (not recommended)
   --no-corpus       Don't seed the routing corpus + pricing catalog
   --dry-run         Print what would happen, install nothing
   --help            Show this help
 
-Each release ships a prebuilt trio for linux-x86_64, linux-aarch64, and
-macOS-arm64. The installer detects your platform, verifies the download
-against SHA256SUMS, and installs zoder, zerocode, and zeroclaw.
+GitLab CI rebuilds master nightly and publishes per-platform binaries for
+linux-x86_64, linux-aarch64, and macOS-arm64. The installer detects your
+platform, verifies the download against its published SHA256 when available,
+and installs zoder into your bin directory.
 EOF
 }
 
@@ -80,9 +95,10 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-  --version) VERSION="${2:?--version needs a tag}"; shift 2 ;;
+  --channel) CHANNEL="${2:?--channel needs a name}"; shift 2 ;;
   --bin-dir) BIN_DIR="${2:?--bin-dir needs a dir}"; shift 2 ;;
   --repo) REPO="${2:?--repo needs owner/repo}"; shift 2 ;;
+  --host) HOST="${2:?--host needs a host}"; shift 2 ;;
   --no-verify) NO_VERIFY=1; shift ;;
   --no-corpus) NO_CORPUS=1; shift ;;
   --dry-run) DRY_RUN=true; shift ;;
@@ -166,34 +182,28 @@ shell_profile() {
   esac
 }
 
-# ── Resolve platform + version ───────────────────────────────────
+# ── Resolve platform + package base ──────────────────────────────
 
 triple=$(detect_target_triple)
 [ -n "$triple" ] || die "unsupported platform: $(uname -s)/$(uname -m) (Linux or macOS-arm64 only; on Windows use WSL)"
 
-if [ "$VERSION" = "latest" ]; then
-  tmptag=$(mktemp)
-  dl "https://api.github.com/repos/${REPO}/releases/latest" "$tmptag" || die "cannot reach GitHub API to resolve latest"
-  VERSION=$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$tmptag" | head -1)
-  rm -f "$tmptag"
-  [ -n "$VERSION" ] || die "could not resolve latest release tag"
-fi
-
-ver_no_v="${VERSION#v}"
-asset="zoder-${ver_no_v}-${triple}.tar.gz"
-base="https://github.com/${REPO}/releases/download/${VERSION}"
+# URL-encode owner/repo into a GitLab project path (ncz-os/zoder -> ncz-os%2Fzoder).
+proj=$(printf '%s' "$REPO" | sed 's#/#%2F#g')
+# Rolling nightly generic package: one raw binary per platform, overwritten each
+# night by GitLab CI. No version to resolve — the channel IS the latest master.
+pkg_base="https://${HOST}/api/v4/projects/${proj}/packages/generic/zoder-nightly/${CHANNEL}"
 
 echo
-printf "%s\n" "$(bold "Installing zoder ${VERSION} (pre-built trio)")"
+printf "%s\n" "$(bold "Installing zoder — nightly ${CHANNEL} build (GitLab)")"
 info "Platform: $triple"
-info "Source:   ${base}/${asset}"
-info "Bins:     ${BINS} → ${BIN_DIR}"
+info "Source:   ${pkg_base}/zoder-${triple}"
+info "Install:  ${BIN_DIR}"
 echo
 
 if [ "$DRY_RUN" = true ]; then
-  info "[dry-run] would download ${base}/${asset}"
-  info "[dry-run] would verify against ${base}/SHA256SUMS"
-  info "[dry-run] would install ${BINS} to ${BIN_DIR}"
+  info "[dry-run] would download ${pkg_base}/zoder-${triple}"
+  info "[dry-run] would verify against ${pkg_base}/zoder-${triple}.sha256 (if published)"
+  info "[dry-run] would install zoder to ${BIN_DIR}"
   [ "$NO_CORPUS" = "1" ] || info "[dry-run] would seed corpus + pricing from ${CORPUS_BASE} into ${ZODER_HOME}"
   exit 0
 fi
@@ -201,59 +211,52 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# Fetch the checksum manifest first: it lists every published asset, so a
-# missing entry means "no prebuilt for this platform" (distinct from a network
-# failure), and we never install a tarball we couldn't verify.
-verify=1
-if [ "$NO_VERIFY" = "1" ]; then
-  verify=0
-  warn "checksum verification disabled (--no-verify / ZODER_NO_VERIFY=1)"
-elif dl "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null; then
-  want=$(grep " ${asset}\$" "${tmp}/SHA256SUMS" | awk '{print $1}' | head -1)
-  [ -n "$want" ] || {
-    avail=$(awk '{print "      "$2}' "${tmp}/SHA256SUMS" | grep '\.tar\.gz' || true)
-    die "no prebuilt published for ${triple} in ${VERSION}. Available:
-${avail}"
-  }
-else
-  verify=0
-  warn "no SHA256SUMS published for ${VERSION}; skipping verify"
-fi
-
-dl "${base}/${asset}" "${tmp}/${asset}" || die "download failed: ${base}/${asset}"
-
-if [ "$verify" = "1" ]; then
-  if have sha256sum; then got=$(sha256sum "${tmp}/${asset}" | awk '{print $1}')
-  elif have shasum; then got=$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')
-  else die "no checksum tool (sha256sum/shasum); re-run with --no-verify to override"; fi
-  [ "$got" = "$want" ] || die "checksum mismatch for ${asset} — download may be corrupt. Expected ${want}, got ${got}"
-  info "Checksum verified"
-fi
-
-# ── Install ───────────────────────────────────────────────────────
-
-tar -xzf "${tmp}/${asset}" -C "${tmp}"
 mkdir -p "$BIN_DIR"
-n=0
-for b in $BINS; do
-  f=$(find "$tmp" -type f -name "$b" -perm -u+x 2>/dev/null | head -1)
-  [ -n "$f" ] || f=$(find "$tmp" -type f -name "$b" 2>/dev/null | head -1)
-  if [ -n "$f" ]; then
-    install -m 0755 "$f" "${BIN_DIR}/${b}"
-    n=$((n + 1))
-  else
-    warn "binary not found in tarball: $b"
+installed=0
+for b in $BIN_REQUIRED $BIN_OPTIONAL; do
+  asset="${b}-${triple}"
+  url="${pkg_base}/${asset}"
+  if ! dl "$url" "${tmp}/${b}" 2>/dev/null; then
+    case " $BIN_REQUIRED " in
+    *" $b "*)
+      die "no nightly build for ${triple} (channel ${CHANNEL}). The nightly builds x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and aarch64-apple-darwin; musl and Intel macOS are not published." ;;
+    *) continue ;; # optional binary not in this nightly — skip silently
+    esac
   fi
+
+  # Optional checksum: <pkg_base>/<asset>.sha256 holds the bare sha256 hex.
+  if [ "$NO_VERIFY" = "1" ]; then
+    warn "checksum verification disabled (--no-verify / ZODER_NO_VERIFY=1)"
+  elif dl "${url}.sha256" "${tmp}/${b}.sha256" 2>/dev/null; then
+    want=$(tr -cd '0-9a-fA-F' <"${tmp}/${b}.sha256" | cut -c1-64)
+    if have sha256sum; then got=$(sha256sum "${tmp}/${b}" | awk '{print $1}')
+    elif have shasum; then got=$(shasum -a 256 "${tmp}/${b}" | awk '{print $1}')
+    else got=""; fi
+    if [ -n "$got" ] && [ -n "$want" ]; then
+      [ "$got" = "$want" ] || die "checksum mismatch for ${asset} — download may be corrupt. Expected ${want}, got ${got}"
+      info "Checksum verified: ${b}"
+    else
+      warn "no checksum tool available; installed ${b} without verification"
+    fi
+  else
+    warn "no checksum published for ${asset}; skipping verify"
+  fi
+
+  install -m 0755 "${tmp}/${b}" "${BIN_DIR}/${b}"
+  installed=$((installed + 1))
 done
-[ "$n" -gt 0 ] || die "no binaries found in ${asset}"
-info "Installed $n binar$([ "$n" = 1 ] && echo y || echo ies) to ${BIN_DIR}"
+[ "$installed" -gt 0 ] || die "nothing installed"
+info "Installed $installed binar$([ "$installed" = 1 ] && echo y || echo ies) to ${BIN_DIR}"
 
 # ── Seed the public corpus + pricing ──────────────────────────────
 # Best-effort: a failed fetch (offline/proxy) never fails the install — zoder
 # also self-heals these on first run. Existing files are left in place so a
 # local `zoder refresh` / `zoder pricing sync` is never clobbered.
 seed_corpus() {
-  [ "$NO_CORPUS" = "1" ] && { warn "corpus seeding skipped (--no-corpus / ZODER_NO_CORPUS=1)"; return 0; }
+  [ "$NO_CORPUS" = "1" ] && {
+    warn "corpus seeding skipped (--no-corpus / ZODER_NO_CORPUS=1)"
+    return 0
+  }
   mkdir -p "$ZODER_HOME/data"
   if [ ! -f "$ZODER_HOME/model_corpus.json" ]; then
     if dl "${CORPUS_BASE}/corpus/model_corpus.json" "$ZODER_HOME/model_corpus.json" 2>/dev/null; then
@@ -288,4 +291,4 @@ esac
 
 echo
 "${BIN_DIR}/zoder" --version 2>/dev/null || true
-printf "%s\n" "$(bold "Done.") Run $(bold zoder) to start, or $(bold "zerocode") for the TUI."
+printf "%s\n" "$(bold "Done.") Run $(bold zoder) to start, or $(bold "zoder tui") for the TUI."
