@@ -2,9 +2,9 @@
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
   "arena_date": "2026-07-05",
   "generated": "2026-07-05",
-  "count": 2561,
-  "routable": 61,
-  "scored": 1394,
+  "count": 2477,
+  "routable": 83,
+  "scored": 1360,
   "models": [
     {
       "id": "ai21.j2-mid-v1",
@@ -94,8 +94,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 8.0,
@@ -110,8 +110,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 4.0,
         "output_usd_per_mtok": 8.0,
@@ -126,8 +126,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7,
         "output_usd_per_mtok": 1.4,
@@ -142,8 +142,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7999999999999999,
         "output_usd_per_mtok": 1.5999999999999999,
@@ -158,8 +158,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7999999999999999,
         "output_usd_per_mtok": 1.5999999999999999,
@@ -174,8 +174,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.5,
@@ -382,8 +382,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 2.5,
@@ -398,8 +398,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.24,
@@ -414,8 +414,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.035,
         "output_usd_per_mtok": 0.14,
@@ -430,8 +430,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 12.5,
@@ -446,8 +446,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7999999999999999,
         "output_usd_per_mtok": 3.1999999999999997,
@@ -462,8 +462,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 5.0,
@@ -1307,8 +1307,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 1.25,
@@ -1336,8 +1336,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 50.0,
@@ -1381,8 +1381,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 5.0,
@@ -1427,8 +1427,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 15.0,
         "output_usd_per_mtok": 75.0,
@@ -1456,8 +1456,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 15.0,
         "output_usd_per_mtok": 75.0,
@@ -1496,8 +1496,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 25.0,
@@ -1542,8 +1542,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 25.0,
@@ -1593,8 +1593,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 25.0,
@@ -1644,8 +1644,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 30.0,
         "output_usd_per_mtok": 150.0,
@@ -1695,8 +1695,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 25.0,
@@ -1740,8 +1740,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 50.0,
@@ -1785,8 +1785,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 15.0,
@@ -1814,8 +1814,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 15.0,
@@ -1860,8 +1860,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 15.0,
@@ -1911,8 +1911,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 10.0,
@@ -2397,8 +2397,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 0.7999999999999999,
@@ -2413,8 +2413,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 0.7999999999999999,
@@ -2441,8 +2441,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.045,
         "output_usd_per_mtok": 0.15,
@@ -2457,8 +2457,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.75,
         "output_usd_per_mtok": 1.2,
@@ -7823,8 +7823,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.42,
         "output_usd_per_mtok": 1.25,
@@ -12539,8 +12539,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 2.0,
@@ -12555,8 +12555,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.075,
         "output_usd_per_mtok": 0.3,
@@ -12571,8 +12571,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 2.0,
@@ -12587,8 +12587,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -12603,8 +12603,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -14557,10 +14557,10 @@
       "leaf": "dolphin-mistral-24b-venice-edition:free",
       "family": "cognitivecomputations",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -14639,8 +14639,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -14655,8 +14655,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -14671,8 +14671,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -14687,8 +14687,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.0375,
         "output_usd_per_mtok": 0.15,
@@ -14701,10 +14701,10 @@
       "leaf": "north-mini-code:free",
       "family": "cohere",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -15123,38 +15123,6 @@
       }
     },
     {
-      "id": "dashscope/qwen-flash",
-      "host": "dashscope",
-      "leaf": "qwen-flash",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "dashscope/qwen-flash-2025-07-28",
-      "host": "dashscope",
-      "leaf": "qwen-flash-2025-07-28",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "dashscope/qwen-max",
       "host": "dashscope",
       "leaf": "qwen-max",
@@ -15235,54 +15203,6 @@
       }
     },
     {
-      "id": "dashscope/qwen-plus-2025-07-28",
-      "host": "dashscope",
-      "leaf": "qwen-plus-2025-07-28",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "dashscope/qwen-plus-2025-09-11",
-      "host": "dashscope",
-      "leaf": "qwen-plus-2025-09-11",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "dashscope/qwen-plus-latest",
-      "host": "dashscope",
-      "leaf": "qwen-plus-latest",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "dashscope/qwen-turbo",
       "host": "dashscope",
       "leaf": "qwen-turbo",
@@ -15344,238 +15264,6 @@
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.19999999999999998,
         "source": "litellm"
-      }
-    },
-    {
-      "id": "dashscope/qwen3-30b-a3b",
-      "host": "dashscope",
-      "leaf": "qwen3-30b-a3b",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
-      }
-    },
-    {
-      "id": "dashscope/qwen3-coder-flash",
-      "host": "dashscope",
-      "leaf": "qwen3-coder-flash",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.65,
-      "w_swe": 0.65,
-      "capability": {
-        "swe_verified": {
-          "acc": 65.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.85,
-        "grind": 0.76
-      }
-    },
-    {
-      "id": "dashscope/qwen3-coder-flash-2025-07-28",
-      "host": "dashscope",
-      "leaf": "qwen3-coder-flash-2025-07-28",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.65,
-      "w_swe": 0.65,
-      "capability": {
-        "swe_verified": {
-          "acc": 65.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.85,
-        "grind": 0.76
-      }
-    },
-    {
-      "id": "dashscope/qwen3-coder-plus",
-      "host": "dashscope",
-      "leaf": "qwen3-coder-plus",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.69,
-      "w_swe": 0.69,
-      "capability": {
-        "swe_verified": {
-          "acc": 69.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.89,
-        "grind": 0.82
-      }
-    },
-    {
-      "id": "dashscope/qwen3-coder-plus-2025-07-22",
-      "host": "dashscope",
-      "leaf": "qwen3-coder-plus-2025-07-22",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.69,
-      "w_swe": 0.69,
-      "capability": {
-        "swe_verified": {
-          "acc": 69.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.89,
-        "grind": 0.82
-      }
-    },
-    {
-      "id": "dashscope/qwen3-max",
-      "host": "dashscope",
-      "leaf": "qwen3-max",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
-      }
-    },
-    {
-      "id": "dashscope/qwen3-max-2026-01-23",
-      "host": "dashscope",
-      "leaf": "qwen3-max-2026-01-23",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
-      }
-    },
-    {
-      "id": "dashscope/qwen3-max-preview",
-      "host": "dashscope",
-      "leaf": "qwen3-max-preview",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
       }
     },
     {
@@ -15750,65 +15438,6 @@
       "workflows": {
         "single_pass": 0.78,
         "grind": 0.66
-      }
-    },
-    {
-      "id": "dashscope/qwen3-vl-plus",
-      "host": "dashscope",
-      "leaf": "qwen3-vl-plus",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
-      }
-    },
-    {
-      "id": "dashscope/qwen3.5-plus",
-      "host": "dashscope",
-      "leaf": "qwen3.5-plus",
-      "family": "dashscope",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.712,
-      "w_swe": 0.856,
-      "capability": {
-        "swe_verified": {
-          "acc": 71.2,
-          "cost_per_test": 0.9636,
-          "latency_s": 496.2,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.88,
-        "grind": 0.8
       }
     },
     {
@@ -16446,8 +16075,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 1.25,
@@ -18371,8 +18000,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.24,
         "output_usd_per_mtok": 0.8999999999999999,
@@ -18400,8 +18029,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.21,
         "output_usd_per_mtok": 0.7899999999999999,
@@ -18487,8 +18116,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 2.1500000000000004,
@@ -18516,8 +18145,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7999999999999999,
         "output_usd_per_mtok": 0.7999999999999999,
@@ -18603,8 +18232,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.27,
         "output_usd_per_mtok": 0.95,
@@ -18677,8 +18306,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.27,
         "output_usd_per_mtok": 0.41,
@@ -19504,54 +19133,6 @@
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 6.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "eu.twelvelabs.pegasus-1-2-v1:0",
-      "host": "",
-      "leaf": "eu.twelvelabs.pegasus-1-2-v1:0",
-      "family": "eu.twelvelabs.pegasus-1-2-v1:0",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 7.5,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "featherless_ai/featherless-ai/Qwerky-72B",
-      "host": "featherless_ai",
-      "leaf": "featherless-ai/Qwerky-72B",
-      "family": "featherless_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "featherless_ai/featherless-ai/Qwerky-QwQ-32B",
-      "host": "featherless_ai",
-      "leaf": "featherless-ai/Qwerky-QwQ-32B",
-      "family": "featherless_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
         "source": "litellm"
       }
     },
@@ -27191,757 +26772,6 @@
       }
     },
     {
-      "id": "github_copilot/claude-haiku-4.5",
-      "host": "github_copilot",
-      "leaf": "claude-haiku-4.5",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.567,
-      "w_swe": 0.82,
-      "capability": {
-        "swe_verified": {
-          "acc": 66.6,
-          "cost_per_test": 0.3662,
-          "latency_s": 242.2,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 61.24,
-          "date": "2025-12-12",
-          "harness": "Warp",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.93
-      },
-      "arena_coding_elo": 1327.2,
-      "arena_webdev_elo": 1327.2,
-      "preference": {
-        "arena_webdev": {
-          "rank": 70,
-          "rating": 1327.2,
-          "source": "arena.ai",
-          "votes": 23650
-        }
-      }
-    },
-    {
-      "id": "github_copilot/claude-opus-4.5",
-      "host": "github_copilot",
-      "leaf": "claude-opus-4.5",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.685,
-      "w_swe": 0.849,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.4,
-          "cost_per_test": 1.0548,
-          "latency_s": 320.5,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 63.15,
-          "date": "2025-12-11",
-          "harness": "Droid",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.98,
-        "grind": 0.98
-      },
-      "arena_coding_elo": 1490.1,
-      "arena_webdev_elo": 1490.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 18,
-          "rating": 1490.1,
-          "source": "arena.ai",
-          "votes": 13060
-        }
-      }
-    },
-    {
-      "id": "github_copilot/claude-opus-4.6-fast",
-      "host": "github_copilot",
-      "leaf": "claude-opus-4.6-fast",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.706,
-      "w_swe": 0.887,
-      "capability": {
-        "swe_verified": {
-          "acc": 78.2,
-          "cost_per_test": 1.2165,
-          "latency_s": 350.8,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 76.4,
-          "date": "2026-05-14",
-          "harness": "Meta-Harness",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.98,
-        "grind": 0.98
-      },
-      "arena_coding_elo": 1541.8,
-      "arena_webdev_elo": 1541.8,
-      "preference": {
-        "arena_agent": {
-          "rank": 12,
-          "score": 0.0347,
-          "source": "arena.ai"
-        },
-        "arena_webdev": {
-          "rank": 7,
-          "rating": 1541.8,
-          "source": "arena.ai",
-          "votes": 11365
-        }
-      }
-    },
-    {
-      "id": "github_copilot/claude-opus-41",
-      "host": "github_copilot",
-      "leaf": "claude-opus-41",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.8,
-      "w_swe": 0.8,
-      "capability": {
-        "swe_verified": {
-          "acc": 80.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.98,
-        "grind": 0.98
-      }
-    },
-    {
-      "id": "github_copilot/claude-sonnet-4",
-      "host": "github_copilot",
-      "leaf": "claude-sonnet-4",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.613,
-      "w_swe": 0.806,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 61.3,
-          "date": "2025-05-24",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.96,
-        "grind": 0.96
-      }
-    },
-    {
-      "id": "github_copilot/claude-sonnet-4.5",
-      "host": "github_copilot",
-      "leaf": "claude-sonnet-4.5",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.554,
-      "w_swe": 0.791,
-      "capability": {
-        "swe_verified": {
-          "acc": 70.0,
-          "cost_per_test": 0.8072,
-          "latency_s": 360.6,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 46.52,
-          "date": "2025-12-24",
-          "harness": "CAMEL-AI",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.96,
-        "grind": 0.96
-      },
-      "arena_coding_elo": 1388.2,
-      "arena_webdev_elo": 1388.2,
-      "preference": {
-        "arena_webdev": {
-          "rank": 48,
-          "rating": 1388.2,
-          "source": "arena.ai",
-          "votes": 15749
-        }
-      }
-    },
-    {
-      "id": "github_copilot/gemini-2.5-pro",
-      "host": "github_copilot",
-      "leaf": "gemini-2.5-pro",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.363,
-      "arena_coding_elo": 1204.3,
-      "arena_webdev_elo": 1204.3,
-      "capability": {
-        "swe_verified": {
-          "acc": 54.4,
-          "cost_per_test": 0.3516,
-          "latency_s": 207.8,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 32.64,
-          "date": "2025-10-31",
-          "harness": "Terminus 2",
-          "source": "terminal-bench"
-        }
-      },
-      "preference": {
-        "arena_webdev": {
-          "rank": 86,
-          "rating": 1204.3,
-          "source": "arena.ai",
-          "votes": 3301
-        }
-      },
-      "w_swe": 0.718
-    },
-    {
-      "id": "github_copilot/gemini-3-pro-preview",
-      "host": "github_copilot",
-      "leaf": "gemini-3-pro-preview",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.683,
-      "arena_coding_elo": 1438.5,
-      "arena_webdev_elo": 1438.5,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.4,
-          "cost_per_test": 0.7715,
-          "latency_s": 394.5,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 69.43,
-          "date": "2026-01-06",
-          "harness": "Ante",
-          "source": "terminal-bench"
-        }
-      },
-      "preference": {
-        "arena_webdev": {
-          "rank": 31,
-          "rating": 1438.5,
-          "source": "arena.ai",
-          "votes": 17152
-        }
-      },
-      "w_swe": 0.865
-    },
-    {
-      "id": "github_copilot/gpt-3.5-turbo",
-      "host": "github_copilot",
-      "leaf": "gpt-3.5-turbo",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-3.5-turbo-0613",
-      "host": "github_copilot",
-      "leaf": "gpt-3.5-turbo-0613",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4",
-      "host": "github_copilot",
-      "leaf": "gpt-4",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4-0613",
-      "host": "github_copilot",
-      "leaf": "gpt-4-0613",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4-o-preview",
-      "host": "github_copilot",
-      "leaf": "gpt-4-o-preview",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4.1",
-      "host": "github_copilot",
-      "leaf": "gpt-4.1",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.524,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 52.4,
-          "date": "2025-04-14",
-          "source": "aider"
-        }
-      },
-      "w_swe": 0.762
-    },
-    {
-      "id": "github_copilot/gpt-4.1-2025-04-14",
-      "host": "github_copilot",
-      "leaf": "gpt-4.1-2025-04-14",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4o",
-      "host": "github_copilot",
-      "leaf": "gpt-4o",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4o-2024-05-13",
-      "host": "github_copilot",
-      "leaf": "gpt-4o-2024-05-13",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4o-2024-08-06",
-      "host": "github_copilot",
-      "leaf": "gpt-4o-2024-08-06",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.231,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 23.1,
-          "date": "2024-12-30",
-          "source": "aider"
-        }
-      },
-      "w_swe": 0.616
-    },
-    {
-      "id": "github_copilot/gpt-4o-2024-11-20",
-      "host": "github_copilot",
-      "leaf": "gpt-4o-2024-11-20",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.182,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 18.2,
-          "date": "2024-12-30",
-          "source": "aider"
-        }
-      },
-      "w_swe": 0.591
-    },
-    {
-      "id": "github_copilot/gpt-4o-mini",
-      "host": "github_copilot",
-      "leaf": "gpt-4o-mini",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "github_copilot/gpt-4o-mini-2024-07-18",
-      "host": "github_copilot",
-      "leaf": "gpt-4o-mini-2024-07-18",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.036,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 3.6,
-          "date": "2024-12-21",
-          "source": "aider"
-        }
-      },
-      "w_swe": 0.518
-    },
-    {
-      "id": "github_copilot/gpt-5",
-      "host": "github_copilot",
-      "leaf": "gpt-5",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.633,
-      "w_swe": 0.844,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        },
-        "terminal_bench": {
-          "acc": 49.61,
-          "date": "2025-11-04",
-          "harness": "Codex CLI",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1394.5,
-      "arena_webdev_elo": 1394.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 44,
-          "rating": 1394.5,
-          "source": "arena.ai",
-          "votes": 3756
-        }
-      }
-    },
-    {
-      "id": "github_copilot/gpt-5-mini",
-      "host": "github_copilot",
-      "leaf": "gpt-5-mini",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.633,
-      "w_swe": 0.844,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        },
-        "terminal_bench": {
-          "acc": 49.61,
-          "date": "2025-11-04",
-          "harness": "Codex CLI",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1394.5,
-      "arena_webdev_elo": 1394.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 44,
-          "rating": 1394.5,
-          "source": "arena.ai",
-          "votes": 3756
-        }
-      }
-    },
-    {
-      "id": "github_copilot/gpt-5.1",
-      "host": "github_copilot",
-      "leaf": "gpt-5.1",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.58,
-      "w_swe": 0.808,
-      "capability": {
-        "terminal_bench": {
-          "acc": 61.57,
-          "date": "2026-05-14",
-          "harness": "hookele",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1391.3,
-      "arena_webdev_elo": 1391.3,
-      "preference": {
-        "arena_webdev": {
-          "rank": 47,
-          "rating": 1391.3,
-          "source": "arena.ai",
-          "votes": 6117
-        }
-      }
-    },
-    {
-      "id": "github_copilot/gpt-5.2",
-      "host": "github_copilot",
-      "leaf": "gpt-5.2",
-      "family": "github_copilot",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.643,
-      "w_swe": 0.847,
-      "capability": {
-        "swe_verified": {
-          "acc": 72.4,
-          "cost_per_test": 0.3115,
-          "latency_s": 188.4,
-          "source": "vals.ai"
-        },
-        "terminal_bench": {
-          "acc": 66.52,
-          "date": "2026-02-12",
-          "harness": "Deep Agents",
-          "source": "terminal-bench"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1405.0,
-      "arena_webdev_elo": 1405.0,
-      "preference": {
-        "arena_webdev": {
-          "rank": 40,
-          "rating": 1405.0,
-          "source": "arena.ai",
-          "votes": 1457
-        }
-      }
-    },
-    {
       "id": "github_copilot/mai-code-1-flash",
       "host": "github_copilot",
       "leaf": "mai-code-1-flash",
@@ -29042,8 +27872,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 2.5,
@@ -29068,8 +27898,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 2.5,
@@ -29084,8 +27914,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -29100,8 +27930,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -29116,8 +27946,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -29158,8 +27988,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -29200,8 +28030,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -29225,8 +28055,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 3.0,
@@ -29276,8 +28106,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 12.0,
@@ -29292,8 +28122,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 12.0,
@@ -29308,8 +28138,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 3.0,
@@ -29324,8 +28154,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 3.0,
@@ -29340,8 +28170,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 1.5,
@@ -29376,8 +28206,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 1.5,
@@ -29392,8 +28222,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 1.5,
@@ -29428,8 +28258,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 12.0,
@@ -29479,8 +28309,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 12.0,
@@ -29495,8 +28325,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.5,
         "output_usd_per_mtok": 9.0,
@@ -29536,8 +28366,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.65,
         "output_usd_per_mtok": 0.65,
@@ -29552,8 +28382,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.15,
@@ -29568,8 +28398,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.08,
         "output_usd_per_mtok": 0.16,
@@ -29593,8 +28423,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -29609,8 +28439,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.12,
@@ -29625,8 +28455,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.33,
@@ -29653,8 +28483,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "listed $0 in public feed but vendor is paid-only \u2014 not auto-routed",
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -29669,8 +28499,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.12,
         "output_usd_per_mtok": 0.35,
@@ -29702,8 +28532,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "listed $0 in public feed but vendor is paid-only \u2014 not auto-routed",
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -29718,8 +28548,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "listed $0 in public feed but vendor is paid-only \u2014 not auto-routed",
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -29734,8 +28564,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "listed $0 in public feed but vendor is paid-only \u2014 not auto-routed",
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -31541,35 +30371,6 @@
       }
     },
     {
-      "id": "gradient_ai/alibaba-qwen3-32b",
-      "host": "gradient_ai",
-      "leaf": "alibaba-qwen3-32b",
-      "family": "gradient_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.6,
-      "w_swe": 0.6,
-      "capability": {
-        "swe_verified": {
-          "acc": 60.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.78,
-        "grind": 0.66
-      }
-    },
-    {
       "id": "gradient_ai/anthropic-claude-3-opus",
       "host": "gradient_ai",
       "leaf": "anthropic-claude-3-opus",
@@ -31759,38 +30560,6 @@
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 0.3,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "gradient_ai/openai-gpt-4o",
-      "host": "gradient_ai",
-      "leaf": "openai-gpt-4o",
-      "family": "gradient_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "gradient_ai/openai-gpt-4o-mini",
-      "host": "gradient_ai",
-      "leaf": "openai-gpt-4o-mini",
-      "family": "gradient_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
         "source": "litellm"
       }
     },
@@ -32136,128 +30905,12 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.06,
         "source": "openrouter"
-      }
-    },
-    {
-      "id": "heroku/claude-3-5-haiku",
-      "host": "heroku",
-      "leaf": "claude-3-5-haiku",
-      "family": "heroku",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.28,
-      "w_swe": 0.64,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 28.0,
-          "date": "2024-12-21",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.93
-      }
-    },
-    {
-      "id": "heroku/claude-3-5-sonnet-latest",
-      "host": "heroku",
-      "leaf": "claude-3-5-sonnet-latest",
-      "family": "heroku",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.516,
-      "w_swe": 0.758,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 51.6,
-          "date": "2025-01-17",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.93
-      }
-    },
-    {
-      "id": "heroku/claude-3-7-sonnet",
-      "host": "heroku",
-      "leaf": "claude-3-7-sonnet",
-      "family": "heroku",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.649,
-      "w_swe": 0.825,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 64.9,
-          "date": "2025-02-24",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.93
-      }
-    },
-    {
-      "id": "heroku/claude-4-sonnet",
-      "host": "heroku",
-      "leaf": "claude-4-sonnet",
-      "family": "heroku",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.74,
-      "w_swe": 0.74,
-      "capability": {
-        "swe_verified": {
-          "acc": 74.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.93
       }
     },
     {
@@ -32642,8 +31295,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.017,
         "output_usd_per_mtok": 0.112,
@@ -32658,8 +31311,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -32714,8 +31367,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.075,
         "output_usd_per_mtok": 0.625,
@@ -32730,8 +31383,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.01,
         "output_usd_per_mtok": 0.03,
@@ -32746,8 +31399,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.075,
         "output_usd_per_mtok": 0.625,
@@ -32762,8 +31415,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -32778,8 +31431,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -33134,8 +31787,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.2,
@@ -34058,8 +32711,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.03,
         "output_usd_per_mtok": 0.12,
@@ -34072,10 +32725,10 @@
       "leaf": "lfm-2.5-1.2b-instruct:free",
       "family": "liquid",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -34088,10 +32741,10 @@
       "leaf": "lfm-2.5-1.2b-thinking:free",
       "family": "liquid",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -34395,44 +33048,12 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.75,
         "output_usd_per_mtok": 1.0,
         "source": "openrouter"
-      }
-    },
-    {
-      "id": "medlm-large",
-      "host": "",
-      "leaf": "medlm-large",
-      "family": "medlm-large",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "medlm-medium",
-      "host": "",
-      "leaf": "medlm-medium",
-      "family": "medlm-medium",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
       }
     },
     {
@@ -34443,8 +33064,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.14,
         "output_usd_per_mtok": 0.14,
@@ -34459,8 +33080,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -34475,8 +33096,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.02,
         "output_usd_per_mtok": 0.03,
@@ -34491,8 +33112,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.345,
         "output_usd_per_mtok": 0.345,
@@ -34507,8 +33128,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.027,
         "output_usd_per_mtok": 0.201,
@@ -34523,8 +33144,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.0509,
         "output_usd_per_mtok": 0.335,
@@ -34537,10 +33158,10 @@
       "leaf": "llama-3.2-3b-instruct:free",
       "family": "meta-llama",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -34555,8 +33176,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.32,
@@ -34569,10 +33190,10 @@
       "leaf": "llama-3.3-70b-instruct:free",
       "family": "meta-llama",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -34587,8 +33208,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -34616,8 +33237,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.3,
@@ -34645,8 +33266,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.18,
         "output_usd_per_mtok": 0.18,
@@ -34878,96 +33499,6 @@
       }
     },
     {
-      "id": "meta_llama/Llama-3.3-70B-Instruct",
-      "host": "meta_llama",
-      "leaf": "Llama-3.3-70B-Instruct",
-      "family": "meta_llama",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "meta_llama/Llama-3.3-8B-Instruct",
-      "host": "meta_llama",
-      "leaf": "Llama-3.3-8B-Instruct",
-      "family": "meta_llama",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "meta_llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-      "host": "meta_llama",
-      "leaf": "Llama-4-Maverick-17B-128E-Instruct-FP8",
-      "family": "meta_llama",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.48,
-      "w_swe": 0.48,
-      "capability": {
-        "swe_verified": {
-          "acc": 48.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.62,
-        "grind": 0.4
-      }
-    },
-    {
-      "id": "meta_llama/Llama-4-Scout-17B-16E-Instruct-FP8",
-      "host": "meta_llama",
-      "leaf": "Llama-4-Scout-17B-16E-Instruct-FP8",
-      "family": "meta_llama",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.48,
-      "w_swe": 0.48,
-      "capability": {
-        "swe_verified": {
-          "acc": 48.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.62,
-        "grind": 0.4
-      }
-    },
-    {
       "id": "microsoft/phi-4",
       "host": "microsoft",
       "leaf": "phi-4",
@@ -34975,8 +33506,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.07,
         "output_usd_per_mtok": 0.14,
@@ -34991,8 +33522,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.62,
         "output_usd_per_mtok": 0.62,
@@ -35382,8 +33913,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 1.1,
@@ -35411,8 +33942,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 2.2,
@@ -35440,8 +33971,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.255,
         "output_usd_per_mtok": 1.02,
@@ -35480,8 +34011,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.2,
@@ -35509,8 +34040,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.2,
@@ -35555,8 +34086,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.12,
         "output_usd_per_mtok": 0.48,
@@ -35605,8 +34136,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.18,
         "output_usd_per_mtok": 0.72,
@@ -35656,8 +34187,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.2,
@@ -37022,8 +35553,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 0.8999999999999999,
@@ -37051,8 +35582,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 2.0,
@@ -37087,8 +35618,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -37103,8 +35634,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -37119,8 +35650,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.15,
@@ -37135,8 +35666,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 6.0,
@@ -37165,8 +35696,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 6.0,
@@ -37195,8 +35726,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 1.5,
@@ -37225,8 +35756,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 2.0,
@@ -37241,8 +35772,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.5,
         "output_usd_per_mtok": 7.5,
@@ -37277,8 +35808,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 2.0,
@@ -37293,8 +35824,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.02,
         "output_usd_per_mtok": 0.03,
@@ -37309,8 +35840,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 0.6,
@@ -37325,8 +35856,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.08,
@@ -37341,8 +35872,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -37357,8 +35888,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.351,
         "output_usd_per_mtok": 0.5549999999999999,
@@ -37373,8 +35904,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.075,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -37389,8 +35920,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 6.0,
@@ -37405,8 +35936,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.3,
@@ -38177,8 +36708,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5700000000000001,
         "output_usd_per_mtok": 2.3,
@@ -38228,8 +36759,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 2.5,
@@ -38279,8 +36810,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 2.5,
@@ -38330,8 +36861,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.375,
         "output_usd_per_mtok": 2.025,
@@ -38380,8 +36911,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.66,
         "output_usd_per_mtok": 3.41,
@@ -38425,8 +36956,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.74,
         "output_usd_per_mtok": 3.5,
@@ -39108,8 +37639,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 1.0,
@@ -39124,8 +37655,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 1.0,
@@ -39138,10 +37669,10 @@
       "leaf": "hermes-3-llama-3.1-405b:free",
       "family": "nousresearch",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -39156,8 +37687,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7,
         "output_usd_per_mtok": 0.7,
@@ -39172,8 +37703,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 3.0,
@@ -39188,8 +37719,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.13,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -41781,8 +40312,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -41810,8 +40341,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -41837,10 +40368,10 @@
       "leaf": "nemotron-3-nano-30b-a3b:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -41866,10 +40397,10 @@
       "leaf": "nemotron-3-nano-omni-30b-a3b-reasoning:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -41897,8 +40428,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.08,
         "output_usd_per_mtok": 0.44999999999999996,
@@ -41924,10 +40455,10 @@
       "leaf": "nemotron-3-super-120b-a12b:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -41955,8 +40486,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 2.2,
@@ -41982,10 +40513,10 @@
       "leaf": "nemotron-3-ultra-550b-a55b:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -42011,10 +40542,10 @@
       "leaf": "nemotron-3.5-content-safety:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -42040,10 +40571,10 @@
       "leaf": "nemotron-nano-12b-v2-vl:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -42069,10 +40600,10 @@
       "leaf": "nemotron-nano-9b-v2:free",
       "family": "nvidia",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -43687,8 +42218,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 1.5,
@@ -43703,8 +42234,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 2.0,
@@ -43719,8 +42250,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 4.0,
@@ -43735,8 +42266,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.5,
         "output_usd_per_mtok": 2.0,
@@ -43751,8 +42282,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 30.0,
         "output_usd_per_mtok": 60.0,
@@ -43767,8 +42298,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 30.0,
@@ -43783,8 +42314,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 30.0,
@@ -43799,8 +42330,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 8.0,
@@ -43824,8 +42355,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 1.5999999999999999,
@@ -43849,8 +42380,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -43874,8 +42405,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -43890,8 +42421,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 15.0,
@@ -43906,8 +42437,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -43931,8 +42462,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -43956,8 +42487,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -43972,8 +42503,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -43997,8 +42528,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -44013,8 +42544,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -44029,8 +42560,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44074,8 +42605,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44119,8 +42650,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44164,8 +42695,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 10.0,
@@ -44193,8 +42724,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 2.0,
@@ -44222,8 +42753,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 2.0,
@@ -44267,8 +42798,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -44297,8 +42828,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 15.0,
         "output_usd_per_mtok": 120.0,
@@ -44342,8 +42873,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44382,8 +42913,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44422,8 +42953,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44462,8 +42993,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 10.0,
@@ -44502,8 +43033,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 2.0,
@@ -44542,8 +43073,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.75,
         "output_usd_per_mtok": 14.0,
@@ -44588,8 +43119,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.75,
         "output_usd_per_mtok": 14.0,
@@ -44634,8 +43165,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.75,
         "output_usd_per_mtok": 14.0,
@@ -44680,8 +43211,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 21.0,
         "output_usd_per_mtok": 168.0,
@@ -44726,8 +43257,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.75,
         "output_usd_per_mtok": 14.0,
@@ -44776,8 +43307,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.75,
         "output_usd_per_mtok": 14.0,
@@ -44826,8 +43357,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 15.0,
@@ -44869,8 +43400,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 8.0,
         "output_usd_per_mtok": 15.0,
@@ -44898,8 +43429,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.75,
         "output_usd_per_mtok": 4.5,
@@ -44941,8 +43472,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 1.25,
@@ -44970,8 +43501,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 30.0,
         "output_usd_per_mtok": 180.0,
@@ -45013,8 +43544,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 30.0,
@@ -45068,8 +43599,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 30.0,
         "output_usd_per_mtok": 180.0,
@@ -45123,8 +43654,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.5,
         "output_usd_per_mtok": 10.0,
@@ -45139,8 +43670,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 2.4,
@@ -45155,8 +43686,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 30.0,
@@ -45171,8 +43702,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.03,
         "output_usd_per_mtok": 0.15,
@@ -45210,10 +43741,10 @@
       "leaf": "gpt-oss-120b:free",
       "family": "openai",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -45241,8 +43772,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.029,
         "output_usd_per_mtok": 0.14,
@@ -45269,10 +43800,10 @@
       "leaf": "gpt-oss-20b:free",
       "family": "openai",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -45300,8 +43831,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.075,
         "output_usd_per_mtok": 0.3,
@@ -45329,8 +43860,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 15.0,
         "output_usd_per_mtok": 60.0,
@@ -45345,8 +43876,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 150.0,
         "output_usd_per_mtok": 600.0,
@@ -45361,8 +43892,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 8.0,
@@ -45386,8 +43917,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 40.0,
@@ -45402,8 +43933,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 4.4,
@@ -45427,8 +43958,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 4.4,
@@ -45452,8 +43983,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 20.0,
         "output_usd_per_mtok": 80.0,
@@ -45477,8 +44008,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 4.4,
@@ -45502,8 +44033,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 8.0,
@@ -45518,8 +44049,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 4.4,
@@ -46019,8 +44550,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": -1000000.0,
         "output_usd_per_mtok": -1000000.0,
@@ -46035,8 +44566,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": -1000000.0,
         "output_usd_per_mtok": -1000000.0,
@@ -46300,10 +44831,10 @@
       "leaf": "free",
       "family": "openrouter",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -46318,8 +44849,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": -1000000.0,
         "output_usd_per_mtok": -1000000.0,
@@ -47850,8 +46381,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": -1000000.0,
         "output_usd_per_mtok": -1000000.0,
@@ -49038,8 +47569,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 1.5,
@@ -49310,8 +47841,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 15.0,
@@ -49594,8 +48125,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -49628,10 +48159,10 @@
       "leaf": "laguna-m.1:free",
       "family": "poolside",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -49646,8 +48177,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.12,
@@ -49660,10 +48191,10 @@
       "leaf": "laguna-xs-2.1:free",
       "family": "poolside",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -49678,8 +48209,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -49712,10 +48243,10 @@
       "leaf": "laguna-xs.2:free",
       "family": "poolside",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -50077,8 +48608,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.36,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -50093,8 +48624,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.04,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -50109,8 +48640,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.66,
         "output_usd_per_mtok": 1.0,
@@ -50125,8 +48656,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 0.78,
@@ -50141,8 +48672,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 0.78,
@@ -50157,8 +48688,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 0.78,
@@ -50173,8 +48704,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.7999999999999999,
         "output_usd_per_mtok": 1.0,
@@ -50189,8 +48720,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.24,
@@ -50218,8 +48749,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.45499999999999996,
         "output_usd_per_mtok": 1.8199999999999998,
@@ -50247,8 +48778,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -50276,8 +48807,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.14950000000000002,
         "output_usd_per_mtok": 1.495,
@@ -50305,8 +48836,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.12,
         "output_usd_per_mtok": 0.5,
@@ -50334,8 +48865,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.04815,
         "output_usd_per_mtok": 0.19305,
@@ -50363,8 +48894,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.13,
         "output_usd_per_mtok": 1.56,
@@ -50392,8 +48923,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.08,
         "output_usd_per_mtok": 0.28,
@@ -50421,8 +48952,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.117,
         "output_usd_per_mtok": 0.45499999999999996,
@@ -50450,8 +48981,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.22,
         "output_usd_per_mtok": 1.7999999999999998,
@@ -50479,8 +49010,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.07,
         "output_usd_per_mtok": 0.27,
@@ -50508,8 +49039,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.195,
         "output_usd_per_mtok": 0.975,
@@ -50537,8 +49068,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.11,
         "output_usd_per_mtok": 0.7999999999999999,
@@ -50566,8 +49097,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.65,
         "output_usd_per_mtok": 3.25,
@@ -50593,10 +49124,10 @@
       "leaf": "qwen3-coder:free",
       "family": "qwen",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -50624,8 +49155,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.78,
         "output_usd_per_mtok": 3.9,
@@ -50653,8 +49184,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.78,
         "output_usd_per_mtok": 3.9,
@@ -50682,8 +49213,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09,
         "output_usd_per_mtok": 1.1,
@@ -50709,10 +49240,10 @@
       "leaf": "qwen3-next-80b-a3b-instruct:free",
       "family": "qwen",
       "kind": "chat",
-      "route_candidate": false,
-      "free": false,
+      "route_candidate": true,
+      "free": true,
       "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "gated_reason": null,
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
@@ -50740,8 +49271,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.0975,
         "output_usd_per_mtok": 0.78,
@@ -50769,8 +49300,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 0.88,
@@ -50798,8 +49329,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 2.6,
@@ -50827,8 +49358,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.13,
         "output_usd_per_mtok": 0.52,
@@ -50856,8 +49387,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.13,
         "output_usd_per_mtok": 1.56,
@@ -50885,8 +49416,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.10400000000000001,
         "output_usd_per_mtok": 0.41600000000000004,
@@ -50914,8 +49445,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.117,
         "output_usd_per_mtok": 0.45499999999999996,
@@ -50943,8 +49474,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.117,
         "output_usd_per_mtok": 1.365,
@@ -50972,8 +49503,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 2.08,
@@ -51011,8 +49542,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.195,
         "output_usd_per_mtok": 1.56,
@@ -51050,8 +49581,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.14,
         "output_usd_per_mtok": 1.0,
@@ -51089,8 +49620,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.385,
         "output_usd_per_mtok": 2.4499999999999997,
@@ -51128,8 +49659,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.15,
@@ -51158,8 +49689,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.065,
         "output_usd_per_mtok": 0.26,
@@ -51187,8 +49718,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.26,
         "output_usd_per_mtok": 1.56,
@@ -51216,8 +49747,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.7999999999999998,
@@ -51246,8 +49777,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.28500000000000003,
         "output_usd_per_mtok": 2.4,
@@ -51276,8 +49807,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.14,
         "output_usd_per_mtok": 1.0,
@@ -51306,8 +49837,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.1875,
         "output_usd_per_mtok": 1.125,
@@ -51335,8 +49866,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.04,
         "output_usd_per_mtok": 6.24,
@@ -51375,8 +49906,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.325,
         "output_usd_per_mtok": 1.95,
@@ -51415,8 +49946,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 3.75,
@@ -51455,8 +49986,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.32,
         "output_usd_per_mtok": 1.28,
@@ -51484,8 +50015,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.09999999999999999,
@@ -51500,8 +50031,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.19999999999999998,
@@ -51516,8 +50047,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.85,
         "output_usd_per_mtok": 1.25,
@@ -51532,8 +50063,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 3.0,
@@ -52575,8 +51106,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 30.0,
@@ -53101,8 +51632,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.04,
         "output_usd_per_mtok": 0.049999999999999996,
@@ -53117,8 +51648,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 3.0,
         "output_usd_per_mtok": 3.0,
@@ -53133,8 +51664,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.85,
         "output_usd_per_mtok": 0.85,
@@ -53149,8 +51680,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.65,
         "output_usd_per_mtok": 0.75,
@@ -53795,118 +52326,6 @@
       }
     },
     {
-      "id": "snowflake/gemma-7b",
-      "host": "snowflake",
-      "leaf": "gemma-7b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/jamba-1.5-large",
-      "host": "snowflake",
-      "leaf": "jamba-1.5-large",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/jamba-1.5-mini",
-      "host": "snowflake",
-      "leaf": "jamba-1.5-mini",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/jamba-instruct",
-      "host": "snowflake",
-      "leaf": "jamba-instruct",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/llama2-70b-chat",
-      "host": "snowflake",
-      "leaf": "llama2-70b-chat",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/llama3-70b",
-      "host": "snowflake",
-      "leaf": "llama3-70b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/llama3-8b",
-      "host": "snowflake",
-      "leaf": "llama3-8b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "snowflake/llama3.1-405b",
       "host": "snowflake",
       "leaf": "llama3.1-405b",
@@ -53955,38 +52374,6 @@
       }
     },
     {
-      "id": "snowflake/llama3.2-1b",
-      "host": "snowflake",
-      "leaf": "llama3.2-1b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/llama3.2-3b",
-      "host": "snowflake",
-      "leaf": "llama3.2-3b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "snowflake/llama3.3-70b",
       "host": "snowflake",
       "leaf": "llama3.3-70b",
@@ -54019,52 +52406,6 @@
       }
     },
     {
-      "id": "snowflake/mistral-7b",
-      "host": "snowflake",
-      "leaf": "mistral-7b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/mistral-large",
-      "host": "snowflake",
-      "leaf": "mistral-large",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.414,
-      "w_swe": 0.707,
-      "capability": {
-        "swe_verified": {
-          "acc": 41.4,
-          "cost_per_test": 0.3217,
-          "latency_s": 187.0,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.66,
-        "grind": 0.48
-      }
-    },
-    {
       "id": "snowflake/mistral-large2",
       "host": "snowflake",
       "leaf": "mistral-large2",
@@ -54091,22 +52432,6 @@
       "workflows": {
         "single_pass": 0.66,
         "grind": 0.48
-      }
-    },
-    {
-      "id": "snowflake/mixtral-8x7b",
-      "host": "snowflake",
-      "leaf": "mixtral-8x7b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
       }
     },
     {
@@ -54213,70 +52538,6 @@
       }
     },
     {
-      "id": "snowflake/reka-core",
-      "host": "snowflake",
-      "leaf": "reka-core",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/reka-flash",
-      "host": "snowflake",
-      "leaf": "reka-flash",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/snowflake-arctic",
-      "host": "snowflake",
-      "leaf": "snowflake-arctic",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "snowflake/snowflake-llama-3.1-405b",
-      "host": "snowflake",
-      "leaf": "snowflake-llama-3.1-405b",
-      "family": "snowflake",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "snowflake/snowflake-llama-3.3-70b",
       "host": "snowflake",
       "leaf": "snowflake-llama-3.3-70b",
@@ -54300,8 +52561,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.3,
@@ -54316,8 +52577,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.19999999999999998,
         "output_usd_per_mtok": 1.15,
@@ -54332,8 +52593,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.85,
         "output_usd_per_mtok": 3.4,
@@ -54433,8 +52694,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.14,
         "output_usd_per_mtok": 0.5700000000000001,
@@ -54449,8 +52710,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.063,
         "output_usd_per_mtok": 0.21,
@@ -54838,8 +53099,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 0.5,
@@ -54854,8 +53115,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.25,
         "output_usd_per_mtok": 0.5,
@@ -54870,8 +53131,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.55,
         "output_usd_per_mtok": 0.7999999999999999,
@@ -54886,8 +53147,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -54987,38 +53248,6 @@
       "economics": {
         "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 0.09999999999999999,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "together_ai/Qwen/Qwen2.5-72B-Instruct-Turbo",
-      "host": "together_ai",
-      "leaf": "Qwen/Qwen2.5-72B-Instruct-Turbo",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "together_ai/Qwen/Qwen2.5-7B-Instruct-Turbo",
-      "host": "together_ai",
-      "leaf": "Qwen/Qwen2.5-7B-Instruct-Turbo",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
         "source": "litellm"
       }
     },
@@ -55363,22 +53592,6 @@
       }
     },
     {
-      "id": "together_ai/meta-llama/Llama-3.2-3B-Instruct-Turbo",
-      "host": "together_ai",
-      "leaf": "meta-llama/Llama-3.2-3B-Instruct-Turbo",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo",
       "host": "together_ai",
       "leaf": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -55513,38 +53726,6 @@
       "economics": {
         "input_usd_per_mtok": 0.18,
         "output_usd_per_mtok": 0.18,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "together_ai/mistralai/Mistral-7B-Instruct-v0.1",
-      "host": "together_ai",
-      "leaf": "mistralai/Mistral-7B-Instruct-v0.1",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "together_ai/mistralai/Mistral-Small-24B-Instruct-2501",
-      "host": "together_ai",
-      "leaf": "mistralai/Mistral-Small-24B-Instruct-2501",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
         "source": "litellm"
       }
     },
@@ -55788,22 +53969,6 @@
       }
     },
     {
-      "id": "together_ai/togethercomputer/CodeLlama-34b-Instruct",
-      "host": "together_ai",
-      "leaf": "togethercomputer/CodeLlama-34b-Instruct",
-      "family": "together_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "together_ai/zai-org/GLM-4.5-Air-FP8",
       "host": "together_ai",
       "leaf": "zai-org/GLM-4.5-Air-FP8",
@@ -55918,22 +54083,6 @@
       }
     },
     {
-      "id": "twelvelabs.pegasus-1-2-v1:0",
-      "host": "",
-      "leaf": "twelvelabs.pegasus-1-2-v1:0",
-      "family": "twelvelabs.pegasus-1-2-v1:0",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 7.5,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "undi95/remm-slerp-l2-13b",
       "host": "undi95",
       "leaf": "remm-slerp-l2-13b",
@@ -55941,8 +54090,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.44999999999999996,
         "output_usd_per_mtok": 0.65,
@@ -55957,8 +54106,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.15,
         "output_usd_per_mtok": 0.6,
@@ -56872,22 +55021,6 @@
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 6.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "us.twelvelabs.pegasus-1-2-v1:0",
-      "host": "",
-      "leaf": "us.twelvelabs.pegasus-1-2-v1:0",
-      "family": "us.twelvelabs.pegasus-1-2-v1:0",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 7.5,
         "source": "litellm"
       }
     },
@@ -62000,70 +60133,6 @@
       }
     },
     {
-      "id": "volcengine/doubao-seed-2-0-code-preview-260215",
-      "host": "volcengine",
-      "leaf": "doubao-seed-2-0-code-preview-260215",
-      "family": "volcengine",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "volcengine/doubao-seed-2-0-lite-260215",
-      "host": "volcengine",
-      "leaf": "doubao-seed-2-0-lite-260215",
-      "family": "volcengine",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "volcengine/doubao-seed-2-0-mini-260215",
-      "host": "volcengine",
-      "leaf": "doubao-seed-2-0-mini-260215",
-      "family": "volcengine",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
-      "id": "volcengine/doubao-seed-2-0-pro-260215",
-      "host": "volcengine",
-      "leaf": "doubao-seed-2-0-pro-260215",
-      "family": "volcengine",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "wandb/MiniMaxAI/MiniMax-M2.5",
       "host": "wandb",
       "leaf": "MiniMaxAI/MiniMax-M2.5",
@@ -63116,8 +61185,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 6.0,
@@ -63132,8 +61201,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 2.5,
@@ -63161,8 +61230,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 2.5,
@@ -63190,8 +61259,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.25,
         "output_usd_per_mtok": 2.5,
@@ -63235,8 +61304,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 2.0,
@@ -64523,8 +62592,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.105,
         "output_usd_per_mtok": 0.28,
@@ -64559,8 +62628,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.435,
         "output_usd_per_mtok": 0.87,
@@ -64595,8 +62664,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 2.2,
@@ -64624,8 +62693,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.13,
         "output_usd_per_mtok": 0.85,
@@ -64653,8 +62722,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 1.7999999999999998,
@@ -64682,8 +62751,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.43,
         "output_usd_per_mtok": 1.74,
@@ -64721,8 +62790,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 0.8999999999999999,
@@ -64750,8 +62819,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.39999999999999997,
         "output_usd_per_mtok": 1.75,
@@ -64796,8 +62865,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.06,
         "output_usd_per_mtok": 0.39999999999999997,
@@ -64825,8 +62894,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.6,
         "output_usd_per_mtok": 1.92,
@@ -64875,8 +62944,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.2,
         "output_usd_per_mtok": 4.0,
@@ -64925,8 +62994,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.966,
         "output_usd_per_mtok": 3.036,
@@ -64970,8 +63039,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.5740000000000001,
         "output_usd_per_mtok": 1.804,
@@ -65019,8 +63088,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.2,
         "output_usd_per_mtok": 4.0,
@@ -65614,8 +63683,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 10.0,
         "output_usd_per_mtok": 50.0,
@@ -65643,8 +63712,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 5.0,
@@ -65672,8 +63741,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 25.0,
@@ -65701,8 +63770,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 10.0,
@@ -65730,8 +63799,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 1.5,
         "output_usd_per_mtok": 9.0,
@@ -65746,8 +63815,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 2.0,
         "output_usd_per_mtok": 12.0,
@@ -65771,8 +63840,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.66,
         "output_usd_per_mtok": 3.41,
@@ -65800,8 +63869,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 5.0,
         "output_usd_per_mtok": 30.0,
@@ -65816,8 +63885,8 @@
       "kind": "chat",
       "route_candidate": false,
       "free": false,
-      "paid": false,
-      "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.75,
         "output_usd_per_mtok": 4.5,
