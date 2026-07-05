@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-07-04",
+  "generated": "2026-07-05",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -10920,8 +10920,8 @@
       "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.9086,
-      "output_usd_per_mtok": 2.8556
+      "input_usd_per_mtok": 0.7546,
+      "output_usd_per_mtok": 2.3716
     },
     "z-ai/glm-5v-turbo": {
       "input_usd_per_mtok": 1.2,
