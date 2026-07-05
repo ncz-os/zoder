@@ -20,7 +20,8 @@ set -eu
 #     | ZODER_BIN_DIR="$HOME/.local/bin" sh
 #
 # Knobs (env or flags):
-#   ZODER_CHANNEL   / --channel <name>  nightly channel          (default: master)
+#   ZODER_CHANNEL   / --channel <name>  master (rolling) or a YYYY-MM-DD date to
+#                                       pin a specific nightly    (default: master)
 #   ZODER_BIN_DIR   / --bin-dir <dir>   install dir              (default: $HOME/.local/bin)
 #   ZODER_REPO      / --repo <o/r>      owner/repo (GitLab path) (default: ncz-os/zoder)
 #   ZODER_HOST      / --host <host>     GitLab host              (default: gitlab.com)
@@ -75,7 +76,8 @@ $(bold "zoder installer") — latest nightly master build (from GitLab)
 Usage: install.sh [options]
 
 Options:
-  --channel <name>  Nightly channel (default: master)
+  --channel <name>  Nightly channel: master (rolling) or a YYYY-MM-DD date
+                    to pin a specific build (default: master)
   --bin-dir <dir>   Install directory (default: \$HOME/.local/bin)
   --repo <owner/r>  Source repository, GitLab path (default: ncz-os/zoder)
   --host <host>     GitLab host (default: gitlab.com)
