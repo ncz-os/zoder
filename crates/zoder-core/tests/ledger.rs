@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
-use zoder_core::{Entry, Ledger, Period};
+use zoder_core::{Entry, FinOpsTags, Ledger, Period};
 
 fn ts(s: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
@@ -21,6 +21,7 @@ fn entry(t: &str, model: &str, cost: f64, tin: u64, tout: u64) -> Entry {
         cost_usd: cost,
         calls: 1,
         violation: None,
+        tags: FinOpsTags::default(),
     }
 }
 

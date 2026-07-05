@@ -2504,17 +2504,26 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // Pre-call budget guard: project this call's cost from the prompt size and
     // the configured output estimate, then gate against the per-call and
-    // month-to-date caps. A $0 (free-model) estimate is never gated;
-    // `--allow-paid` bypasses, matching the paid-model confirmation above.
+    // month-to-date caps. A `Free` (explicit-zero) or `Unknown` (missing
+    // catalog entry) estimate is never gated on its own; the gate's
+    // failure mode is `Confirm` (user decides). `--allow-paid` bypasses,
+    // matching the paid-model confirmation above.
+    //
+    // The ledger read is intentionally fail-closed: any error reading
+    // month-to-date spend is treated as "could not read spend, ask the
+    // user" rather than silently reporting $0 — Finding #10.
     if !cli.allow_paid {
         let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-        let est_usd = pricing.cost(
+        let now = chrono::Utc::now();
+        let verdict = eng.cfg.budget.evaluate_call(
+            &pricing,
             &primary,
             estimate_tokens(&prompt),
             eng.cfg.budget.est_output_tokens,
+            Some(now),
+            || Ledger::new(&eng.cfg.ledger_path).month_to_date_usd(),
         );
-        let month_spent = Ledger::new(&eng.cfg.ledger_path).month_to_date_usd();
-        if let BudgetVerdict::Confirm(msg) = eng.cfg.budget.evaluate(est_usd, month_spent) {
+        if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
                 anyhow::bail!("call declined: over budget");
             }
@@ -2691,15 +2700,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     // Cost: trust live telemetry first; otherwise price from the provider-derived
-    // catalog (free-tier models resolve to $0 chargeback, paid models to their rate).
+    // catalog (free-tier models resolve to $0 chargeback, paid models to their
+    // rate). `cost_at` is time-of-day aware so a DeepSeek call at 20:00 UTC
+    // uses the configured off-peak rate, not peak — Finding #23.
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let ts_utc = chrono::Utc::now();
     let cost = res
         .telemetry
         .cost_usd
-        .unwrap_or_else(|| pricing.cost(&used_model, tokens_in, tokens_out));
+        .unwrap_or_else(|| pricing.cost_at(&used_model, tokens_in, tokens_out, Some(ts_utc)));
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     ledger.record(&Entry {
-        ts_utc: chrono::Utc::now(),
+        ts_utc,
         provider: used_provider_id.clone(),
         model: used_model.clone(),
         host: zoder_core::ledger::host_of_model(&used_model),
@@ -2708,6 +2720,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         cost_usd: cost,
         calls: 1,
         violation: verify.as_ref().err().cloned(),
+        tags: zoder_core::ledger::FinOpsTags::default(),
     })?;
     save_health(&health);
 
@@ -3169,6 +3182,7 @@ pub(crate) async fn agentic_turn(
         cost_usd: cost,
         calls: 1,
         violation,
+        tags: zoder_core::ledger::FinOpsTags::default(),
     }) {
         eprintln!("zoder: warning: failed to record ledger entry: {e}");
     }
@@ -5503,11 +5517,16 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     let ledger = Ledger::new(&cfg.ledger_path);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let since = chrono::Utc::now() - chrono::Duration::days(days.max(1));
+    // Re-price each ledger entry off its recorded timestamp so the
+    // off-peak window is honored on the reconciliation path as well
+    // (Finding #23). This matches what was actually written into the
+    // ledger at ingestion time — a DeepSeek call recorded at 20:00 UTC
+    // is reconciled at its off-peak rate, not peak.
     let local: f64 = ledger
         .entries_in(Some(since), None)?
         .iter()
         .filter(|e| e.provider.eq_ignore_ascii_case(provider))
-        .map(|e| pricing.cost(&e.model, e.tokens_in, e.tokens_out))
+        .map(|e| pricing.cost_at(&e.model, e.tokens_in, e.tokens_out, Some(e.ts_utc)))
         .sum();
 
     if json {

@@ -169,7 +169,7 @@ async fn complete_once(
     let cost = res
         .telemetry
         .cost_usd
-        .unwrap_or_else(|| pricing.cost(&model, tokens_in, tokens_out));
+        .unwrap_or_else(|| pricing.cost_at(&model, tokens_in, tokens_out, Some(Utc::now())));
     // Post-verify the reviewer call was actually served free (catch a free->paid
     // fallback) and record any violation in the ledger rather than marking clean.
     let violation = gate.verify_free(&model_entry, &res.telemetry).err();
@@ -187,6 +187,7 @@ async fn complete_once(
         cost_usd: cost,
         calls: 1,
         violation,
+        tags: zoder_core::ledger::FinOpsTags::default(),
     });
 
     Ok(Completion {

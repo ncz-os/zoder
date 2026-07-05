@@ -10,7 +10,7 @@
 //! advise / report only.
 
 use crate::config::Theme;
-use crate::ledger::{Entry, Ledger};
+use crate::ledger::{Entry, FinOpsTags, Ledger};
 use crate::pricing::{ModelPrice, PricingCatalog};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -53,20 +53,6 @@ impl Paint {
     fn dim(&self, s: &str) -> String {
         self.wrap(s, &self.theme.dim)
     }
-}
-
-/// Optional FinOps tags attached to a ledger entry at ingestion time.
-/// Mirrors the TypeScript `FinOpsTags` interface (snake_case wire format).
-#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
-pub struct FinOpsTags {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_hit_ratio: Option<f64>,
 }
 
 /// Spend grouped by a single dimension (caller / task / model / provider).
@@ -750,6 +736,7 @@ mod tests {
             cost_usd: cost,
             calls: 1,
             violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
         })
         .unwrap();
     }

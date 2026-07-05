@@ -452,6 +452,7 @@ mod tests {
             cost_usd: 0.0,
             calls,
             violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
         };
         let entries = vec![mk("anthropic", 10, 1), mk("anthropic", 60, 1)];
         let plan = SubscriptionPlan {

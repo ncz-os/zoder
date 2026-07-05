@@ -52,12 +52,12 @@ pub use enterprise_cost::{CostSnapshot, MonthCost, ScopeStat};
 pub use finops::{
     build_finops_report, cache_savings_by_model, cheapest_equivalent_advisor,
     cli_run as finops_cli, forecast_burn, realized_rate_by_model, spend_by_dimension, AdvisorRow,
-    BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, FinOpsTags, ModelRealized, SpendGroup,
+    BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, ModelRealized, SpendGroup,
 };
-pub use ledger::{Entry, Ledger, Period, Rollup};
+pub use ledger::{Entry, FinOpsTags, Ledger, Period, Rollup};
 pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
-pub use pricing::{ModelPrice, PricingCatalog};
+pub use pricing::{CostVerdict, ModelPrice, PricingCatalog};
 pub use pricing_sync::{sync_catalog, Source as PricingSource, SyncStats};
 pub use provider::{
     backoff_delay, CallTelemetry, ChatRequest, ChatResult, ErrKind, Message, OpenAiProvider,
