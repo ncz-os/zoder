@@ -63042,8 +63042,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.5740000000000001,
-        "output_usd_per_mtok": 1.804,
+        "input_usd_per_mtok": 0.56,
+        "output_usd_per_mtok": 1.76,
         "source": "openrouter"
       },
       "agentic_score": 0.665,
