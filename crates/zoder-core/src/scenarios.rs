@@ -183,6 +183,75 @@ pub struct RouteScenario {
     pub allow_paid: bool,
 }
 
+/// Sparse override for a [`RouteScenario`]. Every field is `Option<T>` so
+/// the deserializer can tell an operator-supplied value apart from a
+/// missing one: a config block like `[routing.scenarios.economy]` that
+/// only carries `cap_guard = 55` parses into `Some(55.0)` for
+/// `cap_guard` and `None` for every other field, so the merge keeps the
+/// preset's `primary_classes`, `reviewer_classes`, `use_target`,
+/// `budget_mode`, and `allow_paid` intact.
+///
+/// This is the deserialization shape used by `[routing.scenarios.<name>]`
+/// in `config.json` / overlay TOMLs. Use [`RouteScenarioOverride::apply`]
+/// (or [`resolve_active`]) to fold an override onto a preset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RouteScenarioOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_classes: Option<Vec<ProviderClass>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_classes: Option<Vec<ProviderClass>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_target: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_guard: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_mode: Option<BudgetMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_paid: Option<bool>,
+}
+
+impl RouteScenarioOverride {
+    /// `true` when the operator supplied no fields at all. Useful for
+    /// callers that want to skip the merge entirely (it's a no-op).
+    pub fn is_empty(&self) -> bool {
+        self.primary_classes.is_none()
+            && self.reviewer_classes.is_none()
+            && self.use_target.is_none()
+            && self.cap_guard.is_none()
+            && self.budget_mode.is_none()
+            && self.allow_paid.is_none()
+    }
+
+    /// Merge this override onto `base` field-by-field. Only the
+    /// `Some(_)` fields are written; everything else falls through
+    /// to `base` unchanged. Returns `base` when the override is empty.
+    pub fn apply(&self, base: RouteScenario) -> RouteScenario {
+        if self.is_empty() {
+            return base;
+        }
+        let mut out = base;
+        if let Some(v) = &self.primary_classes {
+            out.primary_classes = v.clone();
+        }
+        if let Some(v) = &self.reviewer_classes {
+            out.reviewer_classes = v.clone();
+        }
+        if let Some(v) = self.use_target {
+            out.use_target = v;
+        }
+        if let Some(v) = self.cap_guard {
+            out.cap_guard = v;
+        }
+        if let Some(v) = self.budget_mode {
+            out.budget_mode = v;
+        }
+        if let Some(v) = self.allow_paid {
+            out.allow_paid = v;
+        }
+        out
+    }
+}
+
 fn default_primary_classes() -> Vec<ProviderClass> {
     vec![ProviderClass::Free, ProviderClass::Sub]
 }
@@ -299,19 +368,26 @@ pub fn default_scenarios() -> BTreeMap<String, RouteScenario> {
 /// `balanced` so a typo in `[routing].scenario` is a graceful no-op rather
 /// than a boot-time error — the CLI's `--scenario` console hint points
 /// operators at the valid names.
+///
+/// `override_block` is a [`RouteScenarioOverride`]: every field is
+/// `Option<T>` so a config that only sets `cap_guard = 55` keeps the
+/// preset's `primary_classes`, `use_target`, `budget_mode`, etc. intact
+/// instead of replacing them with generic balanced defaults (which would
+/// silently re-admit subscription use on an `economy` override, for
+/// example — see the Finding #8 fix history).
 pub fn resolve_active(
     scenario_name: &str,
-    override_block: Option<&RouteScenario>,
+    override_block: Option<&RouteScenarioOverride>,
 ) -> RouteScenario {
     let presets = default_scenarios();
-    let mut base = presets
+    let base = presets
         .get(scenario_name)
         .cloned()
         .unwrap_or_else(RouteScenario::balanced);
-    if let Some(o) = override_block {
-        base = o.clone();
+    match override_block {
+        Some(o) => o.apply(base),
+        None => base,
     }
-    base
 }
 
 // ---------------------------------------------------------------------------
@@ -996,12 +1072,96 @@ mod tests {
 
     #[test]
     fn resolve_active_layers_override_when_provided() {
-        let mut override_s = RouteScenario::balanced();
-        override_s.use_target = 42.0;
+        // Build a sparse override with only `use_target` set; the merge
+        // must keep the preset's `cap_guard`, `primary_classes`, etc.
+        let override_s = RouteScenarioOverride {
+            use_target: Some(42.0),
+            ..RouteScenarioOverride::default()
+        };
         let s = resolve_active("balanced", Some(&override_s));
         assert_eq!(s.use_target, 42.0);
         // Other fields intact.
         assert_eq!(s.cap_guard, RouteScenario::balanced().cap_guard);
+        assert_eq!(s.primary_classes, RouteScenario::balanced().primary_classes);
+        assert_eq!(s.budget_mode, RouteScenario::balanced().budget_mode);
+    }
+
+    // -------- sparse scenario override (Finding #8 fix) ---------------
+    //
+    // An `economy` override that only carries `cap_guard = 55` must NOT
+    // replace the preset wholesale. Before the fix, the override parsed
+    // into a `RouteScenario` whose unspecified fields defaulted to
+    // generic balanced values (not economy values), so the active
+    // scenario's `primary_classes` silently became `[free, sub]` —
+    // re-admitting subscription use on an economy override. This test
+    // pins the corrected, field-by-field merge.
+
+    fn ovr() -> RouteScenarioOverride {
+        RouteScenarioOverride::default()
+    }
+
+    #[test]
+    fn sparse_override_on_economy_keeps_economy_primary_classes() {
+        // The exact Finding #8 failure: only `cap_guard` supplied. The
+        // active scenario must still have `primary_classes = [free]`
+        // (economy), NOT `[free, sub]` (the balanced default that the
+        // pre-fix code would silently substitute).
+        let mut o = ovr();
+        o.cap_guard = Some(55.0);
+        let active = resolve_active("economy", Some(&o));
+        assert_eq!(
+            active.primary_classes,
+            vec![ProviderClass::Free],
+            "economy preset primary_classes must survive a sparse override",
+        );
+        assert_eq!(
+            active.use_target,
+            RouteScenario::economy().use_target,
+            "unspecified use_target must fall through to the preset",
+        );
+        assert_eq!(active.cap_guard, 55.0, "the supplied cap_guard wins");
+        assert_eq!(
+            active.budget_mode,
+            RouteScenario::economy().budget_mode,
+            "budget_mode must not flip to a balanced default",
+        );
+    }
+
+    #[test]
+    fn sparse_override_can_only_set_one_field_without_dragging_others() {
+        // Each field is independent: setting only `allow_paid` must
+        // leave every other field at the preset.
+        let mut o = ovr();
+        o.allow_paid = Some(true);
+        let active = resolve_active("balanced", Some(&o));
+        assert!(active.allow_paid);
+        assert_eq!(active.use_target, RouteScenario::balanced().use_target,);
+        assert_eq!(active.cap_guard, RouteScenario::balanced().cap_guard,);
+        assert_eq!(active.budget_mode, RouteScenario::balanced().budget_mode);
+    }
+
+    #[test]
+    fn empty_override_is_a_no_op() {
+        let active = resolve_active("aggressive", Some(&ovr()));
+        assert_eq!(active, RouteScenario::aggressive());
+    }
+
+    #[test]
+    fn override_apply_is_field_independent() {
+        // Direct exercise of `apply()`: every Some(_) overrides, every
+        // None preserves. Mirrors what `resolve_active` does internally.
+        let base = RouteScenario::economy();
+        let mut o = ovr();
+        o.use_target = Some(11.0);
+        o.allow_paid = Some(true);
+        let merged = o.apply(base.clone());
+        assert_eq!(merged.use_target, 11.0);
+        assert!(merged.allow_paid);
+        // All untouched fields inherit from base.
+        assert_eq!(merged.primary_classes, base.primary_classes);
+        assert_eq!(merged.reviewer_classes, base.reviewer_classes);
+        assert_eq!(merged.cap_guard, base.cap_guard);
+        assert_eq!(merged.budget_mode, base.budget_mode);
     }
 
     // -------- per-scenario selection (synthetic) -----------------------

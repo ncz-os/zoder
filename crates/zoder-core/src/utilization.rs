@@ -42,6 +42,7 @@
 //! without affecting other accounts on the same machine.
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -1324,7 +1325,17 @@ pub fn default_store_path() -> Option<PathBuf> {
 /// for providers that publish no rate-limit headers, e.g. MiniMax). Both
 /// are persisted to the same file so a single `~/.zoder/utilization.json`
 /// holds the whole utilization picture for the box.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// **Concurrency** (Finding #9): the store owns a sidecar lockfile
+/// (`<path>.lock`) opened by [`UtilizationStore::open`], and holds an
+/// exclusive `flock(2)` on it for the entire read-modify-write window.
+/// `save()` releases the lock by dropping the store (or by writing
+/// atomically: a `fsync`d temp file in the same directory, then
+/// `rename(2)`). Two processes racing on the same file therefore
+/// serialize cleanly: A's `open` blocks until B's `save` drops the lock,
+/// A reads B's updated JSON, A applies its own delta, A saves. The
+/// flock is automatically released if the process dies.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UtilizationStore {
     #[serde(default)]
     pub records: BTreeMap<String, UtilizationRecord>,
@@ -1336,6 +1347,44 @@ pub struct UtilizationStore {
     pub counters: BTreeMap<String, CounterWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// Sidecar lockfile. Held for the lifetime of the store; Drop
+    /// closes the FD, which releases the `flock(2)`. `#[serde(skip)]`
+    /// because the lock is a process-local handle, not part of the
+    /// persisted JSON.
+    #[serde(skip)]
+    lock: Option<fs::File>,
+}
+
+/// Manual `Clone` is unavailable because the lockfile FD is non-cloneable.
+/// The store's read-modify-write window is short by design (one
+/// request → one capture → one save), and the cross-process
+/// serialization guarantee depends on this single-owner property.
+impl Clone for UtilizationStore {
+    fn clone(&self) -> Self {
+        // Cannot clone an exclusive flock (it is process-unique), so
+        // cloning a `UtilizationStore` would defeat the cross-process
+        // serialization guarantee. Fail fast at compile time? No — we
+        // can't prevent `clone()` at runtime, so the call must panic
+        // with a clear message rather than silently race.
+        panic!(
+            "UtilizationStore cannot be cloned: the sidecar flock is process-unique; \
+             share the store by reference instead"
+        )
+    }
+}
+
+/// Manual `Default` because we can't derive it once `Clone` is hand-
+/// rolled. The default-constructed store has no path and no lock — it
+/// is in-memory only, the same shape the pre-fix code had.
+impl Default for UtilizationStore {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            counters: BTreeMap::new(),
+            path: None,
+            lock: None,
+        }
+    }
 }
 
 fn key(provider: Provider, account_id: &str, plan: &str) -> String {
@@ -1380,33 +1429,119 @@ impl UtilizationRecord {
 }
 
 impl UtilizationStore {
+    /// Path of the sidecar lockfile for `data_path`. The lockfile lives
+    /// next to the data file so it shares the same directory's atomic
+    /// rename semantics; the extension `.lock` keeps it visibly distinct
+    /// from the JSON data file.
+    fn lockfile_path(data_path: &Path) -> PathBuf {
+        let mut s = data_path.as_os_str().to_owned();
+        s.push(".lock");
+        PathBuf::from(s)
+    }
+
     /// Open a store at `path`. Creates an empty one if the file doesn't
     /// exist yet. Returns an error only on real I/O / parse failures —
     /// a missing file is fine.
+    ///
+    /// Acquires an exclusive `flock(2)` on a sidecar `<path>.lock`
+    /// file for the lifetime of the returned store. This serializes
+    /// read-modify-write across processes so two concurrent
+    /// `record_counter` callers cannot lose an increment (Finding #9).
+    /// The lock is released when the store is dropped.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtilizationError> {
         let path = path.as_ref();
+        // Acquire the cross-process lock FIRST, before reading the data
+        // file. Otherwise another process could write between our read
+        // and our write and we'd lose its update. The lock is held until
+        // the returned store is dropped (or until `save` runs, after
+        // which we keep the lock so a follow-up read-modify-write
+        // remains consistent — the typical wire-up is "open + record +
+        // save" inside one short-lived scope).
+        let lock = Self::acquire_lock(path)?;
         match fs::read(path) {
             Ok(bytes) => {
                 if bytes.is_empty() {
-                    let store = Self {
+                    Ok(Self {
                         records: BTreeMap::new(),
                         counters: BTreeMap::new(),
                         path: Some(path.to_path_buf()),
-                    };
-                    return Ok(store);
+                        lock: Some(lock),
+                    })
+                } else {
+                    let mut store: Self =
+                        serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
+                    store.path = Some(path.to_path_buf());
+                    store.lock = Some(lock);
+                    Ok(store)
                 }
-                let mut store: Self =
-                    serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
-                store.path = Some(path.to_path_buf());
-                Ok(store)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
                 records: BTreeMap::new(),
                 counters: BTreeMap::new(),
                 path: Some(path.to_path_buf()),
+                lock: Some(lock),
             }),
             Err(e) => Err(UtilizationError::Io(e)),
         }
+    }
+
+    /// Open a store at `path` WITHOUT acquiring a cross-process lock.
+    /// Used for read-only inspection (the CLI's `report` subcommand)
+    /// where cross-process writes are tolerated and we don't want to
+    /// block on another process's active capture. The returned store
+    /// cannot be safely `save()`-d concurrently with another writer —
+    /// use [`UtilizationStore::open`] (the locked variant) for that.
+    pub fn open_unlocked(path: impl AsRef<Path>) -> Result<Self, UtilizationError> {
+        let path = path.as_ref();
+        match fs::read(path) {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    Ok(Self {
+                        records: BTreeMap::new(),
+                        counters: BTreeMap::new(),
+                        path: Some(path.to_path_buf()),
+                        lock: None,
+                    })
+                } else {
+                    let mut store: Self =
+                        serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
+                    store.path = Some(path.to_path_buf());
+                    store.lock = None;
+                    Ok(store)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
+                records: BTreeMap::new(),
+                counters: BTreeMap::new(),
+                path: Some(path.to_path_buf()),
+                lock: None,
+            }),
+            Err(e) => Err(UtilizationError::Io(e)),
+        }
+    }
+
+    /// Open (creating if needed) the sidecar lockfile at
+    /// `<data_path>.lock` and acquire an exclusive `flock(2)` on it.
+    /// Blocks until the lock is acquired (kernel-level wait — short in
+    /// practice because the typical critical section is one capture +
+    /// one save).
+    fn acquire_lock(data_path: &Path) -> Result<fs::File, UtilizationError> {
+        let lock_path = Self::lockfile_path(data_path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(UtilizationError::Io)?;
+        }
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(UtilizationError::Io)?;
+        // `lock_exclusive` blocks until the kernel grants the lock; on
+        // process death the FD is closed by the kernel and the lock is
+        // released, so a crashed process can't deadlock the next caller.
+        f.lock_exclusive().map_err(UtilizationError::Io)?;
+        Ok(f)
     }
 
     /// Open a store at the default location. Returns `None` when neither
@@ -1595,13 +1730,68 @@ impl UtilizationStore {
     }
 
     /// Persist to the path we were opened from. Creates parent dirs.
+    ///
+    /// Atomic write: serializes to `<path>.tmp.<pid>.<nanos>`, `fsync`s
+    /// it, then `rename(2)`s it onto `<path>`. The rename is atomic on
+    /// POSIX (same filesystem), so a crash mid-write leaves either the
+    /// old file or the new file — never a half-written, unparseable
+    /// blob (Finding #9).
+    ///
+    /// The cross-process `flock(2)` acquired in `open()` is still held
+    /// during the write; callers that need to release it sooner should
+    /// drop the store.
     pub fn save(&self) -> Result<(), UtilizationError> {
         let path = self.path.as_ref().ok_or(UtilizationError::NoPath)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(UtilizationError::Io)?;
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(UtilizationError::Parse)?;
-        fs::write(path, bytes).map_err(UtilizationError::Io)?;
+
+        // Same-directory temp file so `rename(2)` is atomic (cross-
+        // directory rename can fall back to copy+delete on some
+        // platforms, defeating the atomicity). The `<pid>.<nanos>`
+        // suffix lets concurrent processes (or the same process on
+        // retry) pick distinct names so two writers can't collide.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = match path.file_name() {
+            Some(_) => {
+                let mut s = path.as_os_str().to_owned();
+                s.push(format!(".tmp.{pid}.{nanos}"));
+                PathBuf::from(s)
+            }
+            None => {
+                return Err(UtilizationError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utilization store path has no file_name component",
+                )))
+            }
+        };
+
+        // Write the temp file.
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(UtilizationError::Io)?;
+            use std::io::Write;
+            f.write_all(&bytes).map_err(UtilizationError::Io)?;
+            // `sync_all` flushes the file's data AND metadata to disk
+            // before the rename. Without it, a power loss between the
+            // rename and the kernel's flush can leave the file empty
+            // or partial.
+            f.sync_all().map_err(UtilizationError::Io)?;
+        }
+
+        // Atomic rename. On Unix this is guaranteed atomic for same-
+        // filesystem renames; the temp file lives next to the data
+        // file so this is always satisfied.
+        fs::rename(&tmp, path).map_err(UtilizationError::Io)?;
         Ok(())
     }
 }
@@ -1977,13 +2167,15 @@ mod tests {
     fn store_upsert_and_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("utilization.json");
-        let mut s = UtilizationStore::open(&path).unwrap();
-        assert!(s.records.is_empty());
+        {
+            let mut s = UtilizationStore::open(&path).unwrap();
+            assert!(s.records.is_empty());
 
-        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-        let snap = snap_with_primary(42.0, None);
-        s.upsert(&snap, now);
-        s.save().unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+            let snap = snap_with_primary(42.0, None);
+            s.upsert(&snap, now);
+            s.save().unwrap();
+        } // drop the first store so the lockfile is released for the read-back.
 
         let s2 = UtilizationStore::open(&path).unwrap();
         let rec = s2
@@ -2116,10 +2308,12 @@ mod tests {
         // store from the same path and confirm the read-back matches.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("utilization.json");
-        let mut s = UtilizationStore::open(&path).unwrap();
-        let snap = snap_with_primary(72.5, None);
-        let recorded = s.record(&snap, Utc::now());
-        assert!(recorded, "snapshot with windows must be persisted");
+        {
+            let mut s = UtilizationStore::open(&path).unwrap();
+            let snap = snap_with_primary(72.5, None);
+            let recorded = s.record(&snap, Utc::now());
+            assert!(recorded, "snapshot with windows must be persisted");
+        } // drop the first store so the lockfile is released for the read-back.
 
         let s2 = UtilizationStore::open(&path).unwrap();
         let rec = s2
@@ -2212,44 +2406,50 @@ mod tests {
         // is easy to verify by hand: 2*1234 / 5.1e9 = 4.839e-7.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("utilization.json");
-        let mut s = UtilizationStore::open(&path).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
-
-        // Seed the cap the way the live wire-up does (the wire-up
-        // pulls it from the catalog, then sets it on the store).
-        s.set_counter_cap(
-            Provider::MiniMax,
-            "default",
-            MM_PLAN,
-            "monthly",
-            Some(MM_MONTHLY_CAP),
-            now,
-        );
-        // First response: N tokens.
         let n = 1234.0_f64;
-        let used_after_first =
-            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
-        assert_eq!(used_after_first, n, "first response adds exactly N tokens");
-        // Second response: another N tokens.
-        let used_after_second =
-            s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
-        assert_eq!(used_after_second, 2.0 * n, "two responses accumulate to 2N");
+        let expected_pct;
 
-        // Read back via the typed accessor.
-        let w = s
-            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
-            .expect("monthly counter window must persist");
-        assert_eq!(w.used_tokens, 2.0 * n);
-        let expected_pct = (2.0 * n) / MM_MONTHLY_CAP;
-        let got_pct = w
-            .used_percent
-            .expect("used_percent must be Some when cap is known");
-        assert!(
-            (got_pct - expected_pct).abs() < 1e-12,
-            "used_percent must equal 2N/5.1e9 = {expected_pct}, got {got_pct}",
-        );
+        {
+            let mut s = UtilizationStore::open(&path).unwrap();
+
+            // Seed the cap the way the live wire-up does (the wire-up
+            // pulls it from the catalog, then sets it on the store).
+            s.set_counter_cap(
+                Provider::MiniMax,
+                "default",
+                MM_PLAN,
+                "monthly",
+                Some(MM_MONTHLY_CAP),
+                now,
+            );
+            // First response: N tokens.
+            let used_after_first =
+                s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+            assert_eq!(used_after_first, n, "first response adds exactly N tokens");
+            // Second response: another N tokens.
+            let used_after_second =
+                s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", n, now);
+            assert_eq!(used_after_second, 2.0 * n, "two responses accumulate to 2N");
+
+            // Read back via the typed accessor.
+            let w = s
+                .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+                .expect("monthly counter window must persist");
+            assert_eq!(w.used_tokens, 2.0 * n);
+            expected_pct = (2.0 * n) / MM_MONTHLY_CAP;
+            let got_pct = w
+                .used_percent
+                .expect("used_percent must be Some when cap is known");
+            assert!(
+                (got_pct - expected_pct).abs() < 1e-12,
+                "used_percent must equal 2N/5.1e9 = {expected_pct}, got {got_pct}",
+            );
+            // Flush to disk before the next open.
+            s.save().unwrap();
+        } // drop the first store so the lockfile is released for the read-back.
+
         // And the JSON on disk: round-trip.
-        s.save().unwrap();
         let s2 = UtilizationStore::open(&path).unwrap();
         let w2 = s2
             .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
@@ -2355,28 +2555,30 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         // Write a rich record + a counter entry in one store, then
         // re-open.
-        let mut s = UtilizationStore::open(&path).unwrap();
-        // A header-fed record (legacy Layer 3A path).
-        let snap = snap_with_primary(72.5, None);
-        s.record(&snap, now);
-        // A counter-fed entry (Layer 3B path).
-        s.set_counter_cap(
-            Provider::MiniMax,
-            "acct-mm",
-            MM_PLAN,
-            "monthly",
-            Some(MM_MONTHLY_CAP),
-            now,
-        );
-        s.record_counter(
-            Provider::MiniMax,
-            "acct-mm",
-            MM_PLAN,
-            "monthly",
-            2_500_000.0,
-            now,
-        );
-        s.save().unwrap();
+        {
+            let mut s = UtilizationStore::open(&path).unwrap();
+            // A header-fed record (legacy Layer 3A path).
+            let snap = snap_with_primary(72.5, None);
+            s.record(&snap, now);
+            // A counter-fed entry (Layer 3B path).
+            s.set_counter_cap(
+                Provider::MiniMax,
+                "acct-mm",
+                MM_PLAN,
+                "monthly",
+                Some(MM_MONTHLY_CAP),
+                now,
+            );
+            s.record_counter(
+                Provider::MiniMax,
+                "acct-mm",
+                MM_PLAN,
+                "monthly",
+                2_500_000.0,
+                now,
+            );
+            s.save().unwrap();
+        } // drop the first store so the lockfile is released for the read-back.
 
         // Re-open from the same path. Both the header record and
         // the counter row survive.
@@ -2394,6 +2596,9 @@ mod tests {
         assert_eq!(cw.provider, Provider::MiniMax);
         assert_eq!(cw.plan, MM_PLAN);
         assert_eq!(cw.window_name, "monthly");
+        // Drop s2 so the legacy-file re-open below isn't blocked by
+        // the cross-process lock we still hold.
+        drop(s2);
 
         // Backward-compat: a hand-edited file that omits the
         // `counters` key entirely must still parse (this is the

@@ -370,8 +370,16 @@ pub struct RoutingConfig {
     pub scenario: String,
     /// Per-scenario overrides (fields omitted fall through to the preset).
     /// The map keys are the preset names (`economy`, `balanced`, ...).
+    ///
+    /// Every entry is a [`RouteScenarioOverride`] — a sparse shape where
+    /// every field is `Option<T>`. A config block that only carries one
+    /// field (e.g. `cap_guard = 55`) parses with `Some(_)` on that field
+    /// and `None` everywhere else, so the merge keeps the rest of the
+    /// preset intact. (Pre-fix this was a `RouteScenario`, which used
+    /// `#[serde(default)]` per field and silently replaced the preset
+    /// with generic balanced defaults — see Finding #8.)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub scenarios: BTreeMap<String, crate::scenarios::RouteScenario>,
+    pub scenarios: BTreeMap<String, crate::scenarios::RouteScenarioOverride>,
 }
 
 fn default_scenario_name() -> String {
