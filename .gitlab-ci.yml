@@ -168,11 +168,18 @@ nightly:linux:
     - cargo build --release --bin zoder --target x86_64-unknown-linux-gnu
     - cargo build --release --bin zoder --target aarch64-unknown-linux-gnu
     - |
+      # Publish to the rolling `master` channel AND a date-stamped channel
+      # (kept for a week by prune:nightly) so a specific nightly is reproducible:
+      #   install.sh --channel 2026-07-04   pins that build.
+      # Date comes from CI_PIPELINE_CREATED_AT so all jobs in one pipeline agree.
+      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         bin="target/$t/release/zoder"
         sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
-        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t"
-        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-$t.sha256"
+        for ch in master "$DATE"; do
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-$t"
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-$t.sha256"
+        done
       done
 
 nightly:macos-arm64:
@@ -187,7 +194,53 @@ nightly:macos-arm64:
     - rustup target add aarch64-apple-darwin
     - cargo build --release --bin zoder --target aarch64-apple-darwin
     - |
+      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
       bin="target/aarch64-apple-darwin/release/zoder"
       shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
-      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin"
-      curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/master/zoder-aarch64-apple-darwin.sha256"
+      for ch in master "$DATE"; do
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin"
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/zoder-aarch64-apple-darwin.sha256"
+      done
+
+# ── prune: keep only the last 7 date-stamped nightly channels ────────────────
+# The rolling `master` channel is always kept; date-stamped channels (YYYY-MM-DD)
+# older than 7 days are deleted so the registry doesn't grow unbounded. Best-effort
+# (allow_failure) and independent of the build jobs — if CI_JOB_TOKEN lacks package
+# delete rights the nightly still succeeds; stamps just accumulate until fixed.
+prune:nightly:
+  stage: release
+  image: python:3.12
+  <<: *nightly-rules
+  needs: []
+  cache: {}
+  allow_failure: true
+  script:
+    - |
+      python3 - <<'PY'
+      import os, json, datetime, urllib.request, urllib.error
+      api = os.environ["CI_API_V4_URL"]; pid = os.environ["CI_PROJECT_ID"]
+      tok = os.environ["CI_JOB_TOKEN"]
+      def call(url, method="GET"):
+          r = urllib.request.Request(url, method=method, headers={"JOB-TOKEN": tok})
+          return urllib.request.urlopen(r)
+      pkgs = json.load(call(f"{api}/projects/{pid}/packages?package_name=zoder-nightly&per_page=100"))
+      cutoff = datetime.date.today() - datetime.timedelta(days=7)
+      kept = pruned = 0
+      for p in pkgs:
+          v = p.get("version", "")
+          if v == "master":
+              kept += 1; continue
+          try:
+              d = datetime.date.fromisoformat(v)
+          except ValueError:
+              kept += 1; continue          # not a date channel — leave alone
+          if d < cutoff:
+              try:
+                  call(f"{api}/projects/{pid}/packages/{p['id']}", "DELETE")
+                  pruned += 1; print("pruned", v)
+              except urllib.error.HTTPError as e:
+                  print("skip (no delete rights?)", v, e.code)
+          else:
+              kept += 1
+      print(f"prune done: kept {kept}, pruned {pruned}")
+      PY
