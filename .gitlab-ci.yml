@@ -9,7 +9,7 @@
 # moving URL while job credentials are present (Finding #15).
 # Toolchain pinned to 1.94.1.
 default:
-  image: rust:1.94.1
+  image: rust:1.94.1@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c
   cache:
     key:
       files: [Cargo.lock]
@@ -42,7 +42,7 @@ stages: [corpus, check, test, security, package, release]
 # portable across mirrors/installations.
 corpus-sync:
   stage: corpus
-  image: python:3.12
+  image: python:3.12@sha256:a9e4190f02729f01e5b3719bd8b3ea0f8d9350dc17d01a1ce1ca6e3fbfcf7a99
   needs: []
   cache: {}
   rules:
@@ -175,7 +175,7 @@ release:trio:
   # which matches the current GitLab release-job contract. Pin note:
   # `cli:v1.39.0` is the immutable tag; bump by replacing the tag and
   # re-running the pipeline.
-  image: registry.gitlab.com/gitlab-org/cli:v1.39.0
+  image: registry.gitlab.com/gitlab-org/cli:v1.39.0@sha256:7400a9c2174f5331c285cab36cd2edcf4a41d0da39b1ced2985537c70c3097fa
   needs: ["trio:x86-linux", "trio:macos-arm64", "trio:linux-arm64"]
   variables: { GIT_STRATEGY: none }
   script:
@@ -353,7 +353,7 @@ nightly:macos-arm64:
 # delete rights the nightly still succeeds; stamps just accumulate until fixed.
 prune:nightly:
   stage: release
-  image: python:3.12
+  image: python:3.12@sha256:a9e4190f02729f01e5b3719bd8b3ea0f8d9350dc17d01a1ce1ca6e3fbfcf7a99
   <<: *nightly-rules
   needs: []
   cache: {}
@@ -402,7 +402,7 @@ prune:nightly:
 # container:weekly via dotenv, giving a reproducible, SHA-pinned weekly image.
 resolve:zeroclaw-sha:
   stage: package
-  image: rust:1.94
+  image: rust:1.94@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c
   rules:
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
@@ -422,7 +422,7 @@ resolve:zeroclaw-sha:
 container:weekly:
   stage: package
   image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e
     entrypoint: [""]
   rules:
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
@@ -452,7 +452,7 @@ container:weekly:
 
 release:container-weekly:
   stage: release
-  image: registry.gitlab.com/gitlab-org/release-cli:v0.18.0
+  image: registry.gitlab.com/gitlab-org/release-cli:v0.18.0@sha256:696013aea0f2a20482800ce3a77341f840d7c7ec17bd78bd555e0bd6c00e4f11
   rules:
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
   needs:

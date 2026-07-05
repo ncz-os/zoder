@@ -281,12 +281,6 @@ rollback_install() {
   done
 }
 
-# Kept as the explicit post-install smoke rollback entrypoint. Signal/error
-# cleanup uses `rollback_install` directly while the transaction is active.
-rollback_installed() {
-  rollback_install
-}
-
 cleanup_install() {
   status=$?
   trap - EXIT INT TERM HUP
@@ -405,16 +399,15 @@ for b in $BIN_REQUIRED $BIN_OPTIONAL; do
       die "failed to remove stale optional ${b}; previous set will be restored"
   fi
 done
-transaction_active=0
 [ "$installed" -gt 0 ] || die "nothing installed"
 info "Installed $installed binar$([ "$installed" = 1 ] && echo y || echo ies) to ${BIN_DIR}"
 
 # ── Seed the public corpus + pricing ──────────────────────────────
-# Best-effort: a failed fetch (offline/proxy) never fails the install — zoder
-# also self-heals these on first run. Existing files are left in place so a
-# local `zoder refresh` / `zoder pricing sync` is never clobbered. Downloads
-# are atomic (`.part` then `mv`) so a curl that's killed mid-response can
-# never leave a truncated JSON file at the canonical path the CLI loads from.
+# Seeding is part of post-install validation: a failed fetch rolls the binaries
+# back unless the operator explicitly chose --no-corpus for an offline install.
+# Existing files are left in place so a local `zoder refresh` / `zoder pricing
+# sync` is never clobbered. Downloads are atomic (`.part` then `mv`) so a curl
+# that's killed mid-response can never leave a truncated canonical JSON file.
 seed_corpus() {
   [ "$NO_CORPUS" = "1" ] && {
     warn "corpus seeding skipped (--no-corpus / ZODER_NO_CORPUS=1)"
@@ -426,13 +419,15 @@ seed_corpus() {
   # (=$ZODER_HOME/model_corpus.json). The corpus file is a megabyte-class
   # JSON document; enforce a 1 KiB minimum so an empty HTTP/204 body or a
   # truncated response is rejected as a failed seed, not a quiet one.
+  seed_failed=0
   if [ -f "$ZODER_HOME/model_corpus.json" ]; then
     info "Corpus already present at $ZODER_HOME/model_corpus.json (left as-is)"
   elif dl_atomic "${CORPUS_BASE}/corpus/model_corpus.json" \
       "$ZODER_HOME/model_corpus.json" 1024 2>/dev/null; then
     info "Seeded routing corpus → $ZODER_HOME/model_corpus.json"
   else
-    warn "could not fetch corpus (zoder will self-heal on first run)"
+    warn "could not fetch corpus"
+    seed_failed=1
   fi
 
   # Pricing goes to the SAME path the CLI loads via `Config::home().join(
@@ -446,10 +441,12 @@ seed_corpus() {
       "$ZODER_HOME/pricing.json" 1024 2>/dev/null; then
     info "Seeded pricing catalog → $ZODER_HOME/pricing.json"
   else
-    warn "could not fetch pricing catalog (run 'zoder pricing sync' later)"
+    warn "could not fetch pricing catalog"
+    seed_failed=1
   fi
+  [ "$seed_failed" -eq 0 ]
 }
-seed_corpus
+seed_corpus || die "corpus/pricing seeding failed; install was rolled back (re-run with --no-corpus to install offline)"
 
 # ── PATH hint ─────────────────────────────────────────────────────
 
@@ -472,8 +469,13 @@ if ! "${BIN_DIR}/zoder" --version >/dev/null 2>&1; then
   warn "zoder --version failed after install; rolling back ${BIN_DIR}/zoder"
 fi
 if [ "$smoke_failed" -eq 1 ]; then
-  rollback_installed
+  # Leave the transaction active: the EXIT trap performs the rollback once.
+  # Calling rollback here as well would consume the backups and let the trap's
+  # second rollback delete the restored binaries.
   die "zoder --version check failed after install; install was rolled back"
 fi
 info "Smoke verified: ${BIN_DIR}/zoder reports a version"
+# Commit only after every post-install operation and the smoke test succeed.
+# Until this point EXIT/INT/TERM/HUP all restore the previous binary set.
+transaction_active=0
 printf "%s\n" "$(bold "Done.") Run $(bold zoder) to start, or $(bold "zoder tui") for the TUI."
