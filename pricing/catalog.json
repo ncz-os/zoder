@@ -3043,10 +3043,6 @@
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 6.0
     },
-    "eu.twelvelabs.pegasus-1-2-v1:0": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 7.5
-    },
     "fireworks_ai/accounts/fireworks/models/chronos-hermes-13b-v2": {
       "input_usd_per_mtok": 0.19999999999999998,
       "output_usd_per_mtok": 0.19999999999999998
@@ -9185,10 +9181,6 @@
       "input_usd_per_mtok": 0.44999999999999996,
       "output_usd_per_mtok": 2.0
     },
-    "twelvelabs.pegasus-1-2-v1:0": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 7.5
-    },
     "undi95/remm-slerp-l2-13b": {
       "input_usd_per_mtok": 0.44999999999999996,
       "output_usd_per_mtok": 0.65
@@ -9352,10 +9344,6 @@
     "us.mistral.pixtral-large-2502-v1:0": {
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 6.0
-    },
-    "us.twelvelabs.pegasus-1-2-v1:0": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 7.5
     },
     "us.writer.palmyra-x4-v1:0": {
       "input_usd_per_mtok": 2.5,
