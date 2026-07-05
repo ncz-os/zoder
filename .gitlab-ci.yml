@@ -115,7 +115,7 @@ security:
     # `curl ... install-from-binstall-release.sh | bash` (Finding #15).
     # Helper script downloads + verifies + extracts an immutable asset.
     - scripts/ci/ci-prepare-tools.sh binstall
-    - cargo binstall -y cargo-deny@0.16.2
+    - cargo binstall -y cargo-deny@0.19.9
     - cargo deny check
     - cargo fetch --locked
 
@@ -468,5 +468,9 @@ release:container-weekly:
     assets:
       links:
         - name: "container image (weekly-${WEEK})"
-          url: "${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
+          # GitLab release asset links require an http(s)/ftp scheme; a bare
+          # registry ref (registry.gitlab.com/...:tag) is rejected 400. Point at
+          # the Container Registry browse page; the exact pull ref is in the
+          # release description ("docker pull ...:weekly-${WEEK}").
+          url: "${CI_SERVER_URL}/${CI_PROJECT_PATH}/container_registry"
           link_type: "image"
