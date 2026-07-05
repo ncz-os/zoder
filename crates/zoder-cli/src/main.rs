@@ -6052,6 +6052,10 @@ mod scenario_routing_tests {
     }
 
     fn make_snapshot(pct: f64) -> RateLimitSnapshot {
+        // Set `observed_at` to a fresh timestamp so the Finding-#6
+        // freshness gate lets the snapshot drive routing. The
+        // fixture's `now` is fixed (`fixed_now`), so we anchor the
+        // observation there too.
         RateLimitSnapshot {
             provider: zoder_core::utilization::Provider::OpenaiCodex,
             account_id: "acct".into(),
@@ -6064,7 +6068,7 @@ mod scenario_routing_tests {
             }),
             secondary: None,
             has_credits: Some(true),
-            observed_at: None,
+            observed_at: Some(fixed_now()),
         }
     }
 

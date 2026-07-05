@@ -872,43 +872,89 @@ fn capture_counter_usage(
         );
         return;
     };
-    // Cap resolution: look up the catalog once, find the Counter window
-    // for the configured plan, and seed the store with the cap. The set is
-    // idempotent (subsequent calls overwrite the same value, then
-    // `record_counter` recomputes percent from the latest used_tokens).
+    // Cap resolution + increment: look up the catalog once, find the
+    // Counter windows for the configured plan, and (a) seed the store
+    // with the cap for each, then (b) increment the same windows. The
+    // set is idempotent (subsequent calls overwrite the same cap value
+    // via `set_counter_cap`, then `record_counter` recomputes percent
+    // from the latest used_tokens). Each call passes the catalog
+    // window's `reset` and `hours` so `record_counter` can detect a
+    // calendar-period rollover and atomically reset `used_tokens` to
+    // 0 before applying the increment (Finding #4). Without this, June
+    // usage would stay in July and the plan would look exhausted
+    // forever.
     let catalog = crate::subscription_tiers::TierCatalog::bundled();
-    if let Some(entry) = catalog.tier("minimax", plan) {
-        for w in &entry.windows {
-            if matches!(w.observability, crate::config::Observability::Counter) {
-                store.set_counter_cap(
-                    crate::utilization::Provider::MiniMax,
-                    "default",
-                    plan,
-                    &w.name,
-                    w.cap,
-                    now,
-                );
-            }
-        }
-    } else {
-        tracing::debug!(
+    let counter_windows: Vec<(String, Option<f64>, crate::config::ResetKind, u32)> =
+        if let Some(entry) = catalog.tier("minimax", plan) {
+            entry
+                .windows
+                .iter()
+                .filter(|w| matches!(w.observability, crate::config::Observability::Counter))
+                .map(|w| (w.name.clone(), w.cap, w.reset, w.hours))
+                .collect()
+        } else {
+            tracing::debug!(
+                plan,
+                "minimax plan not in catalog; counter capture will run cap-less"
+            );
+            Vec::new()
+        };
+    // (a) Seed the cap for each Counter window. Even when the catalog
+    // isn't available we still increment below; the increment alone is
+    // enough to start tracking tokens, and the next call that does
+    // find the catalog will pick up the cap and recompute percent.
+    for (w_name, cap, _reset, _hours) in &counter_windows {
+        store.set_counter_cap(
+            crate::utilization::Provider::MiniMax,
+            "default",
             plan,
-            "minimax plan not in catalog; counter capture will run cap-less"
+            w_name,
+            *cap,
+            now,
         );
     }
-    // Increment the monthly window (the only Counter window the catalog
-    // declares for `minimax-max` per the Layer 3B spec). If a future
-    // catalog adds more Counter windows (e.g. a weekly counter), this
-    // call would need to iterate the same `windows` list the cap-loop
-    // just walked; today a single monthly window is enough.
-    store.record_counter(
-        crate::utilization::Provider::MiniMax,
-        "default",
-        plan,
-        "monthly",
-        total_tokens,
-        now,
-    );
+    // (b) Increment each Counter window. `ResetKind::Rolling` is the
+    // safe fallback when the catalog doesn't know about the plan
+    // (counter-only track via epoch-second buckets, see
+    // `window_period_for`).
+    let fallback_reset = crate::config::ResetKind::Rolling;
+    let fallback_hours: u32 = 0;
+    for (w_name, _cap, reset, hours) in &counter_windows {
+        store.record_counter(
+            crate::utilization::Provider::MiniMax,
+            "default",
+            plan,
+            w_name,
+            total_tokens,
+            now,
+            *reset,
+            *hours,
+        );
+    }
+    // Catalog-miss path: still increment a default `monthly` window so
+    // a deployed-but-not-yet-catalog-known plan doesn't silently leak
+    // usage. Uses `Rolling` so the increment accumulates against a
+    // rolling clock (no calendar-driven surprise reset).
+    if counter_windows.is_empty() {
+        store.set_counter_cap(
+            crate::utilization::Provider::MiniMax,
+            "default",
+            plan,
+            "monthly",
+            None,
+            now,
+        );
+        store.record_counter(
+            crate::utilization::Provider::MiniMax,
+            "default",
+            plan,
+            "monthly",
+            total_tokens,
+            now,
+            fallback_reset,
+            fallback_hours,
+        );
+    }
     // Best-effort persist. Mirror the header path: tolerate IO failure so
     // a transient disk hiccup never breaks a chat call.
     let _ = store.save();
