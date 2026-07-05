@@ -270,8 +270,16 @@ mkdir -p "$BIN_DIR"
 txn_dir=$(mktemp -d "${BIN_DIR}/.zoder-install.XXXXXX")
 transaction_active=0
 installed_names=""
+seeded_corpus=0
+seeded_pricing=0
 
 rollback_install() {
+  if [ "$seeded_corpus" = 1 ]; then
+    rm -f "$ZODER_HOME/model_corpus.json"
+  fi
+  if [ "$seeded_pricing" = 1 ]; then
+    rm -f "$ZODER_HOME/pricing.json"
+  fi
   for name in $installed_names; do
     if [ -f "${txn_dir}/backup-${name}" ]; then
       mv -f "${txn_dir}/backup-${name}" "${BIN_DIR}/${name}" || true
@@ -424,6 +432,7 @@ seed_corpus() {
     info "Corpus already present at $ZODER_HOME/model_corpus.json (left as-is)"
   elif dl_atomic "${CORPUS_BASE}/corpus/model_corpus.json" \
       "$ZODER_HOME/model_corpus.json" 1024 2>/dev/null; then
+    seeded_corpus=1
     info "Seeded routing corpus → $ZODER_HOME/model_corpus.json"
   else
     warn "could not fetch corpus"
@@ -439,6 +448,7 @@ seed_corpus() {
     info "Pricing catalog already present (left as-is)"
   elif dl_atomic "${CORPUS_BASE}/pricing/catalog.json" \
       "$ZODER_HOME/pricing.json" 1024 2>/dev/null; then
+    seeded_pricing=1
     info "Seeded pricing catalog → $ZODER_HOME/pricing.json"
   else
     warn "could not fetch pricing catalog"

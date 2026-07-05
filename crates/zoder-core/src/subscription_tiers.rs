@@ -35,7 +35,7 @@
 //! windows survived the resolution, with the existing engine path completely
 //! unchanged.
 
-use crate::config::{Observability, QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan};
+use crate::config::{Observability, Provider, QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -198,6 +198,42 @@ impl TierCatalog {
     /// than an error.
     pub fn tier(&self, provider_id: &str, tier_id: &str) -> Option<&TierEntry> {
         self.providers.get(provider_id)?.tiers.get(tier_id)
+    }
+
+    /// Resolve the catalog namespace from provider classification rather than
+    /// requiring an operator-chosen provider id to equal a catalog key.
+    pub fn provider_namespace(&self, provider: &Provider, tier_id: &str) -> Option<String> {
+        if self.tier(&provider.id, tier_id).is_some() {
+            return Some(provider.id.clone());
+        }
+        let identity = format!(
+            "{} {} {} {}",
+            provider.id, provider.kind, provider.base_url, tier_id
+        )
+        .to_ascii_lowercase();
+        let classified = if identity.contains("minimax") {
+            Some("minimax")
+        } else if identity.contains("anthropic") || identity.contains("claude-") {
+            Some("anthropic")
+        } else if identity.contains("openai")
+            || identity.contains("codex")
+            || identity.contains("chatgpt-")
+        {
+            Some("openai")
+        } else {
+            None
+        };
+        if let Some(namespace) = classified.filter(|ns| self.tier(ns, tier_id).is_some()) {
+            return Some(namespace.to_string());
+        }
+
+        let mut matches = self
+            .providers
+            .iter()
+            .filter(|(_, tiers)| tiers.tiers.contains_key(tier_id))
+            .map(|(namespace, _)| namespace.clone());
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
     }
 
     /// All tier ids known for a provider (sorted), or empty when the

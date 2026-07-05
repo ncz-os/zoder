@@ -199,6 +199,34 @@ fn smoke_test_is_fatal_and_rolls_back() {
 }
 
 #[test]
+fn rollback_removes_only_files_seeded_by_this_transaction() {
+    let src = read_install_sh();
+    let rollback = src
+        .split("rollback_install() {")
+        .nth(1)
+        .and_then(|s| s.split("cleanup_install() {").next())
+        .expect("rollback function");
+    assert!(
+        rollback.contains("if [ \"$seeded_corpus\" = 1 ]; then")
+            && rollback.contains("rm -f \"$ZODER_HOME/model_corpus.json\"")
+            && rollback.contains("if [ \"$seeded_pricing\" = 1 ]; then")
+            && rollback.contains("rm -f \"$ZODER_HOME/pricing.json\""),
+        "rollback must remove corpus/pricing created by the failed transaction"
+    );
+    assert!(src.contains("seeded_corpus=1"));
+    assert!(src.contains("seeded_pricing=1"));
+    let corpus_existing = src
+        .find("Corpus already present")
+        .expect("pre-existing corpus branch");
+    let corpus_enroll = src.find("seeded_corpus=1").expect("corpus enrollment");
+    let pricing_existing = src
+        .find("Pricing catalog already present")
+        .expect("pre-existing pricing branch");
+    let pricing_enroll = src.find("seeded_pricing=1").expect("pricing enrollment");
+    assert!(corpus_existing < corpus_enroll && pricing_existing < pricing_enroll);
+}
+
+#[test]
 fn package_script_fetches_commit_sha_after_branchless_clone() {
     let path = workspace_root().join("scripts/package.sh");
     let src = std::fs::read_to_string(&path).unwrap();
@@ -238,4 +266,24 @@ fn checksum_parser_requires_exact_digest_body() {
         !src.contains("tr -cd '0-9a-fA-F'"),
         "checksum verification must not manufacture a digest by stripping arbitrary response text"
     );
+}
+
+#[test]
+fn container_base_images_are_digest_pinned() {
+    let path = workspace_root().join("Containerfile");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let from: Vec<_> = src
+        .lines()
+        .filter(|line| line.starts_with("FROM "))
+        .collect();
+    assert_eq!(from.len(), 2);
+    for line in from {
+        let digest = line
+            .split("@sha256:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("base image is not digest-pinned: {line}"));
+        assert_eq!(digest.len(), 64, "invalid sha256 digest in {line}");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
 }

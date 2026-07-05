@@ -63,7 +63,9 @@ pub use provider::{
     backoff_delay, CallTelemetry, ChatRequest, ChatResult, ErrKind, Message, OpenAiProvider,
     ProviderError,
 };
-pub use quota::{amortized_per_call, plan_usage, window_usage, WindowUsage};
+pub use quota::{
+    amortized_per_call, plan_usage, plan_usage_for_catalog_provider, window_usage, WindowUsage,
+};
 pub use reconcile::{anthropic_costs, openai_costs, ReconResult};
 pub use report::{build_report, build_report_from_entries, Bucket, Gran, Report, RowByModel};
 pub use router::{Route, Router, Tier};

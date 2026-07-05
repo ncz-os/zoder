@@ -24,7 +24,7 @@ use zoder_core::utilization::{
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
-    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, plan_usage, probe_request,
+    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, probe_request,
     run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy, BillingMode,
     BudgetVerdict, ChatRequest, ChatResult, Config, Corpus, CostSnapshot, CostVerdict, Decision,
     EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
@@ -1946,7 +1946,12 @@ fn build_account_views_for_candidates(
                 Some(plan) => plan,
                 None => return None,
             };
-            let resolved = resolve_plan_windows(plan, &catalog, Some(&provider.id));
+            let catalog_provider = plan
+                .tier
+                .as_deref()
+                .and_then(|tier| catalog.provider_namespace(provider, tier))
+                .unwrap_or_else(|| provider.id.clone());
+            let resolved = resolve_plan_windows(plan, &catalog, Some(&catalog_provider));
             let windows: Vec<_> = resolved
                 .windows
                 .into_iter()
@@ -2942,31 +2947,54 @@ async fn agentic_cost(
     fallback_model: &str,
 ) -> (f64, u64, u64, String, bool) {
     match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
-        Ok(sum) => {
-            let cost = sum.window_cost_usd();
-            // Pick the dominant model in the window for attribution.
-            let model = sum
-                .by_model
-                .values()
-                .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens))
-                .map(|m| m.model.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback_model.to_string());
-            let tin = sum
-                .by_model
-                .values()
-                .fold(0_u64, |acc, m| acc.saturating_add(m.input_tokens));
-            let tout = sum
-                .by_model
-                .values()
-                .fold(0_u64, |acc, m| acc.saturating_add(m.output_tokens));
-            if cost.is_finite() && cost >= 0.0 {
-                (cost, tin, tout, model, true)
-            } else {
-                (0.0, tin, tout, model, false)
-            }
-        }
+        Ok(sum) => classify_agentic_cost_summary(&sum, fallback_model),
         Err(_) => (0.0, 0, 0, fallback_model.to_string(), false),
+    }
+}
+
+fn classify_agentic_cost_summary(
+    sum: &zoder_core::EngineCostSummary,
+    fallback_model: &str,
+) -> (f64, u64, u64, String, bool) {
+    let cost = sum.window_cost_usd();
+    // Pick the dominant model in the window for attribution.
+    let model = sum
+        .by_model
+        .values()
+        .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens))
+        .map(|m| m.model.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_model.to_string());
+    let tin = sum
+        .by_model
+        .values()
+        .fold(0_u64, |acc, m| acc.saturating_add(m.input_tokens));
+    let tout = sum
+        .by_model
+        .values()
+        .fold(0_u64, |acc, m| acc.saturating_add(m.output_tokens));
+    // An empty successful query only proves that the engine found no
+    // rows in the requested slice. It does not authoritatively price
+    // the turn, so never turn it into a known $0 ledger entry.
+    if sum.request_count > 0 && !sum.by_model.is_empty() && cost.is_finite() && cost >= 0.0 {
+        (cost, tin, tout, model, true)
+    } else {
+        (0.0, tin, tout, model, false)
+    }
+}
+
+#[cfg(test)]
+mod agentic_cost_tests {
+    use super::*;
+
+    #[test]
+    fn empty_successful_cost_query_is_unknown_not_known_zero() {
+        let summary = zoder_core::EngineCostSummary::default();
+        let (cost, tin, tout, model, known) =
+            classify_agentic_cost_summary(&summary, "fallback-model");
+        assert_eq!((cost, tin, tout), (0.0, 0, 0));
+        assert_eq!(model, "fallback-model");
+        assert!(!known);
     }
 }
 
@@ -4326,7 +4354,12 @@ fn render_subscription_utilization_section(
             (BillingMode::Subscription, Some(plan)) => plan,
             _ => continue,
         };
-        let resolved: ResolvedPlan = resolve_plan_windows(plan, catalog, Some(&p.id));
+        let catalog_provider = plan
+            .tier
+            .as_deref()
+            .and_then(|tier| catalog.provider_namespace(p, tier))
+            .unwrap_or_else(|| p.id.clone());
+        let resolved: ResolvedPlan = resolve_plan_windows(plan, catalog, Some(&catalog_provider));
         if resolved.windows.is_empty() {
             continue;
         }
@@ -5604,12 +5637,10 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // (Finding #23). This matches what was actually written into the
     // ledger at ingestion time — a DeepSeek call recorded at 20:00 UTC
     // is reconciled at its off-peak rate, not peak.
-    let local: f64 = ledger
-        .entries_in(Some(since), None)?
-        .iter()
-        .filter(|e| e.provider.eq_ignore_ascii_case(provider))
-        .map(|e| pricing.cost_at(&e.model, e.tokens_in, e.tokens_out, Some(e.ts_utc)))
-        .sum();
+    let entries = ledger.entries_in(Some(since), None)?;
+    let (local_known, local_cost_unknown) = reconciliation_local_cost(&entries, provider, &pricing);
+    let local = (!local_cost_unknown).then_some(local_known);
+    let delta = local.map(|value| res.billed_usd - value);
 
     if json {
         println!(
@@ -5619,7 +5650,9 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
                 "days": res.days,
                 "provider_billed_usd": res.billed_usd,
                 "local_ledger_usd": local,
-                "delta_usd": res.billed_usd - local,
+                "local_ledger_known_usd": local_known,
+                "cost_unknown": local_cost_unknown,
+                "delta_usd": delta,
                 "source": res.source,
             })
         );
@@ -5629,10 +5662,68 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
             "  provider billed : ${:.2}  ({})",
             res.billed_usd, res.source
         );
-        println!("  local ledger    : ${:.2}  (priced by catalog)", local);
-        println!("  delta           : ${:.2}", res.billed_usd - local);
+        if local_cost_unknown {
+            println!(
+                "  local ledger    : unknown  (${local_known:.2} known subtotal; missing catalog pricing)"
+            );
+            println!("  delta           : unknown");
+        } else {
+            println!("  local ledger    : ${local_known:.2}  (priced by catalog)");
+            println!("  delta           : ${:.2}", res.billed_usd - local_known);
+        }
     }
     Ok(())
+}
+
+fn reconciliation_local_cost(
+    entries: &[Entry],
+    provider: &str,
+    pricing: &PricingCatalog,
+) -> (f64, bool) {
+    let mut known = 0.0;
+    let mut unknown = false;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.provider.eq_ignore_ascii_case(provider))
+    {
+        match pricing.classify_cost(
+            &entry.model,
+            entry.tokens_in,
+            entry.tokens_out,
+            Some(entry.ts_utc),
+        ) {
+            CostVerdict::Priced(cost) => known += cost,
+            CostVerdict::Free => {}
+            CostVerdict::Unknown => unknown = true,
+        }
+    }
+    (known, unknown)
+}
+
+#[cfg(test)]
+mod reconciliation_cost_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_catalog_price_marks_reconciliation_unknown() {
+        let entry = Entry {
+            ts_utc: chrono::Utc::now(),
+            provider: "openai".into(),
+            model: "missing-metered-model".into(),
+            host: "api.openai.com".into(),
+            tokens_in: 100,
+            tokens_out: 50,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: None,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+        };
+        let (known, unknown) =
+            reconciliation_local_cost(&[entry], "openai", &PricingCatalog::default());
+        assert_eq!(known, 0.0);
+        assert!(unknown, "missing pricing must not become authoritative $0");
+    }
 }
 
 fn cmd_sessions(json: bool) -> anyhow::Result<()> {
@@ -5757,7 +5848,8 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
             (BillingMode::Subscription, Some(plan)) => {
                 if let Some(t) = &plan.tier {
                     let conf = catalog
-                        .tier(&p.id, t)
+                        .provider_namespace(p, t)
+                        .and_then(|namespace| catalog.tier(&namespace, t))
                         .map(|e| e.confidence.as_str())
                         .unwrap_or("unknown");
                     format!(" tier={} (as_of={}, confidence={})", t, catalog.as_of, conf)
@@ -5777,7 +5869,18 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
             plan_header
         );
         if let (BillingMode::Subscription, Some(plan)) = (p.billing, &p.subscription) {
-            for w in plan_usage(&entries, &p.id, plan, &catalog) {
+            let catalog_provider = plan
+                .tier
+                .as_deref()
+                .and_then(|tier| catalog.provider_namespace(p, tier))
+                .unwrap_or_else(|| p.id.clone());
+            for w in zoder_core::plan_usage_for_catalog_provider(
+                &entries,
+                &p.id,
+                plan,
+                &catalog,
+                &catalog_provider,
+            ) {
                 let reset = w
                     .next_reset_utc
                     .as_deref()
