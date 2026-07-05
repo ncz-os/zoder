@@ -287,11 +287,14 @@ nightly:linux:
       [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
       echo "nightly using zeroclaw SHA=$ZC_SHA"
       for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        # No --locked on the vendored engine: reproducibility comes from the
-        # pinned zoder-integration SHA (resolve:zeroclaw-sha), not the fork's
-        # checked-in Cargo.lock, which drifts (git deps) and breaks --locked.
-        # Matches scripts/package.sh. zoder's own build above stays --locked.
-        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
+        # Prefer a reproducible --locked engine build (the fork's Cargo.lock is
+        # kept in sync); fall back to unlocked if it ever drifts so the nightly
+        # still ships (source reproducibility holds via the pinned SHA). Matches
+        # scripts/package.sh. zoder's own build above stays --locked.
+        if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" ); then
+          echo "WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
+          ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
+        fi
       done
       # Now safe to upload: all three binaries built successfully and
       # the engine SHA is pinned for this nightly. Publish zoder +
@@ -349,9 +352,12 @@ nightly:macos-arm64:
       ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
       ZC_SHA=$(git -C .zc-src rev-parse HEAD)
       [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
-      # No --locked on the vendored engine (see nightly:linux) — reproducibility
-      # is the pinned zoder-integration SHA, matching scripts/package.sh.
-      ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+      # Prefer --locked (fork lock kept in sync); fall back to unlocked on drift
+      # so the nightly still ships (see nightly:linux). Matches package.sh.
+      if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode ); then
+        echo "WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
+        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+      fi
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
       mkdir -p dist
       echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY

@@ -173,14 +173,17 @@ package_target() {
     local zcsrc; zcsrc="$(ensure_zeroclaw)"
     local feat=(); [ -n "${ZEROCLAW_BUILD_FEATURES:-}" ] && feat=(--features "$ZEROCLAW_BUILD_FEATURES")
     echo ">> [$tgt] build zerocode + zeroclaw ($b) from $zcsrc"
-    # Source reproducibility comes from ZEROCLAW_REF being an immutable SHA
-    # (Finding #17). We deliberately do NOT pass --locked here: the pinned
-    # zoder-integration branch carries a git dependency (whatsapp-rust) whose
-    # checked-in Cargo.lock drifts, so --locked fails with "cannot update the
-    # lock file". Keeping the fork's lock perfectly in sync is upstream fork
-    # maintenance, not a package-build concern; the SHA pin already makes the
-    # engine source deterministic across architectures.
-    ( cd "$zcsrc" && "$b" build --release -p "$ZEROCLAW_BIN_PKG" -p "$ZEROCODE_BIN_PKG" --bin zeroclaw --bin zerocode ${tflag[@]+"${tflag[@]}"} ${feat[@]+"${feat[@]}"} )
+    # Prefer a reproducible --locked build: the fork's zoder-integration
+    # Cargo.lock is kept in sync so exact transitive dep versions are pinned.
+    # If it ever drifts out of sync with Cargo.toml again (git-dep churn →
+    # "cannot update the lock file"), fall back to an unlocked build so the
+    # nightly still ships — source reproducibility still holds via the immutable
+    # ZEROCLAW_REF SHA (Finding #17), and the warning flags that the fork lock
+    # needs regenerating.
+    if ! ( cd "$zcsrc" && "$b" build --release --locked -p "$ZEROCLAW_BIN_PKG" -p "$ZEROCODE_BIN_PKG" --bin zeroclaw --bin zerocode ${tflag[@]+"${tflag[@]}"} ${feat[@]+"${feat[@]}"} ); then
+      echo ">> [$tgt] WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
+      ( cd "$zcsrc" && "$b" build --release -p "$ZEROCLAW_BIN_PKG" -p "$ZEROCODE_BIN_PKG" --bin zeroclaw --bin zerocode ${tflag[@]+"${tflag[@]}"} ${feat[@]+"${feat[@]}"} )
+    fi
     cp "$zcsrc/$reldir/zerocode" "$stage/zerocode"
     cp "$zcsrc/$reldir/zeroclaw" "$stage/zeroclaw"
   fi
@@ -196,9 +199,11 @@ package_target() {
       # Record the goose SHA for the manifest too.
       ( git -C "$gsrc" rev-parse HEAD > "$DIST/.goose-sha" ) 2>/dev/null || true
       echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF"
-      # No --locked: same rationale as the zeroclaw build above — GOOSE_REF is
-      # an immutable SHA (source-deterministic), but a vendored upstream lock we
-      # don't maintain can drift and break --locked.
+      # No --locked here: unlike the zoder-integration fork (whose Cargo.lock we
+      # regenerated so the zeroclaw build is --locked), goose's vendored lock has
+      # not been refreshed, so --locked would fail on drift. Source
+      # reproducibility holds via the immutable GOOSE_REF SHA. To make goose
+      # --locked too, regenerate + commit the goose fork's Cargo.lock (same fix).
       ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose \
           --no-default-features --features "$GOOSE_FEATURES" \
           --config 'profile.release.strip="symbols"' \
