@@ -152,10 +152,6 @@ pub struct FinOpsReport {
     pub forecast: BurnForecast,
 }
 
-fn day_key(ts: &DateTime<Utc>) -> String {
-    ts.format("%Y-%m-%d").to_string()
-}
-
 fn effective_rate(p: &ModelPrice) -> f64 {
     let i = p.input_usd_per_mtok;
     let o = p.output_usd_per_mtok;
@@ -457,41 +453,57 @@ pub fn forecast_burn(
     window_days: u32,
     until: DateTime<Utc>,
 ) -> anyhow::Result<BurnForecast> {
-    let since = until - chrono::Duration::days(window_days as i64);
+    let Some(days_before_until) = window_days.checked_sub(1) else {
+        return Ok(BurnForecast {
+            window_days,
+            avg_daily_cost_usd: 0.0,
+            median_daily_cost_usd: 0.0,
+            trend_usd_per_day: 0.0,
+            forecast_7d_usd: 0.0,
+            forecast_30d_usd: 0.0,
+            sample_days: 0,
+        });
+    };
+    let start_date = until
+        .date_naive()
+        .checked_sub_days(chrono::Days::new(u64::from(days_before_until)))
+        .ok_or_else(|| anyhow::anyhow!("forecast window is outside the supported date range"))?;
+    let since = start_date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid time")
+        .and_utc();
     let entries = ledger.entries_in(Some(since), Some(until))?;
-    let mut daily: BTreeMap<String, f64> = BTreeMap::new();
+    let mut daily = vec![0.0; window_days as usize];
     for e in entries {
         if e.cost_unknown {
             continue;
         }
-        let k = day_key(&e.ts_utc);
-        let total = daily.entry(k).or_insert(0.0);
-        *total = saturating_f64_add(*total, e.cost_usd);
+        let offset = e
+            .ts_utc
+            .date_naive()
+            .signed_duration_since(start_date)
+            .num_days();
+        if let Ok(offset) = usize::try_from(offset) {
+            if let Some(total) = daily.get_mut(offset) {
+                *total = saturating_f64_add(*total, e.cost_usd);
+            }
+        }
     }
-    let mut keys: Vec<String> = daily.keys().cloned().collect();
-    keys.sort();
-    let ys: Vec<f64> = keys.iter().map(|k| daily[k]).collect();
-    let xs: Vec<f64> = (0..keys.len()).map(|i| i as f64).collect();
-    let slope = linear_slope(&xs, &ys);
-    let mean_y = if ys.is_empty() {
-        0.0
-    } else {
-        ys.iter().sum::<f64>() / ys.len() as f64
-    };
-    let last_x = if xs.is_empty() {
-        0.0
-    } else {
-        *xs.last().unwrap()
-    };
-    let project = |n: f64| (mean_y + slope * (last_x + n)).max(0.0);
+    let xs: Vec<f64> = (0..window_days).map(f64::from).collect();
+    let slope = linear_slope(&xs, &daily);
+    let mean_x = xs.iter().sum::<f64>() / xs.len() as f64;
+    let mean_y = daily.iter().sum::<f64>() / daily.len() as f64;
+    let intercept = mean_y - slope * mean_x;
+    let last_x = f64::from(days_before_until);
+    let project = |n: f64| (intercept + slope * (last_x + n)).max(0.0);
     Ok(BurnForecast {
         window_days,
         avg_daily_cost_usd: mean_y,
-        median_daily_cost_usd: median(&ys),
+        median_daily_cost_usd: median(&daily),
         trend_usd_per_day: slope,
         forecast_7d_usd: project(7.0),
         forecast_30d_usd: project(30.0),
-        sample_days: ys.len(),
+        sample_days: daily.len(),
     })
 }
 
@@ -658,8 +670,8 @@ pub fn cli_run(
     argv: &[String],
 ) -> anyhow::Result<i32> {
     let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
-    let since: Option<DateTime<Utc>> = parse_flag(argv, "--since").map(parse_date);
-    let until: Option<DateTime<Utc>> = parse_flag(argv, "--until").map(parse_date);
+    let since: Option<DateTime<Utc>> = parse_flag(argv, "--since").map(parse_date).transpose()?;
+    let until: Option<DateTime<Utc>> = parse_flag(argv, "--until").map(parse_date).transpose()?;
     let window_days: u32 = parse_flag(argv, "--window-days")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(30);
@@ -667,6 +679,9 @@ pub fn cli_run(
     let paint = Paint::new(theme);
     let until_dt = until.unwrap_or_else(Utc::now);
     let since_dt = since.unwrap_or_else(|| until_dt - chrono::Duration::days(30));
+    if since_dt > until_dt {
+        anyhow::bail!("invalid date range: --since must be earlier than or equal to --until");
+    }
     if sub == "forecast" {
         let fc = forecast_burn(ledger, window_days, until_dt)?;
         if json {
@@ -759,14 +774,18 @@ fn parse_flag(argv: &[String], key: &str) -> Option<String> {
     None
 }
 
-fn parse_date(s: String) -> DateTime<Utc> {
+fn parse_date(s: String) -> anyhow::Result<DateTime<Utc>> {
     if let Ok(d) = DateTime::parse_from_rfc3339(&s) {
-        return d.with_timezone(&Utc);
+        return Ok(d.with_timezone(&Utc));
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-        return DateTime::<Utc>::from_naive_utc_and_offset(d.and_hms_opt(0, 0, 0).unwrap(), Utc);
+        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(
+            d.and_hms_opt(0, 0, 0)
+                .expect("midnight is always a valid time"),
+            Utc,
+        ));
     }
-    Utc::now()
+    anyhow::bail!("invalid date {s:?}: expected YYYY-MM-DD or RFC 3339")
 }
 
 #[cfg(test)]
@@ -963,6 +982,119 @@ mod tests {
         let rendered = render_finops_text(&report, &Paint::new(&Theme::default()));
         assert!(rendered.contains("unknown cost:"));
         assert!(rendered.contains("excluded from spend and rates"));
+    }
+
+    #[test]
+    fn forecast_includes_zero_cost_days_across_the_full_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        rec(
+            &led,
+            "2026-06-15 10:00:00",
+            "p",
+            "vendor/model",
+            30.0,
+            100,
+            10,
+        );
+        let until = chrono::NaiveDate::from_ymd_opt(2026, 6, 30)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc();
+
+        let forecast = forecast_burn(&led, 30, until).unwrap();
+
+        assert_eq!(forecast.sample_days, 30);
+        assert!((forecast.avg_daily_cost_usd - 1.0).abs() < 1e-9);
+        assert_eq!(forecast.median_daily_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn forecast_projects_from_the_fitted_regression_intercept() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        for (day, cost) in [(1, 3.0), (2, 5.0), (3, 7.0), (4, 9.0)] {
+            rec(
+                &led,
+                &format!("2026-06-{day:02} 10:00:00"),
+                "p",
+                "vendor/model",
+                cost,
+                100,
+                10,
+            );
+        }
+        let until = chrono::NaiveDate::from_ymd_opt(2026, 6, 4)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc();
+
+        let forecast = forecast_burn(&led, 4, until).unwrap();
+
+        assert!((forecast.trend_usd_per_day - 2.0).abs() < 1e-9);
+        assert!((forecast.forecast_7d_usd - 23.0).abs() < 1e-9);
+        assert!((forecast.forecast_30d_usd - 69.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forecast_trend_preserves_gaps_between_activity_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        rec(
+            &led,
+            "2026-06-01 10:00:00",
+            "p",
+            "vendor/model",
+            3.0,
+            100,
+            10,
+        );
+        rec(
+            &led,
+            "2026-06-04 10:00:00",
+            "p",
+            "vendor/model",
+            9.0,
+            100,
+            10,
+        );
+        let until = chrono::NaiveDate::from_ymd_opt(2026, 6, 4)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc();
+
+        let forecast = forecast_burn(&led, 4, until).unwrap();
+
+        // The regression is over [3, 0, 0, 9], not the compressed [3, 9].
+        assert!((forecast.trend_usd_per_day - 1.8).abs() < 1e-9);
+        assert!((forecast.forecast_7d_usd - 18.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_dates_and_reversed_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let pricing = PricingCatalog::default();
+        let theme = Theme::default();
+
+        let invalid = ["finops", "report", "--since", "2026-99-99"].map(str::to_string);
+        let error = cli_run(&led, &pricing, &theme, &invalid).unwrap_err();
+        assert!(error.to_string().contains("invalid date"));
+
+        let reversed = [
+            "finops",
+            "report",
+            "--since",
+            "2026-07-02",
+            "--until",
+            "2026-07-01",
+        ]
+        .map(str::to_string);
+        let error = cli_run(&led, &pricing, &theme, &reversed).unwrap_err();
+        assert!(error.to_string().contains("--since must be earlier"));
     }
 
     #[test]
