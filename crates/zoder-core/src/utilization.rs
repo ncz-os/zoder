@@ -997,6 +997,9 @@ pub struct AccountView {
     pub provider: Provider,
     pub account_id: String,
     pub plan: String,
+    /// Provider-published credit availability. `Some(false)` is a hard
+    /// fallback signal even when the snapshot contains no rate-limit windows.
+    pub has_credits: Option<bool>,
     /// Configured windows, in catalog order. Every window in the plan
     /// shows up here — even ones with `used_percent = None` (unknown /
     /// PercentOnly-without-numeric) — so the caller can iterate the
@@ -1194,6 +1197,7 @@ pub fn build_account_view(
         provider,
         account_id,
         plan,
+        has_credits: header_record.and_then(|record| record.has_credits),
         windows: views,
     }
 }
@@ -1324,6 +1328,13 @@ pub fn decide_account(
     now: DateTime<Utc>,
     chargeback_remaining: Option<f64>,
 ) -> AccountDecision {
+    if account.has_credits == Some(false) {
+        return AccountDecision {
+            decision: RouteDecision::FallBackToFree,
+            strength: 100.0,
+            binding_window: None,
+        };
+    }
     // Observable = numeric AND not degraded. Stale is still observable
     // (the 0.8 discount is applied at binding time, not at observability
     // time); Degraded is not.
@@ -1603,11 +1614,7 @@ fn compute_used_percent(used_tokens: f64, cap: Option<f64>) -> Option<f64> {
 /// The caller additionally gates this migration on the persisted schema
 /// version, preventing legitimate sub-2% values in v2 from being corrupted.
 fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
-    if let (Some(p), Some(c)) = (cw.used_percent, cw.cap) {
-        if c.is_finite() && c > 0.0 && p.is_finite() && (0.0..=2.0).contains(&p) {
-            cw.used_percent = Some(p * 100.0);
-        }
-    }
+    cw.used_percent = compute_used_percent(cw.used_tokens, cw.cap);
 }
 
 impl UtilizationRecord {
@@ -1799,11 +1806,11 @@ impl UtilizationStore {
         }
     }
 
-    /// Upsert a snapshot. No-op if the snapshot has no windows — we
-    /// don't want a presence-only OpenAI sighting to wipe a richer Codex
-    /// record under the same key.
+    /// Upsert a snapshot. No-op only if it has neither windows nor a credits
+    /// signal. A credits-only `has_credits=false` sighting must survive so L4
+    /// can make the same hard-fallback decision as the legacy path.
     pub fn upsert(&mut self, snap: &RateLimitSnapshot, now: DateTime<Utc>) {
-        if snap.primary.is_none() && snap.secondary.is_none() {
+        if snap.primary.is_none() && snap.secondary.is_none() && snap.has_credits.is_none() {
             return;
         }
         let k = key(snap.provider, &snap.account_id, &snap.plan);
@@ -1829,7 +1836,7 @@ impl UtilizationStore {
     /// that the store chose to drop (so the caller can decide whether to
     /// bother logging).
     pub fn record(&mut self, snap: &RateLimitSnapshot, now: DateTime<Utc>) -> bool {
-        if snap.primary.is_none() && snap.secondary.is_none() {
+        if snap.primary.is_none() && snap.secondary.is_none() && snap.has_credits.is_none() {
             return false;
         }
         self.upsert(snap, now);
@@ -3100,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_counter_percent_migration_rescales_full_and_exhausted_fractions_only() {
+    fn legacy_counter_percent_migration_recomputes_from_tokens_and_cap() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-04T12:00:00Z";
         let counter = |name: &str, used_percent: f64| {
@@ -3124,7 +3131,7 @@ mod tests {
                 "counters": {
                     "full": counter("full", 1.0),
                     "exhausted": counter("exhausted", 1.2),
-                    "already_percent": counter("already_percent", 85.0)
+                    "three_x_cap": counter("three_x_cap", 3.0)
                 }
             }))
             .unwrap(),
@@ -3133,10 +3140,7 @@ mod tests {
         let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
         assert_eq!(migrated.counters["full"].used_percent, Some(100.0));
         assert_eq!(migrated.counters["exhausted"].used_percent, Some(120.0));
-        assert_eq!(
-            migrated.counters["already_percent"].used_percent,
-            Some(85.0)
-        );
+        assert_eq!(migrated.counters["three_x_cap"].used_percent, Some(300.0));
 
         let current_path = dir.path().join("current-v2.json");
         std::fs::write(
@@ -3205,6 +3209,7 @@ mod tests {
             provider,
             account_id: account_id.to_string(),
             plan: plan.to_string(),
+            has_credits: None,
             windows,
         }
     }
@@ -3240,6 +3245,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(70.0), weekly_fresh(60.0)],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3281,6 +3287,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![stale, fresh],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3318,6 +3325,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![degraded_95, fresh_50],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3357,6 +3365,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![d1, d2],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3433,6 +3442,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![hot_5h, cool_weekly],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3465,6 +3475,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![hot],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3485,6 +3496,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(40.0)],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3503,6 +3515,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(82.0)],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3520,6 +3533,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(90.0)],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3537,6 +3551,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(90.0)],
         };
         let mut knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
@@ -3554,6 +3569,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(90.0)],
         };
         let mut knobs = knobs_with(80.0, 85.0, BudgetMode::Chargeback, Some(50.0));
@@ -3573,12 +3589,14 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "idle".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(40.0)],
         };
         let acct_busy = AccountView {
             provider: Provider::Anthropic,
             account_id: "busy".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fresh_5h(82.0)],
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
@@ -3708,6 +3726,78 @@ mod tests {
         // Finding #3: percent is in 0..=100 — 250_000 / 1_000_000 = 25%.
         assert!((w.used_percent.unwrap() - 25.0).abs() < 1e-9);
         assert_eq!(w.health, TelemetryHealth::Fresh);
+    }
+
+    #[test]
+    fn codex_five_hour_header_binds_chatgpt_short_window() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut store = UtilizationStore::default();
+        let snapshot = RateLimitSnapshot {
+            provider: Provider::OpenaiCodex,
+            account_id: "default".into(),
+            plan: "chatgpt-pro".into(),
+            primary: Some(WindowSnapshot {
+                used_percent: Some(90.0),
+                reset_at_epoch: None,
+                window_minutes: Some(300),
+                label: Some("primary".into()),
+            }),
+            secondary: None,
+            has_credits: Some(true),
+            observed_at: Some(now),
+        };
+        store.upsert(&snapshot, now);
+        let window = crate::config::QuotaWindow {
+            name: "5h".into(),
+            hours: 5,
+            unit: crate::config::QuotaUnit::Messages,
+            cap: Some(200.0),
+            models: None,
+            observability: crate::config::Observability::Header,
+            reset: crate::config::ResetKind::Rolling,
+        };
+        let view = build_account_view(
+            Provider::OpenaiCodex,
+            "default",
+            "chatgpt-pro",
+            &[window],
+            &store,
+            now,
+        );
+        assert_eq!(view.windows[0].used_percent, Some(90.0));
+        assert_eq!(
+            decide_account(&view, &RouteKnobs::default(), now, None).decision,
+            RouteDecision::FallBackToFree
+        );
+    }
+
+    #[test]
+    fn credits_only_snapshot_survives_and_forces_l4_fallback() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut store = UtilizationStore::default();
+        let snapshot = RateLimitSnapshot {
+            provider: Provider::OpenaiCodex,
+            account_id: "default".into(),
+            plan: "chatgpt-pro".into(),
+            primary: None,
+            secondary: None,
+            has_credits: Some(false),
+            observed_at: Some(now),
+        };
+        assert!(store.record(&snapshot, now));
+        let view = build_account_view(
+            Provider::OpenaiCodex,
+            "default",
+            "chatgpt-pro",
+            &[],
+            &store,
+            now,
+        );
+        assert_eq!(view.has_credits, Some(false));
+        assert_eq!(
+            decide_account(&view, &RouteKnobs::default(), now, None).decision,
+            RouteDecision::FallBackToFree
+        );
     }
 
     #[test]
@@ -3852,6 +3942,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fc_win(
                 "monthly",
                 720,
@@ -3875,6 +3966,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fc_win(
                 "monthly",
                 720,
@@ -3899,6 +3991,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![fc_win(
                 "monthly",
                 720,
@@ -3922,6 +4015,7 @@ mod tests {
             provider: Provider::Anthropic,
             account_id: "a".into(),
             plan: "max".into(),
+            has_credits: None,
             windows: vec![
                 fc_win(
                     "5h",

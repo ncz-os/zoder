@@ -101,6 +101,92 @@ pub(crate) fn persist_agentic_utilization(
     persist_agentic_utilization_at(provider, headers, &path, Utc::now())
 }
 
+/// Persist real agent-reported token consumption into configured MiniMax
+/// counter windows. This is quota accounting only when a catalog/explicit
+/// token cap exists; percent-only context windows are never synthesized.
+fn persist_agentic_counter_at(
+    provider: &zoder_core::config::Provider,
+    tokens_used: u64,
+    path: &Path,
+    now: DateTime<Utc>,
+) -> bool {
+    let (util_provider, plan_label) = utilization_key(provider);
+    if util_provider != zoder_core::utilization::Provider::MiniMax || tokens_used == 0 {
+        return false;
+    }
+    let Some(plan) = provider.subscription.as_ref() else {
+        return false;
+    };
+    let catalog = zoder_core::subscription_tiers::TierCatalog::bundled();
+    let namespace = plan
+        .tier
+        .as_deref()
+        .and_then(|tier| catalog.provider_namespace(provider, tier))
+        .unwrap_or_else(|| provider.id.clone());
+    let resolved =
+        zoder_core::subscription_tiers::resolve_plan_windows(plan, &catalog, Some(&namespace));
+    let counter_windows: Vec<_> = resolved
+        .windows
+        .iter()
+        .filter(|window| {
+            window.observability == zoder_core::config::Observability::Counter
+                && window.cap.is_some()
+        })
+        .collect();
+    if counter_windows.is_empty() {
+        return false;
+    }
+    let Ok(mut store) = zoder_core::utilization::UtilizationStore::open(path) else {
+        return false;
+    };
+    for window in counter_windows {
+        store.set_counter_cap(
+            util_provider,
+            "default",
+            &plan_label,
+            &window.name,
+            window.cap,
+            now,
+        );
+        let period_id = match window.reset {
+            zoder_core::config::ResetKind::CalendarMonthly => {
+                zoder_core::utilization::period_id_for(now)
+            }
+            zoder_core::config::ResetKind::CalendarDaily => {
+                Some(now.format("%Y-%m-%d").to_string())
+            }
+            zoder_core::config::ResetKind::Rolling => None,
+        };
+        store.set_counter_period_id(
+            util_provider,
+            "default",
+            &plan_label,
+            &window.name,
+            period_id,
+            now,
+        );
+        store.record_counter(
+            util_provider,
+            "default",
+            &plan_label,
+            &window.name,
+            tokens_used as f64,
+            now,
+        );
+    }
+    store.save().is_ok()
+}
+
+pub(crate) fn persist_agentic_counter(
+    provider: &zoder_core::config::Provider,
+    tokens_used: u64,
+) -> bool {
+    let Some(path) = zoder_core::utilization::default_store_path() else {
+        return false;
+    };
+    persist_agentic_counter_at(provider, tokens_used, &path, Utc::now())
+}
+
 #[cfg(test)]
 mod agentic_utilization_tests {
     use super::*;
@@ -121,6 +207,31 @@ mod agentic_utilization_tests {
                 windows: Vec::new(),
             }),
             serves: vec!["gpt-".into()],
+        }
+    }
+
+    fn minimax_counter_provider() -> zoder_core::config::Provider {
+        zoder_core::config::Provider {
+            id: "minimax".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(zoder_core::config::SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: None,
+                windows: vec![zoder_core::config::QuotaWindow {
+                    name: "monthly".into(),
+                    hours: 720,
+                    unit: zoder_core::config::QuotaUnit::Tokens,
+                    cap: Some(100.0),
+                    models: None,
+                    observability: zoder_core::config::Observability::Counter,
+                    reset: zoder_core::config::ResetKind::CalendarMonthly,
+                }],
+            }),
+            serves: vec!["MiniMax-".into()],
         }
     }
 
@@ -145,6 +256,43 @@ mod agentic_utilization_tests {
         );
         assert_eq!(plan, "chatgpt-pro");
         assert!(store.get(util_provider, "default", &plan).is_none());
+    }
+
+    #[test]
+    fn agentic_minimax_usage_increments_capped_counter_and_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let provider = minimax_counter_provider();
+        let now = Utc::now();
+        assert!(persist_agentic_counter_at(&provider, 90, &path, now));
+
+        let store = UtilizationStore::open_unlocked(&path).unwrap();
+        let (util_provider, plan) = utilization_key(&provider);
+        let counter = store
+            .get_counter(util_provider, "default", &plan, "monthly")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 90.0);
+        assert_eq!(counter.cap, Some(100.0));
+        assert_eq!(counter.used_percent, Some(90.0));
+        let windows = &provider.subscription.as_ref().unwrap().windows;
+        let view = zoder_core::utilization::build_account_view(
+            util_provider,
+            "default",
+            &plan,
+            windows,
+            &store,
+            now,
+        );
+        assert_eq!(
+            zoder_core::utilization::decide_account(
+                &view,
+                &zoder_core::utilization::RouteKnobs::default(),
+                now,
+                None,
+            )
+            .decision,
+            zoder_core::utilization::RouteDecision::FallBackToFree
+        );
     }
 
     #[cfg(unix)]

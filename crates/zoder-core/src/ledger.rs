@@ -151,6 +151,25 @@ pub struct Rollup {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub calls: u64,
+    /// Usage whose price was unknown. It is deliberately segregated from the
+    /// known-cost token/call denominator so `$0` is never inferred.
+    pub unknown_cost_tokens: u64,
+    pub unknown_cost_calls: u64,
+}
+
+fn accumulate_rollup(rollup: &mut Rollup, entry: &Entry) -> anyhow::Result<()> {
+    if entry.cost_unknown {
+        rollup.unknown_cost_tokens = rollup
+            .unknown_cost_tokens
+            .saturating_add(entry.tokens_in.saturating_add(entry.tokens_out));
+        rollup.unknown_cost_calls = rollup.unknown_cost_calls.saturating_add(entry.calls);
+        return Ok(());
+    }
+    add_cost(&mut rollup.cost_usd, entry.cost_usd)?;
+    rollup.tokens_in = rollup.tokens_in.saturating_add(entry.tokens_in);
+    rollup.tokens_out = rollup.tokens_out.saturating_add(entry.tokens_out);
+    rollup.calls = rollup.calls.saturating_add(entry.calls);
+    Ok(())
 }
 
 pub struct Ledger {
@@ -325,7 +344,14 @@ impl Ledger {
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         let bucket = Utc::now().format("%Y-%m").to_string();
         match self.rollup(Period::Month) {
-            Ok(m) => Ok(m.get(&bucket).map(|r| r.cost_usd).unwrap_or(0.0)),
+            Ok(m) => match m.get(&bucket) {
+                Some(r) if r.unknown_cost_calls > 0 => anyhow::bail!(
+                    "month-to-date spend contains {} call(s) with unknown cost",
+                    r.unknown_cost_calls
+                ),
+                Some(r) => Ok(r.cost_usd),
+                None => Ok(0.0),
+            },
             Err(e) => Err(e.context(format!(
                 "reading month-to-date spend from {}",
                 self.path.display()
@@ -347,10 +373,7 @@ impl Ledger {
             // A pre-fix ledger had every entry with `calls: 1`, so the
             // old `+= 1` happened to be correct — but a rollup row with
             // `calls: 10` (a legitimate aggregate) was counted as one.
-            add_cost(&mut r.cost_usd, e.cost_usd)?;
-            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
-            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
-            r.calls = r.calls.saturating_add(e.calls);
+            accumulate_rollup(r, &e)?;
         }
         Ok(out)
     }
@@ -367,10 +390,7 @@ impl Ledger {
         let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(period.bucket(&e.ts_utc)).or_default();
-            add_cost(&mut r.cost_usd, e.cost_usd)?;
-            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
-            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
-            r.calls = r.calls.saturating_add(e.calls);
+            accumulate_rollup(r, &e)?;
         }
         Ok(out)
     }
@@ -395,10 +415,7 @@ impl Ledger {
         let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
         for e in self.entries_in_filtered(since, until, keep)? {
             let r = out.entry(e.model.clone()).or_default();
-            add_cost(&mut r.cost_usd, e.cost_usd)?;
-            r.tokens_in = r.tokens_in.saturating_add(e.tokens_in);
-            r.tokens_out = r.tokens_out.saturating_add(e.tokens_out);
-            r.calls = r.calls.saturating_add(e.calls);
+            accumulate_rollup(r, &e)?;
         }
         Ok(out)
     }
@@ -458,6 +475,25 @@ mod tests {
         );
         let total_cost: f64 = r.values().map(|r| r.cost_usd).sum();
         assert!((total_cost - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rollup_segregates_unknown_cost_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        led.record(&entry("2026-07-01 10:00:00", "m", 2.0, 100, 50, 1))
+            .unwrap();
+        let mut unknown = entry("2026-07-01 11:00:00", "m", 0.0, 400, 100, 2);
+        unknown.cost_unknown = true;
+        led.record(&unknown).unwrap();
+        let bucket = led.rollup(Period::Day).unwrap();
+        let row = bucket.values().next().unwrap();
+        assert_eq!(row.cost_usd, 2.0);
+        assert_eq!(row.tokens_in, 100);
+        assert_eq!(row.tokens_out, 50);
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.unknown_cost_tokens, 500);
+        assert_eq!(row.unknown_cost_calls, 2);
     }
 
     /// Finding #22: a JSONL entry carrying `tags` deserializes and
@@ -589,5 +625,26 @@ mod tests {
         assert!((got - 1.0).abs() < 1e-9, "month total {got}");
         // Spot-check the bucket exists under the expected key.
         let _ = month;
+    }
+
+    #[test]
+    fn month_to_date_fails_closed_when_current_cost_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let unknown = Entry {
+            ts_utc: Utc::now(),
+            provider: "p".into(),
+            model: "uncatalogued".into(),
+            host: String::new(),
+            tokens_in: 100,
+            tokens_out: 20,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: None,
+            tags: FinOpsTags::default(),
+        };
+        led.record(&unknown).unwrap();
+        assert!(led.month_to_date_usd().is_err());
     }
 }
