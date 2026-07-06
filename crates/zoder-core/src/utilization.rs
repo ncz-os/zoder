@@ -217,9 +217,32 @@ impl Provider {
     /// typed value. Returns `None` when no header in the input hints at a
     /// known vendor.
     pub fn detect(headers: &dyn HeaderLookup) -> Option<Provider> {
+        // Codex: must match every header `parse_codex` actually consults.
+        // The previous version only matched three of the ten headers the
+        // parser reads, so a Codex response that carried ONLY a header
+        // outside that set (e.g. a proxy that strips
+        // `x-codex-primary-used-percent` but forwards
+        // `x-codex-secondary-used-percent`, or a stripped-shape response
+        // carrying only `x-codex-credits-has-credits` /
+        // `x-codex-primary-reset-at` / `x-codex-primary-window-minutes`)
+        // would fall through every branch and `parse_headers` would
+        // return `None` — silently dropping a real secondary-window
+        // reading. The hard invariant is "absent is unknown, never 0",
+        // and the corollary is "a recognizable Codex header set must
+        // route to the Codex parser" (Finding: detect/parse drift).
         if headers.get("x-codex-plan-type").is_some()
             || headers.get("x-codex-active-limit").is_some()
+            || headers.get("x-codex-credits-has-credits").is_some()
             || headers.get("x-codex-primary-used-percent").is_some()
+            || headers.get("x-codex-primary-window-minutes").is_some()
+            || headers.get("x-codex-primary-reset-at").is_some()
+            || headers.get("x-codex-primary-reset-after-seconds").is_some()
+            || headers.get("x-codex-secondary-used-percent").is_some()
+            || headers.get("x-codex-secondary-window-minutes").is_some()
+            || headers.get("x-codex-secondary-reset-at").is_some()
+            || headers
+                .get("x-codex-secondary-reset-after-seconds")
+                .is_some()
         {
             return Some(Provider::OpenaiCodex);
         }
@@ -2402,6 +2425,75 @@ mod tests {
         assert_eq!(s.provider, Provider::Openai);
         let h = hm([("content-type", "application/json")]);
         assert!(parse_headers(&h, "acct", "free").is_none());
+    }
+
+    // Regression: `Provider::detect` and `parse_codex` were drifting — the
+    // detector only checked three of the ten `x-codex-*` headers the parser
+    // actually consults. A Codex response carrying ONLY a header outside
+    // that set (e.g. a proxy that strips `x-codex-primary-used-percent` but
+    // forwards `x-codex-secondary-used-percent`, or a stripped-shape
+    // response carrying only `x-codex-credits-has-credits` /
+    // `x-codex-primary-reset-at` / `x-codex-primary-window-minutes`) made
+    // `detect` return `None`, so `parse_headers` returned `None` and the
+    // entire header set was silently dropped — including a real
+    // secondary-window reading. The hard invariant ("absent is unknown,
+    // never 0", and its corollary "a recognizable Codex header set must
+    // route to the Codex parser") requires the detector to match every
+    // header the parser consumes. This test pins that contract for the
+    // secondary-only case the previous detector missed.
+    #[test]
+    fn detect_routes_secondary_only_codex_headers_to_codex_parser() {
+        // Detect must tag the header set as Codex.
+        let h = hm([("x-codex-secondary-used-percent", "50")]);
+        assert_eq!(
+            Provider::detect(&h),
+            Some(Provider::OpenaiCodex),
+            "a Codex-shaped secondary-only header set must be detected as Codex"
+        );
+        // parse_headers must surface the secondary reading (the parser
+        // builds a real `secondary` window with `used_percent = 50`; the
+        // bug previously returned `None` here).
+        let s = parse_headers(&h, "acct", "pro").expect(
+            "a Codex-shaped secondary-only header set must not be dropped \
+             by parse_headers",
+        );
+        assert_eq!(s.provider, Provider::OpenaiCodex);
+        let secondary = s
+            .secondary
+            .as_ref()
+            .expect("secondary window must be populated from the secondary header");
+        assert_eq!(secondary.used_percent, Some(50.0));
+        // And the routing decision must use it — a 50% secondary reading
+        // alone must NOT fabricate a PreferSub against an 85% cap_guard;
+        // this is the L3 contract the regression guards.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        assert_eq!(
+            decide(&s, &RouteKnobs::default(), now, None),
+            RouteDecision::PreferSub
+        );
+        // And the sibling-tolerance contract: a malformed value on the
+        // primary header must not also discard the secondary reading.
+        // Before the fix this combination dropped the entire header set.
+        let h2 = hm([
+            ("x-codex-primary-used-percent", "NaN"),
+            ("x-codex-secondary-used-percent", "37"),
+        ]);
+        let s2 = parse_headers(&h2, "acct", "pro").expect(
+            "a malformed primary header must not cause a valid secondary \
+             reading to be dropped",
+        );
+        assert_eq!(s2.provider, Provider::OpenaiCodex);
+        assert!(
+            s2.primary.is_none(),
+            "malformed primary percent must surface as None (no signal), \
+             not as Some(_) — Finding #5"
+        );
+        assert_eq!(
+            s2.secondary.as_ref().and_then(|w| w.used_percent),
+            Some(37.0),
+            "valid sibling-window reading must survive a malformed value \
+             on the other window (sibling tolerance)"
+        );
     }
 
     // -------- effective_used ---------------------------------------
