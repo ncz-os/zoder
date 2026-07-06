@@ -311,6 +311,120 @@ fn pick_transport(raw: &RawServerEntry) -> McpTransportKind {
 }
 
 // ---------------------------------------------------------------------------
+// to_acp_mcp_servers: convert parsed specs into the goose ACP mcpServers
+// wire format.
+//
+// Goose 1.37's ACP `session/new` accepts an `mcpServers` array whose
+// entries are an UNTAGGED enum with exactly two shapes (verified against
+// the goose 1.37 binary — wrong field names cause goose to reject with
+// "data did not match any variant of untagged enum McpServer"):
+//
+//   stdio server:
+//     {
+//       "name":    "<string>",
+//       "command": "<string>",
+//       "args":    ["<string>", ...],
+//       "env":     [{"name": "<string>", "value": "<string>"}, ...]
+//     }
+//
+//   http / streamable-http server:
+//     {
+//       "name":    "<string>",
+//       "url":     "<string>",
+//       "headers": [{"name": "<string>", "value": "<string>"}, ...]
+//     }
+//
+// SSE is NOT supported by goose (it logs
+// "SSE is unsupported, migrate to streamable_http" and rejects the
+// session). We never emit an SSE-shaped variant here — any SSE spec
+// the parser saw (it would have been classified as `Http` because the
+// parser already coalesces `type = "sse"` to `Http` when a `url` is
+// present) is rendered in the http form, which is the migration target
+// goose asks for. If a user configured `type = "sse"` without a url,
+// the spec lands as `Unknown` and is skipped.
+//
+// Specs whose `enabled` flag is explicitly `false` are skipped —
+// matches the `mcp list` table column, which already demotes those.
+// Specs with `Unknown` transport have no recognizable command or url
+// to render, so they are skipped (and a warning is logged so the
+// operator can spot a misconfigured entry in the log).
+/// Convert parsed [`McpServerSpec`]s into goose ACP `mcpServers`
+/// JSON values. Returns an empty `Vec` when no specs are configured,
+/// so the caller can pass the result straight into `session/new`'s
+/// `mcpServers` field without further branching (NON-BREAKING: an
+/// empty input sends an empty array, identical to today's hardcoded
+/// `[]`).
+pub fn to_acp_mcp_servers(specs: &[McpServerSpec]) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for spec in specs {
+        // Mirror the `mcp list` table column: explicit `enabled = false`
+        // demotes; absence is enabled (presence under `[mcp_servers.<name>]`
+        // already implies intent).
+        if matches!(spec.enabled, Some(false)) {
+            continue;
+        }
+        match spec.transport {
+            McpTransportKind::Stdio => {
+                // Stdio needs a command — if the parser produced a Stdio
+                // spec without one (which shouldn't happen, but defensive),
+                // skip rather than emit a malformed entry that goose would
+                // reject.
+                let Some(command) = spec.command.as_deref() else {
+                    tracing::warn!(
+                        server = %spec.name,
+                        "skipping stdio mcp server with no command (malformed spec)",
+                    );
+                    continue;
+                };
+                out.push(serde_json::json!({
+                    "name": spec.name,
+                    "command": command,
+                    "args": spec.args,
+                    // BTreeMap iteration is sorted by key, so the rendered
+                    // JSON object is stable for tests and for goose
+                    // (which is content-based, but stable ordering keeps
+                    // diffs readable).
+                    "env": spec
+                        .env
+                        .iter()
+                        .map(|(k, v)| serde_json::json!({"name": k, "value": v}))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+            McpTransportKind::Http => {
+                // Http needs a url — defensive skip if missing.
+                let Some(url) = spec.url.as_deref() else {
+                    tracing::warn!(
+                        server = %spec.name,
+                        "skipping http mcp server with no url (malformed spec)",
+                    );
+                    continue;
+                };
+                out.push(serde_json::json!({
+                    "name": spec.name,
+                    "url": url,
+                    "headers": spec
+                        .headers
+                        .iter()
+                        .map(|(k, v)| serde_json::json!({"name": k, "value": v}))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+            McpTransportKind::Unknown => {
+                // No recognizable transport; skip with a warning so the
+                // operator can spot it in the log without us silently
+                // emitting a malformed entry.
+                tracing::warn!(
+                    server = %spec.name,
+                    "skipping mcp server with unknown transport (no command/cmd/url/uri)",
+                );
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -614,5 +728,219 @@ env = { K = "v" }
         let json = serde_json::to_string(&specs).expect("serialize");
         let back: Vec<McpServerSpec> = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(specs, back);
+    }
+
+    // --- to_acp_mcp_servers: goose ACP wire format ---------------------
+
+    /// A stdio spec with args + env renders as the stdio variant of
+    /// the goose `mcpServers` untagged enum. Field names and the
+    /// env-array-of-{name,value} shape MUST match goose 1.37
+    /// exactly or goose rejects with
+    /// "data did not match any variant of untagged enum McpServer".
+    #[test]
+    fn to_acp_stdio_spec_matches_goose_wire_shape() {
+        let raw = r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+env = { API_KEY = "secret", DEBUG = "1" }
+"#;
+        let specs = parse_mcp_servers_config(raw).expect("parse");
+        let acp = to_acp_mcp_servers(&specs);
+        assert_eq!(acp.len(), 1, "got: {acp:#?}");
+
+        let entry = &acp[0];
+        // Exact field names goose expects.
+        assert_eq!(entry["name"], "lookup");
+        assert_eq!(entry["command"], "node");
+        assert_eq!(entry["args"], serde_json::json!(["server.js"]));
+        // env must be an ARRAY OF OBJECTS {name, value} — NOT a map.
+        let env = entry["env"].as_array().expect("env must be an array");
+        assert_eq!(env.len(), 2, "env entries: {env:#?}");
+        // BTreeMap iteration is sorted, so DEBUG < API_KEY. Verify both
+        // entries by (name, value) shape rather than order so the test
+        // is robust to BTreeMap-vs-other-map changes.
+        let by_name: std::collections::BTreeMap<&str, &str> = env
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().expect("env entry name"),
+                    e["value"].as_str().expect("env entry value"),
+                )
+            })
+            .collect();
+        assert_eq!(by_name.get("API_KEY").copied(), Some("secret"));
+        assert_eq!(by_name.get("DEBUG").copied(), Some("1"));
+        // No accidental extras.
+        assert!(
+            entry.get("url").is_none(),
+            "stdio variant must NOT carry a url field; got: {entry}"
+        );
+        assert!(
+            entry.get("headers").is_none(),
+            "stdio variant must NOT carry a headers field; got: {entry}"
+        );
+    }
+
+    /// An http spec renders as the http variant with headers as the
+    /// array-of-{name,value} shape. Same field-name precision rule
+    /// as the stdio case.
+    #[test]
+    fn to_acp_http_spec_matches_goose_wire_shape() {
+        let raw = r#"
+[mcp_servers.github]
+type = "streamable_http"
+url = "https://api.example.com/mcp/"
+headers = { Authorization = "Bearer TOKEN" }
+"#;
+        let specs = parse_mcp_servers_config(raw).expect("parse");
+        let acp = to_acp_mcp_servers(&specs);
+        assert_eq!(acp.len(), 1, "got: {acp:#?}");
+
+        let entry = &acp[0];
+        assert_eq!(entry["name"], "github");
+        assert_eq!(entry["url"], "https://api.example.com/mcp/");
+        let headers = entry["headers"]
+            .as_array()
+            .expect("headers must be an array");
+        assert_eq!(headers.len(), 1, "headers: {headers:#?}");
+        assert_eq!(headers[0]["name"], "Authorization");
+        assert_eq!(headers[0]["value"], "Bearer TOKEN");
+        // No accidental extras.
+        assert!(
+            entry.get("command").is_none(),
+            "http variant must NOT carry a command field; got: {entry}"
+        );
+        assert!(
+            entry.get("args").is_none(),
+            "http variant must NOT carry an args field; got: {entry}"
+        );
+        assert!(
+            entry.get("env").is_none(),
+            "http variant must NOT carry an env field; got: {entry}"
+        );
+    }
+
+    /// A server explicitly disabled via `enabled = false` is omitted
+    /// from the output — matches the `mcp list` table column, which
+    /// already demotes these to "disabled". An enabled sibling still
+    /// appears.
+    #[test]
+    fn to_acp_skips_disabled_server() {
+        let raw = r#"
+[mcp_servers.live]
+command = "live"
+
+[mcp_servers.dead]
+command = "dead"
+enabled = false
+"#;
+        let specs = parse_mcp_servers_config(raw).expect("parse");
+        let acp = to_acp_mcp_servers(&specs);
+        assert_eq!(acp.len(), 1, "disabled server leaked into output: {acp:#?}");
+        assert_eq!(acp[0]["name"], "live");
+        assert_eq!(acp[0]["command"], "live");
+    }
+
+    /// Empty input yields an empty Vec — session/new sends `[]`,
+    /// identical to today's hardcoded behavior (NON-BREAKING).
+    #[test]
+    fn to_acp_empty_input_yields_empty_vec() {
+        let acp = to_acp_mcp_servers(&[]);
+        assert!(acp.is_empty());
+    }
+
+    /// A parsed set with no servers also yields an empty Vec.
+    /// Combined with the session/new call site, this is what
+    /// `cargo run -- mcp list` users get today.
+    #[test]
+    fn to_acp_empty_parsed_set_yields_empty_vec() {
+        let specs = parse_mcp_servers_config("").expect("parse");
+        let acp = to_acp_mcp_servers(&specs);
+        assert!(acp.is_empty());
+    }
+
+    /// Mixed input: a stdio and an http server render as TWO
+    /// separate entries — one stdio object, one http object.
+    #[test]
+    fn to_acp_mixed_set_renders_both_variants() {
+        let raw = r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#;
+        let specs = parse_mcp_servers_config(raw).expect("parse");
+        let acp = to_acp_mcp_servers(&specs);
+        assert_eq!(acp.len(), 2, "got: {acp:#?}");
+
+        let lookup = acp
+            .iter()
+            .find(|e| e["name"] == "lookup")
+            .expect("lookup in acp");
+        assert_eq!(lookup["command"], "node");
+        assert!(
+            lookup.get("url").is_none(),
+            "lookup is stdio — must NOT have url; got: {lookup}"
+        );
+
+        let kiwi = acp
+            .iter()
+            .find(|e| e["name"] == "mcp_kiwi_com")
+            .expect("kiwi in acp");
+        assert_eq!(kiwi["url"], "https://mcp.kiwi.com");
+        assert!(
+            kiwi.get("command").is_none(),
+            "kiwi is http — must NOT have command; got: {kiwi}"
+        );
+    }
+
+    /// Specs with `Unknown` transport (no recognizable command/url)
+    /// are skipped, not emitted as malformed entries that goose
+    /// would reject.
+    #[test]
+    fn to_acp_skips_unknown_transport_specs() {
+        // Build a spec whose transport is Unknown: a table that
+        // carries no `command`/`cmd`/`url`/`uri` AND no `type`
+        // discriminator. The parser rejects these outright (it
+        // returns an error from `build_spec`), so we instead build
+        // the spec by hand here to exercise the conversion
+        // function's defensive branch directly.
+        let spec = McpServerSpec {
+            name: "weird".to_string(),
+            transport: McpTransportKind::Unknown,
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            enabled: None,
+            source: McpSource::McpServersTable,
+        };
+        let acp = to_acp_mcp_servers(&[spec]);
+        assert!(
+            acp.is_empty(),
+            "Unknown transport must be skipped, not emitted; got: {acp:#?}"
+        );
+    }
+
+    /// Specs with `enabled = None` (no flag declared) are included
+    /// — matches the `mcp list` column, which treats presence under
+    /// `[mcp_servers.<name>]` as intent. Verifies the demotion
+    /// logic doesn't accidentally also exclude absent flags.
+    #[test]
+    fn to_acp_includes_specs_with_no_enabled_flag() {
+        let raw = r#"
+[mcp_servers.lookup]
+command = "node"
+"#;
+        let specs = parse_mcp_servers_config(raw).expect("parse");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].enabled, None);
+        let acp = to_acp_mcp_servers(&specs);
+        assert_eq!(acp.len(), 1, "absent enabled flag must NOT skip");
+        assert_eq!(acp[0]["name"], "lookup");
     }
 }
