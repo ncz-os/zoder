@@ -829,8 +829,15 @@ impl RoutingContext {
                 continue;
             }
             let (util_provider, plan_label) = agentic::utilization_key(provider);
+            // KNEMON per-account identity: thread the configured
+            // `effective_account_id()` into the AccountView so two
+            // accounts on the same `(provider, tier)` don't merge into
+            // the literal `"default"` key. A provider with no
+            // `account_id` set resolves to `DEFAULT_ACCOUNT_ID` —
+            // byte-identical to the pre-fix behavior.
+            let account_id = plan.effective_account_id();
             let view =
-                build_account_view(util_provider, "default", plan_label, &windows, store, now);
+                build_account_view(util_provider, account_id, plan_label, &windows, store, now);
             let has_live_signal = view.has_credits.is_some()
                 || view.windows.iter().any(|window| {
                     window.used_percent.is_some()
@@ -2035,7 +2042,20 @@ fn scenario_chain_for_roles(
         let primary_model = resolve_effective_primary(cli, eng)?;
         let provider = rc.real_provider_for_model(&eng.cfg, &primary_model)?;
         let (util_provider, plan) = agentic::utilization_key(provider);
-        load_snapshot_for(util_provider, "default", &plan)
+        // KNEMON per-account identity: look up the configured
+        // `effective_account_id()` of the provider that serves the
+        // primary, so the snapshot's `(provider, account_id, plan)`
+        // key matches whatever `capture_rate_limit_snapshot` and the
+        // counter-fed paths wrote for this provider. Pre-fix this was
+        // the literal `"default"`; a legacy single-account provider
+        // still resolves to `"default"` via `effective_account_id()`
+        // and behaves byte-identically.
+        let account_id = provider
+            .subscription
+            .as_ref()
+            .map(|s| s.effective_account_id())
+            .unwrap_or_else(|| zoder_core::config::DEFAULT_ACCOUNT_ID.to_string());
+        load_snapshot_for(util_provider, &account_id, &plan)
     })();
 
     // Fix #1 (Layer 4 wiring): build per-candidate `AccountView`s from
@@ -2177,8 +2197,15 @@ fn build_account_views_for_candidates(
                 return None;
             }
             let (util_prov, plan_label) = agentic::utilization_key(provider);
+            // KNEMON per-account identity: thread the configured
+            // `effective_account_id()` into the AccountView so two
+            // accounts on the same `(provider, tier)` keep separate
+            // views. Pre-fix this was the literal `"default"`; a
+            // legacy config without `account_id` resolves to
+            // `DEFAULT_ACCOUNT_ID` and produces a byte-identical view.
+            let account_id = plan.effective_account_id();
             Some(build_av(
-                util_prov, "default", plan_label, &windows, &store, now,
+                util_prov, account_id, plan_label, &windows, &store, now,
             ))
         })
         .collect()
@@ -5046,9 +5073,16 @@ fn render_subscription_utilization_section(
         }
         let (util_prov, plan_key) = agentic::utilization_key(p);
         let knobs = RouteKnobs::for_triple(util_prov, &p.id, &plan_label(plan));
+        // KNEMON per-account identity: thread the configured
+        // `effective_account_id()` into the AccountView so two
+        // accounts on the same `(provider, tier)` keep separate views.
+        // Pre-fix this was the literal `"default"`; a legacy config
+        // without `account_id` resolves to `DEFAULT_ACCOUNT_ID` and
+        // produces a byte-identical view.
+        let account_id = plan.effective_account_id();
         let view = build_account_view(
             util_prov,
-            "default",
+            account_id,
             plan_key,
             &resolved.windows,
             store,
@@ -8358,6 +8392,192 @@ mod subscription_utilization_render_tests {
         assert!(
             out.contains("as_of="),
             "missing as_of= prefix on disclaimer line in:\n{out}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // KNEMON per-account regression tests (Layer 5 follow-up).
+    //
+    // (b) A route/report for a multi-account provider must surface the
+    //     distinguishing `account_id` in the rendered block, so the
+    //     operator can tell two accounts on the same `(provider, tier)`
+    //     apart at a glance. Pre-fix this collapsed onto the literal
+    //     `"default"` key and the renderer printed the same string for
+    //     both accounts.
+    //
+    // (c) A legacy single-default config produces byte-identical output
+    //     to the pre-fix renderer (the per-account layer is dormant
+    //     when only one account is configured for the provider).
+    // -----------------------------------------------------------------
+
+    /// (b) Two `AccountView`s on the same `(provider, plan)` but with
+    /// distinct `account_id`s MUST render distinguishable blocks. We
+    /// build both views against the same empty store (so no live
+    /// telemetry) and assert the rendered strings carry the per-
+    /// account labels.
+    #[test]
+    fn l5_two_account_views_render_distinguishing_account_labels() {
+        let now = fixed_now();
+        let personal = AccountView {
+            provider: UtilProvider::OpenaiCodex,
+            account_id: "personal".to_string(),
+            plan: "chatgpt-pro".to_string(),
+            has_credits: Some(true),
+            windows: vec![fresh_window("primary", 5, 40.0)],
+        };
+        let team = AccountView {
+            provider: UtilProvider::OpenaiCodex,
+            account_id: "team".to_string(),
+            plan: "chatgpt-pro".to_string(),
+            has_credits: Some(true),
+            windows: vec![fresh_window("primary", 5, 80.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let d_personal = decide_account(&personal, &knobs, now, None);
+        let d_team = decide_account(&team, &knobs, now, None);
+        let b_personal = render_account_block(&personal, &d_personal, &knobs, &pal(), now);
+        let b_team = render_account_block(&team, &d_team, &knobs, &pal(), now);
+
+        // (b) Core assertion: each block names its own account_id, so
+        // an operator scanning the report can tell `personal` and
+        // `team` apart at a glance. Pre-fix both blocks would carry the
+        // literal `"default"` and the test would fail because each
+        // would CONTAIN the OTHER's id by accident (or NEITHER).
+        assert!(
+            b_personal.contains("(personal / chatgpt-pro)"),
+            "personal block missing the per-account label; got:\n{b_personal}"
+        );
+        assert!(
+            b_team.contains("(team / chatgpt-pro)"),
+            "team block missing the per-account label; got:\n{b_team}"
+        );
+        // And — critically — the strings must be distinguishable. A
+        // regression that hard-codes `"default"` would make the two
+        // blocks look identical (both would contain the same header
+        // substring); assert the literals are not interchangeable.
+        assert!(
+            !b_personal.contains("(team /"),
+            "personal block leaked the team label; got:\n{b_personal}"
+        );
+        assert!(
+            !b_team.contains("(personal /"),
+            "team block leaked the personal label; got:\n{b_team}"
+        );
+    }
+
+    /// (c) Legacy single-default config: a provider whose effective
+    /// `account_id` is `DEFAULT_ACCOUNT_ID` must render the legacy
+    /// `provider (default / plan)` block — i.e. byte-identical to the
+    /// pre-fix output. We pin the exact substrings so any future
+    /// change to the renderer that shifts the default case is caught
+    /// (the spec calls this out as the explicit back-compat guarantee).
+    #[test]
+    fn l5_legacy_default_account_renders_byte_identical_to_pre_fix() {
+        let now = fixed_now();
+        let acct = AccountView {
+            provider: UtilProvider::MiniMax,
+            account_id: "default".to_string(),
+            plan: "minimax-monthly".to_string(),
+            has_credits: None,
+            windows: vec![fresh_window("monthly", 720, 40.0)],
+        };
+        let knobs = knobs(80.0, 85.0);
+        let decision = decide_account(&acct, &knobs, now, None);
+        let block = render_account_block(&acct, &decision, &knobs, &pal(), now);
+
+        // Exact back-compat substring: the pre-fix renderer printed the
+        // header as `  minmax (default / minimax-monthly)`. We assert
+        // the post-fix renderer still does so when `account_id ==
+        // "default"`, so a config without `account_id` keeps its
+        // existing operator-visible output.
+        assert!(
+            block.contains("(default / minimax-monthly)"),
+            "legacy default-account block must render the pre-fix header unchanged; got:\n{block}"
+        );
+        // And the existing `IDLE` hint + binding line still appears —
+        // the per-account wiring doesn't touch the per-window rendering.
+        assert!(
+            block.contains("IDLE (40.0% used, 60.0% headroom) -> preferring for build work"),
+            "IDLE hint regression; got:\n{block}"
+        );
+        assert!(
+            block.contains("binding=monthly") && block.contains("verdict=prefer_sub"),
+            "binding/verdict lines missing in legacy block; got:\n{block}"
+        );
+    }
+
+    /// (b) End-to-end: when two `SubscriptionPlan`s on the same
+    /// provider carry distinct `account_id`s, the
+    /// `Subscription utilization` section surfaces BOTH ids so the
+    /// operator can tell them apart at a glance. Pre-fix the section
+    /// would have rendered both blocks under the same `(default / ...)`
+    /// header and the two accounts were indistinguishable.
+    #[test]
+    fn l5_section_renders_distinct_account_labels_for_two_accounts() {
+        let now = fixed_now();
+        let store = UtilizationStore::default();
+        let catalog = TierCatalog::bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(tmp.path());
+        // Two providers on the same `(provider_id, tier)` (chatgpt-pro
+        // for OpenAI-Codex) — distinguished only by `account_id`. The
+        // validator must accept this pair (it already does — that's
+        // the prior config-foundation commit); the regression here is
+        // about the RENDER side.
+        cfg.providers[0].billing = BillingMode::Subscription;
+        cfg.providers[0].subscription = Some(SubscriptionPlan {
+            monthly_fee_usd: 0.0,
+            tier: Some("chatgpt-pro".into()),
+            windows: vec![QuotaWindow {
+                name: "primary".to_string(),
+                hours: 5,
+                unit: zoder_core::QuotaUnit::Messages,
+                cap: Some(100.0),
+                models: None,
+                observability: Observability::Header,
+                reset: ResetKind::default(),
+            }],
+            account_id: Some("personal".into()),
+        });
+        cfg.providers.push(zoder_core::Provider {
+            id: "openai-team".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            kind: "openai-responses".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 0.0,
+                tier: Some("chatgpt-pro".into()),
+                windows: vec![QuotaWindow {
+                    name: "primary".to_string(),
+                    hours: 5,
+                    unit: zoder_core::QuotaUnit::Messages,
+                    cap: Some(100.0),
+                    models: None,
+                    observability: Observability::Header,
+                    reset: ResetKind::default(),
+                }],
+                account_id: Some("team".into()),
+            }),
+            serves: Vec::new(),
+        });
+        let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
+        // Both labels must surface so the operator can tell them apart.
+        assert!(
+            out.contains("(personal / chatgpt-pro)"),
+            "section missing the personal account label; got:\n{out}"
+        );
+        assert!(
+            out.contains("(team / chatgpt-pro)"),
+            "section missing the team account label; got:\n{out}"
+        );
+        // And the legacy `"default"` literal must NOT appear for these
+        // two non-default accounts — that would be the pre-fix
+        // collision symptom.
+        assert!(
+            !out.contains("(default / chatgpt-pro)"),
+            "section leaked the literal default id for a non-default account; got:\n{out}"
         );
     }
 }

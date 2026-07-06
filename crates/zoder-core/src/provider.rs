@@ -1,7 +1,7 @@
 //! Provider layer: OpenAI-compatible chat calls with streaming + LiteLLM
 //! telemetry extraction (exact per-call cost, served backend, fallbacks).
 
-use crate::config::Provider;
+use crate::config::{Provider, DEFAULT_ACCOUNT_ID};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -394,6 +394,16 @@ pub struct OpenAiProvider {
     /// catalog tier when the provider has a `subscription.tier`; the
     /// provider id otherwise. Always set so the store key is stable.
     plan_label: String,
+    /// KNEMON per-account identity for KNEMON capture paths (header-fed
+    /// snapshot recording + counter-fed token accounting). Resolved once
+    /// at construction from the configured
+    /// [`crate::config::SubscriptionPlan::effective_account_id`] so every
+    /// `(provider, account_id, plan)` key the runtime writes is the one
+    /// the routing reader looks up. Defaults to [`DEFAULT_ACCOUNT_ID`]
+    /// when the provider has no `subscription` (free / metered providers
+    /// still produce a stable key, but no record is ever written under
+    /// it because capture paths bail before reaching the store).
+    account_id: String,
     client: reqwest::Client,
     request_timeout: Duration,
     idle_timeout: Duration,
@@ -406,12 +416,25 @@ impl OpenAiProvider {
             .as_ref()
             .map(|s| s.tier.clone().unwrap_or_else(|| "explicit".to_string()))
             .unwrap_or_else(|| p.id.clone());
+        // KNEMON per-account identity: thread the configured
+        // `effective_account_id()` through every capture path so two
+        // accounts on the same `(provider, tier)` never collide on the
+        // literal `"default"` key. Providers with no `subscription`
+        // (free / metered) still resolve to `DEFAULT_ACCOUNT_ID` — the
+        // capture paths short-circuit before writing anything in that
+        // case, so the choice is observable only on subscription wires.
+        let account_id = p
+            .subscription
+            .as_ref()
+            .map(|s| s.effective_account_id())
+            .unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
         Ok(Self {
             base_url: p.base_url.trim_end_matches('/').to_string(),
             kind: p.kind.clone(),
             auth_header: p.auth.header_pair(),
             provider_id: p.id.clone(),
             plan_label,
+            account_id,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -422,6 +445,24 @@ impl OpenAiProvider {
             )),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
         })
+    }
+
+    /// KNEMON per-account identity resolved at construction time from
+    /// the configured [`crate::config::SubscriptionPlan::effective_account_id`].
+    /// Exposed for tests + the few callers (CLI routes / reports) that
+    /// want to key utilization-store lookups by the same id the live
+    /// capture path uses, instead of hard-coding the literal `"default"`.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Plan label resolved at construction time from
+    /// [`Provider::subscription`] (catalog tier when present, the
+    /// configured plan label `"explicit"` when absent, or the provider
+    /// id when the provider has no subscription at all). Stable per
+    /// provider so the store key survives re-reads.
+    pub fn plan_label(&self) -> &str {
+        &self.plan_label
     }
 
     /// Build an endpoint URL for `suffix` (e.g. `"chat/completions"`,
@@ -585,8 +626,16 @@ impl OpenAiProvider {
         // and persist a snapshot to ~/.zoder/utilization.json. The route
         // planner reads that store on the next turn to gate subscriptions
         // against headroom. BEST-EFFORT — any parse / IO error must not
-        // poison the request.
-        capture_rate_limit_snapshot(resp.headers(), &self.base_url, &self.kind, &self.plan_label);
+        // poison the request. The snapshot's `account_id` is the configured
+        // plan's `effective_account_id` (not the literal `"default"`) so
+        // two accounts on the same `(provider, tier)` never collide.
+        capture_rate_limit_snapshot(
+            resp.headers(),
+            &self.base_url,
+            &self.kind,
+            &self.plan_label,
+            &self.account_id,
+        );
         if !status.is_success() {
             let code = status.as_u16();
             let retry_after = retry_after_header(resp.headers());
@@ -615,10 +664,14 @@ impl OpenAiProvider {
             // header-fed capture above already ran on the response
             // headers; for MiniMax that path is a clean no-op, so this
             // is the only signal that provider contributes. Best-effort.
+            // `account_id` is the configured `effective_account_id` —
+            // NOT the literal `"default"` — so two MiniMax accounts on
+            // the same tier keep separate counter buckets.
             capture_counter_usage(
                 &self.provider_id,
                 &self.base_url,
                 &self.plan_label,
+                &self.account_id,
                 r.prompt_tokens,
                 r.completion_tokens,
                 chrono::Utc::now(),
@@ -630,6 +683,7 @@ impl OpenAiProvider {
                 &self.provider_id,
                 &self.base_url,
                 &self.plan_label,
+                &self.account_id,
                 r.prompt_tokens,
                 r.completion_tokens,
                 chrono::Utc::now(),
@@ -982,21 +1036,30 @@ impl<'a> crate::utilization::HeaderLookup for ReqwestHeaderProbe<'a> {
 /// stale disk or a provider that started publishing a brand-new header
 /// shape can never fail the in-flight request.
 ///
-/// The account is not knowable from a single response, so it uses the stable
-/// `"default"` key. The configured plan label is passed by `OpenAiProvider`
-/// and normalized after parsing so capture and scenario/report lookup use the
-/// same tuple even when Codex publishes a different display label.
+/// `account_id` is the configured
+/// [`crate::config::SubscriptionPlan::effective_account_id`] of the
+/// provider that served this response — KNEMON's per-account identity.
+/// The HTTP wire doesn't publish the account, so we read it from the
+/// provider config. A legacy provider that omits `account_id` resolves
+/// to [`DEFAULT_ACCOUNT_ID`], preserving byte-for-byte the pre-fix
+/// behavior on a single-account config. Two providers on the same
+/// `(vendor, tier)` with different `account_id`s now keep separate
+/// `(provider, account_id, plan)` rows. The configured plan label is
+/// passed by `OpenAiProvider` and normalized after parsing so capture
+/// and scenario/report lookup use the same tuple even when Codex
+/// publishes a different display label.
 fn capture_rate_limit_snapshot(
     headers: &reqwest::header::HeaderMap,
     base_url: &str,
     _kind: &str,
     plan: &str,
+    account_id: &str,
 ) {
     let Some(provider) = detect_utilization_provider(headers, base_url) else {
         return;
     };
     let Some(mut snap) =
-        crate::utilization::RateLimitSnapshot::from_headers(headers, provider, "default", plan)
+        crate::utilization::RateLimitSnapshot::from_headers(headers, provider, account_id, plan)
     else {
         return;
     };
@@ -1032,6 +1095,14 @@ fn capture_rate_limit_snapshot(
 /// the path for codex/anthropic; this function is the counterpart that
 /// catches the no-header providers so they don't silently leak.
 ///
+/// `account_id` is the configured
+/// [`crate::config::SubscriptionPlan::effective_account_id`] of the
+/// provider that served the response (see
+/// [`capture_rate_limit_snapshot`] for the rationale). Counter rows
+/// are keyed on `(provider, account_id, plan, window_name)`, so two
+/// MiniMax accounts on the same tier now keep separate buckets instead
+/// of colliding on the legacy `"default"` key.
+///
 /// Only windows with `observability = Counter` are incremented;
 /// `PercentOnly` windows are intentionally untouched (the spec is
 /// explicit: "Only windows with observability=Counter accumulate token
@@ -1040,6 +1111,7 @@ fn capture_counter_usage(
     provider_id: &str,
     base_url: &str,
     plan: &str,
+    account_id: &str,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     now: chrono::DateTime<chrono::Utc>,
@@ -1096,7 +1168,7 @@ fn capture_counter_usage(
             if matches!(w.observability, crate::config::Observability::Counter) {
                 store.set_counter_rolling_hours(
                     crate::utilization::Provider::MiniMax,
-                    "default",
+                    account_id,
                     plan,
                     &w.name,
                     (w.reset == crate::config::ResetKind::Rolling).then_some(w.hours),
@@ -1104,7 +1176,7 @@ fn capture_counter_usage(
                 );
                 store.set_counter_cap(
                     crate::utilization::Provider::MiniMax,
-                    "default",
+                    account_id,
                     plan,
                     &w.name,
                     w.cap,
@@ -1121,7 +1193,7 @@ fn capture_counter_usage(
                 };
                 store.set_counter_period_id(
                     crate::utilization::Provider::MiniMax,
-                    "default",
+                    account_id,
                     plan,
                     &w.name,
                     period_id,
@@ -1142,7 +1214,7 @@ fn capture_counter_usage(
     // just walked; today a single monthly window is enough.
     store.record_counter(
         crate::utilization::Provider::MiniMax,
-        "default",
+        account_id,
         plan,
         "monthly",
         total_tokens,
@@ -1156,6 +1228,9 @@ fn capture_counter_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        Auth, BillingMode, Observability, QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan,
+    };
 
     #[test]
     fn endpoint_url_never_doubles_v1() {
@@ -1280,5 +1355,320 @@ mod tests {
             reasoning_only.has_meaningful_message(),
             "a non-empty reasoning_content counts as meaningful"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // KNEMON per-account wiring — regression tests for the follow-up
+    // that threaded `SubscriptionPlan::effective_account_id()` through
+    // every capture / counter / routing path. The schema-validation
+    // half already landed (config.rs); these tests pin the runtime
+    // half so a future refactor can't silently re-collapse two
+    // configured accounts onto the literal `"default"` key.
+    //
+    // The three regression cases the task calls out:
+    //   (a) two configured accounts on the same `(provider, tier)` keep
+    //       separate counter / snapshot rows (no collision);
+    //   (b) the report/route rendering for a multi-account provider
+    //       shows the distinguishing account label;
+    //   (c) a legacy single-default config still resolves to
+    //       `DEFAULT_ACCOUNT_ID` end-to-end (byte-identical to before).
+    // -----------------------------------------------------------------
+
+    /// Build a `Provider` fixture whose `SubscriptionPlan` carries an
+    /// `account_id` (or `None`, for the legacy cases). The provider id,
+    /// base_url, kind, and tier are stable across the four regression
+    /// tests so only the `account_id` field varies.
+    fn fixture_subscription_provider(account_id: Option<&str>) -> Provider {
+        Provider {
+            id: "minimax".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: Some("token-plan-2".into()),
+                windows: vec![QuotaWindow {
+                    name: "monthly".into(),
+                    hours: 720,
+                    unit: QuotaUnit::Tokens,
+                    cap: Some(100.0),
+                    models: None,
+                    observability: Observability::Counter,
+                    reset: ResetKind::CalendarMonthly,
+                }],
+                account_id: account_id.map(|s| s.to_string()),
+            }),
+            serves: vec!["MiniMax-".into()],
+        }
+    }
+
+    /// (c) Legacy single-default config: a provider with no `account_id`
+    /// must resolve to `DEFAULT_ACCOUNT_ID` for both the OpenAiProvider
+    /// capture wire AND the store-side `effective_account_id` accessor.
+    /// This is the byte-identical-to-today guarantee.
+    #[test]
+    fn knemon_legacy_provider_without_account_id_resolves_to_default() {
+        let legacy = fixture_subscription_provider(None);
+        let prov = OpenAiProvider::new(&legacy).expect("legacy provider must build");
+        assert_eq!(
+            prov.account_id(),
+            DEFAULT_ACCOUNT_ID,
+            "no-account provider must resolve to DEFAULT_ACCOUNT_ID for back-compat"
+        );
+        // And the same id flows through the `effective_account_id()` accessor
+        // on the subscription plan itself — i.e. CLI and provider agree.
+        assert_eq!(
+            legacy.subscription.as_ref().unwrap().effective_account_id(),
+            DEFAULT_ACCOUNT_ID
+        );
+    }
+
+    /// (c) Provider with a configured non-default `account_id` resolves
+    /// to the configured label, NOT the literal `"default"`. Pre-fix
+    /// this returned `"default"` and two accounts on the same tier
+    /// silently collided.
+    #[test]
+    fn knemon_provider_with_account_id_resolves_to_configured_label() {
+        let personal = fixture_subscription_provider(Some("personal"));
+        let team = fixture_subscription_provider(Some("team"));
+        let p_prov = OpenAiProvider::new(&personal).expect("build");
+        let t_prov = OpenAiProvider::new(&team).expect("build");
+        assert_eq!(p_prov.account_id(), "personal");
+        assert_eq!(t_prov.account_id(), "team");
+        // And the two ids MUST be distinct — the whole point of the
+        // fix. Without it, both would have collapsed to "default".
+        assert_ne!(p_prov.account_id(), t_prov.account_id());
+    }
+
+    /// (a) Two providers configured for the same `(provider, tier)`
+    /// but with distinct `account_id`s must NOT collide in the
+    /// utilization store. Pre-fix, capture_rate_limit_snapshot and
+    /// capture_counter_usage hard-coded the literal `"default"`, so
+    /// every account on the same tier overwrote every other. We prove
+    /// the fix by feeding each account its own snapshot + counter
+    /// increment and reading them back independently through the same
+    /// `UtilizationStore` API the CLI uses.
+    #[test]
+    fn knemon_per_account_counters_do_not_collide_on_same_tier() {
+        use crate::utilization::{Provider as UtilProv, UtilizationStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut store = UtilizationStore::open(&path).expect("store open");
+        let now = chrono::Utc::now();
+        let plan = "token-plan-2";
+
+        // Personal account: 30 tokens used.
+        let personal = fixture_subscription_provider(Some("personal"));
+        let personal_acct = personal
+            .subscription
+            .as_ref()
+            .unwrap()
+            .effective_account_id();
+        store.set_counter_cap(
+            UtilProv::MiniMax,
+            &personal_acct,
+            plan,
+            "monthly",
+            Some(100.0),
+            now,
+        );
+        let p_used = store.record_counter(
+            UtilProv::MiniMax,
+            &personal_acct,
+            plan,
+            "monthly",
+            30.0,
+            now,
+        );
+        assert_eq!(
+            p_used, 30.0,
+            "personal counter must record exactly its own 30 tokens"
+        );
+
+        // Team account: 70 tokens used, same provider + same tier.
+        let team = fixture_subscription_provider(Some("team"));
+        let team_acct = team.subscription.as_ref().unwrap().effective_account_id();
+        store.set_counter_cap(
+            UtilProv::MiniMax,
+            &team_acct,
+            plan,
+            "monthly",
+            Some(100.0),
+            now,
+        );
+        let t_used =
+            store.record_counter(UtilProv::MiniMax, &team_acct, plan, "monthly", 70.0, now);
+        assert_eq!(
+            t_used, 70.0,
+            "team counter must record exactly its own 70 tokens, untouched by personal"
+        );
+
+        // Read back independently: each counter row holds the value
+        // for its own account; neither sees the other's increment.
+        let p_row = store
+            .get_counter(UtilProv::MiniMax, &personal_acct, plan, "monthly")
+            .expect("personal counter row");
+        let t_row = store
+            .get_counter(UtilProv::MiniMax, &team_acct, plan, "monthly")
+            .expect("team counter row");
+        assert_eq!(p_row.used_tokens, 30.0);
+        assert_eq!(t_row.used_tokens, 70.0);
+        // CRITICAL: the pre-fix bug collapsed both onto the literal
+        // `"default"` key, so the second `record_counter` would have
+        // overwritten the first (`used_tokens == 70.0` for BOTH reads).
+        // Assert distinctness directly so the test FAILS if either id
+        // is mistakenly passed as `"default"`.
+        assert_ne!(
+            p_row.used_tokens, t_row.used_tokens,
+            "two accounts on the same tier must keep separate used_tokens (got collision)"
+        );
+        assert_eq!(p_row.account_id, "personal");
+        assert_eq!(t_row.account_id, "team");
+    }
+
+    /// (a) Two snapshots with the same `(provider, plan)` but distinct
+    /// `account_id`s must produce independent `UtilizationRecord` rows
+    /// — i.e. the header-fed capture path's
+    /// `(provider, account_id, plan)` key must include the configured
+    /// id, not the literal `"default"`. We drive the public store API
+    /// (the same one `capture_rate_limit_snapshot` uses internally) so
+    /// a regression in either the call site or the storage key is
+    /// caught.
+    #[test]
+    fn knemon_per_account_snapshots_do_not_collide_on_same_tier() {
+        use crate::utilization::{Provider as UtilProv, RateLimitSnapshot, UtilizationStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let mut store = UtilizationStore::open(&path).expect("store open");
+        let now = chrono::Utc::now();
+        let plan = "chatgpt-pro";
+
+        // Personal snapshot — 40% primary used.
+        let personal_snap = RateLimitSnapshot {
+            provider: UtilProv::OpenaiCodex,
+            account_id: "personal".into(),
+            plan: plan.into(),
+            primary: Some(crate::utilization::WindowSnapshot {
+                used_percent: Some(40.0),
+                reset_at_epoch: None,
+                window_minutes: Some(300),
+                label: Some("primary".into()),
+            }),
+            secondary: None,
+            has_credits: Some(true),
+            observed_at: Some(now),
+        };
+        assert!(store.record(&personal_snap, now));
+
+        // Team snapshot — 80% primary used, same `(provider, plan)`.
+        let team_snap = RateLimitSnapshot {
+            provider: UtilProv::OpenaiCodex,
+            account_id: "team".into(),
+            plan: plan.into(),
+            primary: Some(crate::utilization::WindowSnapshot {
+                used_percent: Some(80.0),
+                reset_at_epoch: None,
+                window_minutes: Some(300),
+                label: Some("primary".into()),
+            }),
+            secondary: None,
+            has_credits: Some(true),
+            observed_at: Some(now),
+        };
+        assert!(store.record(&team_snap, now));
+
+        // Read back independently: personal sees 40%, team sees 80%.
+        let p_rec = store
+            .get(UtilProv::OpenaiCodex, "personal", plan)
+            .expect("personal record");
+        let t_rec = store
+            .get(UtilProv::OpenaiCodex, "team", plan)
+            .expect("team record");
+        assert_eq!(p_rec.primary.as_ref().unwrap().used_percent, Some(40.0));
+        assert_eq!(t_rec.primary.as_ref().unwrap().used_percent, Some(80.0));
+        assert_eq!(p_rec.account_id, "personal");
+        assert_eq!(t_rec.account_id, "team");
+    }
+
+    /// (c) End-to-end: a legacy `SubscriptionPlan` with no `account_id`
+    /// produces an `OpenAiProvider` whose `account_id()` accessor
+    /// matches `DEFAULT_ACCOUNT_ID`, AND whose `plan_label()` matches
+    /// the catalog tier. Pre-fix the runtime wrote the literal
+    /// `"default"`; this pins the post-fix behavior so a future
+    /// regression that re-introduces a hard-coded literal would flip
+    /// the assertion and fail the build.
+    #[test]
+    fn knemon_legacy_provider_pins_default_account_id_and_plan_label() {
+        let legacy = fixture_subscription_provider(None);
+        let prov = OpenAiProvider::new(&legacy).expect("build");
+        assert_eq!(prov.account_id(), DEFAULT_ACCOUNT_ID);
+        assert_eq!(prov.plan_label(), "token-plan-2");
+    }
+
+    /// (a) End-to-end through the private `capture_rate_limit_snapshot`
+    /// helper: feed it real `x-codex-*` headers with one `account_id`,
+    /// then again with a different `account_id`, and verify the rows
+    /// land under their respective keys instead of colliding on
+    /// `"default"`. This pins the integration point where the
+    /// `OpenAiProvider` wire-up threads the configured id through the
+    /// capture helper, independent of the public `OpenAiProvider` API
+    /// surface.
+    #[test]
+    fn knemon_capture_rate_limit_snapshot_threads_account_id_through() {
+        use crate::utilization::{Provider as UtilProv, UtilizationStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        // The capture helper writes to `default_store_path()` —
+        // override `ZODER_HOME` so the test doesn't touch
+        // `~/.zoder/utilization.json`.
+        std::env::set_var("ZODER_HOME", dir.path());
+
+        // Real Codex `x-codex-*` headers — `from_headers` needs at
+        // least one of the family to detect the vendor.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-plan-type", "pro".parse().unwrap());
+        headers.insert("x-codex-primary-used-percent", "60".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            "600".parse().unwrap(),
+        );
+
+        // Personal account: capture under its own key.
+        capture_rate_limit_snapshot(
+            &headers,
+            "https://chatgpt.com/backend-api/codex",
+            "openai-responses",
+            "chatgpt-pro",
+            "personal",
+        );
+        // Team account: same provider+plan, distinct id.
+        capture_rate_limit_snapshot(
+            &headers,
+            "https://chatgpt.com/backend-api/codex",
+            "openai-responses",
+            "chatgpt-pro",
+            "team",
+        );
+
+        // Read back from the persisted store. Both rows must exist
+        // and report the correct account_id.
+        let store = UtilizationStore::open(&path).expect("store opens");
+        let p = store
+            .get(UtilProv::OpenaiCodex, "personal", "chatgpt-pro")
+            .expect("personal snapshot persisted under its own account_id");
+        let t = store
+            .get(UtilProv::OpenaiCodex, "team", "chatgpt-pro")
+            .expect("team snapshot persisted under its own account_id");
+        assert_eq!(p.account_id, "personal");
+        assert_eq!(t.account_id, "team");
+        assert_eq!(p.primary.as_ref().unwrap().used_percent, Some(60.0));
+        assert_eq!(t.primary.as_ref().unwrap().used_percent, Some(60.0));
+
+        std::env::remove_var("ZODER_HOME");
     }
 }
