@@ -2260,15 +2260,6 @@ pub(crate) fn resolve_effective_primary(cli: &Cli, eng: &Engine) -> Option<Strin
     eng.cfg.primary_model.clone()
 }
 
-/// `true` when a higher-priority pin (`-m` or `[agents.X].model`) resolved
-/// for this invocation. Used by `agentic_turn` to decide whether to set
-/// `AgentOptions::model_override` so the engine is forced onto the
-/// operator's choice (a non-`Some` model_override would let the alias
-/// fall through to its own default model).
-pub(crate) fn has_explicit_primary_pin(cli: &Cli, eng: &Engine) -> bool {
-    resolve_effective_primary(cli, eng).is_some()
-}
-
 /// Resolved routing for one CLI invocation. `primary` is the order in
 /// which the engine will try candidate models (head first, fallbacks
 /// after). `reviewer` is the scenario-routing-driven cross-family list
@@ -3110,6 +3101,14 @@ fn parse_approval(cli: &Cli) -> ApprovalPolicy {
     }
 }
 
+/// Zeroclaw model selection is performed by choosing the complete
+/// model-specific agent at `session/new`, not by mutating that agent afterward.
+/// Keep this as a named seam so a future routing refactor cannot accidentally
+/// reintroduce the tool-stripping `session/configure { model }` path.
+fn zeroclaw_model_override() -> Option<String> {
+    None
+}
+
 /// Map a model id to a renamed zeroclaw agent alias (the model-named aliases the
 /// TUI picker shows). Falls back to the strongest coding alias. `--agent` wins.
 fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
@@ -3687,24 +3686,17 @@ pub(crate) async fn agentic_turn(
         EngineKind::Goose => None,
     };
 
-    // Force the daemon to use the operator's explicit choice — `-m`, a
-    // `[agents.<alias>].model` per-agent pin, or a configured `primary_model`
-    // fallback — rather than letting the agent alias fall through to its own
-    // default model. Pure-auto routing (no `-m`, no per-agent override, no
-    // `primary_model`) keeps `None` so the alias picks its default as before.
-    //
-    // `resolve_effective_primary` is the single source of truth for the
-    // precedence order (`-m` → per-agent → `primary_model`); using it here
-    // keeps `agentic_turn` consistent with the chain we already built
-    // above. Regression fix 2026-07-04: the previous
-    // `cli.model.is_some() || primary_model.is_some()` test IGNORED
-    // `[agents.<alias>].model`, so `zoder exec --agent codex` ran the
-    // pinned primary model instead of `[agents.codex].model`.
-    let model_override = if has_explicit_primary_pin(cli, &eng) {
-        Some(primary.clone())
-    } else {
-        None
-    };
+    // Zeroclaw selects a complete coding-agent definition at `session/new`:
+    // the model-derived alias carries the provider, runtime/tool profile and
+    // workspace policy as one unit. Do not follow that with a bare
+    // `session/configure { model }`. That RPC mutates only the model on the
+    // already-created agent and, on affected daemon versions/providers, drops
+    // the coding tool dispatcher from the request (the loop then reports
+    // tools=0 forever). `resolve_agent_alias` already maps a forced/pinned model
+    // to its configured Zeroclaw agent, so retaining `None` preserves the full
+    // agent wiring while still selecting the requested model. Goose does not
+    // use this field; it receives the exact routed id through `model_id` below.
+    let model_override = zeroclaw_model_override();
 
     // `socket` is a dummy path for Goose: the goose driver ignores it and
     // builds its own Stdio transport, but `AgentOptions` still requires the
@@ -8656,58 +8648,35 @@ mod model_selection_tests {
         );
     }
 
-    /// `cmd_loop`'s author-turn decision must agree with `resolve_chain`'s
-    /// chain head: the model the engine actually drives is the model
-    /// `agentic_turn` forces via `model_override`, and they both come
-    /// from the same precedence-aware resolver. They cannot diverge
-    /// without re-introducing the 2026-07-04 regression (the bug where
-    /// `agentic_turn`'s `model_override` test was
-    /// `cli.model.is_some() || primary_model.is_some()` and ignored the
-    /// per-agent pin, so the engine received the per-agent pin while the
-    /// daemon was forced onto `primary_model`).
+    /// A forced loop author must still enter Zeroclaw through a complete coding
+    /// agent. The alias selected from the forced model supplies the provider,
+    /// runtime/tool profile and workspace at `session/new`; a subsequent bare
+    /// model override would split that bundle and regresses author turns to
+    /// tools=0 on affected daemons.
     #[test]
-    fn cmd_loop_author_turn_resolves_to_per_agent_pin() {
-        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "codex".into(),
-            AliasedAgentConfig {
-                model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
-                ..Default::default()
-            },
-        );
-        cfg.agents = agents;
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "codex"]).unwrap();
+    fn forced_loop_author_keeps_model_agent_tool_wiring() {
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let cli =
+            Cli::try_parse_from(["zoder", "loop", "-m", "minimax/MiniMax-M3", "task"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
-        // The model the engine actually receives:
         let ResolvedRoutes {
             primary: chain,
             reviewer: _,
             reason: _,
         } = resolve_chain(&cli, &eng, &health).unwrap();
         let head = chain.first().expect("chain must have a head");
-
-        // The model `agentic_turn` would force via `model_override`:
-        let forced = resolve_effective_primary(&cli, &eng).expect("pin present");
-        let would_force_override = has_explicit_primary_pin(&cli, &eng);
-
-        assert!(
-            would_force_override,
-            "has_explicit_primary_pin must be true when a per-agent pin resolves"
+        assert_eq!(
+            resolve_agent_alias(&cli, head),
+            "minimax",
+            "the forced model must select its configured coding-agent alias"
         );
         assert_eq!(
-            head, &forced,
-            "chain head ({head:?}) and `agentic_turn`'s forced override \
-             ({forced:?}) MUST agree: both are downstream of \
-             `resolve_effective_primary`. Mismatch would mean the engine \
-             receives one model and the daemon forces another — a silent \
-             regression of the 2026-07-04 bug."
-        );
-        assert_eq!(
-            head, "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-            "head MUST be the per-agent pin, NOT primary_model; got {head:?}"
+            zeroclaw_model_override(),
+            None,
+            "the model-specific coding agent must not be replaced by a bare \
+             post-session model override that loses its tool/workspace bundle"
         );
     }
 
