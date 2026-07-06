@@ -687,7 +687,7 @@ struct Finding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ReviewOutput {
+pub(crate) struct ReviewOutput {
     #[serde(default)]
     verdict: String,
     #[serde(default)]
@@ -1961,6 +1961,119 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
         .count()
 }
 
+/// Fail-closed predicate: did the reviewer authorize this iteration to be
+/// considered for resolution? This is the ONE place the explicit reviewer
+/// verdict is consulted — the finding-severity heuristic (`blocking`)
+/// cannot override an authoritative `request_changes` / `reject` /
+/// `block`. A reviewer that returns `approve` OR a non-blocking comment
+/// with zero heuristic-blocking findings is OK; every other explicit
+/// verdict blocks resolution regardless of finding counts.
+fn loop_review_ok(r: &ReviewOutput, blocking: usize) -> bool {
+    let explicit_block = matches!(r.verdict.as_str(), "request_changes" | "reject" | "block");
+    if explicit_block {
+        return false;
+    }
+    r.verdict == "approve" || blocking == 0
+}
+
+/// All signals needed by [`decide_loop_resolution`] for one iteration.
+/// Lifted out of `cmd_loop` as a struct so the (substance × check ×
+/// verdict × heuristic-blocking × no-new-progress) matrix can be pinned
+/// by unit tests without spinning up the engine daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoopResolutionSignals {
+    /// Classified diff substance for this iteration (anti-gaming guard).
+    pub substance: DiffSubstance,
+    /// Whether `--check` was configured for this loop run.
+    pub check_configured: bool,
+    /// Pass/fail of the check. `Some(true)` = passed, `Some(false)` =
+    /// failed, `None` = no result (either `--check` was not configured
+    /// or it was suppressed by the watchdog / error path).
+    pub check_passed: Option<bool>,
+    /// The reviewer verdict string for this iteration.
+    pub verdict: String,
+    /// Number of blocking findings per the severity heuristic
+    /// (see [`count_blocking`]).
+    pub blocking_findings: usize,
+}
+
+/// Decide whether THIS iteration's signals authorize resolving the loop.
+/// Mirrors the decision logic in `cmd_loop` 1-for-1 so behavior changes
+/// only flow through this single source of truth.
+///
+/// Fail-closed invariants:
+///
+///   1. ABSENT CHECK is not silently green. A never-configured `--check`
+///      means resolution may still occur — but ONLY on `review_ok &&
+///      substance_ok`, and never on a fabricated "green check".
+///   2. An explicit `request_changes` / `reject` / `block` verdict
+///      BLOCKS resolution regardless of `blocking_findings`. The
+///      explicit verdict is authoritative; the heuristic is not.
+///   3. Non-substantive diffs (Empty / WhitespaceOnly / CommentOnly) are
+///      explicitly rejected by the anti-gaming guard, even when the
+///      check is green.
+pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green: bool) -> bool {
+    let substance_ok = substance_accept_eligible(&s.substance);
+    let check_explicit_passed = s.check_passed == Some(true);
+    // check_satisfied: True unless an actual `--check` ran and failed.
+    // A never-configured check (`s.check_configured == false`) carries
+    // NO negative information; treat it as "no obstacle to resolution",
+    // but resolution still has to clear `review_ok && substance_ok`.
+    let check_satisfied = s.check_passed != Some(false);
+    let review = ReviewOutput {
+        verdict: s.verdict.clone(),
+        ..Default::default()
+    };
+    let review_ok = loop_review_ok(&review, s.blocking_findings);
+    // Anti-gaming guard: never accept a non-substantive diff on a green /
+    // check-satisfied iteration. Mirrors the in-loop guard exactly.
+    if (check_explicit_passed || check_satisfied) && !substance_ok {
+        return false;
+    }
+    // Fail-closed explicit / heuristic blocker: never override an
+    // authoritative reviewer verdict with a passing check.
+    if !review_ok {
+        return false;
+    }
+    // `--accept-on-green` is an opt-in: requires a REAL passing check
+    // AND no reviewer block. Even under --accept-on-green, an explicit
+    // request_changes / reject / block verdict cannot be overridden.
+    if accept_on_green && check_explicit_passed && substance_ok {
+        return true;
+    }
+    // Default resolve path: check satisfied (no negative information)
+    // AND reviewer OK AND substance OK.
+    check_satisfied && substance_ok
+}
+
+/// Build a `LoopResolutionSignals` from a full `ReviewOutput` + check
+/// state, recomputing the blocking-findings count via `count_blocking`
+/// using the honest `green` calibration. Use this when callers have a
+/// real review object (e.g. test fixtures that include findings);
+/// [`LoopResolutionSignals`] is the struct form for pins that already
+/// know the count.
+pub(crate) fn loop_signals_from_review(
+    substance: DiffSubstance,
+    check_configured: bool,
+    check_passed: Option<bool>,
+    review: &ReviewOutput,
+) -> LoopResolutionSignals {
+    // Honest calibration: only an ACTUAL passing `--check` counts as
+    // green for `count_blocking`'s severity threshold. A never-configured
+    // check is `green = false`, which makes `high`-severity findings
+    // blocking — closing the original FAIL-CLOSED defect where an
+    // absent check was treated as if a check had passed.
+    let green = check_passed == Some(true);
+    let blocking_findings = count_blocking(review, green);
+    LoopResolutionSignals {
+        substance,
+        check_configured,
+        check_passed,
+        verdict: review.verdict.clone(),
+        blocking_findings,
+    }
+}
+
 /// Decision returned by [`update_loop_streaks`] for one loop iteration.
 ///
 /// The dead-engine streak tracks the "no edits at all" failure mode (author
@@ -2325,8 +2438,15 @@ nits).\n",
             }
         };
         final_verdict = review.verdict.clone();
-        // The objective gate is "green" when the check passed (or none was given).
-        let green = check_passed.unwrap_or(true);
+        // The objective gate is "green" ONLY when an actual `--check` ran and
+        // passed. A never-configured check is NOT green — it is unknown, and
+        // this branch must NOT fabricate one. `check_satisfied` is the
+        // fail-closed predicate the resolve gate consumes: it is `true` when
+        // either no `--check` was requested OR the configured `--check`
+        // returned exit 0. `green` (kept for the `count_blocking` severity
+        // calibration only) follows the same honest rule.
+        let green = check_passed == Some(true);
+        let check_satisfied = check_passed != Some(false);
         let blocking = count_blocking(&review, green);
 
         let author_model = turn.as_ref().map(|t| t.model.clone());
@@ -2357,10 +2477,16 @@ nits).\n",
             "cost_usd_cumulative": total_cost,
         }));
 
-        // 5. Decide: objective gate (build/test) AND review gate (no blockers).
-        let objective_ok = green;
-        let check_green = check_passed == Some(true); // an actual --check that passed
-        let review_ok = review.verdict == "approve" || blocking == 0;
+        // 5. Decide: review gate AND objective gate AND anti-gaming substance gate.
+        //    `review_ok` is now AUTHORITATIVE on the explicit verdict — see
+        //    `loop_review_ok`. `check_satisfied` does not fabricate a green check
+        //    when none was configured; resolution may still occur on
+        //    `review_ok && substance_ok` when `--check` is absent (logged below).
+        //    The combined decision is delegated to `decide_loop_resolution` so
+        //    the full signal matrix is unit-testable as a single function.
+        let review_ok = loop_review_ok(&review, blocking);
+        let check_green = check_passed == Some(true);
+
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (a
         // "green" iteration whose diff is empty-after-headers, only
         // whitespace, only comments, or only churns test files used to
@@ -2369,6 +2495,17 @@ nits).\n",
         // else is explicitly rejected as non-substantive noise.
         let substance_ok = substance_accept_eligible(&diff_substance);
 
+        // Single-source-of-truth resolution decision: tests pin the
+        // (substance × check × verdict × blocking-findings) matrix
+        // through this exact predicate. `loop_signals_from_review` also
+        // routes the count_blocking calibration through the honest
+        // `green = check_passed == Some(true)` rule so the absent-check
+        // case cannot be treated as a fabricated green.
+        let resolve_now = decide_loop_resolution(
+            &loop_signals_from_review(diff_substance, check.is_some(), check_passed, &review),
+            accept_on_green,
+        );
+
         // Anti-gaming guard rail: if the check is green but the diff is
         // not substantive, the iteration MUST NOT resolve. Emit a clear
         // reason, record it in the iter record (the `substance` field
@@ -2376,7 +2513,7 @@ nits).\n",
         // control flow as a failed check. This closes the gaming surface
         // where an over-eager author could "pass" the loop with whitespace
         // churn or comment-only edits.
-        if (check_green || objective_ok) && !substance_ok {
+        if (check_green || check_satisfied) && !substance_ok {
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: REJECTED green — diff is {diff_substance:?}, \
@@ -2393,7 +2530,7 @@ nits).\n",
         // attempt that slipped past the reviewer. Warn loudly so the
         // operator sees why a "no real code change" iteration resolved.
         if matches!(diff_substance, DiffSubstance::TestOnly)
-            && (check_green || objective_ok)
+            && (check_green || check_satisfied)
             && !cli.quiet
         {
             eprintln!(
@@ -2402,26 +2539,44 @@ nits).\n",
             );
         }
 
+        // Fail-closed observability: when no --check was configured, log
+        // explicitly so an operator can see the resolution rests on review
+        // alone. Never claim a green check.
+        if check.is_none() && !cli.quiet {
+            eprintln!(
+                "[loop] iter {i}: NOTE no --check configured — resolution rests on review \
+ alone (verdict={}, blocking={blocking})",
+                review.verdict
+            );
+        }
+
         // Escape hatch: `--accept-on-green` treats a passing objective check as
         // sufficient, with reviewer findings advisory (for over-strict reviewers).
-        if accept_on_green && check_green && substance_ok {
+        // Still gated by an explicit reviewer verdict — `request_changes` /
+        // `reject` / `block` block even under --accept-on-green.
+        if resolve_now {
             resolved = true;
             if !cli.quiet {
-                eprintln!(
-                    "[loop] iter {i}: RESOLVED on green check (--accept-on-green; \
-reviewer advisory, verdict={}, blocking={blocking})",
-                    review.verdict
-                );
-            }
-            break;
-        }
-        if objective_ok && review_ok && substance_ok {
-            resolved = true;
-            if !cli.quiet {
-                eprintln!(
-                    "[loop] iter {i}: RESOLVED (check={:?} verdict={})",
-                    check_passed, review.verdict
-                );
+                let via = if accept_on_green
+                    && check_passed == Some(true)
+                    && !matches!(diff_substance, DiffSubstance::TestOnly)
+                {
+                    "on green check (--accept-on-green)"
+                } else {
+                    ""
+                };
+                if via.is_empty() {
+                    eprintln!(
+                        "[loop] iter {i}: RESOLVED (check={:?} verdict={})",
+                        check_passed, review.verdict
+                    );
+                } else {
+                    eprintln!(
+                        "[loop] iter {i}: RESOLVED {via} (reviewer advisory, verdict={}, \
+ blocking={blocking})",
+                        review.verdict
+                    );
+                }
             }
             break;
         }
@@ -2430,22 +2585,24 @@ reviewer advisory, verdict={}, blocking={blocking})",
         // isn't accepted. (Never trips on iter 1, where prev_diff is empty.)
         let no_new_progress = i > 1 && diff == prev_diff;
         if no_new_progress {
-            // Stalemate breaker: the objective check is GREEN but the reviewer
-            // keeps blocking the SAME diff. Rather than discard a verified fix,
-            // resolve with the findings recorded as warnings.
-            if check_green && substance_ok && !review_ok {
-                resolved = true;
-                if !cli.quiet {
-                    eprintln!(
-                        "[loop] iter {i}: RESOLVED with warnings — check is green but the \
-reviewer keeps blocking an unchanged diff ({blocking} blocking finding(s) recorded)."
-                    );
-                }
-                break;
+            // Requirement (fail-closed): never convert 'no change since the
+            // last blocking review' into a successful resolution. The
+            // previous stalemate breaker here used to RESOLVE the loop with
+            // warnings when the check was green and the reviewer was
+            // blocking; that path is gone — a blocker on an unchanged diff
+            // means iterate (or, at --max-iters end, UNRESOLVED).
+            //
+            // A single no-op turn is not fatal: the author may just need a
+            // firmer nudge (see the escalated feedback below). Only give up
+            // after STALL_LIMIT consecutive stalls — otherwise keep grinding.
+            if !review_ok && !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: reviewer still blocking on unchanged diff \
+ (verdict={}, blocking={blocking}); will iterate and stop after {STALL_LIMIT} \
+ consecutive stalls.",
+                    review.verdict
+                );
             }
-            // A single no-op turn is not fatal: the author may just need a firmer
-            // nudge (see the escalated feedback below). Only give up after
-            // STALL_LIMIT consecutive stalls — otherwise keep grinding.
             stall_streak += 1;
             if stall_streak >= STALL_LIMIT {
                 if !cli.quiet {
@@ -3364,6 +3521,347 @@ mod tests {
         assert!(all_failed);
         assert_ne!(agg, "approve");
         assert_eq!(payload["complete"].as_bool(), Some(false));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `cmd_loop` resolution decisions — fail-closed regression suite.
+//
+// These tests pin the adversarial-review finding that the autonomous `loop`
+// command previously declared RESOLVED on unvalidated or explicitly-rejected
+// work. The matrix below exercises the production `decide_loop_resolution`
+// helper, which `cmd_loop` calls 1-for-1, so behavior changes flow through
+// a single source of truth.
+//
+// Invariants pinned (all fail-closed):
+//
+//   (a) no --check + substantive change + explicit request_changes verdict
+//       does NOT resolve;
+//   (b) explicit request_changes with zero heuristic-blocking findings still
+//       does NOT resolve;
+//   (c) no --check never resolves merely because the check was assumed
+//       green (requires an explicit non-blocking review of substantive
+//       work);
+//   (d) the existing happy path still resolves.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod loop_resolution_tests {
+    use super::*;
+
+    /// Build a fully-substantive signal object for tests that don't
+    /// care about substance shape — saves typing per-cell.
+    fn substantive_signals(
+        check_configured: bool,
+        check_passed: Option<bool>,
+        verdict: &str,
+        blocking_findings: usize,
+    ) -> LoopResolutionSignals {
+        LoopResolutionSignals {
+            substance: DiffSubstance::Substantive,
+            check_configured,
+            check_passed,
+            verdict: verdict.into(),
+            blocking_findings,
+        }
+    }
+
+    /// (a) REGRESSION: When no `--check` is configured AND the diff is
+    /// substantive AND the reviewer returns an explicit `request_changes`,
+    /// the loop MUST NOT resolve — the explicit verdict is authoritative.
+    /// Pre-fix behavior: `check_passed.unwrap_or(true) == true` fabricated a
+    /// green check, and `verdict == "approve" || blocking == 0` was true at
+    /// blocking == 0, so the loop RESOLVED on a `request_changes` review.
+    #[test]
+    fn no_check_with_explicit_request_changes_blocks_resolution() {
+        let s = substantive_signals(
+            false, // no --check configured
+            None,  // check never ran
+            "request_changes",
+            0,
+        );
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "no --check + explicit request_changes must NOT resolve (it does not, \
+             pre-fix, fabricated a green check and let the request_changes vote slip)"
+        );
+    }
+
+    /// (b) REGRESSION: An explicit `request_changes` verdict MUST block
+    /// resolution REGARDLESS of whether the finding-severity heuristic
+    /// counts zero blocking findings. A zero-heuristic-findings count must
+    /// not override an explicit negative verdict.
+    /// Pre-fix behavior: `review_ok = verdict == "approve" || blocking == 0`
+    /// was true at blocking == 0 even with `verdict == "request_changes"`,
+    /// so the resolve branch fired.
+    #[test]
+    fn explicit_request_changes_blocks_resolution_even_with_zero_blocking_findings() {
+        // Pass a passing --check to remove that from the equation — this is
+        // the exact shape that used to leak through pre-fix.
+        let s = substantive_signals(
+            true,       // --check configured
+            Some(true), // --check passed
+            "request_changes",
+            0, // zero heuristic-blocking findings (no `critical`/`high` w/ location)
+        );
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "explicit request_changes with zero heuristic-blocking findings must NOT \
+             resolve; verdict is authoritative over the heuristic"
+        );
+        // And the same holds for `--accept-on-green` — the explicit
+        // request_changes verdict cannot be overridden.
+        assert!(
+            !decide_loop_resolution(&s, true),
+            "even under --accept-on-green, explicit request_changes must NOT resolve"
+        );
+    }
+
+    /// Companion to (b): the OTHER explicit negative verdicts (`reject` /
+    /// `block`) are equally authoritative. Their heuristic-finding count is
+    /// irrelevant. This closes the same class of bug for verdict strings
+    /// that share rank 2 in `verdict_rank`.
+    #[test]
+    fn explicit_reject_and_block_verdicts_block_resolution() {
+        for verdict in ["reject", "block"] {
+            let s = substantive_signals(true, Some(true), verdict, 0);
+            assert!(
+                !decide_loop_resolution(&s, false),
+                "explicit `{}` verdict with zero blocking findings must NOT resolve",
+                verdict
+            );
+        }
+    }
+
+    /// (c) REGRESSION: When no `--check` is configured, the loop MUST NOT
+    /// resolve merely because the absent check used to be treated as a
+    /// fabricated green. Resolution on an absent check now requires an
+    /// explicit non-blocking review (approve OR comment with zero
+    /// blocking findings) of substantive work.
+    /// Pre-fix behavior: `green = check_passed.unwrap_or(true)` was the
+    /// fabricated green; combined with the calibration in
+    /// `count_blocking` (only `critical` blocks when `green=true`), a
+    /// reviewer that raised only `high`-severity findings (which WOULD
+    /// block when `green=false`) saw `blocking == 0` and the loop
+    /// RESOLVED with no validation having run.
+    #[test]
+    fn no_check_does_not_resolve_on_high_severity_finding_without_substance() {
+        // The reviewer raised one `high`-severity, properly-located
+        // finding. With `check=None`, `count_blocking` must use the
+        // honest `green=false` calibration (so `high` blocks).
+        let review = ReviewOutput {
+            verdict: "comment".into(),
+            summary: String::new(),
+            findings: vec![Finding {
+                severity: "high".into(),
+                title: "real concern".into(),
+                body: "reviewer raised a high-severity issue".into(),
+                location: Some("src/lib.rs:42".into()),
+            }],
+            next_steps: vec![],
+        };
+        let signals = loop_signals_from_review(
+            DiffSubstance::Substantive,
+            false, // no --check
+            None,  // check never ran
+            &review,
+        );
+        assert!(
+            signals.blocking_findings >= 1,
+            "honest calibration: a high-severity finding with no actual check \
+             must count as blocking; pre-fix `green = unwrap_or(true)` would \
+             have made `high` advisory"
+        );
+        assert!(
+            !decide_loop_resolution(&signals, false),
+            "no --check + high-severity blocking finding must NOT resolve; \
+             pre-fix code fabricated a green check and let the high finding through"
+        );
+    }
+
+    /// Companion: no --check + substantive diff + comment with zero
+    /// blocking findings DOES resolve (the legitimate happy path for
+    /// --check-free workflows). This pins requirement (c)'s positive form:
+    /// "requires an explicit non-blocking review of substantive work".
+    #[test]
+    fn no_check_resolves_on_substantive_change_with_non_blocking_review() {
+        let s = substantive_signals(false, None, "comment", 0);
+        assert!(
+            decide_loop_resolution(&s, false),
+            "no --check + substantive diff + comment with zero blocking findings \
+             MUST still resolve (the legitimate happy path for --check-free runs)"
+        );
+    }
+
+    /// (d) REGRESSION: The existing happy path is preserved.
+    ///
+    ///   substantive author change + passing --check (when configured) +
+    ///   review with no blocking findings and NOT an explicit request_changes
+    ///   still resolves as before.
+    ///
+    /// Pre-fix behavior already accepted this. The fix must not regress it.
+    #[test]
+    fn happy_path_substantive_change_passing_check_approve_resolves() {
+        let s = substantive_signals(true, Some(true), "approve", 0);
+        assert!(
+            decide_loop_resolution(&s, false),
+            "happy path: substantive + passing check + approve must resolve"
+        );
+    }
+
+    /// Companion to (d): a `comment` reviewer with zero blocking findings
+    /// also counts as a non-blocking review (the pre-fix behavior). The fix
+    /// must not regress this — it's the most common non-strict-reviewer
+    /// case in production.
+    #[test]
+    fn happy_path_substantive_change_passing_check_comment_zero_findings_resolves() {
+        let s = substantive_signals(true, Some(true), "comment", 0);
+        assert!(
+            decide_loop_resolution(&s, false),
+            "happy path: substantive + passing check + comment + zero findings \
+             must still resolve (preserves pre-fix happy path)"
+        );
+    }
+
+    /// Negative guard: an explicit `request_changes` with a passing check
+    /// and zero heuristic-blocking findings MUST NOT resolve. Re-pins the
+    /// `loop_review_ok` invariant from a different angle for symmetry with
+    /// (b): when the heuristic doesn't trip, the explicit verdict still
+    /// does.
+    #[test]
+    fn explicit_request_changes_with_passing_check_still_blocks() {
+        let s = substantive_signals(true, Some(true), "request_changes", 0);
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "passing check must NOT override an explicit request_changes verdict"
+        );
+    }
+
+    /// Companion: a passing check with non-zero heuristic-blocking findings
+    /// (e.g. real `critical` regression findings the reviewer raised) also
+    /// blocks. This is the legacy fail-closed branch of `review_ok`.
+    #[test]
+    fn passing_check_with_real_blocking_findings_blocks() {
+        let s = substantive_signals(true, Some(true), "comment", 2);
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "passing check + non-zero blocking findings must NOT resolve"
+        );
+    }
+
+    /// Anti-gaming guard: even with a passing check and an explicit
+    /// `approve` reviewer, an empty (non-substantive) diff MUST NOT
+    /// resolve. This re-pins the anti-gaming rail at the resolution gate.
+    #[test]
+    fn empty_diff_with_passing_check_and_approve_does_not_resolve() {
+        let s = LoopResolutionSignals {
+            substance: DiffSubstance::Empty,
+            check_configured: true,
+            check_passed: Some(true),
+            verdict: "approve".into(),
+            blocking_findings: 0,
+        };
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "anti-gaming guard: empty diff must NOT resolve even on green + approve"
+        );
+    }
+
+    /// An explicit failing `--check` MUST NOT resolve (fail-closed check
+    /// gate). This is the same fail-closed invariant requirement (1) but
+    /// for the explicit-failed side.
+    #[test]
+    fn explicit_failing_check_blocks_resolution() {
+        let s = substantive_signals(true, Some(false), "approve", 0);
+        assert!(
+            !decide_loop_resolution(&s, false),
+            "a configured --check that explicitly failed must NOT resolve, even \
+             with an explicit approve verdict (fail-closed)"
+        );
+    }
+
+    /// `--accept-on-green` requires a REAL passing check (not just no
+    /// failure). A never-configured check does not satisfy the
+    /// `--accept-on-green` semantic — the operator asked for "I trust the
+    /// check", so a check must actually have run and passed.
+    #[test]
+    fn accept_on_green_does_not_resolve_when_no_check_ran() {
+        // accept_on_green=true, but check was never run (None). Decision
+        // path: accept_on_green requires `check_explicit_passed`, so this
+        // must fall through to the default branch (which also requires
+        // substance_ok + review_ok — all true here, so it MUST resolve).
+        // The structural intent is: accept_on_green doesn't add NEW
+        // shortcuts — it permits resolving when the explicit check passed,
+        // but the same default-path resolve is allowed in this scenario.
+        let s = substantive_signals(false, None, "comment", 0);
+        assert!(
+            decide_loop_resolution(&s, true),
+            "no --check + substantive + non-blocking review MUST still resolve \
+             even under --accept-on-green; the semantic is additive, not \
+             restrictive"
+        );
+    }
+
+    /// `--accept-on-green` MUST NOT resolve when the explicit check
+    /// failed — adding the fail-closed check gate under all opt-ins.
+    #[test]
+    fn accept_on_green_does_not_resolve_when_check_explicitly_failed() {
+        let s = substantive_signals(true, Some(false), "approve", 0);
+        assert!(
+            !decide_loop_resolution(&s, true),
+            "accept_on_green MUST NOT override an explicit failing --check"
+        );
+    }
+
+    /// `loop_review_ok` matrix pins: every explicit-block verdict beats
+    /// every blocking-findings count. Mirrors requirement (2).
+    #[test]
+    fn loop_review_ok_explicit_verdict_matrix() {
+        // Approve / comment are not explicit blocks; verdict is fine.
+        assert!(loop_review_ok(
+            &ReviewOutput {
+                verdict: "approve".into(),
+                ..Default::default()
+            },
+            0
+        ));
+        assert!(loop_review_ok(
+            &ReviewOutput {
+                verdict: "comment".into(),
+                ..Default::default()
+            },
+            0
+        ));
+        // Explicit blocks beat ZERO blocking findings.
+        for v in ["request_changes", "reject", "block"] {
+            assert!(
+                !loop_review_ok(
+                    &ReviewOutput {
+                        verdict: v.into(),
+                        ..Default::default()
+                    },
+                    0
+                ),
+                "verdict={v} with 0 blocking findings must NOT be OK"
+            );
+        }
+        // An explicit blocker beats a non-zero blocking-findings count.
+        assert!(!loop_review_ok(
+            &ReviewOutput {
+                verdict: "request_changes".into(),
+                ..Default::default()
+            },
+            3
+        ));
+        // Heuristic-only block (no explicit block) still blocks when
+        // findings are non-zero — the legacy fail-closed branch.
+        assert!(!loop_review_ok(
+            &ReviewOutput {
+                verdict: "comment".into(),
+                ..Default::default()
+            },
+            1
+        ));
     }
 }
 
