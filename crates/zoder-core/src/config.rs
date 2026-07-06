@@ -927,12 +927,12 @@ impl Config {
                     p.id
                 ));
             }
-            if p.billing == BillingMode::Subscription && p.subscription.is_none() {
-                errs.push(format!(
-                    "provider {}: billing=subscription requires subscription terms",
-                    p.id
-                ));
-            }
+            // A subscription WITHOUT explicit terms is valid, not an error: a
+            // flat-fee subscription has $0 marginal cost, and the runtime treats
+            // an unspecified tier as uncapped `SubscriptionLive` (see effective
+            // tier logic). Rejecting it broke valid providers with a working key
+            // (e.g. MiniMax). Terms remain optional and only add rate-limit
+            // windows when present.
             if let Some(plan) = &p.subscription {
                 if !plan.monthly_fee_usd.is_finite() || plan.monthly_fee_usd < 0.0 {
                     errs.push(format!(
@@ -1891,15 +1891,19 @@ auth = { type = "env", var = "ACME_KEY" }
     }
 
     #[test]
-    fn validate_rejects_subscription_billing_without_plan() {
+    fn validate_accepts_subscription_billing_without_plan() {
+        // A flat-fee subscription with a valid key but no explicit terms is
+        // valid: marginal cost is \$0 and the runtime treats an unspecified tier
+        // as uncapped SubscriptionLive. It must NOT be rejected (this broke
+        // real providers like MiniMax that ship a working key without terms).
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default_provider(dir.path());
         cfg.providers[0].billing = BillingMode::Subscription;
         cfg.providers[0].subscription = None;
         let errors = cfg.validate().join("\n");
         assert!(
-            errors.contains("billing=subscription requires subscription terms"),
-            "{errors}"
+            !errors.contains("billing=subscription requires subscription terms"),
+            "termless subscription must be accepted, got: {errors}"
         );
     }
 
