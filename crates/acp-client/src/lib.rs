@@ -1627,18 +1627,25 @@ where
                 // Spec: `toolCallId`, `title`, `kind`, `status`, `content`.
                 // The "call" arrives once (status pending) and updates
                 // arrive as `tool_call_update` with the same id. We count
-                // only the initial call, not progress updates.
+                // AND emit the ToolCall event ONLY for the initial call,
+                // never for progress updates: emitting on every status
+                // transition (pending -> in_progress -> completed) makes
+                // the CLI display "[tool] shell" once per transition, i.e.
+                // three "tool called" lines for one logical call. The
+                // `tool_calls` counter and the ToolCall event stream must
+                // agree on "one logical call == one event" — otherwise the
+                // counter says 1 but the CLI shows 3 invocations.
                 if kind == "tool_call" {
                     tool_calls += 1;
+                    let name = update
+                        .get("title")
+                        .or_else(|| update.get("name"))
+                        .or_else(|| update.get("toolName"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    on_event(AgentEvent::ToolCall { name });
                 }
-                let name = update
-                    .get("title")
-                    .or_else(|| update.get("name"))
-                    .or_else(|| update.get("toolName"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                on_event(AgentEvent::ToolCall { name });
             }
             "tool_result_update" | "tool_result" => {
                 let name = update
@@ -2607,6 +2614,178 @@ mod tests {
         assert_eq!(
             utilization_count, 0,
             "Goose context-window usage is not subscription-quota telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn goose_drive_tool_call_update_does_not_duplicate_tool_call_event() {
+        // Regression for the `tool_call_update` event-over-emission bug:
+        //
+        //   Per ACP v1, a single logical tool call generates ONE
+        //   `session/update` with `sessionUpdate == "tool_call"` (the
+        //   initial creation, status pending) and ZERO OR MORE follow-ups
+        //   with `sessionUpdate == "tool_call_update"` (status transitions:
+        //   in_progress -> completed/failed). The `tool_calls` counter
+        //   is incremented only for the initial `tool_call`, but the
+        //   previous driver ALSO emitted an `AgentEvent::ToolCall` for
+        //   every `tool_call_update` — meaning a single call that
+        //   progresses through pending -> in_progress -> completed would
+        //   surface THREE `[tool] shell` lines to the CLI user (and a
+        //   mismatched counter-vs-event invariant: counter==1, events==3).
+        //
+        //   The fix moves the `on_event(AgentEvent::ToolCall { ... })`
+        //   INSIDE the `if kind == "tool_call"` branch so a single
+        //   logical call surfaces exactly ONE event — same count as the
+        //   counter, same count as the user-perceived invocations.
+        //
+        //   This test sends the exact ACP v1 progression: one initial
+        //   `tool_call` (status pending) plus three `tool_call_update`
+        //   frames for the SAME `toolCallId`, then asserts the
+        //   counter and the event count BOTH report exactly one
+        //   invocation. On the old code the test fails because the
+        //   event count is 4 (1 initial + 3 updates); on the fix it
+        //   passes because the event count is 1.
+        let outbound = vec![
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "shell",
+                    "kind": "shell",
+                    "status": "pending"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "in_progress"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "in_progress",
+                    "content": [{ "type": "text", "text": "running..." }]
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "completed"
+                }),
+            ),
+        ];
+        let (_frames, run, events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        // The `tool_calls` counter is correct on BOTH old and new code
+        // (only the initial `tool_call` increments it).
+        assert_eq!(
+            run.tool_calls, 1,
+            "tool_calls counter must reflect logical invocations, not per-update frames"
+        );
+        // Count ALL `ToolCall` events the CLI would surface to the user
+        // (regardless of name). On the OLD code this is 4 (1 initial +
+        // 3 updates); on the FIX it is 1 — matching the counter. We
+        // do NOT filter by name here because a buggy driver might
+        // surface the events with placeholder names ("tool") and the
+        // bug is the COUNT, not the name.
+        let tool_event_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+            .count();
+        assert_eq!(
+            tool_event_count, 1,
+            "exactly one ToolCall event must be emitted per logical tool call \
+             (counter must equal event count); got events={:?}",
+            events
+        );
+        // And the SINGLE event must carry the correct tool name from
+        // the initial `tool_call` (not from a later update).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name } if name == "shell")),
+            "the ToolCall event for call-1 must carry name=\"shell\""
+        );
+    }
+
+    #[tokio::test]
+    async fn goose_drive_tool_call_update_does_not_increment_tool_calls() {
+        // Companion to the test above: even if the fix is reduced to
+        // "never emit ToolCall for tool_call_update" but accidentally
+        // also stopped incrementing `tool_calls` for the initial
+        // `tool_call`, this test would catch it. Sends ONE `tool_call`
+        // followed by FOUR `tool_call_update` frames for the same id;
+        // the counter must be exactly 1, not 0 (regression for "never
+        // count the call") and not 5 (regression for "count every frame").
+        let outbound = vec![
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-7",
+                    "title": "read",
+                    "kind": "read",
+                    "status": "pending"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-7",
+                    "status": "in_progress"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-7",
+                    "status": "in_progress"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-7",
+                    "status": "in_progress"
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-7",
+                    "status": "completed"
+                }),
+            ),
+        ];
+        let (_frames, run, events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        assert_eq!(
+            run.tool_calls, 1,
+            "tool_calls must count logical invocations (1), not frames (5)"
+        );
+        // Count ALL ToolCall events, not just those with the right
+        // name — a buggy driver might emit `ToolCall { name: "tool" }`
+        // placeholders for the updates.
+        let tool_event_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+            .count();
+        assert_eq!(
+            tool_event_count, 1,
+            "exactly one ToolCall event per logical call (must match the counter); got events={:?}",
+            events
         );
     }
 
