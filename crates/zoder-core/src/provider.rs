@@ -272,8 +272,21 @@ struct ChatCompletion {
 }
 #[derive(Deserialize)]
 struct CompletionChoice {
+    // The inner `message` field is `Option<CompletionMessage>` so the
+    // two invalid shapes serialize/deserialize into distinct values,
+    // letting [`CompletionChoice::has_meaningful_message`] reject both:
+    //  - absent or `null` -> `message = None`
+    //  - present but `{}` -> `message = Some(CompletionMessage::default())`
+    //    (every content / reasoning field is None, so the validate
+    //    helper still returns false)
+    // This mirrors the streaming path's `saw_choice` guard: a 2xx body
+    // whose choices array contains only `{}` placeholders MUST surface
+    // as a Decode error rather than a successful empty completion, so a
+    // `--no-stream` / reviewer / health-probe call cannot exit Ok with
+    // empty content and let a billable reservation be reconciled as a
+    // no-op.
     #[serde(default)]
-    message: CompletionMessage,
+    message: Option<CompletionMessage>,
 }
 #[derive(Deserialize, Default)]
 struct CompletionMessage {
@@ -283,6 +296,29 @@ struct CompletionMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+}
+
+impl CompletionChoice {
+    /// True when this choice carries an actual message whose content (or
+    /// any reasoning field, since `show_reasoning = true` is the most
+    /// permissive surface) is non-empty/whitespace-only. Used by the
+    /// non-streaming path as the analogue of the streaming `saw_choice`
+    /// guard so a 2xx body whose choices array contains only `{}`
+    /// placeholders surfaces as a `Decode` error rather than a successful
+    /// empty completion.
+    fn has_meaningful_message(&self) -> bool {
+        let Some(msg) = self.message.as_ref() else {
+            return false;
+        };
+        pick_text(
+            msg.content.clone(),
+            msg.reasoning_content.clone(),
+            msg.reasoning.clone(),
+            /* show_reasoning = */ true,
+        )
+        .chars()
+        .any(|c| !c.is_whitespace())
+    }
 }
 
 /// Pick the answer text honoring the codex-compatible default (no reasoning).
@@ -617,17 +653,31 @@ impl OpenAiProvider {
                 format!("malformed chat-completion response: {e}"),
             )
         })?;
-        let msg = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ErrKind::Decode,
-                    "malformed chat-completion response: no completion choices",
-                )
-            })?;
+        // Schema-invalid 2xx body guard: a response is not "successful" just
+        // because the HTTP layer returned 2xx. We require at least one choice
+        // whose `message` carries parseable content (or, under
+        // `show_reasoning`, a non-empty reasoning field) — mirroring the
+        // streaming path's `saw_choice` check. Without this `{"choices":[{}]}`
+        // would parse, `pick_text` would silently return `""`, the call would
+        // succeed with no content, and a `--no-stream` / reviewer / health-
+        // probe run could exit 0 while a billable reservation is reconciled
+        // as a paid no-op. That is the failure mode the task pins: schema-
+        // invalid wire traffic must surface as a Decode error.
+        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            ProviderError::new(
+                ErrKind::Decode,
+                "malformed chat-completion response: no completion choices",
+            )
+        })?;
+        if !choice.has_meaningful_message() {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                "malformed chat-completion response: empty completion choice/message",
+            ));
+        }
+        let msg = choice
+            .message
+            .expect("has_meaningful_message guarantees Some(_)");
         let content = pick_text(
             msg.content,
             msg.reasoning_content,
@@ -1171,5 +1221,64 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(anthropic.cached_prompt_tokens(), Some(60));
+    }
+
+    /// Companion unit tests to the wire-level integration tests in
+    /// `tests/provider.rs`. They pin the `has_meaningful_message` helper
+    /// in isolation so the schema-invalid response shape is rejected even
+    /// if a future refactor moves the helper. `{}` and `{"message":{}}`
+    /// must fail; `{"message":{"content":""}}` must also fail (the
+    /// provider was given a turn and returned nothing); whitespace-only
+    /// counts as nothing; a real answer counts.
+    #[test]
+    fn completion_choice_meaningful_message_rejects_schema_invalid_shapes() {
+        // `{}` — no `message` at all -> deserialize with `message = None`.
+        let placeholder: CompletionChoice = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            !placeholder.has_meaningful_message(),
+            "an entirely-empty choice object is schema-invalid"
+        );
+
+        // `{"message": {}}` — `message` present, every field None.
+        let empty_msg: CompletionChoice =
+            serde_json::from_value(serde_json::json!({"message": {}})).unwrap();
+        assert!(
+            !empty_msg.has_meaningful_message(),
+            "a present-but-empty message is schema-invalid"
+        );
+
+        // `{"message": {"content": null}}` — explicit null.
+        let null_content: CompletionChoice =
+            serde_json::from_value(serde_json::json!({"message": {"content": null}})).unwrap();
+        assert!(
+            !null_content.has_meaningful_message(),
+            "explicit null content is schema-invalid"
+        );
+
+        // `{"message": {"content": "   "}}` — whitespace-only answer.
+        let ws: CompletionChoice =
+            serde_json::from_value(serde_json::json!({"message": {"content": "   "}})).unwrap();
+        assert!(
+            !ws.has_meaningful_message(),
+            "whitespace-only content is not a meaningful answer"
+        );
+
+        // A real `content` succeeds.
+        let ok_content: CompletionChoice =
+            serde_json::from_value(serde_json::json!({"message": {"content": "hi"}})).unwrap();
+        assert!(
+            ok_content.has_meaningful_message(),
+            "non-empty content is meaningful"
+        );
+
+        // A reasoning-only answer also counts (with show_reasoning=true).
+        let reasoning_only: CompletionChoice = serde_json::from_value(serde_json::json!({
+            "message": {"content": null, "reasoning_content": "thinking aloud"}
+        }))
+        .unwrap();
+        assert!(
+            reasoning_only.has_meaningful_message(),
+            "a non-empty reasoning_content counts as meaningful"
+        );
     }
 }
