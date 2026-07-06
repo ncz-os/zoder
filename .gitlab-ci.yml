@@ -221,96 +221,21 @@ release:trio:
         - { name: "aarch64-linux tar",    url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz" }
         - { name: "aarch64-linux sha256", url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-trio/${CI_COMMIT_TAG}/zoder-${CI_COMMIT_TAG#v}-aarch64-unknown-linux-gnu.tar.gz.sha256" }
 
-# ── nightly: rolling "master of the day" binaries ────────────────────────────
-# Linux builds on GitLab shared runners (x86_64 native + aarch64 cross-compiled);
-# macOS arm64 builds on ULTRA via the fleet-macos-arm64 runner. Both publish to
-# the rolling `zoder-nightly/master` generic package (overwritten each night).
-# Driven by a pipeline schedule with NIGHTLY=1; also runnable manually from web.
-#
-# Finding #17: the prior pipeline uploaded the NEW `zoder` binary BEFORE
-# cloning+building the matching zerocode/zeroclaw TUI pair. If the
-# zeroclaw build failed (or each architecture pulled a different ref
-# because ZEROCLAW_REF was a mutable branch) the rolling `master`
-# channel ended up with new zoder + OLD zerocode/zeroclaw — a
-# broken-trio nightly. We now:
-#   - Pin ZEROCLAW_REF to an immutable SHA resolved fresh each run by
-#     resolve:zeroclaw-sha (inherited via its dotenv artifact).
-#   - Build zerocode/zeroclaw FIRST; only after both succeed do we
-#     publish new zoder + new TUI pair to the rolling `master` channel.
-#   - Reproducibility across runners = one pinned zoder-integration SHA
-#     (resolve:zeroclaw-sha), not the fork's drifting Cargo.lock. zoder's
-#     own build keeps --locked; the vendored engine build does not.
+# ── nightly channel: GitHub builds ALL binaries ──────────────────────────────
+# The zoder trio (zoder + zerocode + zeroclaw) for every arch —
+# aarch64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu — is
+# built NATIVELY on GitHub Actions (.github/workflows/native-builds.yml, nightly)
+# and published to this project's rolling `zoder-nightly/{master,DATE}` generic
+# package (what install.sh + the fleet puller read) plus a GitHub "nightly"
+# release. GitLab no longer builds nightly binaries: no self-hosted ULTRA
+# dependency, no x86 cross-compile. GitLab hosts the package channel, runs the
+# per-push gate + weekly container, and prunes old dated channels (below).
 .nightly-rules: &nightly-rules
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
-
-nightly:linux:
-  stage: release
-  <<: *nightly-rules
-  needs:
-    - job: resolve:zeroclaw-sha
-      artifacts: true
-  timeout: 90m
-  variables:
-    # GitLab builds ONLY x86_64-Linux now. macOS-arm64 and arm64-Linux build
-    # NATIVELY on GitHub Actions (.github/workflows/native-builds.yml) and
-    # publish to this SAME zoder-nightly channel — removing the self-hosted
-    # ULTRA dependency (macOS) and the x86 cross-compile + aarch64 g++ toolchain
-    # (arm64). ZEROCLAW_PINNED_SHA is resolved fresh each run by
-    # resolve:zeroclaw-sha (zoder-integration HEAD) and inherited via dotenv.
-    ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
-    ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
-  script:
-    - rustup target add x86_64-unknown-linux-gnu
-    - cargo build --release --locked --bin zoder --target x86_64-unknown-linux-gnu
-    - |
-      # Build the TUI pair FIRST — do NOT touch the rolling channel
-      # until both zoder AND zerocode/zeroclaw built successfully
-      # (Finding #17: keep the rolling channel consistent).
-      rm -rf .zc-src
-      case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
-      [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
-      git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
-      ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
-      ZC_SHA=$(git -C .zc-src rev-parse HEAD)
-      [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
-      echo "nightly using zeroclaw SHA=$ZC_SHA"
-      t=x86_64-unknown-linux-gnu
-      # Prefer a reproducible --locked engine build (the fork's Cargo.lock is
-      # kept in sync); fall back to unlocked if it ever drifts so the nightly
-      # still ships (source reproducibility holds via the pinned SHA). Matches
-      # scripts/package.sh. zoder's own build above stays --locked.
-      if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" ); then
-        echo "WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
-        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
-      fi
-      # Now safe to upload: all three x86_64 binaries built successfully and
-      # the engine SHA is pinned for this nightly. Publish zoder + TUI pair to
-      # BOTH the rolling `master` channel AND a date-stamped channel (kept a
-      # week by prune:nightly) so `install.sh --channel 2026-07-04` pins it.
-      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
-      mkdir -p dist
-      echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
-      bin="target/$t/release/zoder"
-      sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
-      for name in zoder zerocode zeroclaw; do
-        if [ "$name" = zoder ]; then
-          src="$bin"; shasrc="$bin.sha256"
-          dst="zoder-$t"
-        else
-          src=".zc-src/target/$t/release/$name"
-          shasrc="$src.sha256"
-          sha256sum "$src" | awk '{print $1}' > "$shasrc"
-          dst="${name}-$t"
-        fi
-        for ch in master "$DATE"; do
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$src" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}"
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$shasrc" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}.sha256"
-        done
-      done
 
 # ── prune: keep only the last 7 date-stamped nightly channels ────────────────
 # The rolling `master` channel is always kept; date-stamped channels (YYYY-MM-DD)

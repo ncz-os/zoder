@@ -1,20 +1,19 @@
-name: native nightly builds (macOS-arm64 + arm64-Linux)
+name: native nightly builds (all arches)
 
-# GitLab.com's free shared runners are Linux/x86 only, so the macOS-arm64 and
-# arm64-Linux halves of the zoder trio had to build on self-hosted ULTRA / by
-# cross-compile. This workflow builds those two arches NATIVELY on GitHub's free
-# hosted runners (public repo = unlimited Actions minutes, macOS included) and
-# publishes the exact same artifacts to the canonical GitLab rolling channel
-# (`zoder-nightly/{master,DATE}`) that install.sh and the fleet puller read — so
-# there is one channel, no ULTRA dependency, and no arm64 cross-compile.
-#
-# GitLab keeps the fast per-push gate + x86_64-Linux nightly + weekly container.
-# This runs nightly (after GitLab's 09:00 build) and on demand — never per-push,
-# so it adds no gate noise and stays well within fair use.
+# GitHub is zoder's binary build farm. Public repo = unlimited free Actions
+# (incl. macOS), and GitHub has native hosted runners for every target zoder
+# ships — so all three arches build NATIVELY here (no self-hosted ULTRA, no x86
+# cross-compile). Each run:
+#   1. publishes the raw trio binaries to the canonical GitLab rolling channel
+#      (zoder-nightly/{master,DATE}) that install.sh + the fleet puller read;
+#   2. packages a per-arch tarball and refreshes the GitHub "nightly" release,
+#      so the GitHub repo page surfaces fresh, checksummed downloads.
+# GitLab keeps the fast per-push gate, the weekly container, and hosts the
+# package channel. Runs nightly + on demand only — never per-push.
 
 on:
   schedule:
-    - cron: "15 9 * * *"   # 09:15 UTC, just after the GitLab nightly (09:00)
+    - cron: "15 9 * * *"   # 09:15 UTC, just after the GitLab gate window
   workflow_dispatch:
 
 concurrency:
@@ -22,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write          # to refresh the "nightly" GitHub release
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,16 +29,46 @@ env:
   PROJECT_ID: "83731897"                 # gitlab.com/ncz-os/zoder
   ENGINE_REPO: "gitlab.com/ncz-os/zeroclaw.git"
   ENGINE_BRANCH: "zoder-integration"
+  RELEASE_TAG: "nightly"
 
 jobs:
+  # Reset the rolling "nightly" GitHub release once, before the matrix uploads,
+  # so stale assets (e.g. an old version's tarballs) never linger.
+  prepare-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Recreate the nightly release (clear stale assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DATE="$(date -u +%F)"
+          NOTES="Rolling nightly trio (zoder + zerocode + zeroclaw), refreshed ${DATE} UTC from master.
+
+          - Primary install (all platforms, checksummed): \`curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh\`
+          - These tarballs mirror the canonical GitLab channel \`zoder-nightly/master\`.
+          - Targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin."
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # delete existing assets so the release is a clean rolling snapshot
+            for a in $(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+              gh release delete-asset "$RELEASE_TAG" "$a" --repo "$GITHUB_REPOSITORY" --yes || true
+            done
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --title "zoder nightly (rolling)" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --title "zoder nightly (rolling)" --notes "$NOTES" --target master
+          fi
+
   build:
     name: ${{ matrix.triple }}
+    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: macos-14,         triple: aarch64-apple-darwin }
           - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -59,15 +88,15 @@ jobs:
       - name: Build zoder (own repo, --locked)
         run: cargo build --release --locked --bin zoder --target ${{ matrix.triple }}
 
-      - name: Build engine trio + publish to GitLab nightly channel
+      - name: Build engine trio, publish to GitLab channel + GitHub release
         env:
           TRIPLE: ${{ matrix.triple }}
           ENGINE_USER: ${{ secrets.GITLAB_ENGINE_USER }}
           ENGINE_TOKEN: ${{ secrets.GITLAB_ENGINE_TOKEN }}
           PKG_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
           # Clone the engine fork at zoder-integration HEAD (private → deploy token).
@@ -77,32 +106,41 @@ jobs:
           ZC_SHA="$(git -C .zc-src rev-parse HEAD)"
           echo "engine $ENGINE_BRANCH HEAD = $ZC_SHA"
 
-          # Build the engine pair natively. Prefer --locked (fork lock is kept in
+          # Build the engine pair natively. Prefer --locked (fork lock kept in
           # sync); fall back to unlocked on drift so the nightly still ships.
           if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" ); then
             echo "::warning::--locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked"
             ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" )
           fi
 
+          ZBIN="target/${TRIPLE}/release/zoder"
+          CBIN=".zc-src/target/${TRIPLE}/release/zerocode"
+          EBIN=".zc-src/target/${TRIPLE}/release/zeroclaw"
+          for f in "$ZBIN" "$CBIN" "$EBIN"; do [ -f "$f" ] || { echo "missing built binary: $f" >&2; exit 1; }; done
+
+          # 1) raw binaries → canonical GitLab rolling channel (install.sh reads this)
           DATE="$(date -u +%F)"
           BASE="https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/zoder-nightly"
-
-          publish() {   # $1 = logical name (zoder|zerocode|zeroclaw), $2 = built binary path
-            local name="$1" src="$2" dst="$1-${TRIPLE}" shaf
-            [ -f "$src" ] || { echo "missing built binary: $src" >&2; return 1; }
-            shaf="$(mktemp)"; sha256 "$src" > "$shaf"
+          publish_raw() {   # $1 = name, $2 = src
+            local dst="$1-${TRIPLE}" shaf; shaf="$(mktemp)"; sha256 "$2" > "$shaf"
             local ch
             for ch in master "$DATE"; do
-              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" \
-                --upload-file "$src"  "${BASE}/${ch}/${dst}"
-              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" \
-                --upload-file "$shaf" "${BASE}/${ch}/${dst}.sha256"
+              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file "$2"     "${BASE}/${ch}/${dst}"
+              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file "$shaf"  "${BASE}/${ch}/${dst}.sha256"
             done
-            echo "published $dst (sha256 $(cat "$shaf"))"
           }
+          publish_raw zoder    "$ZBIN"
+          publish_raw zerocode "$CBIN"
+          publish_raw zeroclaw "$EBIN"
 
-          publish zoder    "target/${TRIPLE}/release/zoder"
-          publish zerocode ".zc-src/target/${TRIPLE}/release/zerocode"
-          publish zeroclaw ".zc-src/target/${TRIPLE}/release/zeroclaw"
+          # 2) per-arch tarball → GitHub "nightly" release (repo-page discoverability)
+          STAGE="zoder-${TRIPLE}"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp "$ZBIN" "$CBIN" "$EBIN" "$STAGE/"
+          TAR="${STAGE}.tar.gz"
+          tar -czf "$TAR" "$STAGE"
+          # "<hash>  <file>" format so users can `sha256sum -c` / `shasum -a 256 -c`.
+          echo "$(sha256 "$TAR")  ${TAR}" > "${TAR}.sha256"
+          gh release upload "$RELEASE_TAG" "$TAR" "${TAR}.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
-          echo "zc-sha=$ZC_SHA date=$DATE triple=$TRIPLE" >> "$GITHUB_STEP_SUMMARY"
+          echo "published $TRIPLE (engine $ZC_SHA) to GitLab channel + GitHub $RELEASE_TAG release" >> "$GITHUB_STEP_SUMMARY"

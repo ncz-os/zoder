@@ -508,15 +508,23 @@ curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh \
 Knobs: `ZODER_VERSION` (default `latest`), `ZODER_BIN_DIR` (default
 `~/.local/bin`), `ZODER_REPO`, `ZODER_NO_VERIFY=1` (skip checksum).
 
-**Manual:** grab the tarball for your platform from the releases page —
-GitLab <https://gitlab.com/ncz-os/zoder/-/releases> or GitHub
-<https://github.com/ncz-os/zoder/releases> — verify against `SHA256SUMS`, then:
+**Manual (tarball):** grab your platform's tarball from the GitHub **nightly**
+release <https://github.com/ncz-os/zoder/releases/tag/nightly> — refreshed every
+night with all three arches; each `.tar.gz` has a sibling `.sha256`:
 
 ```bash
-tar -xzf zoder-<ver>-<target>.tar.gz
-sudo install zoder-<ver>-<target>/{zoder,zerocode,zeroclaw} /usr/local/bin/
+base=https://github.com/ncz-os/zoder/releases/download/nightly
+curl -fLO "$base/zoder-<target>.tar.gz"
+curl -fLO "$base/zoder-<target>.tar.gz.sha256"
+sha256sum -c zoder-<target>.tar.gz.sha256      # macOS: shasum -a 256 -c
+tar -xzf zoder-<target>.tar.gz
+sudo install zoder-<target>/{zoder,zerocode,zeroclaw} /usr/local/bin/
 zoder --help          # the trio is now on your PATH
 ```
+
+The raw per-binary artifacts `install.sh` pulls (rolling + date-pinned) live in
+the GitLab package registry: <https://gitlab.com/ncz-os/zoder/-/packages>
+(`zoder-nightly/master`, or `zoder-nightly/<YYYY-MM-DD>` for a pinned day).
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `aarch64-apple-darwin` (Apple Silicon). Windows → use WSL.
@@ -533,9 +541,12 @@ zoder builds natively for:
 | linux arm | `aarch64-unknown-linux-gnu` |
 
 - Local build: `./scripts/build.sh mac` (or `mac-x86`, `linux`).
-- Release targets: the CI matrix in `.github/workflows/release.yml` (native runners).
-- The quality gate (`.github/workflows/quality-gate.yml` on GitHub, `.gitlab-ci.yml`
-  on GitLab) runs fmt / clippy `-D warnings` / build+check / nextest / cargo-deny.
+- Nightly binaries: `.github/workflows/native-builds.yml` builds all three
+  arches natively on GitHub (macOS + arm64-Linux + x86_64-Linux), publishes raw
+  binaries to the GitLab `zoder-nightly` channel and tarballs to the GitHub
+  `nightly` release. Tagged `v*` releases: `.github/workflows/release.yml`.
+- The per-push quality gate runs on **GitLab** (`.gitlab-ci.yml`): fmt / clippy
+  `-D warnings` / check (all + no-default) / nextest / cargo-deny.
 
 ### Windows? Use WSL.
 
