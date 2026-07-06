@@ -8,7 +8,7 @@ free-first, cost-governed, MNEMOS-first.**
 ## TL;DR — install in one line
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 ```
 
 Detects your OS/arch, verifies the SHA-256 checksum, and installs the
@@ -490,7 +490,7 @@ the by-model table.
 ### Install — one line (prebuilt trio: zoder + zerocode + zeroclaw)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 ```
 
 Detects your OS/arch, downloads the version-matched trio for your platform,
@@ -501,7 +501,7 @@ verifies the SHA-256 checksum, and installs `zoder` (CLI), `zerocode` (TUI), and
 machine-readable `zoder-install:` message on error):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh \
   | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR="$HOME/.local/bin" sh
 ```
 
@@ -678,7 +678,7 @@ do **not** depend on any private/internal build process:
   benchmark overlay for tier ranking). A model is marked free/routable only on an
   **explicit** zero public price — unpriced placeholders and enterprise SKUs are
   filtered out.
-- **Pulled from:** `https://raw.githubusercontent.com/ncz-os/zoder/main/{corpus/model_corpus.json,pricing/catalog.json}`.
+- **Pulled from:** `https://raw.githubusercontent.com/ncz-os/zoder/master/{corpus/model_corpus.json,pricing/catalog.json}`.
 
 ### Keeping it current
 
@@ -686,7 +686,7 @@ do **not** depend on any private/internal build process:
 |---|---|
 | Seed on first install | the installer does it automatically (`--no-corpus` to skip) |
 | Refresh rates from public price lists | `zoder pricing sync` |
-| Re-pull the latest public corpus | `curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/main/corpus/model_corpus.json -o ~/.zoder/model_corpus.json` |
+| Re-pull the latest public corpus | `curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/corpus/model_corpus.json -o ~/.zoder/model_corpus.json` |
 | Reconcile the corpus against **your own** endpoint's served models | `zoder refresh` |
 
 The installer seeds both files and leaves any existing copy untouched, so your
