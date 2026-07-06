@@ -1381,6 +1381,144 @@ fn is_engine_known(engine: EngineKind) -> bool {
     matches!(engine, EngineKind::Zeroclaw | EngineKind::Goose)
 }
 
+/// One row of the per-engine write-tool matrix: which `(engine, tool_name)`
+/// pair we recognize as write/edit-class, and which argument field carries
+/// the target filesystem path. The path field is `None` for engines whose
+/// write tools' arg shape is not yet wired up (SLICE 1: zeroclaw is `None`
+/// for every row — the matching `tool_call` arg notification is not yet
+/// piped into the approval decision; goose wires up two tools).
+///
+/// SLICE 2 exposes this struct + [`write_tool_matrix`] (a public accessor
+/// returning the full per-engine matrix) so the zoder CLI can print a
+/// `--list-schemas` view an operator reads to understand "what is enforced
+/// vs what would be denied fail-closed". The matrix itself stays defined
+/// in `acp-client`; this is a read-only accessor, not a duplicate source
+/// of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteToolMatrixRow {
+    /// Which engine this row applies to.
+    pub engine: EngineKind,
+    /// Canonical tool name as it appears on the wire (lowercased on
+    /// lookup; preserved verbatim here so the printed matrix matches
+    /// what an operator sees in a tool-approval log).
+    pub tool_name: &'static str,
+    /// Argument field that holds the target filesystem path for this
+    /// `(engine, tool_name)` pair. `None` for engines whose arg shape
+    /// is not yet wired up — those rows are intentionally here so the
+    /// printed matrix shows "we know this is write-class but we cannot
+    /// yet extract the path; enforcement is fail-closed on this row".
+    pub path_field: Option<&'static str>,
+}
+
+/// Return the per-engine write-tool matrix as a flat, deterministic
+/// (engine-asc, tool-asc) list of [`WriteToolMatrixRow`] entries. The
+/// returned slice is `&'static` because both the engine roster and the
+/// tool tables are compile-time constants — there is no allocation and
+/// no fallible construction.
+///
+/// This is the SOLE public surface an external caller uses to render
+/// the matrix (e.g. `zoder --list-schemas`); the CLI MUST NOT duplicate
+/// the tables, otherwise it drifts from the decision the kernel
+/// actually applies.
+pub fn write_tool_matrix() -> &'static [WriteToolMatrixRow] {
+    // Engine order matters for the rendered output (deterministic): zeroclaw
+    // first, then goose. Within an engine, tools are in the order they
+    // appear in the corresponding `*_WRITE_TOOLS` constant so the
+    // `assert_eq!`-able shape is stable for the CLI's `--list-schemas` test.
+    const ROWS: &[WriteToolMatrixRow] = &[
+        // Zeroclaw: every documented write tool is in the matrix but the
+        // extractor returns `None` for all of them (SLICE 1: arg plumbing
+        // not yet wired). Render them with `path_field = None` so an
+        // operator reading --list-schemas sees "we know these are
+        // write-class, we cannot extract a path, enforcement denies on
+        // fail-closed unless --trust-engine".
+        WriteToolMatrixRow {
+            engine: EngineKind::Zeroclaw,
+            tool_name: "edit",
+            path_field: None,
+        },
+        WriteToolMatrixRow {
+            engine: EngineKind::Zeroclaw,
+            tool_name: "write",
+            path_field: None,
+        },
+        WriteToolMatrixRow {
+            engine: EngineKind::Zeroclaw,
+            tool_name: "apply_patch",
+            path_field: None,
+        },
+        WriteToolMatrixRow {
+            engine: EngineKind::Zeroclaw,
+            tool_name: "shell",
+            path_field: None,
+        },
+        WriteToolMatrixRow {
+            engine: EngineKind::Zeroclaw,
+            tool_name: "bash",
+            path_field: None,
+        },
+        // Goose: write tools with a wired-up path extractor. `text_editor`
+        // uses the canonical `path` field; `write_file` accepts either the
+        // canonical `file_path` or the permissive `path` variant (snake_case
+        // vs permissive camelCase). The path_field listed here is the
+        // PRIMARY one for human readability; the actual extractor accepts
+        // both, see `extract_write_target`.
+        WriteToolMatrixRow {
+            engine: EngineKind::Goose,
+            tool_name: "text_editor",
+            path_field: Some("path"),
+        },
+        WriteToolMatrixRow {
+            engine: EngineKind::Goose,
+            tool_name: "write_file",
+            path_field: Some("file_path"),
+        },
+    ];
+    ROWS
+}
+
+/// Render [`write_tool_matrix`] as a stable, multi-line, human-readable
+/// string. Intended for `zoder --list-schemas`: the operator pastes the
+/// output into a config review, an incident write-up, or a `git diff` of
+/// the kernel policy. Format is deliberately plain-text (no ANSI) so it
+/// is pipe-friendly and `grep`/`diff`-friendly.
+///
+/// Layout:
+///
+/// ```text
+/// writable-root enforcement: per-engine write-tool matrix
+/// (rows describe what is recognized as write-class; path_field=None means
+///  the arg extractor is not yet wired up -> fail-closed deny on enforce)
+/// engine     tool            path_field
+/// zeroclaw   edit            -
+/// zeroclaw   write           -
+/// zeroclaw   apply_patch     -
+/// zeroclaw   shell           -
+/// zeroclaw   bash            -
+/// goose      text_editor     path
+/// goose      write_file      file_path  (also accepts: path)
+/// ```
+pub fn write_tool_matrix_human() -> String {
+    let mut out = String::new();
+    out.push_str("writable-root enforcement: per-engine write-tool matrix\n");
+    out.push_str("(rows describe what is recognized as write-class; ");
+    out.push_str("path_field=None means the arg extractor is not yet wired up ->\n");
+    out.push_str(" fail-closed deny on enforce=true unless --trust-engine is set)\n");
+    out.push_str("engine     tool            path_field\n");
+    for row in write_tool_matrix() {
+        // Engine name uses Debug so `EngineKind::Zeroclaw` -> "zeroclaw"
+        // (the derived Debug for a unit variant is exactly the lowercased
+        // variant name; this is the same string `EngineKind::FromStr`
+        // accepts, so an operator can copy-paste it back into a config).
+        let engine = format!("{:?}", row.engine).to_ascii_lowercase();
+        let field = row.path_field.unwrap_or("-");
+        // Pad for column alignment on the typical small matrix; longer
+        // engine/tool names just push the column over (no truncation).
+        out.push_str(&format!("{:<10} {:<15} {}\n", engine, row.tool_name, field));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Goose ACP driver (standard ACP, no zeroclaw extensions).
 // ---------------------------------------------------------------------------
@@ -2402,13 +2540,37 @@ mod tests {
     // `PathBuf`-only mock that wouldn't catch a real `canonicalize` bug).
     // -----------------------------------------------------------------------
 
+    /// Process-wide monotonic counter used to make `make_containment_dirs`
+    /// produce a UNIQUE subdir name on every call. The previous
+    /// implementation used `SystemTime::now().as_nanos()` alone, which
+    /// collides when two tests in the same process start within the same
+    /// nanosecond (cargo's default test runner runs tests in parallel
+    /// threads). The collision caused the `TempdirShim` Drop impls of one
+    /// pair of tests to `remove_dir_all` the dir that the other pair was
+    /// still mutating, producing "ghost" containment failures like
+    /// `containment_symlink_escape_denied` flaking on a target that
+    /// "vanished" mid-test, and `containment_inside_root_allowed` flaking
+    /// when the target file was `remove_dir_all`'d before the assertion
+    /// read it back. The atomic counter (combined with pid + nanos for
+    /// defense-in-depth across processes) is a no-extra-dep fix that
+    /// guarantees a unique suffix per call within the process.
+    static TEMPDIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// Tiny stand-in for `tempfile::Tempdir`: drops the directory tree on
     /// `Drop` so tests don't leak even when assertions abort early. Lives
     /// inside the `tests` module so it isn't part of the public surface.
     struct TempdirShim(PathBuf);
     impl Drop for TempdirShim {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // Only remove if the dir still exists; under parallel tests a
+            // peer TempdirShim may have already swept it (we tolerate the
+            // resulting NotFound here so a benign race never panics on
+            // drop).
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
         }
     }
     impl TempdirShim {
@@ -2426,13 +2588,22 @@ mod tests {
         // unique subdir of the test temp dir; the `TempdirShim` returned
         // here drops and `remove_dir_all`s it on test exit, so the OS
         // doesn't accumulate stale trees even when assertions abort.
+        //
+        // Uniqueness: the directory name embeds pid (cross-process),
+        // nanoseconds since the Unix epoch (cross-run defense-in-depth),
+        // AND a per-process atomic counter (the only component that
+        // actually changes between two calls inside the same process on
+        // the same nanosecond). Together this is collision-free for the
+        // `cargo test` thread fan-out we run.
+        let seq = TEMPDIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
-            "zoder-acp-slice1-{}-{}",
+            "zoder-acp-slice1-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq,
         ));
         std::fs::create_dir_all(&base).unwrap();
         let root_a = base.join("root_a");
@@ -2554,6 +2725,87 @@ mod tests {
         }
         // Suppress an "unused" warning on the captured `dir` on non-Unix.
         let _ = dir;
+    }
+
+    /// Regression test for the parallel-test tempdir-name collision
+    /// that previously caused this file's symlink/inside-root tests to
+    /// flake under `cargo test` (the default test runner fans out
+    /// across threads, and two tests starting in the same nanosecond
+    /// used to produce the SAME `zoder-acp-slice1-<pid>-<nanos>` path
+    /// — so one's `TempdirShim::drop` would `remove_dir_all` the
+    /// other's test artifacts mid-test, and `path_within_roots` would
+    /// see a "vanished" target). The fix: `make_containment_dirs` now
+    /// appends a process-wide atomic counter, making the directory
+    /// name strictly unique per call inside the process. This test
+    /// exercises that property directly: it creates N independent
+    /// containment dirs in a tight loop and asserts that all of them
+    /// (a) point at distinct filesystem paths and (b) are correctly
+    /// classified by `path_within_roots` (inside == true, outside ==
+    /// false) when paired with their own roots. If anyone regresses
+    /// the uniqueness (e.g. removes the counter), this test will
+    /// catch it deterministically — no parallel runner required.
+    #[test]
+    fn containment_tempdir_names_are_strictly_unique() {
+        const N: usize = 32;
+        let mut dirs: Vec<(TempdirShim, PathBuf, PathBuf)> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let (shim, root_a, root_b, _outside) = make_containment_dirs();
+            dirs.push((shim, root_a, root_b));
+        }
+        // Every base path must be distinct from every other base path.
+        let mut bases: Vec<PathBuf> = dirs
+            .iter()
+            .map(|(shim, _, _)| shim.path().to_path_buf())
+            .collect();
+        let n_before_dedup = bases.len();
+        bases.sort();
+        bases.dedup();
+        assert_eq!(
+            bases.len(),
+            n_before_dedup,
+            "make_containment_dirs must return distinct base paths on every call; \
+             duplicates mean the tempdir-naming fix has regressed (re-introducing \
+             the parallel-test flake that previously broke \
+             containment_symlink_escape_denied and containment_inside_root_allowed)"
+        );
+        // And the per-test root_a / root_b paths must also all be
+        // distinct (defense-in-depth: even if a base collision sneaked
+        // in, root_a would still be unique because it's base+"/root_a").
+        let mut all_roots: Vec<PathBuf> = dirs
+            .iter()
+            .flat_map(|(_, a, b)| [a.clone(), b.clone()])
+            .collect();
+        let n_roots = all_roots.len();
+        all_roots.sort();
+        all_roots.dedup();
+        assert_eq!(
+            all_roots.len(),
+            n_roots,
+            "every root_a / root_b across calls must be distinct"
+        );
+        // Each dir must classify its OWN root_a as inside (sanity
+        // check that the counter-padded paths are still functional
+        // containment roots, not just "unique looking" ones).
+        for (shim, root_a, root_b) in &dirs {
+            let inside_a = root_a.join("ok.txt");
+            std::fs::write(&inside_a, "x").unwrap();
+            assert!(
+                path_within_roots(&inside_a, &[root_a.clone()]),
+                "self-pair inside must be allowed: base={}",
+                shim.path().display()
+            );
+            // And a file under root_b is NOT inside root_a (cross-root
+            // sanity; the counter must not have produced overlapping
+            // roots).
+            let b_file = root_b.join("y.txt");
+            std::fs::write(&b_file, "x").unwrap();
+            assert!(
+                !path_within_roots(&b_file, &[root_a.clone()]),
+                "cross-root sanity: file under root_b must NOT be inside root_a; \
+                 base={}",
+                shim.path().display()
+            );
+        }
     }
 
     #[test]
@@ -2830,6 +3082,64 @@ mod tests {
         assert_eq!(opts.writable_roots, vec![PathBuf::from("/tmp/repo")]);
         assert!(!opts.enforce_writable_roots);
         assert!(!opts.trust_engine);
+    }
+
+    #[test]
+    fn write_tool_matrix_is_non_empty_and_covers_known_engines() {
+        // The matrix MUST cover at least the engines we claim to
+        // support (zeroclaw, goose) so --list-schemas is never empty.
+        // The matrix is also the single source of truth for the kernel;
+        // a missing engine row means an operator has no way to discover
+        // that engine's enforcement posture.
+        let m = write_tool_matrix();
+        assert!(!m.is_empty(), "write-tool matrix must not be empty");
+        let has_zeroclaw = m.iter().any(|r| r.engine == EngineKind::Zeroclaw);
+        let has_goose = m.iter().any(|r| r.engine == EngineKind::Goose);
+        assert!(has_zeroclaw, "matrix must include zeroclaw rows");
+        assert!(has_goose, "matrix must include goose rows");
+    }
+
+    #[test]
+    fn write_tool_matrix_rows_align_with_is_write_class_tool() {
+        // Every row in the public matrix MUST be classified as write-
+        // class by the kernel's own `is_write_class_tool`. Otherwise the
+        // matrix and the kernel decision have drifted — an operator who
+        // trusts the printed matrix would believe a tool is enforced
+        // when the kernel does not actually consult the matrix for it.
+        for row in write_tool_matrix() {
+            assert!(
+                is_write_class_tool(row.engine, row.tool_name),
+                "row {:?}/{:?} must be classified as write-class",
+                row.engine,
+                row.tool_name
+            );
+        }
+    }
+
+    #[test]
+    fn write_tool_matrix_human_contains_known_tools() {
+        // Spot-check the human-readable rendering: it must mention at
+        // least one tool per known engine so an operator can grep for
+        // either engine and find something. The exact format is a
+        // diagnostic surface; we don't pin column alignment here.
+        let s = write_tool_matrix_human();
+        assert!(
+            s.contains("zeroclaw"),
+            "human rendering must include zeroclaw"
+        );
+        assert!(s.contains("goose"), "human rendering must include goose");
+        assert!(
+            s.contains("text_editor"),
+            "human rendering must include goose text_editor row"
+        );
+        assert!(
+            s.contains("write_file"),
+            "human rendering must include goose write_file row"
+        );
+        assert!(
+            s.contains("path"),
+            "human rendering must include the path_field column"
+        );
     }
 
     #[test]

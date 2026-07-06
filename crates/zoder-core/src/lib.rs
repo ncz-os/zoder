@@ -35,8 +35,9 @@ pub mod update;
 pub mod utilization;
 
 pub use acp_client::{
-    new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket, AgentEvent,
-    AgentOptions, AgentRun, ApprovalPolicy, EngineKind, GooseProviderEnv, DEFAULT_AUTO_APPROVE,
+    new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket,
+    write_tool_matrix, write_tool_matrix_human, AgentEvent, AgentOptions, AgentRun, ApprovalPolicy,
+    EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
 };
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use config::{
