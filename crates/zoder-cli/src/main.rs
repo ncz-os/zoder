@@ -232,6 +232,42 @@ struct Cli {
     #[arg(long, global = true, value_name = "ENGINE", default_value = "zeroclaw")]
     engine: String,
 
+    // ---- execution-safety kernel (SLICE 2) ----
+    // The boundary enforcement itself lives in `acp-client` (per-engine
+    // write-tool schema matrix + argument-aware approval decision). These
+    // flags simply wire that boundary into every agentic dispatch site
+    // (`exec`, `loop`, `rescue`, `run`/goose). Without them, today's
+    // behavior is preserved EXACTLY: enforcement OFF, writable_roots =
+    // [cwd].
+    /// Append PATH to the list of writable roots the engine is allowed
+    /// to write into when `--enforce-writable-roots` is set. cwd is
+    /// ALWAYS in the list (today's behavior); this only adds extra
+    /// roots on top. Repeatable: pass `--add-dir` more than once to
+    /// grant several additional roots.
+    #[arg(long = "add-dir", global = true, value_name = "PATH", action = clap::ArgAction::Append)]
+    add_dir: Vec<String>,
+    /// Turn ON the writable-root containment boundary. With this flag,
+    /// every write/edit-class tool call from the engine is checked
+    /// against the resolved writable roots BEFORE the policy decides;
+    /// any target that resolves outside the roots is DENIED regardless
+    /// of `--approve`. Without this flag, the boundary is OFF (today's
+    /// behavior — no new denials).
+    #[arg(long = "enforce-writable-roots", global = true)]
+    enforce_writable_roots: bool,
+    /// Trust the engine's tool-shape identification: when set, an
+    /// unknown engine, an unknown write tool, or a missing/unparseable
+    /// path on a known write tool does NOT force a fail-closed deny.
+    /// **Weakens the boundary** — use only for engines whose schema
+    /// matrix we have validated exhaustively. The default is fail-closed.
+    #[arg(long = "trust-engine", global = true)]
+    trust_engine: bool,
+    /// Print the per-engine write-tool schema matrix (which (engine,
+    /// tool_name, path_field) tuples are recognized as write-class) and
+    /// exit. Useful for auditing what `--enforce-writable-roots` will
+    /// actually check versus what it would deny fail-closed.
+    #[arg(long = "list-schemas", global = true)]
+    list_schemas: bool,
+
     // ---- reliability ----
     /// Per-model transient-failure retries (timeouts/429/5xx) before fallback.
     #[arg(long, global = true, default_value_t = 2)]
@@ -908,6 +944,18 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+
+    // `--list-schemas` is a read-only diagnostic that prints the
+    // per-engine write-tool schema matrix the kernel uses to decide
+    // containment, then exits 0. Handle it BEFORE any subcommand dispatch
+    // so it works without a subcommand (`zoder --list-schemas`) and is
+    // unaffected by routing / engine availability. The matrix is exposed
+    // by `acp-client` as the single source of truth — the CLI must not
+    // duplicate the table, otherwise it drifts from the kernel.
+    if cli.list_schemas {
+        print!("{}", zoder_core::write_tool_matrix_human());
+        return Ok(());
+    }
 
     let result = match &cli.cmd {
         Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
@@ -3145,6 +3193,65 @@ fn parse_approval(cli: &Cli) -> ApprovalPolicy {
     }
 }
 
+/// Build the [`AgentOptions::writable_roots`] vector from `cwd` plus every
+/// `--add-dir` value. cwd is always first (preserves the pre-SLICE-2
+/// default exactly). Each `--add-dir` value is resolved to an absolute
+/// path so the operator cannot accidentally smuggle in a relative escape,
+/// and so the kernel's containment check sees the same canonical form
+/// regardless of how the value was supplied. Canonicalization failures
+/// (typo, missing dir on a path that should be there, permission denied)
+/// are a hard error: a silent "the boundary contains nothing" failure
+/// is worse than a clear startup error.
+pub(crate) fn resolve_writable_roots(
+    cwd: &std::path::Path,
+    add_dir: &[String],
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    // Canonicalize cwd up-front so the returned vector is internally
+    // consistent: every entry is a real, symlink-resolved absolute path
+    // in the form the kernel's `resolve_containment` will see when it
+    // canonicalizes each root at check-time. (Without this, on macOS
+    // where `/tmp` is a symlink to `/private/tmp`, the cwd entry would
+    // be `/tmp/...` while every `--add-dir` entry is `/private/tmp/...`,
+    // and an operator reading the startup notice would see a
+    // mismatched-looking list — even though containment still works,
+    // because the kernel re-canonicalizes each root before
+    // `starts_with`.) Failing to canonicalize cwd is a hard error so
+    // we never silently emit a root the boundary can't actually match
+    // against.
+    let cwd_abs = std::path::absolute(cwd)
+        .with_context(|| format!("cwd {cwd:?}: could not resolve to an absolute path"))?;
+    let cwd_canon = std::fs::canonicalize(&cwd_abs).with_context(|| {
+        format!(
+            "cwd {cwd:?}: could not canonicalize (does the directory exist and is it \
+             readable?)"
+        )
+    })?;
+    let mut roots = Vec::with_capacity(1 + add_dir.len());
+    roots.push(cwd_canon);
+    for raw in add_dir {
+        let p = std::path::PathBuf::from(raw);
+        let abs = std::path::absolute(&p)
+            .with_context(|| format!("--add-dir {raw:?}: could not resolve to an absolute path"))?;
+        let canon = std::fs::canonicalize(&abs).with_context(|| {
+            format!(
+                "--add-dir {raw:?}: could not canonicalize (does the directory exist and \
+                 is it readable?)"
+            )
+        })?;
+        roots.push(canon);
+    }
+    Ok(roots)
+}
+
+/// Render a list of writable roots for the operator-facing startup
+/// notice. Multiple paths are joined with `, `; a single root is rendered
+/// verbatim. We avoid color codes here so the line survives `tee`, log
+/// capture, and grep without ANSI escapes.
+pub(crate) fn format_root_list(roots: &[std::path::PathBuf]) -> String {
+    let parts: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+    parts.join(", ")
+}
+
 /// CLI-side mirror of [`ApprovalPolicy`] for the `--approve` flag.
 ///
 /// Defined here (not on [`ApprovalPolicy`] itself) so a typo is rejected at
@@ -3735,6 +3842,183 @@ mod cli_switch_regression_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SLICE 2 (execution-safety kernel CLI plumbing) regression tests.
+// ---------------------------------------------------------------------------
+//
+// These tests pin the operator-facing flag plumbing for the writable-root
+// containment boundary:
+//   * `--add-dir PATH` (repeatable) populates `writable_roots` on the
+//     constructed AgentOptions in addition to the default cwd.
+//   * `--enforce-writable-roots` flips `enforce_writable_roots` from
+//     false to true.
+//   * `--trust-engine` flips `trust_engine` from false to true.
+//   * Absence of the flags reproduces today's behavior exactly:
+//     `enforce=false`, `writable_roots=[cwd]`.
+//   * `--list-schemas` prints a non-empty matrix covering the known
+//     engines.
+//
+// The tests use `Cli::try_parse_from` directly (mirroring the existing
+// `cli_switch_regression_tests` pattern) and then exercise the
+// `resolve_writable_roots` helper + the `write_tool_matrix_human`
+// accessor from `acp-client` (re-exported via `zoder-core`) to verify
+// the flag plumbing end-to-end without spinning up an actual agent.
+#[cfg(test)]
+mod writable_root_flag_tests {
+    use super::*;
+
+    #[test]
+    fn absence_of_flags_yields_unchanged_defaults() {
+        // No --add-dir, no --enforce-writable-roots, no --trust-engine.
+        // resolve_writable_roots must produce a single-element vector
+        // containing the (canonicalized) cwd; AgentOptions must leave
+        // both bools false. We use a real tempdir as the cwd so
+        // canonicalize succeeds.
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let roots =
+            resolve_writable_roots(&cwd, &cli.add_dir).expect("no flags must resolve cleanly");
+        // resolve_writable_roots canonicalizes cwd; assert the canonical
+        // form so the test is correct on macOS where /tmp is a symlink.
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(roots, vec![cwd_canon]);
+        assert!(!cli.enforce_writable_roots);
+        assert!(!cli.trust_engine);
+    }
+
+    #[test]
+    fn enforce_flag_flips_bool_on_agent_options() {
+        // --enforce-writable-roots alone must flip the bool; the roots
+        // list remains [cwd] (no extra --add-dir), mirroring the spec.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--enforce-writable-roots"]).unwrap();
+        assert!(cli.enforce_writable_roots);
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let roots = resolve_writable_roots(&cwd, &cli.add_dir).unwrap();
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(roots, vec![cwd_canon]);
+    }
+
+    #[test]
+    fn trust_engine_flag_flips_bool_on_agent_options() {
+        // --trust-engine alone must flip trust_engine=true; enforce stays
+        // off (operator chooses both flags independently).
+        let cli = Cli::try_parse_from(["zoder", "exec", "--trust-engine"]).unwrap();
+        assert!(cli.trust_engine);
+        assert!(!cli.enforce_writable_roots);
+    }
+
+    #[test]
+    fn add_dir_accumulates_multiple_roots() {
+        // --add-dir can appear more than once; each occurrence appends
+        // one canonicalized absolute path to writable_roots AFTER cwd.
+        // We use real tempdirs so canonicalize succeeds (it requires
+        // existing directories on Linux/macOS).
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let argv = [
+            "zoder",
+            "exec",
+            "--add-dir",
+            dir1.path().to_str().unwrap(),
+            "--add-dir",
+            dir2.path().to_str().unwrap(),
+        ];
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert_eq!(cli.add_dir.len(), 2, "two --add-dir occurrences");
+
+        // Use a real tempdir as cwd so resolve_writable_roots
+        // canonicalizes it; the assertion compares against the same
+        // canonicalized form.
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let cwd = cwd_dir.path().to_path_buf();
+        let roots = resolve_writable_roots(&cwd, &cli.add_dir)
+            .expect("all --add-dir values resolve cleanly");
+        // Order: cwd first (unchanged default), then the --add-dir
+        // values in argument order.
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(roots[0], cwd_canon);
+        assert_eq!(roots.len(), 3);
+        let expected1 = std::fs::canonicalize(dir1.path()).unwrap();
+        let expected2 = std::fs::canonicalize(dir2.path()).unwrap();
+        assert_eq!(roots[1], expected1, "first --add-dir must be root[1]");
+        assert_eq!(roots[2], expected2, "second --add-dir must be root[2]");
+    }
+
+    #[test]
+    fn add_dir_missing_path_is_a_clear_error() {
+        // A nonexistent --add-dir must surface a clear error at startup,
+        // NOT silently shrink the writable_roots list. A boundary that
+        // contains nothing is worse than a failed run: an operator who
+        // sees the run proceed will assume their flag took effect.
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--add-dir",
+            "/this/path/should/definitely/not/exist/zoder-cli-test-xyz",
+        ])
+        .unwrap();
+        // Use a real tempdir as cwd so cwd canonicalization succeeds and
+        // the failure must come from the --add-dir entry, not from cwd.
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let cwd = cwd_dir.path().to_path_buf();
+        let err = resolve_writable_roots(&cwd, &cli.add_dir)
+            .expect_err("missing --add-dir must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--add-dir"),
+            "error message must mention --add-dir so the operator can \
+             find the offending flag; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn list_schemas_prints_non_empty_matrix_covering_known_engines() {
+        // --list-schemas must produce a non-empty matrix that mentions
+        // every engine the kernel claims to support. We don't pin the
+        // exact format (it's a diagnostic surface); we just check that
+        // both engines and at least one row each are present.
+        let m = zoder_core::write_tool_matrix();
+        assert!(!m.is_empty(), "matrix must not be empty");
+        assert!(m.iter().any(|r| r.engine == EngineKind::Zeroclaw));
+        assert!(m.iter().any(|r| r.engine == EngineKind::Goose));
+        let human = zoder_core::write_tool_matrix_human();
+        assert!(human.contains("zeroclaw"));
+        assert!(human.contains("goose"));
+    }
+
+    #[test]
+    fn list_schemas_flag_is_global() {
+        // --list-schemas must be global so it works without a subcommand
+        // and applies uniformly to every dispatch site. A bare
+        // `zoder --list-schemas` (no subcommand) must parse cleanly.
+        let cli = Cli::try_parse_from(["zoder", "--list-schemas"]).unwrap();
+        assert!(cli.list_schemas);
+        // And on every agentic subcommand, same flag.
+        for sub in ["exec", "loop", "rescue", "run"] {
+            let cli = Cli::try_parse_from(["zoder", sub, "--list-schemas"])
+                .unwrap_or_else(|e| panic!("--list-schemas on `{sub}` must parse: {e}"));
+            assert!(
+                cli.list_schemas,
+                "--list-schemas on `{sub}` must be accepted (global)"
+            );
+        }
+    }
+
+    #[test]
+    fn format_root_list_renders_human_readable_summary() {
+        // The startup notice uses format_root_list; pin a minimal
+        // human-readable contract so a future refactor cannot silently
+        // change it to something operators cannot parse at a glance.
+        let cwd = std::path::PathBuf::from("/tmp/repo");
+        let one = vec![cwd.clone()];
+        assert_eq!(format_root_list(&one), "/tmp/repo");
+        let two = vec![cwd.clone(), std::path::PathBuf::from("/var/data")];
+        assert_eq!(format_root_list(&two), "/tmp/repo, /var/data");
+    }
+}
+
 #[cfg(test)]
 mod ledger_integrity_tests {
     use super::*;
@@ -3985,6 +4269,32 @@ pub(crate) async fn agentic_turn(
     let cwd = agentic_cwd(cli)?;
     let alias = resolve_agent_alias(cli, &primary);
 
+    // SLICE 2 (execution-safety kernel CLI plumbing): resolve the
+    // writable-root containment boundary from the operator's flags.
+    //
+    // Today's behavior is preserved EXACTLY when none of the flags are
+    // passed: `writable_roots = vec![cwd]` (the only root the engine can
+    // write into if enforcement is on) and `enforce_writable_roots = false`
+    // (no new denials, no new checks). When `--enforce-writable-roots`
+    // is set, every write/edit-class tool call from the engine is
+    // resolved (canonicalized, symlink-safe) against this list and DENIED
+    // if it lands outside.
+    //
+    // `--add-dir PATH` (repeatable) appends extra roots on top of cwd.
+    // Each value is resolved to an absolute path so the same operator-
+    // supplied string cannot smuggle in a relative escape; the canonical
+    // form is also what the kernel's containment check expects. Failed
+    // canonicalization is a hard error so an operator gets a clear message
+    // at startup rather than a silent boundary that turns out to contain
+    // nothing.
+    let writable_roots = resolve_writable_roots(&cwd, &cli.add_dir)?;
+    if cli.enforce_writable_roots {
+        eprintln!(
+            "[zoder] writable-root enforcement ON: writes must land in {}",
+            format_root_list(&writable_roots)
+        );
+    }
+
     // Resolve the engine session id once for the helper above. Doing it on the
     // same path as the model/routing resolution keeps `--continue` errors
     // co-located with the other early-validation steps, before we commit to
@@ -4060,13 +4370,15 @@ pub(crate) async fn agentic_turn(
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
         goose_provider,
-        // SLICE 1: writable-root containment defaults. Enforcement is
-        // OFF (non-breaking) and the boundary is the repo cwd. A
-        // follow-up slice will add the CLI flag and validate the
-        // schema matrix; once that lands the default can flip.
-        writable_roots: vec![cwd.clone()],
-        enforce_writable_roots: false,
-        trust_engine: false,
+        // SLICE 2 (execution-safety kernel CLI plumbing): thread the
+        // operator's flags into the agentic driver. Defaults are
+        // non-breaking: enforcement off, writable boundary = cwd. With
+        // `--enforce-writable-roots`, every write/edit-class tool call
+        // is resolved against `writable_roots` and DENIED if it lands
+        // outside (regardless of `ApprovalPolicy`).
+        writable_roots,
+        enforce_writable_roots: cli.enforce_writable_roots,
+        trust_engine: cli.trust_engine,
     };
 
     let started = std::time::Instant::now();
