@@ -73,13 +73,23 @@ fn persist_agentic_utilization_at(
     now: DateTime<Utc>,
 ) -> bool {
     let view = AgenticHeaderView(headers);
-    let Some(mut snapshot) = zoder_core::utilization::parse_headers(&view, "default", "default")
+    // KNEMON per-account identity: thread the configured
+    // `effective_account_id()` through the snapshot so two accounts on
+    // the same `(provider, tier)` never collide on the literal
+    // `"default"` key. A provider with no `account_id` set resolves to
+    // [`DEFAULT_ACCOUNT_ID`] — byte-identical to pre-fix behavior.
+    let account_id = provider
+        .subscription
+        .as_ref()
+        .map(|s| s.effective_account_id())
+        .unwrap_or_else(|| zoder_core::config::DEFAULT_ACCOUNT_ID.to_string());
+    let Some(mut snapshot) = zoder_core::utilization::parse_headers(&view, &account_id, "default")
     else {
         return false;
     };
     let (util_provider, plan) = utilization_key(provider);
     snapshot.provider = util_provider;
-    snapshot.account_id = "default".to_string();
+    snapshot.account_id = account_id;
     snapshot.plan = plan;
     snapshot.observed_at = Some(now);
 
@@ -117,6 +127,12 @@ fn persist_agentic_counter_at(
     let Some(plan) = provider.subscription.as_ref() else {
         return false;
     };
+    // KNEMON per-account identity — see `persist_agentic_utilization_at`.
+    // Counter rows are keyed on `(provider, account_id, plan, window_name)`;
+    // threading the configured `effective_account_id` through every counter
+    // call keeps two MiniMax accounts on the same tier in separate buckets
+    // instead of collapsing onto the legacy `"default"` key.
+    let account_id = plan.effective_account_id();
     let catalog = zoder_core::subscription_tiers::TierCatalog::bundled();
     let namespace = plan
         .tier
@@ -142,7 +158,7 @@ fn persist_agentic_counter_at(
     for window in counter_windows {
         store.set_counter_rolling_hours(
             util_provider,
-            "default",
+            &account_id,
             &plan_label,
             &window.name,
             (window.reset == zoder_core::config::ResetKind::Rolling).then_some(window.hours),
@@ -150,7 +166,7 @@ fn persist_agentic_counter_at(
         );
         store.set_counter_cap(
             util_provider,
-            "default",
+            &account_id,
             &plan_label,
             &window.name,
             window.cap,
@@ -167,7 +183,7 @@ fn persist_agentic_counter_at(
         };
         store.set_counter_period_id(
             util_provider,
-            "default",
+            &account_id,
             &plan_label,
             &window.name,
             period_id,
@@ -175,7 +191,7 @@ fn persist_agentic_counter_at(
         );
         store.record_counter(
             util_provider,
-            "default",
+            &account_id,
             &plan_label,
             &window.name,
             tokens_used as f64,
