@@ -2511,18 +2511,33 @@ async fn try_model(
     json: bool,
     retries: u32,
     quiet: bool,
-) -> Result<ChatResult, (ProviderError, bool)> {
+    ledger: &Ledger,
+    initial_reservation: &mut Option<BillableReservation>,
+) -> anyhow::Result<Result<(ChatResult, BillableReservation), (ProviderError, bool)>> {
     let mut attempt = 0u32;
     loop {
+        let mut reservation = match initial_reservation.take() {
+            Some(reservation) => reservation,
+            None => ledger
+                .reserve_billable()
+                .with_context(|| format!("reserving ledger entry before {} attempt", req.model))?,
+        };
         let mut stdout = std::io::stdout();
         let sink: Option<&mut dyn Write> = if json { None } else { Some(&mut stdout) };
+        reservation.arm().with_context(|| {
+            format!("verifying ledger reservation before {} dispatch", req.model)
+        })?;
         match provider.stream_chat(req, sink).await {
-            Ok(res) => return Ok(res),
+            Ok(res) => return Ok(Ok((res, reservation))),
             Err(e) => {
+                // The request may have reached the server even when the client
+                // timed out or failed to decode the response. Dropping this
+                // armed reservation deliberately retains its unknown-cost row.
+                drop(reservation);
                 // Output already shown for this model: we cannot cleanly retry or
                 // fall back without duplicating/garbling the stream.
                 if e.emitted {
-                    return Err((e, true));
+                    return Ok(Err((e, true)));
                 }
                 if e.retryable() && attempt < retries {
                     let delay = backoff_delay(attempt, e.retry_after);
@@ -2540,7 +2555,7 @@ async fn try_model(
                     attempt += 1;
                     continue;
                 }
-                return Err((e, false));
+                return Ok(Err((e, false)));
             }
         }
     }
@@ -2691,9 +2706,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // Serialize the authoritative budget snapshot with dispatch and reserve
     // durable space for reconciliation before any provider can incur spend.
-    let mut ledger_reservation = Ledger::new(&eng.cfg.ledger_path)
+    let ledger = Ledger::new(&eng.cfg.ledger_path);
+    let ledger_reservation = ledger
         .reserve_billable()
         .with_context(|| "reserving ledger entry before oneshot dispatch")?;
+    let mut initial_reservation = Some(ledger_reservation);
 
     // Pre-call budget guard: project this call's cost from the prompt size and
     // the configured output estimate, then gate against the per-call and
@@ -2714,7 +2731,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             estimate_tokens(&prompt),
             u64::from(cli.max_tokens),
             Some(now),
-            || ledger_reservation.month_to_date_usd(),
+            || {
+                initial_reservation
+                    .as_ref()
+                    .expect("initial reservation exists before dispatch")
+                    .month_to_date_usd()
+            },
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
@@ -2754,6 +2776,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let mut used_provider_id = provider_cfg.id.clone();
     let mut used_latency_ms = 0.0f64;
     let mut outcome: Option<ChatResult> = None;
+    let mut winning_reservation: Option<BillableReservation> = None;
     let mut last_err: Option<ProviderError> = None;
 
     for (i, model_id) in chain.iter().enumerate() {
@@ -2842,9 +2865,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // the chain-wide elapsed time (which would fold in prior models' time
         // plus retry backoff and skew the router's latency EWMA).
         let model_started = std::time::Instant::now();
-        ledger_reservation.arm();
-        match try_model(provider, &req, cli.json, cli.retries, cli.quiet).await {
-            Ok(res) => {
+        match try_model(
+            provider,
+            &req,
+            cli.json,
+            cli.retries,
+            cli.quiet,
+            &ledger,
+            &mut initial_reservation,
+        )
+        .await?
+        {
+            Ok((res, reservation)) => {
                 // Defer the winning model's health recording until after the
                 // policy verify below, so a policy-violating "success" is
                 // recorded as a single failure (not success + failure).
@@ -2852,6 +2884,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 used_provider_id = pid.clone();
                 used_latency_ms = model_started.elapsed().as_millis() as f64;
                 outcome = Some(res);
+                winning_reservation = Some(reservation);
                 break;
             }
             Err((e, fatal)) => {
@@ -2916,7 +2949,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         });
     }
     record_turn_entry(
-        ledger_reservation,
+        winning_reservation.ok_or_else(|| {
+            anyhow::anyhow!("successful oneshot attempt had no ledger reservation")
+        })?,
         &Entry {
             ts_utc,
             provider: used_provider_id.clone(),
@@ -3107,17 +3142,17 @@ async fn agentic_cost(
     from: chrono::DateTime<chrono::Utc>,
     alias: &str,
     fallback_model: &str,
-) -> (f64, u64, u64, String, bool) {
+) -> (f64, u64, u64, String, bool, u64) {
     match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
         Ok(sum) => classify_agentic_cost_summary(&sum, fallback_model),
-        Err(_) => (0.0, 0, 0, fallback_model.to_string(), false),
+        Err(_) => (0.0, 0, 0, fallback_model.to_string(), false, 1),
     }
 }
 
 fn classify_agentic_cost_summary(
     sum: &zoder_core::EngineCostSummary,
     fallback_model: &str,
-) -> (f64, u64, u64, String, bool) {
+) -> (f64, u64, u64, String, bool, u64) {
     let cost = sum.window_cost_usd();
     // Pick the dominant model in the window for attribution.
     let model = sum
@@ -3135,13 +3170,14 @@ fn classify_agentic_cost_summary(
         .by_model
         .values()
         .fold(0_u64, |acc, m| acc.saturating_add(m.output_tokens));
+    let calls = u64::try_from(sum.request_count).unwrap_or(u64::MAX).max(1);
     // An empty successful query only proves that the engine found no
     // rows in the requested slice. It does not authoritatively price
     // the turn, so never turn it into a known $0 ledger entry.
     if sum.request_count > 0 && !sum.by_model.is_empty() && cost.is_finite() && cost >= 0.0 {
-        (cost, tin, tout, model, true)
+        (cost, tin, tout, model, true, calls)
     } else {
-        (0.0, tin, tout, model, false)
+        (0.0, tin, tout, model, false, calls)
     }
 }
 
@@ -3152,11 +3188,34 @@ mod agentic_cost_tests {
     #[test]
     fn empty_successful_cost_query_is_unknown_not_known_zero() {
         let summary = zoder_core::EngineCostSummary::default();
-        let (cost, tin, tout, model, known) =
+        let (cost, tin, tout, model, known, calls) =
             classify_agentic_cost_summary(&summary, "fallback-model");
         assert_eq!((cost, tin, tout), (0.0, 0, 0));
         assert_eq!(model, "fallback-model");
         assert!(!known);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn authoritative_request_count_is_preserved() {
+        let mut summary = zoder_core::EngineCostSummary {
+            request_count: 3,
+            ..Default::default()
+        };
+        summary.by_model.insert(
+            "m".into(),
+            zoder_core::EngineModelStats {
+                model: "m".into(),
+                request_count: 3,
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cost_usd: 0.25,
+            },
+        );
+        let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary, "fallback");
+        assert!(known);
+        assert_eq!(calls, 3);
     }
 }
 
@@ -3457,7 +3516,9 @@ pub(crate) async fn agentic_turn(
     // before any daemon setup, so a Goose request never starts zeroclaw and an
     // unknown value surfaces as a parse error up front.
     let agentic_usage = std::cell::Cell::new(0_u64);
-    ledger_reservation.arm();
+    ledger_reservation
+        .arm()
+        .with_context(|| "verifying ledger reservation before agentic dispatch")?;
     let run = run_agent_dispatch(engine_kind, &opts, |ev| {
         if let AgentEvent::Utilization { headers } = &ev {
             agentic::persist_agentic_utilization(&routed_provider, headers);
@@ -3504,12 +3565,12 @@ pub(crate) async fn agentic_turn(
     // Skip the post-verify paid-gate check (the corpus_paid test
     // also implicitly assumes the daemon reported the actual billed model,
     // which we don't have here).
-    let (cost, tokens_in, tokens_out, model_used, cost_known) = match engine_kind {
+    let (cost, tokens_in, tokens_out, model_used, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             agentic_cost(&socket2, start_ts, &alias, &primary).await
         }
-        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false),
+        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false, 1),
     };
 
     // Post-verify: the engine (via the agent alias) may have run a different —
@@ -3558,7 +3619,7 @@ pub(crate) async fn agentic_turn(
             tokens_out,
             cost_usd: cost,
             cost_unknown: !cost_known,
-            calls: 1,
+            calls: request_count,
             violation,
             tags: finops_tags(cli, tokens_in, None),
         },

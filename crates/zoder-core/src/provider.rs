@@ -618,7 +618,12 @@ impl OpenAiProvider {
             .into_iter()
             .next()
             .map(|c| c.message)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ErrKind::Decode,
+                    "malformed chat-completion response: no completion choices",
+                )
+            })?;
         let content = pick_text(
             msg.content,
             msg.reasoning_content,
@@ -683,6 +688,7 @@ impl OpenAiProvider {
             emitted,
         };
         let mut done = false;
+        let mut saw_choice = false;
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -745,9 +751,13 @@ impl OpenAiProvider {
                     ));
                 }
                 let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
-                let Ok(raw) = std::str::from_utf8(&line_bytes[..nl]) else {
-                    continue;
-                };
+                let raw = std::str::from_utf8(&line_bytes[..nl]).map_err(|error| {
+                    fail(
+                        ErrKind::Decode,
+                        format!("stream contained invalid UTF-8: {error}"),
+                        emitted,
+                    )
+                })?;
                 let line = raw.trim();
                 let Some(payload) = line.strip_prefix("data:") else {
                     continue;
@@ -786,6 +796,7 @@ impl OpenAiProvider {
                     }
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
+                    saw_choice = true;
                     let piece = pick_text(
                         choice.delta.content,
                         choice.delta.reasoning_content,
@@ -817,6 +828,20 @@ impl OpenAiProvider {
             if done {
                 break;
             }
+        }
+        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Err(fail(
+                ErrKind::Decode,
+                "stream ended with an incomplete SSE frame".to_string(),
+                emitted,
+            ));
+        }
+        if !saw_choice {
+            return Err(fail(
+                ErrKind::Decode,
+                "malformed completion stream: no valid completion choice".to_string(),
+                emitted,
+            ));
         }
         // Prefer authoritative usage; fall back to the streamed-chunk count.
         let tokens_out = completion_tokens.unwrap_or(chunk_count);

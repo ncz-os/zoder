@@ -70,6 +70,85 @@ async fn non_streaming_object_is_parsed() {
 }
 
 #[tokio::test]
+async fn non_streaming_success_without_choices_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.message.contains("no completion choices"), "{error}");
+}
+
+#[tokio::test]
+async fn stream_with_only_malformed_frames_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("data: definitely-not-json\n\ndata: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(
+        error.message.contains("no valid completion choice"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn stream_with_valid_json_but_no_choices_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\n\ndata: [DONE]\n\n",
+        ))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+}
+
+#[tokio::test]
+async fn invalid_utf8_sse_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: \xff\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.message.contains("invalid UTF-8"), "{error}");
+}
+
+#[tokio::test]
 async fn rate_limit_is_classified_and_retry_after_parsed() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
