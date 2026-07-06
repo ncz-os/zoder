@@ -390,6 +390,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 100.0, QuotaUnit::Messages)],
             tier: None,
+            ..Default::default()
         };
         let cat = TierCatalog::empty();
         let out = plan_usage(&[], "anthropic", &plan, &cat);
@@ -406,6 +407,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog();
         let out = plan_usage(&[], "anthropic", &plan, &cat);
@@ -432,6 +434,7 @@ mod tests {
                 w("daily", 24, 500.0, QuotaUnit::Messages), // append (extra)
             ],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog();
         let out = plan_usage(&[], "anthropic", &plan, &cat);
@@ -473,6 +476,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 250.0, QuotaUnit::Messages)],
             tier: Some("claude-max-does-not-exist".into()),
+            ..Default::default()
         };
         let cat = catalog(); // catalog exists but tier is unknown.
         let out = plan_usage(&[], "anthropic", &plan, &cat);
@@ -514,6 +518,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("pro".into()),
+            ..Default::default()
         };
         let out = plan_usage(&[], "anthropic", &plan, &cat);
         assert_eq!(out.len(), 1);
@@ -546,6 +551,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog();
         let out = plan_usage(&entries, "anthropic", &plan, &cat);

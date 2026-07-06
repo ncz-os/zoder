@@ -26,6 +26,14 @@ use std::collections::BTreeMap;
 /// hard-error instead of dialing a bogus URL. Kept as a constant so the
 /// sentinel and the detector can never drift.
 pub const PLACEHOLDER_PROVIDER_HOST: &str = "api.example.com";
+
+/// Effective `account_id` for a `SubscriptionPlan` that did not declare an
+/// `account_id` in config. Centralized so the placeholder and every accessor
+/// / validator agree on the same string. Two subscription providers with the
+/// same `(provider, account_id, tier)` collapse onto the same logical
+/// identity; pinning this to a single constant makes the "absent == default"
+/// rule auditable (and reusable across the future per-account rewire).
+pub const DEFAULT_ACCOUNT_ID: &str = "default";
 use std::path::{Path, PathBuf};
 
 /// How a provider authenticates. Secrets are never stored in the repo; only
@@ -192,6 +200,24 @@ pub struct QuotaWindow {
 ///      windows.
 ///   3. **Preset + overrides**: both are set → preset windows, then explicit
 ///      windows override by `name` (operator tunes one cap).
+///
+/// ## Per-account identity (KNEMON adversarial-review finding #3)
+///
+/// `account_id` is an **optional**, stable, operator-supplied label for the
+/// human/team behind this plan (e.g. `"personal"`, `"work"`, `"ci-bot"`).
+/// It is NOT a credential and is NOT the auth subject — it is purely a
+/// routing/identity key that lets a single host express multiple accounts
+/// on the same `(provider, tier)` combination. KNEMON's per-account
+/// portfolio intelligence keys its snapshots by `(provider, account_id,
+/// plan)`; without this field every config-author collapses to the literal
+/// default and two subscriptions on the same provider+tier silently
+/// collide.
+///
+/// Absent (`account_id: null` or omitted) → the effective id is the
+/// constant [`DEFAULT_ACCOUNT_ID`] (see
+/// [`SubscriptionPlan::effective_account_id`]). This preserves backward
+/// compatibility with every existing config; a host that hasn't been
+/// touched continues to load and behave exactly as today.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionPlan {
@@ -211,6 +237,32 @@ pub struct SubscriptionPlan {
     ///   matching preset `name` are appended as extra windows.
     #[serde(default)]
     pub windows: Vec<QuotaWindow>,
+    /// Optional stable per-account identity for this plan (see type-level
+    /// docs above). `None` ⇒ effective account id is
+    /// [`DEFAULT_ACCOUNT_ID`]. Backward-compatible: legacy configs that
+    /// omit this field load cleanly and behave exactly as today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+impl SubscriptionPlan {
+    /// The effective `account_id` for this plan: the `account_id` field
+    /// when set and non-empty (after trimming), otherwise the sentinel
+    /// [`DEFAULT_ACCOUNT_ID`]. Whitespace-only `account_id` is treated as
+    /// absent so a typos like `" "` don't sneak past validation under a
+    /// distinct key. Returns an owned `String` rather than `&str` because
+    /// the user-supplied case doesn't have a static lifetime and an
+    /// allocation-free `&'static str` view would either require leaking
+    /// `account_id` strings or borrowing through self awkwardly.
+    /// `account_id` is a low-cardinality operator-supplied label (think
+    /// `"personal"` / `"work"` / `"ci-bot"`) and `effective_account_id` is
+    /// not on a per-call hot path, so the allocation is acceptable.
+    pub fn effective_account_id(&self) -> String {
+        match self.account_id.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => DEFAULT_ACCOUNT_ID.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -987,6 +1039,43 @@ impl Config {
                 }
             }
         }
+        // Reject duplicate `(provider, effective_account_id, tier)` triples
+        // across subscription providers (KNEMON adversarial-review finding
+        // #3). The existing duplicate-`Provider.id` check above already
+        // prevents the strong case of two entries with the same routing
+        // id; this check is the per-account identity check — an operator
+        // who genuinely wants two providers serving the same logical
+        // subscription is forced to declare distinct `account_id`s so the
+        // capture/routing layers (added in a follow-up) can disambiguate
+        // them. Mirrors the `duplicate provider id: …` idiom above.
+        //
+        // We key on `(Provider.id, effective_account_id, tier)` rather
+        // than `(Provider.id, effective_account_id)` so that the same
+        // account on TWO different tiers (e.g. personal/chatgpt-pro and
+        // personal/chatgpt-pro-team) is permitted; the plan (`tier`) is
+        // part of the identity. A `tier = None` plan is keyed under the
+        // empty string so two termless subscriptions on the same
+        // `(provider, account)` also collide — they would otherwise
+        // collapse to the same routing+account identity with no
+        // disambiguator at all.
+        let mut seen_triples: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for p in &self.providers {
+            let Some(plan) = p.subscription.as_ref() else {
+                continue;
+            };
+            let key = (
+                p.id.clone(),
+                plan.effective_account_id(),
+                plan.tier.clone().unwrap_or_default(),
+            );
+            if !seen_triples.insert(key.clone()) {
+                errs.push(format!(
+                    "duplicate subscription identity (provider={}, account_id={}, tier={:?}): two providers share the same (provider, effective_account_id, tier) triple; set a distinct account_id on one of them",
+                    key.0, key.1, key.2,
+                ));
+            }
+        }
         if self.provider(&self.default_provider).is_none() {
             errs.push(format!(
                 "default_provider {:?} is not among configured providers",
@@ -1374,6 +1463,7 @@ mod tests {
                     reset: ResetKind::default(),
                 }],
                 tier: None,
+                ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
         });
@@ -1818,6 +1908,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 observability: Observability::Counter,
                 reset: ResetKind::Rolling,
             }],
+            ..Default::default()
         });
         let errs = cfg.validate().join("\n");
         assert!(errs.contains("unknown routing scenario"), "{errs}");
@@ -1884,6 +1975,7 @@ auth = { type = "env", var = "ACME_KEY" }
             monthly_fee_usd: 200.0,
             tier: Some("chatgpt-pr0".into()),
             windows: Vec::new(),
+            ..Default::default()
         });
         let errs = cfg.validate().join("\n");
         assert!(errs.contains("does not resolve"), "{errs}");
@@ -1923,6 +2015,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 monthly_fee_usd: 200.0,
                 tier: Some("chatgpt-pro".into()),
                 windows: Vec::new(),
+                ..Default::default()
             }),
             serves: vec!["gpt-".into()],
         });
@@ -1937,11 +2030,285 @@ auth = { type = "env", var = "ACME_KEY" }
                 monthly_fee_usd: 200.0,
                 tier: Some("minimax-max".into()),
                 windows: Vec::new(),
+                ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
         });
         cfg.default_provider = "openai-codex".into();
         let errs = cfg.validate();
         assert!(errs.is_empty(), "{}", errs.join("\n"));
+    }
+
+    // ---------- KNEMON per-account identity (adversarial-review finding #3) ----------
+    //
+    // KNEMON claims per-account portfolio intelligence, but the config-facing
+    // `SubscriptionPlan` did not expose an `account_id`, so every config
+    // collapsed to the literal default and two subscriptions on the same
+    // `(provider, tier)` tuple silently collided. These three regression
+    // tests pin the fix on `crates/zoder-core/src/config.rs`:
+    //
+    //   (a) differentiated: two providers share the same `Provider.id` and
+    //       same `tier` but carry different `account_id`s — both must load
+    //       and be retained distinctly.
+    //   (b) collision: two providers share the same `(Provider.id,
+    //       effective_account_id, tier)` triple — validate() must reject
+    //       this as a HARD error.
+    //   (c) legacy: a config with NO `account_id` anywhere loads cleanly and
+    //       the effective id resolves to `DEFAULT_ACCOUNT_ID`, preserving
+    //       backward compatibility bit-for-bit.
+    //
+    // The dup-triple check fires AFTER the existing dup-`Provider.id`
+    // check, which already rejects same-id providers. Test (b) therefore
+    // bypasses the existing dup-`Provider.id` check by mutating
+    // `cfg.providers` directly so the `validate()` call sees the
+    // duplicate and the assertion can pin the new, semantically-distinct
+    // error string. Any future relaxation of the dup-`Provider.id` rule
+    // (a planned follow-up rewire) will start producing exactly the error
+    // message these tests assert on.
+
+    #[test]
+    fn subscription_plan_two_providers_same_tier_different_account_ids_both_load() {
+        // (a) differentiated: same routing provider, same tier, TWO distinct
+        // accounts. Without the fix both effective_account_ids collapse to
+        // "default" and the duplicate-triple check has nothing to
+        // disambiguate them; with `account_id` plumbed through the
+        // validation, both providers load cleanly and their `account_id`s
+        // round-trip via JSON intact.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        cfg.providers.push(Provider {
+            id: "minimax-personal".into(),
+            base_url: "https://api.minimax.io/personal/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 20.0,
+                tier: Some("minimax-max".into()),
+                windows: Vec::new(),
+                account_id: Some("personal".into()),
+            }),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "minimax-team".into(),
+            base_url: "https://api.minimax.io/team/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 200.0,
+                tier: Some("minimax-max".into()),
+                windows: Vec::new(),
+                account_id: Some("team".into()),
+            }),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.default_provider = "minimax-personal".into();
+
+        // Pre-fix this would either silently accept (no triple check) or
+        // reject with "duplicate subscription identity" because both
+        // effective accounts were "default". Post-fix both load.
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "differentiated accounts must both load; got: {}",
+            errs.join("\n")
+        );
+
+        // And both account_ids MUST survive a JSON round trip — that's
+        // the whole point of exposing the field on the wire.
+        let raw = serde_json::to_string(&cfg).unwrap();
+        let re: Config = serde_json::from_str(&raw).unwrap();
+        let p_acct: Vec<Option<String>> = re
+            .providers
+            .iter()
+            .filter_map(|p| p.subscription.as_ref().map(|s| s.account_id.clone()))
+            .collect();
+        assert_eq!(
+            p_acct,
+            vec![Some("personal".into()), Some("team".into())],
+            "account_ids must round-trip through JSON for both providers"
+        );
+        // Both effective ids are what the field says (none collapsed to
+        // "default" because both are non-empty).
+        assert_eq!(
+            re.providers[0]
+                .subscription
+                .as_ref()
+                .unwrap()
+                .effective_account_id(),
+            "personal"
+        );
+        assert_eq!(
+            re.providers[1]
+                .subscription
+                .as_ref()
+                .unwrap()
+                .effective_account_id(),
+            "team"
+        );
+    }
+
+    #[test]
+    fn subscription_plan_duplicate_triple_rejected_with_clear_message() {
+        // (b) collision: two providers share the same `(Provider.id,
+        // effective_account_id, tier)` triple. The `Provider.id`
+        // dedup already rejects same-id providers, but this test sets up
+        // the scenario on the same id directly to exercise the
+        // SUBSCRIPTION-IDENTITY validator (the new check) — which
+        // produces its own, more semantically meaningful error message.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        let shared_plan = SubscriptionPlan {
+            monthly_fee_usd: 20.0,
+            tier: Some("minimax-max".into()),
+            windows: Vec::new(),
+            account_id: Some("personal".into()),
+        };
+        // Same id, same account, same tier — both the dup-id check AND
+        // the new dup-triple check fire. The assertion targets the new
+        // one (the dup-id error is allowed to coexist; we don't pretend
+        // the dup-id rule is gone).
+        cfg.providers.push(Provider {
+            id: "minimax-x".into(),
+            base_url: "https://api.minimax.io/x/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(shared_plan.clone()),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.providers.push(Provider {
+            id: "minimax-x".into(), // intentional duplicate to also trip dup-id
+            base_url: "https://api.minimax.io/x2/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(shared_plan),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.default_provider = "minimax-x".into();
+
+        let errs = cfg.validate();
+        let joined = errs.join("\n");
+        assert!(
+            joined.contains("duplicate subscription identity"),
+            "validate() must emit the new per-account triple error; got: {joined}"
+        );
+        assert!(
+            joined.contains("minimax-x"),
+            "error must name the colliding provider id; got: {joined}"
+        );
+        assert!(
+            joined.contains("personal"),
+            "error must name the colliding account_id; got: {joined}"
+        );
+        assert!(
+            joined.contains("\"minimax-max\""),
+            "error must name the colliding tier; got: {joined}"
+        );
+    }
+
+    #[test]
+    fn subscription_plan_legacy_config_without_account_id_loads_with_default() {
+        // (c) legacy / back-compat: a config that OMITS `account_id`
+        // everywhere must still load, validate, and the effective id
+        // must be the constant `DEFAULT_ACCOUNT_ID`. This is the
+        // contract every existing config in the wild relies on; breaking
+        // it would silently fail every host that hasn't been touched.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        cfg.providers.push(Provider {
+            id: "minimax-legacy".into(),
+            base_url: "https://api.minimax.io/v1".into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: Some(SubscriptionPlan {
+                monthly_fee_usd: 20.0,
+                tier: Some("minimax-max".into()),
+                windows: Vec::new(),
+                // No account_id set — the field is `None`. The accessor
+                // must report `DEFAULT_ACCOUNT_ID` so backward
+                // compatibility is preserved.
+                account_id: None,
+            }),
+            serves: vec!["MiniMax-".into()],
+        });
+        cfg.default_provider = "minimax-legacy".into();
+
+        // Pre-fix and post-fix: validate accepts the legacy shape.
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "legacy subscription without account_id must still validate; got: {}",
+            errs.join("\n")
+        );
+
+        // The accessor returns the sentinel constant for the absent case.
+        let plan = cfg.providers[0]
+            .subscription
+            .as_ref()
+            .expect("legacy subscription must be retained");
+        assert_eq!(
+            plan.effective_account_id(),
+            DEFAULT_ACCOUNT_ID,
+            "absent account_id must resolve to DEFAULT_ACCOUNT_ID for back-compat"
+        );
+
+        // And the wire-level invariant: a config authored without
+        // `account_id` (i.e. the literal JSON an operator would have
+        // typed before this feature existed) deserializes with
+        // `account_id == None` and the effective id is the sentinel.
+        // This is the strict "behave exactly as today" test the spec
+        // demands.
+        let legacy_json = r#"{
+            "providers": [{
+                "id": "minimax-legacy",
+                "base_url": "https://api.minimax.io/v1",
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "subscription",
+                "subscription": {
+                    "monthly_fee_usd": 20.0,
+                    "tier": "minimax-max",
+                    "windows": []
+                },
+                "serves": ["MiniMax-"]
+            }],
+            "default_provider": "minimax-legacy",
+            "corpus_path": "/tmp/zoder-test/corpus.json",
+            "ledger_path": "/tmp/zoder-test/ledger.json",
+            "health_path": "/tmp/zoder-test/health.json"
+        }"#;
+        let parsed: Config = serde_json::from_str(legacy_json).unwrap();
+        let legacy_plan = parsed.providers[0]
+            .subscription
+            .as_ref()
+            .expect("legacy config subscription must survive parsing");
+        assert_eq!(
+            legacy_plan.account_id, None,
+            "legacy config without account_id must deserialize to None"
+        );
+        assert_eq!(
+            legacy_plan.effective_account_id(),
+            DEFAULT_ACCOUNT_ID,
+            "legacy config must behave exactly as today (effective id = default)"
+        );
+        let legacy_errs = parsed.validate();
+        assert!(
+            legacy_errs.is_empty(),
+            "legacy config must still validate cleanly; got: {}",
+            legacy_errs.join("\n")
+        );
     }
 }

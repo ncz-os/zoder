@@ -8313,6 +8313,7 @@ mod subscription_utilization_render_tests {
                 observability: Observability::Header,
                 reset: ResetKind::default(),
             }],
+            ..Default::default()
         });
         let out2 = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         assert!(
@@ -8344,6 +8345,7 @@ mod subscription_utilization_render_tests {
                 observability: Observability::Header,
                 reset: ResetKind::default(),
             }],
+            ..Default::default()
         });
         let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         assert!(
@@ -9086,6 +9088,7 @@ mod model_selection_tests {
                 observability: zoder_core::config::Observability::Header,
                 reset: zoder_core::config::ResetKind::Rolling,
             }],
+            ..Default::default()
         };
         cfg.providers = vec![
             Provider {
