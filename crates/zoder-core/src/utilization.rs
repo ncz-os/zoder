@@ -1171,14 +1171,21 @@ pub fn build_account_view(
             // PercentOnly: surface the header reading if we have one
             // (the operator / provider only publishes a percent, so
             // even a counter row with no cap would be useless here).
-            crate::config::Observability::PercentOnly => {
-                let from_header = header_match.and_then(|(pct, _)| pct);
-                from_header.or_else(|| {
-                    // Last-ditch: if a caller seeded `used_percent`
-                    // directly on the counter row, surface that.
-                    counter.and_then(|c| effective_counter_percent(c, now))
-                })
-            }
+            //
+            // The counter row is intentionally NOT consulted here.
+            // PercentOnly windows have no API-exposed cap, so any
+            // percent derived from `c.used_tokens / c.cap` would be a
+            // fabricated, "computed" percent that PercentOnly windows
+            // must never carry (the earlier "last-ditch"
+            // `effective_counter_percent(c, now)` fallback leaked a
+            // computed percent whenever a counter row happened to
+            // have a cap set — e.g. legacy data or a misconfigured
+            // wire-up — making the router treat a forged reading as
+            // a real one and gate on it). The only legitimate source
+            // for a PercentOnly window is the header reading; when
+            // that's absent the window is unknown (None) and cannot
+            // gate routing on its own.
+            crate::config::Observability::PercentOnly => header_match.and_then(|(pct, _)| pct),
         };
         // Health: from the freshest observation we have. Counter row
         // wins when its observability is Counter; otherwise the header
@@ -4051,6 +4058,91 @@ mod tests {
         let w = &view.windows[0];
         assert!(w.used_percent.is_none());
         assert_eq!(w.health, TelemetryHealth::Degraded);
+    }
+
+    #[test]
+    fn l4_build_account_view_percent_only_does_not_leak_counter_computed_percent() {
+        // Regression: a PercentOnly window MUST never acquire a computed
+        // percent through the counter path. The store-level invariant is
+        // already pinned by
+        // `counter_percent_only_window_never_gets_a_computed_percent`
+        // (Finding #3 / `record_counter` returns None when cap is None).
+        //
+        // This test pins the normalization-level invariant in
+        // `build_account_view`: even when a counter row for a PercentOnly
+        // window happens to have a cap set (legacy data, misconfigured
+        // wire-up, or a manually-mutated store), the PercentOnly branch
+        // must NOT consult it. `effective_counter_percent` would happily
+        // compute `(used_tokens / cap) * 100` and surface that as the
+        // window's percent — but a "computed" percent is exactly what the
+        // PercentOnly invariant forbids: caps aren't API-exposed for
+        // these windows, and fabricating one lets the router treat a
+        // forged reading as a real one (a PercentOnly window at 50%
+        // would be eligible to drive gating through `hard_cap_breach`).
+        //
+        // Before the fix this assertion failed: the PercentOnly branch
+        // fell back to `effective_counter_percent(c, now)` and the
+        // PercentOnly window came back with `used_percent = Some(50.0)`.
+        let mut s = UtilizationStore::default();
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // Counter row shaped like a misconfigured PercentOnly: cap set
+        // (so `used_percent` is computed to 50.0), used_tokens = 50.
+        // No header observation is recorded — the only signal is the
+        // counter row, and PercentOnly must ignore it.
+        s.set_counter_cap(Provider::Anthropic, "a", "max", "weekly", Some(100.0), now);
+        s.record_counter(Provider::Anthropic, "a", "max", "weekly", 50.0, now);
+        // Sanity: the store-level state IS a "computed percent" (50%).
+        let cw = s
+            .get_counter(Provider::Anthropic, "a", "max", "weekly")
+            .expect("weekly counter row must exist");
+        assert_eq!(
+            cw.used_percent,
+            Some(50.0),
+            "test setup: the counter row carries a computed percent (50/100=50%)"
+        );
+        assert_eq!(
+            cw.cap,
+            Some(100.0),
+            "test setup: the cap is set (misconfigured PercentOnly shape)"
+        );
+        let qw = crate::config::QuotaWindow {
+            name: "weekly".into(),
+            hours: 168,
+            unit: crate::config::QuotaUnit::Messages,
+            cap: None,
+            models: None,
+            observability: crate::config::Observability::PercentOnly,
+            reset: crate::config::ResetKind::default(),
+        };
+        let view = build_account_view(
+            Provider::Anthropic,
+            "a",
+            "max",
+            std::slice::from_ref(&qw),
+            &s,
+            now,
+        );
+        assert_eq!(view.windows.len(), 1);
+        let w = &view.windows[0];
+        // The invariant: PercentOnly must NOT carry a computed percent.
+        assert!(
+            w.used_percent.is_none(),
+            "PercentOnly window leaked a counter-computed percent {:?}; \
+             the router would treat this as a real reading and gate on it",
+            w.used_percent,
+        );
+        // And the routed decision must NOT gate: with no observable
+        // signal, KNEMON keeps the sub (None = headroom baseline).
+        let ad = decide_account(&view, &RouteKnobs::default(), now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::PreferSub,
+            "PercentOnly with no header must keep the sub (None=headroom)"
+        );
+        assert!(
+            ad.binding_window.is_none(),
+            "no window must be binding when the only reading was a leaked computed percent"
+        );
     }
 
     // ---- KNEMON Layer 4b: burn-rate forecast + pre-emption ----
