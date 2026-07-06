@@ -556,6 +556,7 @@ async fn complete_once(
     let verify_failure = gate.verify_free(&model_entry, &res.telemetry).err();
     let paid_failure = crate::paid_without_opt_in(
         cli.allow_paid,
+        provider_cost_neutral,
         "reviewer turn",
         &model,
         known_paid_model,
