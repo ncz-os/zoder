@@ -1,0 +1,108 @@
+name: native nightly builds (macOS-arm64 + arm64-Linux)
+
+# GitLab.com's free shared runners are Linux/x86 only, so the macOS-arm64 and
+# arm64-Linux halves of the zoder trio had to build on self-hosted ULTRA / by
+# cross-compile. This workflow builds those two arches NATIVELY on GitHub's free
+# hosted runners (public repo = unlimited Actions minutes, macOS included) and
+# publishes the exact same artifacts to the canonical GitLab rolling channel
+# (`zoder-nightly/{master,DATE}`) that install.sh and the fleet puller read — so
+# there is one channel, no ULTRA dependency, and no arm64 cross-compile.
+#
+# GitLab keeps the fast per-push gate + x86_64-Linux nightly + weekly container.
+# This runs nightly (after GitLab's 09:00 build) and on demand — never per-push,
+# so it adds no gate noise and stays well within fair use.
+
+on:
+  schedule:
+    - cron: "15 9 * * *"   # 09:15 UTC, just after the GitLab nightly (09:00)
+  workflow_dispatch:
+
+concurrency:
+  group: native-builds
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  PROJECT_ID: "83731897"                 # gitlab.com/ncz-os/zoder
+  ENGINE_REPO: "gitlab.com/ncz-os/zeroclaw.git"
+  ENGINE_BRANCH: "zoder-integration"
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         triple: aarch64-apple-darwin }
+          - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Native build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.triple }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build zoder (own repo, --locked)
+        run: cargo build --release --locked --bin zoder --target ${{ matrix.triple }}
+
+      - name: Build engine trio + publish to GitLab nightly channel
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          ENGINE_USER: ${{ secrets.GITLAB_ENGINE_USER }}
+          ENGINE_TOKEN: ${{ secrets.GITLAB_ENGINE_TOKEN }}
+          PKG_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+
+          # Clone the engine fork at zoder-integration HEAD (private → deploy token).
+          rm -rf .zc-src
+          git clone --depth 1 --branch "$ENGINE_BRANCH" \
+            "https://${ENGINE_USER}:${ENGINE_TOKEN}@${ENGINE_REPO}" .zc-src
+          ZC_SHA="$(git -C .zc-src rev-parse HEAD)"
+          echo "engine $ENGINE_BRANCH HEAD = $ZC_SHA"
+
+          # Build the engine pair natively. Prefer --locked (fork lock is kept in
+          # sync); fall back to unlocked on drift so the nightly still ships.
+          if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" ); then
+            echo "::warning::--locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked"
+            ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" )
+          fi
+
+          DATE="$(date -u +%F)"
+          BASE="https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/zoder-nightly"
+
+          publish() {   # $1 = logical name (zoder|zerocode|zeroclaw), $2 = built binary path
+            local name="$1" src="$2" dst="$1-${TRIPLE}" shaf
+            [ -f "$src" ] || { echo "missing built binary: $src" >&2; return 1; }
+            shaf="$(mktemp)"; sha256 "$src" > "$shaf"
+            local ch
+            for ch in master "$DATE"; do
+              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" \
+                --upload-file "$src"  "${BASE}/${ch}/${dst}"
+              curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" \
+                --upload-file "$shaf" "${BASE}/${ch}/${dst}.sha256"
+            done
+            echo "published $dst (sha256 $(cat "$shaf"))"
+          }
+
+          publish zoder    "target/${TRIPLE}/release/zoder"
+          publish zerocode ".zc-src/target/${TRIPLE}/release/zerocode"
+          publish zeroclaw ".zc-src/target/${TRIPLE}/release/zeroclaw"
+
+          echo "zc-sha=$ZC_SHA date=$DATE triple=$TRIPLE" >> "$GITHUB_STEP_SUMMARY"
