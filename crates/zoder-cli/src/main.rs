@@ -4060,6 +4060,13 @@ pub(crate) async fn agentic_turn(
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
         goose_provider,
+        // SLICE 1: writable-root containment defaults. Enforcement is
+        // OFF (non-breaking) and the boundary is the repo cwd. A
+        // follow-up slice will add the CLI flag and validate the
+        // schema matrix; once that lands the default can flip.
+        writable_roots: vec![cwd.clone()],
+        enforce_writable_roots: false,
+        trust_engine: false,
     };
 
     let started = std::time::Instant::now();
