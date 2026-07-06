@@ -1,9 +1,11 @@
 //! zoder CLI - codex-compatible surface + cost-aware routing extensions.
 
+use std::fs::File;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use fs2::FileExt;
 mod agentic;
 mod goose;
 
@@ -3133,17 +3135,135 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     Ok(socket)
 }
 
+struct AgenticCostScope {
+    directory: PathBuf,
+    active_path: PathBuf,
+    active_file: Option<File>,
+    sequence: u64,
+    overlapped_on_start: bool,
+    from: DateTime<Utc>,
+}
+
+impl AgenticCostScope {
+    fn start(engine_socket: &Path, alias: &str) -> anyhow::Result<Self> {
+        let directory = agentic_scope_directory(engine_socket, alias);
+        std::fs::create_dir_all(&directory)?;
+        let state_lock = open_agentic_scope_file(&directory.join("state.lock"))?;
+        state_lock.lock_exclusive()?;
+
+        let mut overlapped_on_start = false;
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("active") {
+                continue;
+            }
+            let active = open_agentic_scope_file(&path)?;
+            match active.try_lock_exclusive() {
+                Ok(()) => {
+                    drop(active);
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    overlapped_on_start = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let sequence_path = directory.join("sequence");
+        let sequence = read_agentic_scope_sequence(&sequence_path)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("agentic cost-scope sequence overflowed"))?;
+        let sequence_tmp = directory.join("sequence.tmp");
+        let mut sequence_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&sequence_tmp)?;
+        writeln!(sequence_file, "{sequence}")?;
+        sequence_file.sync_data()?;
+        std::fs::rename(sequence_tmp, &sequence_path)?;
+
+        let active_path = directory.join(format!("{sequence}.active"));
+        let active_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&active_path)?;
+        active_file.lock_exclusive()?;
+        let from = Utc::now();
+        Ok(Self {
+            directory,
+            active_path,
+            active_file: Some(active_file),
+            sequence,
+            overlapped_on_start,
+            from,
+        })
+    }
+
+    fn finish(mut self) -> anyhow::Result<(DateTime<Utc>, DateTime<Utc>, bool)> {
+        let state_lock = open_agentic_scope_file(&self.directory.join("state.lock"))?;
+        state_lock.lock_exclusive()?;
+        let to = Utc::now();
+        let current_sequence = read_agentic_scope_sequence(&self.directory.join("sequence"))?;
+        let overlapped = self.overlapped_on_start || current_sequence != self.sequence;
+        self.active_file.take();
+        std::fs::remove_file(&self.active_path)?;
+        Ok((self.from, to, overlapped))
+    }
+}
+
+impl Drop for AgenticCostScope {
+    fn drop(&mut self) {
+        self.active_file.take();
+        let _ = std::fs::remove_file(&self.active_path);
+    }
+}
+
+fn open_agentic_scope_file(path: &Path) -> anyhow::Result<File> {
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?)
+}
+
+fn read_agentic_scope_sequence(path: &Path) -> anyhow::Result<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .with_context(|| format!("decoding agentic cost-scope sequence at {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn agentic_scope_directory(engine_socket: &Path, alias: &str) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in alias.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut path = engine_socket.as_os_str().to_os_string();
+    path.push(format!(".agentic-cost-{hash:016x}"));
+    PathBuf::from(path)
+}
+
 /// Authoritative per-run cost/tokens from the engine's cost tracker, scoped to
-/// `[from, now)` and the agent alias. The boolean is false when the engine
+/// `[from, to)` and the agent alias. The boolean is false when the engine
 /// could not supply an authoritative result; callers must mark that ledger row
 /// unknown rather than treating the numeric placeholder as verified $0.
 async fn agentic_cost(
     socket: &std::path::Path,
     from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
     alias: &str,
     fallback_model: &str,
 ) -> (f64, u64, u64, String, bool, u64) {
-    match fetch_engine_cost(socket, Some(from), Some(chrono::Utc::now()), Some(alias)).await {
+    match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
         Ok(sum) => classify_agentic_cost_summary(&sum, fallback_model),
         Err(_) => (0.0, 0, 0, fallback_model.to_string(), false, 1),
     }
@@ -3216,6 +3336,28 @@ mod agentic_cost_tests {
         let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary, "fallback");
         assert!(known);
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn overlapping_alias_scopes_are_both_non_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let outer = AgenticCostScope::start(&ledger, "codex").unwrap();
+        let inner = AgenticCostScope::start(&ledger, "codex").unwrap();
+
+        assert!(inner.finish().unwrap().2);
+        assert!(outer.finish().unwrap().2);
+    }
+
+    #[test]
+    fn sequential_alias_scopes_remain_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let first = AgenticCostScope::start(&ledger, "codex").unwrap();
+        assert!(!first.finish().unwrap().2);
+
+        let second = AgenticCostScope::start(&ledger, "codex").unwrap();
+        assert!(!second.finish().unwrap().2);
     }
 }
 
@@ -3511,7 +3653,6 @@ pub(crate) async fn agentic_turn(
     };
 
     let started = std::time::Instant::now();
-    let start_ts = chrono::Utc::now();
     // `engine_kind` is parsed and validated by the caller (cmd_exec_agentic),
     // before any daemon setup, so a Goose request never starts zeroclaw and an
     // unknown value surfaces as a parse error up front.
@@ -3519,6 +3660,19 @@ pub(crate) async fn agentic_turn(
     ledger_reservation
         .arm()
         .with_context(|| "verifying ledger reservation before agentic dispatch")?;
+    let cost_scope = if engine_kind == EngineKind::Zeroclaw {
+        match AgenticCostScope::start(&opts.socket, &alias) {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                eprintln!(
+                    "zoder: unable to isolate agentic cost window; spend will be recorded as unknown: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let run = run_agent_dispatch(engine_kind, &opts, |ev| {
         if let AgentEvent::Utilization { headers } = &ev {
             agentic::persist_agentic_utilization(&routed_provider, headers);
@@ -3568,7 +3722,10 @@ pub(crate) async fn agentic_turn(
     let (cost, tokens_in, tokens_out, model_used, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
-            agentic_cost(&socket2, start_ts, &alias, &primary).await
+            match cost_scope.and_then(|scope| scope.finish().ok()) {
+                Some((from, to, false)) => agentic_cost(&socket2, from, to, &alias, &primary).await,
+                Some((_, _, true)) | None => (0.0, 0, 0, primary.clone(), false, 1),
+            }
         }
         EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false, 1),
     };

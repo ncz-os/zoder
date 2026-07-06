@@ -196,7 +196,13 @@ pub struct BillableReservation {
     marker: String,
     month_to_date: Result<f64, String>,
     armed: bool,
+    owner_lock: Option<File>,
+    owner_lock_path: PathBuf,
 }
+
+const RESERVATION_PROVIDER: &str = "__zoder_reservation__";
+const PREPARED_RESERVATION_MODEL: &str = "__zoder_billable_p__";
+const ARMED_RESERVATION_MODEL: &str = "__zoder_billable_a__";
 
 impl BillableReservation {
     /// Month-to-date known spend from the strict snapshot taken while this
@@ -213,6 +219,9 @@ impl BillableReservation {
     /// declines a budget prompt); afterward, an unreconciled slot is retained
     /// as unknown spend so failures cannot become unaccounted retries.
     pub fn arm(&mut self) -> anyhow::Result<()> {
+        if self.armed {
+            anyhow::bail!("billable reservation is already armed");
+        }
         let lock = open_lock_file(&self.lock_path)?;
         lock.lock_exclusive()?;
         let mut file = std::fs::OpenOptions::new()
@@ -222,7 +231,7 @@ impl BillableReservation {
             .with_context(|| {
                 format!("opening ledger at {} before dispatch", self.path.display())
             })?;
-        verify_reservation_slot(
+        transition_reservation_to_armed(
             &mut file,
             self.offset,
             self.slot_bytes,
@@ -230,6 +239,8 @@ impl BillableReservation {
             &self.path,
         )?;
         self.armed = true;
+        self.owner_lock.take();
+        let _ = std::fs::remove_file(&self.owner_lock_path);
         Ok(())
     }
 
@@ -309,6 +320,8 @@ impl Drop for BillableReservation {
                 }
             }
         }
+        self.owner_lock.take();
+        let _ = std::fs::remove_file(&self.owner_lock_path);
     }
 }
 
@@ -349,6 +362,46 @@ fn verify_reservation_slot(
     Ok(())
 }
 
+fn transition_reservation_to_armed(
+    file: &mut File,
+    offset: u64,
+    slot_bytes: usize,
+    marker: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    verify_reservation_slot(file, offset, slot_bytes, marker, path)?;
+    let mut slot = vec![0; slot_bytes];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut slot)?;
+    let prepared = PREPARED_RESERVATION_MODEL.as_bytes();
+    let model_offset = slot
+        .windows(prepared.len())
+        .position(|window| window == prepared)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "reserved ledger slot at byte {offset} of {} is not in prepared phase",
+                path.display()
+            )
+        })?;
+    let phase_offset = PREPARED_RESERVATION_MODEL
+        .rfind('p')
+        .expect("prepared reservation model has a phase byte");
+    debug_assert_eq!(
+        &PREPARED_RESERVATION_MODEL.as_bytes()[..phase_offset],
+        &ARMED_RESERVATION_MODEL.as_bytes()[..phase_offset]
+    );
+    debug_assert_eq!(
+        &PREPARED_RESERVATION_MODEL.as_bytes()[phase_offset + 1..],
+        &ARMED_RESERVATION_MODEL.as_bytes()[phase_offset + 1..]
+    );
+    file.seek(SeekFrom::Start(
+        offset + u64::try_from(model_offset + phase_offset)?,
+    ))?;
+    file.write_all(b"a")?;
+    file.sync_data()?;
+    Ok(())
+}
+
 impl Ledger {
     pub fn new(path: &Path) -> Self {
         Self {
@@ -378,6 +431,7 @@ impl Ledger {
             .read(true)
             .write(true)
             .open(&self.path)?;
+        self.recover_abandoned_prepared(&mut f)?;
         self.entries_strict_from_file(&mut f)?;
         f.seek(SeekFrom::End(0))?;
         f.write_all(line.as_bytes())?;
@@ -407,15 +461,24 @@ impl Ledger {
             .with_context(|| {
                 format!("opening ledger for reservation at {}", self.path.display())
             })?;
+        self.recover_abandoned_prepared(&mut file)?;
         let entries = self.entries_strict_from_file(&mut file)?;
         let month_to_date = month_to_date_from_entries(&entries).map_err(|error| error.to_string());
 
         let offset = file.seek(SeekFrom::End(0))?;
         let marker = format!("zoder-reservation-{:032x}", rand::random::<u128>());
+        let owner_lock_path = reservation_owner_lock_path(&self.path, &marker);
+        let owner_lock = open_lock_file(&owner_lock_path)?;
+        owner_lock.lock_exclusive().with_context(|| {
+            format!(
+                "locking billable reservation owner at {}",
+                owner_lock_path.display()
+            )
+        })?;
         let pending = Entry {
             ts_utc: Utc::now(),
-            provider: "__zoder_reservation__".to_string(),
-            model: "__pending_billable_call__".to_string(),
+            provider: RESERVATION_PROVIDER.to_string(),
+            model: PREPARED_RESERVATION_MODEL.to_string(),
             host: String::new(),
             tokens_in: 0,
             tokens_out: 0,
@@ -471,6 +534,8 @@ impl Ledger {
             marker,
             month_to_date,
             armed: false,
+            owner_lock: Some(owner_lock),
+            owner_lock_path,
         })
     }
 
@@ -478,6 +543,79 @@ impl Ledger {
         let mut lock = self.path.as_os_str().to_os_string();
         lock.push(".lock");
         PathBuf::from(lock)
+    }
+
+    fn recover_abandoned_prepared(&self, file: &mut File) -> anyhow::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut *file);
+        let mut offset = 0_u64;
+        let mut line_no = 0_usize;
+        let mut line = Vec::new();
+        let mut abandoned = Vec::new();
+        loop {
+            line_no += 1;
+            line.clear();
+            let bytes = (&mut reader)
+                .take((MAX_LEDGER_LINE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            if bytes > MAX_LEDGER_LINE_BYTES {
+                anyhow::bail!(
+                    "ledger line {line_no} exceeds {MAX_LEDGER_LINE_BYTES} bytes; truncating early"
+                );
+            }
+            if bytes == BILLABLE_RESERVATION_BYTES {
+                let mut payload = line.as_slice();
+                while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
+                    payload = &payload[..payload.len() - 1];
+                }
+                if let Ok(entry) = serde_json::from_slice::<Entry>(payload) {
+                    if entry.provider == RESERVATION_PROVIDER
+                        && entry.model == PREPARED_RESERVATION_MODEL
+                    {
+                        let marker = reservation_marker(&entry).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "prepared reservation at byte {offset} has invalid owner metadata"
+                            )
+                        })?;
+                        let owner_path = reservation_owner_lock_path(&self.path, marker);
+                        let owner = open_lock_file(&owner_path)?;
+                        match owner.try_lock_exclusive() {
+                            Ok(()) => abandoned.push((offset, owner_path, owner)),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+            offset = offset.saturating_add(u64::try_from(bytes)?);
+        }
+        drop(reader);
+        if abandoned.is_empty() {
+            return Ok(());
+        }
+        let mut writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!(
+                    "opening ledger at {} to recover abandoned reservations",
+                    self.path.display()
+                )
+            })?;
+        let mut blank = vec![b' '; BILLABLE_RESERVATION_BYTES];
+        blank[BILLABLE_RESERVATION_BYTES - 1] = b'\n';
+        for (offset, owner_path, owner) in abandoned {
+            writable.seek(SeekFrom::Start(offset))?;
+            writable.write_all(&blank)?;
+            drop(owner);
+            let _ = std::fs::remove_file(owner_path);
+        }
+        writable.sync_data()?;
+        Ok(())
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -502,8 +640,8 @@ impl Ledger {
         }
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        FileExt::lock_shared(&lock)?;
-        let mut file = match std::fs::File::open(&self.path) {
+        lock.lock_exclusive()?;
+        let mut file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
@@ -511,6 +649,7 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
+        self.recover_abandoned_prepared(&mut file)?;
         read_entries(&mut file, &self.path, on_malformed)
     }
 
@@ -533,7 +672,7 @@ impl Ledger {
         }
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        FileExt::lock_shared(&lock)
+        lock.lock_exclusive()
             .with_context(|| format!("locking ledger at {}", self.path.display()))?;
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
@@ -543,6 +682,7 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
+        self.recover_abandoned_prepared(&mut file)?;
         self.entries_strict_from_file(&mut file)
     }
 
@@ -737,6 +877,20 @@ fn read_entries(
             }
         }
     }
+}
+
+fn reservation_marker(entry: &Entry) -> Option<&str> {
+    let violation = entry.violation.as_deref()?;
+    let marker = violation.strip_prefix("billable call reserved but not reconciled (")?;
+    let marker = marker.strip_suffix(')')?;
+    let hex = marker.strip_prefix("zoder-reservation-")?;
+    (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(marker)
+}
+
+fn reservation_owner_lock_path(ledger_path: &Path, marker: &str) -> PathBuf {
+    let mut path = ledger_path.as_os_str().to_os_string();
+    path.push(format!(".{marker}.owner"));
+    PathBuf::from(path)
 }
 
 fn month_to_date_from_entries(entries: &[Entry]) -> anyhow::Result<f64> {
@@ -1057,6 +1211,34 @@ mod tests {
         let ledger = Ledger::new(&path);
         drop(ledger.reserve_billable().unwrap());
         assert!(ledger.entries_strict().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abandoned_prepared_reservation_is_recovered_after_owner_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut abandoned = ledger.reserve_billable().unwrap();
+        let owner = abandoned.owner_lock.take().unwrap();
+        FileExt::unlock(&owner).unwrap();
+        drop(owner);
+        std::mem::forget(abandoned);
+
+        assert!(ledger.entries_strict().unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_prepared_reservation_is_visible_to_concurrent_budget_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let first = Ledger::new(&path).reserve_billable().unwrap();
+
+        let error = Ledger::new(&path)
+            .month_to_date_usd()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown cost"), "{error}");
+        drop(first);
     }
 
     #[test]

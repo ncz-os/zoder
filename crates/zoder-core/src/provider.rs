@@ -767,10 +767,13 @@ impl OpenAiProvider {
                     done = true;
                     break;
                 }
-                let val: serde_json::Value = match serde_json::from_str(payload) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                let val: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                    fail(
+                        ErrKind::Decode,
+                        format!("malformed provider stream JSON: {error}"),
+                        emitted,
+                    )
+                })?;
                 // A streamed `{"error": ...}` frame is a real provider failure —
                 // surfacing it (rather than skipping) prevents an error from
                 // masquerading as an empty successful response.
@@ -781,9 +784,13 @@ impl OpenAiProvider {
                         emitted,
                     ));
                 }
-                let Ok(parsed) = serde_json::from_value::<StreamChunk>(val) else {
-                    continue;
-                };
+                let parsed = serde_json::from_value::<StreamChunk>(val).map_err(|error| {
+                    fail(
+                        ErrKind::Decode,
+                        format!("malformed provider stream frame: {error}"),
+                        emitted,
+                    )
+                })?;
                 if let Some(u) = parsed.usage {
                     if u.prompt_tokens.is_some() {
                         prompt_tokens = u.prompt_tokens;
