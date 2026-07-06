@@ -156,6 +156,67 @@ async fn schema_invalid_frame_after_valid_choice_is_decode_error() {
 }
 
 #[tokio::test]
+async fn choice_without_delta_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("data: {\"choices\":[{}]}\n\ndata: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.message.contains("malformed provider stream frame"));
+}
+
+#[tokio::test]
+async fn bare_object_after_valid_choice_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                data: {}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.message.contains("malformed provider stream frame"));
+}
+
+#[tokio::test]
+async fn meaningful_usage_only_frame_is_accepted() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let result = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap();
+    assert_eq!(result.content, "ok");
+    assert_eq!(result.prompt_tokens, Some(3));
+    assert_eq!(result.completion_tokens, Some(1));
+}
+
+#[tokio::test]
 async fn stream_with_valid_json_but_no_choices_is_decode_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

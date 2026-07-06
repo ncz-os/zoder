@@ -83,6 +83,60 @@ pub(crate) fn record_turn_entry(
         .with_context(|| format!("reconciling reserved {turn_kind} spend"))
 }
 
+/// Classify an observed paid outcome independently of the pre-dispatch route.
+/// A backend can silently change models or billing posture after that route was
+/// approved, so every dispatch site must apply this to the actual result.
+pub(crate) fn paid_without_opt_in(
+    allow_paid: bool,
+    context: &str,
+    model: &str,
+    known_paid_model: bool,
+    observed_cost: Option<f64>,
+) -> Option<String> {
+    if allow_paid
+        || (!known_paid_model && !observed_cost.is_some_and(|cost| cost.is_finite() && cost > 0.0))
+    {
+        return None;
+    }
+    let cost = observed_cost
+        .filter(|cost| cost.is_finite() && *cost > 0.0)
+        .map(|cost| format!(" and billed ${cost:.4}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{context} used model '{model}' (corpus_paid={known_paid_model}){cost} without --allow-paid"
+    ))
+}
+
+/// Durably account for a completed dispatch before enforcing its post-call
+/// policy result. A violation is also persisted as a routing-health failure and
+/// is always returned as `Err`, ensuring every command exits nonzero instead of
+/// allowing an automated loop to continue spending.
+pub(crate) fn reconcile_policy_checked_turn(
+    reservation: BillableReservation,
+    entry: &Entry,
+    turn_kind: &str,
+    health: &mut HealthStore,
+    health_model: &str,
+    policy_failure: Option<&str>,
+) -> anyhow::Result<()> {
+    // Ledger durability is the first post-dispatch action. In particular, do
+    // not let a health-store error strand real spend in a pending reservation.
+    record_turn_entry(reservation, entry, turn_kind)?;
+    let Some(failure) = policy_failure else {
+        return Ok(());
+    };
+
+    health.record_failure(health_model, &format!("policy: {failure}"));
+    let health_save_error = health.save().err();
+    eprintln!("zoder: POLICY VIOLATION ({turn_kind}): {failure}");
+    if let Some(error) = health_save_error {
+        anyhow::bail!(
+            "policy violation during {turn_kind}: {failure}; additionally failed to persist routing health: {error}"
+        );
+    }
+    anyhow::bail!("policy violation during {turn_kind}: {failure} (exiting non-zero)")
+}
+
 #[derive(Parser, Clone)]
 #[command(
     name = "zoder",
@@ -2914,16 +2968,13 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         anyhow::bail!("{msg}");
     };
 
+    let known_paid_model = eng.corpus.get(&used_model).is_some_and(|model| !model.free);
     let entry = eng.corpus.get(&used_model).cloned().unwrap_or_default();
 
     // C1: the anti-paid-fallback guard governs accounting + exit. Record the
     // winning model's health exactly once here: a verified call is a success,
     // a policy violation is a failure.
     let verify = gate.verify_free(&entry, &res.telemetry);
-    match verify.as_ref() {
-        Ok(()) => health.record_success(&used_model, used_latency_ms),
-        Err(v) => health.record_failure(&used_model, &format!("policy: {v}")),
-    }
 
     // M4: honest token accounting from real usage when available.
     let tokens_in = res.prompt_tokens.unwrap_or(0);
@@ -2942,7 +2993,20 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             CostVerdict::Unknown => (0.0, true),
         },
     };
-    let mut violation = verify.as_ref().err().cloned();
+    let paid_failure = paid_without_opt_in(
+        cli.allow_paid,
+        "oneshot turn",
+        &used_model,
+        known_paid_model,
+        (!unknown_cost).then_some(cost),
+    );
+    let policy_failure = match (verify.as_ref().err(), paid_failure.as_ref()) {
+        (Some(verify), Some(paid)) => Some(format!("{verify}; {paid}")),
+        (Some(verify), None) => Some((*verify).clone()),
+        (None, Some(paid)) => Some(paid.clone()),
+        (None, None) => None,
+    };
+    let mut violation = policy_failure.clone();
     if unknown_cost {
         let msg = format!("cost unknown: no valid telemetry or catalog price for {used_model}");
         violation = Some(match violation {
@@ -2950,34 +3014,31 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             None => msg,
         });
     }
-    record_turn_entry(
+    let ledger_entry = Entry {
+        ts_utc,
+        provider: used_provider_id.clone(),
+        model: used_model.clone(),
+        host: zoder_core::ledger::host_of_model(&used_model),
+        tokens_in,
+        tokens_out,
+        cost_usd: cost,
+        cost_unknown: unknown_cost,
+        calls: 1,
+        violation,
+        tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+    };
+    reconcile_policy_checked_turn(
         winning_reservation.ok_or_else(|| {
             anyhow::anyhow!("successful oneshot attempt had no ledger reservation")
         })?,
-        &Entry {
-            ts_utc,
-            provider: used_provider_id.clone(),
-            model: used_model.clone(),
-            host: zoder_core::ledger::host_of_model(&used_model),
-            tokens_in,
-            tokens_out,
-            cost_usd: cost,
-            cost_unknown: unknown_cost,
-            calls: 1,
-            violation,
-            tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
-        },
+        &ledger_entry,
         "oneshot turn",
+        &mut health,
+        &used_model,
+        policy_failure.as_deref(),
     )?;
+    health.record_success(&used_model, used_latency_ms);
     save_health(&health);
-
-    // C1: a violation is fatal -> stderr message + non-zero exit.
-    if let Err(v) = verify {
-        eprintln!("zoder: POLICY VIOLATION: {v}");
-        anyhow::bail!(
-            "policy violation: free model {used_model} was not verified free (exiting non-zero)"
-        );
-    }
 
     // Persist the turn to the session transcript.
     if let Some(s) = session.as_mut() {
@@ -3473,6 +3534,46 @@ mod ledger_integrity_tests {
             .expect("routing must not select a subscription without ledger integrity");
         assert!(err.to_string().contains("loading quota-routing ledger"));
     }
+
+    #[test]
+    fn paid_without_allow_paid_reconciles_records_failure_and_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let health_path = dir.path().join("health.json");
+        let mut entry = test_entry();
+        let failure = paid_without_opt_in(
+            false,
+            "agentic turn",
+            &entry.model,
+            true,
+            Some(entry.cost_usd),
+        )
+        .expect("known paid outcome without --allow-paid must be rejected");
+        entry.violation = Some(failure.clone());
+
+        let reservation = Ledger::new(&ledger_path).reserve_billable().unwrap();
+        let mut health = HealthStore::load(&health_path);
+        let result = reconcile_policy_checked_turn(
+            reservation,
+            &entry,
+            "agentic turn",
+            &mut health,
+            &entry.model,
+            Some(&failure),
+        );
+
+        assert!(
+            result.is_err(),
+            "CLI main propagates this Err as a nonzero exit"
+        );
+        let rows = Ledger::new(&ledger_path).entries_strict().unwrap();
+        assert_eq!(rows.len(), 1, "completed spend must be reconciled first");
+        assert_eq!(rows[0].violation.as_deref(), Some(failure.as_str()));
+        let persisted = HealthStore::load(&health_path);
+        let model_health = persisted.models.get(&entry.model).unwrap();
+        assert_eq!(model_health.failures, 1);
+        assert_eq!(model_health.calls, 1);
+    }
 }
 
 pub(crate) async fn agentic_turn(
@@ -3742,54 +3843,62 @@ pub(crate) async fn agentic_turn(
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    let violation = if !cost_known {
-        Some(format!(
-            "cost unknown: {engine_kind:?} returned no authoritative cost telemetry"
-        ))
-    } else if !cli.allow_paid
-        && engine_kind == EngineKind::Zeroclaw
-        && (cost > 0.0 || model_used_paid)
-    {
-        let v = format!(
-            "agentic run (alias {alias}) billed ${cost:.4} on engine model '{model_used}' \
-             (corpus_paid={model_used_paid}) without --allow-paid"
-        );
-        eprintln!("zoder: POLICY VIOLATION: {v}");
-        Some(v)
-    } else {
-        None
+    let paid_failure = (engine_kind == EngineKind::Zeroclaw)
+        .then(|| {
+            paid_without_opt_in(
+                cli.allow_paid,
+                &format!("agentic run (alias {alias})"),
+                &model_used,
+                model_used_paid,
+                cost_known.then_some(cost),
+            )
+        })
+        .flatten();
+    let unknown_cost_violation = (!cost_known)
+        .then(|| format!("cost unknown: {engine_kind:?} returned no authoritative cost telemetry"));
+    let violation = match (&paid_failure, unknown_cost_violation) {
+        (Some(paid), Some(unknown)) => Some(format!("{paid}; {unknown}")),
+        (Some(paid), None) => Some(paid.clone()),
+        (None, unknown) => unknown,
     };
 
-    record_turn_entry(
+    let ledger_entry = Entry {
+        ts_utc: chrono::Utc::now(),
+        // Attribute to the provider that serves the model the engine actually
+        // ran (per-model routing), not the default provider.
+        provider: routing
+            .real_provider_for_model(&eng.cfg, &model_used)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| routed_provider.id.clone()),
+        model: model_used.clone(),
+        host: zoder_core::ledger::host_of_model(&model_used),
+        tokens_in,
+        tokens_out,
+        cost_usd: cost,
+        cost_unknown: !cost_known,
+        calls: request_count,
+        violation,
+        tags: finops_tags(cli, tokens_in, None),
+    };
+    reconcile_policy_checked_turn(
         ledger_reservation,
-        &Entry {
-            ts_utc: chrono::Utc::now(),
-            // Attribute to the provider that serves the model the engine actually
-            // ran (per-model routing), not the default provider.
-            provider: routing
-                .real_provider_for_model(&eng.cfg, &model_used)
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| routed_provider.id.clone()),
-            model: model_used.clone(),
-            host: zoder_core::ledger::host_of_model(&model_used),
-            tokens_in,
-            tokens_out,
-            cost_usd: cost,
-            cost_unknown: !cost_known,
-            calls: request_count,
-            violation,
-            tags: finops_tags(cli, tokens_in, None),
-        },
+        &ledger_entry,
         "agentic turn",
+        &mut health,
+        &model_used,
+        paid_failure.as_deref(),
     )?;
     // A timed-out (or otherwise non-completed) turn still returns a TurnResult so
     // the caller can preserve partial output — but it is NOT a success: record it
     // as a failure so latency/health-aware routing learns this model couldn't
     // finish in budget (the BUG2 routing follow-up consumes this signal).
     if run.succeeded() {
-        health.record_success(&primary, elapsed_ms);
+        health.record_success(&model_used, elapsed_ms);
     } else {
-        health.record_failure(&primary, &format!("turn did not complete: {}", run.outcome));
+        health.record_failure(
+            &model_used,
+            &format!("turn did not complete: {}", run.outcome),
+        );
     }
     save_health(&health);
 
@@ -5132,9 +5241,9 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
 
     if opts.probe {
         if opts.all {
-            run_probe_all(&eng, &mut health, cli.quiet, cli.json).await?;
+            run_probe_all(cli, &eng, &mut health, cli.quiet, cli.json).await?;
         } else {
-            run_probe_default(&eng, &mut health, cli.quiet).await?;
+            run_probe_default(cli, &eng, &mut health, cli.quiet).await?;
         }
         save_health(&health);
     }
@@ -5164,10 +5273,80 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reconcile_probe_success(
+    cli: &Cli,
+    eng: &Engine,
+    gate: &PolicyGate,
+    provider_id: &str,
+    model_id: &str,
+    result: ChatResult,
+    reservation: BillableReservation,
+    health: &mut HealthStore,
+) -> anyhow::Result<()> {
+    let tokens_in = result.prompt_tokens.unwrap_or(0);
+    let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
+    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let ts_utc = Utc::now();
+    let (cost, cost_unknown) = match result.telemetry.cost_usd {
+        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
+        _ => match pricing.classify_cost(model_id, tokens_in, tokens_out, Some(ts_utc)) {
+            CostVerdict::Priced(cost) => (cost, false),
+            CostVerdict::Free => (0.0, false),
+            CostVerdict::Unknown => (0.0, true),
+        },
+    };
+    let model_entry = eng.corpus.get(model_id);
+    let verify_failure =
+        model_entry.and_then(|model| gate.verify_free(model, &result.telemetry).err());
+    let paid_failure = paid_without_opt_in(
+        cli.allow_paid,
+        "health probe",
+        model_id,
+        model_entry.is_some_and(|model| !model.free),
+        (!cost_unknown).then_some(cost),
+    );
+    let policy_failure = match (&verify_failure, &paid_failure) {
+        (Some(verify), Some(paid)) => Some(format!("{verify}; {paid}")),
+        (Some(verify), None) => Some(verify.clone()),
+        (None, Some(paid)) => Some(paid.clone()),
+        (None, None) => None,
+    };
+    let unknown_violation = cost_unknown
+        .then(|| format!("cost unknown: no valid telemetry or catalog price for {model_id}"));
+    let violation = match (&policy_failure, unknown_violation) {
+        (Some(policy), Some(unknown)) => Some(format!("{policy}; {unknown}")),
+        (Some(policy), None) => Some(policy.clone()),
+        (None, unknown) => unknown,
+    };
+    let entry = Entry {
+        ts_utc,
+        provider: provider_id.to_string(),
+        model: model_id.to_string(),
+        host: zoder_core::ledger::host_of_model(model_id),
+        tokens_in,
+        tokens_out,
+        cost_usd: cost,
+        cost_unknown,
+        calls: 1,
+        violation,
+        tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
+    };
+    reconcile_policy_checked_turn(
+        reservation,
+        &entry,
+        "health probe",
+        health,
+        model_id,
+        policy_failure.as_deref(),
+    )
+}
+
 /// Backward-compatible probe: default provider only, free chat candidates.
 /// Preserved unchanged for `--probe` without `--all` so existing scripts
 /// keep their narrow, fast behavior.
 async fn run_probe_default(
+    cli: &Cli,
     eng: &Engine,
     health: &mut HealthStore,
     quiet: bool,
@@ -5188,11 +5367,27 @@ async fn run_probe_default(
             )
         })?;
     let provider = OpenAiProvider::new(provider_cfg)?;
+    let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
+    let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
     if !quiet {
         eprintln!("[zoder] probing {} free models...", targets.len());
     }
     for id in &targets {
+        let model_entry = eng
+            .corpus
+            .get(id)
+            .expect("default probe targets came from the corpus");
+        let provider_paid = provider_cfg.paid || provider_cfg.billing == BillingMode::Metered;
+        let provider_cost_neutral =
+            !provider_cfg.paid && provider_cfg.billing != BillingMode::Metered;
+        if let Decision::NeedConfirm(why) =
+            gate.check(model_entry, provider_paid, provider_cost_neutral)
+        {
+            anyhow::bail!(
+                "health probe for '{id}' requires paid spend; pass --allow-paid to run it.\n{why}"
+            );
+        }
         let req = ChatRequest {
             model: id.clone(),
             messages: vec![Message::new("user", "ping")],
@@ -5202,10 +5397,26 @@ async fn run_probe_default(
             show_reasoning: false,
             reasoning_effort: None,
         };
+        let mut reservation = Ledger::new(&eng.cfg.ledger_path)
+            .reserve_billable()
+            .with_context(|| format!("reserving ledger entry before health probe for {id}"))?;
+        reservation.arm().with_context(|| {
+            format!("verifying ledger reservation before health probe for {id}")
+        })?;
         let t = std::time::Instant::now();
         match provider.stream_chat(&req, None).await {
-            Ok(_) => {
+            Ok(result) => {
                 let ms = t.elapsed().as_millis() as f64;
+                reconcile_probe_success(
+                    cli,
+                    eng,
+                    &gate,
+                    provider_cfg.id.as_str(),
+                    id,
+                    result,
+                    reservation,
+                    health,
+                )?;
                 health.record_success(id, ms);
                 if !quiet {
                     eprintln!("  ok   {id}  {ms:.0}ms");
@@ -5226,6 +5437,7 @@ async fn run_probe_default(
 /// fetch the live model catalog, ping each model, classify, stamp into
 /// the store, and print a per-provider report.
 async fn run_probe_all(
+    cli: &Cli,
     eng: &Engine,
     health: &mut HealthStore,
     quiet: bool,
@@ -5242,6 +5454,8 @@ async fn run_probe_all(
     /// parallel Vec.
     struct Plan {
         provider_id: String,
+        provider_paid: bool,
+        provider_cost_neutral: bool,
         provider: OpenAiProvider,
         targets: Vec<String>,
         dropped: usize,
@@ -5310,6 +5524,8 @@ async fn run_probe_all(
         );
         plans.push(Plan {
             provider_id: p.id.clone(),
+            provider_paid: p.paid || p.billing == BillingMode::Metered,
+            provider_cost_neutral: !p.paid && p.billing != BillingMode::Metered,
             provider,
             targets,
             dropped,
@@ -5317,6 +5533,8 @@ async fn run_probe_all(
     }
 
     let mut flat_outcomes: Vec<ProbeOutcome> = Vec::new();
+    let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
+    let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
 
     // Iterate provider-by-provider. For each provider: ping every
     // (capped) target under the per-ping timeout, classify, stamp into
@@ -5326,6 +5544,8 @@ async fn run_probe_all(
     for plan in plans {
         let Plan {
             provider_id,
+            provider_paid,
+            provider_cost_neutral,
             provider,
             targets,
             dropped,
@@ -5333,12 +5553,49 @@ async fn run_probe_all(
         let mut provider_outcomes: Vec<ProbeOutcome> = Vec::with_capacity(targets.len());
 
         for model_id in &targets {
+            let model_entry = eng
+                .corpus
+                .get(model_id)
+                .cloned()
+                .unwrap_or_else(|| ModelEntry {
+                    id: model_id.clone(),
+                    gated_reason: Some(
+                        "unknown probe model: not in corpus, cannot verify free".into(),
+                    ),
+                    ..Default::default()
+                });
+            if let Decision::NeedConfirm(why) =
+                gate.check(&model_entry, provider_paid, provider_cost_neutral)
+            {
+                anyhow::bail!(
+                    "health probe for '{model_id}' via '{provider_id}' requires paid spend; \
+                     pass --allow-paid to run it.\n{why}"
+                );
+            }
             let req = probe_request(model_id);
+            let mut reservation = Ledger::new(&eng.cfg.ledger_path)
+                .reserve_billable()
+                .with_context(|| {
+                    format!("reserving ledger entry before health probe for {model_id}")
+                })?;
+            reservation.arm().with_context(|| {
+                format!("verifying ledger reservation before health probe for {model_id}")
+            })?;
             let t = std::time::Instant::now();
             let outcome =
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(result)) => {
                         let ms = t.elapsed().as_millis() as f64;
+                        reconcile_probe_success(
+                            cli,
+                            eng,
+                            &gate,
+                            &provider_id,
+                            model_id,
+                            result,
+                            reservation,
+                            health,
+                        )?;
                         health.record_classified_success(
                             model_id,
                             ms,
