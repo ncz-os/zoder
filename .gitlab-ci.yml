@@ -255,29 +255,21 @@ nightly:linux:
       artifacts: true
   timeout: 90m
   variables:
-    # ZEROCLAW_PINNED_SHA is resolved fresh each run by resolve:zeroclaw-sha
-    # (ncz-os/zeroclaw:zoder-integration HEAD) and inherited via the dotenv
-    # artifact above, so this runner builds the SAME engine SHA as macos-arm64
-    # with no hand-maintained project variable. "master of the day", every day.
+    # GitLab builds ONLY x86_64-Linux now. macOS-arm64 and arm64-Linux build
+    # NATIVELY on GitHub Actions (.github/workflows/native-builds.yml) and
+    # publish to this SAME zoder-nightly channel — removing the self-hosted
+    # ULTRA dependency (macOS) and the x86 cross-compile + aarch64 g++ toolchain
+    # (arm64). ZEROCLAW_PINNED_SHA is resolved fresh each run by
+    # resolve:zeroclaw-sha (zoder-integration HEAD) and inherited via dotenv.
     ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
     ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
   script:
-    - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-    # Both the C and C++ aarch64 cross toolchains: some engine (-sys) deps use
-    # cc-rs for C++ and need aarch64-linux-gnu-g++, not just gcc. Missing g++
-    # broke the vendored zeroclaw arm64 build (macos-arm64 builds native, so it
-    # was unaffected). Wire CC/CXX so cc-rs picks the cross compilers.
-    - apt-get update && apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-    - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-    - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+    - rustup target add x86_64-unknown-linux-gnu
     - cargo build --release --locked --bin zoder --target x86_64-unknown-linux-gnu
-    - cargo build --release --locked --bin zoder --target aarch64-unknown-linux-gnu
     - |
       # Build the TUI pair FIRST — do NOT touch the rolling channel
       # until both zoder AND zerocode/zeroclaw built successfully
       # (Finding #17: keep the rolling channel consistent).
-      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-      export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
       rm -rf .zc-src
       case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
       [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
@@ -286,91 +278,37 @@ nightly:linux:
       ZC_SHA=$(git -C .zc-src rev-parse HEAD)
       [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
       echo "nightly using zeroclaw SHA=$ZC_SHA"
-      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        # Prefer a reproducible --locked engine build (the fork's Cargo.lock is
-        # kept in sync); fall back to unlocked if it ever drifts so the nightly
-        # still ships (source reproducibility holds via the pinned SHA). Matches
-        # scripts/package.sh. zoder's own build above stays --locked.
-        if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" ); then
-          echo "WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
-          ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
-        fi
-      done
-      # Now safe to upload: all three binaries built successfully and
-      # the engine SHA is pinned for this nightly. Publish zoder +
-      # TUI pair to BOTH the rolling `master` channel AND a
-      # date-stamped channel (kept a week by prune:nightly) so
-      # `install.sh --channel 2026-07-04` pins the build.
-      DATE="${CI_PIPELINE_CREATED_AT%%T*}"
-      mkdir -p dist
-      echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
-      for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        bin="target/$t/release/zoder"
-        sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
-        for name in zoder zerocode zeroclaw; do
-          if [ "$name" = zoder ]; then
-            src="$bin"; shasrc="$bin.sha256"
-            dst="zoder-$t"
-          else
-            src=".zc-src/target/$t/release/$name"
-            shasrc="$src.sha256"
-            sha256sum "$src" | awk '{print $1}' > "$shasrc"
-            dst="${name}-$t"
-          fi
-          for ch in master "$DATE"; do
-            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$src" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}"
-            curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$shasrc" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}.sha256"
-          done
-        done
-      done
-
-nightly:macos-arm64:
-  stage: release
-  <<: *nightly-rules
-  needs:
-    - job: resolve:zeroclaw-sha
-      artifacts: true
-  tags: [fleet-macos-arm64]
-  timeout: 90m
-  variables:
-    GIT_STRATEGY: clone
-    # Same resolved SHA as nightly:linux (inherited from resolve:zeroclaw-sha's
-    # dotenv) — both nightlies build one identical engine revision per run.
-    ZEROCLAW_REF: "${ZEROCLAW_PINNED_SHA}"
-    ZEROCLAW_REPO: "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
-  script:
-    - rustup target add aarch64-apple-darwin
-    - cargo build --release --locked --bin zoder --target aarch64-apple-darwin
-    - |
-      # Build the TUI pair FIRST on the macOS runner using the same
-      # resolved SHA — both nightlies inherit ZEROCLAW_PINNED_SHA from
-      # resolve:zeroclaw-sha so the engine revision is identical across arches.
-      rm -rf .zc-src
-      case "$ZEROCLAW_REF" in *[!0-9a-fA-F]*|'') echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1;; esac
-      [ "${#ZEROCLAW_REF}" -eq 40 ] || { echo "ZEROCLAW_REF must be an exact 40-hex commit SHA" >&2; exit 1; }
-      git clone --depth 1 "$ZEROCLAW_REPO" .zc-src
-      ( cd .zc-src && git fetch -q origin "$ZEROCLAW_REF" && git checkout -q FETCH_HEAD )
-      ZC_SHA=$(git -C .zc-src rev-parse HEAD)
-      [ "$(printf '%s' "$ZC_SHA" | tr 'A-F' 'a-f')" = "$(printf '%s' "$ZEROCLAW_REF" | tr 'A-F' 'a-f')" ] || { echo "resolved zeroclaw SHA $ZC_SHA does not match pin $ZEROCLAW_REF" >&2; exit 1; }
-      # Prefer --locked (fork lock kept in sync); fall back to unlocked on drift
-      # so the nightly still ships (see nightly:linux). Matches package.sh.
-      if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode ); then
+      t=x86_64-unknown-linux-gnu
+      # Prefer a reproducible --locked engine build (the fork's Cargo.lock is
+      # kept in sync); fall back to unlocked if it ever drifts so the nightly
+      # still ships (source reproducibility holds via the pinned SHA). Matches
+      # scripts/package.sh. zoder's own build above stays --locked.
+      if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" ); then
         echo "WARN: --locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked — regenerate the zoder-integration lock" >&2
-        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode )
+        ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$t" )
       fi
+      # Now safe to upload: all three x86_64 binaries built successfully and
+      # the engine SHA is pinned for this nightly. Publish zoder + TUI pair to
+      # BOTH the rolling `master` channel AND a date-stamped channel (kept a
+      # week by prune:nightly) so `install.sh --channel 2026-07-04` pins it.
       DATE="${CI_PIPELINE_CREATED_AT%%T*}"
       mkdir -p dist
       echo "zc-sha=$ZC_SHA date=$DATE" > dist/NIGHTLY
+      bin="target/$t/release/zoder"
+      sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
       for name in zoder zerocode zeroclaw; do
         if [ "$name" = zoder ]; then
-          bin="target/aarch64-apple-darwin/release/zoder"
+          src="$bin"; shasrc="$bin.sha256"
+          dst="zoder-$t"
         else
-          bin=".zc-src/target/release/$name"
+          src=".zc-src/target/$t/release/$name"
+          shasrc="$src.sha256"
+          sha256sum "$src" | awk '{print $1}' > "$shasrc"
+          dst="${name}-$t"
         fi
-        shasum -a 256 "$bin" | awk '{print $1}' > "$bin.sha256"
         for ch in master "$DATE"; do
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-aarch64-apple-darwin"
-          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$bin.sha256" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${name}-aarch64-apple-darwin.sha256"
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$src" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}"
+          curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$shasrc" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/zoder-nightly/${ch}/${dst}.sha256"
         done
       done
 
