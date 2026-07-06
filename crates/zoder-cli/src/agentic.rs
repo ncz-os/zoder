@@ -213,6 +213,7 @@ mod agentic_utilization_tests {
                 monthly_fee_usd: 200.0,
                 tier: Some("chatgpt-pro".into()),
                 windows: Vec::new(),
+                ..Default::default()
             }),
             serves: vec!["gpt-".into()],
         }
@@ -238,6 +239,7 @@ mod agentic_utilization_tests {
                     observability: zoder_core::config::Observability::Counter,
                     reset: zoder_core::config::ResetKind::CalendarMonthly,
                 }],
+                ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
         }

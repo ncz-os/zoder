@@ -576,6 +576,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 100.0, QuotaUnit::Tokens)],
             tier: None,
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -590,6 +591,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -617,6 +619,7 @@ mod tests {
                 w("daily", 24, 500.0, QuotaUnit::Messages), // new window not in the preset
             ],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -650,6 +653,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 250.0, QuotaUnit::Messages)],
             tier: Some("claude-max-9999x-not-real".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -671,6 +675,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("does-not-exist".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -690,6 +695,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 1.0, QuotaUnit::Tokens)],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         // provider_id is right (e.g. operator typo'd the provider id in their config).
@@ -711,6 +717,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 7.0, QuotaUnit::Tokens)],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, None);
@@ -730,6 +737,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 42.0, QuotaUnit::Tokens)],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = TierCatalog::empty();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -913,6 +921,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("minimax-max".into()),
+            ..Default::default()
         };
         let r = resolve_plan_windows(&plan, &cat, Some("minimax"));
         assert_eq!(r.windows.len(), 3);
@@ -953,6 +962,7 @@ mod tests {
                 w("daily", 24, 50.0, QuotaUnit::Tokens),
             ],
             tier: None,
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -972,6 +982,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -1004,6 +1015,7 @@ mod tests {
                 w("daily", 24, 500.0, QuotaUnit::Messages), // append (extra)
             ],
             tier: Some("claude-max-20x".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -1041,6 +1053,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![w("5h", 5, 250.0, QuotaUnit::Messages)],
             tier: Some("claude-max-9999x-not-real".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -1056,6 +1069,7 @@ mod tests {
             monthly_fee_usd: 0.0,
             windows: vec![],
             tier: Some("does-not-exist".into()),
+            ..Default::default()
         };
         let cat = catalog_with_anthropic_max20x();
         let r = resolve_plan_windows(&plan, &cat, Some("anthropic"));
@@ -1076,6 +1090,7 @@ mod tests {
                     monthly_fee_usd: 0.0,
                     windows: vec![w("5h", 5, 100.0, QuotaUnit::Tokens)],
                     tier: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -1084,6 +1099,7 @@ mod tests {
                     monthly_fee_usd: 0.0,
                     windows: vec![],
                     tier: Some("claude-max-20x".into()),
+                    ..Default::default()
                 },
             ),
             (
@@ -1095,6 +1111,7 @@ mod tests {
                         w("daily", 24, 2.0, QuotaUnit::Messages), // append
                     ],
                     tier: Some("claude-max-20x".into()),
+                    ..Default::default()
                 },
             ),
         ];
