@@ -45,10 +45,16 @@ ZEROCLAW_BIN_PKG="${ZEROCLAW_BIN_PKG:-zeroclawlabs}"  # owns the `zeroclaw` engi
 ZEROCODE_BIN_PKG="${ZEROCODE_BIN_PKG:-zerocode}"      # owns the `zerocode` TUI bin
 # Goose (Block -> Linux Foundation / AAIF) is the SECOND engine: a per-turn
 # `goose acp` subprocess zoder/zodercode drive over stdio. Built CLI-ONLY
-# (-p goose-cli --bin goose), never the Tauri desktop. PINNED ref — bump only
-# when the acp-client real-goose integration test stays green (the contract test).
+# (-p goose-cli --bin goose), never the Tauri desktop.
+#
+# Unlike zoder + the zeroclaw engine (which track moving master-of-the-day
+# branches), goose is deliberately pinned to a STABLE upstream RELEASE tag — the
+# fixed, known-good reference agent in the trio to test against. Bump to a newer
+# release only when the acp-client real-goose integration test stays green (the
+# contract test). Current most-supported stable release: v1.41.0 (2026-07-03);
+# the aaif-goose fork mirrors block/goose's release tags.
 GOOSE_REPO="${GOOSE_REPO:-https://github.com/aaif-goose/goose.git}"
-GOOSE_REF="${GOOSE_REF:-b00a99a430d3b3dbcae989d9b9c665a5d6537f67}"
+GOOSE_REF="${GOOSE_REF:-v1.41.0}"
 GOOSE_SRC_DIR="${GOOSE_SRC_DIR:-}"
 GOOSE_BIN_PKG="${GOOSE_BIN_PKG:-goose-cli}"  # owns the `goose` CLI bin (has `goose acp`)
 # LEAN by default: --no-default-features drops goose's local-inference ML runtime
@@ -199,11 +205,11 @@ package_target() {
       # Record the goose SHA for the manifest too.
       ( git -C "$gsrc" rev-parse HEAD > "$DIST/.goose-sha" ) 2>/dev/null || true
       echo ">> [$tgt] build goose CLI ($b) from $gsrc @ $GOOSE_REF"
-      # No --locked here: unlike the zoder-integration fork (whose Cargo.lock we
-      # regenerated so the zeroclaw build is --locked), goose's vendored lock has
-      # not been refreshed, so --locked would fail on drift. Source
-      # reproducibility holds via the immutable GOOSE_REF SHA. To make goose
-      # --locked too, regenerate + commit the goose fork's Cargo.lock (same fix).
+      # No --locked here: goose is pinned to a stable upstream RELEASE tag (see
+      # GOOSE_REF, currently v1.41.0), which fixes the version — reproducibility
+      # comes from the release tag. A release ships an in-sync Cargo.lock, so
+      # --locked could be restored after confirming the goose build stays green;
+      # left unlocked for now to match the zeroclaw engine build.
       ( cd "$gsrc" && "$b" build --release -p "$GOOSE_BIN_PKG" --bin goose \
           --no-default-features --features "$GOOSE_FEATURES" \
           --config 'profile.release.strip="symbols"' \
