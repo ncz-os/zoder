@@ -46,29 +46,43 @@ pub enum Classification {
     /// HTTP 404 (no such model at this provider). The id is wrong for this
     /// endpoint; consult should permanently skip it.
     Unprovisioned,
+    /// HTTP 401/403 (missing/invalid/expired credential for the provider).
+    /// The provider is rejecting the caller's API key — that is a
+    /// configuration/account problem, not model ill-health, so it MUST NOT
+    /// trip the circuit breaker and MUST be skipped by consult until the
+    /// operator fixes the key. Persisted as the lowercase token
+    /// "unauthorized".
+    Unauthorized,
     /// Anything else: timeouts, decode errors, network, 5xx-other, etc.
     Error,
 }
 
 impl Classification {
     /// Map an HTTP status code to a classification. Anything not in {2xx,
-    /// 404, 429, 503} falls through to `Error`.
+    /// 404, 429, 503, 401, 403} falls through to `Error`.
     pub fn from_status(status: u16) -> Self {
         match status {
             200..=299 => Classification::Reachable,
             404 => Classification::Unprovisioned,
+            // 401/403 are the provider REJECTING THE CREDENTIAL (missing /
+            // invalid / expired API key). That is a configuration problem
+            // for the operator, not model ill-health — classify as
+            // Unauthorized so consult skips the model and the circuit
+            // breaker does not open on the (perfectly fine) model behind it.
+            401 | 403 => Classification::Unauthorized,
             429 | 503 => Classification::Capacity,
             _ => Classification::Error,
         }
     }
 
     /// `true` for outcomes that should make consult SKIP this model
-    /// regardless of breakder state: `Capacity` (transient) and
-    /// `Unprovisioned` (permanent).
+    /// regardless of breakder state: `Capacity` (transient),
+    /// `Unprovisioned` (permanent), and `Unauthorized` (key rejected — keep
+    /// retrying it does not help, the operator must fix the credential).
     pub fn skips_consult(self) -> bool {
         matches!(
             self,
-            Classification::Capacity | Classification::Unprovisioned
+            Classification::Capacity | Classification::Unprovisioned | Classification::Unauthorized
         )
     }
 
@@ -78,6 +92,7 @@ impl Classification {
             Classification::Reachable => "reachable",
             Classification::Capacity => "capacity",
             Classification::Unprovisioned => "unprovisioned",
+            Classification::Unauthorized => "unauthorized",
             Classification::Error => "error",
         }
     }
@@ -117,9 +132,9 @@ impl ModelHealth {
         self.classification = Some(classification);
     }
 
-    /// `true` when the most recent classification is `Capacity` or
-    /// `Unprovisioned`. consult treats these as "skip for now" independent
-    /// of the breaker.
+    /// `true` when the most recent classification is `Capacity`,
+    /// `Unprovisioned`, or `Unauthorized`. consult treats these as "skip
+    /// for now" independent of the breaker.
     pub fn is_skipped_by_classification(&self) -> bool {
         self.classification
             .map(Classification::skips_consult)
@@ -239,6 +254,20 @@ impl HealthStore {
     /// but resets the breaker state in the opposite direction. `provider_id`
     /// may be empty for legacy callers; the new field is left `None` in that
     /// case so the JSON stays minimal.
+    ///
+    /// SPECIAL CASE: when `classification` is `Unauthorized` (HTTP 401/403
+    /// from the provider — i.e. the credential was rejected) this is NOT a
+    /// model-health failure. The model itself is fine; only the API key on
+    /// the operator's side is wrong. We must therefore NOT increment
+    /// `consecutive_failures`, NOT bump `failures`, and NOT stamp
+    /// `last_failure_unix` (which would otherwise pin the breaker open).
+    /// We still call `mark_checked` so the on-disk store records the
+    /// probe attempt, the provider that rejected it, and the unauthorized
+    /// classification — consult uses that to skip the model until the
+    /// operator updates the credential. Net effect: the model's breaker
+    /// state is preserved exactly as it was before, so a model whose key
+    /// is broken does not get bench-binned by `BREAKER_THRESHOLD`
+    /// consecutive auth errors.
     pub fn record_classified_failure(
         &mut self,
         model: &str,
@@ -248,6 +277,23 @@ impl HealthStore {
     ) {
         let h = self.models.entry(model.to_string()).or_default();
         h.calls = h.calls.saturating_add(1);
+        if classification == Classification::Unauthorized {
+            // Auth/credential rejection — model is unknown-healthy, only
+            // the key is wrong. Stamp the probe (so consult can render
+            // freshness + the unauthorized tag) but leave breaker state
+            // untouched. Truncate the error string the same way the
+            // failure path does so legacy readers see a consistent
+            // last_error length cap (still records WHAT went wrong, just
+            // does not count it as a model failure).
+            h.last_error = Some(err.chars().take(160).collect());
+            if !provider_id.is_empty() {
+                h.mark_checked(provider_id, classification);
+            } else {
+                h.checked_at_unix = Some(now_unix());
+                h.classification = Some(classification);
+            }
+            return;
+        }
         h.failures = h.failures.saturating_add(1);
         h.consecutive_failures = h.consecutive_failures.saturating_add(1);
         h.last_error = Some(err.chars().take(160).collect());
@@ -303,11 +349,21 @@ mod tests {
             Classification::from_status(404),
             Classification::Unprovisioned
         );
+        // 401/403 => Unauthorized (credential rejection — must NOT trip the
+        // breaker; see record_classified_failure_preserves_breaker_on_auth).
+        assert_eq!(
+            Classification::from_status(401),
+            Classification::Unauthorized
+        );
+        assert_eq!(
+            Classification::from_status(403),
+            Classification::Unauthorized
+        );
         // 429/503 => Capacity (transient skip).
         assert_eq!(Classification::from_status(429), Classification::Capacity);
         assert_eq!(Classification::from_status(503), Classification::Capacity);
         // Everything else => Error.
-        for s in [400u16, 401, 403, 500, 502, 504] {
+        for s in [400u16, 500, 502, 504] {
             assert_eq!(
                 Classification::from_status(s),
                 Classification::Error,
@@ -317,10 +373,27 @@ mod tests {
     }
 
     #[test]
-    fn skips_consult_predicate_matches_only_capacity_and_unprovisioned() {
+    fn unauthorized_has_lowercase_token_and_round_trips_through_serde() {
+        // snake_case rename must produce the lowercase token "unauthorized"
+        // and it must round-trip through the on-disk JSON shape so a future
+        // enum tweak can't silently rename a persisted record.
+        assert_eq!(Classification::Unauthorized.as_str(), "unauthorized");
+        assert_eq!(
+            serde_json::to_string(&Classification::Unauthorized).unwrap(),
+            "\"unauthorized\""
+        );
+        let back: Classification = serde_json::from_str("\"unauthorized\"").expect("deserialize");
+        assert_eq!(back, Classification::Unauthorized);
+    }
+
+    #[test]
+    fn skips_consult_predicate_includes_unauthorized() {
+        // AuthenticatED models must be routable as normal; rejected credentials
+        // must make consult skip the model without re-trying it.
         assert!(!Classification::Reachable.skips_consult());
         assert!(Classification::Capacity.skips_consult());
         assert!(Classification::Unprovisioned.skips_consult());
+        assert!(Classification::Unauthorized.skips_consult());
         assert!(!Classification::Error.skips_consult());
     }
 
@@ -336,9 +409,14 @@ mod tests {
             serde_json::to_string(&Classification::Unprovisioned).unwrap(),
             "\"unprovisioned\""
         );
+        assert_eq!(
+            serde_json::to_string(&Classification::Unauthorized).unwrap(),
+            "\"unauthorized\""
+        );
         assert_eq!(Classification::Reachable.as_str(), "reachable");
         assert_eq!(Classification::Capacity.as_str(), "capacity");
         assert_eq!(Classification::Unprovisioned.as_str(), "unprovisioned");
+        assert_eq!(Classification::Unauthorized.as_str(), "unauthorized");
         assert_eq!(Classification::Error.as_str(), "error");
     }
 
@@ -441,5 +519,131 @@ mod tests {
         assert_eq!(h.classification, Some(Classification::Unprovisioned));
         assert_eq!(h.provider_id.as_deref(), Some("openrouter"));
         assert!(h.is_skipped_by_classification());
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression tests for the "401/403 trips the breaker" defect.
+    //
+    // Symptom: a provider rejecting the API key with HTTP 401/403 used to
+    // classify as Error and increment consecutive_failures; after the third
+    // rejection the circuit breaker opened on a perfectly fine model whose
+    // only problem was the operator's credential. These tests pin the
+    // corrected behavior: credential rejections NEVER trip the breaker,
+    // while genuine Errors still do. They live here (not in
+    // zoder-core/src/health_probe.rs) because the fix is inside the
+    // model-health crate's record_classified_failure path and we want a
+    // focused unit that exercises the public surface in isolation.
+    // ---------------------------------------------------------------------
+
+    /// A single 401/403 probe stamps the model as checked (so consult can
+    /// render the unauthorized tag) but it must NOT bump
+    /// `consecutive_failures`, must NOT bump `failures`, and must NOT stamp
+    /// `last_failure_unix` (which would otherwise arm the breaker cooldown).
+    #[test]
+    fn record_classified_failure_does_not_trip_breaker_on_auth() {
+        let mut s = HealthStore::default();
+        s.record_classified_failure(
+            "openai/gpt-4o",
+            "provider HTTP 401 Unauthorized: invalid api key",
+            "openrouter",
+            Classification::Unauthorized,
+        );
+        let h = &s.models["openai/gpt-4o"];
+        // calls IS counted (a probe happened) but the breaker-relevant
+        // counters are untouched.
+        assert_eq!(h.calls, 1);
+        assert_eq!(
+            h.failures, 0,
+            "Unauthorized must not be counted as a failure"
+        );
+        assert_eq!(
+            h.consecutive_failures, 0,
+            "Unauthorized must not increment consecutive_failures"
+        );
+        assert!(
+            h.last_failure_unix.is_none(),
+            "Unauthorized must not stamp last_failure_unix (would arm breaker)"
+        );
+        // The diagnostic string IS preserved so an operator inspecting the
+        // store can see why consult is skipping the model.
+        assert_eq!(
+            h.last_error.as_deref(),
+            Some("provider HTTP 401 Unauthorized: invalid api key")
+        );
+        // And the consult path sees the unauthorized classification and
+        // skips the model — exactly what the task wants.
+        assert_eq!(h.classification, Some(Classification::Unauthorized));
+        assert!(h.is_skipped_by_classification());
+        assert!(!s.breaker_open("openai/gpt-4o"));
+    }
+
+    /// Even after MORE than BREAKER_THRESHOLD auth-rejected probes, the
+    /// breaker MUST stay closed. This is the test that fails on the old
+    /// code (where 401/403 mapped to Error and record_classified_failure
+    /// incremented consecutive_failures every time).
+    #[test]
+    fn many_unauthorized_probes_never_open_breaker() {
+        let mut s = HealthStore::default();
+        let model = "anthropic/claude-3.7";
+        // Hammer the probe with >= BREAKER_THRESHOLD 401/403 outcomes.
+        for i in 0..(BREAKER_THRESHOLD * 5) {
+            s.record_classified_failure(
+                model,
+                &format!("provider HTTP 401 Unauthorized: probe {i}"),
+                "openrouter",
+                Classification::Unauthorized,
+            );
+        }
+        let h = &s.models[model];
+        assert_eq!(h.calls, (BREAKER_THRESHOLD * 5) as u64);
+        assert_eq!(h.failures, 0);
+        assert_eq!(h.consecutive_failures, 0);
+        assert!(h.last_failure_unix.is_none());
+        assert!(
+            !s.breaker_open(model),
+            "breaker must NEVER open on auth rejection"
+        );
+        // state() must still report Healthy — the model is fine.
+        assert_eq!(h.state(), State::Healthy);
+    }
+
+    /// Sanity check: the SAME count of genuine Errors DOES open the
+    /// breaker. Without this, the previous test could be passing only
+    /// because record_classified_failure is broken in some other way.
+    #[test]
+    fn many_error_probes_open_breaker() {
+        let mut s = HealthStore::default();
+        let model = "broken/model";
+        for _ in 0..BREAKER_THRESHOLD {
+            s.record_classified_failure(model, "boom", "openrouter", Classification::Error);
+        }
+        let h = &s.models[model];
+        assert_eq!(h.consecutive_failures, BREAKER_THRESHOLD);
+        assert_eq!(h.failures, BREAKER_THRESHOLD as u64);
+        assert!(s.breaker_open(model), "Errors must still trip the breaker");
+        assert_eq!(h.state(), State::Down);
+    }
+
+    /// After an Unauthorized-stamped probe, a subsequent SUCCESS resets the
+    /// breaker-clean state we just preserved — proving the two code paths
+    /// remain consistent (no leftover counter corruption).
+    #[test]
+    fn auth_rejection_then_success_keeps_record_consistent() {
+        let mut s = HealthStore::default();
+        let model = "x/y";
+        for _ in 0..(BREAKER_THRESHOLD * 2) {
+            s.record_classified_failure(model, "401", "openrouter", Classification::Unauthorized);
+        }
+        assert_eq!(s.models[model].consecutive_failures, 0);
+        // A later success should land cleanly with no leftover breaker
+        // debt to clear.
+        s.record_classified_success(model, 100.0, "openrouter", Classification::Reachable);
+        assert_eq!(s.models[model].consecutive_failures, 0);
+        assert_eq!(s.models[model].failures, 0);
+        assert_eq!(
+            s.models[model].classification,
+            Some(Classification::Reachable)
+        );
+        assert!(!s.breaker_open(model));
     }
 }
