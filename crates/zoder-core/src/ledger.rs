@@ -8,7 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Optional FinOps tags attached to a ledger entry at ingestion time.
@@ -185,20 +185,22 @@ pub struct Ledger {
     path: PathBuf,
 }
 
-/// Exclusive, preallocated accounting transaction for one billable dispatch.
+/// Durable, preallocated accounting transaction for one billable dispatch.
 /// If dropped without reconciliation, its valid unknown-cost row remains in
 /// the ledger, forcing subsequent budget/reporting decisions to fail closed.
 pub struct BillableReservation {
-    file: File,
+    path: PathBuf,
+    lock_path: PathBuf,
     offset: u64,
     slot_bytes: usize,
+    marker: String,
     month_to_date: Result<f64, String>,
     armed: bool,
 }
 
 impl BillableReservation {
-    /// Month-to-date known spend from the strict snapshot protected by this
-    /// reservation's exclusive lock.
+    /// Month-to-date known spend from the strict snapshot taken while this
+    /// reservation was created under the exclusive sidecar lock.
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         self.month_to_date
             .as_ref()
@@ -210,8 +212,25 @@ impl BillableReservation {
     /// called, dropping the guard cancels the slot (for example when a user
     /// declines a budget prompt); afterward, an unreconciled slot is retained
     /// as unknown spend so failures cannot become unaccounted retries.
-    pub fn arm(&mut self) {
+    pub fn arm(&mut self) -> anyhow::Result<()> {
+        let lock = open_lock_file(&self.lock_path)?;
+        lock.lock_exclusive()?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!("opening ledger at {} before dispatch", self.path.display())
+            })?;
+        verify_reservation_slot(
+            &mut file,
+            self.offset,
+            self.slot_bytes,
+            &self.marker,
+            &self.path,
+        )?;
         self.armed = true;
+        Ok(())
     }
 
     /// Replace the preallocated unknown-cost reservation with the final entry.
@@ -232,9 +251,28 @@ impl BillableReservation {
         let mut line = vec![b' '; self.slot_bytes];
         line[..json.len()].copy_from_slice(&json);
         line[self.slot_bytes - 1] = b'\n';
-        self.file.seek(SeekFrom::Start(self.offset))?;
-        self.file.write_all(&line)?;
-        self.file.sync_data()?;
+        let lock = open_lock_file(&self.lock_path)?;
+        lock.lock_exclusive()?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!(
+                    "opening ledger at {} for reconciliation",
+                    self.path.display()
+                )
+            })?;
+        verify_reservation_slot(
+            &mut file,
+            self.offset,
+            self.slot_bytes,
+            &self.marker,
+            &self.path,
+        )?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        file.write_all(&line)?;
+        file.sync_data()?;
         Ok(())
     }
 }
@@ -242,10 +280,73 @@ impl BillableReservation {
 impl Drop for BillableReservation {
     fn drop(&mut self) {
         if !self.armed {
-            let _ = self.file.set_len(self.offset);
-            let _ = self.file.sync_data();
+            // Other writers may have appended after this reservation was
+            // created, so cancellation must blank only our fixed-size slot;
+            // truncating to `offset` would discard their rows.
+            if let Ok(lock) = open_lock_file(&self.lock_path) {
+                if lock.lock_exclusive().is_ok() {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&self.path)
+                    {
+                        if verify_reservation_slot(
+                            &mut file,
+                            self.offset,
+                            self.slot_bytes,
+                            &self.marker,
+                            &self.path,
+                        )
+                        .is_ok()
+                        {
+                            let mut blank = vec![b' '; self.slot_bytes];
+                            blank[self.slot_bytes - 1] = b'\n';
+                            let _ = file.seek(SeekFrom::Start(self.offset));
+                            let _ = file.write_all(&blank);
+                            let _ = file.sync_data();
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening ledger lock at {}", path.display()))
+}
+
+fn verify_reservation_slot(
+    file: &mut File,
+    offset: u64,
+    slot_bytes: usize,
+    marker: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut slot = vec![0; slot_bytes];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut slot).with_context(|| {
+        format!(
+            "reading reserved ledger slot at byte {offset} of {}",
+            path.display()
+        )
+    })?;
+    if !slot
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
+    {
+        anyhow::bail!(
+            "reserved ledger slot at byte {offset} of {} is missing or was replaced",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 impl Ledger {
@@ -268,28 +369,35 @@ impl Ledger {
         // can't interleave a partial line. (writeln! issues two writes.)
         let mut line = serde_json::to_string(e)?;
         line.push('\n');
+        let lock_path = self.lock_path();
+        let lock = open_lock_file(&lock_path)?;
+        lock.lock_exclusive()?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&self.path)?;
-        f.lock_exclusive()?;
-        self.entries_strict_unlocked()?;
+        self.entries_strict_from_file(&mut f)?;
         f.seek(SeekFrom::End(0))?;
         f.write_all(line.as_bytes())?;
         f.sync_data()?;
         Ok(())
     }
 
-    /// Lock, strictly validate, and preallocate the durable row that will be
-    /// reconciled after one external billable dispatch. Callers must acquire
-    /// this before their budget check and retain it through `reconcile`.
+    /// Lock, strictly validate, and preallocate the durable row for one external
+    /// billable dispatch. The stable sidecar lock is released before this
+    /// returns; the persisted pending row makes concurrent budget decisions
+    /// fail closed without holding a lock while arbitrary provider/tool code runs.
     pub fn reserve_billable(&self) -> anyhow::Result<BillableReservation> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating ledger directory {}", parent.display()))?;
         }
+        let lock_path = self.lock_path();
+        let lock = open_lock_file(&lock_path)?;
+        lock.lock_exclusive()
+            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -299,12 +407,11 @@ impl Ledger {
             .with_context(|| {
                 format!("opening ledger for reservation at {}", self.path.display())
             })?;
-        file.lock_exclusive()
-            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
-        let entries = self.entries_strict_unlocked()?;
+        let entries = self.entries_strict_from_file(&mut file)?;
         let month_to_date = month_to_date_from_entries(&entries).map_err(|error| error.to_string());
 
         let offset = file.seek(SeekFrom::End(0))?;
+        let marker = format!("zoder-reservation-{:032x}", rand::random::<u128>());
         let pending = Entry {
             ts_utc: Utc::now(),
             provider: "__zoder_reservation__".to_string(),
@@ -315,7 +422,9 @@ impl Ledger {
             cost_usd: 0.0,
             cost_unknown: true,
             calls: 1,
-            violation: Some("billable call reserved but not reconciled".to_string()),
+            violation: Some(format!(
+                "billable call reserved but not reconciled ({marker})"
+            )),
             tags: FinOpsTags::default(),
         };
         let json = serde_json::to_vec(&pending)?;
@@ -323,25 +432,52 @@ impl Ledger {
         let mut slot = vec![b' '; BILLABLE_RESERVATION_BYTES];
         slot[..json.len()].copy_from_slice(&json);
         slot[BILLABLE_RESERVATION_BYTES - 1] = b'\n';
-        file.write_all(&slot).with_context(|| {
-            format!(
-                "preallocating billable ledger entry at {}",
-                self.path.display()
-            )
-        })?;
-        file.sync_data().with_context(|| {
-            format!(
-                "syncing billable ledger reservation at {}",
-                self.path.display()
-            )
-        })?;
+        let preallocate = file
+            .write_all(&slot)
+            .with_context(|| {
+                format!(
+                    "preallocating billable ledger entry at {}",
+                    self.path.display()
+                )
+            })
+            .and_then(|()| {
+                file.sync_data().with_context(|| {
+                    format!(
+                        "syncing billable ledger reservation at {}",
+                        self.path.display()
+                    )
+                })
+            });
+        if let Err(error) = preallocate {
+            let rollback = file
+                .set_len(offset)
+                .and_then(|()| file.sync_data())
+                .with_context(|| {
+                    format!(
+                        "rolling back failed ledger reservation at {}",
+                        self.path.display()
+                    )
+                });
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(error.context(rollback_error)),
+            };
+        }
         Ok(BillableReservation {
-            file,
+            path: self.path.clone(),
+            lock_path,
             offset,
             slot_bytes: BILLABLE_RESERVATION_BYTES,
+            marker,
             month_to_date,
             armed: false,
         })
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut lock = self.path.as_os_str().to_os_string();
+        lock.push(".lock");
+        PathBuf::from(lock)
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -358,9 +494,16 @@ impl Ledger {
     /// to $0 and bypass the pre-call budget gate (Finding #10).
     pub fn entries_observed(
         &self,
-        mut on_malformed: impl FnMut(usize, &str),
+        on_malformed: impl FnMut(usize, &str),
     ) -> anyhow::Result<Vec<Entry>> {
-        let f = match std::fs::File::open(&self.path) {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+        }
+        let lock_path = self.lock_path();
+        let lock = open_lock_file(&lock_path)?;
+        FileExt::lock_shared(&lock)?;
+        let mut file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
@@ -368,73 +511,7 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
-        // Stream bytes line-by-line. Reading the whole file into a String
-        // first (the old behavior) is fine for small ledgers but breaks on
-        // multi-MiB JSONL: one invalid UTF-8 byte in line 1 of a 50 MiB
-        // file makes the whole `read_to_string` fail with InvalidData,
-        // collapsing every entry to zero (Finding #10). Per-line
-        // incremental `fill_buf` processing recovers as much as possible and
-        // enforces `MAX_LEDGER_LINE_BYTES` before appending each chunk.
-        let reader = BufReader::with_capacity(64 * 1024, f);
-        let mut out = Vec::new();
-        let mut line_no: usize = 0;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut reader = reader;
-        loop {
-            line_no += 1;
-            buf.clear();
-            loop {
-                let available = reader.fill_buf().with_context(|| {
-                    format!(
-                        "reading ledger at line {line_no} of {}",
-                        self.path.display()
-                    )
-                })?;
-                if available.is_empty() {
-                    if buf.is_empty() {
-                        return Ok(out);
-                    }
-                    break;
-                }
-                let chunk_len = available
-                    .iter()
-                    .position(|&byte| byte == b'\n')
-                    .map_or(available.len(), |position| position + 1);
-                if buf.len().saturating_add(chunk_len) > MAX_LEDGER_LINE_BYTES {
-                    return Err(anyhow::anyhow!(
-                        "ledger line {line_no} exceeds {} bytes; truncating early",
-                        MAX_LEDGER_LINE_BYTES
-                    ));
-                }
-                let has_newline = available[chunk_len - 1] == b'\n';
-                buf.extend_from_slice(&available[..chunk_len]);
-                reader.consume(chunk_len);
-                if has_newline {
-                    break;
-                }
-            }
-            // Trim the trailing newline (and any CR for CRLF safety) so
-            // `serde_json::from_slice` doesn't see a trailing whitespace
-            // it objects to. Empty / whitespace-only lines are skipped
-            // silently — they were always tolerated, and there's no
-            // caller-visible state to corrupt.
-            while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-                buf.pop();
-            }
-            if buf.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            match serde_json::from_slice::<Entry>(&buf) {
-                Ok(e) if entry_numbers_valid(&e) => out.push(e),
-                _ => {
-                    // `from_utf8_lossy` keeps the malformed byte visible
-                    // for the caller; the line is still skipped so a
-                    // single bad row doesn't blank the rollup.
-                    let raw = String::from_utf8_lossy(&buf).into_owned();
-                    on_malformed(line_no, &raw);
-                }
-            }
-        }
+        read_entries(&mut file, &self.path, on_malformed)
     }
 
     /// All entries, silently skipping malformed lines. For visibility into
@@ -450,7 +527,15 @@ impl Ledger {
     /// malformed. Quota and budget decisions must use this stricter view: a
     /// skipped row may contain spend, so continuing would be fail-open.
     pub fn entries_strict(&self) -> anyhow::Result<Vec<Entry>> {
-        let file = match File::open(&self.path) {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+        }
+        let lock_path = self.lock_path();
+        let lock = open_lock_file(&lock_path)?;
+        FileExt::lock_shared(&lock)
+            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
+        let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
@@ -458,16 +543,15 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
-        FileExt::lock_shared(&file)
-            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
-        self.entries_strict_unlocked()
+        self.entries_strict_from_file(&mut file)
     }
 
-    fn entries_strict_unlocked(&self) -> anyhow::Result<Vec<Entry>> {
+    fn entries_strict_from_file(&self, file: &mut File) -> anyhow::Result<Vec<Entry>> {
         let mut malformed_lines = Vec::new();
-        let entries = self
-            .entries_observed(|line_no, _| malformed_lines.push(line_no))
-            .with_context(|| format!("reading ledger from {}", self.path.display()))?;
+        let entries = read_entries(file, &self.path, |line_no, _| {
+            malformed_lines.push(line_no);
+        })
+        .with_context(|| format!("reading ledger from {}", self.path.display()))?;
         if !malformed_lines.is_empty() {
             anyhow::bail!(
                 "cannot establish ledger integrity: {} contains malformed non-empty row(s) at line(s) {}",
@@ -594,6 +678,64 @@ impl Ledger {
             accumulate_rollup(r, &e)?;
         }
         Ok(out)
+    }
+}
+
+fn read_entries(
+    file: &mut File,
+    path: &Path,
+    mut on_malformed: impl FnMut(usize, &str),
+) -> anyhow::Result<Vec<Entry>> {
+    file.seek(SeekFrom::Start(0))?;
+    // Parse incrementally so one invalid UTF-8 byte cannot blank a large
+    // ledger, while bounding memory before accumulating an attacker-sized line.
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut out = Vec::new();
+    let mut line_no = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        line_no += 1;
+        buf.clear();
+        loop {
+            let available = reader.fill_buf().with_context(|| {
+                format!("reading ledger at line {line_no} of {}", path.display())
+            })?;
+            if available.is_empty() {
+                if buf.is_empty() {
+                    return Ok(out);
+                }
+                break;
+            }
+            let chunk_len = available
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            if buf.len().saturating_add(chunk_len) > MAX_LEDGER_LINE_BYTES {
+                anyhow::bail!(
+                    "ledger line {line_no} exceeds {} bytes; truncating early",
+                    MAX_LEDGER_LINE_BYTES
+                );
+            }
+            let has_newline = available[chunk_len - 1] == b'\n';
+            buf.extend_from_slice(&available[..chunk_len]);
+            reader.consume(chunk_len);
+            if has_newline {
+                break;
+            }
+        }
+        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+            buf.pop();
+        }
+        if buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<Entry>(&buf) {
+            Ok(entry) if entry_numbers_valid(&entry) => out.push(entry),
+            _ => {
+                let raw = String::from_utf8_lossy(&buf).into_owned();
+                on_malformed(line_no, &raw);
+            }
+        }
     }
 }
 
@@ -915,5 +1057,116 @@ mod tests {
         let ledger = Ledger::new(&path);
         drop(ledger.reserve_billable().unwrap());
         assert!(ledger.entries_strict().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_reservation_does_not_block_nested_ledger_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut reservation = ledger.reserve_billable().unwrap();
+        reservation.arm().unwrap();
+
+        let nested_path = path.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Ledger::new(&nested_path).entries_strict();
+            send.send(result).unwrap();
+        });
+        let nested = receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("nested ledger read deadlocked behind reservation");
+        let entries = nested.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].cost_unknown);
+
+        reservation
+            .reconcile(&entry("2026-07-01 10:00:00", "m", 0.25, 10, 5, 1))
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_reservation_observes_pending_row_and_fails_budget_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut first = Ledger::new(&path).reserve_billable().unwrap();
+        first.arm().unwrap();
+
+        let (send, receive) = std::sync::mpsc::channel();
+        let nested_path = path.clone();
+        std::thread::spawn(move || {
+            send.send(Ledger::new(&nested_path).reserve_billable())
+                .unwrap();
+        });
+        let second = receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("concurrent reservation deadlocked")
+            .unwrap();
+        let error = second.month_to_date_usd().unwrap_err().to_string();
+        assert!(error.contains("unknown cost"), "{error}");
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn uncertain_attempt_is_retained_when_later_attempt_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+
+        let mut timed_out_attempt = ledger.reserve_billable().unwrap();
+        timed_out_attempt.arm().unwrap();
+        drop(timed_out_attempt);
+
+        let mut winning_attempt = ledger.reserve_billable().unwrap();
+        winning_attempt.arm().unwrap();
+        winning_attempt
+            .reconcile(&entry("2026-07-01 10:00:00", "winner", 0.25, 10, 5, 1))
+            .unwrap();
+
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].cost_unknown);
+        assert_eq!(entries[1].model, "winner");
+        assert_eq!(entries[1].cost_usd, 0.25);
+    }
+
+    #[test]
+    fn cancelling_older_reservation_preserves_later_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let older = ledger.reserve_billable().unwrap();
+        let newer = ledger.reserve_billable().unwrap();
+        newer
+            .reconcile(&entry("2026-07-01 10:00:00", "newer", 0.5, 2, 1, 1))
+            .unwrap();
+        drop(older);
+
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "newer");
+    }
+
+    #[test]
+    fn dispatch_refuses_replaced_canonical_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let rotated = dir.path().join("ledger.rotated.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut reservation = ledger.reserve_billable().unwrap();
+        std::fs::rename(&path, &rotated).unwrap();
+        let replacement = entry("2026-07-01 10:00:00", "replacement", 1.0, 1, 1, 1);
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&replacement).unwrap()),
+        )
+        .unwrap();
+
+        let error = reservation.arm().unwrap_err().to_string();
+        assert!(error.contains("reserved ledger slot"), "{error}");
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "replacement");
     }
 }

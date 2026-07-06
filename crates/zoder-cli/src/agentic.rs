@@ -526,7 +526,9 @@ async fn complete_once(
         reasoning_effort: cli.reasoning.clone(),
     };
     let provider = OpenAiProvider::new(provider_cfg)?;
-    ledger_reservation.arm();
+    ledger_reservation
+        .arm()
+        .with_context(|| "verifying ledger reservation before reviewer dispatch")?;
     let res = provider
         .stream_chat(&req, None)
         .await
