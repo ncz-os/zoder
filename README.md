@@ -529,6 +529,17 @@ the GitLab package registry: <https://gitlab.com/ncz-os/zoder/-/packages>
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `aarch64-apple-darwin` (Apple Silicon). Windows → use WSL.
 
+### Container (Docker)
+
+The full stack (zoder + zerocode + zeroclaw + goose) ships as a multi-arch image
+(`linux/amd64` + `linux/arm64`) on GitHub Container Registry, rebuilt weekly:
+
+```bash
+docker pull ghcr.io/ncz-os/zoder:latest        # or :weekly-<ISO-week>, e.g. :weekly-2026-W27
+docker run --rm ghcr.io/ncz-os/zoder --help
+# persist routing state:  docker run -v zoder-home:/root/.zoder ghcr.io/ncz-os/zoder ...
+```
+
 ### Build from source
 
 zoder builds natively for:
