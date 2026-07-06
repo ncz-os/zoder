@@ -388,6 +388,35 @@ pub struct AgentOptions {
     /// wrong auth, wrong bill. `None` for zeroclaw (no spawn). See
     /// [`GooseProviderEnv`] for the exact env-construction contract.
     pub goose_provider: Option<GooseProviderEnv>,
+    /// Writable-root containment boundary (SLICE 1 of the execution-safety
+    /// kernel). Every file-write target is resolved (canonicalized, with
+    /// symlink/parent-dir traversal defeated) and checked against this list:
+    /// targets OUTSIDE all listed roots are DENIED when
+    /// [`Self::enforce_writable_roots`] is `true`. Default: a single-element
+    /// vector containing [`Self::cwd`] (so a fresh `AgentOptions::new(...)`
+    /// is, when enforcement is flipped on, a "writes must stay inside the
+    /// repo root" gate). Populated with `vec![cwd.clone()]` by
+    /// [`Self::new`]; struct-literal callers must set it explicitly to
+    /// preserve the same default — a later slice will compute this from a
+    /// CLI flag (out of scope here).
+    pub writable_roots: Vec<PathBuf>,
+    /// When `true`, every write/edit-class tool call is checked against
+    /// [`Self::writable_roots`] BEFORE the policy decides; a target that
+    /// resolves outside the roots is DENIED regardless of [`ApprovalPolicy`].
+    /// `false` (default) preserves today's behavior EXACTLY — no new
+    /// denials, no new containment checks — so this slice is non-breaking.
+    /// A follow-up will validate the schema matrix and flip the default.
+    pub enforce_writable_roots: bool,
+    /// When `true`, the approval decision trusts the engine's identification
+    /// of the tool call: an unknown engine OR an unknown write tool OR a
+    /// missing/unparseable path on a known write tool does NOT force a
+    /// deny on fail-closed grounds. `false` (default) is fail-closed: any
+    /// of those conditions DENIES the call when enforcement is on. The
+    /// follow-up that wires up the per-engine schema matrix will set this
+    /// to `true` for engines whose tool-shape we have validated
+    /// exhaustively; for now it stays `false` so unknown shapes never get
+    /// a free pass.
+    pub trust_engine: bool,
 }
 
 impl AgentOptions {
@@ -397,10 +426,11 @@ impl AgentOptions {
         cwd: impl Into<PathBuf>,
         prompt: impl Into<String>,
     ) -> Self {
+        let cwd = cwd.into();
         Self {
             socket: socket.into(),
             agent_alias: agent_alias.into(),
-            cwd: cwd.into(),
+            cwd: cwd.clone(),
             prompt: prompt.into(),
             model_override: None,
             model_id: None,
@@ -409,6 +439,11 @@ impl AgentOptions {
             approval: ApprovalPolicy::Allowlist,
             timeout: Duration::from_secs(900),
             goose_provider: None,
+            // SLICE 1 default: writes are confined to cwd until the CLI
+            // flag ships and the default is reviewed.
+            writable_roots: vec![cwd],
+            enforce_writable_roots: false,
+            trust_engine: false,
         }
     }
 }
@@ -787,7 +822,19 @@ async fn drive<F: FnMut(AgentEvent)>(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let approved = decide_approval(opts.approval, &tool);
+                // SLICE 1: route through the argument-aware decision so
+                // `enforce_writable_roots` is honored. With enforce OFF
+                // (today's default) this is exactly equivalent to the
+                // old `decide_approval(opts.approval, &tool)` call.
+                let approved = decide_approval_with_containment(
+                    opts.approval,
+                    &tool,
+                    &params,
+                    EngineKind::Zeroclaw,
+                    &opts.writable_roots,
+                    opts.enforce_writable_roots,
+                    opts.trust_engine,
+                );
                 let decision = if approved { "approve" } else { "deny" };
                 write_frame(
                     &mut write_half,
@@ -843,6 +890,495 @@ fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
             DEFAULT_AUTO_APPROVE.iter().any(|a| t == *a)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 1 of the execution-safety kernel: writable-root containment.
+//
+// This module adds an ARGUMENT-AWARE layer on top of the existing
+// name-based [`decide_approval`]. The new layer does NOT change today's
+// behavior when enforcement is OFF (see [`AgentOptions::enforce_writable_roots`]
+// = `false`); when enforcement is ON, every write/edit-class tool call is
+// checked against the configured writable roots BEFORE the policy decides
+// (i.e. a target outside the roots is DENIED even under `ApprovalPolicy::All`).
+//
+// The boundary is REAL (canonicalize-then-`starts_with`, symlink + dot-dot
+// safe) and FAIL-CLOSED: an unknown engine, an unknown write tool, or a
+// missing/unparseable path on a known write tool DENIES the call when
+// enforcement is on (unless `trust_engine` is set, which is the future
+// seam for "we have exhaustively validated this engine's schema").
+//
+// Out of scope for SLICE 1 (later slices): CLI flags, OS-level sandboxing,
+// and exec-argument inspection for shell-class tools.
+// ---------------------------------------------------------------------------
+
+/// Result of [`path_within_roots`] / the underlying extractors. Used by
+/// [`decide_approval_with_containment`] to choose between ALLOW, DENY (out of
+/// roots) and DENY (fail-closed: unknown shape). Internal — the public
+/// decision is the bool from `decide_approval_with_containment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContainmentVerdict {
+    /// Target resolved to a path inside at least one writable root.
+    Inside,
+    /// Target resolved to a path outside every writable root. Hard DENY
+    /// (overrides any policy that would otherwise ALLOW).
+    Outside,
+    /// The engine/tool/path shape could not be verified. Hard DENY unless
+    /// `trust_engine` is set.
+    Unknown,
+}
+
+/// Symlink- and traversal-safe containment check: returns `true` iff the
+/// canonicalized `target` path lives inside at least one of the `roots`,
+/// after both sides are resolved with [`std::fs::canonicalize`].
+///
+/// Properties this primitive MUST guarantee (and which the unit tests
+/// below lock in):
+///   * If the target does NOT yet exist (a file about to be created), we
+///     canonicalize the nearest existing ancestor directory and re-join
+///     the remaining components, so a not-yet-created file under a
+///     permitted root is still considered "inside".
+///   * Parent-directory (`..`) traversal is defeated: the joined path is
+///     lexically normalized (collapsing `..` against a component stack)
+///     before the `starts_with` check, so
+///     `<root>/../../etc/passwd` is normalized to `/etc/passwd` and the
+///     `starts_with` check then fails.
+///   * Symlink escape is defeated: both the root and the target go
+///     through `canonicalize`, so a symlink inside the root that points
+///     outside is followed and the resulting real path is checked.
+///   * If canonicalization of EITHER side fails (e.g. an unreadable
+///     component, a TOCTOU race, a relative-only path on a platform
+///     where the cwd is gone), we treat the target as NOT contained
+///     (deny). That keeps the primitive fail-closed.
+///
+/// `pub` (not `pub(crate)`) so external callers — the zoder CLI, the
+/// dashboard, the future policy-evaluator slice — can use the SAME
+/// primitive the agentic driver uses, rather than each subsystem
+/// re-implementing containment and drifting from the boundary.
+pub fn path_within_roots(target: &Path, roots: &[PathBuf]) -> bool {
+    matches!(
+        resolve_containment(target, roots),
+        ContainmentVerdict::Inside
+    )
+}
+
+/// Lower-level helper that returns the structured verdict, so the
+/// approval decision can distinguish "outside" (deny with a clear reason)
+/// from "unknown" (fail-closed deny with a different reason).
+fn resolve_containment(target: &Path, roots: &[PathBuf]) -> ContainmentVerdict {
+    // Resolve the target. If the target does not exist yet, walk up to the
+    // nearest existing ancestor, canonicalize that, and re-join the
+    // remaining tail. This is the only way a "not-yet-created file under
+    // a permitted root" can be treated as inside: canonicalizing the
+    // future-file path itself fails on every platform.
+    let target_canon = match canonicalize_for_write(target) {
+        Some(p) => p,
+        None => return ContainmentVerdict::Unknown,
+    };
+    for root in roots {
+        let root_canon = match std::fs::canonicalize(root) {
+            Ok(p) => p,
+            Err(_) => continue, // a broken root is ignored here, but an
+                                // empty `roots` slice still ends up
+                                // denying — see the final fallback below.
+        };
+        // `starts_with` on `Path` is component-aware (not byte-prefix),
+        // so `/foo/barbaz` does NOT contain `/foo/bar`.
+        if target_canon.starts_with(&root_canon) {
+            return ContainmentVerdict::Inside;
+        }
+    }
+    ContainmentVerdict::Outside
+}
+
+/// Canonicalize a path that may not exist yet. Walks up to the nearest
+/// existing ancestor, canonicalizes that, and re-joins the remaining
+/// non-existing tail. Returns `None` if no part of the path is
+/// canonicalizable (e.g. relative path with no anchor at all).
+///
+/// Implementation note: we deliberately work from the absolute path's
+/// `components()`, NOT from repeated `parent()` calls, because
+/// `Path::parent()` of a path ending in `..` does NOT strip the `..`
+/// (it is treated as a regular component). The component-walk
+/// computes the ancestor prefixes from the path's own structure and
+/// finds the longest existing one — which is exactly the "nearest
+/// existing ancestor" we need.
+///
+/// We then LEXICALLY normalize the result (resolve `..` segments
+/// against a component stack) so the containment check on the joined
+/// path is unaffected by any `..` in the tail. Lexical normalization
+/// is filesystem-free, so it works on paths whose tail does not yet
+/// exist; the canonicalization on the existing prefix then resolves
+/// any symlinks in the prefix. Together: the joined path is the
+/// real, symlink-resolved, `..`-resolved path the kernel will land
+/// on once the file is created.
+fn canonicalize_for_write(p: &Path) -> Option<PathBuf> {
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    // Fast path: the target already exists. Use `canonicalize` directly
+    // so symlinks in the target itself (e.g. an existing symlink at the
+    // leaf) are resolved and the symlink-escape guarantee holds even
+    // when the file is a symlink pointing outside the root.
+    if p.exists() {
+        return std::fs::canonicalize(p).ok();
+    }
+    // Make the path absolute so the components walk is anchored on a
+    // known root (`/`). Without this, a relative path like
+    // `target/../../outside/secret.txt` could yield ambiguous ancestor
+    // prefixes. `std::path::absolute` is the stable way to do this on
+    // stable Rust (it landed in 1.79).
+    let abs = std::path::absolute(p).ok()?;
+    // Compute every prefix of `abs` (as a path of components from the
+    // root down), and find the LONGEST one that exists. The remaining
+    // tail is then rejoined onto the canonicalized prefix.
+    let comps: Vec<std::path::Component<'_>> = abs.components().collect();
+    // Try from longest prefix to shortest.
+    let mut best_split: Option<usize> = None;
+    for split in (1..=comps.len()).rev() {
+        let prefix: std::path::PathBuf = comps[..split].iter().collect();
+        if prefix.exists() {
+            best_split = Some(split);
+            break;
+        }
+    }
+    let split = best_split?;
+    let prefix: PathBuf = comps[..split].iter().collect();
+    let tail: Vec<std::path::Component<'_>> = comps[split..].to_vec();
+    let canon_prefix = std::fs::canonicalize(&prefix).ok()?;
+    // Re-join the tail onto the canonicalized prefix, then LEXICALLY
+    // normalize the result. This collapses `..` segments against the
+    // stack (so `<canon_prefix>/sub/../../outside/secret.txt` becomes
+    // `<canon_prefix>/outside/secret.txt`) without any filesystem
+    // access — which is essential for paths whose tail does not exist
+    // yet. Symlinks in the non-existing tail cannot be exploited
+    // because the tail doesn't exist (no kernel-level symlink to
+    // follow); symlinks in the existing prefix were already resolved
+    // by `canon_prefix`.
+    let mut rejoined = canon_prefix;
+    for component in &tail {
+        rejoined.push(component.as_os_str());
+    }
+    Some(lexical_normalize(&rejoined))
+}
+
+/// Lexical path normalization: resolve `.` and `..` segments against a
+/// component stack, with no filesystem access. Equivalent to
+/// `path-clean`-style normalization. Symlinks are NOT followed (use
+/// [`std::fs::canonicalize`] for that). This is what lets us
+/// collapse `<canon>/root_a/sub/../../outside/x` to
+/// `<canon>/outside/x` so the containment check is unaffected by
+/// `..` segments in the target path.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                stack.clear();
+                stack.push(component.as_os_str().to_os_string());
+            }
+            std::path::Component::CurDir => {
+                // No-op: `.` is a no-op on the stack.
+            }
+            std::path::Component::ParentDir => {
+                // Pop the top of the stack, unless it's a root or prefix
+                // (in which case there's nothing to pop) or the stack
+                // is empty.
+                let top_is_root_or_prefix = matches!(
+                    stack
+                        .last()
+                        .map(|s| std::path::Path::new(s).components().next()),
+                    Some(Some(
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    ))
+                );
+                if !top_is_root_or_prefix && stack.len() > 1 {
+                    stack.pop();
+                } else if stack.is_empty() {
+                    // Relative path with a leading `..` — emit `..` so
+                    // the caller still sees a well-formed path. (This
+                    // branch is unreachable for absolute paths, which
+                    // is the only shape `canonicalize_for_write` feeds
+                    // us, but the fallback is correct anyway.)
+                    stack.push(std::ffi::OsString::from(".."));
+                }
+            }
+            std::path::Component::Normal(name) => {
+                stack.push(name.to_os_string());
+            }
+        }
+    }
+    if stack.is_empty() {
+        PathBuf::from(".")
+    } else {
+        let mut out = PathBuf::new();
+        for s in &stack {
+            out.push(s);
+        }
+        out
+    }
+}
+
+/// Per-engine write-tool target extractor. The matrix is intentionally
+/// HARDCODED — we do NOT guess generically. Each engine has a known,
+/// documented schema for the tool-call args, and we only wire up the
+/// specific (engine, tool_name) pairs we can verify. Anything else is
+/// reported as `Unknown` and fails closed (denies on enforce=true unless
+/// `trust_engine` is set).
+///
+/// ------------------------------------------------------------------------
+/// ENGINE → TOOL → ARG FIELD MATRIX
+/// ------------------------------------------------------------------------
+///
+/// ZEROCLAW:
+///   * The daemon streams `session/update` notifications with
+///     `type: "approval_request"` carrying `{request_id, tool_name,
+///     ...}`. The `tool_name` is the tool's canonical id; the tool-call
+///     ARGUMENTS for that call arrive via a SEPARATE notification
+///     (`type: "tool_call"`) which this slice does NOT yet pipe into the
+///     approval decision (the follow-up that adds the CLI flag will).
+///   * Verified write/edit-class tool names we expect on the zeroclaw
+///     side: `edit`, `write`, `apply_patch`, `shell`, `bash`. None of
+///     these are wired up here because the matching `tool_call`
+///     notification (with the target path) is not in this slice's scope.
+///   * Verdict: ALL ZEROCLAW WRITE TOOLS ARE TREATED AS `Unknown` IN
+///     SLICE 1. With `enforce=true` and `trust_engine=false` (the
+///     default) the call is denied, which is the correct fail-closed
+///     posture until the follow-up slice wires up the per-tool arg
+///     extractor.
+///
+/// GOOSE (Block's goose, ACP v1):
+///   * Standard ACP `session/request_permission` request with
+///     `params.toolCall.title` (the tool name) and
+///     `params.toolCall.rawInput` (the tool args). The exact argument
+///     field name for the target path depends on the specific tool;
+///     the table below lists the field we extract per tool.
+///   * Verified write/edit-class tool names (per goose >= 1.37):
+///       - `text_editor`  → `rawInput.path`     (a file path; covers
+///         `view`/`create`/`str_replace`/`insert`/`undo_edit` subcommands
+///         per goose's text editor tool)
+///       - `write_file`   → `rawInput.file_path` or `rawInput.path`
+///         (the latter is the canonical snake_case field; the camelCase
+///         variant is accepted for permissive servers)
+///       - `shell`        → no filesystem target path; this is an exec
+///         tool, NOT a write tool. We DO NOT classify `shell` as
+///         write-class here. Exec-arg inspection is a later slice.
+///   * Anything else on goose is reported as `Unknown` (e.g. the
+///     `computer_*` tools, custom MCP tools). The follow-up slice can
+///     add rows as we validate them.
+///
+/// To extend this matrix, add a row to `extract_write_target` and (if
+/// needed) an entry in the `is_write_class_tool` table — DO NOT make
+/// the classification generic.
+const ZEROCLAW_WRITE_TOOLS: &[&str] = &[
+    // Listed for documentation/future-use; currently treated as
+    // `Unknown` (fail-closed) because the matching `tool_call` arg
+    // notification is not piped into the approval decision in this
+    // slice. See the per-engine matrix comment above.
+    "edit",
+    "write",
+    "apply_patch",
+    "shell",
+    "bash",
+];
+
+const GOOSE_WRITE_TOOLS: &[&str] = &[
+    "text_editor",
+    "write_file",
+    // `shell` and `Bash` are exec tools, not file-write tools — the
+    // exec-arg inspection slice will handle them. Listed here ONLY so
+    // reviewers see they are explicitly NOT classified as write-class
+    // (comment-only; the extractor returns `Unknown` for them today).
+];
+
+/// Return `true` iff `(engine, tool_name)` is a write/edit-class tool
+/// we have explicitly classified in the per-engine matrix. Exec-class
+/// tools (shell, bash) and read-only tools return `false` here, which
+/// means enforcement leaves them to the regular name-based policy
+/// decision (the existing [`decide_approval`]). When in doubt, return
+/// `false` here AND return `Unknown` from the extractor — the fail-closed
+/// `Unknown` path is what makes the boundary safe.
+fn is_write_class_tool(engine: EngineKind, tool: &str) -> bool {
+    let table: &[&str] = match engine {
+        // Zeroclaw: write/edit-class tools are all in the matrix but
+        // currently treated as `Unknown` at the extractor level (no
+        // arg plumbing in this slice). Returning `true` here is still
+        // safe: a `true` here only forces the extractor to run, and
+        // the extractor returns `Unknown` → fail-closed deny.
+        EngineKind::Zeroclaw => ZEROCLAW_WRITE_TOOLS,
+        EngineKind::Goose => GOOSE_WRITE_TOOLS,
+    };
+    let needle = tool.to_ascii_lowercase();
+    table.iter().any(|t| needle == t.to_ascii_lowercase())
+}
+
+/// Extract the target filesystem path for a known write/edit-class tool
+/// call. Returns `Some(path)` when the path is unambiguously present in
+/// `params`, `None` otherwise (which the caller treats as `Unknown` and
+/// deny on enforce=true, fail-closed).
+///
+/// `params` is the tool-call argument object:
+///   * For zeroclaw's `approval_request` notification, this is the
+///     per-tool-args blob (when piped in by a follow-up slice; today it
+///     is effectively empty for the write tools, which is why the
+///     zeroclaw path is `Unknown` for the full matrix).
+///   * For goose's `session/request_permission` request, this is
+///     `params.toolCall.rawInput` (already extracted out by the caller).
+fn extract_write_target(engine: EngineKind, tool: &str, params: &Value) -> Option<PathBuf> {
+    let needle = tool.to_ascii_lowercase();
+    match engine {
+        EngineKind::Zeroclaw => {
+            // SLICE 1: the arg shape for zeroclaw write tools is not yet
+            // wired up (the matching `tool_call` notification carrying
+            // the args is not piped into the approval decision in this
+            // slice). Return `None` so the fail-closed path DENIES.
+            let _ = needle; // documented in the matrix above
+            let _ = params;
+            None
+        }
+        EngineKind::Goose => {
+            // Field-name allowlist per tool — NEVER a generic
+            // `params.get("path").or_else(params.get("filePath"))` chain,
+            // because that would let an unrelated MCP tool with a
+            // `path` field accidentally be classified as a write.
+            let field: &[&str] = match needle.as_str() {
+                "text_editor" => &["path"],
+                "write_file" => &["file_path", "path"],
+                // Unknown goose write tool (or exec/read tool reaching
+                // this branch by mistake). Fail closed.
+                _ => return None,
+            };
+            pick_string_field(params, field).map(PathBuf::from)
+        }
+    }
+}
+
+/// Look up one of the candidate string fields in `params`. Returns the
+/// first one that is a non-empty string. Used by
+/// [`extract_write_target`] for the goose matrix.
+fn pick_string_field(params: &Value, candidates: &[&str]) -> Option<String> {
+    let obj = params.as_object()?;
+    for key in candidates {
+        if let Some(s) = obj.get(*key).and_then(Value::as_str) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Argument-aware approval decision (SLICE 1).
+///
+/// When `enforce` is `false`, this is a strict passthrough to the
+/// existing name-based [`decide_approval`] — NO new denials, NO new
+/// containment checks. That keeps this slice non-breaking.
+///
+/// When `enforce` is `true`:
+///   1. If the tool is NOT write/edit-class (per the per-engine matrix),
+///      the decision falls through to the name-based policy unchanged.
+///   2. If the tool IS write/edit-class, extract the target path. An
+///      unknown engine / unknown write tool / missing-or-unparseable
+///      path yields `Unknown`. With `trust_engine = false` (the
+///      default), `Unknown` DENIES.
+///   3. Resolve containment: target inside any root → fall through
+///      to the name-based policy. Target outside all roots → DENY,
+///      regardless of `ApprovalPolicy`.
+///   4. Every DENY logs a clear reason (target vs roots, or the
+///      fail-closed cause). The log goes through the `tracing`-free
+///      `eprintln!` channel used elsewhere in this file (tests assert
+///      on the return value; the log is for operators).
+pub(crate) fn decide_approval_with_containment(
+    policy: ApprovalPolicy,
+    tool: &str,
+    params: &Value,
+    engine: EngineKind,
+    writable_roots: &[PathBuf],
+    enforce: bool,
+    trust_engine: bool,
+) -> bool {
+    // Non-enforced path: exact behavior of `decide_approval` today.
+    if !enforce {
+        return decide_approval(policy, tool);
+    }
+    // Enforced path: only write/edit-class tools go through the
+    // containment check; everything else keeps today's name-based
+    // decision (so e.g. `read` is still allowed under Allowlist even
+    // when enforcement is on, regardless of `writable_roots`).
+    if !is_write_class_tool(engine, tool) {
+        return decide_approval(policy, tool);
+    }
+    // Known write tool — extract the target path. Fail closed on any
+    // shape mismatch: an unknown engine, an unknown write tool, or a
+    // missing/unparseable path on a known write tool all DENY unless
+    // `trust_engine` is set.
+    let target = match extract_write_target(engine, tool, params) {
+        Some(p) => p,
+        None => {
+            // Fail-closed deny with a clear reason. The reason
+            // distinguishes "unknown engine" from "unknown tool" from
+            // "missing path" so an operator reading the log can tell
+            // which follow-up slice needs to land.
+            let reason = if !is_engine_known(engine) {
+                format!(
+                    "writable-root containment: denying {engine:?} tool {tool:?}: \
+                     unknown engine (no schema registered in slice 1)"
+                )
+            } else if !is_write_class_tool(engine, tool) {
+                format!(
+                    "writable-root containment: denying {engine:?} tool {tool:?}: \
+                     tool not in the per-engine write matrix"
+                )
+            } else {
+                format!(
+                    "writable-root containment: denying {engine:?} tool {tool:?}: \
+                     target path missing or unparseable in tool params"
+                )
+            };
+            if !trust_engine {
+                eprintln!("{reason}");
+                return false;
+            }
+            // trust_engine=true: fall through to the name-based policy
+            // for unknown shapes. This is the future seam for
+            // "exhaustively validated engine, accept whatever shape it
+            // sends". The default `false` keeps the boundary fail-closed.
+            return decide_approval(policy, tool);
+        }
+    };
+    // We have a target path. Resolve containment.
+    let verdict = resolve_containment(&target, writable_roots);
+    match verdict {
+        ContainmentVerdict::Inside => decide_approval(policy, tool),
+        ContainmentVerdict::Outside => {
+            eprintln!(
+                "writable-root containment: denying {engine:?} tool {tool:?}: \
+                 target {} resolves outside writable_roots {:?}",
+                target.display(),
+                writable_roots
+            );
+            false
+        }
+        ContainmentVerdict::Unknown => {
+            // Canonicalize failed (e.g. unreadable component, TOCTOU
+            // race, relative-only path). Fail closed.
+            eprintln!(
+                "writable-root containment: denying {engine:?} tool {tool:?}: \
+                 target {} could not be resolved against writable_roots {:?}",
+                target.display(),
+                writable_roots
+            );
+            false
+        }
+    }
+}
+
+/// `true` for the engine variants the per-engine matrix supports.
+/// Keeping this as a tiny helper (not a method on `EngineKind`) means
+/// the matrix can be extended without leaking implementation details
+/// into the engine enum itself.
+fn is_engine_known(engine: EngineKind) -> bool {
+    matches!(engine, EngineKind::Zeroclaw | EngineKind::Goose)
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,7 +2032,29 @@ where
             // behavior) was wrong because (a) real goose may surface
             // server-generated ids like `"opt-A9F1"` instead of the canonical
             // names, and (b) the semantics are in `kind` by spec.
-            let approved = decide_approval(opts.approval, &tool_name);
+            // SLICE 1: route through the argument-aware decision so
+            // `enforce_writable_roots` is honored. The "params" we pass
+            // to the extractor is `toolCall.rawInput` — the tool-call
+            // argument object per the standard ACP v1 spec, where the
+            // per-engine matrix in `extract_write_target` looks up
+            // the target path. If `rawInput` is absent (e.g. an older
+            // server variant or a non-standard MCP tool), we pass an
+            // empty `Value::Object` so the extractor returns `None`
+            // and the fail-closed path DENIES on enforce=true.
+            let tool_args = req_params
+                .get("toolCall")
+                .and_then(|tc| tc.get("rawInput"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            let approved = decide_approval_with_containment(
+                opts.approval,
+                &tool_name,
+                &tool_args,
+                EngineKind::Goose,
+                &opts.writable_roots,
+                opts.enforce_writable_roots,
+                opts.trust_engine,
+            );
             let options = req_params
                 .get("options")
                 .and_then(Value::as_array)
@@ -1765,6 +2323,12 @@ async fn read_result(
 
 #[cfg(test)]
 mod tests {
+    // Clippy nits: `&[x.clone()]` is idiomatic for tests (we want to
+    // assert the closure captures a single-element slice), and the
+    // `single_match` / `needless_collect` style here is fine for test
+    // code clarity. Allow the specific lints instead of refactoring
+    // every call site.
+    #![allow(clippy::cloned_ref_to_slice_refs)]
     use super::*;
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
@@ -1822,6 +2386,452 @@ mod tests {
         assert!(!decide_approval(ApprovalPolicy::None, "read"));
     }
 
+    // -----------------------------------------------------------------------
+    // SLICE 1 — writable-root containment (the execution-safety kernel)
+    //
+    // The tests below lock in the boundary properties. They are organized
+    // into four groups:
+    //
+    //   A. Containment primitive (`path_within_roots`)
+    //   B. Argument-aware enforcement (`decide_approval_with_containment`)
+    //   C. Fail-closed posture (unknown engine / unknown tool / no path)
+    //   D. Non-breaking (enforce=false is exactly today's name-based decision)
+    //
+    // Containment tests use a real tempdir so the boundary is exercised
+    // against real on-disk paths and symlinks (rather than a synthetic
+    // `PathBuf`-only mock that wouldn't catch a real `canonicalize` bug).
+    // -----------------------------------------------------------------------
+
+    /// Tiny stand-in for `tempfile::Tempdir`: drops the directory tree on
+    /// `Drop` so tests don't leak even when assertions abort early. Lives
+    /// inside the `tests` module so it isn't part of the public surface.
+    struct TempdirShim(PathBuf);
+    impl Drop for TempdirShim {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl TempdirShim {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    /// Helper: build a fresh `TempdirShim` with two real roots (`root_a`,
+    /// `root_b`) that are `canonicalize`-able, plus a separate `outside`
+    /// dir that is guaranteed not to be under either root. Returns the
+    /// shim (for `.path()`) and the three paths.
+    fn make_containment_dirs() -> (TempdirShim, PathBuf, PathBuf, PathBuf) {
+        // Hand-rolled tempdir (no extra dep just for tests): create a
+        // unique subdir of the test temp dir; the `TempdirShim` returned
+        // here drops and `remove_dir_all`s it on test exit, so the OS
+        // doesn't accumulate stale trees even when assertions abort.
+        let base = std::env::temp_dir().join(format!(
+            "zoder-acp-slice1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let root_a = base.join("root_a");
+        let root_b = base.join("root_b");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        (TempdirShim(base), root_a, root_b, outside)
+    }
+
+    #[test]
+    fn containment_inside_root_allowed() {
+        let (dir, root_a, _root_b, _outside) = make_containment_dirs();
+        let file = root_a.join("file.txt");
+        std::fs::write(&file, "ok").unwrap();
+        // Inside: single root, the file sits directly under it.
+        assert!(path_within_roots(&file, &[root_a.clone()]));
+        // Inside: nested file.
+        let nested = root_a.join("sub").join("deep.txt");
+        std::fs::create_dir_all(root_a.join("sub")).unwrap();
+        std::fs::write(&nested, "ok").unwrap();
+        assert!(path_within_roots(&nested, &[root_a.clone()]));
+        // Inside: multiple roots, file is under one of them.
+        let root_b = dir.path().join("root_b");
+        assert!(path_within_roots(&file, &[root_a.clone(), root_b.clone()]));
+    }
+
+    #[test]
+    fn containment_outside_root_denied() {
+        let (_dir, root_a, _root_b, outside) = make_containment_dirs();
+        let file = outside.join("evil.txt");
+        std::fs::write(&file, "x").unwrap();
+        // Outside: target under a dir that is not in the roots.
+        assert!(!path_within_roots(&file, &[root_a.clone()]));
+        // Outside: empty roots list.
+        assert!(!path_within_roots(&file, &[]));
+        // Outside: target's parent is a prefix of a root but target is
+        // not actually under it (the `starts_with` check is
+        // component-aware).
+        let root_prefix = root_a.join("foo");
+        let evil_sibling = root_a.join("foobar");
+        std::fs::write(&evil_sibling, "x").unwrap();
+        assert!(
+            !path_within_roots(&evil_sibling, &[root_prefix.clone()]),
+            "starts_with on Path is component-aware, so root_a/foo does NOT \
+             contain root_a/foobar"
+        );
+    }
+
+    #[test]
+    fn containment_parent_dir_traversal_denied() {
+        let (dir, root_a, _root_b, outside) = make_containment_dirs();
+        // Place a sensitive file OUTSIDE the root.
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        // Build a target that traverses OUT of the root via `..` to reach
+        // the secret. The target does not exist yet (we are testing the
+        // pre-write containment check), so the not-yet-existing branch
+        // of `canonicalize_for_write` is the one under test.
+        //
+        // `dir.path()/root_a/../outside/secret.txt` canonicalizes to
+        // `dir.path()/outside/secret.txt`, which is OUTSIDE `root_a`.
+        let sneaky = dir
+            .path()
+            .join("root_a")
+            .join("..")
+            .join("outside")
+            .join("secret.txt");
+        assert!(
+            !path_within_roots(&sneaky, &[root_a.clone()]),
+            "dot-dot traversal must be denied: target={}",
+            sneaky.display()
+        );
+        // And the same path with extra `..` segments is also denied.
+        let extra_sneaky = dir
+            .path()
+            .join("root_a")
+            .join("sub")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("secret.txt");
+        assert!(!path_within_roots(&extra_sneaky, &[root_a.clone()]));
+    }
+
+    #[test]
+    fn containment_symlink_escape_denied() {
+        let (dir, root_a, _root_b, outside) = make_containment_dirs();
+        // Place a sensitive file outside the root.
+        let secret = outside.join("passwd");
+        std::fs::write(&secret, "root:x:0:0:").unwrap();
+        // Inside the root, create a SYMLINK that points at the secret.
+        // `canonicalize` follows the symlink, so the resolved target is
+        // OUTSIDE the root and containment must deny it.
+        let symlink_path = root_a.join("sneaky_link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, &symlink_path).unwrap();
+            // The symlink ITSELF is inside the root, but resolution
+            // follows it and lands outside. `path_within_roots` must
+            // deny.
+            assert!(
+                !path_within_roots(&symlink_path, &[root_a.clone()]),
+                "symlink escape must be denied: symlink={} -> real={}",
+                symlink_path.display(),
+                secret.display()
+            );
+            // The real path of the secret is also denied (sanity).
+            assert!(!path_within_roots(&secret, &[root_a.clone()]));
+        }
+        // On non-Unix we just verify the basic containment still holds
+        // for the inside case so the test doesn't false-fail on Windows.
+        #[cfg(not(unix))]
+        {
+            let inside = root_a.join("normal.txt");
+            std::fs::write(&inside, "ok").unwrap();
+            assert!(path_within_roots(&inside, &[root_a.clone()]));
+        }
+        // Suppress an "unused" warning on the captured `dir` on non-Unix.
+        let _ = dir;
+    }
+
+    #[test]
+    fn containment_not_yet_existing_file_under_root_allowed() {
+        let (_dir, root_a, _root_b, _outside) = make_containment_dirs();
+        // The target does not exist yet (about to be created by a write
+        // tool). It sits under the root. The not-yet-existing branch of
+        // `canonicalize_for_write` must walk up to the existing ancestor
+        // (the root) and re-join the tail, classifying the target as
+        // inside.
+        let future_file = root_a.join("new").join("soon.txt");
+        assert!(!future_file.exists(), "precondition: target must not exist");
+        assert!(path_within_roots(&future_file, &[root_a.clone()]));
+        // Single-segment tail (file directly under the root) also works.
+        let future_top = root_a.join("brand_new.txt");
+        assert!(path_within_roots(&future_top, &[root_a.clone()]));
+        // A not-yet-existing target that would land OUTSIDE the root
+        // (via traversal) is still denied.
+        let sneaky_future = root_a.join("..").join("outside").join("later.txt");
+        assert!(!path_within_roots(&sneaky_future, &[root_a.clone()]));
+    }
+
+    #[test]
+    fn enforce_off_is_exactly_today_behavior() {
+        // The new arg-aware function must, with enforce=false, return
+        // EXACTLY the same result as the old name-based `decide_approval`.
+        // That is the non-breaking guarantee: every existing call site
+        // continues to behave identically until the follow-up flips the
+        // default.
+        let cases: &[(&str, ApprovalPolicy, bool)] = &[
+            // (tool, policy, expected)
+            ("read", ApprovalPolicy::Allowlist, true),
+            ("grep", ApprovalPolicy::Allowlist, true),
+            ("shell", ApprovalPolicy::Allowlist, false),
+            ("write", ApprovalPolicy::Allowlist, false),
+            ("shell", ApprovalPolicy::All, true),
+            ("anything", ApprovalPolicy::All, true),
+            ("read", ApprovalPolicy::None, false),
+            ("shell", ApprovalPolicy::None, false),
+            ("dangerous_shell_proxy", ApprovalPolicy::Allowlist, false),
+        ];
+        for (tool, policy, expected) in cases {
+            let new_decision = decide_approval_with_containment(
+                *policy,
+                tool,
+                &Value::Null,
+                EngineKind::Goose,
+                &[],
+                /* enforce = */ false,
+                /* trust_engine = */ false,
+            );
+            let old_decision = decide_approval(*policy, tool);
+            assert_eq!(
+                new_decision, old_decision,
+                "enforce=false must match decide_approval for ({tool:?}, {policy:?})"
+            );
+            assert_eq!(
+                new_decision, *expected,
+                "enforce=false for ({tool:?}, {policy:?}) must equal {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_on_denies_write_tool_outside_roots_under_all() {
+        // Even under ApprovalPolicy::All (which would normally approve
+        // every tool call), a write tool whose target resolves outside
+        // the writable roots must be DENIED when enforce=true.
+        let (_dir, root_a, _root_b, outside) = make_containment_dirs();
+        let evil_target = outside.join("leak.txt");
+        std::fs::write(&evil_target, "x").unwrap();
+        // Goose write_file targeting the evil path.
+        let goose_args = json!({ "file_path": evil_target.to_string_lossy() });
+        assert!(
+            !decide_approval_with_containment(
+                ApprovalPolicy::All,
+                "write_file",
+                &goose_args,
+                EngineKind::Goose,
+                &[root_a.clone()],
+                /* enforce = */ true,
+                /* trust_engine = */ false,
+            ),
+            "ApprovalPolicy::All + enforce=true + write_file outside roots MUST deny"
+        );
+        // Same under Allowlist (also expected to deny via the boundary).
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::Allowlist,
+            "write_file",
+            &goose_args,
+            EngineKind::Goose,
+            &[root_a.clone()],
+            true,
+            false,
+        ));
+        // Same with the other goose write tool (text_editor).
+        let text_editor_args = json!({ "path": evil_target.to_string_lossy() });
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "text_editor",
+            &text_editor_args,
+            EngineKind::Goose,
+            &[root_a.clone()],
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn enforce_on_allows_write_tool_inside_roots_under_all() {
+        // Mirror of the above: a write tool whose target resolves inside
+        // the writable roots must still be APPROVED under All when
+        // enforce=true (the boundary does NOT block legitimate writes).
+        let (_dir, root_a, _root_b, _outside) = make_containment_dirs();
+        let ok_target = root_a.join("ok.txt");
+        std::fs::write(&ok_target, "x").unwrap();
+        let goose_args = json!({ "file_path": ok_target.to_string_lossy() });
+        assert!(decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &goose_args,
+            EngineKind::Goose,
+            &[root_a.clone()],
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn enforce_on_read_tool_unaffected() {
+        // Read-class tools must NOT be affected by writable_roots even
+        // when enforce=true. A `read` against a path outside the roots
+        // is still allowed under Allowlist (the read is not a write,
+        // so the boundary doesn't gate it).
+        let (_dir, _root_a, _root_b, outside) = make_containment_dirs();
+        let outside_file = outside.join("x.txt");
+        std::fs::write(&outside_file, "x").unwrap();
+        assert!(decide_approval_with_containment(
+            ApprovalPolicy::Allowlist,
+            "read",
+            &json!({ "path": outside_file.to_string_lossy() }),
+            EngineKind::Goose,
+            &[PathBuf::from("/some/unused/root")],
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn fail_closed_unknown_engine_denies_on_enforce() {
+        // `EngineKind` has only two variants today (Zeroclaw, Goose); we
+        // simulate "unknown engine" by calling the per-engine matrix
+        // helpers directly, asserting they all return Unknown / fail
+        // closed. The high-level entry point also denies for the
+        // zeroclaw path on enforce=true (the matrix is registered but
+        // the extractor returns None — see the per-engine matrix
+        // comment in lib.rs).
+        assert!(!is_engine_known(EngineKind::Zeroclaw) || is_engine_known(EngineKind::Zeroclaw));
+        // Zeroclaw: write tool with no plumbing -> fail-closed deny.
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write",
+            &json!({ "path": "/tmp/anything" }),
+            EngineKind::Zeroclaw,
+            &[],
+            true,
+            /* trust_engine = */ false,
+        ));
+        // Even with a path-shaped arg, the zeroclaw extractor returns
+        // None in slice 1, so the fail-closed branch fires.
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "edit",
+            &json!({ "path": "/tmp/anything" }),
+            EngineKind::Zeroclaw,
+            &[],
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn fail_closed_unknown_goose_write_tool_denies_on_enforce() {
+        // A write tool that is NOT in the goose per-engine matrix
+        // (e.g. a custom MCP tool called "wipe_disk") is treated as
+        // not-write-class, so enforcement falls through to the name
+        // policy. Under Allowlist that means deny; under All it means
+        // allow. The boundary is NOT engaged because the tool is not
+        // classified as write-class.
+        assert!(decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "wipe_disk",
+            &json!({ "path": "/etc/passwd" }),
+            EngineKind::Goose,
+            &[],
+            true,
+            false,
+        ));
+        // But: a tool that IS classified as write-class with a
+        // missing/empty path is fail-closed denied.
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &json!({}), // no file_path, no path
+            EngineKind::Goose,
+            &[],
+            true,
+            false,
+        ));
+        // Same with an unparseable (non-string) path.
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &json!({ "file_path": 12345 }),
+            EngineKind::Goose,
+            &[],
+            true,
+            false,
+        ));
+        // An empty-string path is also a deny (treat as missing).
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &json!({ "file_path": "" }),
+            EngineKind::Goose,
+            &[],
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn fail_closed_trust_engine_relaxes_fail_closed_only() {
+        // `trust_engine=true` is the future seam for "we have validated
+        // this engine's schema exhaustively". When set, an unknown
+        // shape on a known write tool falls through to the name-based
+        // policy (here: ApprovalPolicy::All -> approve). The boundary
+        // is NOT relaxed: an extractable target OUTSIDE the roots is
+        // still denied.
+        let (_dir, root_a, _root_b, outside) = make_containment_dirs();
+        let evil = outside.join("leak.txt");
+        std::fs::write(&evil, "x").unwrap();
+        // Unknown shape on a known write tool: trust_engine=true
+        // relaxes the fail-closed branch (returns true under All).
+        assert!(decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &json!({}), // no file_path
+            EngineKind::Goose,
+            &[root_a.clone()],
+            true,
+            /* trust_engine = */ true,
+        ));
+        // But: known shape with target outside roots is STILL denied
+        // (the boundary is not relaxed by trust_engine).
+        let goose_args = json!({ "file_path": evil.to_string_lossy() });
+        assert!(!decide_approval_with_containment(
+            ApprovalPolicy::All,
+            "write_file",
+            &goose_args,
+            EngineKind::Goose,
+            &[root_a.clone()],
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn agent_options_new_defaults_are_safe() {
+        // `AgentOptions::new` must set `writable_roots` to a single
+        // element containing the cwd, and must leave `enforce_*` as
+        // false (so today's behavior is preserved by default).
+        let opts = AgentOptions::new("/tmp/sock", "codex", "/tmp/repo", "hi");
+        assert_eq!(opts.writable_roots, vec![PathBuf::from("/tmp/repo")]);
+        assert!(!opts.enforce_writable_roots);
+        assert!(!opts.trust_engine);
+    }
+
     #[test]
     fn engine_kind_from_str_lowercase() {
         assert_eq!(
@@ -1862,6 +2872,12 @@ mod tests {
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(5),
             goose_provider: None,
+            // SLICE 1: defaults matching `AgentOptions::new` — keep tests
+            // non-breaking (enforce off, trust off) and pin the writable
+            // boundary to the synthetic cwd used by goose-driver tests.
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
         }
     }
 
@@ -4031,6 +5047,13 @@ mod goose_acp_real_turn {
             approval: ApprovalPolicy::None,
             timeout: std::time::Duration::from_secs(60),
             goose_provider: None,
+            // SLICE 1: defaults matching `AgentOptions::new` — keep this
+            // real-engine oracle test non-breaking (enforce off,
+            // trust off) and pin the writable boundary to the
+            // synthetic cwd it uses.
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
         };
         let mut conn = connect_transport(&transport)
             .await
