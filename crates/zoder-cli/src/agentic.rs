@@ -487,6 +487,10 @@ async fn complete_once(
     // could spend with no confirmation or free-verification.
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
+    let known_paid_model = eng
+        .corpus
+        .get(&model)
+        .is_some_and(|candidate| !candidate.free);
     let model_entry = eng
         .corpus
         .get(&model)
@@ -546,8 +550,24 @@ async fn complete_once(
         },
     };
     // Post-verify the reviewer call was actually served free (catch a free->paid
-    // fallback) and record any violation in the ledger rather than marking clean.
-    let mut violation = gate.verify_free(&model_entry, &res.telemetry).err();
+    // fallback), and independently reject a known-paid/positive-cost outcome
+    // without the explicit opt-in. Both failures are reconciled before they are
+    // returned so review and CI commands cannot fail open.
+    let verify_failure = gate.verify_free(&model_entry, &res.telemetry).err();
+    let paid_failure = crate::paid_without_opt_in(
+        cli.allow_paid,
+        "reviewer turn",
+        &model,
+        known_paid_model,
+        (!unknown_cost).then_some(cost),
+    );
+    let policy_failure = match (&verify_failure, &paid_failure) {
+        (Some(verify), Some(paid)) => Some(format!("{verify}; {paid}")),
+        (Some(verify), None) => Some(verify.clone()),
+        (None, Some(paid)) => Some(paid.clone()),
+        (None, None) => None,
+    };
+    let mut violation = policy_failure.clone();
     if unknown_cost {
         let msg = format!("cost unknown: no valid telemetry or catalog price for {model}");
         violation = Some(match violation {
@@ -555,25 +575,27 @@ async fn complete_once(
             None => msg,
         });
     }
-    if let Some(v) = &violation {
-        eprintln!("zoder: POLICY VIOLATION (reviewer): {v}");
-    }
-    crate::record_turn_entry(
+    let ledger_entry = Entry {
+        ts_utc: Utc::now(),
+        provider: provider_cfg.id.clone(),
+        model: model.clone(),
+        host: zoder_core::ledger::host_of_model(&model),
+        tokens_in,
+        tokens_out,
+        cost_usd: cost,
+        cost_unknown: unknown_cost,
+        calls: 1,
+        violation,
+        tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+    };
+    let mut health = HealthStore::load(&eng.cfg.health_path);
+    crate::reconcile_policy_checked_turn(
         ledger_reservation,
-        &Entry {
-            ts_utc: Utc::now(),
-            provider: provider_cfg.id.clone(),
-            model: model.clone(),
-            host: zoder_core::ledger::host_of_model(&model),
-            tokens_in,
-            tokens_out,
-            cost_usd: cost,
-            cost_unknown: unknown_cost,
-            calls: 1,
-            violation,
-            tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
-        },
+        &ledger_entry,
         "reviewer turn",
+        &mut health,
+        &model,
+        policy_failure.as_deref(),
     )?;
 
     Ok(Completion {
@@ -581,6 +603,70 @@ async fn complete_once(
         content: res.content,
         cost_usd: cost,
     })
+}
+
+#[cfg(test)]
+mod reviewer_policy_tests {
+    use super::*;
+
+    #[test]
+    fn non_free_reviewer_fallback_is_reconciled_and_returned_as_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+        let gate = PolicyGate::new(&cfg, false, true);
+        let model = ModelEntry {
+            id: "free-reviewer".into(),
+            free: true,
+            ..Default::default()
+        };
+        let telemetry = zoder_core::CallTelemetry {
+            api_base: Some("https://paid.example.test/v1".into()),
+            cost_usd: Some(0.02),
+            ..Default::default()
+        };
+        let failure = gate
+            .verify_free(&model, &telemetry)
+            .expect_err("a billed reviewer fallback must fail verification");
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let health_path = dir.path().join("health.json");
+        let entry = Entry {
+            ts_utc: Utc::now(),
+            provider: "paid-fallback".into(),
+            model: model.id.clone(),
+            host: String::new(),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.02,
+            cost_unknown: false,
+            calls: 1,
+            violation: Some(failure.clone()),
+            tags: Default::default(),
+        };
+        let reservation = Ledger::new(&ledger_path).reserve_billable().unwrap();
+        let mut health = HealthStore::load(&health_path);
+
+        let result = crate::reconcile_policy_checked_turn(
+            reservation,
+            &entry,
+            "reviewer turn",
+            &mut health,
+            &model.id,
+            Some(&failure),
+        );
+
+        assert!(result.is_err(), "reviewer policy failure must propagate");
+        let rows = Ledger::new(&ledger_path).entries_strict().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].violation.as_deref(), Some(failure.as_str()));
+        assert_eq!(
+            HealthStore::load(&health_path)
+                .models
+                .get(&model.id)
+                .unwrap()
+                .failures,
+            1
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -228,6 +228,12 @@ struct PromptTokensDetails {
 }
 
 impl Usage {
+    fn is_meaningful(&self) -> bool {
+        self.prompt_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.cached_prompt_tokens().is_some()
+    }
+
     fn cached_prompt_tokens(&self) -> Option<u64> {
         self.prompt_tokens_details
             .as_ref()
@@ -238,14 +244,12 @@ impl Usage {
 
 #[derive(Deserialize)]
 struct StreamChunk {
-    #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
 }
 #[derive(Deserialize)]
 struct StreamChoice {
-    #[serde(default)]
     delta: Delta,
 }
 #[derive(Deserialize, Default)]
@@ -791,6 +795,23 @@ impl OpenAiProvider {
                         emitted,
                     )
                 })?;
+                // Every successful frame must advance one of the two pieces of
+                // stream state we understand: completion choices, or concrete
+                // usage telemetry. Requiring `choices` and each choice's
+                // `delta` at deserialization rejects `{}` and
+                // `{"choices":[{}]}`; this check also rejects inert frames such
+                // as `{"choices":[],"usage":{}}` while preserving the standard
+                // final usage-only frame (`choices: []` plus token counts).
+                if parsed.choices.is_empty()
+                    && !parsed.usage.as_ref().is_some_and(Usage::is_meaningful)
+                {
+                    return Err(fail(
+                        ErrKind::Decode,
+                        "malformed provider stream frame: expected a completion choice or meaningful usage telemetry"
+                            .to_string(),
+                        emitted,
+                    ));
+                }
                 if let Some(u) = parsed.usage {
                     if u.prompt_tokens.is_some() {
                         prompt_tokens = u.prompt_tokens;
