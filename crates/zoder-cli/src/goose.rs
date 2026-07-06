@@ -188,6 +188,8 @@ pub(crate) async fn cmd_recipe(cli: &crate::Cli, action: &RecipeCmd) -> anyhow::
 // mcp: list engine-configured extensions/servers (goose extensions).
 // ---------------------------------------------------------------------------
 
+use zoder_core::{parse_mcp_servers_file, McpServerSpec, McpTransportKind};
+
 /// Engine config file: `<engine_config_dir>/config.toml`.
 fn engine_config_file() -> PathBuf {
     crate::zeroclaw_data_dir()
@@ -197,38 +199,143 @@ fn engine_config_file() -> PathBuf {
         .join("config.toml")
 }
 
-pub(crate) fn cmd_mcp(_cli: &crate::Cli, action: &McpCmd) -> anyhow::Result<()> {
-    match action {
-        McpCmd::List => {
-            let path = engine_config_file();
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                println!("engine config not found at {}", path.display());
-                return Ok(());
-            };
-            // No TOML dependency in the CLI: scan section headers for MCP/extension
-            // tables (e.g. `[mcp_servers.foo]`, `[[mcp]]`, `[extensions.bar]`).
-            let mut names: Vec<String> = Vec::new();
-            for line in raw.lines() {
-                let l = line.trim();
-                let inner = l.trim_start_matches('[').trim_end_matches(']').trim();
-                let lower = inner.to_ascii_lowercase();
-                if (l.starts_with('['))
-                    && (lower.starts_with("mcp") || lower.starts_with("extension"))
-                {
-                    names.push(inner.to_string());
-                }
-            }
-            if names.is_empty() {
-                println!("no MCP extensions configured in {}", path.display());
-                println!("add them under [mcp_servers.<name>] in the engine config.");
+/// Render one server's transport in a compact, human-readable form
+/// suitable for the `mcp list` table column. Captures exactly the
+/// shape a future slice will hand to the goose ACP `session/new`
+/// call, so what the user sees here matches what the engine will
+/// receive.
+fn describe_transport(spec: &McpServerSpec) -> String {
+    match spec.transport {
+        McpTransportKind::Stdio => {
+            let cmd = spec.command.as_deref().unwrap_or("?");
+            if spec.args.is_empty() {
+                cmd.to_string()
             } else {
-                println!("MCP extensions in {}:", path.display());
-                for n in names {
-                    println!("  {n}");
+                format!("{cmd} {}", spec.args.join(" "))
+            }
+        }
+        McpTransportKind::Http => spec.url.as_deref().unwrap_or("?").to_string(),
+        McpTransportKind::Unknown => "(unknown transport)".to_string(),
+    }
+}
+
+/// Render one server's `enabled` state for the listing's tail
+/// column. Absence is shown as "enabled" — presence under
+/// `[mcp_servers.<name>]` already implies intent, and only an
+/// explicit `enabled = false` should be visually demoted.
+fn describe_enabled(spec: &McpServerSpec) -> &'static str {
+    match spec.enabled {
+        Some(false) => "disabled",
+        _ => "enabled",
+    }
+}
+
+pub(crate) fn cmd_mcp(_cli: &crate::Cli, action: &McpCmd) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    cmd_mcp_write(action, &engine_config_file(), &mut out)
+}
+
+/// Inner, test-friendly form of `cmd_mcp` that reads the engine
+/// config from an explicit path and writes its output to any
+/// `Write`. The wrapper picks the production path and stdout;
+/// tests inject a temp file and an in-memory buffer. This keeps
+/// the parse/format logic covered by unit tests without flaking
+/// on the engine's `HOME` / `ZEROCLAW_CONFIG_DIR` resolution or
+/// on stdout capture races.
+pub(crate) fn cmd_mcp_write<W: std::io::Write>(
+    action: &McpCmd,
+    path: &Path,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    match action {
+        McpCmd::List { json } => {
+            // Engine config may legitimately be absent — the user
+            // hasn't created it yet. The parser already treats a
+            // missing file as "no servers configured" (returns
+            // empty Vec), so the listing below renders the
+            // canonical "none configured" + hint.
+            let specs = match parse_mcp_servers_file(path) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    // Whole-file parse failure. Surface a clean
+                    // message and the hint; don't spew a backtrace
+                    // for a config the user wrote by hand.
+                    writeln!(
+                        out,
+                        "failed to parse engine config at {}: {e}",
+                        path.display()
+                    )?;
+                    writeln!(
+                        out,
+                        "add MCP servers under [mcp_servers.<name>] in the engine config."
+                    )?;
+                    return Ok(());
                 }
+            };
+
+            if *json {
+                // Stable contract: serde_json over `Vec<McpServerSpec>`.
+                // The follow-up slice that hands these to goose ACP
+                // `session/new` consumes the same shape via
+                // `parse_mcp_servers_file` + `serde_json::to_value`.
+                let value = serde_json::to_string_pretty(&specs)?;
+                writeln!(out, "{value}")?;
+                return Ok(());
+            }
+
+            if specs.is_empty() {
+                writeln!(out, "none configured ({}).", path.display())?;
+                writeln!(
+                    out,
+                    "add them under [mcp_servers.<name>] in the engine config."
+                )?;
+                return Ok(());
+            }
+
+            writeln!(out, "MCP servers in {}:", path.display())?;
+            // Compute a stable column width from the longest name so
+            // the table lines up regardless of how many servers
+            // there are. Names are short in practice, but the
+            // formatted output is meant to be readable, not minimal.
+            let name_w = specs
+                .iter()
+                .map(|s| s.name.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(4);
+            let transport_w = specs
+                .iter()
+                .map(|s| transport_label(s.transport).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("transport".len());
+            writeln!(
+                out,
+                "  {:<name_w$}  {:<transport_w$}  {:<8}  transport-detail",
+                "name", "transport", "enabled",
+            )?;
+            for spec in &specs {
+                writeln!(
+                    out,
+                    "  {:<name_w$}  {:<transport_w$}  {:<8}  {}",
+                    spec.name,
+                    transport_label(spec.transport),
+                    describe_enabled(spec),
+                    describe_transport(spec),
+                )?;
             }
             Ok(())
         }
+    }
+}
+
+/// One-word label for the transport kind, for the table column.
+fn transport_label(kind: McpTransportKind) -> &'static str {
+    match kind {
+        McpTransportKind::Stdio => "stdio",
+        McpTransportKind::Http => "http",
+        McpTransportKind::Unknown => "?",
     }
 }
 
@@ -285,5 +392,200 @@ pub(crate) fn cmd_configure(edit: bool, validate: bool) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mcp list tests — exercise the parser + formatter end-to-end against
+// temp files. The runtime/session path is NOT touched here (that's a
+// separate live-validated slice); these tests just lock down the
+// PARSING + DISPLAY behavior of `mcp list` and its `--json` mode.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod mcp_list_tests {
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("config.toml");
+        std::fs::write(&p, body).expect("write config");
+        p
+    }
+
+    /// Run the command with an in-memory buffer as "stdout" and
+    /// return the captured text. Keeps the test off the real
+    /// stdout so it doesn't race sibling tests.
+    fn run_capturing(action: &McpCmd, path: &Path) -> (String, anyhow::Result<()>) {
+        let mut buf: Vec<u8> = Vec::new();
+        let res = cmd_mcp_write(action, path, &mut buf);
+        let s = String::from_utf8(buf).unwrap_or_default();
+        (s, res)
+    }
+
+    /// `mcp list --json` against a config with one stdio + one
+    /// http server must emit both as structured JSON, parseable
+    /// back into `Vec<McpServerSpec>` and matching the on-disk
+    /// shape.
+    #[test]
+    fn mcp_list_json_emits_both_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#,
+        );
+
+        let (out, res) = run_capturing(&McpCmd::List { json: true }, &path);
+        res.expect("cmd_mcp_write");
+
+        let specs: Vec<zoder_core::McpServerSpec> =
+            serde_json::from_str(&out).expect("json parses to McpServerSpec list");
+        assert_eq!(specs.len(), 2);
+
+        let lookup = specs
+            .iter()
+            .find(|s| s.name == "lookup")
+            .expect("lookup present");
+        assert_eq!(lookup.transport, zoder_core::McpTransportKind::Stdio);
+        assert_eq!(lookup.command.as_deref(), Some("node"));
+        assert_eq!(lookup.args, vec!["server.js".to_string()]);
+        assert!(lookup.url.is_none());
+
+        let kiwi = specs
+            .iter()
+            .find(|s| s.name == "mcp_kiwi_com")
+            .expect("kiwi present");
+        assert_eq!(kiwi.transport, zoder_core::McpTransportKind::Http);
+        assert_eq!(kiwi.url.as_deref(), Some("https://mcp.kiwi.com"));
+        assert!(kiwi.command.is_none());
+    }
+
+    /// A config with no MCP tables must render the "none
+    /// configured" hint, and `--json` must emit `[]`.
+    #[test]
+    fn mcp_list_no_servers_prints_hint_and_emits_empty_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[profile]
+primary_model = "openai/gpt-4o"
+"#,
+        );
+
+        let (human, res) = run_capturing(&McpCmd::List { json: false }, &path);
+        res.expect("cmd_mcp_write human");
+        assert!(
+            human.contains("none configured"),
+            "human output should say none configured; got:\n{human}"
+        );
+        assert!(
+            human.contains("[mcp_servers.<name>]"),
+            "human output should retain the add-here hint; got:\n{human}"
+        );
+
+        let (json_out, res) = run_capturing(&McpCmd::List { json: true }, &path);
+        res.expect("cmd_mcp_write json");
+        let specs: Vec<zoder_core::McpServerSpec> =
+            serde_json::from_str(&json_out).expect("json parses to empty list");
+        assert!(specs.is_empty());
+    }
+
+    /// A missing config file is not an error: it renders the
+    /// "none configured" hint, same as a present-but-empty one.
+    #[test]
+    fn mcp_list_missing_file_prints_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.toml");
+        let (out, res) = run_capturing(&McpCmd::List { json: false }, &path);
+        res.expect("cmd_mcp_write");
+        assert!(
+            out.contains("none configured"),
+            "missing file should be treated as none configured; got:\n{out}"
+        );
+    }
+
+    /// Legacy `[extensions.<name>]` heading form must still be
+    /// surfaced — that's the third form the old scanner
+    /// recognized.
+    #[test]
+    fn mcp_list_legacy_extensions_table_is_parsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[extensions.bitbucket]
+type = "stdio"
+cmd = "/usr/local/bin/bitbucket-mcp"
+args = ["--stdio"]
+"#,
+        );
+        let (out, res) = run_capturing(&McpCmd::List { json: true }, &path);
+        res.expect("cmd_mcp_write");
+
+        let specs: Vec<zoder_core::McpServerSpec> =
+            serde_json::from_str(&out).expect("json parses");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "bitbucket");
+        assert_eq!(specs[0].transport, zoder_core::McpTransportKind::Stdio);
+        assert_eq!(specs[0].source, zoder_core::McpSource::ExtensionsTable);
+        assert_eq!(
+            specs[0].command.as_deref(),
+            Some("/usr/local/bin/bitbucket-mcp")
+        );
+    }
+
+    /// The human-readable table includes the name, transport,
+    /// enabled flag, and the command-or-url detail for each
+    /// configured server. This is what users will see in
+    /// `mcp list` output, so lock it down.
+    #[test]
+    fn mcp_list_human_output_lists_each_server_with_transport_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#,
+        );
+        let (out, res) = run_capturing(&McpCmd::List { json: false }, &path);
+        res.expect("cmd_mcp_write");
+        // Both names appear
+        assert!(
+            out.contains("lookup"),
+            "human output should list lookup; got:\n{out}"
+        );
+        assert!(
+            out.contains("mcp_kiwi_com"),
+            "human output should list mcp_kiwi_com; got:\n{out}"
+        );
+        // Both transports appear with their human labels
+        assert!(
+            out.contains("stdio"),
+            "human output should show stdio; got:\n{out}"
+        );
+        assert!(
+            out.contains("http"),
+            "human output should show http; got:\n{out}"
+        );
+        // The transport details (command + url) appear
+        assert!(
+            out.contains("node"),
+            "human output should include command; got:\n{out}"
+        );
+        assert!(
+            out.contains("https://mcp.kiwi.com"),
+            "human output should include url; got:\n{out}"
+        );
     }
 }

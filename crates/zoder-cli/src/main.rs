@@ -674,7 +674,14 @@ enum RecipeCmd {
 #[derive(Subcommand, Clone)]
 enum McpCmd {
     /// List MCP servers/extensions configured in the engine config.
-    List,
+    List {
+        /// Emit the parsed server specs as structured JSON instead of
+        /// the human-readable table. Stable contract — the future slice
+        /// that hands the same specs to the goose ACP `session/new`
+        /// reads this same shape.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Review target selection for `review` / `adversarial-review`.

@@ -20,6 +20,7 @@ pub use health_probe::{
 };
 pub use model_health as health;
 pub mod ledger;
+pub mod mcp;
 pub mod policy;
 pub mod pricing;
 pub mod pricing_sync;
@@ -56,6 +57,9 @@ pub use finops::{
     BurnForecast, CacheSavingsRow, Dimension, FinOpsReport, ModelRealized, SpendGroup,
 };
 pub use ledger::{BillableReservation, Entry, FinOpsTags, Ledger, Period, Rollup};
+pub use mcp::{
+    parse_mcp_servers_config, parse_mcp_servers_file, McpServerSpec, McpSource, McpTransportKind,
+};
 pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{CostVerdict, ModelPrice, PricingCatalog};
