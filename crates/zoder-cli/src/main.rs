@@ -70,6 +70,12 @@ fn finops_tags(
     }
 }
 
+/// The resolved provider is authoritative for marginal billing. Catalog model
+/// prices are only relevant when the serving provider is actually metered.
+fn is_cost_neutral_provider(provider: &Provider) -> bool {
+    !provider.paid && provider.billing != BillingMode::Metered
+}
+
 /// Persist a completed turn before it can be reported as successful. Ledger
 /// accounting is a quota-control boundary, so every caller must propagate a
 /// write failure instead of allowing an unrecorded paid turn to succeed.
@@ -88,12 +94,14 @@ pub(crate) fn record_turn_entry(
 /// approved, so every dispatch site must apply this to the actual result.
 pub(crate) fn paid_without_opt_in(
     allow_paid: bool,
+    provider_cost_neutral: bool,
     context: &str,
     model: &str,
     known_paid_model: bool,
     observed_cost: Option<f64>,
 ) -> Option<String> {
     if allow_paid
+        || provider_cost_neutral
         || (!known_paid_model && !observed_cost.is_some_and(|cost| cost.is_finite() && cost > 0.0))
     {
         return None;
@@ -2739,7 +2747,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         .unwrap_or(false);
     let provider_cost_neutral = routing
         .real_provider_for_model(&eng.cfg, &primary)
-        .map(|p| !p.paid && p.billing != BillingMode::Metered)
+        .map(is_cost_neutral_provider)
         .unwrap_or(false);
     if let Decision::NeedConfirm(msg) =
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
@@ -2769,7 +2777,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // The ledger read is intentionally fail-closed: any error reading
     // month-to-date spend is treated as "could not read spend, ask the
     // user" rather than silently reporting $0 — Finding #10.
-    if !cli.allow_paid {
+    if !cli.allow_paid && !provider_cost_neutral {
         let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
         let verdict = eng.cfg.budget.evaluate_call(
@@ -2986,6 +2994,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     };
     let paid_failure = paid_without_opt_in(
         cli.allow_paid,
+        eng.cfg
+            .provider(&used_provider_id)
+            .is_some_and(is_cost_neutral_provider),
         "oneshot turn",
         &used_model,
         known_paid_model,
@@ -3447,8 +3458,12 @@ fn evaluate_default_exec_budget(
     pricing: &PricingCatalog,
     model: &str,
     prompt: &str,
+    provider_cost_neutral: bool,
     month_spent: impl FnOnce() -> anyhow::Result<f64>,
 ) -> BudgetVerdict {
+    if provider_cost_neutral {
+        return BudgetVerdict::WithinBudget;
+    }
     cfg.budget.evaluate_call(
         pricing,
         model,
@@ -3477,11 +3492,49 @@ mod default_exec_budget_tests {
                 ..Default::default()
             },
         );
-        let verdict =
-            evaluate_default_exec_budget(&cfg, &pricing, "paid-model", "agentic prompt", || {
-                Ok(0.0)
-            });
+        let verdict = evaluate_default_exec_budget(
+            &cfg,
+            &pricing,
+            "paid-model",
+            "agentic prompt",
+            false,
+            || Ok(0.0),
+        );
         assert!(matches!(verdict, BudgetVerdict::Confirm(_)));
+    }
+
+    #[test]
+    fn free_provider_bypasses_catalog_budget_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.budget.max_cost_per_call_usd = Some(0.0);
+        let provider = &mut cfg.providers[0];
+        provider.paid = false;
+        provider.billing = BillingMode::Free;
+
+        let mut priced = PricingCatalog::default();
+        priced.models.insert(
+            "catalog-paid-model".into(),
+            zoder_core::pricing::ModelPrice {
+                usd_per_mtok: 100.0,
+                ..Default::default()
+            },
+        );
+        let unknown = PricingCatalog::default();
+        for (pricing, model) in [
+            (&priced, "catalog-paid-model"),
+            (&unknown, "catalog-unknown-model"),
+        ] {
+            let verdict = evaluate_default_exec_budget(
+                &cfg,
+                pricing,
+                model,
+                "agentic prompt",
+                is_cost_neutral_provider(&cfg.providers[0]),
+                || panic!("a free provider must not consult paid ledger spend"),
+            );
+            assert_eq!(verdict, BudgetVerdict::WithinBudget);
+        }
     }
 }
 
@@ -3542,6 +3595,7 @@ mod ledger_integrity_tests {
         let mut entry = test_entry();
         let failure = paid_without_opt_in(
             false,
+            false,
             "agentic turn",
             &entry.model,
             true,
@@ -3572,6 +3626,21 @@ mod ledger_integrity_tests {
         let model_health = persisted.models.get(&entry.model).unwrap();
         assert_eq!(model_health.failures, 1);
         assert_eq!(model_health.calls, 1);
+    }
+
+    #[test]
+    fn free_provider_positive_reported_cost_is_not_a_paid_violation() {
+        assert_eq!(
+            paid_without_opt_in(
+                false,
+                true,
+                "agentic turn",
+                "catalog-paid-model",
+                true,
+                Some(42.0),
+            ),
+            None
+        );
     }
 }
 
@@ -3641,8 +3710,7 @@ pub(crate) async fn agentic_turn(
     // cost-neutral even if the corpus has the model non-free, so we let it
     // through (paid must still confirm).
     let provider_paid = routed_provider.paid || routed_provider.billing == BillingMode::Metered;
-    let provider_cost_neutral =
-        !routed_provider.paid && routed_provider.billing != BillingMode::Metered;
+    let provider_cost_neutral = is_cost_neutral_provider(&routed_provider);
     if let Decision::NeedConfirm(msg) =
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
@@ -3662,9 +3730,14 @@ pub(crate) async fn agentic_turn(
     // pricing, per-call caps, or month-to-date caps.
     if !cli.allow_paid {
         let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-        let verdict = evaluate_default_exec_budget(&eng.cfg, &pricing, &primary, &prompt, || {
-            ledger_reservation.month_to_date_usd()
-        });
+        let verdict = evaluate_default_exec_budget(
+            &eng.cfg,
+            &pricing,
+            &primary,
+            &prompt,
+            provider_cost_neutral,
+            || ledger_reservation.month_to_date_usd(),
+        );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
                 anyhow::bail!("call declined: over budget");
@@ -3837,8 +3910,12 @@ pub(crate) async fn agentic_turn(
         .unwrap_or(false);
     let paid_failure = (engine_kind == EngineKind::Zeroclaw)
         .then(|| {
+            let provider_cost_neutral = routing
+                .real_provider_for_model(&eng.cfg, &model_used)
+                .is_some_and(is_cost_neutral_provider);
             paid_without_opt_in(
                 cli.allow_paid,
+                provider_cost_neutral,
                 &format!("agentic run (alias {alias})"),
                 &model_used,
                 model_used_paid,
@@ -5293,6 +5370,9 @@ fn reconcile_probe_success(
         model_entry.and_then(|model| gate.verify_free(model, &result.telemetry).err());
     let paid_failure = paid_without_opt_in(
         cli.allow_paid,
+        eng.cfg
+            .provider(provider_id)
+            .is_some_and(is_cost_neutral_provider),
         "health probe",
         model_id,
         model_entry.is_some_and(|model| !model.free),
