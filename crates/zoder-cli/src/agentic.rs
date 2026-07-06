@@ -804,6 +804,22 @@ fn build_diff(
                 let unstaged = run_git(cwd, &["diff"]).unwrap_or_default();
                 d = format!("{staged}\n{unstaged}");
             }
+            // Surface untracked-but-not-ignored files. `git diff` only sees
+            // tracked paths, so a working tree whose only work is NEW
+            // not-yet-added files would otherwise produce an empty diff and
+            // the review/loop would wrongly report "no changes to review".
+            // `git ls-files --others --exclude-standard` honors `.gitignore`,
+            // so ignored paths and anything under `.git/` are excluded by
+            // construction. Each untracked path is appended as a synthetic
+            // "new file mode" hunk using the same unified-diff shape the
+            // reviewer expects.
+            let untracked = untracked_not_ignored_diff(cwd);
+            if !untracked.is_empty() {
+                if !d.is_empty() && !d.ends_with('\n') {
+                    d.push('\n');
+                }
+                d.push_str(&untracked);
+            }
             Ok(("working-tree".into(), d))
         }
         ReviewScope::Branch => {
@@ -815,14 +831,237 @@ fn build_diff(
     }
 }
 
+/// Enumerate untracked, non-ignored working-tree paths and render each as a
+/// unified-diff "new file" hunk. Paths under `.git/` are never returned
+/// because they are always ignored by `--exclude-standard`. Returns an
+/// empty string when there are no untracked-not-ignored paths. On any
+/// failure (no git, missing binary, etc.) returns an empty string — this is
+/// a best-effort supplement to the tracked diff and must not break review.
+fn untracked_not_ignored_diff(cwd: &Path) -> String {
+    let Ok(listing) = run_git(
+        cwd,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--directory",
+        ],
+    ) else {
+        return String::new();
+    };
+    if listing.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for raw in listing.split('\0') {
+        if raw.is_empty() {
+            continue;
+        }
+        // `--directory` collapses nested untracked trees into a single
+        // directory entry ending in `/`; recurse into it so the diff is not
+        // empty when only nested files exist. Skip `.git/` defensively.
+        let path = Path::new(raw);
+        if raw.starts_with(".git/") || raw == ".git" {
+            continue;
+        }
+        let abs = cwd.join(path);
+        let file_diff = if raw.ends_with('/') {
+            render_untracked_dir_hunk(path, &abs)
+        } else if abs.is_file() {
+            render_untracked_file_hunk(path, &abs)
+        } else {
+            continue;
+        };
+        if !file_diff.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&file_diff);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Render one untracked file as a unified-diff "new file" hunk. Uses
+/// `git diff --no-index --no-color -- /dev/null <path>` when possible so the
+/// hunk is byte-identical to what `git diff` would emit post-`git add -N`;
+/// falls back to a hand-built hunk when the index diff fails (e.g. binary
+/// files, very large files).
+fn render_untracked_file_hunk(rel: &Path, abs: &Path) -> String {
+    let dev_null = Path::new("/dev/null");
+    if let Ok(ok) = std::process::Command::new("git")
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--no-color")
+        .arg("--no-textconv")
+        .arg("--")
+        .arg(dev_null)
+        .arg(abs)
+        .output()
+    {
+        // `git diff --no-index` exits 1 when files differ (the normal case
+        // for new files) and 0 when they are identical. Anything >1 is an
+        // error worth ignoring so we fall through to the synthetic hunk.
+        let code = ok.status.code().unwrap_or(-1);
+        if code <= 1 {
+            // Strip the first four header lines git --no-index prints
+            // (`diff --git ...`, `index ...`, `--- /dev/null`, `+++ <path>`)
+            // — we re-emit a clean unified-diff header ourselves.
+            let stdout = String::from_utf8_lossy(&ok.stdout);
+            return rewrite_no_index_hunk(&stdout, rel);
+        }
+    }
+    synthetic_new_file_hunk(rel, abs)
+}
+
+/// Build a minimal valid unified-diff hunk for a new file from its on-disk
+/// bytes. Used as a fallback when `git diff --no-index` refuses (e.g. on
+/// binary files it cannot read). The content is omitted for binary files.
+fn synthetic_new_file_hunk(rel: &Path, abs: &Path) -> String {
+    let bytes = match std::fs::read(abs) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let is_binary = bytes.contains(&0);
+    let rel_display = rel.to_string_lossy();
+    let mut out = format!(
+        "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n",
+        rel = rel_display,
+    );
+    if is_binary {
+        out.push_str("@@ -0,0 +1 @@\n");
+        out.push_str("Binary files /dev/null and b/");
+        out.push_str(&rel_display);
+        out.push_str(" differ\n");
+        return out;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let line_count = text.lines().count();
+    if line_count == 0 && text.is_empty() {
+        out.push_str("@@ -0,0 +0,0 @@\n");
+        return out;
+    }
+    out.push_str(&format!("@@ -0,0 +1,{line_count} @@\n"));
+    for line in text.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Re-emit a `git diff --no-index` hunk with our own header so all hunks in
+/// the working-tree diff share the same shape (`diff --git a/P b/P`,
+/// `new file mode 100644`, `--- /dev/null`, `+++ b/P`).
+fn rewrite_no_index_hunk(stdout: &str, rel: &Path) -> String {
+    let rel_display = rel.to_string_lossy();
+    let mut out = String::new();
+    let mut lines = stdout.lines();
+    // Drop `diff --git ...`, `index ...`, `--- /dev/null`, `+++ b/<path>`.
+    let _ = lines.next();
+    let _ = lines.next();
+    let _ = lines.next();
+    let _ = lines.next();
+    out.push_str(&format!(
+        "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n",
+        rel = rel_display,
+    ));
+    for line in lines {
+        // `git diff --no-index` prefixes "No newline at end of file" with
+        // a literal "\ No newline at end of file" continuation; preserve it
+        // verbatim so the reviewer sees the same hunk it would on `git add`.
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render an untracked directory (from `ls-files --directory`) as one
+/// synthetic "new file" hunk per contained regular file. `--directory`
+/// collapses nested trees into a single dir entry to keep the listing
+/// bounded; we recurse here so a tree containing only nested files still
+/// produces a non-empty diff.
+fn render_untracked_dir_hunk(rel: &Path, abs: &Path) -> String {
+    let mut out = String::new();
+    let Ok(read) = std::fs::read_dir(abs) else {
+        return String::new();
+    };
+    let mut entries: Vec<_> = read.filter_map(Result::ok).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let child_rel = rel.join(entry.file_name());
+        let child_abs = entry.path();
+        let piece = if child_abs.is_dir() {
+            render_untracked_dir_hunk(&child_rel, &child_abs)
+        } else if child_abs.is_file() {
+            render_untracked_file_hunk(&child_rel, &child_abs)
+        } else {
+            continue;
+        };
+        if !piece.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&piece);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// Cap the diff so we never blow the context window (head + tail).
+///
+/// Truncation lands on a CHARACTER boundary so a diff containing non-ASCII
+/// (identifiers, comments, test data) cannot panic with "byte index N is
+/// not a char boundary". The cap is interpreted as the maximum number of
+/// bytes in the returned string; the head and tail slices are the largest
+/// char-boundary-prefix and char-boundary-suffix that each fit the budget.
 fn cap_diff(diff: &str, max: usize) -> String {
     if diff.len() <= max {
         return diff.to_string();
     }
-    let head = &diff[..max * 3 / 4];
-    let tail = &diff[diff.len() - max / 4..];
-    format!("{head}\n\n...[diff truncated for length]...\n\n{tail}")
+    let head_end = floor_char_boundary(diff, max * 3 / 4);
+    let tail_len = max / 4;
+    let tail_start = ceil_char_boundary_from_end(diff, tail_len);
+    format!(
+        "{head}\n\n...[diff truncated for length]...\n\n{tail}",
+        head = &diff[..head_end],
+        tail = &diff[tail_start..]
+    )
+}
+
+/// Largest `i <= n` such that `s.is_char_boundary(i)` is true (so `&s[..i]`
+/// is a valid UTF-8 slice). `n = s.len()` and `n = 0` are always safe and
+/// returned unchanged.
+fn floor_char_boundary(s: &str, n: usize) -> usize {
+    if n >= s.len() {
+        return s.len();
+    }
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest `i` such that `s.len() - i <= n` AND `s.is_char_boundary(i)` is
+/// true (so `&s[i..]` is a valid UTF-8 slice and is no longer than `n`
+/// bytes). Returns `0` when the requested tail would cover the whole string.
+fn ceil_char_boundary_from_end(s: &str, n: usize) -> usize {
+    if n >= s.len() {
+        return 0;
+    }
+    let mut i = s.len() - n;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,5 +3364,216 @@ mod tests {
         assert!(all_failed);
         assert_ne!(agg, "approve");
         assert_eq!(payload["complete"].as_bool(), Some(false));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `build_diff` / `cap_diff` review-diff soundness regressions.
+//
+// The two fixes here close FAIL-CLOSED defects found by adversarial review:
+//
+//   * `build_diff` (WorkingTree scope) used to build its diff from
+//     `git diff HEAD` alone. A working tree whose only work is NEW,
+//     not-yet-added files therefore produced an EMPTY diff and the
+//     review/loop would wrongly report "no changes to review".
+//     The fix enumerates untracked-not-ignored paths via
+//     `git ls-files --others --exclude-standard` and appends each as a
+//     synthetic "new file" unified-diff hunk.
+//
+//   * `cap_diff` used to slice the input by raw byte offset, panicking
+//     when the cap landed inside a multibyte UTF-8 codepoint. The fix
+//     walks each boundary to a char boundary before slicing.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod review_diff_soundness_tests {
+    use super::*;
+
+    /// Initialize a temp git repo with one committed file. Returns the
+    /// repo path. Mirrors the test idioms used elsewhere in the crate
+    /// (tempfile::tempdir + std::process::Command shelling out to git).
+    fn init_temp_repo_with_one_committed_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        // Required to run `git commit` in a fresh temp dir without
+        // inheriting the host's identity.
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "review-diff-test"]);
+        run(&["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo)
+    }
+
+    /// REGRESSION: a working tree whose ONLY work is brand-new, not-yet-added
+    /// files must produce a NON-empty working-tree diff. The old `build_diff`
+    /// relied on `git diff HEAD`, which only sees tracked paths and would
+    /// return an empty diff here. The fix enumerates untracked-not-ignored
+    /// files via `git ls-files --others --exclude-standard` and appends each
+    /// as a synthetic "new file" hunk.
+    #[test]
+    fn build_diff_includes_new_untracked_files_in_working_tree() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+
+        // Add a NEW untracked file (no `git add`).
+        let new_file = repo.join("new_feature.rs");
+        std::fs::write(&new_file, "pub fn new_thing() -> u32 { 42 }\n").unwrap();
+
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::WorkingTree, None).expect("build_diff ok");
+
+        assert!(
+            !diff.trim().is_empty(),
+            "build_diff must surface brand-new untracked files (was empty: {:?})",
+            diff
+        );
+        assert!(
+            diff.contains("new_feature.rs"),
+            "diff should reference the new untracked file: {diff}"
+        );
+        // The synthetic hunk must follow the unified-diff shape the reviewer
+        // expects (`diff --git a/P b/P` + `new file mode` + `--- /dev/null`
+        // + `+++ b/P`).
+        assert!(
+            diff.contains("diff --git a/new_feature.rs b/new_feature.rs"),
+            "diff should contain a `diff --git` header for the new file: {diff}"
+        );
+        assert!(
+            diff.contains("new file mode"),
+            "diff should mark the file as a new file: {diff}"
+        );
+        assert!(
+            diff.contains("--- /dev/null"),
+            "diff should pair the new file against /dev/null: {diff}"
+        );
+    }
+
+    /// Companion guard: when only `.gitignore`d junk is added, the diff must
+    /// stay empty. The fix uses `--exclude-standard`, so a `.gitignore`d
+    /// untracked file must NOT be surfaced (and we must NOT panic).
+    #[test]
+    fn build_diff_does_not_surface_gitignored_untracked_files() {
+        let (dir, repo) = init_temp_repo_with_one_committed_file();
+        std::fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir_all(repo.join("ignored")).unwrap();
+        std::fs::write(repo.join("ignored").join("noise.txt"), "ignore me\n").unwrap();
+
+        let (_label, diff) = build_diff(&repo, ReviewScope::WorkingTree, None).unwrap();
+        assert!(
+            !diff.contains("noise.txt"),
+            "gitignored paths must not appear in the working-tree diff: {diff}"
+        );
+        drop(dir);
+    }
+
+    /// REGRESSION: `cap_diff` must NOT panic when the cap lands in the
+    /// middle of a multibyte UTF-8 codepoint. The old byte-index slice
+    /// panicked with "byte index N is not a char boundary"; the fix snaps
+    /// to the nearest char boundary before slicing. We use a string with a
+    /// known multibyte layout (2-byte Latin-1 supplement `é` followed by
+    /// 4-byte emoji `🦀`) and pick a cap that forces the head slice to
+    /// land inside one of those sequences.
+    #[test]
+    fn cap_diff_does_not_panic_on_multibyte_codepoint_boundary() {
+        // 20 ASCII chars + "é" (2 bytes) + "🦀" (4 bytes) + 20 more ASCII.
+        let mut body = String::new();
+        for _ in 0..20 {
+            body.push('a');
+        }
+        body.push('é');
+        body.push('🦀');
+        for _ in 0..20 {
+            body.push('b');
+        }
+
+        // A cap that lands inside the 2-byte `é` sequence at byte 21.
+        // The head slice is `max * 3 / 4` bytes; choose max=28 so
+        // 28*3/4 = 21, which falls between the two bytes of `é`.
+        let capped = std::panic::catch_unwind(|| cap_diff(&body, 28));
+        let capped = capped.expect("cap_diff must not panic on a mid-codepoint cap");
+
+        // The returned string must still be valid UTF-8 (it is, by
+        // construction) AND must satisfy the cap semantics: the head slice
+        // must end on a char boundary and contain no more than 21 bytes.
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        assert!(
+            capped.contains("truncated for length"),
+            "cap_diff should keep its truncation marker: {capped}"
+        );
+        let marker_pos = capped.find("...[diff truncated for length]...").unwrap();
+        let head = &capped[..marker_pos];
+        let head_no_newlines = head.trim_end_matches('\n');
+        assert!(
+            head_no_newlines.len() <= 21,
+            "head slice must be <= max*3/4 bytes on a char boundary, got {}",
+            head_no_newlines.len()
+        );
+        // The head slice must NOT have cut `é` in half: it must end before
+        // the `é` codepoint begins, which sits at byte index 20.
+        assert!(
+            !head_no_newlines.ends_with('é'),
+            "head must not end mid-codepoint (cut a multibyte char): {head_no_newlines:?}"
+        );
+    }
+
+    /// Companion guard: the cap semantics must still hold on a purely-ASCII
+    /// diff (no multibyte chars). The head+tail layout must remain valid
+    /// and the truncation marker must be present when `len > max`.
+    #[test]
+    fn cap_diff_preserves_head_tail_layout_for_ascii() {
+        let body: String = (0..200).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let max = 80;
+        assert!(body.len() > max);
+        let capped = cap_diff(&body, max);
+        assert!(capped.contains("...[diff truncated for length]..."));
+        let marker = "...[diff truncated for length]...";
+        let head = &capped[..capped.find(marker).unwrap()];
+        let tail = &capped[capped.find(marker).unwrap() + marker.len()..];
+        assert!(head.trim_end_matches('\n').len() <= max * 3 / 4);
+        // The tail slice is `&diff[diff.len() - max/4..]`, so its length
+        // (excluding the marker suffix newlines) must be <= max/4 bytes.
+        let tail_trimmed = tail.trim_start_matches('\n').trim_end_matches('\n');
+        assert!(tail_trimmed.len() <= max / 4);
+        // The tail must contain the LAST chars of `body`.
+        let last_chunk: String = body
+            .chars()
+            .rev()
+            .take(max / 4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            tail_trimmed.ends_with(&last_chunk),
+            "tail must end with the last `max/4` chars of body: tail={tail_trimmed:?} last={last_chunk:?}"
+        );
+    }
+
+    /// Edge case: `max == 0` (or smaller than the marker) must not panic.
+    /// The head slice is `max * 3 / 4 = 0` bytes — we just verify the call
+    /// returns a valid UTF-8 string without panicking.
+    #[test]
+    fn cap_diff_handles_degenerate_caps_without_panicking() {
+        let body = "hello, world! résumé naïve 🚀";
+        for max in 0..8 {
+            let capped =
+                std::panic::catch_unwind(|| cap_diff(body, max)).expect("cap_diff must not panic");
+            assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        }
     }
 }
