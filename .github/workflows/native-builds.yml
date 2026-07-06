@@ -49,15 +49,16 @@ jobs:
           - Primary install (all platforms, checksummed): \`curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh\`
           - These tarballs mirror the canonical GitLab channel \`zoder-nightly/master\`.
           - Targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin."
+          # Delete the release + its tag if present (the prior orphaned release
+          # had an invalid tag, which blocks `gh release edit`), then create it
+          # fresh on master. The `nightly` tag + /releases/download/nightly/...
+          # URLs stay stable, so docs/links don't break.
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # delete existing assets so the release is a clean rolling snapshot
-            for a in $(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
-              gh release delete-asset "$RELEASE_TAG" "$a" --repo "$GITHUB_REPOSITORY" --yes || true
-            done
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --title "zoder nightly (rolling)" --notes "$NOTES"
-          else
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --title "zoder nightly (rolling)" --notes "$NOTES" --target master
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           fi
+          git push origin ":refs/tags/${RELEASE_TAG}" 2>/dev/null || true   # belt-and-suspenders tag cleanup
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "zoder nightly (rolling)" --notes "$NOTES" --target master
 
   build:
     name: ${{ matrix.triple }}
