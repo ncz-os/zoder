@@ -58,7 +58,8 @@ pub use finops::{
 };
 pub use ledger::{BillableReservation, Entry, FinOpsTags, Ledger, Period, Rollup};
 pub use mcp::{
-    parse_mcp_servers_config, parse_mcp_servers_file, McpServerSpec, McpSource, McpTransportKind,
+    parse_mcp_servers_config, parse_mcp_servers_file, to_acp_mcp_servers, McpServerSpec, McpSource,
+    McpTransportKind,
 };
 pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};

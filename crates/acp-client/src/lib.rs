@@ -417,6 +417,18 @@ pub struct AgentOptions {
     /// exhaustively; for now it stays `false` so unknown shapes never get
     /// a free pass.
     pub trust_engine: bool,
+    /// Pre-serialized ACP `mcpServers` array to hand to the goose
+    /// engine's `session/new` call. Each entry is an untagged-enum
+    /// JSON object — stdio or http — built by
+    /// `zoder_core::to_acp_mcp_servers` from the parsed engine-config
+    /// MCP server specs. Defaulting to `Vec::new()` is NON-BREAKING:
+    /// when no servers are configured the goose `session/new` call
+    /// sends `[]` exactly as today, so existing operator setups are
+    /// unaffected. Populated by the CLI from
+    /// `parse_mcp_servers_file` + `to_acp_mcp_servers` for a goose
+    /// run; `acp-client` itself stays decoupled from `zoder-core`'s
+    /// parsing layer and only sees ready-to-send JSON values.
+    pub mcp_servers: Vec<Value>,
 }
 
 impl AgentOptions {
@@ -444,6 +456,12 @@ impl AgentOptions {
             writable_roots: vec![cwd],
             enforce_writable_roots: false,
             trust_engine: false,
+            // SLICE: configured MCP servers pre-serialized for the
+            // goose `session/new` `mcpServers` parameter. Defaulting
+            // to an empty Vec preserves today's wire shape EXACTLY —
+            // session/new sends `[]` when nothing is configured, so
+            // existing operator setups see no change.
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -1918,9 +1936,14 @@ where
     // 2. session/new. STANDARD params only: `cwd` + `mcpServers`. Deliberately
     //    omit zeroclaw's `agent_alias` / `chat_mode` — goose doesn't know
     //    what they mean and would either ignore or error on them.
+    //
+    //    `mcpServers` is populated by the CLI from the parsed engine-config
+    //    server specs (see `zoder_core::to_acp_mcp_servers`); an empty
+    //    `opts.mcp_servers` keeps today's wire shape (`[]`) so this slice
+    //    is NON-BREAKING when no servers are configured.
     let new_params = json!({
         "cwd": opts.cwd.to_string_lossy(),
-        "mcpServers": [],
+        "mcpServers": opts.mcp_servers,
     });
     write_frame(
         write_half,
@@ -3188,6 +3211,8 @@ mod tests {
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
             trust_engine: false,
+            // SLICE: empty Vec keeps the wire shape `[]` — non-breaking.
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -3823,6 +3848,40 @@ mod tests {
         (frames, res, events)
     }
 
+    /// Same as [`drive_against_mock`] but lets the caller pass an
+    /// explicitly-built `AgentOptions` (e.g. with `mcp_servers`
+    /// populated, for the populated-array wire-shape regression
+    /// test). Mirrors the existing helper so the populated test
+    /// doesn't have to reach back into private mock plumbing.
+    async fn drive_against_mock_with_opts(
+        outbound: Vec<String>,
+        show_reasoning: bool,
+        approval: ApprovalPolicy,
+        opts: AgentOptions,
+    ) -> (Vec<serde_json::Value>, AgentRun, Vec<AgentEvent>) {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = MockGoose {
+            received: received.clone(),
+            outbound,
+        };
+        let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
+        let server_handle = tokio::spawn(run_mock(server, engine_io));
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let mut opts = opts;
+        opts.show_reasoning = show_reasoning;
+        opts.approval = approval;
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let res = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
+            events.push(ev);
+        })
+        .await
+        .expect("drive_goose_io should succeed against a well-behaved mock");
+        let _ = server_handle.await;
+        let frames = received.lock().unwrap().clone();
+        (frames, res, events)
+    }
+
     #[tokio::test]
     async fn goose_drive_handshake_emits_standard_acp() {
         // The goose driver must speak STANDARD ACP, not zeroclaw extensions.
@@ -3871,6 +3930,133 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[0]["text"], "hello");
+    }
+
+    /// Regression for adversarial-review finding #5: when the CLI
+    /// populates `AgentOptions::mcp_servers` from the parsed engine
+    /// config, the goose `session/new` params must carry that
+    /// populated array VERBATIM — not drop it back to `[]` at the
+    /// call site, not flatten it, not wrap it. The two entries below
+    /// are the stdio + http shapes produced by
+    /// `zoder_core::to_acp_mcp_servers`; the assertions check the
+    /// exact field names (`command`/`args`/`env`, `url`/`headers`)
+    /// and the array-of-{name,value} sub-shapes so that an accidental
+    /// future "simplification" (e.g. passing the map straight through
+    /// as a JSON object) breaks the test instead of silently shipping
+    /// wire-shape drift to the goose binary.
+    #[tokio::test]
+    async fn goose_drive_session_new_carries_populated_mcp_servers() {
+        // The pre-serialized ACP objects the CLI would have built via
+        // `zoder_core::to_acp_mcp_servers(...)` for a config with one
+        // stdio server (with args + env) and one http server (with
+        // headers). Hand-built here so the test owns the exact
+        // expected wire shape rather than depending on the converter's
+        // own output — keeps this test honest as a wire-shape lock.
+        let populated = vec![
+            serde_json::json!({
+                "name": "lookup",
+                "command": "node",
+                "args": ["server.js"],
+                "env": [
+                    {"name": "API_KEY", "value": "secret"},
+                    {"name": "DEBUG", "value": "1"},
+                ],
+            }),
+            serde_json::json!({
+                "name": "github",
+                "url": "https://api.example.com/mcp/",
+                "headers": [
+                    {"name": "Authorization", "value": "Bearer TOKEN"},
+                ],
+            }),
+        ];
+
+        // The mock harness drives the driver with the options the
+        // caller built. We override `mcp_servers` directly here
+        // (rather than going through `goose_opts`, which is locked to
+        // the empty-Vec default to keep the sibling
+        // `goose_drive_handshake_emits_standard_acp` test stable).
+        let mut opts = goose_opts(None);
+        opts.mcp_servers = populated.clone();
+
+        let (frames, _run, _events) =
+            drive_against_mock_with_opts(vec![], false, ApprovalPolicy::Allowlist, opts).await;
+        assert_eq!(frames.len(), 3, "expected init/new/prompt frames");
+
+        // session/new params must carry the populated array verbatim.
+        let new = &frames[1];
+        assert_eq!(new["method"], "session/new");
+        let np = &new["params"];
+        let actual = np["mcpServers"]
+            .as_array()
+            .expect("mcpServers must be an array");
+        assert_eq!(
+            actual.len(),
+            2,
+            "mcpServers length must match what was passed in; got: {actual:?}"
+        );
+
+        // Field-name precision: stdio entry must carry `command`/`args`/`env`
+        // and MUST NOT carry `url`/`headers`. http entry must carry
+        // `url`/`headers` and MUST NOT carry `command`/`args`/`env`.
+        // These are the exact untagged-enum field names goose 1.37
+        // expects (wrong field names cause goose to reject with
+        // "data did not match any variant of untagged enum McpServer").
+        let lookup = actual
+            .iter()
+            .find(|e| e["name"] == "lookup")
+            .expect("lookup entry present");
+        assert_eq!(lookup["command"], "node");
+        assert_eq!(lookup["args"], serde_json::json!(["server.js"]));
+        let env = lookup["env"].as_array().expect("env must be an array");
+        assert_eq!(env.len(), 2);
+        // env entries MUST be {name, value} objects, not a flat map.
+        for entry in env {
+            assert!(
+                entry.get("name").is_some(),
+                "env entry missing name: {entry}"
+            );
+            assert!(
+                entry.get("value").is_some(),
+                "env entry missing value: {entry}"
+            );
+        }
+        assert!(
+            lookup.get("url").is_none(),
+            "stdio variant must NOT have url"
+        );
+        assert!(
+            lookup.get("headers").is_none(),
+            "stdio variant must NOT have headers"
+        );
+
+        let github = actual
+            .iter()
+            .find(|e| e["name"] == "github")
+            .expect("github entry present");
+        assert_eq!(github["url"], "https://api.example.com/mcp/");
+        let headers = github["headers"]
+            .as_array()
+            .expect("headers must be an array");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0]["name"], "Authorization");
+        assert_eq!(headers[0]["value"], "Bearer TOKEN");
+        assert!(
+            github.get("command").is_none(),
+            "http variant must NOT have command"
+        );
+        assert!(
+            github.get("args").is_none(),
+            "http variant must NOT have args"
+        );
+        assert!(
+            github.get("env").is_none(),
+            "http variant must NOT have env"
+        );
+
+        // initialize + session/prompt must remain unchanged in shape.
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(frames[2]["method"], "session/prompt");
     }
 
     #[tokio::test]
@@ -5364,6 +5550,10 @@ mod goose_acp_real_turn {
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
             trust_engine: false,
+            // SLICE: empty Vec keeps the wire shape `[]` — non-breaking
+            // against the real goose binary even though that test path
+            // is gated behind `#[ignore]`.
+            mcp_servers: Vec::new(),
         };
         let mut conn = connect_transport(&transport)
             .await

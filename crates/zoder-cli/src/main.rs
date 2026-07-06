@@ -27,13 +27,13 @@ use zoder_core::utilization::{
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
-    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, probe_request,
-    run_agent_dispatch, sync_catalog, AgentEvent, AgentOptions, ApprovalPolicy,
-    BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult, Config, Corpus,
-    CostSnapshot, CostVerdict, Decision, EngineKind, Entry, GooseProviderEnv, Gran, HealthStore,
-    Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
-    ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat,
-    Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
+    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, parse_mcp_servers_file,
+    probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers, AgentEvent, AgentOptions,
+    ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult,
+    Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind, Entry, GooseProviderEnv, Gran,
+    HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
+    PricingSource, ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole,
+    ScopeStat, Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
     PROBE_PING_TIMEOUT_SECS,
 };
 
@@ -4386,6 +4386,20 @@ pub(crate) async fn agentic_turn(
         writable_roots,
         enforce_writable_roots: cli.enforce_writable_roots,
         trust_engine: cli.trust_engine,
+        // MCP/extension servers configured in the engine config
+        // (`<engine_config_dir>/config.toml`). Parsed and converted
+        // into the goose ACP `mcpServers` wire format for the goose
+        // path; zeroclaw has its own session path and does not look
+        // at this field, so leaving it empty there is harmless.
+        // NON-BREAKING: a missing config file, a parse failure, or
+        // zero servers all produce an empty Vec — which the goose
+        // driver serializes as `[]` (identical to today's hardcoded
+        // shape). A parse failure is logged at warn level (the
+        // `mcp list` command already surfaces it explicitly); the
+        // session still runs without servers, since silently
+        // dropping the user's turn is worse than running with the
+        // pre-slice default.
+        mcp_servers: build_goose_mcp_servers(engine_kind),
     };
 
     let started = std::time::Instant::now();
@@ -6731,6 +6745,44 @@ fn engine_socket_path() -> std::path::PathBuf {
         }
     }
     zeroclaw_data_dir().join("daemon.sock")
+}
+
+/// Parse the engine-config MCP server specs and convert them to the
+/// goose ACP `mcpServers` wire format.
+///
+/// Only meaningful for the goose path: zeroclaw has its own session
+/// shape and never reads `AgentOptions::mcp_servers`, so the function
+/// returns an empty Vec for `EngineKind::Zeroclaw` without touching
+/// the filesystem. For goose it reads `<data_dir>/config.toml` via
+/// `parse_mcp_servers_file` and runs the result through
+/// `to_acp_mcp_servers`.
+///
+/// NON-BREAKING: a missing config file, a parse failure, or zero
+/// configured servers all return an empty Vec — the goose
+/// `session/new` call serializes that as `[]`, identical to today's
+/// hardcoded wire shape. A parse failure is logged at warn level
+/// (the `mcp list` command surfaces the same error to the operator
+/// explicitly when they ask); we do not propagate the error here
+/// because dropping the agentic turn because of a bad MCP block in
+/// a config the operator hasn't even invoked the `mcp list` view
+/// for would be a worse failure mode than running without servers.
+fn build_goose_mcp_servers(engine_kind: EngineKind) -> Vec<serde_json::Value> {
+    if !matches!(engine_kind, EngineKind::Goose) {
+        return Vec::new();
+    }
+    let path = crate::goose::engine_config_file_for_cli();
+    let specs = match parse_mcp_servers_file(&path) {
+        Ok(specs) => specs,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to parse engine config for goose mcpServers; proceeding with empty list",
+            );
+            return Vec::new();
+        }
+    };
+    to_acp_mcp_servers(&specs)
 }
 
 /// One period's live engine usage for the user's account.

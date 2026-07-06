@@ -191,12 +191,25 @@ pub(crate) async fn cmd_recipe(cli: &crate::Cli, action: &RecipeCmd) -> anyhow::
 use zoder_core::{parse_mcp_servers_file, McpServerSpec, McpTransportKind};
 
 /// Engine config file: `<engine_config_dir>/config.toml`.
-fn engine_config_file() -> PathBuf {
+///
+/// `pub(crate)` so `main.rs` can reuse it when populating the
+/// goose `AgentOptions::mcp_servers` field (the `mcp list` command
+/// in this same module reads the same file). Keeping a single
+/// resolution site means there is exactly one place to change if
+/// the engine config location ever moves.
+pub(crate) fn engine_config_file_for_cli() -> PathBuf {
     crate::zeroclaw_data_dir()
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default()
         .join("config.toml")
+}
+
+/// Backwards-compatible alias used internally by this module; new
+/// callers should use [`engine_config_file_for_cli`] so the
+/// resolution logic isn't duplicated.
+fn engine_config_file() -> PathBuf {
+    engine_config_file_for_cli()
 }
 
 /// Render one server's transport in a compact, human-readable form
