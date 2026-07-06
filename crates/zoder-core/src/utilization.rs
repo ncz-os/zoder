@@ -1408,7 +1408,26 @@ pub fn decide_account(
         match w.reset_at {
             None => false,
             Some(r) => {
-                let time_to_reset = (r - now).num_seconds().max(0) as f64;
+                // A reset_at strictly in the past can't be CONFIRMED
+                // imminent: the vendor hasn't yet surfaced the
+                // rollover (clock skew, stale header, briefly-delayed
+                // timer), so we have no signal for how soon this
+                // window will actually reset. Treating "already
+                // past reset_at" as "imminent" would silently flip
+                // the cap_guard gate off for any heavily-used
+                // account whose last sighting was a minute old —
+                // a stale snapshot would let the user overshoot the
+                // cap by the time the real signal arrives. Fold the
+                // past-reset case into the same NOT-relaxable bucket
+                // as `None`: when the rollover isn't reliably
+                // imminent, prefer the conservative path and fall
+                // back rather than risk letting a paid turn through
+                // a guard we can no longer see.
+                let raw = (r - now).num_seconds();
+                if raw < 0 {
+                    return false;
+                }
+                let time_to_reset = raw as f64;
                 (time_to_reset / cycle_secs) <= knobs.reset_imminence_threshold
             }
         }
@@ -4244,5 +4263,49 @@ mod tests {
             "proj {}",
             f.projected_used_percent
         );
+    }
+
+    // Regression: when a window's `reset_at` is strictly in the past
+    // (clock skew / stale header / delayed rollover), the original code
+    // clamped `(r - now).num_seconds()` to `0`, which then satisfied
+    // `(time_to_reset / cycle_secs) <= reset_imminence_threshold` (0 <= 0.10)
+    // and incorrectly flipped `is_window_imminently_resetting` to true.
+    // That, in turn, let `hard_cap_breach` trip the cap_guard and
+    // `relax` quietly turn it back off for a heavily-used account
+    // whose last sighting was a few seconds stale — exactly the
+    // "stale snapshot unblocks a paid turn through a guard we can
+    // no longer see" failure mode the conservative reset-relaxation
+    // rule is meant to prevent. The fix refuses to treat a past
+    // `reset_at` as imminent; this test pins that contract.
+    #[test]
+    fn decide_account_does_not_relax_when_reset_at_is_in_the_past() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        // 5h window, used 95%, reset_at 30 seconds AGO (stale header):
+        // we have no reliable signal for when (or if) the rollover
+        // will actually arrive, so the cap_guard must hold.
+        let reset_in_the_past = now - chrono::Duration::seconds(30);
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            has_credits: None,
+            windows: vec![fc_win(
+                "5h",
+                5,
+                95.0,
+                TelemetryHealth::Fresh,
+                Some(reset_in_the_past),
+            )],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "a stale reset_at (in the past) must not relax the cap_guard \
+             gate; old code returned PreferSub because clamping to 0 \
+             looked like an imminent reset"
+        );
+        assert_eq!(ad.binding_window.as_deref(), Some("5h"));
     }
 }
