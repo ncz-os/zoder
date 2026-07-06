@@ -107,9 +107,52 @@ async fn stream_with_only_malformed_frames_is_decode_error() {
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Decode);
     assert!(
-        error.message.contains("no valid completion choice"),
+        error.message.contains("malformed provider stream JSON"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn malformed_frame_after_emitted_choice_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                data: definitely-not-json\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let mut sink = Vec::new();
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), Some(&mut sink))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.emitted);
+    assert_eq!(sink, b"partial");
+}
+
+#[tokio::test]
+async fn schema_invalid_frame_after_valid_choice_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                data: {\"choices\":\"not-an-array\"}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode);
+    assert!(error.message.contains("malformed provider stream frame"));
+    assert!(!error.emitted, "nothing was written without a sink");
 }
 
 #[tokio::test]
