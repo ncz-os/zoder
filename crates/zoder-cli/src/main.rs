@@ -207,10 +207,13 @@ struct Cli {
     /// agentic loop (codex `exec` drop-in) when the engine is reachable.
     #[arg(long, global = true)]
     oneshot: bool,
-    /// Tool-approval policy for the agentic loop: all | allowlist | none
-    /// (default allowlist).
-    #[arg(long, global = true, value_name = "POLICY")]
-    approve: Option<String>,
+    /// Tool-approval policy for the agentic loop. Must be one of:
+    /// `all` (auto-approve every tool), `allowlist` (auto-approve only the
+    /// read-only allowlist), `none` (deny every tool). Unknown values are
+    /// rejected at parse time so a typo never silently downgrades to the
+    /// default `allowlist`.
+    #[arg(long, global = true, value_name = "POLICY", value_enum)]
+    approve: Option<ApprovalArg>,
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
@@ -3132,11 +3135,30 @@ fn agentic_cwd(cli: &Cli) -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn parse_approval(cli: &Cli) -> ApprovalPolicy {
-    match cli.approve.as_deref() {
-        Some("all") => ApprovalPolicy::All,
-        Some("none") => ApprovalPolicy::None,
-        _ => ApprovalPolicy::Allowlist,
+    match cli.approve {
+        // clap has already rejected any value other than these three at parse
+        // time (see `ApprovalArg`), so the `None` arm is the only fallthrough
+        // — and the historical default was `Allowlist`.
+        Some(ApprovalArg::All) => ApprovalPolicy::All,
+        Some(ApprovalArg::None) => ApprovalPolicy::None,
+        Some(ApprovalArg::Allowlist) | None => ApprovalPolicy::Allowlist,
     }
+}
+
+/// CLI-side mirror of [`ApprovalPolicy`] for the `--approve` flag.
+///
+/// Defined here (not on [`ApprovalPolicy`] itself) so a typo is rejected at
+/// parse time by clap rather than silently downgraded to `Allowlist`. The
+/// mapping is kept in `parse_approval` so the engine-side enum stays
+/// clap-free.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalArg {
+    /// Auto-approve every tool (fully autonomous).
+    All,
+    /// Auto-approve only the read-only allowlist; deny the rest.
+    Allowlist,
+    /// Deny every tool (read-only review runs).
+    None,
 }
 
 /// Zeroclaw model selection is performed by choosing the complete
@@ -3566,6 +3588,154 @@ mod default_exec_budget_tests {
 }
 
 #[cfg(test)]
+mod cli_switch_regression_tests {
+    //! Adversarial-review finding #6: four switches used to be silently
+    //! accepted-and-ignored (a `--approve` typo downgraded to allowlist, the
+    //! agentic path ignored `--continue`, `transfer` minted a fresh empty
+    //! session, and `run --background` was a no-op). The regression tests
+    //! below pin the new behavior so a future cleanup cannot reintroduce
+    //! silent acceptance without flipping these assertions.
+    use super::*;
+    use zoder_core::Session;
+
+    // --- Fix #1: --approve must reject unknown values at parse time. ---
+
+    #[test]
+    fn invalid_approve_value_is_rejected_at_parse_time() {
+        let res = Cli::try_parse_from(["zoder", "exec", "--approve", "bogus"]);
+        let err = match res {
+            Ok(_) => {
+                panic!("--approve bogus must be rejected at parse time, but it parsed cleanly")
+            }
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--approve") && msg.contains("bogus"),
+            "clap error must call out the offending flag and value so the user can \
+             fix the typo; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_approve_values_parse_to_matching_policy() {
+        // Sanity: each accepted value parses and `parse_approval` maps it
+        // to the right `ApprovalPolicy`. The historical bug was that
+        // *anything* typed here silently downgraded to `Allowlist`.
+        let cases = [
+            ("all", ApprovalPolicy::All),
+            ("allowlist", ApprovalPolicy::Allowlist),
+            ("none", ApprovalPolicy::None),
+        ];
+        for (raw, want) in cases {
+            let cli = Cli::try_parse_from(["zoder", "exec", "--approve", raw])
+                .unwrap_or_else(|e| panic!("--approve {raw} must parse: {e}"));
+            assert_eq!(parse_approval(&cli), want, "--approve {raw}");
+        }
+    }
+
+    // --- Fix #3: --continue must resume a prior agentic session
+    //              (previously it was silently accepted-and-ignored). ---
+
+    /// Pin the happy path: `--continue` with an existing latest session
+    /// returns that session's id (NOT a freshly-minted empty one).
+    #[test]
+    fn continue_resolves_to_latest_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut original = Session::new("pinned-2026-07-06");
+        original.push("user", "earlier turn");
+        original.push("assistant", "earlier answer");
+        let mut saved = original.clone();
+        saved.save(&sessions).unwrap();
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
+        let got = resolve_engine_session_id(&cli, &sessions, None)
+            .expect("--continue with a prior session must resolve")
+            .expect("--continue must yield a session id");
+        assert_eq!(
+            got, original.id,
+            "--continue must attach to the prior session, not mint a fresh one"
+        );
+    }
+
+    /// Pin the fail-loud path: `--continue` with NO prior session is an
+    /// error with a clear message, not a silent fallthrough to a new
+    /// empty session.
+    #[test]
+    fn continue_without_prior_session_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
+        let err = resolve_engine_session_id(&cli, &sessions, None)
+            .expect_err("--continue with no prior session must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--continue") && msg.contains("no prior session"),
+            "the message must mention --continue and explain the missing session so the \
+             caller can run a session first or pass --session <id>; got: {msg}"
+        );
+    }
+
+    /// Without --continue, --session, or a session_override, the resolver
+    /// returns None so the engine mints a fresh session. Old behavior
+    /// returned Some(empty-default) on a mistaken continue_; this guards
+    /// against that regression coming back.
+    #[test]
+    fn no_session_hint_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let got = resolve_engine_session_id(&cli, &sessions, None)
+            .expect("no --session/--continue must not error");
+        assert!(got.is_none(), "fresh invocation must yield None");
+    }
+
+    /// An explicit --session id always wins over --continue (continuation
+    /// is an implicit selection; explicit is unambiguous).
+    #[test]
+    fn explicit_session_id_wins_over_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut prior = Session::new("prior");
+        prior.push("user", "earlier");
+        let _ = prior.save(&sessions);
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "explicit-id"])
+            .unwrap();
+        let got = resolve_engine_session_id(&cli, &sessions, None)
+            .expect("explicit --session must succeed")
+            .expect("explicit --session must yield Some");
+        assert_eq!(
+            got, "explicit-id",
+            "--session <id> must beat --continue regardless of what's in the sessions dir"
+        );
+    }
+
+    /// A programmatic session_override (used by the loop's continuation
+    /// turns) beats both --session and --continue. This matches the
+    /// precedence documented at resolve_engine_session_id.
+    #[test]
+    fn session_override_wins_over_explicit_and_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "from-cli"]).unwrap();
+        let got = resolve_engine_session_id(&cli, &sessions, Some("from-loop"))
+            .expect("override must succeed")
+            .expect("override must yield Some");
+        assert_eq!(got, "from-loop");
+    }
+}
+
+#[cfg(test)]
 mod ledger_integrity_tests {
     use super::*;
 
@@ -3669,6 +3839,46 @@ mod ledger_integrity_tests {
             None
         );
     }
+}
+
+/// Resolve the engine session id to attach this agentic turn to.
+///
+/// Precedence (most explicit to least):
+///   1. `session_override` from a programmatic caller (used by the `loop`'s
+///      own follow-up turns).
+///   2. `--session <id>` from the CLI (explicit id).
+///   3. `--continue` from the CLI: load the most-recently-updated session
+///      from the sessions dir and use ITS id. This is the previously-missing
+///      wiring — `--continue` used to be silently accepted-and-ignored on the
+///      agentic path, leaving the engine to mint a fresh empty session
+///      every time. With this helper, an `--continue` without a prior
+///      session is rejected with a clear error (instead of fabricating an
+///      empty context) and the engine continues the real prior thread.
+///
+/// Both Zeroclaw and Goose accept a session id through the same
+/// `AgentOptions.session_id` field, so this lookup is engine-agnostic.
+fn resolve_engine_session_id(
+    cli: &Cli,
+    sessions_dir: &Path,
+    session_override: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(id) = session_override {
+        return Ok(Some(id.to_string()));
+    }
+    if let Some(id) = cli.session.as_deref() {
+        return Ok(Some(id.to_string()));
+    }
+    if cli.continue_ {
+        let session = Session::latest(sessions_dir)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--continue requested but no prior session exists in {} (run a session \
+                 first with `zoder exec ...`, or pass --session <id> explicitly)",
+                sessions_dir.display()
+            )
+        })?;
+        return Ok(Some(session.id));
+    }
+    Ok(None)
 }
 
 pub(crate) async fn agentic_turn(
@@ -3775,6 +3985,13 @@ pub(crate) async fn agentic_turn(
     let cwd = agentic_cwd(cli)?;
     let alias = resolve_agent_alias(cli, &primary);
 
+    // Resolve the engine session id once for the helper above. Doing it on the
+    // same path as the model/routing resolution keeps `--continue` errors
+    // co-located with the other early-validation steps, before we commit to
+    // an engine dispatch.
+    let engine_session_id =
+        resolve_engine_session_id(cli, &eng.cfg.sessions_dir(), session_override.as_deref())?;
+
     // The Goose path SPAWNS its own engine process (`goose acp` over stdio)
     // and does not use `opts.socket`. We must NOT touch the zeroclaw daemon
     // in that case — starting it would waste a process, fight for the same
@@ -3838,7 +4055,7 @@ pub(crate) async fn agentic_turn(
         // `chain[0]`); the goose driver prefers this over the zeroclaw
         // agent alias (which goose doesn't understand).
         model_id: Some(primary.clone()),
-        session_id: session_override.or_else(|| cli.session.clone()),
+        session_id: engine_session_id,
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
@@ -4010,7 +4227,7 @@ pub(crate) async fn agentic_turn(
     })
 }
 
-async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+pub(crate) async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     if cli.dry_run {
         let eng = Engine::load()?;
         let health = HealthStore::load(&eng.cfg.health_path);

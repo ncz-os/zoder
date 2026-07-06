@@ -3,7 +3,7 @@
 //! `configure`. These are thin wrappers over the agentic engine + config that
 //! `exec`/`tui` already provide, so behavior and cost accounting stay uniform.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -16,11 +16,56 @@ use crate::{McpCmd, RecipeCmd};
 // run: headless agentic (goose `run`).
 // ---------------------------------------------------------------------------
 
+/// Body of `cmd_run` split out from the entry point so the dispatch /
+/// in-worker / inline behaviors can be exercised without actually forking
+/// a worker. `dispatch_fn` represents "spawn a background worker and
+/// return its id"; `inline_fn` represents "run the agentic turn inline".
+/// In production both are the real implementations; tests can swap either
+/// for a stub.
+///
+/// Returns the printed-to-stdout job id when a background dispatch
+/// happens, or `None` when the run was executed inline.
+pub(crate) async fn run_with_dispatch<F, Fut>(
+    cli: &crate::Cli,
+    background: bool,
+    in_worker: bool,
+    dispatch_fn: F,
+    inline_fn: Fut,
+) -> anyhow::Result<Option<String>>
+where
+    F: FnOnce(&str, &Path) -> anyhow::Result<String>,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let cwd = crate::agentic_cwd(cli)?;
+    // `--background` here is the agentic `run` flavor of the same job
+    // registry that `review`/`rescue`/`loop` use. Previously the flag
+    // was silently accepted-and-ignored (the inline worker still ran on
+    // `--background`), so `status`/`result`/`cancel` never saw `run`
+    // jobs. Re-exec self into the worker under `ZODER_JOB_DIR` so the
+    // worker writes its terminal status on exit and the foreground
+    // process can hand the new job id back to the caller.
+    //
+    // `in_worker` is the resolved-up-front `active_job_dir().is_some()`
+    // flag, computed by the caller. Exposing it as a parameter keeps
+    // unit tests parallel-safe (env mutation is process-wide and racy
+    // under parallel `cargo test`).
+    if background && !in_worker {
+        let id = dispatch_fn("run", &cwd)?;
+        println!("{id}");
+        if !cli.quiet {
+            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
+        }
+        return Ok(Some(id));
+    }
+    inline_fn.await?;
+    Ok(None)
+}
+
 pub(crate) async fn cmd_run(
     cli: &crate::Cli,
     text: Option<String>,
     instructions: Option<String>,
-    _background: bool,
+    background: bool,
 ) -> anyhow::Result<()> {
     let task = match (text, instructions) {
         (Some(t), _) => t,
@@ -28,9 +73,16 @@ pub(crate) async fn cmd_run(
             .with_context(|| format!("reading instructions file {file:?}"))?,
         (None, None) => crate::read_prompt(None)?, // stdin / -
     };
-    // `run` is a headless agentic execution; background detachment is provided by
-    // the codex-surface job registry (`rescue --background`). Here we run inline.
-    crate::cmd_exec_agentic(cli, Some(task)).await
+    let task2 = task.clone();
+    run_with_dispatch(
+        cli,
+        background,
+        crate::agentic::active_job_dir().is_some(),
+        crate::agentic::spawn_background,
+        async move { crate::cmd_exec_agentic(cli, Some(task2)).await },
+    )
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

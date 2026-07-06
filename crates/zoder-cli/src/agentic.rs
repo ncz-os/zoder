@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use zoder_core::{
     BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Ledger, Message,
-    ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog,
+    ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog, Session,
 };
 
 use crate::{Engine, ReviewScope};
@@ -2744,15 +2744,42 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
     Ok(())
 }
 
+/// Look up the resumable session id for `transfer`.
+///
+/// Returns the most-recently-updated session in `sessions_dir` (the same
+/// one `--continue` would resolve to), or an error if none exists. Used as
+/// a named seam so tests can drive the lookup with an isolated tempdir
+/// without depending on `ZODER_HOME`.
+fn transfer_resume_target(sessions_dir: &Path) -> anyhow::Result<String> {
+    let Some(session) = Session::latest(sessions_dir)? else {
+        anyhow::bail!(
+            "no resumable session found in {} (run a session first: \
+             `zoder exec ...` to establish one, then `zoder transfer` to print \
+             its id; pass --session <id> explicitly to use a known id)",
+            sessions_dir.display()
+        );
+    };
+    Ok(session.id)
+}
+
 pub(crate) async fn cmd_transfer(cli: &crate::Cli) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
-    let alias = crate::resolve_agent_alias(cli, cli.model.as_deref().unwrap_or(""));
-    let socket = crate::ensure_engine_daemon().await?;
-    let sid = zoder_core::new_session(&socket, &alias, &cwd).await?;
+    // `transfer` returns the resumable id of the PRIOR multi-turn session
+    // already established for this workspace (the one a previous `zoder
+    // exec --session <id>` or `zoder ... --continue` wrote). It MUST NOT
+    // mint a new, empty session id: that would defeat the entire point of
+    // transfer (picking up an in-flight thread from another terminal/host),
+    // and the field report that triggered this fix found a user "resuming"
+    // a fabricated-empty session and losing real context. If nothing exists
+    // yet, `transfer_resume_target` fails loudly so the caller can create
+    // one intentionally instead.
+    let cfg = Config::load().context("loading zoder config to locate sessions dir")?;
+    let sessions_dir = cfg.sessions_dir();
+    let sid = transfer_resume_target(&sessions_dir)?;
     if cli.json {
         println!(
             "{}",
-            json!({"session_id": sid, "agent": alias, "cwd": cwd.to_string_lossy()})
+            json!({"session_id": sid, "cwd": cwd.to_string_lossy()})
         );
     } else {
         println!("session: {sid}");
@@ -2804,7 +2831,7 @@ fn write_meta(dir: &Path, meta: &JobMeta) -> anyhow::Result<()> {
 }
 
 /// Re-exec the current invocation as a detached worker writing to a new job dir.
-fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String> {
+pub(crate) fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String> {
     let id = format!(
         "{}-{:04x}",
         Utc::now().format("%Y%m%d-%H%M%S"),
@@ -3539,6 +3566,185 @@ mod tests {
         assert!(all_failed);
         assert_ne!(agg, "approve");
         assert_eq!(payload["complete"].as_bool(), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod cli_switch_transfer_and_background_tests {
+    //! Adversarial-review finding #6 (cont'd): pin the new behavior of
+    //! `transfer` and `run --background`. `transfer` must NEVER mint a new
+    //! empty session id — it has to either hand back the existing one or
+    //! fail loudly. `run --background` must dispatch the run through the
+    //! existing job registry so `status`/`result`/`cancel` can see it.
+
+    use super::*;
+    use crate::Cli;
+    use clap::Parser;
+    use zoder_core::Session;
+
+    fn tmp_sessions_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-cli-switch-{label}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // --- Fix #2: transfer. ---
+
+    /// With a prior session on disk, `transfer_resume_target` MUST return
+    /// that session's id. The historical bug: it minted a fresh, empty
+    /// session id that the user then "resumed", losing all real context.
+    #[test]
+    fn transfer_resume_target_returns_existing_session_id() {
+        let sessions = tmp_sessions_dir("transfer-exists");
+        let mut prior = Session::new("established-via-cli");
+        prior.push("user", "earlier task");
+        prior.push("assistant", "earlier reply");
+        prior.save(&sessions).unwrap();
+
+        let got = transfer_resume_target(&sessions)
+            .expect("transfer must succeed when a prior session exists");
+        assert_eq!(
+            got, prior.id,
+            "transfer must hand back the existing session id, not a fresh one"
+        );
+    }
+
+    /// With NO prior session, `transfer_resume_target` must FAIL LOUDLY
+    /// instead of fabricating an empty session id. Old behavior minted one.
+    #[test]
+    fn transfer_resume_target_errors_when_no_prior_session() {
+        let sessions = tmp_sessions_dir("transfer-empty");
+        let err = match transfer_resume_target(&sessions) {
+            Ok(id) => panic!(
+                "transfer must error when no prior session exists; got Ok({id:?}) \
+                 (that's the bug — fabricating an empty id)"
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no resumable session"),
+            "error must explain there is no resumable session; got: {msg}"
+        );
+    }
+
+    // --- Fix #4: run --background. ---
+
+    /// With `--background` and not in worker mode, `run_with_dispatch`
+    /// MUST call the dispatch function and report the returned job id
+    /// (NOT call the inline runner). The OLD behavior called the inline
+    /// runner unconditionally, so the agentic turn ran inline and was
+    /// indistinguishable from a foreground invocation; `status`/`result`/
+    /// `cancel` never saw `run` jobs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_path_is_taken_when_background_and_not_in_worker() {
+        let cli = Cli::try_parse_from(["zoder", "run", "--background", "-t", "x"]).unwrap();
+        let dispatched = std::cell::Cell::new(false);
+        let ran_inline = std::cell::Cell::new(false);
+        let dispatched_id = "fake-job-id-12345";
+
+        let got = crate::goose::run_with_dispatch(
+            &cli,
+            true,
+            false, // not in worker mode
+            |_kind, _cwd| {
+                dispatched.set(true);
+                Ok(dispatched_id.to_string())
+            },
+            async {
+                ran_inline.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect("dispatch path must succeed");
+
+        assert!(
+            dispatched.get(),
+            "--background without worker env must take the dispatch path (was silently ignored)"
+        );
+        assert!(
+            !ran_inline.get(),
+            "--background must NOT run inline; that was the old silently-ignored bug"
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(dispatched_id),
+            "the job id from the dispatch must be returned to the caller"
+        );
+    }
+
+    /// In worker mode (`in_worker=true`), `run_with_dispatch` MUST run
+    /// inline (we are the worker) and NOT re-dispatch into an infinite
+    /// recursion. The worker predicate is now injected, so this test
+    /// does not need to mutate any process-wide env var (parallel-safe).
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_worker_mode_runs_inline_and_skips_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "run", "--background", "-t", "x"]).unwrap();
+        let dispatched = std::cell::Cell::new(false);
+        let ran_inline = std::cell::Cell::new(false);
+
+        let got = crate::goose::run_with_dispatch(
+            &cli,
+            true,
+            true, // we ARE the worker
+            |_kind, _cwd| {
+                dispatched.set(true);
+                Ok("DISPATCHED".to_string())
+            },
+            async {
+                ran_inline.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect("in-worker path must succeed");
+
+        assert!(
+            !dispatched.get(),
+            "when we are the worker — re-dispatching would loop forever"
+        );
+        assert!(ran_inline.get(), "in-worker mode must run inline");
+        assert!(got.is_none(), "in-worker mode returns no dispatch id");
+    }
+
+    /// Without `--background`, dispatch must never happen — even when
+    /// we're not the worker. This pins the inverse precondition.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_background_means_always_inline() {
+        let cli = Cli::try_parse_from(["zoder", "run", "-t", "x"]).unwrap();
+        let dispatched = std::cell::Cell::new(false);
+        let ran_inline = std::cell::Cell::new(false);
+
+        let got = crate::goose::run_with_dispatch(
+            &cli,
+            false,
+            false, // not a worker, but no --background
+            |_kind, _cwd| {
+                dispatched.set(true);
+                Ok("DISPATCHED".to_string())
+            },
+            async {
+                ran_inline.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect("inline path must succeed");
+
+        assert!(
+            !dispatched.get(),
+            "without --background we MUST NOT dispatch — that was the original silent-ignore bug"
+        );
+        assert!(ran_inline.get(), "without --background we run inline");
+        assert!(
+            got.is_none(),
+            "without --background no dispatch id is returned"
+        );
     }
 }
 
