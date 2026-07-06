@@ -20,14 +20,24 @@ ARG ZEROCLAW_REF=zoder-integration
 ENV ZEROCLAW_REPO=${ZEROCLAW_REPO} \
     ZEROCLAW_REF=${ZEROCLAW_REF} \
     CARGO_TERM_COLOR=never
-# package.sh builds the native x86_64 trio + goose and tarballs them.
-RUN bash scripts/package.sh x86_64-unknown-linux-gnu \
-    && mkdir -p /out \
-    && tar -xzf dist/zoder-*-x86_64-unknown-linux-gnu.tar.gz -C /out --strip-components=1 \
-    && ls -l /out/zoder /out/zerocode /out/zeroclaw /out/goose
+# Build the native trio + goose for the target platform. buildx sets TARGETARCH
+# (amd64|arm64); map it to the Rust triple. With the docker/build-push per-arch
+# native-runner pattern (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) each
+# platform compiles NATIVELY — no cross-compile, no QEMU-slow arm64 build.
+ARG TARGETARCH
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) TRIPLE=x86_64-unknown-linux-gnu ;; \
+      arm64) TRIPLE=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    bash scripts/package.sh "$TRIPLE"; \
+    mkdir -p /out; \
+    tar -xzf dist/zoder-*-"$TRIPLE".tar.gz -C /out --strip-components=1; \
+    ls -l /out/zoder /out/zerocode /out/zeroclaw /out/goose
 
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
-LABEL org.opencontainers.image.source="https://gitlab.com/ncz-os/zoder" \
+LABEL org.opencontainers.image.source="https://github.com/ncz-os/zoder" \
       org.opencontainers.image.title="zoder-stack" \
       org.opencontainers.image.description="zoder + zerocode + zeroclaw + goose — free-first agentic coding stack" \
       org.opencontainers.image.licenses="Apache-2.0"

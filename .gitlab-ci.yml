@@ -323,58 +323,8 @@ resolve:zeroclaw-sha:
     reports:
       dotenv: sha.env
 
-container:weekly:
-  stage: package
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e
-    entrypoint: [""]
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "trigger"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  timeout: 150m
-  cache: {}
-  needs:
-    - job: resolve:zeroclaw-sha
-      artifacts: true
-  script:
-    - export WEEK="$(date -u +%G-W%V)"
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"username\":\"${CI_REGISTRY_USER}\",\"password\":\"${CI_REGISTRY_PASSWORD}\"}}}" > /kaniko/.docker/config.json
-    - /kaniko/executor
-        --context "${CI_PROJECT_DIR}"
-        --dockerfile "${CI_PROJECT_DIR}/Containerfile"
-        --build-arg "ZEROCLAW_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
-        --build-arg "ZEROCLAW_REF=${ZEROCLAW_PINNED_SHA}"
-        --destination "${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
-        --destination "${CI_REGISTRY_IMAGE}:latest"
-    - echo "WEEK=${WEEK}" > week.env
-  artifacts:
-    reports:
-      dotenv: week.env
-
-release:container-weekly:
-  stage: release
-  image: registry.gitlab.com/gitlab-org/release-cli:v0.18.0@sha256:696013aea0f2a20482800ce3a77341f840d7c7ec17bd78bd555e0bd6c00e4f11
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "trigger"'
-  needs:
-    - job: container:weekly
-      artifacts: true
-  variables:
-    GIT_STRATEGY: none
-  script:
-    - echo "cutting release stack-${WEEK} for ${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
-  release:
-    tag_name: "stack-${WEEK}"
-    description: "Weekly zoder stack container — zoder + zerocode + zeroclaw + goose (${WEEK}). Pull: docker pull ${CI_REGISTRY_IMAGE}:weekly-${WEEK}"
-    assets:
-      links:
-        - name: "container image (weekly-${WEEK})"
-          # GitLab release asset links require an http(s)/ftp scheme; a bare
-          # registry ref (registry.gitlab.com/...:tag) is rejected 400. Point at
-          # the Container Registry browse page; the exact pull ref is in the
-          # release description ("docker pull ...:weekly-${WEEK}").
-          url: "${CI_SERVER_URL}/${CI_PROJECT_PATH}/container_registry"
-          link_type: "image"
+# NOTE: the weekly stack container moved to GitHub Actions + ghcr.io — GitLab.com
+# has no free arm64 runner, so a multi-arch (amd64+arm64) container can't build
+# natively here. See .github/workflows/container-weekly.yml →
+# ghcr.io/ncz-os/zoder:{weekly-<ISOweek>,latest}. GitLab keeps the per-push gate,
+# the resolve:zeroclaw-sha helper (for tag trio builds), and prune.
