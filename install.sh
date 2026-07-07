@@ -39,9 +39,13 @@ ZODER_HOME="${ZODER_HOME:-$HOME/.zoder}"
 NO_CORPUS="${ZODER_NO_CORPUS:-0}"
 DRY_RUN=false
 
-# zoder is the product. zerocode + zeroclaw (the TUI trio) are installed too when
-# the nightly publishes them; today the nightly ships `zoder` alone, so those are
-# best-effort and skipped silently when absent (forward-compatible).
+# zoder is the product. zerocode + zeroclaw (the TUI trio) are installed too
+# when the nightly publishes them — currently GitHub Actions nightly
+# (.github/workflows/native-builds.yml) ships all three binaries (zoder,
+# zerocode, zeroclaw) per arch to the zoder-nightly/{master,DATE} package
+# channel. They are still listed as OPTIONAL here so an older or partial
+# channel (e.g. a CI outage that only publishes `zoder`) doesn't fail the
+# install — a missing artifact is a warn-and-skip, never a fatal.
 BIN_REQUIRED="zoder"
 BIN_OPTIONAL="zerocode zeroclaw"
 
