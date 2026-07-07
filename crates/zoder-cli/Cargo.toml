@@ -32,3 +32,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Used by the reviewer-fallback-chain integration tests so the dispatcher
+# can run against a real HTTP mock instead of being forced to mock out
+# `reqwest::Client`. Wiremock is already a workspace dev-dep used by the
+# `tests/provider.rs` integration tests in zoder-core.
+wiremock.workspace = true
