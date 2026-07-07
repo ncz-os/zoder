@@ -27,14 +27,14 @@ use zoder_core::utilization::{
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
-    estimate_tokens, fetch_engine_cost, finops_cli, openai_costs, parse_mcp_servers_file,
-    probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers, AgentEvent, AgentOptions,
-    ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult,
-    Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind, Entry, GooseProviderEnv, Gran,
-    HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
-    PricingSource, ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole,
-    ScopeStat, Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
-    PROBE_PING_TIMEOUT_SECS,
+    estimate_tokens, fetch_engine_cost, finops_cli, load_project_instructions, openai_costs,
+    parse_mcp_servers_file, probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers,
+    AgentEvent, AgentOptions, ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict,
+    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind,
+    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
+    Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
+    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, SubscriptionPlan, Theme,
+    Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
 fn finops_task(cli: &Cli) -> &'static str {
@@ -4400,6 +4400,25 @@ pub(crate) async fn agentic_turn(
         // dropping the user's turn is worse than running with the
         // pre-slice default.
         mcp_servers: build_goose_mcp_servers(engine_kind),
+        // PROJECT-INSTRUCTIONS SLICE: parity with Claude Code /
+        // Codex CLI, both of which read AGENTS.md or CLAUDE.md at
+        // the repo root and fold it into the model's context.
+        //
+        // The loader lives in `zoder-core` (a pure read of the
+        // matched file, trimmed + size-capped); this CLI seam is
+        // the single place the file is opened, mirroring how
+        // `mcp_servers` is parsed here and handed to `acp-client`
+        // as a ready-to-send value (so `acp-client` itself stays
+        // decoupled from filesystem IO).
+        //
+        // NON-BREAKING: when AGENTS.md / CLAUDE.md is absent
+        // (the default for any project that hasn't onboarded the
+        // convention), `load_project_instructions` returns `None`
+        // and the agentic driver sends the prompt text
+        // byte-for-byte — exactly matching every pre-this-slice
+        // run. The agentic gates continue to be byte-identical
+        // for a project without project-instructions files.
+        project_instructions: load_project_instructions(&cwd),
     };
 
     let started = std::time::Instant::now();
