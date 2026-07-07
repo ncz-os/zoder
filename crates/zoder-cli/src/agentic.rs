@@ -4714,42 +4714,38 @@ mod reviewer_chain_dispatch_tests {
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zoder_core::config::Provider;
 
-    /// Process-wide mutex around every test in this module. Tests mutate
-    /// `ZODER_HOME`, and the env var is process-global, so parallel runs
-    /// would step on each other (and on the agentic engine's own state).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// `RAII` guard that sets `ZODER_HOME` to `home` for the lifetime of
+    /// RAII guard that sets `ZODER_HOME` to `home` for the lifetime of
     /// the guard and restores the prior value (or unsets it) on drop.
-    /// Pairs with `ENV_LOCK` for tests that mutate the env mid-async
-    /// (the closure-driven `with_fake_home` helper used by the
-    /// synchronous tests in `main.rs` doesn't fit when the body of a
-    /// test is itself `async` — the async runtime has to outlive the
-    /// env mutation, and the closure-bound executor pattern is awkward).
-    /// The guard is intentionally cheap (no allocations) so dropping it
-    /// inside an async block is well-defined.
+    /// Holds `crate::test_env::ENV_LOCK` — the SAME lock
+    /// `main.rs::health_install_tests` uses — so an async reviewer-chain
+    /// test and a sync install-daily test running in different threads
+    /// of the same binary are properly serialized. Without the shared
+    /// lock the two modules each had their own `static Mutex<()>` and
+    /// the env var raced between them (test A set `ZODER_HOME=/A`, test
+    /// B's `Engine::load()` read `/B`, and A's `Config::load()` found
+    /// the wrong corpus). The guard is intentionally cheap (no
+    /// allocations beyond the lock guard) so dropping it inside an
+    /// async block is well-defined.
     struct HomeGuard {
-        _env_lock: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
+        // Holding the shared `EnvGuard` (not just a bare
+        // `MutexGuard`) is what makes the `Drop` impl run on
+        // guard-drop, restoring the prior `ZODER_HOME` exactly
+        // when the lock is released. The `inner` field is
+        // therefore read implicitly (by the drop glue) — mark
+        // it `_inner` to silence the "never read" warning while
+        // keeping the self-documenting field name for anyone
+        // stepping through the type in a debugger.
+        #[allow(dead_code)]
+        inner: crate::test_env::EnvGuard,
     }
     impl HomeGuard {
         fn new(home: &Path) -> Self {
-            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let prev = std::env::var("ZODER_HOME").ok();
-            std::env::set_var("ZODER_HOME", home);
-            Self { _env_lock, prev }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("ZODER_HOME", v),
-                None => std::env::remove_var("ZODER_HOME"),
+            Self {
+                inner: crate::test_env::EnvGuard::new(home),
             }
         }
     }
