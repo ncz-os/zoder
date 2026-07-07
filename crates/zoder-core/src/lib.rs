@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod policy;
 pub mod pricing;
 pub mod pricing_sync;
+pub mod project_instructions;
 pub mod provider;
 pub mod quota;
 pub mod reconcile;
@@ -65,6 +66,10 @@ pub use model_health::{Classification, HealthStore, State};
 pub use policy::{Decision, PolicyGate, PAID_WARNING};
 pub use pricing::{CostVerdict, ModelPrice, PricingCatalog};
 pub use pricing_sync::{sync_catalog, Source as PricingSource, SyncStats};
+pub use project_instructions::{
+    compose_prompt, load_project_instructions, MAX_PROJECT_INSTRUCTIONS_BYTES,
+    PROJECT_INSTRUCTIONS_HEADER, PROJECT_INSTRUCTIONS_SEPARATOR, TRUNCATION_MARKER,
+};
 pub use provider::{
     backoff_delay, CallTelemetry, ChatRequest, ChatResult, ErrKind, Message, OpenAiProvider,
     ProviderError,

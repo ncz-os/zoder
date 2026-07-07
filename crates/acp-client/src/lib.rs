@@ -203,6 +203,45 @@ impl tokio::io::AsyncWrite for TransportWriter {
     }
 }
 
+/// Compose the final `session/prompt` text for an ACP engine
+/// (zeroclaw or goose): the project-instructions block sits on top
+/// when `AgentOptions::project_instructions` is `Some`, the user's
+/// task text sits below it; when `None`, the returned string is
+/// EXACTLY `opts.prompt` byte-for-byte so a project without
+/// `AGENTS.md` / `CLAUDE.md` keeps every pre-this-slice wire shape.
+///
+/// The header format mirrors `zoder-core`'s `compose_prompt`:
+///   `# Project instructions (AGENTS.md)\n\n{text}\n\n---\n\n{task}`
+///
+/// Implemented locally (without depending on `zoder_core`) so the
+/// prompt shape that hits the wire stays debuggable from this file
+/// alone and an acp-client unit test can pin both the byte shape and
+/// the regression-guard behavior without spinning up the full
+/// `zoder_core` crate. The two implementations are kept in lockstep
+/// by the `acp_client::tests::compose_prompt_*` test set.
+pub(crate) fn compose_session_prompt(opts: &AgentOptions) -> String {
+    let Some(instructions) = opts
+        .project_instructions
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        // Non-breaking default: when no AGENTS.md / CLAUDE.md was
+        // loaded, send the prompt text unchanged so existing
+        // operator tooling that diffs the wire still matches.
+        return opts.prompt.clone();
+    };
+    const HEADER: &str = "# Project instructions (AGENTS.md)\n\n";
+    const SEPARATOR: &str = "\n\n---\n\n";
+    let mut out = String::with_capacity(
+        HEADER.len() + instructions.len() + SEPARATOR.len() + opts.prompt.len(),
+    );
+    out.push_str(HEADER);
+    out.push_str(instructions);
+    out.push_str(SEPARATOR);
+    out.push_str(&opts.prompt);
+    out
+}
+
 /// Open the configured transport and return a connected reader/writer pair.
 ///
 /// - [`EngineTransport::UnixSocket`] mirrors today's behavior byte-for-byte:
@@ -429,6 +468,28 @@ pub struct AgentOptions {
     /// run; `acp-client` itself stays decoupled from `zoder-core`'s
     /// parsing layer and only sees ready-to-send JSON values.
     pub mcp_servers: Vec<Value>,
+    /// Optional project-level instructions loaded from
+    /// `AGENTS.md` (Codex CLI convention) or `CLAUDE.md` (Claude Code
+    /// convention) at the repo root by
+    /// `zoder_core::load_project_instructions`. When `Some(text)`, both
+    /// ACP drivers (`drive` for zeroclaw, `drive_goose_io` for goose)
+    /// prepend a clearly-delimited
+    /// `# Project instructions (AGENTS.md)\n\n{text}\n\n---\n\n`
+    /// block ahead of [`Self::prompt`] before sending the
+    /// `session/prompt` frame, so the model and any log/debug output
+    /// can tell the project-instructions block apart from the user's
+    /// task text.
+    ///
+    /// When `None` (default), the prompt sent to the model is exactly
+    /// `prompt` byte-for-byte — preserving every pre-this-slice
+    /// run's wire shape, including the AGENTS.md-parity regression
+    /// guard exercised by `AgentOptions::new` and the
+    /// `acp_client::tests::prompt_*` test suite. The CLI populates
+    /// this field at construction time and never edits it past that
+    /// point; loaded at the CLI seam so `acp-client` itself stays
+    /// decoupled from filesystem IO (parity with how
+    /// [`Self::mcp_servers`] is handed in pre-serialized).
+    pub project_instructions: Option<String>,
 }
 
 impl AgentOptions {
@@ -462,6 +523,12 @@ impl AgentOptions {
             // session/new sends `[]` when nothing is configured, so
             // existing operator setups see no change.
             mcp_servers: Vec::new(),
+            // PROJECT-INSTRUCTIONS SLICE: default to None so
+            // pre-this-slice AgentOptions::new call sites keep sending
+            // the raw prompt byte-for-byte. The CLI seam populates
+            // this when AGENTS.md / CLAUDE.md is present at the repo
+            // root.
+            project_instructions: None,
         }
     }
 }
@@ -719,13 +786,24 @@ async fn drive<F: FnMut(AgentEvent)>(
     }
 
     // 4. session/prompt — response is `{}`; real output streams as notifications.
+    //
+    // PROJECT-INSTRUCTIONS SLICE: when the loader populated
+    // `opts.project_instructions` at the CLI seam, the
+    // composed prompt (instructions block + the user's task
+    // text, separated by `---`) is what reaches the engine.
+    // When `project_instructions` is `None`, the body of
+    // `compose_session_prompt` returns `opts.prompt` BYTE-FOR-BYTE,
+    // so this slice is non-breaking for any run without an
+    // AGENTS.md / CLAUDE.md at the repo root (regression pinned
+    // by `prompt_none_is_byte_identical_to_task`).
+    let final_prompt = compose_session_prompt(opts);
     write_frame(
         &mut write_half,
         &json!({
             "jsonrpc": "2.0",
             "id": "prompt",
             "method": "session/prompt",
-            "params": { "session_id": session_id, "prompt": opts.prompt },
+            "params": { "session_id": session_id, "prompt": final_prompt },
         }),
     )
     .await?;
@@ -2016,13 +2094,24 @@ where
     //
     //    Standard ACP content block shape:
     //     prompt: [{ type: "text", text: <string> }]
+    //
+    // PROJECT-INSTRUCTIONS SLICE: when the loader populated
+    // `opts.project_instructions` at the CLI seam, the composed
+    // prompt (instructions block + the user's task text, separated
+    // by `---`) is what reaches the engine. When
+    // `project_instructions` is `None`, `compose_session_prompt`
+    // returns `opts.prompt` BYTE-FOR-BYTE, so any run without
+    // AGENTS.md / CLAUDE.md at the repo root still sends the raw
+    // prompt — matching the pre-this-slice wire shape verbatim
+    // (regression pinned by `goose_prompt_frame_is_byte_identical_to_prompt_when_no_instructions`).
+    let final_prompt = compose_session_prompt(opts);
     let prompt_frame = json!({
         "jsonrpc": "2.0",
         "id": "prompt",
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": opts.prompt }],
+            "prompt": [{ "type": "text", "text": final_prompt }],
         },
     });
     let mut content = String::new();
@@ -2493,6 +2582,151 @@ mod tests {
     use super::*;
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
+
+    // -----------------------------------------------------------------
+    // PROJECT-INSTRUCTIONS SLICE — prompt composition regression guard.
+    //
+    // These tests pin the contract `compose_session_prompt` exposes
+    // to both `drive` (zeroclaw wire shape) and `drive_goose_io`
+    // (goose ACP wire shape):
+    //
+    //   * When `AgentOptions::project_instructions` is `None`, the
+    //     composed prompt text MUST be EXACTLY `opts.prompt`
+    //     byte-for-byte — matching every pre-this-slice run's wire
+    //     shape (any project without AGENTS.md / CLAUDE.md sees no
+    //     change). This is the non-breaking regression guard the
+    //     slice spec calls out.
+    //
+    //   * When `Some(text)`, the composed prompt MUST prepend a
+    //     clearly-delimited `# Project instructions (AGENTS.md)`
+    //     block ahead of the user's task, and the user's task text
+    //     MUST still appear verbatim somewhere in the result.
+    //
+    // An empty `Some("")` is normalized to "no instructions" —
+    // same behavior as `None` — so a zero-byte file cannot leak a
+    // bare-header block into the prompt.
+    // -----------------------------------------------------------------
+    fn opts_with_prompt(prompt: &str) -> AgentOptions {
+        let mut o = goose_opts(None);
+        o.prompt = prompt.to_string();
+        o
+    }
+
+    #[test]
+    fn prompt_none_is_byte_identical_to_task() {
+        let opts = opts_with_prompt("hello");
+        // `project_instructions` defaults to None in `goose_opts`,
+        // matching the `AgentOptions::new` default.
+        assert_eq!(
+            opts.project_instructions, None,
+            "compose_session_prompt regression guard requires the default to be None",
+        );
+        let composed = compose_session_prompt(&opts);
+        assert_eq!(
+            composed, "hello",
+            "with no project_instructions, the composed prompt MUST be exactly the task text \
+             (regression guard against silently injecting a header for repos without AGENTS.md)",
+        );
+    }
+
+    #[test]
+    fn prompt_empty_string_treated_as_none() {
+        // Empty `Some("")` is a degenerate case (a zero-byte file or
+        // a forgotten-`trim` bug upstream) and would otherwise produce
+        // an empty header block in front of the task. Normalize it
+        // to "no instructions" so the wire shape stays identical to
+        // the `None` path.
+        let mut opts = opts_with_prompt("hello");
+        opts.project_instructions = Some(String::new());
+        assert_eq!(
+            compose_session_prompt(&opts),
+            "hello",
+            "empty project_instructions must NOT prepend an empty header block",
+        );
+    }
+
+    #[test]
+    fn prompt_some_prepends_header_and_keeps_task_verbatim() {
+        // Block layout: `# Project instructions (AGENTS.md)\n\n{text}\n\n---\n\n{task}`.
+        // Mirrors `zoder_core::project_instructions::compose_prompt` so
+        // the CLI loader and the in-driver composer stay in lockstep;
+        // any future drift is caught by the parallel `zoder_core`
+        // tests and by these.
+        const HEADER: &str = "# Project instructions (AGENTS.md)\n\n";
+        const SEPARATOR: &str = "\n\n---\n\n";
+
+        let mut opts = opts_with_prompt("do the thing");
+        opts.project_instructions = Some("be polite".to_string());
+
+        let composed = compose_session_prompt(&opts);
+        let expected = format!("{HEADER}be polite{SEPARATOR}do the thing");
+        assert_eq!(
+            composed, expected,
+            "the prepended block must follow the documented header / separator format",
+        );
+
+        // The user's task text must still appear verbatim SOMEWHERE
+        // in the composed prompt; that's the whole point of
+        // prepending instead of replacing. Tests assert presence
+        // (not position) so future refactors that move the header
+        // to a foot-block are still caught — they would change the
+        // prompt in user-visible ways without affecting this check.
+        assert!(
+            composed.contains("do the thing"),
+            "composed prompt must contain the user's task text verbatim; got {composed:?}",
+        );
+
+        // And instructions must precede the user's task so the model
+        // treats them as system-level guidance, not as a follow-up
+        // instruction inside the task stream.
+        let instr_pos = composed
+            .find("be polite")
+            .expect("instructions text present in composed prompt");
+        let task_pos = composed
+            .find("do the thing")
+            .expect("task text present in composed prompt");
+        assert!(
+            instr_pos < task_pos,
+            "instructions must precede the user's task in the composed prompt \
+             (got instructions at byte {instr_pos}, task at byte {task_pos})",
+        );
+
+        // The separator is the single visible boundary between the
+        // two blocks — the model and any debug/log output can grep
+        // for it to tell project-instructions from user task.
+        assert!(
+            composed.contains("\n\n---\n\n"),
+            "the instructions/task boundary separator must be present in the composed prompt",
+        );
+    }
+
+    #[test]
+    fn prompt_some_preserves_unicode_and_newlines_in_task() {
+        // Regression for an earlier risk: a misbegotten `.trim()` or
+        // `.chars().collect()` between `prompt` and the wire would
+        // silently drop multi-byte / newline content. The composed
+        // prompt must carry the task text through verbatim.
+        let task = "summary\n  - fix login\n  - tweak copy\n  ñ";
+        let mut opts = opts_with_prompt(task);
+        opts.project_instructions = Some("instructions".to_string());
+        let composed = compose_session_prompt(&opts);
+        assert!(
+            composed.contains(task),
+            "task text must appear verbatim in the composed prompt; got {composed:?}",
+        );
+    }
+
+    #[test]
+    fn agent_options_new_defaults_project_instructions_to_none() {
+        // The non-breaking default: `AgentOptions::new` must yield
+        // `project_instructions: None` so any pre-this-slice
+        // construction site keeps sending the raw prompt.
+        let opts = AgentOptions::new("/tmp/sock", "codex", "/tmp/repo", "hi");
+        assert_eq!(
+            opts.project_instructions, None,
+            "AgentOptions::new must default project_instructions to None (non-breaking)",
+        );
+    }
 
     #[test]
     fn allowlist_is_read_only_and_exact_match() {
@@ -3213,6 +3447,11 @@ mod tests {
             trust_engine: false,
             // SLICE: empty Vec keeps the wire shape `[]` — non-breaking.
             mcp_servers: Vec::new(),
+            // PROJECT-INSTRUCTIONS SLICE: defaults to None so the
+            // goose-driver test surface keeps sending the raw `prompt`
+            // verbatim. A test that wants to exercise the prepended
+            // block sets it explicitly.
+            project_instructions: None,
         }
     }
 
@@ -5554,6 +5793,10 @@ mod goose_acp_real_turn {
             // against the real goose binary even though that test path
             // is gated behind `#[ignore]`.
             mcp_servers: Vec::new(),
+            // PROJECT-INSTRUCTIONS SLICE: default off so the
+            // real-engine oracle continues to send the raw prompt
+            // verbatim (matches every other `AgentOptions` literal).
+            project_instructions: None,
         };
         let mut conn = connect_transport(&transport)
             .await
