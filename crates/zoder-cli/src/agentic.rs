@@ -1364,6 +1364,158 @@ fn ceil_char_boundary_from_end(s: &str, n: usize) -> usize {
     i
 }
 
+/// Resolve `HEAD` to its full SHA. Returns `None` if the repo has no
+/// commits yet (the only case `git rev-parse HEAD` can fail with the
+/// repository present). Trims trailing whitespace; an empty trimmed result
+/// is also treated as `None` defensively (e.g. some plumbing edge cases).
+fn rev_parse_head(cwd: &Path) -> Option<String> {
+    run_git(cwd, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Outcome of one [`enforce_repo_commit_author`] pass. Variants are
+/// intentionally distinguishable so the loop can render an honest iter
+/// record (e.g. `already_correct` is a real no-op, not a missing field) and
+/// unit tests can pin each branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitAuthorEnforcement {
+    /// The repo has no commits yet. There is nothing to correct.
+    NoCommit,
+    /// HEAD's author already matches the repo's configured identity.
+    /// No git mutation happened; the SHA is unchanged.
+    AlreadyCorrect { current: String },
+    /// The repo has no configured `user.name`/`user.email`. There is
+    /// nothing correct to amend to — leave the commit alone rather than
+    /// guessing an identity.
+    NoConfiguredIdentity,
+    /// `git commit --amend --author=... --no-edit` was applied. The new
+    /// commit object has a different SHA (the author field is part of
+    /// the object) but the tree, message, and committer are preserved.
+    Corrected { from: String, to: String },
+    /// A git call failed. The commit is left untouched; the loop records
+    /// the reason and continues.
+    Failed { reason: String },
+}
+
+/// Render a [`CommitAuthorEnforcement`] for the per-iter JSON record.
+/// `None` (the author turn did not move HEAD) is rendered as `null` so
+/// consumers can distinguish "no commit was made" from "a commit was
+/// made and inspected" — a meaningful difference for downstream
+/// auditability.
+fn commit_author_enforcement_to_json(result: Option<&CommitAuthorEnforcement>) -> Value {
+    match result {
+        None => Value::Null,
+        Some(CommitAuthorEnforcement::NoCommit) => json!({"status": "no_commit"}),
+        Some(CommitAuthorEnforcement::AlreadyCorrect { current }) => {
+            json!({"status": "already_correct", "current": current})
+        }
+        Some(CommitAuthorEnforcement::NoConfiguredIdentity) => {
+            json!({"status": "no_configured_identity"})
+        }
+        Some(CommitAuthorEnforcement::Corrected { from, to }) => {
+            json!({"status": "corrected", "from": from, "to": to})
+        }
+        Some(CommitAuthorEnforcement::Failed { reason }) => {
+            json!({"status": "failed", "reason": reason})
+        }
+    }
+}
+
+/// Reconcile HEAD's author with the repo's own git config identity.
+///
+/// Zoder's default engine is `zeroclaw`, a long-lived daemon connected
+/// over a Unix socket. Zoder cannot control the daemon's environment, so
+/// the git identity the daemon uses when it runs `git commit` is whatever
+/// its parent process started it with — typically `zoder-bot <...>` and
+/// NOT the repo's configured `user.name`/`user.email`. Every commit the
+/// daemon lands in the working tree therefore needs to be amended to
+/// carry the repo's identity before the loop reports the turn as
+/// complete, otherwise a human has to `git commit --amend --author=...`
+/// after every loop run.
+///
+/// The fix is deliberately narrow:
+///
+///   * Only the author field is rewritten. `--no-edit` keeps the message
+///     and tree untouched; the committer is also preserved by `git`
+///     itself.
+///   * Only runs when the repo's local-then-global config has BOTH
+///     `user.name` and `user.email` set. If either is missing, there is
+///     nothing correct to amend to and the commit is left alone.
+///   * Skips the amend entirely when the HEAD author already matches the
+///     configured identity (no wasted amend, no SHA churn, no
+///     "corrected" log line).
+///
+/// Returns the outcome for observability and tests. Any git failure is
+/// captured as `Failed { reason }` — this function never panics and
+/// never returns an `Err`, so the loop can keep going.
+fn enforce_repo_commit_author(cwd: &Path) -> CommitAuthorEnforcement {
+    // 1. Resolve HEAD's SHA. A brand-new repo with no commits errors out
+    //    here — there is nothing to correct, and the next author turn may
+    //    create the first commit (which a future iter will catch via the
+    //    `None -> Some(sha)` SHA transition in `cmd_loop`).
+    let Some(_head_sha) = rev_parse_head(cwd) else {
+        return CommitAuthorEnforcement::NoCommit;
+    };
+
+    // 2. Resolve the repo's configured identity. `git config user.name` /
+    //    `user.email` honor the standard local-then-global resolution
+    //    (we deliberately do NOT pass `--global`, which would bypass the
+    //    local repo override). If either is missing, there is nothing
+    //    correct to amend to — leave the commit alone.
+    let cfg_name = run_git(cwd, &["config", "user.name"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cfg_email = run_git(cwd, &["config", "user.email"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (cfg_name, cfg_email) = match (cfg_name, cfg_email) {
+        (Some(n), Some(e)) => (n, e),
+        _ => return CommitAuthorEnforcement::NoConfiguredIdentity,
+    };
+    let desired = format!("{cfg_name} <{cfg_email}>");
+
+    // 3. Read HEAD's current author. `%an <%ae>` is the literal shape
+    //    git itself renders, so the comparison is byte-exact (no
+    //    whitespace or quoting surprises).
+    let current = match run_git(cwd, &["log", "-1", "--format=%an <%ae>"]) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            return CommitAuthorEnforcement::Failed {
+                reason: format!("reading HEAD author: {e}"),
+            }
+        }
+    };
+    if current == desired {
+        return CommitAuthorEnforcement::AlreadyCorrect { current };
+    }
+
+    // 4. Apply the correction. `--no-edit` keeps the message, tree, and
+    //    committer untouched; only the author field is rewritten. The
+    //    new commit object has a different SHA (the author is part of
+    //    the object), but content is preserved.
+    let amend = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["commit", "--amend", "--author", &desired, "--no-edit"])
+        .status();
+    match amend {
+        Ok(s) if s.success() => CommitAuthorEnforcement::Corrected {
+            from: current,
+            to: desired,
+        },
+        Ok(s) => CommitAuthorEnforcement::Failed {
+            reason: format!("`git commit --amend` exited {s}"),
+        },
+        Err(e) => CommitAuthorEnforcement::Failed {
+            reason: format!("spawning `git commit --amend`: {e}"),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Diff-substance anti-gaming guard.
 //
@@ -2554,6 +2706,13 @@ pub(crate) async fn cmd_loop(
     // consecutive stalls, mirroring `dead_streak`. Prevents one empty author turn
     // from terminating a task that is genuinely still converging.
     let mut stall_streak = 0usize;
+    // HEAD SHA captured at the end of the previous iteration, used to detect
+    // "this author turn produced a new commit" (the post-commit safety net
+    // that reconciles the commit's author with the repo's configured
+    // identity — see `enforce_repo_commit_author`). `None` when the repo has
+    // no commits yet; the transition `None -> Some(sha)` then triggers a
+    // correction on the first author-made commit.
+    let mut prev_head: Option<String> = rev_parse_head(&cwd);
     const STALL_LIMIT: usize = 3;
 
     for i in 1..=max_iters {
@@ -2623,7 +2782,33 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             }
         };
 
-        // 2. Capture the working-tree diff (whatever edits actually landed).
+        // 2. Post-commit author reconciliation. The default engine is a
+        //    long-lived zeroclaw daemon whose git identity is out of
+        //    zoder's control, so any commit the author turn landed in
+        //    the working tree is amended to carry the repo's configured
+        //    `user.name`/`user.email` here, before the diff is built
+        //    and the reviewer is invoked. This is the safety net that
+        //    closes the recurring operational defect where every
+        //    `zoder loop` commit landed under `zoder-bot <...>` and a
+        //    human had to `git commit --amend --author=...` before it
+        //    was push-safe. See `enforce_repo_commit_author` for the
+        //    invariants (author-only, no-op when already correct, no-op
+        //    when no configured identity).
+        let current_head: Option<String> = rev_parse_head(&cwd);
+        let commit_author_enforcement: Option<CommitAuthorEnforcement> =
+            if current_head != prev_head {
+                let result = enforce_repo_commit_author(&cwd);
+                if let CommitAuthorEnforcement::Corrected { from, to } = &result {
+                    if !cli.quiet {
+                        eprintln!("[zoder] corrected commit author: {from} -> {to}");
+                    }
+                }
+                Some(result)
+            } else {
+                None
+            };
+
+        // 3. Capture the working-tree diff (whatever edits actually landed).
         let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
@@ -2635,7 +2820,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // continues to the next iteration.
         let diff_substance = classify_diff_substance(&diff);
 
-        // 3. Validate (build/test) if a check command was given. The check is
+        // 4. Validate (build/test) if a check command was given. The check is
         // its own child process (a shell) and historically had NO watchdog —
         // a hung script blocked the loop forever. Wrap with `run_check_watched`
         // so a wedged check is killed at `loop_timeout_secs` and recorded as a
@@ -2698,7 +2883,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             }
         }
 
-        // 4. Adversarial review of the current diff (+ validation output).
+        // 5. Adversarial review of the current diff (+ validation output).
         let review_user = {
             let mut u = format!(
                 "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
@@ -2802,7 +2987,13 @@ nits).\n",
         // Track the watchdog budget so per-iter logs show what went wrong.
         // `check_phase_timed_out` distinguishes a wedged check from a check that
         // genuinely reported failure (CI exited 1, etc.) — same `passed=false`
-        // outcome, different root cause.
+        // outcome, different root cause. `commit_author_enforcement` is the
+        // post-commit safety net: when the author turn moved HEAD, this
+        // records whether the new commit's author was already correct,
+        // was rewritten to the repo's configured identity, was left alone
+        // because no identity was configured, or some other terminal
+        // outcome — so the iter record is the single source of truth
+        // for what (if anything) the loop had to fix on disk.
         iterations.push(json!({
             "iter": i,
             "author_model": author_model,
@@ -2818,9 +3009,12 @@ nits).\n",
             "blocking_findings": blocking,
             "summary": review.summary,
             "cost_usd_cumulative": total_cost,
+            "commit_author_enforcement": commit_author_enforcement_to_json(
+                commit_author_enforcement.as_ref()
+            ),
         }));
 
-        // 5. Decide: review gate AND objective gate AND anti-gaming substance gate.
+        // 6. Decide: review gate AND objective gate AND anti-gaming substance gate.
         //    `review_ok` is now AUTHORITATIVE on the explicit verdict — see
         //    `loop_review_ok`. `check_satisfied` does not fabricate a green check
         //    when none was configured; resolution may still occur on
@@ -2967,8 +3161,17 @@ re-prompting the author with a firmer directive."
             stall_streak = 0;
         }
         prev_diff = diff.clone();
+        // Advance the "previous HEAD" cursor for the next iter's
+        // new-commit detection. After a successful amend, `current_head`
+        // is the new SHA; if the author never moved HEAD, this re-asserts
+        // the unchanged value. Captured here (not at iter start) so a
+        // commit that lands during this iter is correctly detected as
+        // "new" only for THIS iter — the next iter's cursor is the
+        // post-amend state, which is the only correct "previous" for
+        // detecting further author-made commits.
+        prev_head = current_head;
 
-        // 6. Compose feedback for the next author turn.
+        // 7. Compose feedback for the next author turn.
         let mut fb = String::new();
         if let Some(e) = &author_err {
             fb.push_str(&format!(
@@ -5222,4 +5425,483 @@ mod reviewer_chain_dispatch_tests {
     // end reviewer tests).
     #[allow(dead_code)]
     fn _unused_import_anchor(_: &Provider, _: &PathBuf) {}
+}
+
+// ---------------------------------------------------------------------------
+// `enforce_repo_commit_author` — post-commit author reconciliation.
+//
+// Pins the operational defect where every `zoder loop` commit landed
+// under `zoder-bot <...>` and a human had to `git commit --amend
+// --author=...` before the commit was push-safe. The fix lives in
+// `enforce_repo_commit_author` (above) and runs inside `cmd_loop` after
+// every author turn that moves HEAD.
+//
+// These tests use real `git` (not git2 / gix — neither is a dep) and
+// cover the three primary cases the production incident surfaced, plus
+// the no-commit / no-configured-identity edge cases the fail-closed
+// contract demands:
+//   * mismatched author -> amend, author field updated, tree / message
+//     byte-identical, SHA moved (proves the amend actually ran),
+//   * already-correct author -> no-op, SHA unchanged,
+//   * no configured identity -> no-op, no error,
+//   * no commits at all -> no-op, no error.
+//
+// All tests are POSIX-safe (they use `git` via the same shell-out path
+// the production code uses) and isolated per-test via `tempfile::tempdir`
+// so a stray env-var leak in one test cannot poison the next.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod commit_author_enforcement_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Run `git` against `repo`, asserting success. Mirrors the helper in
+    /// `review_diff_soundness_tests` (kept independent so this module
+    /// has no cross-module coupling).
+    fn run(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Run `git` and return its trimmed stdout, asserting success. Used
+    /// for read-only probes (`rev-parse`, `log`, `config`).
+    fn read(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Initialize a temp repo, set a chosen local identity, commit a
+    /// single seed file, then return the repo path. The local identity
+    /// is what subsequent tests will configure the `user.name` /
+    /// `user.email` to — distinct from the seed commit's author so the
+    /// "mismatched" case has something to fix.
+    fn init_repo_with_local_identity(name: &str, email: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["config", "init.defaultBranch", "main"]);
+        // Seed the repo with a commit under a deliberately-DIFFERENT
+        // identity (so we can test the correction path), then re-set
+        // the local identity to the values under test before returning.
+        run(
+            &repo,
+            &["config", "user.email", "seed-author@example.invalid"],
+        );
+        run(&repo, &["config", "user.name", "Seed Author"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-q", "-m", "init"]);
+        // Now switch to the identity the test will assert against.
+        run(&repo, &["config", "user.email", email]);
+        run(&repo, &["config", "user.name", name]);
+        (dir, repo)
+    }
+
+    /// REGRESSION (the production incident): a commit whose author
+    /// does NOT match the repo's `user.name`/`user.email` MUST be
+    /// amended to carry the repo's identity, while the tree and
+    /// message are preserved byte-for-byte. Before this fix, the loop
+    /// shipped commits under `zoder-bot <...>` and a human had to
+    /// `git commit --amend --author=...` after every run.
+    #[test]
+    fn enforce_repo_commit_author_amends_mismatched_author() {
+        let (_dir, repo) =
+            init_repo_with_local_identity("Configured User", "configured@example.invalid");
+
+        // Capture the pre-amend invariants: SHA, tree SHA, message.
+        // The SHA MUST change after the amend (author is part of the
+        // object) but the tree and message MUST stay byte-identical.
+        let pre_sha = read(&repo, &["rev-parse", "HEAD"]);
+        let pre_tree = read(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let pre_msg = read(&repo, &["log", "-1", "--format=%s"]);
+        let pre_author = read(&repo, &["log", "-1", "--format=%an <%ae>"]);
+        assert_eq!(
+            pre_author, "Seed Author <seed-author@example.invalid>",
+            "pre-condition: the seed commit must NOT already match the configured identity, \
+             or this test pins nothing"
+        );
+
+        let result = enforce_repo_commit_author(&repo);
+        match &result {
+            CommitAuthorEnforcement::Corrected { from, to } => {
+                assert_eq!(from, "Seed Author <seed-author@example.invalid>");
+                assert_eq!(to, "Configured User <configured@example.invalid>");
+            }
+            other => panic!("expected Corrected, got {other:?}"),
+        }
+
+        // HEAD's author is now the configured identity.
+        assert_eq!(
+            read(&repo, &["log", "-1", "--format=%an <%ae>"]),
+            "Configured User <configured@example.invalid>",
+            "HEAD author must equal the configured identity after the amend"
+        );
+
+        // SHA moved (the amend produced a new object — author is part
+        // of the object). This is the literal witness that the amend
+        // actually ran, not a no-op-with-fancy-logging.
+        let post_sha = read(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(pre_sha, post_sha, "amend MUST change the commit SHA");
+
+        // Tree SHA is byte-identical — `git commit --amend` with
+        // `--no-edit` and no working-tree change must NOT alter the
+        // tree. This is the regression guard: a buggy implementation
+        // that re-staged or dropped the tree would surface here.
+        assert_eq!(
+            read(&repo, &["rev-parse", "HEAD^{tree}"]),
+            pre_tree,
+            "tree SHA must be byte-identical before/after the amend; only the author field moves"
+        );
+
+        // Message is byte-identical — `--no-edit` keeps the message
+        // exactly as-is.
+        assert_eq!(
+            read(&repo, &["log", "-1", "--format=%s"]),
+            pre_msg,
+            "commit subject must be byte-identical before/after the amend"
+        );
+    }
+
+    /// `enforce_repo_commit_author` is a no-op when HEAD's author
+    /// already matches the configured identity. The SHA must be
+    /// unchanged (so we know the amend really did not run) and the
+    /// outcome must report `AlreadyCorrect` so the iter record is
+    /// honest about what happened.
+    #[test]
+    fn enforce_repo_commit_author_is_noop_when_already_correct() {
+        let (dir, repo) =
+            init_repo_with_local_identity("Already Right", "already-right@example.invalid");
+        // The seed commit was under a different identity. Amend once
+        // to put the seed commit on the right identity, then run the
+        // helper again — that second run is the actual no-op case
+        // under test.
+        let _ = enforce_repo_commit_author(&repo);
+        let post_amend_sha = read(&repo, &["rev-parse", "HEAD"]);
+        let post_amend_author = read(&repo, &["log", "-1", "--format=%an <%ae>"]);
+        assert_eq!(
+            post_amend_author, "Already Right <already-right@example.invalid>",
+            "first run must align the seed commit's author with the configured identity"
+        );
+
+        let result = enforce_repo_commit_author(&repo);
+        match &result {
+            CommitAuthorEnforcement::AlreadyCorrect { current } => {
+                assert_eq!(current, "Already Right <already-right@example.invalid>");
+            }
+            other => panic!("expected AlreadyCorrect, got {other:?}"),
+        }
+
+        // SHA unchanged: literal proof the amend did NOT run on the
+        // second call. A buggy implementation that always amended
+        // (even on a matching identity) would keep rewriting the
+        // commit to itself with a new SHA every call.
+        assert_eq!(
+            read(&repo, &["rev-parse", "HEAD"]),
+            post_amend_sha,
+            "no-op run MUST NOT change the commit SHA"
+        );
+        drop(dir);
+    }
+
+    /// When the repo has no configured `user.name` / `user.email`
+    /// there is nothing correct to amend to — leave the commit alone
+    /// and surface `NoConfiguredIdentity` so the iter record is
+    /// honest. The fix MUST NOT guess an identity (hardcoding
+    /// `zoder-bot` here would be the obvious wrong answer) and MUST
+    /// NOT error.
+    ///
+    /// Hermeticity: the host's `~/.gitconfig` (or system config) may
+    /// carry its own `user.name`/`user.email`, which would shadow the
+    /// repo's local config under git's normal local-then-global
+    /// resolution. We force a hermetic `git` invocation by pointing
+    /// `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at `/dev/null`,
+    /// which makes git treat those scopes as empty — the same
+    /// trick the unit tests in this crate use elsewhere when they
+    /// need a clean identity-free repo.
+    #[cfg(unix)]
+    #[test]
+    fn enforce_repo_commit_author_does_nothing_when_no_identity_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["config", "init.defaultBranch", "main"]);
+        // Seed the repo with a commit under a known-wrong author so
+        // the assertion below has a literal witness to compare
+        // against. We have to set the identity to make the seed
+        // commit, then unset it to put the helper in the
+        // "no-identity" state.
+        run(&repo, &["config", "user.email", "seed@example.invalid"]);
+        run(&repo, &["config", "user.name", "Seed"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-q", "-m", "init"]);
+        // Unset BOTH user fields at the local scope. The
+        // local-then-global lookup will then resolve to "no
+        // identity" ONLY if the global scope is also empty, which
+        // is the case in the test sandbox because we override the
+        // env below.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--unset", "user.name"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--unset", "user.email"])
+            .status();
+
+        // Hermetic git: ignore the host's global / system config so
+        // a CI runner with `user.name=ULTRA build` in `~/.gitconfig`
+        // does not leak into the test. The local repo's own config
+        // (where we just unset user.name / user.email) is the only
+        // scope that matters.
+        let _guard = HermeticGitConfig::installed();
+
+        // Pre-condition: `git config user.name` resolves to empty.
+        let probe = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.name"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("spawn git");
+        assert!(
+            !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim().is_empty(),
+            "pre-condition: the test repo must have no user.name set (probe exit={:?} stdout={:?})",
+            probe.status,
+            String::from_utf8_lossy(&probe.stdout)
+        );
+
+        let pre_sha = read(&repo, &["rev-parse", "HEAD"]);
+        let pre_author = read(&repo, &["log", "-1", "--format=%an <%ae>"]);
+
+        let result = enforce_repo_commit_author(&repo);
+        assert!(
+            matches!(result, CommitAuthorEnforcement::NoConfiguredIdentity),
+            "no configured identity must surface as NoConfiguredIdentity, got {result:?}"
+        );
+
+        // Commit is byte-untouched: same SHA, same author. The helper
+        // MUST NOT guess an identity (e.g. fall back to a hardcoded
+        // default like `zoder-bot`) and MUST NOT amend.
+        assert_eq!(
+            read(&repo, &["rev-parse", "HEAD"]),
+            pre_sha,
+            "no-configured-identity must NOT amend HEAD"
+        );
+        assert_eq!(
+            read(&repo, &["log", "-1", "--format=%an <%ae>"]),
+            pre_author,
+            "no-configured-identity must NOT rewrite HEAD's author"
+        );
+        drop(dir);
+    }
+
+    /// Test-scoped RAII guard that makes every `git` invocation in
+    /// this test process see an empty global / system config. Used
+    /// by tests that need a "no identity is set anywhere" precondition
+    /// regardless of the host's `~/.gitconfig` (CI runners frequently
+    /// have a `user.name=...` in their global config which would
+    /// otherwise leak in and break the no-identity assertion).
+    ///
+    /// Unix-only: the only way to override the global config location
+    /// cleanly is the `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` env
+    /// vars, set via `libc::setenv`. On non-unix the test is
+    /// conditional and the guard is a no-op (its only consumer is
+    /// also unix-only — see the `cfg` attribute on the tests below).
+    ///
+    /// **Concurrency.** `setenv` mutates the whole-process env, so
+    /// a test that holds this guard MUST also hold the shared
+    /// `GIT_ENV_LOCK` mutex to serialize against other tests in this
+    /// binary that might be reading git config concurrently. Without
+    /// the lock, two parallel tests could see each other's
+    /// `GIT_CONFIG_GLOBAL` and one of them would observe the wrong
+    /// identity. The lock is held for the guard's lifetime — a few
+    /// `git` invocations in the test body — so the wall-clock cost
+    /// is small and parallel test throughput is preserved.
+    struct HermeticGitConfig {
+        // RAII: `_lock` must be declared FIRST so its `Drop` runs
+        // LAST (Rust drops fields in declaration order). The lock
+        // must still be held when `Drop` for `HermeticGitConfig`
+        // (the one below) runs `unsetenv` — otherwise another test
+        // could grab the lock, see the env-var override, and leak
+        // it. This is the same field-ordering discipline `EnvGuard`
+        // uses elsewhere in this crate.
+        #[cfg(unix)]
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _private: (),
+    }
+
+    /// Process-wide serialization point for tests that touch
+    /// `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`. See
+    /// `HermeticGitConfig` for the why.
+    #[cfg(unix)]
+    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl HermeticGitConfig {
+        /// Construct and install the guard. Construction calls
+        /// `install()` so the test body only has to bind the value
+        /// to a `_guard` binding for `Drop` to run at scope exit.
+        fn installed() -> Self {
+            Self::install();
+            // The lock is held for the guard's lifetime. Declared
+            // as `Option` so the unix / non-unix arms can both
+            // share the same struct shape (the field is absent on
+            // non-unix, where the lock is also absent).
+            #[cfg(unix)]
+            let lock = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            Self {
+                #[cfg(unix)]
+                _lock: lock,
+                _private: (),
+            }
+        }
+
+        #[cfg(unix)]
+        fn install() {
+            // `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` are honored
+            // by `git` since 1.7.10; pointing them at `/dev/null`
+            // makes git treat those scopes as empty. We use process
+            // env (not thread-local) because `Command::new("git")`
+            // inherits the parent process's env by default — every
+            // test invocation already runs inside a `cargo test`
+            // process, so setting the env once at the top of the
+            // test propagates to every `git` child the test spawns
+            // (including the ones the helper itself spawns via
+            // `std::process::Command`).
+            //
+            // SAFETY: `setenv` is not thread-safe; this test is
+            // `#[test]` (not `#[tokio::test]`), so the test function
+            // is the only thread that observes the change in the
+            // short window between `setenv` and the test's
+            // `git` invocations. The mutex held by `_lock`
+            // (declared above) serializes against any other test
+            // that might be reading git config in parallel. The
+            // `&str` -> `*const i8` cast is safe because the
+            // pointers are derived from string literals with
+            // `'static` lifetime; `setenv` only copies the bytes
+            // during the call, so the borrow is released before
+            // the function returns.
+            unsafe {
+                libc::setenv(
+                    c"GIT_CONFIG_GLOBAL".as_ptr() as *const libc::c_char,
+                    c"/dev/null".as_ptr() as *const libc::c_char,
+                    1,
+                );
+                libc::setenv(
+                    c"GIT_CONFIG_SYSTEM".as_ptr() as *const libc::c_char,
+                    c"/dev/null".as_ptr() as *const libc::c_char,
+                    1,
+                );
+            }
+        }
+
+        #[cfg(not(unix))]
+        fn install() {}
+    }
+
+    #[cfg(unix)]
+    impl Drop for HermeticGitConfig {
+        fn drop(&mut self) {
+            // Best-effort: clear the env so the next test (if any)
+            // sees the host's normal git config. We do not fail the
+            // test on `unsetenv` errors — the only consequence is
+            // residual process env, which is harmless after the
+            // process exits. SAFETY: see `install`; the cast is from
+            // a `'static` string literal. The lock (`_lock`) is
+            // still held at this point (Rust drops `_lock` AFTER
+            // `HermeticGitConfig`'s own `Drop`, because `_lock` is
+            // declared first in the struct), so another test cannot
+            // observe a half-cleaned env.
+            unsafe {
+                libc::unsetenv(c"GIT_CONFIG_GLOBAL".as_ptr() as *const libc::c_char);
+                libc::unsetenv(c"GIT_CONFIG_SYSTEM".as_ptr() as *const libc::c_char);
+            }
+        }
+    }
+
+    /// A brand-new repo with NO commits must return `NoCommit` and
+    /// must not error. The author turn may be in the middle of
+    /// staging untracked files — there is nothing to amend and the
+    /// helper must not invent one.
+    #[test]
+    fn enforce_repo_commit_author_does_nothing_with_no_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["config", "user.email", "x@example.invalid"]);
+        run(&repo, &["config", "user.name", "X"]);
+
+        let result = enforce_repo_commit_author(&repo);
+        assert!(
+            matches!(result, CommitAuthorEnforcement::NoCommit),
+            "no-commit repo must surface as NoCommit, got {result:?}"
+        );
+        drop(dir);
+    }
+
+    /// `commit_author_enforcement_to_json` is the bridge from the
+    /// enum to the per-iter JSON record. It must distinguish
+    /// "no commit was made" (`null`) from each of the four
+    /// outcome variants so downstream audit logs can tell them
+    /// apart — the regression we are guarding against is
+    /// "everything collapses to null, no observability for what
+    /// actually happened".
+    #[test]
+    fn commit_author_enforcement_to_json_renders_all_variants() {
+        // No commit was made during this iter.
+        assert_eq!(
+            commit_author_enforcement_to_json(None),
+            serde_json::Value::Null
+        );
+        // No commits in the repo at all.
+        let v = commit_author_enforcement_to_json(Some(&CommitAuthorEnforcement::NoCommit));
+        assert_eq!(v["status"], "no_commit");
+        // HEAD's author already matches.
+        let v = commit_author_enforcement_to_json(Some(&CommitAuthorEnforcement::AlreadyCorrect {
+            current: "X <x@y>".into(),
+        }));
+        assert_eq!(v["status"], "already_correct");
+        assert_eq!(v["current"], "X <x@y>");
+        // No identity configured.
+        let v =
+            commit_author_enforcement_to_json(Some(&CommitAuthorEnforcement::NoConfiguredIdentity));
+        assert_eq!(v["status"], "no_configured_identity");
+        // Amended.
+        let v = commit_author_enforcement_to_json(Some(&CommitAuthorEnforcement::Corrected {
+            from: "A <a@b>".into(),
+            to: "C <c@d>".into(),
+        }));
+        assert_eq!(v["status"], "corrected");
+        assert_eq!(v["from"], "A <a@b>");
+        assert_eq!(v["to"], "C <c@d>");
+        // Failed (e.g. git binary not found, repo disappeared).
+        let v = commit_author_enforcement_to_json(Some(&CommitAuthorEnforcement::Failed {
+            reason: "boom".into(),
+        }));
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["reason"], "boom");
+    }
 }
