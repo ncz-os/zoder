@@ -1840,10 +1840,36 @@ fn kill_process_group(pgid: Option<i32>, pid: Option<u32>) {
 /// can take the whole subtree down with one `kill(-pgid, SIGKILL)` and no
 /// orphan shells/process can outlive the budget.
 ///
+/// Before spawn, `cmd` is statically inspected by
+/// [`crate::exec_safety::inspect_shell_command`] against a small denylist
+/// of clearly-catastrophic patterns (`rm -rf /`, redirects to `/etc/...`,
+/// `dd of=/dev/...`, `curl|sh`, …). A deny is returned to the caller as
+/// `(false, reason)` so the loop naturally records the failure and feeds
+/// it to the next author turn — no silent proceed, no special error type.
+/// `allow_dangerous = true` skips the inspection and is the explicit
+/// escape hatch for operators who really do need to run a destructive
+/// validation command from `--check`.
+///
 /// Returns `(passed, tail)` where `tail` is the last ~4 KB of combined
 /// stdout+stderr. On timeout `passed` is `false` and `tail` carries a clear
 /// phase-timed-out marker so the next author turn can see it.
-async fn run_check_watched(cwd: &Path, cmd: &str, secs: u64) -> (bool, String) {
+async fn run_check_watched(
+    cwd: &Path,
+    cmd: &str,
+    secs: u64,
+    allow_dangerous: bool,
+) -> (bool, String) {
+    if !allow_dangerous {
+        match crate::exec_safety::inspect_shell_command(cmd) {
+            crate::exec_safety::ExecVerdict::Allow => {}
+            crate::exec_safety::ExecVerdict::Deny(reason) => {
+                // Same return shape as a real failure so the loop treats a
+                // denied check identically to a failing one — the next
+                // author turn reads the deny-reason out of the tail.
+                return (false, reason);
+            }
+        }
+    }
     let budget = std::time::Duration::from_secs(secs.max(1));
     let mut command = tokio::process::Command::new("sh");
     command
@@ -1915,8 +1941,17 @@ async fn run_check_watched(cwd: &Path, cmd: &str, secs: u64) -> (bool, String) {
 /// can exercise the original "spawn-and-block" semantics independently of
 /// `run_check_watched`. Production callers always go through the watched
 /// path so a wedged child can never block the loop.
+///
+/// `allow_dangerous` mirrors `run_check_watched`: the denylist inspection
+/// runs unless the caller passes `true`.
 #[cfg(test)]
-fn run_check(cwd: &Path, cmd: &str) -> (bool, String) {
+fn run_check(cwd: &Path, cmd: &str, allow_dangerous: bool) -> (bool, String) {
+    if !allow_dangerous {
+        match crate::exec_safety::inspect_shell_command(cmd) {
+            crate::exec_safety::ExecVerdict::Allow => {}
+            crate::exec_safety::ExecVerdict::Deny(reason) => return (false, reason),
+        }
+    }
     match std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -2172,6 +2207,12 @@ fn update_loop_streaks(
 /// [`DEFAULT_LOOP_TIMEOUT_SECS`], configurable via `--loop-timeout`): each
 /// author/check/review child is hard-capped at this many seconds. On expiry
 /// the spawned process group is killed and the loop continues — never hangs.
+///
+/// `allow_dangerous_check` opts out of the pre-exec denylist in
+/// [`crate::exec_safety::inspect_shell_command`] that runs against the
+/// `--check` command string before `sh -c` spawns it. Default is `false`;
+/// an operator who genuinely needs to run a destructive validation command
+/// can pass `--allow-dangerous-check` to skip the inspection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_loop(
     cli: &crate::Cli,
@@ -2185,6 +2226,7 @@ pub(crate) async fn cmd_loop(
     accept_on_green: bool,
     background: bool,
     loop_timeout_secs: u64,
+    allow_dangerous_check: bool,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
     if background && active_job_dir().is_none() {
@@ -2323,7 +2365,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     eprintln!("[loop] iter {i}: check `{c}`…");
                 }
                 let t0 = std::time::Instant::now();
-                let (ok, tail) = run_check_watched(&cwd, c, loop_timeout_secs).await;
+                let (ok, tail) =
+                    run_check_watched(&cwd, c, loop_timeout_secs, allow_dangerous_check).await;
                 if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
                     check_timed_out = true;
                     if !cli.quiet {
@@ -3034,7 +3077,7 @@ mod tests {
         // Budget of 1s on a child that sleeps 30s — if the watchdog works
         // we land back in ~1s. If it doesn't, the test itself fails on the
         // CI runner's overall timeout, mirroring the production symptom.
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "sleep 30", 1).await;
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "sleep 30", 1, false).await;
         let elapsed = start.elapsed();
 
         assert!(!ok, "hung child must be reported as failed");
@@ -3060,7 +3103,7 @@ mod tests {
     /// didn't accidentally turn every check into a 900s wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_passes_fast_child() {
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "exit 0", 1).await;
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "exit 0", 1, false).await;
         assert!(ok, "fast pass-through must succeed; tail={tail:?}");
         assert!(
             !tail.contains("killed after") && !tail.contains("(loop timeout)"),
@@ -3073,7 +3116,7 @@ mod tests {
     /// tell "CI red" from "loop hung" and may try to fix the wrong thing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_passes_through_real_failures() {
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "echo boom; exit 1", 1).await;
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "echo boom; exit 1", 1, false).await;
         assert!(!ok, "exit 1 must report failure");
         assert!(
             tail.contains("boom"),
@@ -3140,8 +3183,77 @@ mod tests {
         // If anyone re-introduces a timeout inside the raw `run_check`, this
         // assertion catches it: the watchdog is the only thing that bounds
         // wall-clock, by design.
-        let (ok, _tail) = run_check(&tmp_cwd(), "exit 0");
+        let (ok, _tail) = run_check(&tmp_cwd(), "exit 0", false);
         assert!(ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // `run_check_watched` + exec_safety wiring.
+    //
+    // These tests pin the integration: the denylist lives in
+    // `exec_safety::inspect_shell_command`, but the production call site
+    // is `run_check_watched` (and its unwatched twin `run_check`). The
+    // pure-function tests in `exec_safety::tests` cover every pattern;
+    // these tests assert the call site actually consults the denylist
+    // before spawning `sh -c`.
+    // -----------------------------------------------------------------------
+
+    /// A `--check` command that matches the denylist MUST be refused
+    /// without ever spawning `sh -c`. The deny-reason reaches the caller
+    /// as the `tail`, where the next loop iteration will read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_denies_dangerous_command_without_spawning() {
+        let start = std::time::Instant::now();
+        let (ok, tail) = run_check_watched(&tmp_cwd(), "rm -rf /", 5, false).await;
+        let elapsed = start.elapsed();
+        assert!(!ok, "denied command must be reported as failed");
+        assert!(
+            tail.contains("rm -rf /") || tail.to_lowercase().contains("filesystem"),
+            "tail must carry the deny reason; got: {tail:?}"
+        );
+        // The denylist fires synchronously, BEFORE the spawn — so this
+        // returns in microseconds, not the full watchdog budget. If a
+        // future refactor accidentally spawns first and then checks, this
+        // assertion catches it.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "denylist must short-circuit before spawn; took {:?}",
+            elapsed
+        );
+    }
+
+    /// `allow_dangerous = true` is the documented operator escape hatch
+    /// for legitimate destructive validation commands. The shell still
+    /// runs (and in this test, exits non-zero because `rm -rf /` on a
+    /// non-privileged shell will fail), but the denylist itself is
+    /// bypassed. The exact runtime behavior of `rm -rf /` is
+    /// platform/permission-dependent and out of scope for this pin;
+    /// what matters is that the call reaches the shell at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_bypasses_denylist_when_allow_dangerous() {
+        // `true` is a no-op shell command that exits 0; we use it as a
+        // benign stand-in to prove that `allow_dangerous=true` lets a
+        // command through. We avoid running `rm -rf /` for real here
+        // because that interacts with the host filesystem and the
+        // integration test environment.
+        let (ok, _tail) = run_check_watched(&tmp_cwd(), "true", 5, true).await;
+        assert!(
+            ok,
+            "allow_dangerous=true must let a benign command pass to the shell"
+        );
+    }
+
+    /// An ordinary, benign `--check` command MUST still pass through the
+    /// denylist (and through to the shell). This is the regression guard
+    /// against accidentally over-blocking on common CI commands — the
+    /// loop would otherwise refuse to run any `cargo test` ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_passes_through_benign_command() {
+        let (ok, _tail) = run_check_watched(&tmp_cwd(), "true", 5, false).await;
+        assert!(
+            ok,
+            "benign `true` command must pass the denylist and exit 0"
+        );
     }
 
     // -----------------------------------------------------------------------

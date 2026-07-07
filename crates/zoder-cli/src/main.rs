@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use fs2::FileExt;
 mod agentic;
+mod exec_safety;
 mod goose;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
@@ -564,6 +565,14 @@ enum Cmd {
         /// advisory (escape hatch for over-strict reviewers). Requires `--check`.
         #[arg(long)]
         accept_on_green: bool,
+        /// Skip the pre-exec denylist inspection of the `--check` command
+        /// string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`,
+        /// `curl|sh`, …). Default is to refuse to run a `--check` command
+        /// that matches the denylist — set this flag to allow such
+        /// commands explicitly. The denylist is best-effort, not a sandbox;
+        /// see `exec_safety.rs` for the honest scope statement.
+        #[arg(long)]
+        allow_dangerous_check: bool,
         /// Run detached as a tracked background job.
         #[arg(long)]
         background: bool,
@@ -1080,6 +1089,7 @@ async fn run() -> anyhow::Result<()> {
             base,
             scope,
             accept_on_green,
+            allow_dangerous_check,
             background,
         }) => {
             agentic::cmd_loop(
@@ -1094,6 +1104,7 @@ async fn run() -> anyhow::Result<()> {
                 *accept_on_green,
                 *background,
                 cli.loop_timeout.unwrap_or(900),
+                *allow_dangerous_check,
             )
             .await
         }
