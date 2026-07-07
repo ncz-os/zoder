@@ -1,12 +1,24 @@
 //! Provider layer: OpenAI-compatible chat calls with streaming + LiteLLM
 //! telemetry extraction (exact per-call cost, served backend, fallbacks).
 
-use crate::config::{Provider, DEFAULT_ACCOUNT_ID};
+use crate::config::{Auth, Provider, DEFAULT_ACCOUNT_ID};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
+
+/// Anthropic Messages API version header. Pinned to the value the wire
+/// adapter always sends; Anthropic's docs guarantee this version is honored
+/// indefinitely. The constant lives here so the request builder and the
+/// tests share the exact same string.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Anthropic Messages API wire suffix (the `/v1/messages` path). The
+/// existing `endpoint_url` helper adds the `/v1` segment when the configured
+/// `base_url` does not already include one, so passing `"messages"` here
+/// yields the spec-correct `{base_url}/v1/messages` URL for both
+/// `https://api.anthropic.com` and `https://api.anthropic.com/v1`.
+const ANTHROPIC_MESSAGES_SUFFIX: &str = "messages";
 
 /// Default overall request budget (seconds). Override: ZODER_TIMEOUT_S.
 const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
@@ -375,16 +387,182 @@ fn endpoint_url(base_url: &str, kind: &str, suffix: &str) -> String {
     }
 }
 
+/// Strip a `Bearer ` prefix (case-insensitive) from a header value so a
+/// `kind == "anthropic"` provider can re-use an [`Auth`] whose
+/// [`Auth::header_pair`] returns `Authorization: Bearer <token>`. The
+/// Anthropic Messages API wants `x-api-key: <token>` with NO `Bearer `
+/// prefix. Pure &str -> &str so callers can decide what to do on a None.
+fn strip_bearer_prefix(value: &str) -> &str {
+    let trimmed = value.trim_start();
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        &trimmed[7..]
+    } else if trimmed.eq_ignore_ascii_case("bearer") {
+        ""
+    } else {
+        value
+    }
+}
+
+/// Build the Anthropic Messages API wire body. Anthropic's `messages` array
+/// only allows role `user`/`assistant` (no `system` inline), so any leading
+/// system-role message in `req.messages` is pulled out and rendered as the
+/// top-level `system` string field. All other messages pass through with
+/// the same `(role, content)` shape OpenAI uses — the field names line up,
+/// so the JSON is structurally compatible. `stream` is preserved so the
+/// SSE path can request `stream: true` end-to-end.
+///
+/// `req.reasoning_effort` is dropped for Anthropic: the Messages API has no
+/// `reasoning_effort` field, and silently injecting an OpenAI-shaped key
+/// would either be ignored or rejected depending on the gateway. The
+/// `show_reasoning` surface is also dropped for the same reason — Anthropic
+/// exposes thinking content via `content_block_delta.type == "thinking_delta"`
+/// and a separate `thinking` block at the request level, which the wire
+/// adapter in this slice does not surface (it is a deliberate out-of-scope
+/// follow-up so the slice stays focused on parity with the OpenAI path).
+fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
+    // Split system vs non-system; preserve the original ordering of the
+    // user/assistant half (Anthropic rejects an unsorted messages array
+    // only if a `system` string appears AFTER a message, but does reject an
+    // inline `role: "system"` entry, so the cleanest contract is "lift
+    // every leading system message into the top-level string and concat
+    // the rest verbatim").
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut rest: Vec<&Message> = Vec::new();
+    for msg in &req.messages {
+        if msg.role == "system" && rest.is_empty() {
+            system_parts.push(&msg.content);
+        } else {
+            rest.push(msg);
+        }
+    }
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "max_tokens": req.max_tokens,
+        "messages": rest,
+        "stream": req.stream,
+    });
+    if !system_parts.is_empty() {
+        // Anthropic accepts a plain string OR a structured
+        // `[{"type":"text","text":"..."}]` array; the string form is the
+        // common case and keeps the JSON identical to what most SDKs send.
+        body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+    }
+    body
+}
+
+/// Anthropic Messages API non-streaming response: pull the first text
+/// block out of `content` and translate `usage.input_tokens` /
+/// `usage.output_tokens` into the OpenAI-shaped `prompt_tokens` /
+/// `completion_tokens` fields that [`ChatResult`] already knows how to
+/// surface. The schema-invalid-2xx guard from the OpenAI path is preserved
+/// here: a response with no `content` array, or a `content` array whose
+/// entries all carry non-text types and therefore leave the answer empty,
+/// MUST surface as `ErrKind::Decode` (see `consume_full` for the failure
+/// mode the streaming path's `saw_choice` guard rejects).
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContent>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+    /// `stop_reason` is parsed for parity with future caller code that may
+    /// want to surface why Anthropic ended the turn (`end_turn`,
+    /// `max_tokens`, `stop_sequence`, `tool_use`); the current wire adapter
+    /// does not need it. Allowed-dead-code so the field stays documented
+    /// and ready without silencing the warning at the call site.
+    #[serde(default)]
+    #[allow(dead_code)]
+    stop_reason: Option<String>,
+}
+#[derive(Deserialize)]
+struct AnthropicContent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    /// Anthropic-specific cache telemetry: `cache_creation_input_tokens`
+    /// plus `cache_read_input_tokens` are reported on every cache hit and
+    /// map cleanly onto the OpenAI-shaped `cached_prompt_tokens` field the
+    /// existing utilization capture paths already aggregate.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+impl AnthropicResponse {
+    fn has_meaningful_text(&self) -> bool {
+        self.content.iter().any(|block| {
+            block.kind == "text"
+                && block
+                    .text
+                    .as_deref()
+                    .map(|t| t.chars().any(|c| !c.is_whitespace()))
+                    .unwrap_or(false)
+        })
+    }
+    fn joined_text(&self) -> String {
+        let mut out = String::new();
+        for block in &self.content {
+            if block.kind == "text" {
+                if let Some(text) = &block.text {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+        }
+        out
+    }
+    fn cached_prompt_tokens(&self) -> Option<u64> {
+        match (
+            self.usage.as_ref().and_then(|u| u.cache_read_input_tokens),
+            self.usage
+                .as_ref()
+                .and_then(|u| u.cache_creation_input_tokens),
+        ) {
+            (Some(read), Some(create)) => Some(read.saturating_add(create)),
+            (Some(read), None) => Some(read),
+            (None, Some(create)) => Some(create),
+            (None, None) => None,
+        }
+    }
+}
+
 pub struct OpenAiProvider {
     base_url: String,
     /// Provider wire kind: `openai-chat` | `openai-responses` | `azure-openai`
-    /// | `custom`. Drives endpoint routing (Azure uses a deployment path +
-    /// `?api-version`, others the OpenAI `/v1/...` convention).
+    /// | `anthropic` | `custom`. Drives endpoint routing (Azure uses a
+    /// deployment path + `?api-version`, Anthropic uses the `/v1/messages`
+    /// Messages API with `x-api-key` + `anthropic-version` headers, others
+    /// the OpenAI `/v1/...` convention).
+    ///
+    /// `openai-responses` and `custom` currently fall through to the
+    /// `openai-chat` request shape (documented follow-up; the wire adapter
+    /// in this slice does not silently invent behavior for kinds it does
+    /// not implement).
     kind: String,
     /// Pre-resolved auth header `(name, value)` — `Authorization: Bearer …`
     /// for bearer styles, or a custom `api-key`-style header for enterprise
     /// gateways. `None` when the provider needs no credential.
     auth_header: Option<(String, String)>,
+    /// Original [`Auth`] (cloned from the config). Kept alongside
+    /// `auth_header` so a `kind == "anthropic"` request can re-resolve the
+    /// raw credential into Anthropic's `x-api-key: <token>` shape (the
+    /// pre-resolved `auth_header` already wraps a bearer token in
+    /// `Authorization: Bearer …`, which Anthropic's wire protocol does not
+    /// accept). Anthropic-auth users who configure
+    /// `Auth::ApiKeyHeader { header: "x-api-key", … }` see the same header
+    /// pair either way, but the bearer path needs the re-resolution.
+    auth: Auth,
     /// Provider id from the config (e.g. `"minimax"`). Used by the
     /// counter-fed utilization wire-up to decide whether a response
     /// belongs to a MiniMax provider (which publishes no rate-limit
@@ -432,6 +610,12 @@ impl OpenAiProvider {
             base_url: p.base_url.trim_end_matches('/').to_string(),
             kind: p.kind.clone(),
             auth_header: p.auth.header_pair(),
+            // Cloned so the Anthropic path can re-resolve the raw
+            // credential into `x-api-key: <token>` without going back
+            // through the bearer wrapper that `auth_header_pair` applies.
+            // The `header_pair` value above is still the OpenAI/Azure
+            // default; the Anthropic branch ignores it entirely.
+            auth: p.auth.clone(),
             provider_id: p.id.clone(),
             plan_label,
             account_id,
@@ -560,6 +744,14 @@ impl OpenAiProvider {
     }
 
     fn body(&self, req: &ChatRequest) -> serde_json::Value {
+        if self.is_anthropic() {
+            // Anthropic Messages API has no `temperature` default at the
+            // request level (it does — but the wire shape differs from
+            // OpenAI's), and the system prompt extraction lives in
+            // [`anthropic_body`]. Branching here keeps the OpenAI path
+            // byte-for-byte unchanged for any non-anthropic provider.
+            return anthropic_body(req);
+        }
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
@@ -581,6 +773,27 @@ impl OpenAiProvider {
     }
 
     fn request(&self, req: &ChatRequest) -> reqwest::RequestBuilder {
+        if self.is_anthropic() {
+            // Anthropic Messages API:
+            //   * endpoint: POST {base}/v1/messages
+            //   * headers: `x-api-key: <token>` + `anthropic-version: 2023-06-01`
+            //   * body: `anthropic_body(req)`
+            // No `Authorization: Bearer …` header — Anthropic's wire protocol
+            // rejects it with 401. The credential resolution strips a
+            // leading `Bearer ` from a pre-resolved `auth_header` value
+            // (covers the `Env { var }` / `Bearer { token }` paths); an
+            // `ApiKeyHeader { header: "x-api-key", … }` config re-uses its
+            // already-stripped value verbatim.
+            let mut rb = self
+                .client
+                .post(self.endpoint(ANTHROPIC_MESSAGES_SUFFIX))
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&self.body(req));
+            if let Some(token) = self.anthropic_api_key() {
+                rb = rb.header("x-api-key", token);
+            }
+            return rb;
+        }
         let mut rb = self
             .client
             .post(self.endpoint("chat/completions"))
@@ -589,6 +802,36 @@ impl OpenAiProvider {
             rb = rb.header(name.as_str(), value.as_str());
         }
         rb
+    }
+
+    /// `true` when this provider is configured to use the Anthropic
+    /// Messages API wire shape. Treats an empty/unset `kind` (the
+    /// pre-`#[serde(default = "default_kind")]` legacy shape) as
+    /// `openai-chat` so a config that never declared `kind` keeps the
+    /// legacy behavior bit-for-bit.
+    fn is_anthropic(&self) -> bool {
+        self.kind == "anthropic"
+    }
+
+    /// Resolve the raw credential for an Anthropic provider call. Returns
+    /// `None` when no credential is configured (Anthropic will respond 401
+    /// with the same classification as an OpenAI 401 — the request still
+    /// carries `x-api-key:` with an empty string in that case so the
+    /// response shape stays uniform for tests).
+    ///
+    /// For `Env { var }` / `Bearer { token }` this strips the `Bearer `
+    /// wrapper that [`Auth::header_pair`] applies; for `ApiKeyHeader { … }`
+    /// the configured header name is irrelevant (Anthropic only honors
+    /// `x-api-key`) so we use the raw resolved value directly.
+    fn anthropic_api_key(&self) -> Option<String> {
+        match &self.auth {
+            Auth::None => None,
+            Auth::Env { .. } | Auth::Bearer { .. } => self
+                .auth
+                .resolve()
+                .map(|tok| strip_bearer_prefix(&tok).to_string()),
+            Auth::ApiKeyHeader { .. } => self.auth.resolve(),
+        }
     }
 
     /// Chat call. If `sink` is Some, decoded content is written to it live
@@ -700,6 +943,9 @@ impl OpenAiProvider {
         telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
+        if self.is_anthropic() {
+            return self.consume_full_anthropic(resp, telemetry, sink).await;
+        }
         let body = self.read_limited_body(resp, "chat completion").await?;
         let parsed: ChatCompletion = serde_json::from_slice(&body).map_err(|e| {
             ProviderError::new(
@@ -766,7 +1012,68 @@ impl OpenAiProvider {
         })
     }
 
+    /// Anthropic non-streaming response: parse the Messages API JSON body
+    /// (`{"content": [...], "usage": {...}}`) and translate the result into
+    /// the same [`ChatResult`] shape the OpenAI path returns. Mirrors the
+    /// schema-invalid-2xx guard: a body whose `content` array has no text
+    /// block (e.g. only `type: "tool_use"`, or an empty array) MUST surface
+    /// as `ErrKind::Decode` so a `--no-stream` / reviewer / health-probe
+    /// call cannot exit Ok with an empty content and let a billable
+    /// reservation reconcile as a no-op.
+    async fn consume_full_anthropic(
+        &self,
+        resp: reqwest::Response,
+        telemetry: CallTelemetry,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<ChatResult, ProviderError> {
+        let body = self.read_limited_body(resp, "anthropic message").await?;
+        let parsed: AnthropicResponse = serde_json::from_slice(&body).map_err(|e| {
+            ProviderError::new(
+                ErrKind::Decode,
+                format!("malformed anthropic response: {e}"),
+            )
+        })?;
+        // Same schema-invalid-2xx contract the OpenAI path enforces.
+        if !parsed.has_meaningful_text() {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                "malformed anthropic response: empty content",
+            ));
+        }
+        let content = parsed.joined_text();
+        if content.len() > MAX_CONTENT_BYTES {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                format!("decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"),
+            ));
+        }
+        if let Some(s) = sink {
+            let _ = s.write_all(content.as_bytes());
+            let _ = s.flush();
+        }
+        let (prompt_tokens, completion_tokens) = match parsed.usage {
+            Some(ref u) => (u.input_tokens, u.output_tokens),
+            None => (None, None),
+        };
+        let cached_prompt_tokens = parsed.cached_prompt_tokens();
+        let tokens_out = completion_tokens.unwrap_or(0);
+        Ok(ChatResult {
+            content,
+            tokens_out,
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens,
+            telemetry,
+        })
+    }
+
     /// Streaming path: parse newline-delimited SSE frames as they arrive.
+    /// Dispatched on `kind`: Anthropic events use a different envelope
+    /// (`event: …` lines and `data: {...}` with `type: "content_block_delta"`
+    /// / `message_delta` etc.) than OpenAI's `data: {"choices":[…]}` chunks,
+    /// so the two paths run entirely separate parsers rather than sharing a
+    /// single loop. The OpenAI loop below is byte-for-byte unchanged from
+    /// the pre-Anthropic-adapter version.
     async fn consume_stream(
         &self,
         req: &ChatRequest,
@@ -774,6 +1081,9 @@ impl OpenAiProvider {
         telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
+        if self.is_anthropic() {
+            return self.consume_stream_anthropic(resp, telemetry, sink).await;
+        }
         let deadline = Instant::now() + self.request_timeout;
         let mut content = String::new();
         let mut chunk_count: u64 = 0;
@@ -976,6 +1286,310 @@ impl OpenAiProvider {
             ));
         }
         // Prefer authoritative usage; fall back to the streamed-chunk count.
+        let tokens_out = completion_tokens.unwrap_or(chunk_count);
+        Ok(ChatResult {
+            content,
+            tokens_out,
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens,
+            telemetry,
+        })
+    }
+
+    /// Anthropic SSE streaming parser. Mirrors the shape of the OpenAI
+    /// streaming loop but consumes Anthropic's distinct event envelope:
+    ///
+    /// ```text
+    /// event: message_start
+    /// data: {"type":"message_start","message":{"id":"…","usage":{"input_tokens":N,"output_tokens":1}}}
+    ///
+    /// event: content_block_start
+    /// data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    ///
+    /// event: content_block_delta
+    /// data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}
+    ///
+    /// event: content_block_stop
+    /// data: {"type":"content_block_stop","index":0}
+    ///
+    /// event: message_delta
+    /// data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":K}}
+    ///
+    /// event: message_stop
+    /// data: {"type":"message_stop"}
+    /// ```
+    ///
+    /// The parser accumulates `delta.text` fragments into the same
+    /// `content` string the OpenAI path produces, captures the
+    /// `input_tokens` / `output_tokens` usage off the appropriate events
+    /// (`message_start` carries `input_tokens`; `message_delta` carries
+    /// the final `output_tokens` so we don't need to guess), and treats
+    /// `message_stop` as the terminal event. A mid-stream `event: error`
+    /// (the only Anthropic-side way to surface an auth / rate-limit /
+    /// overload rejection on a 2xx connection) is mapped onto the same
+    /// `ErrKind::Http` shape the OpenAI streaming-error path uses, so
+    /// downstream classification does not silently swallow it.
+    async fn consume_stream_anthropic(
+        &self,
+        resp: reqwest::Response,
+        telemetry: CallTelemetry,
+        mut sink: Option<&mut dyn Write>,
+    ) -> Result<ChatResult, ProviderError> {
+        let deadline = Instant::now() + self.request_timeout;
+        let mut content = String::new();
+        let mut chunk_count: u64 = 0;
+        let mut prompt_tokens: Option<u64> = None;
+        let mut completion_tokens: Option<u64> = None;
+        let mut cached_prompt_tokens: Option<u64> = None;
+        let mut emitted = false;
+        let mut stream = resp.bytes_stream();
+        let mut response_bytes = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
+        let fail = |kind: ErrKind, msg: String, emitted: bool| ProviderError {
+            message: msg,
+            kind,
+            status: None,
+            retry_after: None,
+            emitted,
+        };
+        let mut done = false;
+        let mut saw_text = false;
+        // Track the most recent `event:` line so the next `data:` line is
+        // paired with the right envelope. SSE resets per-event, so we keep
+        // the LAST seen event name until a new one arrives. A missing
+        // `event:` line defaults to `"message"` (the spec's default event
+        // type), which Anthropic never uses in practice for the messages
+        // API — every real frame carries an explicit `event:` line.
+        let mut current_event: Option<String> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(fail(
+                    ErrKind::Timeout,
+                    format!("request timeout after {:?}", self.request_timeout),
+                    emitted,
+                ));
+            }
+            let step = self.idle_timeout.min(remaining);
+            let next = match timeout(step, stream.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(fail(
+                            ErrKind::Timeout,
+                            format!("request timeout after {:?}", self.request_timeout),
+                            emitted,
+                        ));
+                    }
+                    return Err(fail(
+                        ErrKind::Timeout,
+                        format!("stream stalled: no data for {:?}", self.idle_timeout),
+                        emitted,
+                    ));
+                }
+            };
+            let Some(chunk) = next else { break };
+            let bytes = chunk.map_err(|e| {
+                let mut pe = classify_reqwest(e);
+                pe.emitted = emitted;
+                pe
+            })?;
+            response_bytes = response_bytes.saturating_add(bytes.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
+                return Err(fail(
+                    ErrKind::Decode,
+                    format!("stream exceeded {MAX_RESPONSE_BYTES} byte response ceiling"),
+                    emitted,
+                ));
+            }
+            buf.extend_from_slice(&bytes);
+            if buf.len() > MAX_BUFFER_BYTES {
+                return Err(fail(
+                    ErrKind::Decode,
+                    format!("stream buffer exceeded {MAX_BUFFER_BYTES} byte ceiling"),
+                    emitted,
+                ));
+            }
+            // Anthropic SSE frames are CRLF- or LF-delimited, terminated by
+            // a blank line. Process one frame at a time: a frame is a
+            // sequence of `field: value` lines (we only care about
+            // `event:` and `data:`) followed by an empty line.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                if nl > MAX_LINE_BYTES {
+                    return Err(fail(
+                        ErrKind::Decode,
+                        format!("stream line exceeded {MAX_LINE_BYTES} byte ceiling"),
+                        emitted,
+                    ));
+                }
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let raw = std::str::from_utf8(&line_bytes[..nl]).map_err(|error| {
+                    fail(
+                        ErrKind::Decode,
+                        format!("stream contained invalid UTF-8: {error}"),
+                        emitted,
+                    )
+                })?;
+                let line = raw.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    // Blank line = end of frame. Nothing to dispatch —
+                    // the per-line `event`/`data` updates above already
+                    // happened. Reset for the next frame; the next
+                    // `event:` line will re-populate `current_event`.
+                    continue;
+                }
+                if let Some(ev) = line.strip_prefix("event:") {
+                    current_event = Some(ev.trim().to_string());
+                    continue;
+                }
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if payload == "[DONE]" {
+                        // Anthropic never sends `[DONE]`; ignore (don't
+                        // mark `done`) so we keep waiting for the
+                        // terminal `message_stop` event.
+                        continue;
+                    }
+                    let val: serde_json::Value =
+                        serde_json::from_str(payload).map_err(|error| {
+                            fail(
+                                ErrKind::Decode,
+                                format!("malformed anthropic stream JSON: {error}"),
+                                emitted,
+                            )
+                        })?;
+                    // Top-level `error` envelope: Anthropic emits
+                    // `event: error` with a body shaped like
+                    // `{"type":"error","error":{"type":"authentication_error",...}}`.
+                    // Surface as Http; status code is not part of the
+                    // payload so we cannot classify from the body alone —
+                    // upstream callers relying on a 401/403/429 status
+                    // code should still hit the non-2xx branch in
+                    // `stream_chat` before this fires.
+                    if current_event.as_deref() == Some("error")
+                        || val.get("type").and_then(|t| t.as_str()) == Some("error")
+                    {
+                        return Err(fail(
+                            ErrKind::Http,
+                            format!("anthropic stream error: {}", redact(payload)),
+                            emitted,
+                        ));
+                    }
+                    match current_event.as_deref() {
+                        Some("message_start") => {
+                            // Carries `message.usage.input_tokens` (and
+                            // `output_tokens` = 1 placeholder; we ignore
+                            // the placeholder and wait for `message_delta`
+                            // to set the authoritative output_tokens).
+                            if let Some(input) = val
+                                .get("message")
+                                .and_then(|m| m.get("usage"))
+                                .and_then(|u| u.get("input_tokens"))
+                                .and_then(|n| n.as_u64())
+                            {
+                                prompt_tokens = Some(input);
+                            }
+                            if let Some(usage) = val
+                                .get("message")
+                                .and_then(|m| m.get("usage"))
+                                .and_then(|u| u.get("cache_read_input_tokens"))
+                                .and_then(|n| n.as_u64())
+                            {
+                                cached_prompt_tokens = Some(usage);
+                            }
+                        }
+                        Some("content_block_delta") => {
+                            // The deltas carry `delta.type` ∈
+                            // {"text_delta","input_json_delta","thinking_delta"}.
+                            // We only surface `text_delta` for parity
+                            // with the OpenAI path's `content` field.
+                            let piece = val
+                                .get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or_default();
+                            if !piece.is_empty() {
+                                saw_text = true;
+                                if content.len().saturating_add(piece.len()) > MAX_CONTENT_BYTES {
+                                    return Err(fail(
+                                        ErrKind::Decode,
+                                        format!(
+                                            "decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"
+                                        ),
+                                        emitted,
+                                    ));
+                                }
+                                chunk_count += 1;
+                                content.push_str(piece);
+                                if let Some(s) = sink.as_deref_mut() {
+                                    let _ = s.write_all(piece.as_bytes());
+                                    let _ = s.flush();
+                                    emitted = true;
+                                }
+                            }
+                        }
+                        Some("message_delta") => {
+                            // Carries the authoritative final
+                            // `usage.output_tokens` (and optionally a
+                            // stop_reason / stop_sequence, which we
+                            // ignore for parity with the OpenAI path).
+                            if let Some(out) = val
+                                .get("usage")
+                                .and_then(|u| u.get("output_tokens"))
+                                .and_then(|n| n.as_u64())
+                            {
+                                completion_tokens = Some(out);
+                            }
+                            // Cache-read updates can also arrive here on
+                            // long streams; sum with the value from
+                            // `message_start` so a multi-block run keeps
+                            // the running tally.
+                            if let Some(extra) = val
+                                .get("usage")
+                                .and_then(|u| u.get("cache_read_input_tokens"))
+                                .and_then(|n| n.as_u64())
+                            {
+                                cached_prompt_tokens =
+                                    Some(cached_prompt_tokens.unwrap_or(0).saturating_add(extra));
+                            }
+                        }
+                        Some("message_stop") => {
+                            done = true;
+                        }
+                        // content_block_start / content_block_stop /
+                        // ping / unknown: informational only, ignore.
+                        _ => {}
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Err(fail(
+                ErrKind::Decode,
+                "stream ended with an incomplete SSE frame".to_string(),
+                emitted,
+            ));
+        }
+        // Schema-invalid-2xx guard for the streaming path: a successful
+        // Anthropic stream MUST carry at least one text delta; a body
+        // that connects, handshakes, and then closes with `message_stop`
+        // having produced no `content_block_delta` with a text payload
+        // is just as empty as the `{"choices":[{}]}` shape the OpenAI
+        // path rejects.
+        if !saw_text {
+            return Err(fail(
+                ErrKind::Decode,
+                "malformed anthropic stream: no text content".to_string(),
+                emitted,
+            ));
+        }
         let tokens_out = completion_tokens.unwrap_or(chunk_count);
         Ok(ChatResult {
             content,
