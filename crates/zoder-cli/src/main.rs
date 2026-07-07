@@ -3546,6 +3546,127 @@ fn classify_agentic_cost_summary(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test environment: shared `ENV_LOCK` for tests that mutate `ZODER_HOME`.
+//
+// **Background.** `Config::load()` resolves `$ZODER_HOME` at call time via
+// `std::env::var`. The env var is process-global, so any two tests in the
+// same binary that both set it can race: test A sets `ZODER_HOME=/A`, test
+// B sets `ZODER_HOME=/B`, and whichever `Config::load()` call lands second
+// reads the wrong home. The previous attempt at this fix guarded each test
+// module with its OWN `static Mutex<()>` — which serializes within a module
+// but does NOT prevent `main.rs`'s `health_install_tests` from racing with
+// `agentic.rs`'s `reviewer_chain_dispatch_tests` (different statics in
+// different modules, same process, same env var). The shared lock below is
+// the single serialization point for the whole binary.
+//
+// **Scope.** Only `ZODER_HOME` reads/writes in test code are guarded. The
+// async reviewer-chain tests hold the lock for the entire `complete_once`
+// call (which internally calls `Engine::load()`); wiremock responses are
+// fast, so the total wall-clock cost of the serialization is small. Sync
+// tests in `main.rs` hold the lock only for the `with_fake_home` closure,
+// which is the minimum scope needed to make the `install_daily_job` +
+// `read_to_string` sequence atomic.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod test_env {
+    use std::sync::Mutex;
+
+    /// Process-wide mutex around every test that mutates `ZODER_HOME`.
+    /// Shared by ALL test modules in this binary (`health_install_tests`,
+    /// `reviewer_chain_dispatch_tests`, and any future module that needs
+    /// to redirect `$ZODER_HOME` to a tempdir). Tests acquire it via
+    /// [`super::with_fake_home`] (sync) or [`super::test_env::EnvGuard`]
+    /// (async) — never via `std::env::set_var` directly.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard for async tests: sets `ZODER_HOME` to `home` and holds
+    /// the shared `ENV_LOCK` for the guard's lifetime. Pairs with
+    /// `with_fake_home` for sync tests so both paths serialize on the
+    /// same lock.
+    pub(crate) struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn new(home: &std::path::Path) -> Self {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var("ZODER_HOME").ok();
+            std::env::set_var("ZODER_HOME", home);
+            Self { _lock, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("ZODER_HOME", v),
+                None => std::env::remove_var("ZODER_HOME"),
+            }
+        }
+    }
+
+    /// **REGRESSION GUARD: cross-module `ZODER_HOME` race.** This test
+    /// pins the shared-lock contract. It spawns N threads, each of which
+    /// takes the shared lock, sets `ZODER_HOME` to its own private
+    /// tempdir, reads `Config::home()` inside the locked section, and
+    /// asserts the result matches its own tempdir. Without the shared
+    /// lock (e.g. if `main.rs` and `agentic.rs` each had their own
+    /// `static Mutex<()>`), two threads in different modules could
+    /// race: thread A sets `/A`, thread B sets `/B`, and whichever
+    /// `Config::home()` lands second sees the wrong value. With the
+    /// shared lock, the second thread blocks until the first releases,
+    /// and every thread observes its own home.
+    ///
+    /// The test runs the loop `ITERATIONS` times to maximize the chance
+    /// of catching a race on CI where thread scheduling is non-
+    /// deterministic. Each iteration is a fresh set of tempdirs.
+    #[test]
+    fn shared_env_lock_serializes_concurrent_zoder_home_writes() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 32;
+
+        for _ in 0..ITERATIONS {
+            // Each thread gets its own tempdir. We hold the Arc<PathBuf>
+            // so the directory is not cleaned up while the thread is
+            // still reading it.
+            let dirs: Vec<Arc<std::path::PathBuf>> = (0..THREADS)
+                .map(|_| Arc::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()))
+                .collect();
+            // A barrier so all threads enter the locked section at
+            // roughly the same time — maximizes contention and the
+            // chance of catching a race.
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::with_capacity(THREADS);
+            for dir in &dirs {
+                let dir = Arc::clone(dir);
+                let barrier = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let _guard = EnvGuard::new(&dir);
+                    let observed = zoder_core::Config::home();
+                    assert_eq!(
+                        observed,
+                        *dir,
+                        "thread observed a different ZODER_HOME than it set \
+                         (race: another thread's set_var landed during this \
+                         thread's lock-held section). expected={}, observed={}",
+                        dir.display(),
+                        observed.display()
+                    );
+                }));
+            }
+            for h in handles {
+                h.join().expect("thread panicked");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod agentic_cost_tests {
     use super::*;
@@ -7769,28 +7890,29 @@ mod health_install_tests {
     //! [`super::current_backend`] and asserts on the right artefact.
     //! Everything runs against a `tempfile::tempdir()` masquerading as
     //! `$ZODER_HOME` so nothing touches the real LaunchAgents / systemd
-    //! dirs. A process-wide mutex serializes the env-mutating tests so
-    //! parallel runs of `cargo test` can't trample each other's
+    //! dirs. A process-wide mutex (shared with `agentic::reviewer_chain_dispatch_tests`
+    //! via `super::test_env::ENV_LOCK`) serializes the env-mutating tests
+    //! so parallel runs of `cargo test` can't trample each other's
     //! `ZODER_HOME`.
 
     use super::*;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Process-wide mutex around all tests that mutate `ZODER_HOME`. The
-    /// env var is process-global so the tests MUST be serialized.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn fake_home() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
 
     /// Run `f` with `ZODER_HOME` pointed at `home`, restoring the prior
-    /// value (or unsetting it) on the way out. The `ENV_LOCK` mutex makes
-    /// the read-modify-write atomic w.r.t. other tests in the same
-    /// process.
+    /// value (or unsetting it) on the way out. The shared
+    /// `super::test_env::ENV_LOCK` mutex makes the read-modify-write
+    /// atomic w.r.t. every other test in this binary that touches
+    /// `ZODER_HOME` (notably the async reviewer-chain tests in
+    /// `agentic::reviewer_chain_dispatch_tests`, which use the SAME
+    /// lock via `super::super::test_env::EnvGuard`).
     fn with_fake_home<F: FnOnce(&Path)>(home: &Path, f: F) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("ZODER_HOME").ok();
         std::env::set_var("ZODER_HOME", home);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home)));
