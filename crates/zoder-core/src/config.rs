@@ -508,6 +508,28 @@ fn default_strict_free() -> bool {
     true
 }
 
+/// Parse a `Config::reviewer_model`-style value into an ordered list of
+/// reviewer candidates (head first). The legacy shape is a single model id
+/// (a one-element `Vec`); the reviewer chain format introduced by the
+/// cross-model fallback fix extends that to a comma-separated list (e.g.
+/// `"model_a,model_b,model_c"`) so a single broken provider doesn't sink
+/// the whole adversarial review. Whitespace around each entry is trimmed
+/// and empty entries are dropped so a trailing comma degrades to a
+/// one-element list rather than producing `["model_a", ""]`.
+///
+/// Public-in-crate visibility so the unit tests under this module can
+/// exercise the parser directly (the same way the existing
+/// `default_provider` helpers are tested).
+pub(crate) fn parse_reviewer_chain(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// One provider-as-candidate for the smart router, decorated with its rank
 /// criteria (billing tier + prefix specificity). The struct exists so the
 /// inner ranking function can return multiple candidates (tests inspect
@@ -898,6 +920,39 @@ impl Config {
         self.agents
             .get(alias)
             .and_then(|a| a.reviewer_model.clone())
+    }
+
+    /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
+    /// reviewer candidates (head first). The legacy single-string form is
+    /// preserved: a `Config::reviewer_model` containing a single model id is
+    /// returned as a one-element vector — the same shape the field has always
+    /// produced when consulted as a chain. When the operator writes a
+    /// comma-separated string (e.g. `"model_a,model_b,model_c"`) it is split
+    /// on `,` so a single stuck model does not sink the whole review (the
+    /// reviewer pipeline falls through to the next candidate instead of bailing
+    /// out at the head).
+    ///
+    /// Whitespace around each entry is trimmed and empty entries are dropped
+    /// — a trailing comma is treated like a one-element list, not as
+    /// `["model_a", ""]`. Callers should treat this as the reviewer chain's
+    /// profile-level contribution; the per-agent pin
+    /// (`agent_reviewer_model`) and the scenario-routed reviewer chain
+    /// (`ResolvedRoutes::reviewer`) compose on top of the head this returns.
+    pub fn reviewer_models(&self) -> Vec<String> {
+        parse_reviewer_chain(self.reviewer_model.as_deref())
+    }
+
+    /// Same as [`Self::reviewer_models`] but takes an explicit alias so the
+    /// per-agent `[agents.<alias>].reviewer_model` pin is honored first,
+    /// falling through to the profile-level chain. Returning `Vec<String>`
+    /// mirrors the reviewer chain shape consumed by the reviewer dispatch
+    /// loop in `complete_once` and keeps the call sites symmetric.
+    pub fn reviewer_models_for(&self, alias: Option<&str>) -> Vec<String> {
+        if let Some(pin) = self.agent_reviewer_model(alias) {
+            parse_reviewer_chain(Some(&pin))
+        } else {
+            self.reviewer_models()
+        }
     }
 
     /// Provider ids contributed by a given vendor overlay. Returns an empty
@@ -2309,6 +2364,156 @@ auth = { type = "env", var = "ACME_KEY" }
             legacy_errs.is_empty(),
             "legacy config must still validate cleanly; got: {}",
             legacy_errs.join("\n")
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Cross-model reviewer fallback: chain parsing.
+    //
+    // Regression fix for the 2026-07-07 reviewer-pipeline defect. A single
+    // dead/misbehaving reviewer model used to kill the whole adversarial
+    // review even though the author path already had a
+    // cross-model fallback chain. The fix lifts the reviewer's
+    // `Config::reviewer_model` (a single string today) into an ordered
+    // chain so a comma-separated list expresses "if the head fails, try
+    // the tail in order, until one answers". These tests pin the parser
+    // contract end-to-end so the dispatcher can rely on it.
+    // ---------------------------------------------------------------------
+
+    /// Legacy single-model config: `reviewer_model = "x"` produces a
+    /// one-element chain. The chain dispatch must treat a single candidate
+    /// identically to today's behavior — run it once and report its error
+    /// verbatim if it fails (no fallback to be had).
+    #[test]
+    fn parse_reviewer_chain_single_is_one_element_vec() {
+        assert_eq!(
+            parse_reviewer_chain(Some("deepseek-coder")),
+            vec!["deepseek-coder"]
+        );
+        assert_eq!(parse_reviewer_chain(None), Vec::<String>::new());
+        // Whitespace around the head is trimmed (defensive — JSON deserialization
+        // generally doesn't introduce whitespace, but a TOML "" wrapped
+        // entry should not produce a " x " key with spaces).
+        assert_eq!(
+            parse_reviewer_chain(Some("  kimi-k2.6  ")),
+            vec!["kimi-k2.6"]
+        );
+        // Empty string is treated as "unset" — operator wrote the field
+        // but left it blank. A blank field MUST NOT silently degrade to
+        // a one-element chain containing "" (that would fail loudly at
+        // provider resolution and look like a hard config error).
+        assert_eq!(parse_reviewer_chain(Some("")), Vec::<String>::new());
+    }
+
+    /// Comma-separated chain: a config with `reviewer_model = "a,b,c"`
+    /// produces an ordered list of three candidates, head first. Whitespace
+    /// around each entry is trimmed and empty entries (the trailing comma
+    /// case) are dropped so a typo doesn't slip a sentinel through.
+    #[test]
+    fn parse_reviewer_chain_csv_splits_and_dedups_whitespace() {
+        assert_eq!(
+            parse_reviewer_chain(Some("kimi-k2.6,glm-5.1,qwen-coder")),
+            vec!["kimi-k2.6", "glm-5.1", "qwen-coder"]
+        );
+        // Whitespace around entries is trimmed.
+        assert_eq!(
+            parse_reviewer_chain(Some(" kimi-k2.6 , glm-5.1 ")),
+            vec!["kimi-k2.6", "glm-5.1"]
+        );
+        // Trailing comma + empty entries are dropped (don't sneak "" into
+        // the chain — that would route to the placeholder host and 404).
+        assert_eq!(parse_reviewer_chain(Some("kimi-k2.6,,")), vec!["kimi-k2.6"]);
+        // Leading comma is also tolerated.
+        assert_eq!(parse_reviewer_chain(Some(",glm-5.1")), vec!["glm-5.1"]);
+    }
+
+    /// `Config::reviewer_models()` is the public accessor the reviewer
+    /// dispatcher calls. Wire-format round-trip: a config.json that the
+    /// operator writes with `reviewer_model` as a single string still
+    /// produces a one-element chain; a comma-separated value produces
+    /// the full list.
+    #[test]
+    fn config_reviewer_models_parses_string_field_into_chain() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-chain-test"));
+        // Legacy single-pin shape — must survive byte-for-byte.
+        cfg.reviewer_model = Some("kimi-k2.6".into());
+        assert_eq!(
+            cfg.reviewer_models(),
+            vec!["kimi-k2.6".to_string()],
+            "single-string reviewer_model must produce a 1-element chain (back-compat)"
+        );
+        // Multi-pin shape — the reviewer-pipeline-defect fix.
+        cfg.reviewer_model = Some("kimi-k2.6, glm-5.1, qwen-coder".into());
+        assert_eq!(
+            cfg.reviewer_models(),
+            vec![
+                "kimi-k2.6".to_string(),
+                "glm-5.1".to_string(),
+                "qwen-coder".to_string()
+            ],
+            "comma-separated reviewer_model must produce an ordered candidate list"
+        );
+        // Unset field — chain is empty (the dispatcher falls through to
+        // the cross-family default).
+        cfg.reviewer_model = None;
+        assert!(
+            cfg.reviewer_models().is_empty(),
+            "absent reviewer_model must yield an empty chain"
+        );
+    }
+
+    /// `reviewer_models_for(alias)` honors the per-agent pin first
+    /// (the `[agents.<alias>].reviewer_model` channel), falling through
+    /// to the profile-level chain. The per-agent pin is independent of
+    /// `primary_model` — an operator can pin a different reviewer per
+    /// alias without touching the author default. The chain form
+    /// extends naturally: a per-agent `reviewer_model = "x,y"` produces
+    /// a two-candidate chain just like the profile-level field does.
+    #[test]
+    fn config_reviewer_models_for_alias_applies_per_agent_pin_first() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-chain-test"));
+        cfg.reviewer_model = Some("fallback-head, fallback-tail".into());
+        // Per-agent override wins: only the alias-pinned chain is
+        // returned; the profile-level "fallback-*" entries are NOT
+        // merged into it (the operator wrote a per-agent pin with
+        // explicit intent — layering profile fallbacks would corrupt
+        // that intent).
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: None,
+                reviewer_model: Some("z-ai/glm-5.1,nvidia/llama-3.3-nemotron".into()),
+            },
+        );
+        cfg.agents = agents;
+
+        let per_agent = cfg.reviewer_models_for(Some("codex"));
+        assert_eq!(
+            per_agent,
+            vec![
+                "z-ai/glm-5.1".to_string(),
+                "nvidia/llama-3.3-nemotron".to_string()
+            ],
+            "per-agent reviewer chain must take precedence over profile-level"
+        );
+
+        // Unknown alias falls through to the profile-level chain (no
+        // per-agent pin to consult), preserving the legacy "per-agent
+        // wins, profile-level otherwise" precedence.
+        let profile = cfg.reviewer_models_for(Some("unknown-agent"));
+        assert_eq!(
+            profile,
+            vec!["fallback-head".to_string(), "fallback-tail".to_string()],
+            "unknown alias must fall through to the profile-level chain"
+        );
+
+        // No alias and no per-agent pin — profile-level chain as-is.
+        let none = cfg.reviewer_models_for(None);
+        assert_eq!(
+            none,
+            vec!["fallback-head".to_string(), "fallback-tail".to_string()],
+            "alias=None must fall through to the profile-level chain"
         );
     }
 }
