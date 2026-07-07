@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-07-06",
+  "generated": "2026-07-07",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -5682,8 +5682,8 @@
       "output_usd_per_mtok": 0.201
     },
     "meta-llama/llama-3.2-3b-instruct": {
-      "input_usd_per_mtok": 0.0509,
-      "output_usd_per_mtok": 0.335
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.33
     },
     "meta-llama/llama-3.2-3b-instruct:free": {
       "input_usd_per_mtok": 0.0,
@@ -6438,6 +6438,10 @@
     "nebius/nvidia/Llama-3.3-Nemotron-Super-49B-v1": {
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.39999999999999997
+    },
+    "nex-agi/nex-n2-mini": {
+      "input_usd_per_mtok": 0.024999999999999998,
+      "output_usd_per_mtok": 0.09999999999999999
     },
     "nex-agi/nex-n2-pro": {
       "input_usd_per_mtok": 0.25,
@@ -8959,9 +8963,17 @@
       "input_usd_per_mtok": 0.14,
       "output_usd_per_mtok": 0.5700000000000001
     },
+    "tencent/hy3": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7999999999999999
+    },
     "tencent/hy3-preview": {
       "input_usd_per_mtok": 0.063,
       "output_usd_per_mtok": 0.21
+    },
+    "tencent/hy3:free": {
+      "input_usd_per_mtok": 0.0,
+      "output_usd_per_mtok": 0.0
     },
     "tensormesh/MiniMaxAI/MiniMax-M2.5": {
       "input_usd_per_mtok": 0.3,
@@ -10584,8 +10596,8 @@
       "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.896,
-      "output_usd_per_mtok": 2.816
+      "input_usd_per_mtok": 0.8999999999999999,
+      "output_usd_per_mtok": 2.8600000000000003
     },
     "z-ai/glm-5v-turbo": {
       "input_usd_per_mtok": 1.2,
