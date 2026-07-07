@@ -23,7 +23,7 @@ options, manual, and source builds are [below](#install--build-targets).
 zoder "refactor this for readability" < src/foo.rs   # run a task on the best FREE model
 zerocode                                             # interactive pair-coding TUI
 zoder review        # multi-model code review → consensus verdict
-zoder fix           # review → fix in place → re-review, until it passes
+zoder loop          # author → validate → review → fix, until it passes
 zoder report        # spend + what the free path saved you, in dollars
 ```
 
@@ -88,7 +88,7 @@ zoder exec -
 zoder review
 
 # Review -> agent applies fixes in place -> re-review, until it passes.
-zoder fix
+zoder loop
 
 # See which model the router would choose (and the fallback chain).
 zoder route "write a unit test"
@@ -101,7 +101,7 @@ zoder report
 |---|---|
 | `zoder "<prompt>"` / `zoder exec` | Run a task through the free-first router (codex-compatible; `-` reads stdin). |
 | `zoder review` | Fan a code review to a panel of models and reach a consensus verdict. |
-| `zoder fix` | Review → agent applies fixes in place → re-review, looping until it passes. |
+| `zoder loop` | Author → validate (build/test) → adversarial review → fix, looping until the check passes and the reviewer raises no blocking findings. Pass `--check "<cmd>"` to gate each iteration on a local command (e.g. `cargo test -p foo`), or `--reviewer <model>` for an adversarial second opinion. |
 | `zoder route` | Show the model the router would pick + the cross-family fallback chain. |
 | `zoder report` | Usage + chargeback report: daily/weekly/by-model, with the savings headline. Pass `--vendor <name>` to scope to a TOML-defined vendor (e.g. `enterprise`, `ibm`, `microsoft`). |
 | `zoder spend` | Raw spend rollups from the local ledger. |
