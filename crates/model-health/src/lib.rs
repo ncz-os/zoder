@@ -32,7 +32,9 @@ pub enum State {
 /// Outcome class for a single model probe.
 ///
 /// The classify-from-error mapping lives in [`Classification::from_status`]
-/// (HTTP code) and [`Classification::from_err_kind`] (typed provider error).
+/// (HTTP code), [`Classification::from_anthropic_error_body`] (typed
+/// Anthropic Messages API error envelope), and
+/// [`Classification::from_err_kind`] (typed provider error).
 /// New variants MUST stay cheap to persist (one lowercase token) and the
 /// serde rename below keeps the on-disk shape stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,79 @@ impl Classification {
             401 | 403 => Classification::Unauthorized,
             429 | 503 => Classification::Capacity,
             _ => Classification::Error,
+        }
+    }
+
+    /// Classify an Anthropic Messages API error response. Anthropic
+    /// surfaces typed errors in a single envelope of the shape
+    ///
+    /// ```text
+    /// {
+    ///   "type": "error",
+    ///   "error": {
+    ///     "type": "authentication_error" | "rate_limit_error" | "overloaded_error" | ...,
+    ///     "message": "..."
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// mirroring the `{"error":{"code":..., "message":...}}` envelope
+    /// OpenAI / OpenAI-compatible backends use. The mapping is
+    /// deliberately identical to what `Classification::from_status`
+    /// already produces for the matching HTTP code, so a credential
+    /// rejection lands on `Unauthorized` regardless of whether it was
+    /// carried by `type: "authentication_error"` (the body) or
+    /// `status: 401` (the headers), a rate-limit lands on `Capacity`,
+    /// and an `overloaded_error` (Anthropic's 529) lands on `Capacity`
+    /// the same way 429 / 503 do. An unparseable body, or an
+    /// unrecognized `error.type`, falls through to `from_status(status)`
+    /// so the HTTP-code path remains the source of truth for everything
+    /// the typed envelope does not cover.
+    ///
+    /// This is the Anthropic counterpart to the OpenAI-style
+    /// `from_status`-driven classification already used in
+    /// `zoder-core::health_probe::classify_err`. Both backends now land
+    /// on the same `Classification` variants for the same operational
+    /// outcomes — credential rejection, capacity, model-missing,
+    /// generic error — so the breaker + consult paths do not need a
+    /// per-provider branch.
+    pub fn from_anthropic_error_body(body: &str, status: u16) -> Self {
+        // Defensive: every malformed body falls back to the status-only
+        // path so an upstream caller that hands us an empty string, an
+        // HTML gateway error page, or a truncated body still gets a
+        // well-defined Classification instead of a silent default.
+        let parsed = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) => v,
+            Err(_) => return Classification::from_status(status),
+        };
+        // Anthropic error envelope: top-level `type: "error"` and a
+        // nested `error.type` string naming the typed rejection. Both
+        // fields must agree for the body to be considered a typed
+        // Anthropic error envelope; anything else (e.g. an OpenAI-style
+        // `{"error":{"code":"...",...}}` body that a future gateway
+        // might proxy through) defers to the status code.
+        let outer_type = parsed.get("type").and_then(|t| t.as_str());
+        let inner_type = parsed
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str());
+        let Some(inner) = inner_type else {
+            return Classification::from_status(status);
+        };
+        if outer_type != Some("error") {
+            return Classification::from_status(status);
+        }
+        match inner {
+            // Auth/credential rejection — never trip the breaker (the
+            // model itself is fine; the operator's API key is wrong).
+            "authentication_error" | "permission_error" => Classification::Unauthorized,
+            // Rate-limit + Anthropic's 529 overloaded_error are both
+            // transient capacity signals — consult should skip until
+            // the next probe, the same way 429 / 503 do.
+            "rate_limit_error" | "overloaded_error" => Classification::Capacity,
+            // Typed but unknown error name: defer to the status code so
+            // 401/403/404/429/503 still map onto the right variant.
+            _ => Classification::from_status(status),
         }
     }
 
@@ -384,6 +459,131 @@ mod tests {
         );
         let back: Classification = serde_json::from_str("\"unauthorized\"").expect("deserialize");
         assert_eq!(back, Classification::Unauthorized);
+    }
+
+    /// Anthropic error-body classification. Mirrors the `from_status`
+    /// mapping for the same operational outcomes but recognizes the
+    /// typed Anthropic envelope:
+    /// `{"type":"error","error":{"type":"authentication_error"|...}}`.
+    /// Every cell of the contract is pinned: the typed envelope wins
+    /// over the status code (so a 200 with an inline error body still
+    /// classifies correctly — Anthropic never does this, but a
+    /// misbehaving gateway might), an unparseable body falls through
+    /// to `from_status`, and an OpenAI-style envelope (no top-level
+    /// `type: "error"`) also defers to the status code so the two
+    /// backends share the same downstream classification pipeline.
+    #[test]
+    fn anthropic_error_body_maps_typed_envelope_onto_classification() {
+        // The task-pinned case: a 401 carrying `authentication_error`
+        // MUST classify as Unauthorized (credential rejection — never
+        // trip the breaker; consult skips the model).
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        assert_eq!(
+            Classification::from_anthropic_error_body(body, 401),
+            Classification::Unauthorized,
+            "Anthropic 401 + authentication_error must classify as Unauthorized"
+        );
+        // permission_error is Anthropic's name for a 403 with the same
+        // operational meaning — same outcome, same classification.
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"type":"error","error":{"type":"permission_error","message":"key lacks scope"}}"#,
+                403
+            ),
+            Classification::Unauthorized
+        );
+        // Rate-limit envelopes (HTTP 429) land on Capacity — consult
+        // skips until the next probe, the same way 429 already does in
+        // `from_status`.
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+                429
+            ),
+            Classification::Capacity
+        );
+        // Anthropic's overloaded_error (HTTP 529) is also a transient
+        // capacity signal — same outcome as 503. We mirror the existing
+        // 429/503 -> Capacity mapping so the breaker + consult paths
+        // treat both backends the same.
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"try again"}}"#,
+                529
+            ),
+            Classification::Capacity
+        );
+        // Typed envelope wins over the status code when the two
+        // disagree — a 500 with an authentication_error body is still
+        // a credential rejection and must NOT be lumped into Error
+        // (which would trip the breaker on a perfectly fine model).
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"type":"error","error":{"type":"authentication_error","message":"x"}}"#,
+                500
+            ),
+            Classification::Unauthorized
+        );
+        // An unknown typed error name defers to the status code so
+        // the well-known mappings still apply — e.g. a future
+        // `not_found_error` carrying HTTP 404 still classifies as
+        // Unprovisioned.
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"type":"error","error":{"type":"not_found_error","message":"x"}}"#,
+                404
+            ),
+            Classification::Unprovisioned
+        );
+        // OpenAI-style envelope (no top-level `type: "error"`) defers
+        // to the status code — a 401 with an OpenAI body still lands
+        // on Unauthorized through `from_status`.
+        assert_eq!(
+            Classification::from_anthropic_error_body(
+                r#"{"error":{"code":"invalid_api_key","message":"x"}}"#,
+                401
+            ),
+            Classification::Unauthorized
+        );
+        // Unparseable body + 401 still lands on Unauthorized via the
+        // status fallback (the caller can always trust
+        // `from_status` to do the right thing).
+        assert_eq!(
+            Classification::from_anthropic_error_body("not-json", 401),
+            Classification::Unauthorized
+        );
+        // Unparseable body + 500 lands on Error (status fallback).
+        assert_eq!(
+            Classification::from_anthropic_error_body("garbage", 500),
+            Classification::Error
+        );
+    }
+
+    #[test]
+    fn anthropic_authentication_error_classifies_as_unauthorized() {
+        // Task-pinned assertion (adversarial-review finding #5): an
+        // Anthropic 401 with a typed `authentication_error` body
+        // classifies as Classification::Unauthorized — identical to
+        // the OpenAI 401 path so a credential rejection never trips
+        // the breaker on a perfectly fine model behind the bad key.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let cls = Classification::from_anthropic_error_body(body, 401);
+        assert_eq!(cls, Classification::Unauthorized);
+        // And the same classification survives the
+        // record_classified_failure -> "breaker stays closed" contract
+        // — i.e. the Anthropic envelope feeds into the same store
+        // path the OpenAI 401 already exercises.
+        let mut s = HealthStore::default();
+        let model = "anthropic/claude-3.7";
+        for _ in 0..(BREAKER_THRESHOLD * 2) {
+            s.record_classified_failure(model, body, "anthropic", cls);
+        }
+        assert_eq!(
+            s.models[model].consecutive_failures, 0,
+            "Anthropic authentication_error must not increment the breaker (Unauthorized special-case)"
+        );
+        assert!(s.models[model].classification == Some(Classification::Unauthorized));
+        assert!(!s.breaker_open(model));
     }
 
     #[test]

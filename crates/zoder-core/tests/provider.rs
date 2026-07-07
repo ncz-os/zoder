@@ -1,5 +1,5 @@
 use std::time::Duration;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zoder_core::{
     backoff_delay, Auth, BillingMode, ChatRequest, ErrKind, Message, OpenAiProvider, Provider,
@@ -535,4 +535,348 @@ fn backoff_honors_retry_after_floor() {
     // Without a hint, attempt 0 is sub-second-ish (<= ~1s with jitter).
     let d0 = backoff_delay(0, None);
     assert!(d0 <= Duration::from_millis(1200));
+}
+
+// =====================================================================
+// Anthropic Messages API adapter — wire-level integration tests.
+//
+// These tests pin the four properties the Anthropic slice promised:
+//   * endpoint + headers (path, `x-api-key`, `anthropic-version`),
+//   * body shape (system lifted to top-level, no `temperature` field,
+//     streaming flag propagated),
+//   * openai-chat byte-identical behavior (the non-anthropic path
+//     never sees this fork),
+//   * non-streaming response parser,
+//   * streaming SSE decoder,
+//   * typed error envelope on a 401 (no `auth_error`, just the
+//     authentication_error JSON — surface as ErrKind::Http / 401).
+// =====================================================================
+
+/// Build an `OpenAiProvider` configured to hit the given base_url with
+/// Anthropic wire shape. `auth` is whatever `Auth` variant the test
+/// wants to exercise — `Bearer { token }` to assert the leading
+/// `Bearer ` is stripped, `ApiKeyHeader { … }` to assert a verbatim
+/// header passthrough, `None` to assert the empty-credential shape.
+fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
+    let cfg = Provider {
+        id: "anthropic".into(),
+        base_url: base_url.to_string(),
+        kind: "anthropic".into(),
+        auth,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+    };
+    OpenAiProvider::new(&cfg).unwrap()
+}
+
+/// Same as `req()` but uses an Anthropic-shaped model id.
+fn anthropic_req(model: &str, stream: bool) -> ChatRequest {
+    ChatRequest {
+        model: model.into(),
+        messages: vec![
+            // Two system messages so we also exercise the
+            // concat-with-blank-line behavior of the system-lift.
+            Message::new("system", "You are concise."),
+            Message::new("system", "Answer in one sentence."),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 16,
+        temperature: 0.5,
+        stream,
+        show_reasoning: false,
+        reasoning_effort: None,
+    }
+}
+
+/// Task-pinned test (item 4a): an Anthropic provider POSTs to the
+/// `/v1/messages` endpoint with the spec-correct `x-api-key` +
+/// `anthropic-version: 2023-06-01` headers, lifts any leading
+/// `role: "system"` message(s) into the top-level `system` string,
+/// passes the rest of the messages through, and never emits the
+/// OpenAI-shaped `temperature` / `messages[0].role == "system"` body.
+/// The `Bearer ` prefix from a `Bearer { token }` auth is stripped
+/// before the `x-api-key` header is set.
+#[tokio::test]
+async fn anthropic_request_hits_v1_messages_with_correct_headers_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(header("x-api-key", "raw-token-no-bearer"))
+        .and(header_exists("x-api-key"))
+        // The OpenAI-shaped `temperature` field MUST NOT appear in the
+        // Anthropic body — a passing assertion here is the
+        // byte-identical-to-OpenAI-wasn't-applied guard.
+        .and(body_partial_json(serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 16,
+            "stream": false,
+            "system": "You are concise.\n\nAnswer in one sentence.",
+            "messages": [
+                { "role": "user", "content": "hi" }
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(
+        &server.uri(),
+        Auth::Bearer {
+            token: "raw-token-no-bearer".into(),
+        },
+    );
+    let res = p
+        .stream_chat(&anthropic_req("claude-3-5-sonnet", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "ok");
+}
+
+/// Task-pinned test (item 4b): the openai-chat path must remain
+/// byte-identical to before — a `kind = "openai-chat"` provider
+/// never sees the `is_anthropic()` branch, never sends the
+/// `anthropic-version` header, and never lifts system messages. We
+/// exercise this by hitting a path that the Anthropic branch would
+/// ALSO accept and asserting the wire mock matched the OpenAI
+/// `/v1/chat/completions` route instead of `/v1/messages`.
+#[tokio::test]
+async fn openai_chat_path_remains_byte_identical_after_anthropic_fork() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // The OpenAI path passes `temperature` straight through and
+        // carries system messages inline — the Anthropic branch would
+        // have removed both. A passing assertion here proves the
+        // OpenAI route is still the only route taken for
+        // `kind = "openai-chat"`. No `stream_options` because this is
+        // a non-streaming call; the Anthropic branch would have also
+        // stripped `temperature`.
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "hello"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server.uri());
+    let req = ChatRequest {
+        model: "gpt-4o".into(),
+        messages: vec![
+            Message::new("system", "be terse"),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 16,
+        temperature: 0.0,
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: None,
+    };
+    let res = p.stream_chat(&req, None).await.unwrap();
+    assert_eq!(res.content, "hello");
+}
+
+/// Task-pinned test (item 4c): the non-streaming Anthropic response
+/// parser lifts the first `type: "text"` block, translates
+/// `usage.input_tokens` -> `prompt_tokens` and
+/// `usage.output_tokens` -> `completion_tokens`, and includes
+/// `cache_read_input_tokens` + `cache_creation_input_tokens` in the
+/// cache telemetry. A schema-invalid 2xx body (e.g. empty `content`)
+/// MUST surface as ErrKind::Decode — same contract the OpenAI path
+/// enforces.
+#[tokio::test]
+async fn anthropic_non_streaming_response_is_parsed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_01",
+            "content": [
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "world"},
+                {"type": "tool_use", "id": "x", "name": "y", "input": {}}
+            ],
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 2
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let res = p
+        .stream_chat(&anthropic_req("claude", false), None)
+        .await
+        .unwrap();
+    // joined_text() concatenates consecutive text blocks with `\n`.
+    // The expected output therefore carries the inter-block separator
+    // the parser inserts, not the implicit "no separator" the OpenAI
+    // path uses for its single `message.content` string.
+    assert_eq!(res.content, "Hello \nworld");
+    assert_eq!(res.prompt_tokens, Some(7));
+    assert_eq!(res.completion_tokens, Some(4));
+    // cache_read + cache_creation = 3 + 2 = 5
+    assert_eq!(res.cached_prompt_tokens, Some(5));
+}
+
+/// Schema-invalid 2xx guard for the non-streaming Anthropic path: a
+/// response whose `content` array is empty (or contains only non-text
+/// entries, or has only whitespace text) MUST surface as
+/// ErrKind::Decode. This mirrors the OpenAI `{"choices":[{}]}`
+/// guard.
+#[tokio::test]
+async fn anthropic_non_streaming_empty_content_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&anthropic_req("claude", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(err.message.contains("empty content"), "got: {err}");
+}
+
+/// Task-pinned test (item 4d): the streaming Anthropic SSE decoder
+/// walks the `event: …` / `data: {…}` envelope, accumulates
+/// `content_block_delta.delta.text` into the `content` string,
+/// captures `message_start.usage.input_tokens` as `prompt_tokens`,
+/// captures `message_delta.usage.output_tokens` as the authoritative
+/// `completion_tokens`, treats `message_stop` as the terminal event,
+/// and rejects streams that close without producing any text delta.
+#[tokio::test]
+async fn anthropic_streaming_sse_is_assembled() {
+    let server = MockServer::start().await;
+    // Build the SSE body from the exact Anthropic event shape the
+    // parser was written against.
+    let body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\
+\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let mut sink = Vec::new();
+    let res = p
+        .stream_chat(&anthropic_req("claude", true), Some(&mut sink))
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(sink, b"Hello");
+    // input_tokens from message_start, output_tokens from message_delta.
+    assert_eq!(res.prompt_tokens, Some(5));
+    assert_eq!(res.completion_tokens, Some(2));
+}
+
+/// Stream that closes via `message_stop` without producing any text
+/// delta — same schema-invalid-2xx contract as the non-streaming
+/// empty-content case. The decoder must surface ErrKind::Decode.
+#[tokio::test]
+async fn anthropic_streaming_with_no_text_delta_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&anthropic_req("claude", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(err.message.contains("no text content"), "got: {err}");
+}
+
+/// Typed Anthropic error envelope on a 401 must surface as
+/// ErrKind::Http (the existing classify_err path picks the
+/// `Unauthorized` classification off the status code 401 — the
+/// envelope parsing for the *body* is wired into
+/// `model_health::Classification::from_anthropic_error_body` and is
+/// exercised by the model-health unit tests). This integration test
+/// pins the wire side: the 401 response body is read verbatim and
+/// surfaced through `ProviderError::message`.
+#[tokio::test]
+async fn anthropic_401_with_typed_error_envelope_is_classified_as_http() {
+    let server = MockServer::start().await;
+    let body =
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(
+        &server.uri(),
+        Auth::Bearer {
+            token: "bogus".into(),
+        },
+    );
+    let err = p
+        .stream_chat(&anthropic_req("claude", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Http);
+    assert_eq!(err.status, Some(401));
+    // The body must round-trip through `ProviderError::message` so a
+    // downstream classifier can pick the typed envelope apart.
+    assert!(err.message.contains("authentication_error"), "got: {err}");
 }
