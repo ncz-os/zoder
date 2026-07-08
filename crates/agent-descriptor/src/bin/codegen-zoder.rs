@@ -96,6 +96,7 @@ fn _force_imports_used() {
         billing: BillingMode::Free,
         subscription: None,
         serves: vec!["test-model".into()],
+        azure_api_version: None,
     };
     let _quota_unit: QuotaUnit = QuotaUnit::Requests;
     let _theme: Theme = Theme {

@@ -283,6 +283,7 @@ mod tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: Vec::new(),
+            azure_api_version: None,
         }
     }
 
