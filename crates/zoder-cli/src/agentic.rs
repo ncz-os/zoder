@@ -2284,14 +2284,25 @@ fn kill_process_group(pgid: Option<i32>, pid: Option<u32>) {
 /// escape hatch for operators who really do need to run a destructive
 /// validation command from `--check`.
 ///
+/// `policy` drives the OS-level sandbox backend selection. When `policy`'s
+/// `backend == ExecSandbox::None` (the default), the child is spawned as
+/// `sh -c <cmd>` exactly as before — byte-for-byte, no argv change. When
+/// `policy` selects a backend, `crate::exec_safety::wrap_spawn_command`
+/// decides the wrapped argv; we don't duplicate the dispatch here so a
+/// future backend (Linux bwrap, …) lands in exactly one place. A backend
+/// that's unsupported on the running platform surfaces as `(false,
+/// reason)` so the loop renders it like any other check failure.
+///
 /// Returns `(passed, tail)` where `tail` is the last ~4 KB of combined
 /// stdout+stderr. On timeout `passed` is `false` and `tail` carries a clear
 /// phase-timed-out marker so the next author turn can see it.
+#[allow(clippy::too_many_arguments)]
 async fn run_check_watched(
     cwd: &Path,
     cmd: &str,
     secs: u64,
     allow_dangerous: bool,
+    policy: &zoder_core::ExecSafetyConfig,
 ) -> (bool, String) {
     if !allow_dangerous {
         match crate::exec_safety::inspect_shell_command(cmd) {
@@ -2305,10 +2316,25 @@ async fn run_check_watched(
         }
     }
     let budget = std::time::Duration::from_secs(secs.max(1));
-    let mut command = tokio::process::Command::new("sh");
+    // Backend dispatch: the denylist above is the *if*, the policy is the
+    // *how*. `wrap_spawn_command` is the single dispatch point so the
+    // sandbox logic isn't duplicated; we just consume its argv here.
+    let plan = match crate::exec_safety::wrap_spawn_command(cwd, cmd, policy) {
+        Ok(p) => p,
+        Err(reason) => {
+            // An unsupported-platform / misconfigured-backend error from
+            // the dispatch site is surfaced through the same `(false,
+            // tail)` shape as a real command failure so the loop treats
+            // it identically — the next author turn reads the reason out
+            // of the tail verbatim.
+            return (false, reason);
+        }
+    };
+    let mut command = tokio::process::Command::new(&plan.argv[0]);
+    for arg in &plan.argv[1..] {
+        command.arg(arg);
+    }
     command
-        .arg("-c")
-        .arg(cmd)
         .current_dir(cwd)
         .stdin(Stdio::null())
         // Detach the child into its own process group so we can SIGKILL the
@@ -2378,20 +2404,33 @@ async fn run_check_watched(
 ///
 /// `allow_dangerous` mirrors `run_check_watched`: the denylist inspection
 /// runs unless the caller passes `true`.
+///
+/// `policy` mirrors `run_check_watched` and drives the OS-level sandbox
+/// backend selection (see `crate::exec_safety::wrap_spawn_command`).
+/// Default `&ExecSafetyConfig::default()` = `backend = None` preserves the
+/// pre-sandbox byte-for-byte behavior.
 #[cfg(test)]
-fn run_check(cwd: &Path, cmd: &str, allow_dangerous: bool) -> (bool, String) {
+fn run_check(
+    cwd: &Path,
+    cmd: &str,
+    allow_dangerous: bool,
+    policy: &zoder_core::ExecSafetyConfig,
+) -> (bool, String) {
     if !allow_dangerous {
         match crate::exec_safety::inspect_shell_command(cmd) {
             crate::exec_safety::ExecVerdict::Allow => {}
             crate::exec_safety::ExecVerdict::Deny(reason) => return (false, reason),
         }
     }
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
-        .output()
-    {
+    let plan = match crate::exec_safety::wrap_spawn_command(cwd, cmd, policy) {
+        Ok(p) => p,
+        Err(reason) => return (false, reason),
+    };
+    let mut cmd_builder = std::process::Command::new(&plan.argv[0]);
+    for arg in &plan.argv[1..] {
+        cmd_builder.arg(arg);
+    }
+    match cmd_builder.current_dir(cwd).output() {
         Ok(o) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&o.stdout));
@@ -2672,6 +2711,17 @@ pub(crate) async fn cmd_loop(
         return Ok(());
     }
 
+    // Read the operator's exec-safety policy (the OS-level sandbox backend
+    // selection — see `zoder_core::ExecSafetyConfig`). Default = `None`
+    // preserves the pre-sandbox byte-for-byte behavior. We do this once at
+    // the top of the loop instead of per-iteration because the config is
+    // immutable for the loop's lifetime and because every per-iteration
+    // `Engine::load()` would re-read `config.json` and the overlay TOMLs.
+    // A failure to load the engine is treated as a fatal misconfig — the
+    // operator's config is broken in a way that already prevents the loop
+    // from running at all.
+    let exec_safety_policy = Engine::load()?.cfg.exec_safety;
+
     // Task text: trailing args, else -i FILE, else stdin.
     let mut task_txt = task.join(" ");
     if task_txt.trim().is_empty() {
@@ -2832,8 +2882,14 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     eprintln!("[loop] iter {i}: check `{c}`…");
                 }
                 let t0 = std::time::Instant::now();
-                let (ok, tail) =
-                    run_check_watched(&cwd, c, loop_timeout_secs, allow_dangerous_check).await;
+                let (ok, tail) = run_check_watched(
+                    &cwd,
+                    c,
+                    loop_timeout_secs,
+                    allow_dangerous_check,
+                    &exec_safety_policy,
+                )
+                .await;
                 if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
                     check_timed_out = true;
                     if !cli.quiet {
@@ -3562,7 +3618,14 @@ mod tests {
         // Budget of 1s on a child that sleeps 30s — if the watchdog works
         // we land back in ~1s. If it doesn't, the test itself fails on the
         // CI runner's overall timeout, mirroring the production symptom.
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "sleep 30", 1, false).await;
+        let (ok, tail) = run_check_watched(
+            &tmp_cwd(),
+            "sleep 30",
+            1,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(!ok, "hung child must be reported as failed");
@@ -3588,7 +3651,14 @@ mod tests {
     /// didn't accidentally turn every check into a 900s wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_passes_fast_child() {
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "exit 0", 1, false).await;
+        let (ok, tail) = run_check_watched(
+            &tmp_cwd(),
+            "exit 0",
+            1,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         assert!(ok, "fast pass-through must succeed; tail={tail:?}");
         assert!(
             !tail.contains("killed after") && !tail.contains("(loop timeout)"),
@@ -3601,7 +3671,14 @@ mod tests {
     /// tell "CI red" from "loop hung" and may try to fix the wrong thing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_passes_through_real_failures() {
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "echo boom; exit 1", 1, false).await;
+        let (ok, tail) = run_check_watched(
+            &tmp_cwd(),
+            "echo boom; exit 1",
+            1,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         assert!(!ok, "exit 1 must report failure");
         assert!(
             tail.contains("boom"),
@@ -3668,7 +3745,12 @@ mod tests {
         // If anyone re-introduces a timeout inside the raw `run_check`, this
         // assertion catches it: the watchdog is the only thing that bounds
         // wall-clock, by design.
-        let (ok, _tail) = run_check(&tmp_cwd(), "exit 0", false);
+        let (ok, _tail) = run_check(
+            &tmp_cwd(),
+            "exit 0",
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        );
         assert!(ok);
     }
 
@@ -3689,7 +3771,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_denies_dangerous_command_without_spawning() {
         let start = std::time::Instant::now();
-        let (ok, tail) = run_check_watched(&tmp_cwd(), "rm -rf /", 5, false).await;
+        let (ok, tail) = run_check_watched(
+            &tmp_cwd(),
+            "rm -rf /",
+            5,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
         assert!(!ok, "denied command must be reported as failed");
         assert!(
@@ -3721,7 +3810,14 @@ mod tests {
         // command through. We avoid running `rm -rf /` for real here
         // because that interacts with the host filesystem and the
         // integration test environment.
-        let (ok, _tail) = run_check_watched(&tmp_cwd(), "true", 5, true).await;
+        let (ok, _tail) = run_check_watched(
+            &tmp_cwd(),
+            "true",
+            5,
+            true,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         assert!(
             ok,
             "allow_dangerous=true must let a benign command pass to the shell"
@@ -3734,7 +3830,14 @@ mod tests {
     /// loop would otherwise refuse to run any `cargo test` ever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_check_watched_passes_through_benign_command() {
-        let (ok, _tail) = run_check_watched(&tmp_cwd(), "true", 5, false).await;
+        let (ok, _tail) = run_check_watched(
+            &tmp_cwd(),
+            "true",
+            5,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
         assert!(
             ok,
             "benign `true` command must pass the denylist and exit 0"

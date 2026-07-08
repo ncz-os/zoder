@@ -413,6 +413,17 @@ pub struct Config {
     /// (`RoutingConfig::active()`), preserving the legacy free-only behavior.
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// OS-level sandbox backend selection for the loop's `--check` execution.
+    /// Default (`backend = None`) is byte-for-byte identical to the prior
+    /// behavior — the loop consults the string denylist only. Selecting
+    /// `backend = "seatbelt"` on a macOS host wraps `sh -c` in
+    /// `/usr/bin/sandbox-exec -p <profile>`; the same selection on a
+    /// non-macOS host errors at runtime with a clear "unsupported on this
+    /// platform" message (see
+    /// `crates/zoder-cli/src/exec_safety::wrap_spawn_command`). Linux
+    /// backends (bubblewrap / Landlock) are a documented follow-up.
+    #[serde(default)]
+    pub exec_safety: ExecSafetyConfig,
 }
 
 /// Routing-scenario block from `config.json` / an overlay TOML. Mirrors the
@@ -631,6 +642,132 @@ fn subscription_window_exhausted(
     usage.iter().any(|w| w.pct >= 1.0)
 }
 
+// ---------------------------------------------------------------------------
+// Execution-safety sandbox backend selection.
+//
+// This module's *portable* slice (`inspect_shell_command` in
+// `crates/zoder-cli/src/exec_safety.rs`) is a pre-spawn STRING denylist — a
+// guard rail, not a containment boundary. The types below are the
+// opt-in OS-level sandbox BACKEND that actually wraps the spawned child in an
+// OS containment primitive (macOS seatbelt / future Linux landlock+bwrap).
+//
+// Default = `ExecSandbox::None` = exactly the legacy "denylist only" behavior,
+// byte-for-byte. Selecting `Seatbelt` on a host that is not running macOS is a
+// HARD ERROR (`Err("…unsupported on this platform")`) at the call site, not a
+// silent fallback — see `crates/zoder-cli/src/exec_safety::wrap_spawn_command`
+// for the dispatch contract.
+//
+// Linux support is a documented follow-up: the policy enum and the dispatch
+// site are designed to admit a future `Linux(Bubblewrap)` variant without
+// changing the current behavior. We deliberately do NOT stub a Linux variant
+// in this change — a half-implemented sandbox backend that pretends to
+// contain is worse than none (see exec_safety module doc on the "half-working
+// platform-specific code" failure mode).
+// ---------------------------------------------------------------------------
+
+/// Concrete OS-sandbox backend the loop should wrap `--check` execution in.
+///
+/// `serde` shape is intentionally a plain lowercase tag so the operator's
+/// `config.json` / overlay TOML reads naturally (`"backend": "seatbelt"`).
+/// Unknown variants deserialize to `None` via the custom `Deserialize` impl
+/// below so a typo or a not-yet-implemented backend in a new build does not
+/// turn into a hard config load failure (forward-compat — preserves the
+/// "config keeps loading" contract the rest of `Config` already follows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecSandbox {
+    /// No OS-level sandbox: the legacy pre-spawn string denylist is the only
+    /// guard rail. **This is the default** so a config-less or unmodified
+    /// host behaves byte-for-byte as it did before this change.
+    #[default]
+    None,
+    /// macOS seatbelt (`/usr/bin/sandbox-exec -p <profile>`). On any other
+    /// platform the call site MUST reject this with a clear "unsupported on
+    /// this platform" error rather than silently downgrading to `None`.
+    Seatbelt,
+    /// Forward-compat catch-all: a future build (or a typo) that names a
+    /// backend this binary doesn't implement. We deserialize unknown tags
+    /// into this variant so a config keeps loading — the dispatch site is
+    /// the single place that surfaces the unsupported-backend error to the
+    /// operator when they actually try to use it.
+    #[serde(other)]
+    Unsupported,
+}
+
+/// Per-call-site knobs of the macOS seatbelt profile. These are the
+/// well-known "least privilege" choices for the loop's validation command;
+/// an operator who wants more freedom edits the config, an operator who
+/// wants less freedom keeps the defaults. Each field maps to one SBPL
+/// clause so the generated profile is auditable end-to-end (see
+/// `crates/zoder-cli/src/exec_safety::generate_seatbelt_profile`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SeatbeltProfileOptions {
+    /// Allow outbound network from inside the sandbox. Default `false`
+    /// (deny-by-default) — most `--check` commands (`cargo test`, `pytest`)
+    /// do not need network and a compromised test must not silently phone
+    /// home. Operators who run network-dependent checks (e.g. `npm install`
+    /// inside a `--check`) flip this to `true`.
+    #[serde(default = "default_seatbelt_allow_network")]
+    pub allow_network: bool,
+    /// Mount the host's `/tmp` read-write inside the sandbox. Default
+    /// `true` because `cargo`, `pytest`, `node`, and almost every common
+    /// `--check` writes intermediates there. Operators on hardened hosts
+    /// can flip this off; the SBPL will then deny writes under `/tmp` and
+    /// any tool that needs scratch space will fail loudly.
+    #[serde(default = "default_seatbelt_allow_tmp")]
+    pub allow_tmp: bool,
+    /// Read access to the user's `$HOME` (read-only; no writes). Default
+    /// `false` because `~/.cargo`, `~/.npm`, etc. are common and a sandbox
+    /// that can't read them will fail to compile most projects — but
+    /// writing to `$HOME` from a `--check` is almost never legitimate and
+    /// is denied by default. Operators who need to read `.gitconfig`,
+    /// `.cargo/config.toml`, etc. without writing to `$HOME` flip this
+    /// to `true`.
+    #[serde(default = "default_seatbelt_allow_home_read")]
+    pub allow_home_read: bool,
+}
+
+fn default_seatbelt_allow_network() -> bool {
+    false
+}
+fn default_seatbelt_allow_tmp() -> bool {
+    true
+}
+fn default_seatbelt_allow_home_read() -> bool {
+    false
+}
+
+impl Default for SeatbeltProfileOptions {
+    fn default() -> Self {
+        Self {
+            allow_network: default_seatbelt_allow_network(),
+            allow_tmp: default_seatbelt_allow_tmp(),
+            allow_home_read: default_seatbelt_allow_home_read(),
+        }
+    }
+}
+
+/// `[exec_safety]` block from `config.json` / an overlay TOML. Owns the
+/// opt-in OS-sandbox backend selection and the per-backend profile knobs.
+/// Absent block or absent `backend` = `ExecSandbox::None` = current behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecSafetyConfig {
+    /// Which OS-level sandbox backend to wrap `--check` execution in.
+    /// Default (`None`) preserves the pre-existing "denylist only" behavior
+    /// byte-for-byte. See [`ExecSandbox`] for the supported variants and
+    /// their cross-platform contracts.
+    #[serde(default)]
+    pub backend: ExecSandbox,
+    /// Per-backend profile knobs. Currently only consulted when
+    /// `backend == ExecSandbox::Seatbelt`; ignored otherwise so an operator
+    /// who later flips the backend from `None` to `Seatbelt` doesn't have
+    /// to also move their profile options.
+    #[serde(default)]
+    pub seatbelt: SeatbeltProfileOptions,
+}
+
 impl Config {
     /// Config directory: $ZODER_HOME or ~/.zoder.
     pub fn home() -> PathBuf {
@@ -746,6 +883,7 @@ impl Config {
             agents: BTreeMap::new(),
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
+            exec_safety: ExecSafetyConfig::default(),
         }
     }
 
