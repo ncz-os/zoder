@@ -920,23 +920,34 @@ pub fn effective_used(snap: &RateLimitSnapshot, now: DateTime<Utc>) -> f64 {
 /// that want the same behavior regardless of time should set `now` to a
 /// fixed [`DateTime`] in tests.
 ///
-/// Freshness gate (Finding #6): the legacy path used to ignore
-/// `observed_at` entirely, so a two-hour-old 90% snapshot kept gating
-/// routing even though the equivalent [`AccountView`] would mark it
-/// Degraded and exclude it from binding. We now derive
-/// [`TelemetryHealth`] from `observed_at` whenever the caller actually
-/// sets it (the live wire-up via [`parse_headers`] always does), and
-/// refuse to fall back on anything Degraded — the same trust nothing
-/// more than 60 minutes old or with a missing clock invariant
-/// [`decide_account`] already honors. Material future-dated
-/// `observed_at` (more than [`FUTURE_TIMESTAMP_TOLERANCE_SECS`] ahead
-/// of `now`) is treated as clock-skewed Degraded rather than Fresh.
+/// Freshness gate (Finding #6 + adversarial review Z-18): the legacy
+/// path used to ignore `observed_at` entirely, so a two-hour-old 90%
+/// snapshot kept gating routing even though the equivalent
+/// [`AccountView`] would mark it Degraded and exclude it from binding.
+/// We now derive [`TelemetryHealth`] from `observed_at` whenever the
+/// caller actually sets it (the live wire-up via [`parse_headers`]
+/// always does), and FAIL CLOSED on anything Degraded — the same
+/// "trust nothing more than 60 minutes old" invariant
+/// [`decide_account`] already honors. A Degraded snapshot is
+/// untrustworthy either direction (it may have refilled, but it also
+/// may not have), so the only safe routing decision is to NOT pin the
+/// paid sub through it. A Fresh / Stale snapshot continues through
+/// the normal use_target / cap_guard bands; a Degraded one returns
+/// [`RouteDecision::FallBackToFree`] regardless of the snapshot's
+/// `used_percent` or `has_credits` — preferring the subscription on
+/// data we can't trust would be the fail-OPEN bug the adversarial
+/// review caught (Z-18). Material future-dated `observed_at` (more
+/// than [`FUTURE_TIMESTAMP_TOLERANCE_SECS`] ahead of `now`) is treated
+/// as clock-skewed Degraded rather than Fresh.
 ///
 /// A snapshot with `observed_at = None` is trusted at face value (no
 /// freshness inference): the live wire-up always sets `observed_at`
 /// (so this branch only hits synthetic test fixtures / internal
 /// callers that know what they're doing — same trust contract as the
-/// pre-fix code).
+/// pre-fix code). Callers that want the fail-closed path on absent
+/// telemetry should branch on `None` themselves BEFORE handing a
+/// snapshot to `decide()` (see `candidate_eligible` in
+/// [`crate::scenarios`], Z-19).
 pub fn decide(
     snap: &RateLimitSnapshot,
     knobs: &RouteKnobs,
@@ -946,14 +957,20 @@ pub fn decide(
     // Stale reset: window rolled over -> full headroom.
     let used = effective_used(snap, now);
 
-    // Freshness gate: only applied when the caller supplied an
-    // `observed_at`. The live capture path always does; tests / internal
-    // callers that pass `observed_at = None` keep the legacy trust
-    // contract.
+    // Freshness gate (Z-18, fail-closed): only applied when the caller
+    // supplied an `observed_at`. The live capture path always does;
+    // tests / internal callers that pass `observed_at = None` keep the
+    // legacy trust contract. A Degraded snapshot is untrustworthy — we
+    // must NOT use it to keep the sub eligible (a 99% reading may
+    // still be 99%, but it may also have refilled) and we must NOT use
+    // it to fall back on a low reading (the 5% may have spiked to 95%
+    // since the last sighting). The only safe verdict is to fall
+    // back to free; the router then either picks a Free class
+    // candidate or surfaces a routing error to the caller.
     if let Some(observed_at) = snap.observed_at {
         let snap_age = (now - observed_at).num_seconds();
         if TelemetryHealth::from_age_secs(Some(snap_age)) == TelemetryHealth::Degraded {
-            return RouteDecision::PreferSub;
+            return RouteDecision::FallBackToFree;
         }
     }
 
@@ -2520,7 +2537,7 @@ mod tests {
         // parse_headers must surface the secondary reading (the parser
         // builds a real `secondary` window with `used_percent = 50`; the
         // bug previously returned `None` here).
-        let s = parse_headers(&h, "acct", "pro").expect(
+        let mut s = parse_headers(&h, "acct", "pro").expect(
             "a Codex-shaped secondary-only header set must not be dropped \
              by parse_headers",
         );
@@ -2531,9 +2548,17 @@ mod tests {
             .expect("secondary window must be populated from the secondary header");
         assert_eq!(secondary.used_percent, Some(50.0));
         // And the routing decision must use it — a 50% secondary reading
-        // alone must NOT fabricate a PreferSub against an 85% cap_guard;
-        // this is the L3 contract the regression guards.
+        // alone must not be discarded by the parser (the regression
+        // this test guards). Pin the snapshot's `observed_at` to the
+        // test's `now` so the freshness gate is Fresh (the gate is
+        // keyed off the age relative to `now`; a parser-produced
+        // `observed_at = Utc::now()` would otherwise be far in the
+        // future relative to the test's hard-coded 2026-07-04 `now`
+        // and Degraded, which would now fail closed — that's the
+        // Z-18 fix and is correct, but unrelated to the
+        // secondary-window detection contract this test pins).
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        s.observed_at = Some(now);
         assert_eq!(
             decide(&s, &RouteKnobs::default(), now, None),
             RouteDecision::PreferSub
@@ -2545,10 +2570,11 @@ mod tests {
             ("x-codex-primary-used-percent", "NaN"),
             ("x-codex-secondary-used-percent", "37"),
         ]);
-        let s2 = parse_headers(&h2, "acct", "pro").expect(
+        let mut s2 = parse_headers(&h2, "acct", "pro").expect(
             "a malformed primary header must not cause a valid secondary \
              reading to be dropped",
         );
+        s2.observed_at = Some(now);
         assert_eq!(s2.provider, Provider::OpenaiCodex);
         assert!(
             s2.primary.is_none(),
@@ -2752,6 +2778,14 @@ mod tests {
 
     #[test]
     fn degraded_no_credits_signal_does_not_gate() {
+        // Adversarial review Z-18 (fail-closed: degraded snapshot must
+        // not keep a possibly-exhausted sub eligible). A Degraded
+        // snapshot is untrustworthy either direction; the routing
+        // decision must fail CLOSED (FallBackToFree), NOT PreferSub.
+        // This previously asserted PreferSub (the fail-OPEN behavior
+        // the comment below originally justified); the test was
+        // updated as part of the Z-18 fix to pin the corrected
+        // fail-closed contract.
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let mut snap = snap_with_primary(99.0, None);
         snap.has_credits = Some(false);
@@ -2763,7 +2797,78 @@ mod tests {
                 now,
                 None
             ),
+            RouteDecision::FallBackToFree,
+            "a Degraded snapshot must fail CLOSED regardless of has_credits; \
+             PreferSub here would let a possibly-exhausted sub through on stale data",
+        );
+    }
+
+    #[test]
+    fn decide_degraded_snapshot_high_usage_falls_back_to_free() {
+        // Z-18 (fail-closed: stale telemetry must not keep a
+        // possibly-exhausted sub eligible). A snapshot whose
+        // `observed_at` is more than 60 minutes old is Degraded; a
+        // 99% reading on it cannot be trusted — the window may have
+        // refilled, but it also may not have, and routing through a
+        // (possibly) 99%-used subscription is the fail-OPEN bug. The
+        // decision must be `FallBackToFree`, NOT `PreferSub`. Must
+        // FAIL on the pre-fix code (which returns `PreferSub` for
+        // any Degraded snapshot).
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut snap = snap_with_primary(99.0, None);
+        snap.observed_at = Some(now - chrono::Duration::hours(2));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::FallBackToFree,
+            "a Degraded snapshot at 99% used must fail CLOSED, NOT PreferSub",
+        );
+    }
+
+    #[test]
+    fn decide_fresh_snapshot_low_usage_still_prefers_sub() {
+        // Non-regression for the Z-18 fix: a FRESH snapshot at low
+        // usage must STILL PreferSub — only stale/absent telemetry
+        // changes to the conservative path. (Sanity check that the
+        // fail-closed fix didn't over-correct.)
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut snap = snap_with_primary(30.0, None);
+        snap.observed_at = Some(now - chrono::Duration::seconds(30));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
             RouteDecision::PreferSub,
+            "a Fresh snapshot at 30% used must still PreferSub",
+        );
+    }
+
+    #[test]
+    fn decide_stale_but_not_degraded_snapshot_still_uses_bands() {
+        // Non-regression for the Z-18 fix: a Stale (5..=60 min)
+        // snapshot must STILL flow through the normal use_target /
+        // cap_guard bands — the freshness gate only fires on
+        // Degraded. A 30% stale reading is still under use_target
+        // -> PreferSub.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut snap = snap_with_primary(30.0, None);
+        snap.observed_at = Some(now - chrono::Duration::minutes(30));
+        assert_eq!(
+            decide(
+                &snap,
+                &knobs_with(80.0, 85.0, BudgetMode::Block, None),
+                now,
+                None
+            ),
+            RouteDecision::PreferSub,
+            "a Stale-but-not-Degraded snapshot at 30% used must still PreferSub via the normal bands",
         );
     }
 
