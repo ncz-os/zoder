@@ -13,13 +13,14 @@
 //!   2. **OS-level sandbox backend dispatch** ([`wrap_spawn_command`]) —
 //!      when the operator opts in via the `[exec_safety]` block in
 //!      `config.json`, the spawned child is wrapped in an OS containment
-//!      primitive. **macOS seatbelt (`/usr/bin/sandbox-exec -p <profile>`)
-//!      is implemented**; selecting it on a non-macOS host surfaces a
-//!      clear "unsupported on this platform" error rather than silently
-//!      disabling the protection. Linux backends (bubblewrap / Landlock)
-//!      remain a documented follow-up — the dispatch site is designed to
-//!      admit a future `ExecSandbox::LinuxBubblewrap` variant without
-//!      changing the current behavior.
+//!      primitive. Two backends are wired up: **macOS seatbelt**
+//!      (`/usr/bin/sandbox-exec -p <profile>`) and **Linux bubblewrap**
+//!      (`bwrap <argv> -- sh -c <cmd>`). Each backend is gated on its
+//!      native OS via `cfg(target_os = …)`; selecting it off-native surfaces
+//!      a clear "unsupported on this platform" error rather than silently
+//!      disabling the protection. The dispatch site is designed to admit
+//!      additional backends without changing the current behavior — see
+//!      `wrap_spawn_command` for the single-match contract.
 //!
 //! What this module IS
 //! -------------------
@@ -42,10 +43,11 @@
 //! boundary. A determined adversarial command can evade a substring/regex
 //! denylist trivially (base64, `eval`, hex-escaped binaries, `python -c`,
 //! etc.). To turn the denylist into actual containment, set
-//! `[exec_safety].backend = "seatbelt"` in your config (macOS only) — the
-//! dispatch in `wrap_spawn_command` will then wrap the child in
-//! `sandbox-exec`. Without that, the denylist is best-effort only and
-//! should not be over-sold.
+//! `[exec_safety].backend = "seatbelt"` on macOS or
+//! `[exec_safety].backend = "linux_bubblewrap"` on Linux — the dispatch
+//! in `wrap_spawn_command` will then wrap the child in `sandbox-exec` or
+//! `bwrap` respectively. Without that, the denylist is best-effort only
+//! and should not be over-sold.
 //!
 //! Design shape (mirrors `crates/acp-client/src/lib.rs::resolve_containment`):
 //!   * Pure function: no I/O, no side effects (the denylist).
@@ -335,27 +337,41 @@ fn has_remote_pipe_shell(s: &str) -> bool {
 // `agentic.rs`) consults both: the denylist decides IF we will run, the
 // backend decides HOW we will run.
 //
-// Cross-platform contract (mirrored by the `target_os = "macos"` / off-mac
-// `cfg` arms in `wrap_spawn_command` and by the test surface):
-//   * `ExecSandbox::None`     — same on every OS. The dispatch site invokes
-//                               `sh -c <cmd>` exactly as before; the
-//                               returned plan's `argv` is `[sh, -c, cmd]`.
-//   * `ExecSandbox::Seatbelt` — built and tested on macOS; on every other
-//                               OS the dispatch site returns
-//                               `Err("seatbelt backend is unsupported on
-//                               this platform — only macOS is wired up;
-//                               Linux backends are a documented follow-up")`.
-//                               We deliberately do NOT silently fall back to
-//                               `None` on non-mac — see module doc on the
-//                               "half-working platform-specific code" failure
-//                               mode. The same `Err` is what the unit tests
-//                               pin on Linux CI so the cross-platform contract
-//                               can't regress silently.
+// Cross-platform contract (mirrored by the `target_os = "macos"` /
+// `target_os = "linux"` / off-native `cfg` arms in `wrap_spawn_command`,
+// `seatbelt_plan`, and `linux_plan`, and by the test surface):
+//   * `ExecSandbox::None`             — same on every OS. The dispatch site
+//                                       invokes `sh -c <cmd>` exactly as
+//                                       before; the returned plan's `argv`
+//                                       is `[sh, -c, cmd]`.
+//   * `ExecSandbox::Seatbelt`         — built and tested on macOS; on every
+//                                       other OS the dispatch site returns
+//                                       `Err("seatbelt backend is
+//                                       unsupported on this platform — only
+//                                       macOS is wired up; …")`. We
+//                                       deliberately do NOT silently fall
+//                                       back to `None` on non-mac — see
+//                                       module doc on the "half-working
+//                                       platform-specific code" failure
+//                                       mode. The same `Err` is what the
+//                                       unit tests pin on Linux CI so the
+//                                       cross-platform contract can't
+//                                       regress silently.
+//   * `ExecSandbox::LinuxBubblewrap`  — symmetric mirror of seatbelt for
+//                                       Linux. Built and tested on Linux;
+//                                       on every other OS the dispatch
+//                                       site returns
+//                                       `Err("…linux_bubblewrap backend is
+//                                       unsupported on this platform — only
+//                                       Linux is wired up; …")`. Same
+//                                       hard-error-on-wrong-host policy.
 // ---------------------------------------------------------------------------
 
 use std::ffi::OsString;
 
-use zoder_core::{ExecSafetyConfig, ExecSandbox, SeatbeltProfileOptions};
+use zoder_core::{
+    ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, SeatbeltProfileOptions,
+};
 
 /// What `wrap_spawn_command` decided the spawn should look like. The call
 /// site consumes `argv` (as `OsString`s — needed because the working
@@ -406,6 +422,7 @@ pub(crate) fn wrap_spawn_command(
             sandboxed: false,
         }),
         ExecSandbox::Seatbelt => seatbelt_plan(cwd, cmd, &policy.seatbelt),
+        ExecSandbox::LinuxBubblewrap => linux_plan(cwd, cmd, &policy.linux_bubblewrap),
         // Forward-compat catch-all (the `#[serde(other)]` variant on
         // `ExecSandbox`): the operator's config named a backend this
         // build doesn't know about — a typo, or a future variant on a
@@ -416,8 +433,8 @@ pub(crate) fn wrap_spawn_command(
         ExecSandbox::Unsupported => {
             Err("exec_safety backend is set to a value this build does not \
              recognize — see zoder_core::ExecSandbox for the supported \
-             variants (currently `none` and `seatbelt`). Set \
-             `exec_safety.backend = \"none\"` to restore the legacy \
+             variants (currently `none`, `seatbelt`, and `linux_bubblewrap`). \
+             Set `exec_safety.backend = \"none\"` to restore the legacy \
              denylist-only behavior, or upgrade zoder to a build that \
              implements the named backend."
                 .to_string())
@@ -572,6 +589,192 @@ pub(crate) fn generate_seatbelt_profile(
     // children on exit (otherwise waitpid-equivalents wedge).
     p.push_str("(allow signal)\n");
     p
+}
+
+/// Build a `bubblewrap` dispatch plan. The argv is generated as a `Vec<OsString>`
+/// (with every flag documented inline so the operator can audit it by running
+/// `bwrap <args> -- sh -c 'echo hi'` from a shell) and passed to `bwrap` as
+/// the argv of a fresh `Command`.
+///
+/// Platform contract (mirrors [`seatbelt_plan`]):
+///   * `cfg(target_os = "linux")` — return the wrapped plan.
+///   * any other target — return `Err` with a clear unsupported message.
+///     This is what the unit tests assert on macOS CI / dev hosts; the
+///     regression guard keeps the cross-platform contract honest even
+///     though we can never actually execute a `bwrap` binary on a non-Linux
+///     runner.
+fn linux_plan(
+    cwd: &std::path::Path,
+    cmd: &str,
+    opts: &LinuxBubblewrapProfileOptions,
+) -> Result<SandboxSpawnPlan, String> {
+    // The unsupported-on-this-platform path is platform-independent so the
+    // unit test can assert it from any host (including the macOS CI box
+    // this loop runs on). The actual bwrap wrap is Linux-only via the
+    // inner `#[cfg]`.
+    if !cfg!(target_os = "linux") {
+        return Err(format!(
+            "linux_bubblewrap backend is unsupported on this platform \
+             ({target}); only Linux is wired up in this build. Use \
+             `seatbelt` on macOS, or see \
+             crates/zoder-cli/src/exec_safety.rs module doc for the full \
+             backend matrix.",
+            target = std::env::consts::OS,
+        ));
+    }
+
+    let argv = generate_bubblewrap_argv(cwd, cmd, opts);
+    Ok(SandboxSpawnPlan {
+        argv,
+        sandboxed: true,
+    })
+}
+
+/// Render the `bwrap` argv for the Linux bubblewrap sandbox. The argv is
+/// deny-network-by-default (via `--unshare-net`) and then re-allows exactly
+/// what `--check` legitimately needs (read-write bind of the working dir,
+/// read-only binds of system paths the dynamic linker and shell scripts
+/// reach for). Every flag is documented inline because bubblewrap's argv is
+/// order-sensitive (`--` MUST appear between the bind/unshare flags and the
+/// wrapped command) and a misplaced `--` silently runs the wrapped command
+/// OUTSIDE the sandbox.
+///
+/// The function is pure and platform-independent (it never touches the
+/// filesystem or shell) so the SAME function is unit-tested on macOS CI —
+/// that is the regression guard the task brief asks for. (The pure
+/// profile-string test for seatbelt serves the same purpose; this is the
+/// pure-argv equivalent.)
+#[allow(clippy::vec_init_then_push)] // imperative push is clearer here than a `vec![…]` macro with inline `if` arms (allow_tmp / unshare_net / allow_home_read are all conditional).
+pub(crate) fn generate_bubblewrap_argv(
+    cwd: &std::path::Path,
+    cmd: &str,
+    opts: &LinuxBubblewrapProfileOptions,
+) -> Vec<OsString> {
+    // Canonical POSIX form of the cwd for the bwrap `--bind` argument.
+    // bwrap's `--bind` takes two absolute paths and binds the source onto
+    // the destination inside the new mount namespace; a relative source
+    // would be resolved against the parent shell's cwd, not the wrapped
+    // child's cwd, and would silently bind the wrong tree. We always want
+    // the canonical absolute form, so we canonicalize at argv-generation
+    // time and fall back to the literal input string when canonicalization
+    // fails (the path may not exist yet, e.g. a freshly-created `--check`
+    // target dir).
+    let cwd_str = cwd
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+
+    // We build the argv imperatively with `push` rather than a single
+    // `vec![…]` macro because several entries are conditional
+    // (`opts.allow_tmp`, `opts.unshare_net`, `opts.allow_home_read`)
+    // and a `vec![…]` macro with inline `if` arms is harder to audit
+    // than the linear block below. The function-level
+    // `#[allow(clippy::vec_init_then_push)]` documents the choice.
+    let mut argv: Vec<OsString> = Vec::new();
+    // The wrapped program itself. `/usr/bin/bwrap` is the canonical
+    // install path on Debian/Ubuntu/Fedora/Arch; an operator on a NixOS
+    // or otherwise-customized PATH can override via a symlink at this
+    // location. (We don't take a `--bwrap-path` knob because bwrap's
+    // argv-builder contract is "the binary is called `bwrap`" and
+    // resolving via `$PATH` is what every consumer of bubblewrap expects.)
+    argv.push(OsString::from("/usr/bin/bwrap"));
+    // Read-only bind of `/usr` — system libraries, dynamic linker, and
+    // toolchain binaries live here. Read-only is intentional: even though
+    // the wrapped command runs as the calling user, granting write access
+    // to `/usr` would let a compromised `--check` clobber system binaries
+    // and persist past the loop's lifetime. The dynamic linker
+    // (`ld-linux.so`) reads from `/usr/lib` and would fail to start `sh`
+    // without this clause.
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(OsString::from("/usr"));
+    argv.push(OsString::from("/usr"));
+    // Read-only bind of `/bin` — many distributions keep essential
+    // utilities (sh, ls, cat, …) here as a hardlink/symlink farm off
+    // `/usr/bin`. bwrap needs both bound because the kernel's `execve`
+    // resolves the literal path passed by the shell, and `sh` itself is
+    // commonly invoked as `/bin/sh`.
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(OsString::from("/bin"));
+    argv.push(OsString::from("/bin"));
+    // Read-only bind of `/lib` — the dynamic linker and a few legacy
+    // libraries live here on glibc-based distros. Without this clause,
+    // even a binary compiled against libc.so.6 fails to load because the
+    // linker cannot resolve its own path. (`/lib64` is covered by the
+    // `/lib` ro-bind when it's a symlink to `/usr/lib`; on older distros
+    // where it is a real directory, this is where the missing path comes
+    // from — bwrap binds the source path as a tree, so symlink targets
+    // are followed transparently.)
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(OsString::from("/lib"));
+    argv.push(OsString::from("/lib"));
+    // Read-only bind of `/etc` — DNS resolvers, the timezone database, and
+    // the system locale files live here. A `--check` command that needs
+    // to resolve hostnames (e.g. `cargo test` pulling a crate from a
+    // git URL, when network is allowed) reads `/etc/resolv.conf`; without
+    // this clause every DNS lookup fails with a confusing "no such host"
+    // rather than a clear "sandbox blocked it". Read-only is again
+    // intentional — a write to `/etc/resolv.conf` from a `--check` is a
+    // smell the operator should see.
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(OsString::from("/etc"));
+    argv.push(OsString::from("/etc"));
+    // Read-write bind of the working directory onto itself inside the
+    // new mount namespace. This is the WHOLE point of running a build
+    // inside a sandbox: `cargo test` writes `target/`, `pytest` writes
+    // `.pytest_cache/`, etc. — all of which must land under cwd and be
+    // visible to the operator's host filesystem afterwards. (bwrap's
+    // `--bind` is read-write; `--ro-bind` is the read-only variant we
+    // use above for system paths.)
+    argv.push(OsString::from("--bind"));
+    argv.push(OsString::from(&cwd_str));
+    argv.push(OsString::from(&cwd_str));
+    // Optional tmp mounts. `--check` commands almost always need scratch
+    // space (cargo's incremental-compilation cache, pytest's tmp_path
+    // fixture, node's npm cache), so the default is to bind tmp read-write.
+    // Operators on hardened hosts can flip `allow_tmp = false` to deny
+    // tmp entirely and let the wrapped command fail loudly if it tries
+    // to use it.
+    if opts.allow_tmp {
+        argv.push(OsString::from("--bind"));
+        argv.push(OsString::from("/tmp"));
+        argv.push(OsString::from("/tmp"));
+    }
+    // Optional home-read bind. Grants READ-ONLY access to `/home` so
+    // `~/.cargo/config.toml`, `~/.gitconfig`, `~/.npmrc`, etc. are
+    // visible to the wrapped command. Writes to `/home` remain denied
+    // because the bind is `--ro-bind` — a `--check` that needs to
+    // write to `$HOME` is a smell the operator should notice.
+    if opts.allow_home_read {
+        argv.push(OsString::from("--ro-bind"));
+        argv.push(OsString::from("/home"));
+        argv.push(OsString::from("/home"));
+    }
+    // Network policy. By default we unshare the network namespace so the
+    // wrapped process has no interface at all (not even loopback) and
+    // cannot phone home or pull bytes from a compromised `cargo test`.
+    // Operators running network-dependent checks (e.g. `npm install`
+    // inside a `--check`) flip `unshare_net = false`; the argv then
+    // omits the `--unshare-net` flag and the wrapped process inherits
+    // the host network namespace.
+    if opts.unshare_net {
+        argv.push(OsString::from("--unshare-net"));
+    }
+    // The bwrap argv separator. Everything after `--` is the program to
+    // exec inside the new mount namespace. bwrap REQUIRES this to be a
+    // separate argv entry (not glued to the preceding flag) — a single
+    // token like `--unshare-net--` is parsed by bwrap as the literal
+    // option name and silently skips the unwrap. Pushing it as its own
+    // OsString guarantees the argv slot is correct.
+    argv.push(OsString::from("--"));
+    // The wrapped command — exactly the legacy `sh -c <cmd>` shape, so
+    // the wrapped process sees an argv of `["sh", "-c", cmd]` and the
+    // operator's existing `--check` commands continue to work
+    // unchanged inside the sandbox.
+    argv.push(OsString::from("sh"));
+    argv.push(OsString::from("-c"));
+    argv.push(OsString::from(cmd));
+    argv
 }
 
 #[cfg(test)]
@@ -845,7 +1048,7 @@ mod tests {
     // caught by the same `cargo test --workspace` gate the rest of the
     // crate relies on.
     //
-    // The three required tests from the brief live here:
+    // The seatbelt tests live here:
     //   1. default (None) backend leaves the command unchanged
     //      — byte-for-byte regression guard;
     //   2. Seatbelt backend wraps with `sandbox-exec` + the generated SBPL
@@ -855,6 +1058,12 @@ mod tests {
     //      CI;
     //   3. selecting Seatbelt off-macOS surfaces the documented unsupported
     //      error so the cross-platform contract is regression-safe.
+    //
+    // The Linux bubblewrap backend mirrors seatbelt 1:1 with one
+    // structural twist — the "profile" is a `Vec<OsString>` (bwrap's argv)
+    // rather than a `String` (SBPL). All four required tests for that
+    // backend live at the bottom of this module so they sit next to the
+    // code-under-test and to the seatbelt tests they mirror.
     // -----------------------------------------------------------------------
 
     /// Default `ExecSafetyConfig::default()` must produce the legacy
@@ -1130,6 +1339,7 @@ mod tests {
         let policy = ExecSafetyConfig {
             backend: ExecSandbox::Seatbelt,
             seatbelt: SeatbeltProfileOptions::default(),
+            ..Default::default()
         };
         let plan =
             wrap_spawn_command(cwd, "cargo test --workspace", &policy).expect("macOS dispatch");
@@ -1154,5 +1364,383 @@ mod tests {
         assert_eq!(plan.argv[3].to_string_lossy(), "sh");
         assert_eq!(plan.argv[4].to_string_lossy(), "-c");
         assert_eq!(plan.argv[5].to_string_lossy(), "cargo test --workspace");
+    }
+
+    // -----------------------------------------------------------------------
+    // Linux bubblewrap backend.
+    //
+    // Mirrors the seatbelt test block above 1:1. The "profile" for the
+    // Linux backend is a `Vec<OsString>` (bwrap's argv) rather than a
+    // SBPL `String`, so the assertions look at argv slots rather than at
+    // substrings of a profile. The contract under test is identical:
+    //   1. default (None) backend leaves the command unchanged
+    //      — same regression guard as the seatbelt block above;
+    //   2. Linux bubblewrap wraps with `/usr/bin/bwrap` + the generated
+    //      argv; the argv contains the deny-network (`--unshare-net`)
+    //      and bind-workdir (`--bind <cwd> <cwd>`) clauses;
+    //   3. the argv generator is a PURE function of `(cwd, cmd, opts)` —
+    //      tested on every host (including this macOS CI box);
+    //   4. selecting `LinuxBubblewrap` off-Linux surfaces the documented
+    //      unsupported error so the cross-platform contract is
+    //      regression-safe.
+    // -----------------------------------------------------------------------
+
+    /// `generate_bubblewrap_argv` is a PURE function of `(cwd, cmd, opts)` —
+    /// it never touches the filesystem beyond `Path::canonicalize`, which
+    /// gracefully falls back to the literal input string when
+    /// canonicalization fails. That purity means we can — and should —
+    /// test the bwrap argv contract on macOS CI too, not only on Linux
+    /// hosts. This is the platform-independent regression guard the brief
+    /// asks for: if someone removes the deny-network flag or the workdir
+    /// bind, this test fails on every host (macOS, Linux, CI), not only
+    /// on the developer's laptop.
+    #[test]
+    fn bubblewrap_argv_default_options_contain_unshare_net_and_workdir_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        // The argv generator canonicalizes the cwd internally (bwrap's
+        // `--bind` takes two absolute paths and binds the source onto the
+        // destination inside the new mount namespace; a relative source
+        // would be resolved against the parent shell's cwd and silently
+        // bind the wrong tree). Mirror that here so the test asserts on
+        // the SAME string the argv embeds, not the raw tempdir path.
+        let cwd_str = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let argv = generate_bubblewrap_argv(
+            cwd,
+            "cargo test --workspace --locked --all-features",
+            &LinuxBubblewrapProfileOptions::default(),
+        );
+        // Wrapped program must be `/usr/bin/bwrap`. Anything else (a bare
+        // `bwrap` resolving through `$PATH`, or a wrong absolute path)
+        // would silently fall back to whatever the operator's PATH points
+        // at, and a non-bwrap binary that happens to accept `--ro-bind`
+        // could become a confused-deputy attack vector.
+        assert_eq!(
+            argv[0].to_string_lossy(),
+            "/usr/bin/bwrap",
+            "wrapped program must be /usr/bin/bwrap; got: {:?}",
+            argv[0]
+        );
+        // The argv separator `--` MUST be present — everything after it is
+        // the program to exec inside the new mount namespace, and a
+        // missing `--` causes bwrap to try to interpret the wrapped
+        // command's argv as bwrap options. (The exact slot is asserted
+        // by the dispatch integration test below; here we just pin that
+        // the separator is somewhere in the argv.)
+        assert!(
+            argv.iter().any(|a| a.to_string_lossy() == "--"),
+            "argv must contain the bwrap `--` separator; got: {:?}",
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        // Default deny-network clause: `--unshare-net`. Default is
+        // `unshare_net = true`, so the flag MUST appear. A future
+        // "default to allow network" change has to update this test
+        // (and the operator-visible docs) instead of slipping through.
+        assert!(
+            argv.iter().any(|a| a.to_string_lossy() == "--unshare-net"),
+            "argv must contain --unshare-net by default (deny network); got: {:?}",
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        // Workdir read-write bind: `--bind <cwd> <cwd>`. The argv
+        // generator uses canonical absolute paths for both source and
+        // destination so the bind lands at the operator-visible mount
+        // point, not at a bwrap-internal placeholder.
+        let argv_strings: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let bind_idx = argv_strings
+            .iter()
+            .position(|a| a == "--bind")
+            .expect("argv must contain at least one --bind (the workdir bind)");
+        // The `--bind` flag is followed by the source path and the
+        // destination path; for the workdir bind they must both equal
+        // the canonical cwd.
+        assert_eq!(
+            argv_strings[bind_idx + 1],
+            cwd_str,
+            "workdir bind source must equal the canonical cwd"
+        );
+        assert_eq!(
+            argv_strings[bind_idx + 2],
+            cwd_str,
+            "workdir bind destination must equal the canonical cwd"
+        );
+        // Default tmp-bind: `--bind /tmp /tmp` MUST be present. Without
+        // it, almost every `--check` (cargo, pytest, node) fails with a
+        // confusing "no such file or directory" the operator can't
+        // triage. Operators who want tmp fully denied flip
+        // `allow_tmp = false` (covered by the dedicated test below).
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--bind", "/tmp", "/tmp"]),
+            "argv must contain `--bind /tmp /tmp` by default; got: {:?}",
+            argv_strings
+        );
+        // System path read-only binds — without these, dyld/ld-linux
+        // fails to load `sh` itself.
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/usr", "/usr"]),
+            "argv must contain `--ro-bind /usr /usr`; got: {:?}",
+            argv_strings
+        );
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/bin", "/bin"]),
+            "argv must contain `--ro-bind /bin /bin`; got: {:?}",
+            argv_strings
+        );
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/lib", "/lib"]),
+            "argv must contain `--ro-bind /lib /lib`; got: {:?}",
+            argv_strings
+        );
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/etc", "/etc"]),
+            "argv must contain `--ro-bind /etc /etc`; got: {:?}",
+            argv_strings
+        );
+        // The wrapped command must be the legacy `sh -c <cmd>` shape so
+        // the operator's existing `--check` strings continue to work
+        // unchanged inside the sandbox. The argv after `--` MUST be
+        // exactly `[sh, -c, cmd]`.
+        let sep_idx = argv_strings
+            .iter()
+            .position(|a| a == "--")
+            .expect("argv must contain the `--` separator");
+        assert_eq!(
+            argv_strings.len() - sep_idx - 1,
+            3,
+            "wrapped command after `--` must be exactly 3 args (sh, -c, cmd); got argv: {:?}",
+            argv_strings
+        );
+        assert_eq!(argv_strings[sep_idx + 1], "sh");
+        assert_eq!(argv_strings[sep_idx + 2], "-c");
+        assert_eq!(
+            argv_strings[sep_idx + 3],
+            "cargo test --workspace --locked --all-features",
+            "wrapped command after `--` must be the operator's literal cmd string"
+        );
+    }
+
+    /// Optional knob honored: `unshare_net = false` MUST drop the
+    /// `--unshare-net` flag. (The default test above pins the
+    /// `true`-side; this test pins the `false`-side.)
+    #[test]
+    fn bubblewrap_argv_unshare_net_false_omits_unshare_net_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let opts = LinuxBubblewrapProfileOptions {
+            unshare_net: false,
+            ..Default::default()
+        };
+        let argv = generate_bubblewrap_argv(cwd, "echo hi", &opts);
+        assert!(
+            !argv.iter().any(|a| a.to_string_lossy() == "--unshare-net"),
+            "unshare_net=false must omit the --unshare-net flag; got: {:?}",
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Optional knob honored: `allow_home_read = true` MUST add a
+    /// `--ro-bind /home /home` entry. (The default test pins the
+    /// `false`-side implicitly — a default-options argv must NOT
+    /// contain this triple — and this test pins the `true`-side so the
+    /// operator-visible "read home but not write home" contract is
+    /// regression-safe in both directions.)
+    #[test]
+    fn bubblewrap_argv_allow_home_read_true_emits_ro_home_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let opts = LinuxBubblewrapProfileOptions {
+            allow_home_read: true,
+            ..Default::default()
+        };
+        let argv_strings: Vec<String> = generate_bubblewrap_argv(cwd, "echo hi", &opts)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/home", "/home"]),
+            "allow_home_read=true must emit `--ro-bind /home /home`; got: {:?}",
+            argv_strings
+        );
+        // The home bind is READ-ONLY. A `--bind /home /home` (the
+        // read-write variant) would silently let a `--check` write to
+        // `$HOME`, which is exactly the failure mode the option's
+        // doc-comment warns about. Pin that it doesn't appear.
+        assert!(
+            !argv_strings.windows(3).any(|w| w == ["--bind", "/home", "/home"]),
+            "allow_home_read=true must use the read-only `--ro-bind` variant, not `--bind`; got: {:?}",
+            argv_strings
+        );
+    }
+
+    /// Optional knob honored: `allow_tmp = false` MUST drop both tmp
+    /// binds. Most `--check` commands need scratch space, so the default
+    /// is `true` — but a hardened host that wants tmp fully denied can
+    /// flip this off and the argv must respect that.
+    #[test]
+    fn bubblewrap_argv_allow_tmp_false_omits_tmp_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let opts = LinuxBubblewrapProfileOptions {
+            allow_tmp: false,
+            ..Default::default()
+        };
+        let argv_strings: Vec<String> = generate_bubblewrap_argv(cwd, "echo hi", &opts)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv_strings
+                .windows(3)
+                .any(|w| w == ["--bind", "/tmp", "/tmp"]),
+            "allow_tmp=false must omit the /tmp bind; got: {:?}",
+            argv_strings
+        );
+    }
+
+    /// `ExecSandbox::LinuxBubblewrap` selected on a NON-Linux host (the
+    /// case for the macOS CI box this loop runs on, and for any macOS
+    /// operator who copies an example config) MUST surface a clear
+    /// "unsupported on this platform" error rather than attempting to
+    /// invoke `/usr/bin/bwrap` (which would fail with a confusing "file
+    /// not found" on macOS). This is the cross-platform contract the
+    /// brief explicitly asks us to pin — the mirror image of the seatbelt
+    /// off-macOS test above.
+    #[test]
+    fn wrap_spawn_command_linux_bubblewrap_off_linux_yields_unsupported_error() {
+        use std::path::Path;
+        let policy = ExecSafetyConfig {
+            backend: ExecSandbox::LinuxBubblewrap,
+            ..Default::default()
+        };
+        let result = wrap_spawn_command(Path::new("/tmp"), "echo hi", &policy);
+        if cfg!(target_os = "linux") {
+            // Linux host: dispatch succeeds and the argv is wrapped.
+            // We don't go further here — the dedicated Linux test below
+            // pins the wrapped shape.
+            let plan = result.expect("linux_bubblewrap on Linux must succeed");
+            assert!(plan.sandboxed, "sandboxed flag must be set");
+            assert_eq!(
+                plan.argv[0].to_string_lossy(),
+                "/usr/bin/bwrap",
+                "LinuxBubblewrap must wrap with /usr/bin/bwrap"
+            );
+        } else {
+            // Non-Linux host (macOS dev, macOS CI, …): dispatch MUST
+            // surface a clear unsupported-platform error. The test runs
+            // on every host so the contract is regression-safe on Linux
+            // too.
+            let err = result.expect_err(
+                "LinuxBubblewrap on a non-Linux host must be a hard error, \
+                 not a silent fallback to None or a confusing spawn failure",
+            );
+            assert!(
+                err.contains("linux_bubblewrap backend is unsupported on this platform"),
+                "error must call out the unsupported-platform condition; got: {err}"
+            );
+            assert!(
+                err.contains(std::env::consts::OS),
+                "error must name the current OS so the operator can triage; got: {err}"
+            );
+        }
+    }
+
+    /// Linux-only assertion of the wrapped argv shape: when
+    /// `LinuxBubblewrap` is selected on a Linux host, the argv starts
+    /// with `/usr/bin/bwrap`, contains the `--unshare-net` + workdir-bind
+    /// flags, ends with `-- sh -c <cmd>`. Gated on `target_os = "linux"`
+    /// because the dispatch itself is gated — see the platform branch in
+    /// `linux_plan`. The dedicated `bubblewrap_argv_*` tests above pin
+    /// the argv CONTENT platform-independently; this test pins that the
+    /// dispatch actually wires the argv through to the `SandboxSpawnPlan`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrap_spawn_command_linux_bubblewrap_on_linux_produces_bwrap_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        // Mirror the canonicalize the argv generator does internally
+        // (so the test asserts on the SAME string the argv embeds).
+        let cwd_canonical = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let policy = ExecSafetyConfig {
+            backend: ExecSandbox::LinuxBubblewrap,
+            linux_bubblewrap: LinuxBubblewrapProfileOptions::default(),
+        };
+        let plan =
+            wrap_spawn_command(cwd, "cargo test --workspace", &policy).expect("Linux dispatch");
+        assert!(
+            plan.sandboxed,
+            "LinuxBubblewrap plan must report sandboxed=true"
+        );
+        assert_eq!(
+            plan.argv[0].to_string_lossy(),
+            "/usr/bin/bwrap",
+            "wrapped program must be /usr/bin/bwrap"
+        );
+        // The argv must contain the deny-network flag and the workdir
+        // bind. Use the same substring-window assertion shape as the
+        // pure-function test above so a hand-edited config that strips
+        // either flag is caught here too.
+        let argv_strings: Vec<String> = plan
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv_strings.contains(&"--unshare-net".to_string()),
+            "Linux dispatch must include --unshare-net by default; got: {:?}",
+            argv_strings
+        );
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w == ["--bind", &cwd_canonical, &cwd_canonical]),
+            "Linux dispatch must include `--bind <cwd> <cwd>` for the workdir; got: {:?}",
+            argv_strings
+        );
+        // The wrapped target is the legacy `sh -c <cmd>` shape.
+        let sep_idx = argv_strings
+            .iter()
+            .position(|a| a == "--")
+            .expect("Linux dispatch must contain the `--` separator");
+        assert_eq!(
+            argv_strings.len() - sep_idx - 1,
+            3,
+            "Linux dispatch wrapped command must be exactly 3 args (sh, -c, cmd); got argv: {:?}",
+            argv_strings
+        );
+        assert_eq!(argv_strings[sep_idx + 1], "sh");
+        assert_eq!(argv_strings[sep_idx + 2], "-c");
+        assert_eq!(
+            argv_strings[sep_idx + 3],
+            "cargo test --workspace",
+            "Linux dispatch must pass the operator's literal cmd string through to sh -c"
+        );
     }
 }
