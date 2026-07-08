@@ -1306,8 +1306,8 @@ mod tests {
                  fallback to None or a confusing spawn failure",
             );
             assert!(
-                err.contains("seatbelt backend is unsupported on this platform"),
-                "error must call out the unsupported-platform condition; got: {err}"
+                err.contains("unsupported on this platform") && err.contains("seatbelt"),
+                "error must call out the seatbelt-unsupported-platform condition; got: {err}"
             );
             assert!(
                 err.contains(std::env::consts::OS),
