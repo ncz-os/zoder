@@ -20,6 +20,16 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// `https://api.anthropic.com` and `https://api.anthropic.com/v1`.
 const ANTHROPIC_MESSAGES_SUFFIX: &str = "messages";
 
+/// OpenAI Responses API wire suffix (the `/v1/responses` path). Same
+/// `/v1`-injection contract as [`ANTHROPIC_MESSAGES_SUFFIX`]: passing
+/// `"responses"` to the shared `endpoint_url` helper yields the
+/// spec-correct `{base_url}/v1/responses` URL for both
+/// `https://api.openai.com` and `https://api.openai.com/v1`. The
+/// constant is only used by the `kind == "openai-responses"` branch;
+/// the chat-completions branch stays on the literal `"chat/completions"`
+/// suffix it was hard-coded to before this slice landed.
+const RESPONSES_SUFFIX: &str = "responses";
+
 /// Default overall request budget (seconds). Override: ZODER_TIMEOUT_S.
 const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
 /// Default stream inactivity budget (seconds). A model that stops emitting for
@@ -537,18 +547,194 @@ impl AnthropicResponse {
     }
 }
 
+/// Build the OpenAI Responses API wire body. The Responses API uses
+/// `input` instead of `messages`, `max_output_tokens` instead of
+/// `max_tokens`, and a `reasoning: {effort: "..."}` object instead of the
+/// top-level `reasoning_effort` string the chat-completions path emits.
+/// `temperature` and `stream` keep their field names.
+///
+/// System-role handling: a leading system message in `req.messages` is
+/// emitted inline as a `role: "system"` item in `input` rather than
+/// promoted to a top-level `instructions` string. Both shapes are
+/// spec-valid for the Responses API; the inline `input[]` shape is
+/// chosen because:
+///   * it keeps a single message-processing path with the chat branch
+///     (no special-case extraction pass),
+///   * it survives a follow-up that decides to support multi-system
+///     prompts the same way the chat branch already does
+///     (concat → item list), and
+///   * operators inspecting the wire body see the same `(role, content)`
+///     structure the chat-completions branch emits.
+///
+/// `developer` messages are passed through the same way — the Responses
+/// API treats them as a sibling of `system` and accepts them inline.
+///
+/// `reasoning_effort` (when set) is emitted as a top-level
+/// `reasoning: {effort: "..."}` object (NOT `{"summary":"auto", ...}` —
+/// the existing chat path passes the raw string and we mirror that
+/// minimal contract here so a future change to either branch touches
+/// only one place).
+///
+/// `show_reasoning` is dropped: the Responses API has no `reasoning_content`
+/// field in the same shape the chat-completions response emits, and
+/// silently injecting an OpenAI-shaped key would either be ignored or
+/// rejected depending on the gateway. The `reasoning` summary block is a
+/// separate out-of-scope follow-up (mirrors the deliberate
+/// `show_reasoning` drop on the Anthropic branch).
+fn responses_body(req: &ChatRequest) -> serde_json::Value {
+    let input: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .map(|m| {
+            // The Responses API accepts `role: "developer"` and
+            // `role: "system"` interchangeably — map the chat-style
+            // `system` role onto `system` (the spec default) and pass
+            // user / assistant through verbatim.
+            let role = match m.role.as_str() {
+                "system" | "developer" => "system",
+                "user" => "user",
+                "assistant" => "assistant",
+                // Anything else (rare tool-role messages) gets passed
+                // through unchanged so the wire adapter doesn't silently
+                // drop information the operator explicitly encoded.
+                other => other,
+            };
+            serde_json::json!({
+                "role": role,
+                "content": m.content,
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "input": input,
+        "max_output_tokens": req.max_tokens,
+        "temperature": req.temperature,
+        "stream": req.stream,
+    });
+    if let Some(eff) = &req.reasoning_effort {
+        body["reasoning"] = serde_json::json!({ "effort": eff });
+    }
+    body
+}
+
+/// OpenAI Responses API non-streaming response shape (subset we consume).
+/// Mirrors the [`AnthropicResponse`] / [`ChatCompletion`] structure: pull
+/// the assistant text out of every `output[]` entry whose
+/// `content[].type == "output_text"`, and translate the Responses-shaped
+/// `usage.input_tokens` / `usage.output_tokens` into the OpenAI-shaped
+/// `prompt_tokens` / `completion_tokens` fields the [`ChatResult`]
+/// surface already aggregates. The same schema-invalid-2xx guard the
+/// Anthropic and chat paths enforce applies: a response whose `output`
+/// array is empty (or carries only non-`output_text` content blocks and
+/// therefore leaves the answer empty) MUST surface as `ErrKind::Decode`.
+#[derive(Deserialize)]
+struct ResponsesResponse {
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    status: Option<String>,
+}
+#[derive(Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(default)]
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "role")]
+    role: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContent>,
+}
+#[derive(Deserialize)]
+struct ResponsesContent {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    /// Some Responses-shaped bodies also report `total_tokens`; we
+    /// ignore it (the wire adapter only ever exposes prompt + completion
+    /// upstream) but parse it for future-compat.
+    #[serde(default)]
+    #[allow(dead_code)]
+    total_tokens: Option<u64>,
+}
+
+impl ResponsesResponse {
+    fn joined_text(&self) -> String {
+        let mut out = String::new();
+        for item in &self.output {
+            // Only `message`-typed items carry the conversational
+            // assistant text (`reasoning`-typed items hold reasoning
+            // summaries and would require a separate `show_reasoning`
+            // contract — see the `responses_body` doc comment for why
+            // that is a deliberate out-of-scope follow-up). The
+            // `role: "assistant"` filter is belt-and-braces: every
+            // well-formed Responses body tags the assistant message
+            // item with role `assistant`, and ignoring anything else
+            // keeps the parser robust against a future Responses-shaped
+            // body that adds an extra non-message output entry.
+            if item.kind.as_deref() != Some("message") {
+                continue;
+            }
+            if item.role.as_deref().is_some_and(|r| r != "assistant") {
+                continue;
+            }
+            for block in &item.content {
+                if block.kind.as_deref() == Some("output_text") {
+                    if let Some(text) = &block.text {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(text);
+                    }
+                }
+            }
+        }
+        out
+    }
+    fn has_meaningful_text(&self) -> bool {
+        // Whitespace-only text counts as nothing: same contract the
+        // Anthropic / chat branches enforce so a billable reservation
+        // cannot silently reconcile as a no-op.
+        self.joined_text().chars().any(|c| !c.is_whitespace())
+    }
+}
+
 pub struct OpenAiProvider {
     base_url: String,
     /// Provider wire kind: `openai-chat` | `openai-responses` | `azure-openai`
     /// | `anthropic` | `custom`. Drives endpoint routing (Azure uses a
     /// deployment path + `?api-version`, Anthropic uses the `/v1/messages`
-    /// Messages API with `x-api-key` + `anthropic-version` headers, others
-    /// the OpenAI `/v1/...` convention).
+    /// Messages API with `x-api-key` + `anthropic-version` headers, OpenAI
+    /// `chat/completions` and Responses variants both use the OpenAI
+    /// `/v1/...` convention with `Authorization: Bearer …`).
     ///
-    /// `openai-responses` and `custom` currently fall through to the
-    /// `openai-chat` request shape (documented follow-up; the wire adapter
-    /// in this slice does not silently invent behavior for kinds it does
-    /// not implement).
+    /// `openai-responses` targets the OpenAI Responses API
+    /// (`POST {base}/v1/responses`): it replaces the chat `messages` array
+    /// with `input`, the `max_tokens` field with `max_output_tokens`, and
+    /// the chat-completion `reasoning_effort` top-level string with a
+    /// top-level `reasoning: {effort: "..."}` object. System-role messages
+    /// are emitted inline as a `role: "system"` item in `input` (the same
+    /// way the Responses API spec supports and the goose reference
+    /// adapter also does) rather than promoted to a top-level
+    /// `instructions` string; this keeps a single message-processing path
+    /// and avoids carrying a leading non-message field that operators then
+    /// have to reason about when inspecting what the wire adapter sent.
+    ///
+    /// `custom` still falls through to the `openai-chat` request shape
+    /// (documented follow-up; the wire adapter in this slice does not
+    /// silently invent behavior for kinds it does not implement).
     kind: String,
     /// Pre-resolved auth header `(name, value)` — `Authorization: Bearer …`
     /// for bearer styles, or a custom `api-key`-style header for enterprise
@@ -559,7 +745,10 @@ pub struct OpenAiProvider {
     /// raw credential into Anthropic's `x-api-key: <token>` shape (the
     /// pre-resolved `auth_header` already wraps a bearer token in
     /// `Authorization: Bearer …`, which Anthropic's wire protocol does not
-    /// accept). Anthropic-auth users who configure
+    /// accept). The `openai-responses` kind keeps the same bearer-shaped
+    /// authorization as `openai-chat` (the Responses API uses
+    /// `Authorization: Bearer …` verbatim), so it does NOT need to
+    /// re-resolve the credential. Anthropic-auth users who configure
     /// `Auth::ApiKeyHeader { header: "x-api-key", … }` see the same header
     /// pair either way, but the bearer path needs the re-resolution.
     auth: Auth,
@@ -752,6 +941,17 @@ impl OpenAiProvider {
             // byte-for-byte unchanged for any non-anthropic provider.
             return anthropic_body(req);
         }
+        if self.is_responses() {
+            // OpenAI Responses API: `input` instead of `messages`,
+            // `max_output_tokens` instead of `max_tokens`,
+            // `reasoning: {effort: "..."}` instead of `reasoning_effort`,
+            // and an inline `role: "system"` item for any system
+            // message. The body helper lives in [`responses_body`].
+            // Keeping it behind its own branch preserves the
+            // `openai-chat` byte-for-byte contract for every other
+            // kind (including `custom` and `azure-openai`).
+            return responses_body(req);
+        }
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
@@ -794,6 +994,26 @@ impl OpenAiProvider {
             }
             return rb;
         }
+        if self.is_responses() {
+            // OpenAI Responses API:
+            //   * endpoint: POST {base}/v1/responses
+            //   * headers: `Authorization: Bearer …` (same as
+            //     chat-completions — the Responses API does not use
+            //     `x-api-key` or any custom header), so the
+            //     pre-resolved `auth_header` is applied verbatim.
+            //   * body: `responses_body(req)`.
+            // `reasoning_effort` mapping (`{"effort":"…"}` object)
+            // lives inside `responses_body` so the helper stays a
+            // pure `ChatRequest -> serde_json::Value` transformer.
+            let mut rb = self
+                .client
+                .post(self.endpoint(RESPONSES_SUFFIX))
+                .json(&self.body(req));
+            if let Some((name, value)) = &self.auth_header {
+                rb = rb.header(name.as_str(), value.as_str());
+            }
+            return rb;
+        }
         let mut rb = self
             .client
             .post(self.endpoint("chat/completions"))
@@ -811,6 +1031,16 @@ impl OpenAiProvider {
     /// legacy behavior bit-for-bit.
     fn is_anthropic(&self) -> bool {
         self.kind == "anthropic"
+    }
+
+    /// `true` when this provider is configured to use the OpenAI
+    /// Responses API wire shape (`POST {base}/v1/responses`). Sibling of
+    /// [`Self::is_anthropic`]; checked after the Anthropic branch so a
+    /// config that wants either shape gets the right wire format and
+    /// the `openai-chat` byte-identical contract is preserved for the
+    /// default / empty / unset / `azure-openai` / `custom` kinds.
+    fn is_responses(&self) -> bool {
+        self.kind == "openai-responses"
     }
 
     /// Resolve the raw credential for an Anthropic provider call. Returns
@@ -946,6 +1176,9 @@ impl OpenAiProvider {
         if self.is_anthropic() {
             return self.consume_full_anthropic(resp, telemetry, sink).await;
         }
+        if self.is_responses() {
+            return self.consume_full_responses(resp, telemetry, sink).await;
+        }
         let body = self.read_limited_body(resp, "chat completion").await?;
         let parsed: ChatCompletion = serde_json::from_slice(&body).map_err(|e| {
             ProviderError::new(
@@ -1067,6 +1300,70 @@ impl OpenAiProvider {
         })
     }
 
+    /// OpenAI Responses API non-streaming response: parse the
+    /// `{"output": [...], "usage": {...}}` body and translate into the
+    /// same [`ChatResult`] shape the chat and Anthropic paths return.
+    /// Mirrors the schema-invalid-2xx guard both other paths enforce:
+    /// a body whose `output` array has no `output_text` content block
+    /// (e.g. an empty array, only `reasoning`-typed items, or only
+    /// whitespace text) MUST surface as `ErrKind::Decode` so a
+    /// `--no-stream` / reviewer / health-probe run cannot exit Ok with
+    /// an empty content and let a billable reservation reconcile as a
+    /// no-op. The Responses API surface has no analogue of
+    /// `cached_prompt_tokens` (no `prompt_tokens_details.cached_tokens`
+    /// block); `cached_prompt_tokens` is left `None` for the Responses
+    /// path, matching the byte-level contract an OpenAI Codex
+    /// `openai-responses` proxy would publish.
+    async fn consume_full_responses(
+        &self,
+        resp: reqwest::Response,
+        telemetry: CallTelemetry,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<ChatResult, ProviderError> {
+        let body = self.read_limited_body(resp, "responses message").await?;
+        let parsed: ResponsesResponse = serde_json::from_slice(&body).map_err(|e| {
+            ProviderError::new(
+                ErrKind::Decode,
+                format!("malformed responses response: {e}"),
+            )
+        })?;
+        // Same schema-invalid-2xx contract as the other two branches.
+        if !parsed.has_meaningful_text() {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                "malformed responses response: empty output text",
+            ));
+        }
+        let content = parsed.joined_text();
+        if content.len() > MAX_CONTENT_BYTES {
+            return Err(ProviderError::new(
+                ErrKind::Decode,
+                format!("decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"),
+            ));
+        }
+        if let Some(s) = sink {
+            let _ = s.write_all(content.as_bytes());
+            let _ = s.flush();
+        }
+        let (prompt_tokens, completion_tokens) = match parsed.usage {
+            Some(ref u) => (u.input_tokens, u.output_tokens),
+            None => (None, None),
+        };
+        let tokens_out = completion_tokens.unwrap_or(0);
+        Ok(ChatResult {
+            content,
+            tokens_out,
+            prompt_tokens,
+            completion_tokens,
+            // The Responses API doesn't expose an OpenAI-shaped
+            // `cached_tokens` block on a non-streaming response; the
+            // cached-prompt telemetry cap stays at `None` for this
+            // branch (see the doc comment for rationale).
+            cached_prompt_tokens: None,
+            telemetry,
+        })
+    }
+
     /// Streaming path: parse newline-delimited SSE frames as they arrive.
     /// Dispatched on `kind`: Anthropic events use a different envelope
     /// (`event: …` lines and `data: {...}` with `type: "content_block_delta"`
@@ -1083,6 +1380,9 @@ impl OpenAiProvider {
     ) -> Result<ChatResult, ProviderError> {
         if self.is_anthropic() {
             return self.consume_stream_anthropic(resp, telemetry, sink).await;
+        }
+        if self.is_responses() {
+            return self.consume_stream_responses(resp, telemetry, sink).await;
         }
         let deadline = Instant::now() + self.request_timeout;
         let mut content = String::new();
@@ -1600,6 +1900,311 @@ impl OpenAiProvider {
             telemetry,
         })
     }
+
+    /// OpenAI Responses API SSE streaming parser. Mirrors the shape of
+    /// [`Self::consume_stream_anthropic`] but consumes the Responses
+    /// API's distinct event envelope:
+    ///
+    /// ```text
+    /// event: response.created
+    /// data: {"type":"response.created","response":{"id":"…","model":"…"}}
+    ///
+    /// event: response.output_text.delta
+    /// data: {"type":"response.output_text.delta","delta":"Hel"}
+    ///
+    /// event: response.output_text.delta
+    /// data: {"type":"response.output_text.delta","delta":"lo"}
+    ///
+    /// event: response.completed
+    /// data: {"type":"response.completed","response":{"usage":{"input_tokens":N,"output_tokens":K,"total_tokens":N+K}}}
+    /// ```
+    ///
+    /// Text pieces arrive on `response.output_text.delta` (carrying a
+    /// single `delta` string per event). Usage arrives on the terminal
+    /// `response.completed` event under `response.usage.{input_tokens,
+    /// output_tokens, total_tokens}`. Errors arrive as either an
+    /// `event: error` or a typed `{"type":"response.failed", …}`
+    /// envelope; both surface as `ErrKind::Http` (mirrors the way the
+    /// Anthropic branch surfaces an inline stream error and the way
+    /// the OpenAI-branch stream parser surfaces a `{"error":…}` data
+    /// frame).
+    ///
+    /// `response.created` / `response.in_progress` /
+    /// `response.output_item.added` / `response.content_part.added` /
+    /// `response.output_text.done` / `response.content_part.done` /
+    /// `response.output_item.done` / ping are recognized but ignored
+    /// (the wire adapter does not surface any state from them, they
+    /// exist to give a desktop-style consumer hooks for cursor +
+    /// completion rendering). The Responses API uses typed
+    /// `sequence_number` ordering rather than data-fragment ordering,
+    /// which is fine for the byte-level text assembly this parser
+    /// does.
+    async fn consume_stream_responses(
+        &self,
+        resp: reqwest::Response,
+        telemetry: CallTelemetry,
+        mut sink: Option<&mut dyn Write>,
+    ) -> Result<ChatResult, ProviderError> {
+        // The endpoint URL is read in `request()`; we accept the same
+        // stall / idle / buffer / line ceilings the chat and
+        // Anthropic branches accept so a hostile / misconfigured
+        // backend cannot pin us in a read loop. (The dispatch site in
+        // `consume_stream` forwards `&ChatRequest` for symmetry with
+        // the chat branch; the Responses parser does not need it
+        // because text deltas arrive as plain strings, not under
+        // `pick_text`'s reasoning-content fan-out.)
+        let deadline = Instant::now() + self.request_timeout;
+        let mut content = String::new();
+        let mut chunk_count: u64 = 0;
+        let mut prompt_tokens: Option<u64> = None;
+        let mut completion_tokens: Option<u64> = None;
+        // Responses API emits no cache-token surface on its SSE
+        // terminal event (the chat branch's `cached_prompt_tokens`
+        // comes from `prompt_tokens_details.cached_tokens`, which
+        // the Responses stream does not publish). Leave it
+        // unconditionally `None` so the wire adapter doesn't carry
+        // a phantom value an operator inspecting the run log
+        // would otherwise assume came from a typed envelope.
+        let mut emitted = false;
+        let mut stream = resp.bytes_stream();
+        let mut response_bytes = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
+        let fail = |kind: ErrKind, msg: String, emitted: bool| ProviderError {
+            message: msg,
+            kind,
+            status: None,
+            retry_after: None,
+            emitted,
+        };
+        let mut done = false;
+        let mut saw_text = false;
+        let mut current_event: Option<String> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(fail(
+                    ErrKind::Timeout,
+                    format!("request timeout after {:?}", self.request_timeout),
+                    emitted,
+                ));
+            }
+            let step = self.idle_timeout.min(remaining);
+            let next = match timeout(step, stream.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(fail(
+                            ErrKind::Timeout,
+                            format!("request timeout after {:?}", self.request_timeout),
+                            emitted,
+                        ));
+                    }
+                    return Err(fail(
+                        ErrKind::Timeout,
+                        format!("stream stalled: no data for {:?}", self.idle_timeout),
+                        emitted,
+                    ));
+                }
+            };
+            let Some(chunk) = next else { break };
+            let bytes = chunk.map_err(|e| {
+                let mut pe = classify_reqwest(e);
+                pe.emitted = emitted;
+                pe
+            })?;
+            response_bytes = response_bytes.saturating_add(bytes.len());
+            if response_bytes > MAX_RESPONSE_BYTES {
+                return Err(fail(
+                    ErrKind::Decode,
+                    format!("stream exceeded {MAX_RESPONSE_BYTES} byte response ceiling"),
+                    emitted,
+                ));
+            }
+            buf.extend_from_slice(&bytes);
+            if buf.len() > MAX_BUFFER_BYTES {
+                return Err(fail(
+                    ErrKind::Decode,
+                    format!("stream buffer exceeded {MAX_BUFFER_BYTES} byte ceiling"),
+                    emitted,
+                ));
+            }
+            // Responses API SSE frames are CRLF- or LF-delimited
+            // `field: value` lines separated by a blank line. The
+            // frame loop tracks `event:` lines alongside `data:` ones
+            // (same contract the Anthropic branch uses) so the next
+            // `data:` line is paired with the correct envelope.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                if nl > MAX_LINE_BYTES {
+                    return Err(fail(
+                        ErrKind::Decode,
+                        format!("stream line exceeded {MAX_LINE_BYTES} byte ceiling"),
+                        emitted,
+                    ));
+                }
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let raw = std::str::from_utf8(&line_bytes[..nl]).map_err(|error| {
+                    fail(
+                        ErrKind::Decode,
+                        format!("stream contained invalid UTF-8: {error}"),
+                        emitted,
+                    )
+                })?;
+                let line = raw.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(ev) = line.strip_prefix("event:") {
+                    current_event = Some(ev.trim().to_string());
+                    continue;
+                }
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    // The Responses API doesn't terminate with a
+                    // `[DONE]` sentinel the way the chat-completions
+                    // stream does; the equivalent is the
+                    // `response.completed` typed event handled below.
+                    // Ignore any `[DONE]` sentinel defensively in case
+                    // a gateway proxy interposes one.
+                    if payload == "[DONE]" {
+                        continue;
+                    }
+                    let val: serde_json::Value =
+                        serde_json::from_str(payload).map_err(|error| {
+                            fail(
+                                ErrKind::Decode,
+                                format!("malformed responses stream JSON: {error}"),
+                                emitted,
+                            )
+                        })?;
+                    let event_type = current_event
+                        .as_deref()
+                        .or_else(|| val.get("type").and_then(|t| t.as_str()));
+                    // Top-level / `event: error` envelope. Mirrors
+                    // the same heuristic the Anthropic branch uses
+                    // to surface an inline stream error so an
+                    // HTTP-200 + error-frame cannot masquerade as a
+                    // successful empty response.
+                    if event_type == Some("error")
+                        || val.get("type").and_then(|t| t.as_str()) == Some("error")
+                    {
+                        return Err(fail(
+                            ErrKind::Http,
+                            format!("responses stream error: {}", redact(payload)),
+                            emitted,
+                        ));
+                    }
+                    // `response.failed` carries the same operational
+                    // outcome as an inline `error` event (the
+                    // request was rejected by the backend mid-flight
+                    // after a 200 had been written) — surface as
+                    // `ErrKind::Http`, identical envelope shape.
+                    if event_type == Some("response.failed") {
+                        return Err(fail(
+                            ErrKind::Http,
+                            format!("responses stream failed: {}", redact(payload)),
+                            emitted,
+                        ));
+                    }
+                    match event_type {
+                        // Text deltas: the Responses API carries the
+                        // raw fragment in a top-level `delta` string
+                        // (NOT inside a `delta: {text: "..."}`
+                        // wrapper). Accumulate onto `content` and
+                        // write through to the sink byte-for-byte
+                        // so `sink` and `content` agree.
+                        Some("response.output_text.delta") => {
+                            let piece = val
+                                .get("delta")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default();
+                            if !piece.is_empty() {
+                                saw_text = true;
+                                if content.len().saturating_add(piece.len()) > MAX_CONTENT_BYTES {
+                                    return Err(fail(
+                                        ErrKind::Decode,
+                                        format!(
+                                            "decoded content exceeded {MAX_CONTENT_BYTES} byte ceiling"
+                                        ),
+                                        emitted,
+                                    ));
+                                }
+                                chunk_count += 1;
+                                content.push_str(piece);
+                                if let Some(s) = sink.as_deref_mut() {
+                                    let _ = s.write_all(piece.as_bytes());
+                                    let _ = s.flush();
+                                    emitted = true;
+                                }
+                            }
+                        }
+                        // Terminal event: `response.completed` carries
+                        // the authoritative usage under
+                        // `response.usage.{input_tokens,
+                        // output_tokens, total_tokens}`. The
+                        // `total_tokens` field is accepted for
+                        // future-compat but we only ever surface
+                        // prompt + completion upstream to match the
+                        // chat + Anthropic branch contract.
+                        Some("response.completed") => {
+                            if let Some(usage) = val.get("response").and_then(|r| r.get("usage")) {
+                                if let Some(p) = usage.get("input_tokens").and_then(|n| n.as_u64())
+                                {
+                                    prompt_tokens = Some(p);
+                                }
+                                if let Some(c) = usage.get("output_tokens").and_then(|n| n.as_u64())
+                                {
+                                    completion_tokens = Some(c);
+                                }
+                            }
+                            done = true;
+                        }
+                        // response.created /
+                        // response.in_progress /
+                        // response.output_item.added /
+                        // response.content_part.added /
+                        // response.output_text.done /
+                        // response.content_part.done /
+                        // response.output_item.done / unknown:
+                        // informational only, ignore (the OpenAI
+                        // Responses SSE spec calls these lifecycle
+                        // events and they don't carry text the
+                        // byte-level assembler would otherwise
+                        // need).
+                        _ => {}
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Err(fail(
+                ErrKind::Decode,
+                "stream ended with an incomplete SSE frame".to_string(),
+                emitted,
+            ));
+        }
+        if !saw_text {
+            return Err(fail(
+                ErrKind::Decode,
+                "malformed responses stream: no output text".to_string(),
+                emitted,
+            ));
+        }
+        let tokens_out = completion_tokens.unwrap_or(chunk_count);
+        Ok(ChatResult {
+            content,
+            tokens_out,
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens: None,
+            telemetry,
+        })
+    }
 }
 
 /// Heuristic: turn a `reqwest::header::HeaderMap` + configured `base_url`
@@ -1969,6 +2574,197 @@ mod tests {
             reasoning_only.has_meaningful_message(),
             "a non-empty reasoning_content counts as meaningful"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // OpenAI Responses API — unit tests for the wire-shaping helpers.
+    // Companion to the integration tests in `tests/provider.rs`, which
+    // exercise the full HTTP path. These pin `responses_body()` and
+    // the `ResponsesResponse` parser in isolation so a future refactor
+    // that moves them stays covered:
+    //   * system message inline as `role: "system"` (not promoted),
+    //   * `max_output_tokens` instead of `max_tokens`,
+    //   * `temperature` + `stream` passed through verbatim,
+    //   * `reasoning_effort` translated to `reasoning: {effort: …}`,
+    //   * `input` is an array of `{role, content}` items (never the
+    //     chat-shaped `messages`),
+    //   * `ResponsesResponse.joined_text` concatenates every
+    //     `output[].content[].type == "output_text"` block and ignores
+    //     `reasoning` / tool / function-call entries.
+    // -----------------------------------------------------------------
+
+    fn responses_unit_req() -> ChatRequest {
+        ChatRequest {
+            model: "gpt-5".into(),
+            messages: vec![
+                Message::new("system", "be terse"),
+                Message::new("developer", "answer in one sentence"),
+                Message::new("user", "hi"),
+                Message::new("assistant", "hello"),
+            ],
+            max_tokens: 32,
+            temperature: 0.25,
+            stream: true,
+            show_reasoning: false,
+            reasoning_effort: Some("medium".into()),
+        }
+    }
+
+    #[test]
+    fn responses_body_emits_input_array_with_system_dev_user_assistant_items() {
+        let body = responses_body(&responses_unit_req());
+        // `messages` MUST NOT appear in the Responses body — the
+        // chat-shaped field name would reject at the backend or, at
+        // best, be silently ignored.
+        assert!(
+            body.get("messages").is_none(),
+            "messages must not appear in a responses body: {body}"
+        );
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        assert_eq!(input.len(), 4, "all messages must pass through: {body}");
+        // `system` and `developer` collapse onto the same `system`
+        // role in `input` (the Responses API spec treats them as
+        // siblings; collapsing them here keeps the wire body
+        // deterministic regardless of how the caller labeled the
+        // message).
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"], "be terse");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"], "answer in one sentence");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"], "hi");
+        assert_eq!(input[3]["role"], "assistant");
+        assert_eq!(input[3]["content"], "hello");
+    }
+
+    #[test]
+    fn responses_body_uses_max_output_tokens_and_keeps_temperature_stream() {
+        let body = responses_body(&responses_unit_req());
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["max_output_tokens"], 32);
+        // `max_tokens` MUST NOT appear — the chat-shaped field name
+        // would either be silently ignored or rejected by the
+        // Responses API depending on the gateway.
+        assert!(
+            body.get("max_tokens").is_none(),
+            "max_tokens must not appear in a responses body: {body}"
+        );
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn responses_body_translates_reasoning_effort_into_reasoning_object() {
+        let body = responses_body(&responses_unit_req());
+        assert_eq!(
+            body.get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(|e| e.as_str()),
+            Some("medium"),
+            "reasoning_effort must be translated to reasoning: {{effort: ...}}: {body}"
+        );
+        // No top-level `reasoning_effort` field — the Responses API
+        // would reject it.
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "raw reasoning_effort must not appear: {body}"
+        );
+    }
+
+    #[test]
+    fn responses_body_without_reasoning_effort_omits_reasoning_field() {
+        let mut req = responses_unit_req();
+        req.reasoning_effort = None;
+        let body = responses_body(&req);
+        assert!(
+            body.get("reasoning").is_none(),
+            "no reasoning object when reasoning_effort is unset: {body}"
+        );
+    }
+
+    #[test]
+    fn responses_response_joined_text_concatenates_output_text_blocks() {
+        let parsed: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Hello "},
+                        {"type": "output_text", "text": "world"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed.joined_text(), "Hello \nworld");
+        assert!(parsed.has_meaningful_text());
+    }
+
+    #[test]
+    fn responses_response_joined_text_ignores_non_message_and_non_text_items() {
+        let parsed: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}]
+                },
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "nope"}]
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed.joined_text(), "");
+        assert!(!parsed.has_meaningful_text());
+    }
+
+    #[test]
+    fn responses_response_joined_text_skips_whitespace_only_text() {
+        let parsed: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "   \n  "}]
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(!parsed.has_meaningful_text());
+    }
+
+    #[test]
+    fn responses_response_extracts_input_and_output_token_counts() {
+        let parsed: ResponsesResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "x"}]
+            }],
+            "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+        }))
+        .unwrap();
+        let (prompt, completion) = match parsed.usage {
+            Some(ref u) => (u.input_tokens, u.output_tokens),
+            None => (None, None),
+        };
+        assert_eq!(prompt, Some(9));
+        assert_eq!(completion, Some(4));
+        // Mirrors the `total_tokens` round-trip — proves the field is
+        // accepted even though the wire adapter doesn't surface it
+        // upstream.
+        assert_eq!(parsed.usage.as_ref().and_then(|u| u.total_tokens), Some(13));
     }
 
     // -----------------------------------------------------------------
