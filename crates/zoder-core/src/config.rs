@@ -714,6 +714,22 @@ pub enum ExecSandbox {
     /// establishes (inverted: Linux variant off-Linux is the error path,
     /// not seatbelt off-mac).
     LinuxBubblewrap,
+    /// Linux **Landlock** (kernel LSM, in-process `landlock_restrict_self`).
+    /// Unlike [`ExecSandbox::LinuxBubblewrap`], Landlock is a *kernel*
+    /// feature: there is no external wrapper binary to invoke. The crate
+    /// applies the ruleset to the spawned child via a `pre_exec` hook on
+    /// the [`std::process::Command`] (i.e. between `fork` and `exec`),
+    /// so the ruleset attaches to the *child* before it ever runs the
+    /// user's `sh -c <cmd>`. The two Linux backends are complementary:
+    /// bubblewrap gives the operator a userspace wrapper with
+    /// mount-namespace isolation, while Landlock is in-kernel and adds
+    /// no new binary dependency, but requires a Linux >= 5.13 host.
+    ///
+    /// On any non-Linux platform the call site MUST reject this with a
+    /// clear "unsupported on this platform" error rather than silently
+    /// downgrading to `None` — the same cross-platform contract the
+    /// bubblewrap variant establishes.
+    LinuxLandlock,
     /// Forward-compat catch-all: a future build (or a typo) that names a
     /// backend this binary doesn't implement. We deserialize unknown tags
     /// into this variant so a config keeps loading — the dispatch site is
@@ -840,6 +856,63 @@ impl Default for LinuxBubblewrapProfileOptions {
     }
 }
 
+/// Per-call-site knobs of the Linux Landlock ruleset. Mirrors
+/// [`LinuxBubblewrapProfileOptions`] 1:1 so an operator who has a bubblewrap
+/// profile block can copy the shape across to the in-kernel Landlock
+/// backend without re-reading docs. The semantics are intentionally
+/// equivalent (read-only system paths, read-write workdir, optional
+/// read-only home, optional tmp); the only difference is the
+/// *implementation* — Landlock is a kernel LSM (no external binary, no
+/// mount-namespace manipulation) while bubblewrap is a userspace wrapper
+/// binary that builds a new mount namespace.
+///
+/// `unshare_net` is intentionally absent from this profile: Landlock's
+/// network-port scoping is ABI-gated (it was added in Landlock ABI v4,
+/// Linux 6.7) and tying it to the same default-on/off knob as bubblewrap
+/// would create a silent ABI-downgrade surprise on older kernels. The
+/// in-kernel ruleset uses Landlock's `BestEffort` compatibility level,
+/// so a missing port-access right is silently dropped on older hosts
+/// (and surfaced via `RulesetStatus::PartiallyEnforced` at runtime).
+/// Operators who need the network-port knob should add a separate
+/// `scope_net` field in a future iteration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxLandlockProfileOptions {
+    /// Mount `/tmp` (and `/var/tmp` as a symlink-fallback) read-write
+    /// inside the ruleset. Default `true` because `cargo`, `pytest`,
+    /// `node`, and almost every common `--check` writes intermediates
+    /// there. Operators on hardened hosts can flip this off; the ruleset
+    /// then omits the `/tmp` rules and any tool that needs scratch space
+    /// will fail loudly.
+    #[serde(default = "default_landlock_allow_tmp")]
+    pub allow_tmp: bool,
+    /// Read access to `/home` (read-only; no writes). Default `false`
+    /// because most builds either inline everything they need under the
+    /// working dir or fail loudly — granting read access to `/home`
+    /// effectively exposes `~/.cargo`, `~/.npm`, etc. Operators who need
+    /// those to be visible flip this to `true`; the ruleset then includes
+    /// a read-only `/home` rule. Writes to `/home` remain denied because
+    /// the rule is read-only.
+    #[serde(default = "default_landlock_allow_home_read")]
+    pub allow_home_read: bool,
+}
+
+fn default_landlock_allow_tmp() -> bool {
+    true
+}
+fn default_landlock_allow_home_read() -> bool {
+    false
+}
+
+impl Default for LinuxLandlockProfileOptions {
+    fn default() -> Self {
+        Self {
+            allow_tmp: default_landlock_allow_tmp(),
+            allow_home_read: default_landlock_allow_home_read(),
+        }
+    }
+}
+
 /// `[exec_safety]` block from `config.json` / an overlay TOML. Owns the
 /// opt-in OS-sandbox backend selection and the per-backend profile knobs.
 /// Absent block or absent `backend` = `ExecSandbox::None` = current behavior.
@@ -865,6 +938,13 @@ pub struct ExecSafetyConfig {
     /// move their profile options.
     #[serde(default)]
     pub linux_bubblewrap: LinuxBubblewrapProfileOptions,
+    /// Per-backend profile knobs for the in-kernel Linux Landlock
+    /// ruleset. Consulted when `backend == ExecSandbox::LinuxLandlock`;
+    /// ignored otherwise so an operator who flips the backend from
+    /// `LinuxBubblewrap` to `LinuxLandlock` (both Linux) doesn't have to
+    /// also move their profile options.
+    #[serde(default)]
+    pub linux_landlock: LinuxLandlockProfileOptions,
 }
 
 impl Config {
