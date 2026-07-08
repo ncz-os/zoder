@@ -2352,8 +2352,16 @@ async fn run_check_watched(
     for arg in &plan.argv[1..] {
         command.arg(arg);
     }
+    // Z-15: the dispatch canonicalized the cwd ONCE into `plan.cwd`
+    // and threaded that canonical path into the bwrap argv (`--bind`
+    // and `--chdir`). The production `.current_dir()` MUST use the
+    // SAME canonical value, not the raw `cwd` argument, so the
+    // wrapped shell's view of the filesystem matches the policy
+    // target — a single source of truth pins both, with no
+    // TOCTOU window where the policy protects one tree and the
+    // spawn runs in a different one.
     command
-        .current_dir(cwd)
+        .current_dir(&plan.cwd)
         .stdin(Stdio::null())
         // Detach the child into its own process group so we can SIGKILL the
         // whole subtree on timeout (shell + any descendants the command
@@ -2448,7 +2456,10 @@ fn run_check(
     for arg in &plan.argv[1..] {
         cmd_builder.arg(arg);
     }
-    match cmd_builder.current_dir(cwd).output() {
+    // Z-15: use the dispatch-canonicalized cwd, not the raw `cwd`
+    // argument, so the wrapped shell's cwd matches the policy
+    // target. See the matching note in `run_check_watched` above.
+    match cmd_builder.current_dir(&plan.cwd).output() {
         Ok(o) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&o.stdout));
