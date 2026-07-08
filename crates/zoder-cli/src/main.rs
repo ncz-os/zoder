@@ -9,6 +9,7 @@ use fs2::FileExt;
 mod agentic;
 mod exec_safety;
 mod goose;
+mod jobs;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -545,6 +546,13 @@ enum Cmd {
         /// Job id (default: most recent running).
         job: Option<String>,
     },
+    /// Manage the background-job directories under the zoder state dir:
+    /// list what's there, or prune the finished ones to reclaim space.
+    /// Subcommands: `list`, `prune`.
+    Jobs {
+        #[command(subcommand)]
+        action: JobsCmd,
+    },
     /// Autonomous fix loop: author -> validate (build/test) -> adversarial
     /// review -> fix, repeating until the check passes and the reviewer raises
     /// no blocking findings (or `--max-iters`). The author keeps one engine
@@ -679,6 +687,39 @@ enum Cmd {
         /// tool-probe, serialized). Suppresses the pretty renderer.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Subcommands for `zoder jobs …`. Each subcommand reuses the same
+/// state-dir resolution as `status`/`result`/`cancel` — the path is
+/// never independently computed here.
+#[derive(Subcommand, Clone)]
+enum JobsCmd {
+    /// List every job directory under the zoder state dir, newest first.
+    /// Mirrors `zoder status` but does NOT require a job id; prints
+    /// id / status / started / age / cwd. `--json` emits the structured
+    /// form for tools to consume.
+    List {
+        /// Include jobs from any working directory (not only cwd's).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove FINISHED background-job directories to reclaim disk space.
+    /// NEVER touches a running job. Honors `--older-than`, `--keep`, and
+    /// `--dry-run`. Default retention: keep finished jobs from the last
+    /// 7 days (so a recent failed loop is still recoverable for
+    /// debugging).
+    Prune {
+        /// Only prune finished jobs older than this duration (e.g. `7d`,
+        /// `24h`, `30m`, `60s`). Default: 7 days.
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Always keep the N most-recent finished jobs (regardless of age).
+        #[arg(long, value_name = "N")]
+        keep: Option<usize>,
+        /// Print what WOULD be pruned without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1095,6 +1136,22 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Status { job, all }) => agentic::cmd_status(&cli, job.clone(), *all),
         Some(Cmd::Result { job }) => agentic::cmd_result(&cli, job.clone()),
         Some(Cmd::Cancel { job }) => agentic::cmd_cancel(&cli, job.clone()),
+        Some(Cmd::Jobs { action }) => match action {
+            JobsCmd::List { all } => jobs::cmd_jobs_list(&cli, *all),
+            JobsCmd::Prune {
+                older_than,
+                keep,
+                dry_run,
+            } => jobs::cmd_jobs_prune(
+                &cli,
+                jobs::JobsPruneArgs {
+                    older_than: older_than.clone(),
+                    keep: *keep,
+                    dry_run: *dry_run,
+                    json: cli.json,
+                },
+            ),
+        },
         Some(Cmd::Loop {
             task,
             instructions,
