@@ -1471,13 +1471,17 @@ fn cmd_gate(
     //     skipped and why, so the audit trail is complete and the
     //     operator can act on it without the gate silently passing).
     //     Under strict, a missing REQUIRED tool upgrades to Failed
-    //     (Red) inside run_plan — Yellow under strict therefore only
-    //     means "an OPTIONAL tool was missing", which is advisory.
+    //     (Yellow under strict therefore only means "an OPTIONAL tool was
+    //     missing", which is advisory.)
     //   Red -> 1
+    //   Inconclusive (Z-6) -> 1: an empty / all-optional plan is
+    //     NOT a pass; the gate cannot certify it. Exit non-zero so
+    //     CI / approval flows block on it.
     let code: i32 = match &report.status {
         GateStatus::Green => 0,
         GateStatus::Yellow { .. } => 0,
         GateStatus::Red { .. } => 1,
+        GateStatus::Inconclusive => 1,
     };
     if code != 0 {
         std::process::exit(code);
@@ -1513,7 +1517,11 @@ impl GateOutcome {
     fn run(&self, mode: &GateMode) -> GateReport {
         let env = PathEnv::new();
         let (results, _) = run_plan(&self.plan, *mode, &env);
-        GateReport::new(results, self.pre_run_compat.clone())
+        // Stamp the mode into the report so consumers (and the rest of
+        // the CLI / merge-gate adapters) can distinguish a Strict
+        // verdict from a LocalIterate verdict. See `GateReport::new`
+        // docstring and the Z-5 adversarial-review pin.
+        GateReport::new(results, self.pre_run_compat.clone(), *mode)
     }
 }
 
@@ -1674,6 +1682,9 @@ fn status_payload(status: &GateStatus) -> serde_json::Value {
         }
         GateStatus::Red { failures } => {
             serde_json::json!({"verdict": "red", "failures": failures})
+        }
+        GateStatus::Inconclusive => {
+            serde_json::json!({"verdict": "inconclusive"})
         }
     }
 }
@@ -7668,17 +7679,33 @@ mod gate_tests {
     use zoder_core::gate_bundle::default_bundle;
 
     #[test]
-    fn empty_repo_yields_no_plan_and_green_status() {
+    fn empty_repo_yields_no_plan_and_inconclusive_status() {
         // A repo with NO marker files must produce an empty plan, no
-        // signals, and a Green (empty) report — the gate operates on
-        // whatever it can see and reports honestly. Never panics.
+        // signals, and an `Inconclusive` report — the gate operates on
+        // whatever it can see and reports honestly: zero required steps
+        // ran, so it CANNOT certify a pass. Never panics.
+        //
+        // Adversarial-review pin (Z-6): the previous behavior surfaced
+        // this as Green, letting an autonomous agent "pass" the gate
+        // without doing any work. Now it surfaces as Inconclusive (and
+        // the CLI's exit code is non-zero, blocking approval).
         let tmp = tempfile::tempdir().expect("tempdir");
         let outcome = run_gate_for_root(tmp.path());
         assert!(outcome.plan.is_empty(), "no markers -> empty plan");
         assert!(outcome.signals.ecosystems.is_empty());
         assert!(outcome.probe.is_empty(), "no plan -> no probe");
         let report = outcome.run(&GateMode::Strict);
-        assert_eq!(report.status, GateStatus::Green);
+        assert_eq!(
+            report.status,
+            GateStatus::Inconclusive,
+            "empty plan must aggregate to Inconclusive (Z-6), got {:?}",
+            report.status,
+        );
+        assert!(report.is_inconclusive());
+        assert!(
+            !report.is_passed(),
+            "empty plan must NOT be is_passed() (Z-6)"
+        );
         assert!(report.results.is_empty());
     }
 
@@ -7907,15 +7934,26 @@ mod gate_tests {
     fn outcome_with_no_ecosystems_still_returns_a_usable_handle() {
         // Defensive: an empty-repo run must still produce a
         // GateOutcome that can be queried without panicking. The
-        // probe is empty, the plan is empty, signals are empty, but
-        // the report still renders an honest Green.
+        // probe is empty, the plan is empty, signals are empty. The
+        // report must NOT render Green (Z-6): zero required steps ran,
+        // so the gate cannot certify a pass. It must render
+        // `Inconclusive` and `is_passed()` must be false.
         let tmp = tempfile::tempdir().expect("tempdir");
         let outcome = run_gate_for_root(tmp.path());
         assert_eq!(outcome.plan.len(), 0);
         assert_eq!(outcome.pre_run_compat.added_baseline.len(), 0);
         let report = outcome.run(&GateMode::Strict);
-        assert!(report.is_passed());
+        assert!(
+            !report.is_passed(),
+            "empty repo must NOT be is_passed() (Z-6), got status {:?}",
+            report.status,
+        );
+        assert!(
+            report.is_inconclusive(),
+            "empty repo must be Inconclusive (Z-6)"
+        );
         assert!(!report.is_failed());
+        assert!(matches!(report.status, GateStatus::Inconclusive));
     }
 
     #[test]

@@ -1104,7 +1104,8 @@ mod tests {
             match status {
                 crate::gate::GateStatus::Green
                 | crate::gate::GateStatus::Yellow { .. }
-                | crate::gate::GateStatus::Red { .. } => {}
+                | crate::gate::GateStatus::Red { .. }
+                | crate::gate::GateStatus::Inconclusive => {}
             }
             return;
         }
