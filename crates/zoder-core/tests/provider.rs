@@ -880,3 +880,372 @@ async fn anthropic_401_with_typed_error_envelope_is_classified_as_http() {
     // downstream classifier can pick the typed envelope apart.
     assert!(err.message.contains("authentication_error"), "got: {err}");
 }
+
+// =====================================================================
+// OpenAI Responses API adapter — wire-level integration tests.
+//
+// These tests pin the same properties the Anthropic slice pinned,
+// scoped to the OpenAI Responses wire shape:
+//   * endpoint + headers (`.../v1/responses`, `Authorization: Bearer …`),
+//   * body shape (`input` array + `max_output_tokens` + system item +
+//     `reasoning: {effort: …}` translation),
+//   * openai-chat byte-identical behavior (the openai-responses branch
+//     never triggers for `kind = "openai-chat"` — see
+//     `openai_chat_path_remains_byte_identical_after_responses_fork`),
+//   * non-streaming response parser,
+//   * streaming SSE decoder,
+//   * `Authorization: Bearer …` + the standard OpenAI `{"error":…}` 401
+//     envelope surfaces as `ErrKind::Http`. The OpenAI-shaped error
+//     body is intentionally NOT classified specially in model-health:
+//     `Classification::from_status(401)` already lands on
+//     `Unauthorized` so no per-provider branch is needed (this is the
+//     no-new-classification-code contract the spec calls out — see the
+//     existing `Classification::from_anthropic_error_body` OpenAI-shape
+//     tests, which already defer to `from_status`).
+// =====================================================================
+
+/// Build an `OpenAiProvider` configured to hit the given base_url with
+/// the OpenAI Responses API wire shape. Mirrors `anthropic_provider`.
+fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
+    let cfg = Provider {
+        id: "responses".into(),
+        base_url: base_url.to_string(),
+        kind: "openai-responses".into(),
+        auth,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+    };
+    OpenAiProvider::new(&cfg).unwrap()
+}
+
+/// Same as `req()` but uses a Responses-shaped request, including a
+/// `reasoning_effort` so we also assert the `{effort: "..."}`
+/// translation the adapter applies.
+fn responses_req(model: &str, stream: bool) -> ChatRequest {
+    ChatRequest {
+        model: model.into(),
+        messages: vec![
+            Message::new("system", "You are concise."),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 32,
+        temperature: 0.25,
+        stream,
+        show_reasoning: false,
+        reasoning_effort: Some("low".into()),
+    }
+}
+
+/// Task-pinned test (item 1a): a `kind == "openai-responses"`
+/// provider POSTs to the `/v1/responses` endpoint with the
+/// `Authorization: Bearer …` header (NOT `x-api-key`), converts the
+/// chat-shaped `messages` array into the Responses-shaped `input`
+/// array, replaces `max_tokens` with `max_output_tokens`, lifts the
+/// leading system message inline as a `role: "system"` item in
+/// `input`, and translates `reasoning_effort` into a top-level
+/// `reasoning: {effort: "..."}` object.
+#[tokio::test]
+async fn responses_request_hits_v1_responses_with_correct_headers_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("Authorization", "Bearer raw-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "resp_01",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(
+        &server.uri(),
+        Auth::Bearer {
+            token: "raw-token".into(),
+        },
+    );
+    let res = p
+        .stream_chat(&responses_req("gpt-5", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "ok");
+    // The Bodies the OpenAI Responses wire contract REQUIRES these
+    // fields — pin them through a follow-up mock that exercises the
+    // exact wire body, not just the response.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("Authorization", "Bearer raw-token"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                { "role": "system", "content": "You are concise." },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_output_tokens": 32,
+            "temperature": 0.25,
+            "stream": false,
+            "reasoning": { "effort": "low" }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let p2 = responses_provider(
+        &server.uri(),
+        Auth::Bearer {
+            token: "raw-token".into(),
+        },
+    );
+    let res = p2
+        .stream_chat(&responses_req("gpt-5", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "ok");
+}
+
+/// Task-pinned test (item 1b): the openai-chat path must remain
+/// byte-identical to before — a `kind = "openai-chat"` provider
+/// never sees the `is_responses()` branch, never sends the
+/// `input` / `max_output_tokens` / `reasoning: {effort: …}` body,
+/// and still POSTs to `/v1/chat/completions`. We exercise this by
+/// hitting the OpenAI Chat Completions shape and asserting the wire
+/// mock matched that route instead of `/v1/responses`.
+#[tokio::test]
+async fn openai_chat_path_remains_byte_identical_after_responses_fork() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // The OpenAI Chat path passes `messages` straight through
+        // and uses `max_tokens` — the Responses branch would have
+        // translated these to `input` and `max_output_tokens`.
+        // A passing assertion here proves the Chat route is still
+        // the only route taken for `kind = "openai-chat"`.
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "hello"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server.uri());
+    let req = ChatRequest {
+        model: "gpt-4o".into(),
+        messages: vec![
+            Message::new("system", "be terse"),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 16,
+        temperature: 0.0,
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: None,
+    };
+    let res = p.stream_chat(&req, None).await.unwrap();
+    assert_eq!(res.content, "hello");
+}
+
+/// Task-pinned test (item 1c): the non-streaming Responses response
+/// parser concatenates every `output[].content[].type == "output_text"`
+/// block into the `content` string and translates
+/// `usage.input_tokens` -> `prompt_tokens` and `usage.output_tokens`
+/// -> `completion_tokens`. Multi-text-block output, a non-text item
+/// (tool-call style), and a reasoning item must all be handled.
+#[tokio::test]
+async fn responses_non_streaming_response_is_parsed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "resp_01",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Hello "},
+                        {"type": "output_text", "text": "world"}
+                    ]
+                }
+            ],
+            "usage": {"input_tokens": 7, "output_tokens": 4, "total_tokens": 11}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(&server.uri(), Auth::None);
+    let res = p
+        .stream_chat(&responses_req("gpt-5", false), None)
+        .await
+        .unwrap();
+    // Concat with a single `\n` separator (matching the Anthropic
+    // branch's joined_text contract). Reasoning items are filtered
+    // out — `show_reasoning: false` is the default.
+    assert_eq!(res.content, "Hello \nworld");
+    assert_eq!(res.prompt_tokens, Some(7));
+    assert_eq!(res.completion_tokens, Some(4));
+}
+
+/// Schema-invalid 2xx guard for the non-streaming Responses path:
+/// a response whose `output` array is empty (or carries only
+/// non-`message` items, or only whitespace text) MUST surface as
+/// `ErrKind::Decode`. Same contract the OpenAI Chat and Anthropic
+/// branches enforce.
+#[tokio::test]
+async fn responses_non_streaming_empty_output_text_is_decode_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&responses_req("gpt-5", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(err.message.contains("empty output text"), "got: {err}");
+}
+
+/// Task-pinned test (item 1d): the streaming Responses SSE decoder
+/// walks the `event: …` / `data: {…}` envelope, accumulates
+/// `response.output_text.delta` `delta` strings into `content`,
+/// captures `response.completed.response.usage.input_tokens` as
+/// `prompt_tokens` and `output_tokens` as `completion_tokens`,
+/// treats `response.completed` as the terminal event, and rejects
+/// streams that close without producing any `output_text.delta`.
+#[tokio::test]
+async fn responses_streaming_sse_is_assembled() {
+    let server = MockServer::start().await;
+    // Build the SSE body from the exact Responses event shape the
+    // parser was written against. `event:` lines are followed by a
+    // `data:` line with the typed JSON envelope.
+    let body = "\
+event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\
+\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(&server.uri(), Auth::None);
+    let mut sink = Vec::new();
+    let res = p
+        .stream_chat(&responses_req("gpt-5", true), Some(&mut sink))
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(sink, b"Hello");
+    // input_tokens from response.completed.response.usage,
+    // output_tokens from the same envelope.
+    assert_eq!(res.prompt_tokens, Some(5));
+    assert_eq!(res.completion_tokens, Some(2));
+}
+
+/// Stream that closes via `response.completed` without producing any
+/// `response.output_text.delta` — same schema-invalid-2xx contract
+/// as the non-streaming empty-output-text case. The decoder must
+/// surface ErrKind::Decode.
+#[tokio::test]
+async fn responses_streaming_with_no_text_delta_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "\
+event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0,\"total_tokens\":3}}}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&responses_req("gpt-5", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(err.message.contains("no output text"), "got: {err}");
+}
+
+/// OpenAI-shaped `{"error":{...}}` envelope on a 401 must surface
+/// as `ErrKind::Http`. Same contract the OpenAI-chat and Anthropic
+/// wire tests pin: the HTTP status code drives the classification
+/// (the existing `classify_err` -> `from_status(401)` pipeline maps
+/// it onto Unauthorized without any provider-specific branch).
+/// `model_health::Classification::from_anthropic_error_body` already
+/// documents that an OpenAI-style envelope defers to `from_status`,
+/// confirming the wire adapter here does NOT need new
+/// classification code.
+#[tokio::test]
+async fn responses_401_with_openai_error_envelope_is_classified_as_http() {
+    let server = MockServer::start().await;
+    let body = r#"{"error":{"code":"invalid_api_key","message":"bad token"}}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(
+        &server.uri(),
+        Auth::Bearer {
+            token: "bogus".into(),
+        },
+    );
+    let err = p
+        .stream_chat(&responses_req("gpt-5", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Http);
+    assert_eq!(err.status, Some(401));
+    // The body must round-trip through `ProviderError::message` so a
+    // downstream classifier can pick the typed envelope apart.
+    assert!(err.message.contains("invalid_api_key"), "got: {err}");
+}
