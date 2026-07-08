@@ -24,7 +24,7 @@ fn req(model: &str, stream: bool) -> ChatRequest {
         model: model.into(),
         messages: vec![Message::new("user", "hi")],
         max_tokens: 16,
-        temperature: 0.0,
+        temperature: Some(0.0),
         stream,
         show_reasoning: false,
         reasoning_effort: None,
@@ -381,6 +381,99 @@ async fn stream_with_valid_json_but_no_choices_is_decode_error() {
     assert_eq!(error.kind, ErrKind::Decode);
 }
 
+/// Z-9: a streaming OpenAI response that yields one or more `choices`
+/// frames but never emits a non-empty `delta.content` MUST surface as
+/// `ErrKind::Decode`, not a successful empty completion. Without this
+/// guard the stream would tick `saw_choice = true`, `pick_text` would
+/// return `""`, and the call would be reconciled as a 0-token paid
+/// success — exactly the failure mode the non-streaming
+/// `has_meaningful_message()` guard at ~1205 already prevents. We
+/// exercise the real streaming parser end-to-end through
+/// `OpenAiProvider::stream_chat` with a wiremock SSE body whose
+/// `choices[].delta.content` is absent / empty / whitespace-only.
+#[tokio::test]
+async fn stream_with_choices_but_no_content_is_decode_error() {
+    // Three independent shapes that must all be rejected. Any one of
+    // them reaching the success branch is the bug the task pins.
+    let bodies = [
+        // 1) choices present, delta has NO `content` field at all.
+        "data: {\"choices\":[{\"delta\":{}}]}\n\n\
+         data: [DONE]\n\n",
+        // 2) choices present, delta content is the empty string.
+        "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n\
+         data: [DONE]\n\n",
+        // 3) choices present, delta content is whitespace-only.
+        "data: {\"choices\":[{\"delta\":{\"content\":\"   \\n \"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0}}\n\n\
+         data: [DONE]\n\n",
+    ];
+
+    for (idx, body) in bodies.iter().enumerate() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(*body))
+            .mount(&server)
+            .await;
+
+        let mut sink = Vec::new();
+        let result = provider(&server.uri())
+            .stream_chat(&req("m", true), Some(&mut sink))
+            .await;
+        let error = match result {
+            Ok(r) => panic!(
+                "case {idx}: empty-completion stream must NOT return Ok; got content={:?} completion_tokens={:?}",
+                r.content, r.completion_tokens
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            error.kind,
+            ErrKind::Decode,
+            "case {idx}: empty-completion stream must surface as Decode, got: {error}"
+        );
+        // The reservation must not be reconciled as a paid success:
+        // the failure mode the task names is exactly an `Ok` with empty
+        // `content`. The error message must name the cause so a
+        // downstream classifier can pick it apart from a transport
+        // or timeout error.
+        assert!(
+            error.message.contains("empty completion")
+                || error.message.contains("no content")
+                || error.message.contains("empty content"),
+            "case {idx}: error must name the empty-completion cause, got: {error}"
+        );
+    }
+}
+
+/// Mirror of `stream_with_choices_but_no_content_is_decode_error`:
+/// a stream whose choices DO produce a non-empty content delta must
+/// still succeed (fail-open on the guard, not fail-closed on real
+/// output). Pinned so a follow-up tightening of the Z-9 guard
+/// doesn't accidentally swallow real content.
+#[tokio::test]
+async fn stream_with_real_content_delta_still_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n\
+             data: [DONE]\n\n",
+        ))
+        .mount(&server)
+        .await;
+
+    let mut sink = Vec::new();
+    let res = provider(&server.uri())
+        .stream_chat(&req("m", true), Some(&mut sink))
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(sink, b"Hello");
+    assert_eq!(res.completion_tokens, Some(2));
+}
+
 #[tokio::test]
 async fn invalid_utf8_sse_is_decode_error() {
     let server = MockServer::start().await;
@@ -583,7 +676,7 @@ fn anthropic_req(model: &str, stream: bool) -> ChatRequest {
             Message::new("user", "hi"),
         ],
         max_tokens: 16,
-        temperature: 0.5,
+        temperature: Some(0.5),
         stream,
         show_reasoning: false,
         reasoning_effort: None,
@@ -594,10 +687,16 @@ fn anthropic_req(model: &str, stream: bool) -> ChatRequest {
 /// `/v1/messages` endpoint with the spec-correct `x-api-key` +
 /// `anthropic-version: 2023-06-01` headers, lifts any leading
 /// `role: "system"` message(s) into the top-level `system` string,
-/// passes the rest of the messages through, and never emits the
-/// OpenAI-shaped `temperature` / `messages[0].role == "system"` body.
-/// The `Bearer ` prefix from a `Bearer { token }` auth is stripped
-/// before the `x-api-key` header is set.
+/// passes the rest of the messages through, and lifts the leading
+/// system-role messages into the top-level `system` string rather
+/// than the OpenAI-shaped `messages[0].role == "system"` body. The
+/// `Bearer ` prefix from a `Bearer { token }` auth is stripped
+/// before the `x-api-key` header is set. The Anthropic Messages API
+/// accepts its own `temperature` field (not the OpenAI-shaped
+/// `messages[0]` row), so the wire adapter now forwards
+/// `req.temperature = Some(_)` and omits the field on `None` — see
+/// the dedicated `anthropic_body_forwards_some_temperature` /
+/// `anthropic_body_omits_temperature_when_none` unit tests.
 #[tokio::test]
 async fn anthropic_request_hits_v1_messages_with_correct_headers_and_body() {
     let server = MockServer::start().await;
@@ -606,9 +705,12 @@ async fn anthropic_request_hits_v1_messages_with_correct_headers_and_body() {
         .and(header("anthropic-version", "2023-06-01"))
         .and(header("x-api-key", "raw-token-no-bearer"))
         .and(header_exists("x-api-key"))
-        // The OpenAI-shaped `temperature` field MUST NOT appear in the
-        // Anthropic body — a passing assertion here is the
-        // byte-identical-to-OpenAI-wasn't-applied guard.
+        // The OpenAI-shaped `messages[0].role == "system"` body MUST
+        // NOT appear — the system message must be lifted into the
+        // top-level `system` string. The Anthropic `temperature`
+        // field is independent of the OpenAI-shaped one (a separate
+        // test pins its forwarding on the wire), so we only assert
+        // the structural keys here.
         .and(body_partial_json(serde_json::json!({
             "model": "claude-3-5-sonnet",
             "max_tokens": 16,
@@ -631,11 +733,90 @@ async fn anthropic_request_hits_v1_messages_with_correct_headers_and_body() {
             token: "raw-token-no-bearer".into(),
         },
     );
-    let res = p
-        .stream_chat(&anthropic_req("claude-3-5-sonnet", false), None)
-        .await
-        .unwrap();
+    // Build a request with `temperature: None` so this test stays
+    // focused on the structural keys (the dedicated unit tests pin
+    // the `temperature` forwarding end-to-end and on the wire).
+    let mut req = anthropic_req("claude-3-5-sonnet", false);
+    req.temperature = None;
+    let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "ok");
+}
+
+/// Z-10 wire-level pin: a reviewer / health-probe call that asks
+/// for `temperature = Some(0.0)` MUST put `"temperature": 0.0` on the
+/// wire so the deterministic contract the caller depends on actually
+/// reaches the backend. Companion to the unit test
+/// `anthropic_body_forwards_some_temperature`; this one drives the
+/// full `OpenAiProvider::stream_chat` path so a refactor that moves
+/// the `body()` dispatch is also covered. The mock matches any
+/// POST so we can inspect the actual request body the adapter
+/// sent.
+#[tokio::test]
+async fn anthropic_request_forwards_some_temperature_on_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let mut req = anthropic_req("claude", false);
+    req.temperature = Some(0.0);
+    let res = p.stream_chat(&req, None).await.unwrap();
+    assert_eq!(res.content, "ok");
+
+    // Inspect the actual wire body. Pre-fix this would have omitted
+    // `temperature` entirely (the Anthropic branch silently dropped
+    // the field), so the request would have fallen back to the model
+    // default and the deterministic `temperature = 0` contract the
+    // caller asked for would have been lost.
+    let received = server.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1, "expected exactly one POST");
+    let body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("wire body must be valid JSON");
+    assert_eq!(
+        body.get("temperature"),
+        Some(&serde_json::json!(0.0)),
+        "Some(0.0) must round-trip as `temperature: 0.0` on the wire: {body}"
+    );
+}
+
+/// Z-10 wire-level pin: `temperature = None` MUST NOT emit a
+/// `temperature` field at all — the Anthropic Messages API treats
+/// the absence of the field as "use the model default", and a stale
+/// `temperature: 0.0` from a previous request would silently
+/// downgrade the call. Companion to the unit test
+/// `anthropic_body_omits_temperature_when_none`.
+#[tokio::test]
+async fn anthropic_request_omits_temperature_on_wire_when_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let mut req = anthropic_req("claude", false);
+    req.temperature = None;
+    let res = p.stream_chat(&req, None).await.unwrap();
+    assert_eq!(res.content, "ok");
+
+    let received = server.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1, "expected exactly one POST");
+    let body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("wire body must be valid JSON");
+    assert!(
+        body.get("temperature").is_none(),
+        "None must not emit a temperature field on the wire: {body}"
+    );
 }
 
 /// Task-pinned test (item 4b): the openai-chat path must remain
@@ -682,7 +863,7 @@ async fn openai_chat_path_remains_byte_identical_after_anthropic_fork() {
             Message::new("user", "hi"),
         ],
         max_tokens: 16,
-        temperature: 0.0,
+        temperature: Some(0.0),
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
@@ -931,7 +1112,7 @@ fn responses_req(model: &str, stream: bool) -> ChatRequest {
             Message::new("user", "hi"),
         ],
         max_tokens: 32,
-        temperature: 0.25,
+        temperature: Some(0.25),
         stream,
         show_reasoning: false,
         reasoning_effort: Some("low".into()),
@@ -1058,7 +1239,7 @@ async fn openai_chat_path_remains_byte_identical_after_responses_fork() {
             Message::new("user", "hi"),
         ],
         max_tokens: 16,
-        temperature: 0.0,
+        temperature: Some(0.0),
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,

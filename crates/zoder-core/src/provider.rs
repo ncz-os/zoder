@@ -169,7 +169,16 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: u32,
-    pub temperature: f32,
+    /// Optional sampling temperature. `Some(v)` forwards `v` to the
+    /// wire so a deterministic reviewer / health-probe call can pin
+    /// `Some(0.0)`. `None` lets the model pick its own default
+    /// temperature — the Anthropic Messages API, for example, treats
+    /// the absence of the field as "use the model default", and a
+    /// stale literal `0.0` from a previous request would silently
+    /// downgrade the call. The Responses and OpenAI chat paths
+    /// forward `Some(_)` verbatim and omit the field on `None` to
+    /// match the Anthropic contract.
+    pub temperature: Option<f32>,
     pub stream: bool,
     /// Surface model reasoning/thinking in the returned content. Off by default
     /// so the answer surface stays codex-compatible.
@@ -421,6 +430,12 @@ fn strip_bearer_prefix(value: &str) -> &str {
 /// so the JSON is structurally compatible. `stream` is preserved so the
 /// SSE path can request `stream: true` end-to-end.
 ///
+/// `req.temperature` is forwarded when `Some` so a deterministic reviewer
+/// / health-probe call that asks for `temperature = 0` actually gets
+/// `temperature = 0` on the wire; `None` omits the field entirely so the
+/// model picks its own default (matching the Responses / OpenAI chat
+/// contract, which also omit the field on `None`).
+///
 /// `req.reasoning_effort` is dropped for Anthropic: the Messages API has no
 /// `reasoning_effort` field, and silently injecting an OpenAI-shaped key
 /// would either be ignored or rejected depending on the gateway. The
@@ -456,6 +471,9 @@ fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
         // `[{"type":"text","text":"..."}]` array; the string form is the
         // common case and keeps the JSON identical to what most SDKs send.
         body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+    }
+    if let Some(temp) = req.temperature {
+        body["temperature"] = serde_json::json!(temp);
     }
     body
 }
@@ -609,9 +627,11 @@ fn responses_body(req: &ChatRequest) -> serde_json::Value {
         "model": req.model,
         "input": input,
         "max_output_tokens": req.max_tokens,
-        "temperature": req.temperature,
         "stream": req.stream,
     });
+    if let Some(temp) = req.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
     if let Some(eff) = &req.reasoning_effort {
         body["reasoning"] = serde_json::json!({ "effort": eff });
     }
@@ -956,9 +976,11 @@ impl OpenAiProvider {
             "model": req.model,
             "messages": req.messages,
             "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
             "stream": req.stream,
         });
+        if let Some(temp) = req.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
         // Ask the backend to emit a final usage chunk so we can record real
         // prompt/completion token counts instead of guessing.
         if req.stream {
@@ -1407,6 +1429,17 @@ impl OpenAiProvider {
         };
         let mut done = false;
         let mut saw_choice = false;
+        // Z-9: a stream that yields one or more `choices` frames but never
+        // pushes a non-empty content delta must NOT be reconciled as a
+        // successful completion — the billable reservation would otherwise
+        // be paid out as a no-op. Mirrors the non-streaming
+        // `has_meaningful_message()` guard at ~1205. Set when any non-empty
+        // `pick_text` fragment is appended to `content`; a `choices: [{}]`
+        // or `{"choices":[{"delta":{"content":""}}]}` stream leaves this
+        // false and surfaces as `ErrKind::Decode` at the bottom of the
+        // function, with `emitted` unchanged so the caller knows nothing
+        // was written to the sink.
+        let mut saw_content = false;
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -1555,6 +1588,18 @@ impl OpenAiProvider {
                                 emitted,
                             ));
                         }
+                        // Mirror the non-streaming `has_meaningful_message`
+                        // contract: whitespace-only deltas do not count as
+                        // a real answer, so a stream that pushes only
+                        // whitespace (or a single non-content frame) is
+                        // still schema-invalid and must surface as Decode
+                        // at the bottom of the function. This stops a
+                        // billable reservation from being reconciled as a
+                        // paid no-op when the model "answered" with just
+                        // a newline.
+                        if piece.chars().any(|c| !c.is_whitespace()) {
+                            saw_content = true;
+                        }
                         chunk_count += 1;
                         content.push_str(&piece);
                         if let Some(s) = sink.as_deref_mut() {
@@ -1582,6 +1627,24 @@ impl OpenAiProvider {
             return Err(fail(
                 ErrKind::Decode,
                 "malformed completion stream: no valid completion choice".to_string(),
+                emitted,
+            ));
+        }
+        // Z-9 guard: a stream that carries a choice but no non-empty
+        // content delta is schema-invalid in the same sense the
+        // non-streaming `has_meaningful_message()` guard catches. We
+        // must NOT credit the call as a 0-token success — a billable
+        // reservation would be paid out as a no-op, and a
+        // `--no-stream` / reviewer / health-probe run on the same
+        // model would have surfaced as a Decode error on the
+        // non-streaming path. The `emitted` flag stays at its
+        // accumulated value so the caller (and the retry/fallback
+        // classifier) can tell whether any bytes reached the sink.
+        if !saw_content {
+            return Err(fail(
+                ErrKind::Decode,
+                "malformed completion stream: empty completion choice (no content delta)"
+                    .to_string(),
                 emitted,
             ));
         }
@@ -2603,7 +2666,7 @@ mod tests {
                 Message::new("assistant", "hello"),
             ],
             max_tokens: 32,
-            temperature: 0.25,
+            temperature: Some(0.25),
             stream: true,
             show_reasoning: false,
             reasoning_effort: Some("medium".into()),
@@ -2765,6 +2828,71 @@ mod tests {
         // accepted even though the wire adapter doesn't surface it
         // upstream.
         assert_eq!(parsed.usage.as_ref().and_then(|u| u.total_tokens), Some(13));
+    }
+
+    // -----------------------------------------------------------------
+    // Z-10: Anthropic Messages API body — `temperature` forwarding.
+    //
+    // `anthropic_body()` silently dropped `req.temperature` from the
+    // wire body, so a reviewer / health-probe call that requested
+    // `temperature = 0` would get the model default and become
+    // nondeterministic. The Responses path already forwards
+    // `temperature`; mirror it on the Anthropic branch. The pin:
+    //   * `temperature = Some(0.0)` MUST emit `"temperature": 0.0` on
+    //     the wire (the deterministic-call contract a reviewer or
+    //     health probe depends on),
+    //   * `temperature = None` MUST NOT emit a `temperature` field at
+    //     all (an explicit `None` means "let the model pick its own
+    //     default", which is the only correct way to opt back in to
+    //     the pre-fix behavior).
+    //
+    // Tests exercise the REAL `anthropic_body()` function (not a
+    // reimplementation) so a future refactor that moves the helper
+    // stays covered.
+    // -----------------------------------------------------------------
+
+    fn anthropic_unit_req(temperature: Option<f32>) -> ChatRequest {
+        ChatRequest {
+            model: "claude-3-5-sonnet".into(),
+            messages: vec![
+                Message::new("system", "be terse"),
+                Message::new("user", "hi"),
+            ],
+            max_tokens: 16,
+            temperature,
+            stream: false,
+            show_reasoning: false,
+            reasoning_effort: None,
+        }
+    }
+
+    /// `Some(0.0)` MUST round-trip to `"temperature": 0.0` on the wire
+    /// so a deterministic reviewer / health-probe call actually gets
+    /// the temperature it asked for. Pre-fix this assertion fails
+    /// because `anthropic_body` silently drops the field.
+    #[test]
+    fn anthropic_body_forwards_some_temperature() {
+        let body = anthropic_body(&anthropic_unit_req(Some(0.0)));
+        assert_eq!(
+            body.get("temperature"),
+            Some(&serde_json::json!(0.0)),
+            "Some(0.0) must round-trip as `\"temperature\": 0.0`: {body}"
+        );
+    }
+
+    /// `None` MUST NOT emit a `temperature` key at all — the
+    /// Anthropic wire protocol treats the absence of the field as
+    /// "use the model default", and a stale `temperature: 0.0` from
+    /// a previous request would silently downgrade the call. Pre-fix
+    /// the field was never emitted regardless of the request, so this
+    /// assertion also pins the unchanged None path.
+    #[test]
+    fn anthropic_body_omits_temperature_when_none() {
+        let body = anthropic_body(&anthropic_unit_req(None));
+        assert!(
+            body.get("temperature").is_none(),
+            "None must not emit a temperature field: {body}"
+        );
     }
 
     // -----------------------------------------------------------------

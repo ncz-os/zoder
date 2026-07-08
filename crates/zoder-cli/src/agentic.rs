@@ -797,7 +797,7 @@ async fn dispatch_reviewer_for_model(
         model: model.to_string(),
         messages,
         max_tokens,
-        temperature: 0.1,
+        temperature: Some(0.1),
         stream: false,
         show_reasoning: false,
         reasoning_effort: cli.reasoning.clone(),
