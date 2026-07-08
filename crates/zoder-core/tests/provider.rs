@@ -1,5 +1,5 @@
 use std::time::Duration;
-use wiremock::matchers::{body_partial_json, header, header_exists, method, path};
+use wiremock::matchers::{body_partial_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zoder_core::{
     backoff_delay, Auth, BillingMode, ChatRequest, ErrKind, Message, OpenAiProvider, Provider,
@@ -15,6 +15,7 @@ fn provider(base_url: &str) -> OpenAiProvider {
         billing: BillingMode::Metered,
         subscription: None,
         serves: Vec::new(),
+        azure_api_version: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -567,6 +568,7 @@ fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         billing: BillingMode::Metered,
         subscription: None,
         serves: Vec::new(),
+        azure_api_version: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -916,6 +918,7 @@ fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         billing: BillingMode::Metered,
         subscription: None,
         serves: Vec::new(),
+        azure_api_version: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -1248,4 +1251,408 @@ async fn responses_401_with_openai_error_envelope_is_classified_as_http() {
     // The body must round-trip through `ProviderError::message` so a
     // downstream classifier can pick the typed envelope apart.
     assert!(err.message.contains("invalid_api_key"), "got: {err}");
+}
+
+// =====================================================================
+// Native Azure OpenAI wire adapter — wire-level integration tests.
+//
+// These tests pin the four properties the Azure slice promises:
+//
+//   * endpoint + headers (`POST {base}/chat/completions?api-version=…`
+//     with `api-key: <token>` — NOT `Authorization: Bearer …`),
+//   * body shape (the openai-chat-completions body — Azure returns the
+//     same wire shape, so no parallel `azure_body()` helper is needed;
+//     the body builder falls through to the chat branch),
+//   * openai-chat byte-identical behavior (the `azure-openai` branch
+//     never triggers for `kind = "openai-chat"` — see
+//     `openai_chat_path_remains_byte_identical_after_azure_fork`),
+//   * non-streaming response parser (Azure returns
+//     `chat.completion` shapes — the existing OpenAI response parser
+//     handles them unchanged),
+//   * streaming SSE decoder (Azure returns `chat.completion.chunk`
+//     shapes — the existing OpenAI SSE decoder handles them unchanged),
+//   * OpenAI-shape `{"error": …}` envelope on a 401 surfaces as
+//     `ErrKind::Http` — same as every other OpenAI-compatible branch;
+//     the existing `classify_err -> from_status(401)` pipeline picks
+//     it up without any provider-specific code.
+//
+// Like the Anthropic / Responses slices, the regression guard tests
+// pin the openai-chat byte-for-byte contract: nothing about the
+// `azure-openai` branch may leak into the openai-chat branch.
+// =====================================================================
+
+/// Mutex that serializes the small number of integration tests in this
+/// binary that touch the shared `AZURE_OPENAI_API_VERSION` env var.
+/// Cargo runs tests in parallel by default, and the env-var read inside
+/// `OpenAiProvider::new` is non-atomic against concurrent
+/// `std::env::set_var` calls — without this guard, the precedence test
+/// races with the other tests in this binary that also flip the same
+/// variable. The integration suite has a tighter set of tests than the
+/// unit-test module so a single lock here is enough.
+static AZURE_INTEG_API_VERSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build an `OpenAiProvider` configured to hit the given base_url with
+/// the Azure OpenAI native wire shape. `auth` exercises every `Auth`
+/// variant the operator can use against Azure — `ApiKeyHeader { header:
+/// "api-key", … }` (the recommended shape in `config.microsoft.toml`),
+/// `Env { var }` (Azure key in an env var), and `None` (no credential,
+/// to assert the empty-credential shape).
+fn azure_provider(base_url: &str, auth: Auth, azure_api_version: Option<&str>) -> OpenAiProvider {
+    let cfg = Provider {
+        id: "azure".into(),
+        base_url: base_url.to_string(),
+        kind: "azure-openai".into(),
+        auth,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+        azure_api_version: azure_api_version.map(|s| s.to_string()),
+    };
+    OpenAiProvider::new(&cfg).unwrap()
+}
+
+/// Same as `req()` but uses an Azure-friendly model id.
+fn azure_req(model: &str, stream: bool) -> ChatRequest {
+    ChatRequest {
+        model: model.into(),
+        messages: vec![
+            Message::new("system", "be terse"),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 16,
+        temperature: 0.5,
+        stream,
+        show_reasoning: false,
+        reasoning_effort: None,
+    }
+}
+
+/// Task-pinned test (item Azure-1a): a `kind == "azure-openai"` provider
+/// POSTs to the deployment-route path
+/// (`{base}/openai/deployments/<deployment>/chat/completions`) with the
+/// `api-key: <token>` header (NOT `Authorization: Bearer …`) and the
+/// `?api-version=<v>` query string. The body is the openai-chat
+/// `messages` / `max_tokens` / `temperature` / `stream` shape — Azure
+/// reuses the chat-completions body verbatim, so the wire adapter
+/// does NOT carry a parallel `azure_body()` builder (the body builder
+/// falls through to the chat branch for `kind == "azure-openai"`,
+/// documented in the `body()` helper).
+#[tokio::test]
+async fn azure_request_hits_deployment_route_with_api_key_header_and_chat_body() {
+    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER", "raw-azure-key");
+    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
+
+    // Start the mock server first (no env-var dependency), then
+    // build the provider under the lock so a parallel test can't
+    // flip the env var between our `set_var` and the constructor's
+    // read. The lock is released BEFORE the `.mount().await` and
+    // `stream_chat(...).await` awaits — clippy's
+    // `await_holding_lock` lint correctly flags a sync mutex held
+    // across an await point (the runtime would block on a blocking
+    // lock).
+    let server = MockServer::start().await;
+    let p = {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        azure_provider(
+            &format!("{}/openai/deployments/gpt4o", server.uri()),
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "ZODER_TEST_AZURE_API_KEY_HEADER".into(),
+            },
+            Some("2024-10-21"),
+        )
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/openai/deployments/gpt4o/chat/completions"))
+        .and(query_param("api-version", "2024-10-21"))
+        .and(header("api-key", "raw-azure-key"))
+        .and(header_exists("api-key"))
+        // CRITICAL: the Azure branch must NOT send `Authorization: Bearer`.
+        // The mock matches on `api-key` only (so `Authorization` would
+        // not cause a rejection), but the body must carry the
+        // openai-chat shape and MUST NOT carry the Responses-only
+        // fields (`input`, `max_output_tokens`, `reasoning`) or the
+        // Anthropic-only `system` string.
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 16,
+            "temperature": 0.5,
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "hi" }
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let res = p
+        .stream_chat(&azure_req("gpt-4o", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "ok");
+    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER");
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+}
+
+/// Task-pinned test (item Azure-1b): `Provider::azure_api_version`
+/// field overrides the `AZURE_OPENAI_API_VERSION` env var. The mock
+/// only matches the FIELD-pinned version, so a passing assertion
+/// proves the field wins.
+#[tokio::test]
+async fn azure_provider_field_api_version_overrides_env_var() {
+    // Set the env var to a value the mock would REJECT — if the
+    // adapter consults the env var instead of the field, the mock
+    // never matches and the test fails. Start the server first
+    // (no env-var dependency), then build the provider under the
+    // lock — clippy's `await_holding_lock` lint correctly flags a
+    // sync mutex held across an await point.
+    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-08-01");
+    let server = MockServer::start().await;
+    let p = {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        azure_provider(
+            &format!("{}/openai/deployments/gpt4o", server.uri()),
+            Auth::None,
+            // FIELD set to "2024-10-21" — must beat the env var.
+            Some("2024-10-21"),
+        )
+    };
+
+    Mock::given(method("POST"))
+        .and(query_param("api-version", "2024-10-21"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let res = p
+        .stream_chat(&azure_req("gpt-4o", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "ok");
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+}
+
+/// Task-pinned test (item Azure-1c): the openai-chat path must remain
+/// byte-identical to before — a `kind = "openai-chat"` provider never
+/// sees the `is_azure()` branch, never sends the `api-key` header,
+/// and never carries the deployment-route path. We exercise this by
+/// hitting a path that the Azure branch would ALSO accept (the mock
+/// is scoped to the openai-chat shape) and asserting the wire mock
+/// matched the openai-chat shape, not the Azure branch.
+#[tokio::test]
+async fn openai_chat_path_remains_byte_identical_after_azure_fork() {
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // The openai-chat path passes `messages` straight through and
+        // uses `max_tokens` — the Azure branch would have done the
+        // same on the body (Azure reuses the chat shape). The
+        // BYTE-DISTINGUISHING wire difference is the URL: the
+        // openai-chat path produces a `/v1/chat/completions` route
+        // and an openai-chat path-based base_url would produce a
+        // DIFFERENT mock match. We use a base_url WITHOUT a deployment
+        // route here so the openai-chat path's normalizer injects
+        // `/v1/` (the Azure branch keeps the deployment route intact
+        // instead). The mock therefore matches the openai-chat
+        // branch ONLY — proving the Azure branch never fires for
+        // `kind = "openai-chat"`.
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+            "temperature": 0.5,
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "hello"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let p = provider(&server.uri());
+    let req = ChatRequest {
+        model: "gpt-4o".into(),
+        messages: vec![
+            Message::new("system", "be terse"),
+            Message::new("user", "hi"),
+        ],
+        max_tokens: 16,
+        temperature: 0.5,
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: None,
+    };
+    let res = p.stream_chat(&req, None).await.unwrap();
+    assert_eq!(res.content, "hello");
+}
+
+/// Task-pinned test (item Azure-1d): the Azure branch's non-streaming
+/// response is parsed by the EXISTING openai-chat response parser
+/// (Azure returns OpenAI-standard `chat.completion` shapes). Token
+/// usage round-trips through the OpenAI-shaped
+/// `prompt_tokens` / `completion_tokens` fields without any
+/// Azure-specific branch.
+#[tokio::test]
+async fn azure_non_streaming_response_is_parsed() {
+    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_2", "azure-key");
+    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
+    let server = MockServer::start().await;
+    let p = {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        azure_provider(
+            &format!("{}/openai/deployments/gpt4o", server.uri()),
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "ZODER_TEST_AZURE_API_KEY_HEADER_2".into(),
+            },
+            Some("2024-10-21"),
+        )
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/openai/deployments/gpt4o/chat/completions"))
+        .and(query_param("api-version", "2024-10-21"))
+        .and(header("api-key", "azure-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-azure-01",
+            "choices": [{"message": {"content": "Hello from Azure"}}],
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 4
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let res = p
+        .stream_chat(&azure_req("gpt-4o", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello from Azure");
+    assert_eq!(res.prompt_tokens, Some(7));
+    assert_eq!(res.completion_tokens, Some(4));
+    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_2");
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+}
+
+/// Task-pinned test (item Azure-1e): the Azure branch's streaming SSE
+/// decoder walks the OpenAI-standard `chat.completion.chunk` shape
+/// (Azure returns the same `data: {"choices":[{"delta":{"content":
+/// "..."}}]}` events the openai-chat path consumes). The end-of-stream
+/// `[DONE]` sentinel closes the SSE stream and yields the accumulated
+/// content + a final usage chunk.
+#[tokio::test]
+async fn azure_streaming_sse_is_assembled() {
+    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_3", "azure-key");
+    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
+    let server = MockServer::start().await;
+    let p = {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        azure_provider(
+            &format!("{}/openai/deployments/gpt4o", server.uri()),
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "ZODER_TEST_AZURE_API_KEY_HEADER_3".into(),
+            },
+            Some("2024-10-21"),
+        )
+    };
+
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/openai/deployments/gpt4o/chat/completions"))
+        .and(query_param("api-version", "2024-10-21"))
+        .and(header("api-key", "azure-key"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let mut sink = Vec::new();
+    let res = p
+        .stream_chat(&azure_req("gpt-4o", true), Some(&mut sink))
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(res.completion_tokens, Some(2));
+    assert_eq!(res.prompt_tokens, Some(3));
+    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_3");
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+}
+
+/// Typed Azure error envelope on a 401 must surface as ErrKind::Http
+/// — Azure returns OpenAI-shape `{"error":{...}}` envelopes (the
+/// existing `classify_err -> from_status(401)` pipeline maps it onto
+/// Unauthorized without any Azure-specific branch, exactly like the
+/// openai-responses test pins for the same shape). No
+/// `model_health`-specific Azure code is required; the existing
+/// `Classification::from_anthropic_error_body` OpenAI-shape
+/// documentation covers the no-new-classification-code contract.
+#[tokio::test]
+async fn azure_401_with_openai_error_envelope_is_classified_as_http() {
+    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_4", "bogus");
+    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
+    let server = MockServer::start().await;
+    let p = {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        azure_provider(
+            &format!("{}/openai/deployments/gpt4o", server.uri()),
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "ZODER_TEST_AZURE_API_KEY_HEADER_4".into(),
+            },
+            Some("2024-10-21"),
+        )
+    };
+
+    let body = r#"{"error":{"code":"401","message":"Access denied due to invalid subscription key or a malformed API key. Please provide a valid key for this resource."}}"#;
+    Mock::given(method("POST"))
+        .and(path("/openai/deployments/gpt4o/chat/completions"))
+        .and(query_param("api-version", "2024-10-21"))
+        .and(header("api-key", "bogus"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let err = p
+        .stream_chat(&azure_req("gpt-4o", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Http);
+    assert_eq!(err.status, Some(401));
+    // The error body round-trips through `ProviderError::message`.
+    assert!(
+        err.message.contains("invalid subscription key"),
+        "got: {err}"
+    );
+    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_4");
+    std::env::remove_var("AZURE_OPENAI_API_VERSION");
 }

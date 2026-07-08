@@ -922,6 +922,7 @@ mod tests {
             billing,
             subscription: None,
             serves: Vec::new(),
+            azure_api_version: None,
         }
     }
 

@@ -232,6 +232,7 @@ mod agentic_utilization_tests {
                 ..Default::default()
             }),
             serves: vec!["gpt-".into()],
+            azure_api_version: None,
         }
     }
 
@@ -258,6 +259,7 @@ mod agentic_utilization_tests {
                 ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         }
     }
 

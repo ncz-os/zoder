@@ -8240,6 +8240,7 @@ mod scenario_routing_tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: Vec::new(),
+            azure_api_version: None,
         };
         assert_eq!(classify_provider(&p, "nvidia/llama"), ProviderClass::Free);
         let p = Provider {
@@ -8251,6 +8252,7 @@ mod scenario_routing_tests {
             billing: BillingMode::Metered,
             subscription: None,
             serves: Vec::new(),
+            azure_api_version: None,
         };
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Free);
         let p = Provider {
@@ -8262,6 +8264,7 @@ mod scenario_routing_tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: Vec::new(),
+            azure_api_version: None,
         };
         assert_eq!(classify_provider(&p, "MiniMax-M3"), ProviderClass::Free);
     }
@@ -9376,6 +9379,7 @@ mod subscription_utilization_render_tests {
                 account_id: Some("team".into()),
             }),
             serves: Vec::new(),
+            azure_api_version: None,
         });
         let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         // Both labels must surface so the operator can tell them apart.
@@ -9435,6 +9439,7 @@ mod model_selection_tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: vec!["minimax/".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "nvidia-eih".into(),
@@ -9451,6 +9456,7 @@ mod model_selection_tests {
                 "moonshotai/".into(),
                 "z-ai/".into(),
             ],
+            azure_api_version: None,
         });
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
@@ -9914,6 +9920,7 @@ mod model_selection_tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: vec!["free/nemotron".into(), "free/llama".into()],
+            azure_api_version: None,
         });
         let mut corpus = fixture_corpus();
         // Pin corpus entries: the head is paid (owned by the metered
@@ -10135,6 +10142,7 @@ mod model_selection_tests {
                 billing: BillingMode::Subscription,
                 subscription: Some(plan),
                 serves: vec!["gpt-".into()],
+                azure_api_version: None,
             },
             Provider {
                 id: "openai-metered".into(),
@@ -10145,6 +10153,7 @@ mod model_selection_tests {
                 billing: BillingMode::Metered,
                 subscription: None,
                 serves: vec!["gpt-".into()],
+                azure_api_version: None,
             },
         ];
         cfg.default_provider = "openai-sub".into();
