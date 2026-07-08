@@ -1690,6 +1690,7 @@ mod tests {
             .into_owned();
         let policy = ExecSafetyConfig {
             backend: ExecSandbox::LinuxBubblewrap,
+            seatbelt: SeatbeltProfileOptions::default(),
             linux_bubblewrap: LinuxBubblewrapProfileOptions::default(),
         };
         let plan =
