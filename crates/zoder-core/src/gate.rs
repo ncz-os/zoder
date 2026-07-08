@@ -87,6 +87,13 @@ pub enum GateStatus {
     Yellow { skipped: Vec<String> },
     /// at least one REQUIRED step failed
     Red { failures: Vec<String> },
+    /// Zero required steps ran (empty plan, all-optional plan, or a plan
+    /// whose required steps were all absent for some other reason).
+    /// The gate CANNOT certify "passed" — there was no required check to
+    /// actually run. Adversarial-review pin: the previous behavior
+    /// aggregated this to `Green`, letting an autonomous agent pass
+    /// the gate without doing any work. `is_passed()` returns false.
+    Inconclusive,
 }
 
 impl Ecosystem {
@@ -338,12 +345,17 @@ pub struct CompatibilityReport {
 ///  - Otherwise the CiJob becomes a runnable required GateStep
 ///    (name/category/command/tool from the job, `required = true`) and its name is
 ///    added to `report.runnable`.
-///  - Then union with `baseline`: for each baseline step whose `category` is NOT
-///    already present among the runnable CI-derived steps, append it to the plan and
-///    record its name in `report.added_baseline`. (Baseline fills gaps; it never
-///    duplicates a category the repo CI already runs.)
-///  - Plan order: runnable CI-derived steps first (input order), then added baseline
-///    steps (baseline order). Report vectors follow the same input order.
+///  - Then union with `baseline`: baseline REQUIRED steps ALWAYS run, even if
+///    CI already covers the same category — CI-derived steps are additive, never
+///    a replacement for the baseline safety set. (Adversarial-review pin Z-7:
+///    the previous behavior suppressed baseline REQUIRED steps when CI claimed
+///    to cover the same category, letting a repo author commit a CI YAML whose
+///    `test` job is `["true"]` and silently displace `cargo test`.) OPTIONAL
+///    baseline steps keep their existing dedup rule: a category already covered
+///    by the runnable CI steps is not duplicated.
+///  - Plan order: runnable CI-derived steps first (input order), then added
+///    baseline steps (baseline order). Report vectors follow the same input
+///    order.
 pub fn derive_plan(
     ci_jobs: &[CiJob],
     baseline: &[GateStep],
@@ -368,22 +380,41 @@ pub fn derive_plan(
         plan.push(step);
     }
 
-    // Step 2: union baseline. Baseline fills categories the runnable CI steps
-    // don't already cover; it never duplicates a covered category.
+    // Step 2: union baseline.
     //
-    // IMPORTANT: track categories present among the RUNNABLE CI-derived steps
-    // (not the CI input as a whole). A skipped CI job leaves its category
-    // uncovered locally — the baseline must fill it. This is the whole point
-    // of honest degradation.
-    let mut covered: Vec<StepCategory> = plan.iter().map(|s| s.category).collect();
+    // Z-7 fix: REQUIRED baseline steps ALWAYS run, regardless of CI category
+    // coverage. CI YAML is repo-controlled, and a malicious / low-effort CI
+    // file (`test: ["true"]`) must NOT be allowed to silently displace the
+    // real baseline safety check (e.g. `cargo test --all-targets`). The
+    // CI-derived step is additive — it lives alongside the baseline.
+    //
+    // OPTIONAL baseline steps keep their original dedup-by-category
+    // behavior: an optional check is advisory, and doubling it up when CI
+    // already covers the category is noise without safety value.
+    //
+    // A skipped CI job leaves its category uncovered locally — that part of
+    // the original behavior is unchanged (skipped CI does NOT count toward
+    // "covered categories" for optional baseline suppression).
+    let mut covered_optional: Vec<StepCategory> = plan.iter().map(|s| s.category).collect();
 
     for base in baseline {
-        if covered.contains(&base.category) {
+        if base.required {
+            // Required baseline: ALWAYS append. Category may already be
+            // "covered" by a CI-derived step — that's the Z-7 case, and we
+            // keep the baseline here so the real safety check runs.
+            report.added_baseline.push(base.name.clone());
+            plan.push(base.clone());
+        } else if covered_optional.contains(&base.category) {
+            // Optional baseline: skip if a runnable CI step already
+            // covers this category. (A SKIPPED CI job is not in the plan,
+            // so its category does not count as covered — honest
+            // degradation preserved for the optional case.)
             continue;
+        } else {
+            covered_optional.push(base.category);
+            report.added_baseline.push(base.name.clone());
+            plan.push(base.clone());
         }
-        covered.push(base.category);
-        report.added_baseline.push(base.name.clone());
-        plan.push(base.clone());
     }
 
     (plan, report)
@@ -405,15 +436,23 @@ fn skip_reason(job: &CiJob) -> Option<String> {
 }
 
 /// Aggregate step results into the honest Green/Yellow/Red status:
-///  - Red if ANY required step outcome is Failed (failures = names of the
-///    required steps that Failed, in input order).
+///  - `Inconclusive` if NO required steps ran (empty plan, all-optional
+///    plan, or a plan whose required steps were all absent). This is
+///    load-bearing: "no required work to check" is NOT the same as
+///    "all required work passed". Adversarial-review pin (Z-6): the
+///    previous behavior aggregated this to `Green`, letting an
+///    autonomous agent pass the gate without doing any work.
+///  - Red if ANY required step outcome is Failed (failures = names of
+///    the required steps that Failed, in input order).
 ///  - else Yellow if ANY step (required or optional) outcome is Skipped
 ///    (skipped = names of ALL skipped steps, in input order).
-///  - else Green.
+///  - else Green (a non-empty required set, all required Passed, nothing
+///    Skipped anywhere).
 ///
 /// Note: a FAILED *optional* step does NOT turn the gate Red or Yellow —
 /// only required-Failed => Red, any-Skipped => Yellow.
 pub fn aggregate(results: &[StepResult]) -> GateStatus {
+    let mut required_count: usize = 0;
     let mut required_failures: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
@@ -421,15 +460,33 @@ pub fn aggregate(results: &[StepResult]) -> GateStatus {
         match &r.outcome {
             StepOutcome::Failed => {
                 if r.required {
+                    required_count += 1;
                     required_failures.push(r.step_name.clone());
                 }
                 // optional Failed -> intentionally ignored (advisory).
             }
             StepOutcome::Skipped { .. } => {
+                if r.required {
+                    required_count += 1;
+                }
                 skipped.push(r.step_name.clone());
             }
-            StepOutcome::Passed => {}
+            StepOutcome::Passed => {
+                if r.required {
+                    required_count += 1;
+                }
+            }
         }
+    }
+
+    // Z-6 fix: zero required steps means the gate cannot certify a
+    // pass. "No work to check" is not "all work passed". Return
+    // Inconclusive BEFORE the Red/Yellow/Green cascade so the existing
+    // logic for honest plans (with at least one required step) is
+    // unchanged: required_count > 0 below means the Inconclusive
+    // branch never fires for honest plans.
+    if required_count == 0 {
+        return GateStatus::Inconclusive;
     }
 
     if !required_failures.is_empty() {
@@ -1029,9 +1086,9 @@ pub fn detect_repo_signals(marker_files: &[&str]) -> RepoSignals {
 /// be lost (the renderer relies on it for honest accounting).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
-    /// The aggregated verdict (Green / Yellow / Red). Sourced from
-    /// `aggregate(&results)`. Held by value so the report is fully
-    /// self-contained and cannot drift from the results.
+    /// The aggregated verdict (Green / Yellow / Red / Inconclusive).
+    /// Sourced from `aggregate(&results)`. Held by value so the report
+    /// is fully self-contained and cannot drift from the results.
     pub status: GateStatus,
     /// Per-step results, in plan order.
     pub results: Vec<StepResult>,
@@ -1040,12 +1097,25 @@ pub struct GateReport {
     /// Green — an all-Green report without a compatibility breakdown is
     /// not honestly auditable.
     pub compatibility: CompatibilityReport,
+    /// The [`GateMode`] the runner executed under. Stamped into the
+    /// report so a consumer can tell a `LocalIterate` verdict (dev
+    /// inner-loop, deliberately degraded) from a `Strict` verdict
+    /// (fail-closed, approval-grade). Without this stamp, a
+    /// `LocalIterate` Green/Yellow can be mistaken for an authoritative
+    /// pass at an approval / merge gate. See `was_strict()` /
+    /// `is_authoritative_pass()`.
+    mode: GateMode,
 }
 
 impl GateReport {
     /// Build the canonical `GateReport` from runner outputs. Always
     /// recomputes the status from `results` via `aggregate` so the report
     /// can never get out of sync with what actually happened.
+    ///
+    /// The `mode` is STAMPED into the report so consumers can tell a
+    /// `LocalIterate` verdict from a `Strict` verdict via `was_strict()`
+    /// / `is_authoritative_pass()`. See the field doc on `mode` for the
+    /// adversarial-review rationale (Z-5).
     ///
     /// Fail-closed contract for the compatibility breakdown: a non-empty
     /// `compatibility.skipped` set means CI jobs exist that this local
@@ -1056,8 +1126,14 @@ impl GateReport {
     /// skipped job, we downgrade to Yellow (with the skipped job names
     /// surfaced for the reviewer). Red still dominates: a results-only
     /// Red is preserved as Red regardless of how clean the compatibility
-    /// breakdown is.
-    pub fn new(results: Vec<StepResult>, compatibility: CompatibilityReport) -> Self {
+    /// breakdown is. `Inconclusive` (zero required steps ran) is also
+    /// preserved end-to-end — neither the compatibility-driven
+    /// downgrade nor any other path may turn it back into Green.
+    pub fn new(
+        results: Vec<StepResult>,
+        compatibility: CompatibilityReport,
+        mode: GateMode,
+    ) -> Self {
         // Defensive recompute: a caller could in principle construct a
         // status manually and disagree with the results. We refuse to be
         // the source of that disagreement.
@@ -1067,6 +1143,8 @@ impl GateReport {
         // results) already block convergence, so we leave them alone.
         // Yellow via results is widened to include the compatibility
         // skipped names so the reviewer sees the full unverified set.
+        // Inconclusive (Z-6) is preserved — there is nothing honest to
+        // downgrade it TO.
         if !compatibility.skipped.is_empty() {
             match &status {
                 GateStatus::Green => {
@@ -1091,8 +1169,11 @@ impl GateReport {
                     union.dedup();
                     status = GateStatus::Yellow { skipped: union };
                 }
-                GateStatus::Red { .. } => {
-                    // Red dominates: do not mutate.
+                GateStatus::Red { .. } | GateStatus::Inconclusive => {
+                    // Red dominates: do not mutate. Inconclusive is also
+                    // preserved (we do not pretend a "skipped CI job"
+                    // narrows the gap when the gate ran zero required
+                    // steps in the first place).
                 }
             }
         }
@@ -1100,11 +1181,38 @@ impl GateReport {
             status,
             results,
             compatibility,
+            mode,
         }
     }
 
+    /// The [`GateMode`] this report was produced under.
+    pub fn mode(&self) -> GateMode {
+        self.mode
+    }
+
+    /// True iff the gate ran in [`GateMode::Strict`] — the
+    /// approval-grade, fail-closed posture. `LocalIterate` returns
+    /// false here even if its verdict happens to be Green.
+    ///
+    /// Adversarial-review pin (Z-5): callers in approval / merge-gate
+    /// contexts MUST key on `is_authoritative_pass()` (or pair
+    /// `is_passed()` with `was_strict()`). A `LocalIterate` verdict is
+    /// deliberately degraded for the dev inner-loop; reading its
+    /// Green as "safe to merge" was the defect.
+    pub fn was_strict(&self) -> bool {
+        matches!(self.mode, GateMode::Strict)
+    }
+
     /// True iff the gate is Green (safe to merge, within known local
-    /// scope). Yellow and Red both block convergence / approval.
+    /// scope). Yellow, Red, and Inconclusive all block convergence /
+    /// approval.
+    ///
+    /// NOTE: `is_passed()` does NOT consider the gate mode. A
+    /// `LocalIterate` run with all optional checks passing returns
+    /// `is_passed() == true` (so dev ergonomics in the inner-loop
+    /// path are preserved: "everything I had passed"). Approval-grade
+    /// callers must combine with `was_strict()` — use
+    /// `is_authoritative_pass()` for that.
     pub fn is_passed(&self) -> bool {
         matches!(self.status, GateStatus::Green)
     }
@@ -1113,6 +1221,24 @@ impl GateReport {
     /// for callers that explicitly handle the blocking branches.
     pub fn is_failed(&self) -> bool {
         matches!(self.status, GateStatus::Red { .. })
+    }
+
+    /// True iff the gate ran zero required steps (empty plan,
+    /// all-optional plan, or a plan whose required steps were all
+    /// absent). The gate CANNOT certify a pass in this state — there
+    /// was no required check to actually run. Adversarial-review pin
+    /// (Z-6): the previous behavior surfaced this as Green.
+    pub fn is_inconclusive(&self) -> bool {
+        matches!(self.status, GateStatus::Inconclusive)
+    }
+
+    /// True iff this is an AUTHORITATIVE pass: the gate ran in
+    /// [`GateMode::Strict`] AND its status is Green. Approval / merge
+    /// gates should key on this rather than on `is_passed()` alone —
+    /// a `LocalIterate` Green is intentionally not authoritative (the
+    /// dev inner-loop mode skips required tools rather than failing).
+    pub fn is_authoritative_pass(&self) -> bool {
+        self.was_strict() && self.is_passed()
     }
 
     /// Names of every required step that ran AND passed. Useful for
@@ -1126,8 +1252,9 @@ impl GateReport {
     }
 
     /// Single-line human verdict ("🟢 GREEN", "🟡 YELLOW (skipped: n)",
-    /// "🔴 RED (failed: a, b)"). Useful for log lines / structured logs /
-    /// dashboards where a `GateStatus` enum is awkward.
+    /// "🔴 RED (failed: a, b)", "⚪ INCONCLUSIVE"). Useful for log
+    /// lines / structured logs / dashboards where a `GateStatus` enum
+    /// is awkward.
     pub fn headline(&self) -> String {
         match &self.status {
             GateStatus::Green => "🟢 GREEN \u{2014} every required check ran and passed, nothing was skipped; safe to merge within known local scope".to_string(),
@@ -1141,6 +1268,7 @@ impl GateReport {
                 failures.len(),
                 failures.join(", "),
             ),
+            GateStatus::Inconclusive => "\u{26aa} INCONCLUSIVE \u{2014} no required checks ran (empty plan or all-optional plan); the gate cannot certify a pass \u{2014} cannot merge, cannot approve".to_string(),
         }
     }
 
@@ -1217,7 +1345,7 @@ impl GateReport {
 
     /// Compact one-line summary, suitable for structured log lines and
     /// for CI summarizers that want a single record per gate run. Format:
-    ///   <Badge> GREEN|YELLOW|RED [required=N passed=M optional=K]
+    ///   <Badge> GREEN|YELLOW|RED|INCONCLUSIVE [required=N passed=M optional=K]
     pub fn to_compact(&self) -> String {
         let mut required = 0usize;
         let mut required_passed = 0usize;
@@ -1241,6 +1369,7 @@ impl GateReport {
             GateStatus::Green => ("🟢", "GREEN"),
             GateStatus::Yellow { .. } => ("🟡", "YELLOW"),
             GateStatus::Red { .. } => ("🔴", "RED"),
+            GateStatus::Inconclusive => ("⚪", "INCONCLUSIVE"),
         };
         format!(
             "{badge} {label} [required={required} passed={required_passed} optional={optional} passed={optional_passed}]"
@@ -1940,9 +2069,16 @@ mod tests {
     }
 
     #[test]
-    fn derive_plan_baseline_does_not_duplicate_a_category_ci_already_covers() {
-        // CI already has a Security job, so the baseline Security step must
-        // be SKIPPED (no duplicate category in the plan, not in added_baseline).
+    fn derive_plan_baseline_required_step_always_runs_even_when_ci_covers_category() {
+        // Adversarial-review pin (Z-7): a repo-authored CI job covering a
+        // category that is ALSO covered by a baseline REQUIRED step must
+        // NOT displace the baseline. Baseline safety required steps
+        // ALWAYS run, even if CI claims to cover the same category. The
+        // CI-derived step is additive, never a replacement.
+        //
+        // (The previous behavior suppressed the baseline required step
+        // when CI covered the category, letting a no-op CI YAML
+        // silently displace e.g. `cargo test`.)
         let jobs = vec![ci("trivy", StepCategory::Security)];
         let baseline = vec![
             GateStep {
@@ -1963,15 +2099,69 @@ mod tests {
 
         let (plan, report) = derive_plan(&jobs, &baseline);
 
-        // CI's Security step is the one in the plan.
+        // CI's Security step is in the plan (still runnable).
         assert!(plan.iter().any(|s| s.name == "trivy"));
-        // The baseline Security step ("deny") must NOT be added.
+        // AND the baseline Security step ("deny") is ALSO in the plan —
+        // baseline REQUIRED steps are additive, not displaced (Z-7).
         assert!(
-            !plan.iter().any(|s| s.name == "deny"),
-            "baseline Security step must not duplicate CI's Security, got {plan:?}",
+            plan.iter().any(|s| s.name == "deny"),
+            "baseline REQUIRED Security step must run even when CI covers Security (Z-7), got {plan:?}",
         );
-        // Only the Format baseline step is added.
-        assert_eq!(report.added_baseline, vec!["fmt".to_string()]);
+        // Both baseline steps are recorded as added (they were missing
+        // from the CI input).
+        assert_eq!(
+            report.added_baseline,
+            vec!["deny".to_string(), "fmt".to_string()],
+            "both required baseline steps must be added (Z-7), got {:?}",
+            report.added_baseline,
+        );
+    }
+
+    #[test]
+    fn derive_plan_baseline_optional_step_is_still_deduped_when_ci_covers_category() {
+        // Counter-test for Z-7: the fix is specifically about REQUIRED
+        // baseline steps. Optional baseline steps keep their existing
+        // dedup-by-category rule — an optional check is advisory, and
+        // doubling it up when CI already covers the category is noise
+        // without safety value.
+        let jobs = vec![ci("trivy", StepCategory::Security)];
+        let baseline = vec![
+            GateStep {
+                name: "deny".to_string(),
+                category: StepCategory::Security,
+                command: vec!["cargo".to_string(), "deny".to_string()],
+                tool: "cargo-deny".to_string(),
+                required: true, // required — must always run
+            },
+            GateStep {
+                name: "optional-audit".to_string(),
+                category: StepCategory::Security,
+                command: vec!["audit".to_string()],
+                tool: "audit".to_string(),
+                required: false, // optional — dedup if CI covers
+            },
+        ];
+
+        let (plan, report) = derive_plan(&jobs, &baseline);
+
+        // The required baseline deny step is in the plan (Z-7).
+        assert!(
+            plan.iter().any(|s| s.name == "deny"),
+            "baseline REQUIRED Security step must run (Z-7), got {plan:?}",
+        );
+        // The OPTIONAL baseline audit step is deduped out (CI's trivy
+        // already covers Security).
+        assert!(
+            !plan.iter().any(|s| s.name == "optional-audit"),
+            "baseline OPTIONAL Security step must be deduped when CI covers Security (Z-7 counter-test), got {plan:?}",
+        );
+        // Only the required baseline is in added_baseline (optional
+        // audit was suppressed by the dedup rule).
+        assert_eq!(
+            report.added_baseline,
+            vec!["deny".to_string()],
+            "only the required baseline must appear in added_baseline (Z-7 counter-test)",
+        );
     }
 
     #[test]
@@ -2839,7 +3029,11 @@ mod tests {
             result("fmt", true, StepOutcome::Passed),
             result("test", true, StepOutcome::Passed),
         ];
-        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &[]));
+        let report = GateReport::new(
+            results,
+            compat(&["fmt", "test"], &[], &[]),
+            GateMode::Strict,
+        );
         assert_eq!(report.status, GateStatus::Green);
         assert!(report.is_passed());
         assert!(!report.is_failed());
@@ -2852,7 +3046,11 @@ mod tests {
             result("lint", true, StepOutcome::Passed),
             result("test", true, StepOutcome::Passed),
         ];
-        let report = GateReport::new(results, compat(&["fmt", "lint", "test"], &[], &[]));
+        let report = GateReport::new(
+            results,
+            compat(&["fmt", "lint", "test"], &[], &[]),
+            GateMode::Strict,
+        );
         assert_eq!(report.status, GateStatus::Green);
         assert!(report.is_passed());
         assert_eq!(report.passed_required_names(), vec!["fmt", "lint", "test"],);
@@ -2871,7 +3069,11 @@ mod tests {
             ),
             result("test", true, StepOutcome::Passed),
         ];
-        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &["audit"]));
+        let report = GateReport::new(
+            results,
+            compat(&["fmt", "test"], &[], &["audit"]),
+            GateMode::Strict,
+        );
         assert_eq!(
             report.status,
             GateStatus::Yellow {
@@ -2897,7 +3099,11 @@ mod tests {
             ),
             result("test", true, StepOutcome::Failed),
         ];
-        let report = GateReport::new(results, compat(&["fmt", "test"], &[], &["audit"]));
+        let report = GateReport::new(
+            results,
+            compat(&["fmt", "test"], &[], &["audit"]),
+            GateMode::Strict,
+        );
         assert_eq!(
             report.status,
             GateStatus::Red {
@@ -2918,7 +3124,11 @@ mod tests {
             result("b", true, StepOutcome::Failed),
             result("c", true, StepOutcome::Passed),
         ];
-        let report = GateReport::new(results, compat(&["a", "b", "c"], &[], &[]));
+        let report = GateReport::new(
+            results,
+            compat(&["a", "b", "c"], &[], &[]),
+            GateMode::Strict,
+        );
         assert_eq!(
             report.status,
             GateStatus::Red {
@@ -2933,19 +3143,24 @@ mod tests {
         let green = GateReport::new(
             vec![result("fmt", true, StepOutcome::Passed)],
             compat(&["fmt"], &[], &[]),
+            GateMode::Strict,
         );
         assert!(green.headline().contains("🟢"));
         assert!(green.headline().contains("GREEN"));
 
         let yellow = GateReport::new(
-            vec![result(
-                "audit",
-                false,
-                StepOutcome::Skipped {
-                    reason: "tool `x` not available".to_string(),
-                },
-            )],
-            compat(&[], &[], &["audit"]),
+            vec![
+                result("lint", true, StepOutcome::Passed),
+                result(
+                    "audit",
+                    false,
+                    StepOutcome::Skipped {
+                        reason: "tool `x` not available".to_string(),
+                    },
+                ),
+            ],
+            compat(&["lint"], &[], &["audit"]),
+            GateMode::Strict,
         );
         assert!(yellow.headline().contains("🟡"));
         assert!(yellow.headline().contains("YELLOW"));
@@ -2953,6 +3168,7 @@ mod tests {
         let red = GateReport::new(
             vec![result("test", true, StepOutcome::Failed)],
             compat(&["test"], &[], &[]),
+            GateMode::Strict,
         );
         assert!(red.headline().contains("🔴"));
         assert!(red.headline().contains("RED"));
@@ -2972,6 +3188,7 @@ mod tests {
                 result("test", true, StepOutcome::Passed),
             ],
             compat(&["fmt", "test"], &[], &["deny"]),
+            GateMode::Strict,
         );
         let pretty = report.to_pretty();
         // Verdict line.
@@ -3013,6 +3230,7 @@ mod tests {
                 )],
                 &["deny"],
             ),
+            GateMode::Strict,
         );
         // The status must be Yellow (not Green) because CI skipped a job.
         match &report.status {
@@ -3061,6 +3279,7 @@ mod tests {
                 &[("zeta", "requires CI secrets (upstream CI verifies)")],
                 &["audit"],
             ),
+            GateMode::Strict,
         );
         match &report.status {
             GateStatus::Yellow { skipped } => {
@@ -3094,6 +3313,7 @@ mod tests {
                 )],
                 &["test"],
             ),
+            GateMode::Strict,
         );
         // Red must be preserved end-to-end.
         assert_eq!(
@@ -3114,6 +3334,7 @@ mod tests {
                 result("test", true, StepOutcome::Failed),
             ],
             compat(&["fmt"], &[], &["test"]),
+            GateMode::Strict,
         );
         let pretty = report.to_pretty();
         assert!(pretty.contains("🔴 RED"));
@@ -3135,6 +3356,7 @@ mod tests {
                 ),
             ],
             compat(&["lint"], &[], &["audit"]),
+            GateMode::Strict,
         );
         let pretty = report.to_pretty();
         assert!(pretty.contains("🟡 YELLOW"));
@@ -3159,6 +3381,7 @@ mod tests {
                 ),
             ],
             compat(&["required-step"], &[], &["optional-step"]),
+            GateMode::Strict,
         );
         let pretty = report.to_pretty();
         // The required-step line must have the `*` marker.
@@ -3190,6 +3413,7 @@ mod tests {
                 ),
             ],
             compat(&["fmt"], &[], &["audit"]),
+            GateMode::Strict,
         );
         let compact = report.to_compact();
         assert!(compact.lines().count() <= 2, "compact must fit on one line");
@@ -3232,7 +3456,11 @@ mod tests {
             },
         );
 
-        let report = GateReport::new(results.clone(), compat(&["fmt"], &[], &["deny"]));
+        let report = GateReport::new(
+            results.clone(),
+            compat(&["fmt"], &[], &["deny"]),
+            GateMode::Strict,
+        );
         assert_eq!(
             report.status,
             GateStatus::Red {
@@ -3264,10 +3492,17 @@ mod tests {
             },
         );
 
-        let report = GateReport::new(results, compat(&["fmt"], &[], &["deny"]));
+        let report = GateReport::new(
+            results,
+            compat(&["fmt"], &[], &["deny"]),
+            GateMode::LocalIterate,
+        );
         assert!(!report.is_passed());
         assert!(!report.is_failed());
         assert!(report.headline().contains("🟡 YELLOW"));
+        // Z-5: LocalIterate verdict is NOT authoritative.
+        assert!(!report.was_strict());
+        assert!(!report.is_authoritative_pass());
     }
 
     #[test]
@@ -3277,7 +3512,7 @@ mod tests {
         // three renderings (headline, pretty, compact) carry Red, and
         // `is_passed()` stays false.
         let results = vec![result("test", true, StepOutcome::Failed)];
-        let report = GateReport::new(results, compat(&["test"], &[], &[]));
+        let report = GateReport::new(results, compat(&["test"], &[], &[]), GateMode::Strict);
         assert_eq!(
             report.status,
             GateStatus::Red {
@@ -3288,5 +3523,270 @@ mod tests {
         assert!(report.to_pretty().contains("🔴 RED"));
         assert!(report.to_compact().contains("🔴 RED"));
         assert!(!report.is_passed());
+    }
+
+    // -------------------------------------------------------------------
+    //  Z-5 / Z-6 / Z-7 — adversarial-review pins for gate-gaming holes.
+    //
+    //  Each test below was authored against the BUGGY behavior and is
+    //  expected to FAIL on the pre-fix code. After the fix, every test
+    //  in this block must pass.
+    // -------------------------------------------------------------------
+
+    // ----- Z-6: empty / all-optional plan aggregates to Green -------------
+
+    #[test]
+    fn z6_aggregate_empty_results_is_not_green() {
+        // Adversarial-review pin (Z-6): a plan with ZERO required steps
+        // (empty plan) must NOT aggregate to Green. "No work to check"
+        // is silently "passed" today — that is dishonest.
+        let results: Vec<StepResult> = vec![];
+        let status = aggregate(&results);
+        assert!(
+            !matches!(status, GateStatus::Green),
+            "empty results must not be Green (Z-6), got {status:?}",
+        );
+        assert!(
+            matches!(status, GateStatus::Inconclusive),
+            "empty results must aggregate to Inconclusive, got {status:?}",
+        );
+    }
+
+    #[test]
+    fn z6_aggregate_only_optional_passed_is_not_green() {
+        // Adversarial-review pin (Z-6): a plan with only OPTIONAL steps
+        // (all passing) must NOT aggregate to Green — there were zero
+        // required checks, so the gate cannot certify a pass.
+        let results = vec![
+            result("fmt", false, StepOutcome::Passed),
+            result("lint", false, StepOutcome::Passed),
+            result("audit", false, StepOutcome::Passed),
+        ];
+        let status = aggregate(&results);
+        assert!(
+            !matches!(status, GateStatus::Green),
+            "all-optional + all-passed must not be Green (Z-6), got {status:?}",
+        );
+        assert!(
+            matches!(status, GateStatus::Inconclusive),
+            "all-optional + all-passed must aggregate to Inconclusive, got {status:?}",
+        );
+    }
+
+    #[test]
+    fn z6_aggregate_only_optional_skipped_is_not_green_either() {
+        // Adversarial-review pin (Z-6): a plan with only OPTIONAL steps
+        // (any combination of pass/fail/skip) must NOT be Green — there
+        // were zero required checks.
+        let results = vec![
+            result("fmt", false, StepOutcome::Passed),
+            result(
+                "audit",
+                false,
+                StepOutcome::Skipped {
+                    reason: "tool `cargo-audit` not available".to_string(),
+                },
+            ),
+        ];
+        let status = aggregate(&results);
+        assert!(
+            !matches!(status, GateStatus::Green),
+            "all-optional + mixed outcomes must not be Green (Z-6), got {status:?}",
+        );
+    }
+
+    #[test]
+    fn z6_aggregate_real_required_passed_still_yields_green() {
+        // Counter-test for the Z-6 fix: a real plan with at least one
+        // required step that PASSED must still aggregate to Green. The
+        // fix must not break honest plans.
+        let results = vec![
+            result("fmt", false, StepOutcome::Passed),
+            result("lint", true, StepOutcome::Passed),
+            result("test", true, StepOutcome::Passed),
+        ];
+        assert_eq!(aggregate(&results), GateStatus::Green);
+    }
+
+    #[test]
+    fn z6_gate_report_empty_plan_is_not_passed() {
+        // Adversarial-review pin (Z-6): GateReport::new over an empty
+        // results list must NOT report `is_passed() == true`. The
+        // headline must reflect Inconclusive, not Green.
+        let report = GateReport::new(vec![], CompatibilityReport::default(), GateMode::Strict);
+        assert!(
+            !report.is_passed(),
+            "empty plan must not be is_passed() (Z-6), got status {:?}",
+            report.status,
+        );
+        assert!(
+            report.is_inconclusive(),
+            "empty plan must be is_inconclusive(), got status {:?}",
+            report.status,
+        );
+        assert!(!report.is_failed());
+        assert!(report.headline().contains("INCONCLUSIVE"));
+        assert!(!report.headline().contains("GREEN"));
+    }
+
+    #[test]
+    fn z6_gate_report_all_optional_passed_is_not_passed() {
+        // Adversarial-review pin (Z-6): GateReport::new over an
+        // all-optional, all-passed results list must NOT report
+        // `is_passed() == true`.
+        let results = vec![
+            result("fmt", false, StepOutcome::Passed),
+            result("audit", false, StepOutcome::Passed),
+        ];
+        let report = GateReport::new(results, CompatibilityReport::default(), GateMode::Strict);
+        assert!(
+            !report.is_passed(),
+            "all-optional + all-passed must not be is_passed() (Z-6), got status {:?}",
+            report.status,
+        );
+        assert!(report.is_inconclusive());
+    }
+
+    // ----- Z-5: LocalIterate downgrades missing REQUIRED tools to skips ---
+
+    #[test]
+    fn z5_gate_report_stamps_mode_and_was_strict_accessor() {
+        // Adversarial-review pin (Z-5): the gate runner must record the
+        // mode it ran in. A consumer must be able to tell a
+        // LocalIterate verdict from a Strict one via `was_strict()`.
+        let plan = vec![s("fmt", true)];
+        let env = FakeEnv::new(&["fmt"]);
+        let (results, _status) = run_plan(&plan, GateMode::LocalIterate, &env);
+        let report = GateReport::new(
+            results,
+            CompatibilityReport::default(),
+            GateMode::LocalIterate,
+        );
+        // mode is stamped and accessible.
+        assert_eq!(report.mode(), GateMode::LocalIterate);
+        assert!(
+            !report.was_strict(),
+            "LocalIterate report must not report was_strict() (Z-5)",
+        );
+        // The "this is an authoritative pass" combo accessor must agree.
+        assert!(
+            !report.is_authoritative_pass(),
+            "LocalIterate + Green is never an authoritative pass (Z-5)",
+        );
+    }
+
+    #[test]
+    fn z5_gate_report_local_iterate_zero_required_tools_is_not_authoritative() {
+        // Adversarial-review pin (Z-5): under LocalIterate, a REQUIRED
+        // step whose tool is unavailable routes to Skipped (Yellow)
+        // instead of Failed (Red). That verdict must be marked
+        // non-authoritative — callers keying on Strict-Green must
+        // reject it.
+        let plan = vec![s("fmt", true), s("deny", true)];
+        let env = FakeEnv::new(&[]); // zero required tools
+        let (results, status) = run_plan(&plan, GateMode::LocalIterate, &env);
+        let report = GateReport::new(
+            results,
+            CompatibilityReport::default(),
+            GateMode::LocalIterate,
+        );
+
+        // Sanity: LocalIterate + missing REQUIRED tool -> Skipped -> Yellow.
+        assert!(
+            matches!(status, GateStatus::Yellow { .. }),
+            "LocalIterate + missing required tool must be Yellow, got {status:?}",
+        );
+
+        // The mode stamp makes the verdict non-authoritative.
+        assert!(
+            !report.was_strict(),
+            "LocalIterate report must not be was_strict()"
+        );
+        assert!(
+            !report.is_authoritative_pass(),
+            "LocalIterate zero-tools report must NOT be an authoritative pass (Z-5)",
+        );
+
+        // is_passed() may remain true under LocalIterate only when the
+        // status is Green (it is not, here — it is Yellow).
+        assert!(!report.is_passed(), "Yellow is not is_passed() (Z-5)");
+    }
+
+    #[test]
+    fn z5_gate_report_strict_full_pass_is_authoritative() {
+        // Counter-test for Z-5: under Strict with all required steps
+        // passing and all required tools present, the verdict IS an
+        // authoritative pass.
+        let plan = vec![s("fmt", true), s("lint", true)];
+        let env = FakeEnv::new(&["fmt", "lint"]);
+        let (results, status) = run_plan(&plan, GateMode::Strict, &env);
+        let report = GateReport::new(results, CompatibilityReport::default(), GateMode::Strict);
+
+        assert_eq!(status, GateStatus::Green);
+        assert!(
+            report.was_strict(),
+            "Strict report must report was_strict()"
+        );
+        assert!(
+            report.is_authoritative_pass(),
+            "Strict + all-required-passed IS an authoritative pass",
+        );
+        assert!(report.is_passed());
+    }
+
+    // ----- Z-7: repo-authored CI job displaces baseline safety steps ------
+
+    #[test]
+    fn z7_derive_plan_baseline_test_step_runs_even_when_ci_test_job_claims_to_cover_it() {
+        // Adversarial-review pin (Z-7): a repo-authored CI `test` job
+        // with a no-op command (`["true"]`) must NOT displace the
+        // baseline test step. Baseline safety required steps ALWAYS
+        // run, even if CI claims to cover the same category. The
+        // CI-derived step is additive, never a replacement.
+        let ci_jobs = vec![CiJob {
+            name: "fake-test".to_string(),
+            command: vec!["true".to_string()],
+            tool: "true".to_string(),
+            category: StepCategory::Test,
+            needs_secrets: false,
+            needs_services: false,
+            self_hosted: false,
+        }];
+        let baseline = vec![GateStep {
+            name: "test".to_string(),
+            category: StepCategory::Test,
+            command: vec!["cargo", "test", "--all-targets"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            tool: "cargo".to_string(),
+            required: true,
+        }];
+        let (plan, _report) = derive_plan(&ci_jobs, &baseline);
+
+        // The baseline `test` step must be present + required in the plan.
+        let baseline_test = plan
+            .iter()
+            .find(|s| s.name == "test")
+            .expect("baseline test step must be present");
+        assert!(
+            baseline_test.required,
+            "baseline test step must be required (Z-7), got {plan:?}",
+        );
+        // And it must be the REAL cargo test, not the CI's `true` no-op.
+        assert_eq!(
+            baseline_test.command,
+            vec!["cargo", "test", "--all-targets"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            "baseline cargo test must NOT be displaced by a no-op CI job (Z-7)",
+        );
+        assert_eq!(baseline_test.tool, "cargo");
+        // The CI's fake job is also still in the plan (additive).
+        assert!(
+            plan.iter().any(|s| s.name == "fake-test"),
+            "the CI-derived job must still appear in the plan additively, got {plan:?}",
+        );
     }
 }
