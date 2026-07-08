@@ -458,12 +458,25 @@ pub fn candidate_eligible(
             if !classes.contains(&ProviderClass::Sub) {
                 return false;
             }
-            // KNEMON gate: a missing snapshot, or a snapshot whose reset
-            // window has already rolled over, is treated as "full
-            // headroom" by `decide()` (it returns PreferSub on stale
-            // resets; `effective_used` zeros them out). So the missing-
-            // snapshot case is naturally expressed by `None`.
-            let snap = snapshot.cloned().unwrap_or_default();
+            // Z-19 (adversarial review, fail-closed): a missing
+            // snapshot is NOT headroom. The pre-fix code
+            // `unwrap_or_default()`'d `None` into an all-None /
+            // zero-default `RateLimitSnapshot`, so `effective_used`
+            // computed as 0% and the sub was ALWAYS eligible —
+            // absence of evidence was treated as evidence of
+            // headroom. The fail-closed contract is "no Sub
+            // telemetry => no Sub eligibility": a sub we can't
+            // observe may be at the cap (or have been refilled), and
+            // we must not silently funnel the request through it
+            // just because we have no data. Drop to Free (or to
+            // the next class in the role's preference list). A
+            // present snapshot whose reset window has already
+            // rolled over is still treated as headroom — that's a
+            // trustable signal, not absent telemetry.
+            let snap = match snapshot {
+                Some(s) => s,
+                None => return false,
+            };
             // Run `decide()` with no remaining-budget signal — that's
             // what the per-role eligibility check has at routing time.
             // Spec wording for the verdict-to-eligibility mapping is:
@@ -476,7 +489,7 @@ pub fn candidate_eligible(
             // pretending an unknown budget has headroom would bypass the
             // budget gate and also prevent the Paid fallback from being
             // reached.
-            let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
+            let decision = crate::utilization::decide(snap, &scenario.knobs(), now, None);
             match decision {
                 RouteDecision::PreferSub | RouteDecision::Chargeback => true,
                 RouteDecision::FallBackToFree => false,
@@ -583,9 +596,13 @@ pub fn chain_for_role(
 /// single-snapshot path so callers see the same `RouteDecision` shape.
 ///
 /// `None` `account_view` for a `Sub` candidate falls back to the legacy
-/// single-snapshot path — that's the documented "no per-account
-/// information -> headroom" baseline so a candidate without a layered
-/// account view never gets artificially demoted.
+/// single-snapshot path. Z-19 (adversarial review, fail-closed): a
+/// `None` snapshot on that legacy path is NOT headroom — a sub we
+/// can't observe may be at the cap, and silently funneling the
+/// request through it because we have no telemetry is the fail-OPEN
+/// bug. The legacy fallback now fails closed (returns `false` /
+/// ineligible) on `None` snapshots, matching the same contract
+/// `candidate_eligible` honors.
 pub fn candidate_eligible_with_account(
     role: Role,
     candidate: &RoutableCandidate,
@@ -619,8 +636,18 @@ pub fn candidate_eligible_with_account(
                     RouteDecision::FallBackToFree => false,
                 }
             } else {
-                let snap = snapshot.cloned().unwrap_or_default();
-                let decision = crate::utilization::decide(&snap, &scenario.knobs(), now, None);
+                // Z-19 fail-closed: a None snapshot on the legacy
+                // fallback path makes the sub INELIGIBLE. We must
+                // not synthesize a default snapshot and ask
+                // `decide()` to evaluate it — the default would
+                // zero out `effective_used` and yield PreferSub
+                // (the fail-OPEN bug). Drop to the next class in
+                // the role's preference list.
+                let snap = match snapshot {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let decision = crate::utilization::decide(snap, &scenario.knobs(), now, None);
                 match decision {
                     RouteDecision::PreferSub | RouteDecision::Chargeback => true,
                     RouteDecision::FallBackToFree => false,
@@ -1384,18 +1411,77 @@ mod tests {
 
     #[test]
     fn missing_snapshot_is_treated_as_headroom() {
-        // The spec calls this out explicitly: "snapshot absent or past
-        // reset_at => headroom => keep".
+        // Adversarial review Z-19 (fail-closed: missing Sub telemetry
+        // must not keep the sub eligible). The pre-fix comment said
+        // "snapshot absent => headroom => keep", but that's the
+        // fail-OPEN bug: an absent snapshot is `unwrap_or_default()`'d
+        // into an all-None / zero default, so `effective_used`
+        // computes as 0% and the sub is ALWAYS eligible — absence of
+        // evidence is treated as evidence of headroom. After the
+        // Z-19 fix, a missing snapshot must fail CLOSED: the Sub
+        // candidate is ineligible, the Free candidate wins.
         let scenario = RouteScenario::balanced();
         let cands = vec![
             candidate("free-a", ProviderClass::Free, 99.0),
             candidate("sub-a", ProviderClass::Sub, 80.0),
         ];
-        // Reviewer with no snapshot -> KNEMON returns headroom -> sub wins.
+        // Reviewer with no snapshot -> sub is INELIGIBLE (no
+        // telemetry) -> free wins.
         assert_eq!(
             pick_candidate_for_role(Role::Reviewer, &cands, &scenario, None, false, now())
                 .as_deref(),
-            Some("sub-a")
+            Some("free-a"),
+            "missing Sub telemetry must fail CLOSED: sub ineligible, free wins",
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_makes_sub_candidate_ineligible_in_candidate_eligible() {
+        // Z-19 fail-closed: direct unit test of `candidate_eligible`
+        // for a Sub candidate when the snapshot is None. The pre-fix
+        // `unwrap_or_default()` produced an all-zero snapshot, so
+        // `effective_used` was 0% and the sub was ALWAYS eligible.
+        // The Z-19 fix distinguishes "no snapshot" from "0% used"
+        // and returns `false` (ineligible) so the route falls back
+        // to Free. Must FAIL on the pre-fix code (which returns
+        // `true`).
+        let scenario = RouteScenario::balanced();
+        let sub = candidate("sub-a", ProviderClass::Sub, 80.0);
+        assert!(
+            !candidate_eligible(Role::Reviewer, &sub, &scenario, None, false, now()),
+            "missing Sub telemetry must make the sub INELIGIBLE (fail-closed); \
+             pre-fix it was eligible because unwrap_or_default() gave 0%",
+        );
+        // Sanity: a FRESH snapshot with low usage still makes the
+        // sub eligible — only absent telemetry changes to the
+        // conservative path.
+        let fresh = snapshot_with_used(20.0, None);
+        assert!(
+            candidate_eligible(Role::Reviewer, &sub, &scenario, Some(&fresh), false, now()),
+            "a fresh snapshot at 20% must still keep the sub eligible (non-regression)",
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_makes_sub_ineligible_in_candidate_eligible_with_account_legacy_path() {
+        // Z-19 fail-closed for the with-account legacy fallback
+        // branch (when no AccountView is supplied, candidate_eligible
+        // still consults the snapshot via `decide()`). Same
+        // fail-closed contract: a None snapshot must make the sub
+        // ineligible, not "0% used -> PreferSub".
+        let scenario = RouteScenario::balanced();
+        let sub = candidate("sub-a", ProviderClass::Sub, 80.0);
+        assert!(
+            !candidate_eligible_with_account(
+                Role::Reviewer,
+                &sub,
+                &scenario,
+                None,
+                None,
+                false,
+                now(),
+            ),
+            "missing Sub telemetry must make the sub INELIGIBLE on the legacy fallback path too",
         );
     }
 
