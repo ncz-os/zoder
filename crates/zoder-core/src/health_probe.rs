@@ -84,7 +84,7 @@ pub fn probe_request(model_id: &str) -> ChatRequest {
         model: model_id.to_string(),
         messages: vec![crate::provider::Message::new("user", PROBE_PROMPT)],
         max_tokens: PROBE_MAX_TOKENS,
-        temperature: 0.0,
+        temperature: Some(0.0),
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].content, "ping");
         assert!(!req.stream);
-        assert_eq!(req.temperature, 0.0);
+        assert_eq!(req.temperature, Some(0.0));
     }
 
     // Suppress unused warnings for items used only in some tests.
