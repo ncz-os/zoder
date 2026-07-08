@@ -287,6 +287,7 @@ mod tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         let g = PolicyGate::new(&cfg, false, true);
         let t = CallTelemetry {

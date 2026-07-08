@@ -271,7 +271,7 @@ pub struct Provider {
     pub id: String,
     pub base_url: String,
     #[serde(default = "default_kind")]
-    pub kind: String, // openai-chat | openai-responses | anthropic | custom
+    pub kind: String, // openai-chat | openai-responses | azure-openai | anthropic | custom
     pub auth: Auth,
     /// Provider serves only paid models (used by the policy gate as a hint).
     #[serde(default)]
@@ -292,6 +292,29 @@ pub struct Provider {
     /// `default_provider`. Prefixes are matched with `str::starts_with`.
     #[serde(default)]
     pub serves: Vec<String>,
+    /// Override the Azure OpenAI Data Plane API version (`api-version` query
+    /// parameter) for `kind == "azure-openai"` providers. The base URL is
+    /// expected to already encode the deployment route
+    /// (`…/openai/deployments/<deployment>`) per the Azure OpenAI wire
+    /// contract — the deployment itself is therefore intentionally NOT a
+    /// separate field, matching how every Azure SDK / curl example builds
+    /// the URL.
+    ///
+    /// Resolution precedence for `kind == "azure-openai"`:
+    ///   1. `azure_api_version` field on this provider (per-provider
+    ///      override; what most multi-tenant operators will use),
+    ///   2. `AZURE_OPENAI_API_VERSION` environment variable (host-wide
+    ///      override; legacy / CI workflows),
+    ///   3. built-in default `"2024-10-21"` (the current GA Data Plane
+    ///      version as of this commit).
+    ///
+    /// `None` (the default) ⇒ fall through to the env var / built-in default.
+    /// Other kinds (`openai-chat`, `openai-responses`, `anthropic`,
+    /// `custom`) ignore this field — the OpenAI chat-completions path
+    /// doesn't accept `api-version` and Anthropic pins its own version
+    /// header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_api_version: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -968,6 +991,7 @@ impl Config {
                 billing: BillingMode::Free,
                 subscription: None,
                 serves: Vec::new(),
+                azure_api_version: None,
             }],
             default_provider: "default".into(),
             corpus_path: home.join("model_corpus.json"),
@@ -1686,6 +1710,7 @@ mod tests {
             billing: BillingMode::Free,
             subscription: None,
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "nvidia-eih".into(),
@@ -1701,6 +1726,7 @@ mod tests {
                 "meta/llama-".into(),
                 "mistralai/".into(),
             ],
+            azure_api_version: None,
         });
         // Prefix match wins, in config order.
         assert_eq!(cfg.provider_for_model("MiniMax-M3").unwrap().id, "minimax");
@@ -1758,6 +1784,7 @@ mod tests {
                 ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-met".into(),
@@ -1773,6 +1800,7 @@ mod tests {
             billing: BillingMode::Metered,
             subscription: None,
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         // Empty catalog: explicit `windows` on the subscription resolve
         // directly, no preset lookup needed. (Passing an empty catalog is
@@ -2310,6 +2338,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 ..Default::default()
             }),
             serves: vec!["gpt-".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-sub".into(),
@@ -2325,6 +2354,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 ..Default::default()
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.default_provider = "openai-codex".into();
         let errs = cfg.validate();
@@ -2383,6 +2413,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 account_id: Some("personal".into()),
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-team".into(),
@@ -2398,6 +2429,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 account_id: Some("team".into()),
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.default_provider = "minimax-personal".into();
 
@@ -2475,6 +2507,7 @@ auth = { type = "env", var = "ACME_KEY" }
             billing: BillingMode::Subscription,
             subscription: Some(shared_plan.clone()),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-x".into(), // intentional duplicate to also trip dup-id
@@ -2485,6 +2518,7 @@ auth = { type = "env", var = "ACME_KEY" }
             billing: BillingMode::Subscription,
             subscription: Some(shared_plan),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.default_provider = "minimax-x".into();
 
@@ -2535,6 +2569,7 @@ auth = { type = "env", var = "ACME_KEY" }
                 account_id: None,
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         });
         cfg.default_provider = "minimax-legacy".into();
 
@@ -2752,5 +2787,219 @@ auth = { type = "env", var = "ACME_KEY" }
             vec!["fallback-head".to_string(), "fallback-tail".to_string()],
             "alias=None must fall through to the profile-level chain"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Azure OpenAI native wire adapter — config tests.
+    //
+    // The Azure adapter takes a per-provider `azure_api_version` field
+    // on `Provider` (see `Provider::azure_api_version` for the full
+    // resolution precedence docs). These tests pin the parse contract:
+    //
+    //   * `azure_api_version = "2024-10-21"` round-trips through both
+    //     TOML and JSON without mutation,
+    //   * a config that omits the field entirely still parses cleanly
+    //     and the field is `None` (back-compat: every existing config
+    //     in the wild works unchanged),
+    //   * `Provider` carries `azure_api_version` as an explicit field
+    //     rather than tacking it onto `base_url` or a separate
+    //     `meta` block — the operator inspects one struct, not a
+    //     parallel one.
+    //
+    // The runtime resolution (config field -> env var -> default) is
+    // covered by the unit + integration tests in
+    // `crates/zoder-core/src/provider.rs` and `crates/zoder-core/tests/provider.rs`.
+    // ---------------------------------------------------------------------
+
+    /// `azure_api_version = "..."` parses cleanly through TOML (the
+    /// vendor-overlay format) and the parsed field round-trips
+    /// byte-for-byte. The serialization shape uses `serde(default,
+    /// skip_serializing_if = "Option::is_none")` so absent fields do
+    /// NOT pollute the serialized output (back-compat for every
+    /// pre-Azure config in the wild).
+    #[test]
+    fn provider_azure_api_version_round_trips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.azure.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[providers]]
+id = "azure-gpt4o"
+base_url = "https://res.openai.azure.com/openai/deployments/gpt4o"
+kind = "azure-openai"
+auth = { type = "api_key_header", header = "api-key", var = "AZURE_OPENAI_API_KEY" }
+paid = true
+billing = "metered"
+azure_api_version = "2024-10-21"
+"#,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let overlay: VendorOverlay = toml::from_str(&raw).expect("azure overlay must parse");
+        let azure_provider = overlay
+            .providers
+            .iter()
+            .find(|p| p.id == "azure-gpt4o")
+            .expect("azure provider must be present");
+        assert_eq!(
+            azure_provider.azure_api_version.as_deref(),
+            Some("2024-10-21"),
+            "azure_api_version must round-trip through TOML"
+        );
+        assert_eq!(azure_provider.kind, "azure-openai");
+
+        // And serialization: serialize the provider back to TOML and
+        // confirm `azure_api_version` appears verbatim (no
+        // re-shuffling). The `skip_serializing_if = "Option::is_none"`
+        // annotation keeps the field absent for legacy providers.
+        let re_serialized = toml::to_string(&Provider {
+            id: "azure-gpt4o".into(),
+            base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
+            kind: "azure-openai".into(),
+            auth: Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "AZURE_OPENAI_API_KEY".into(),
+            },
+            paid: true,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: Some("2024-10-21".into()),
+        })
+        .expect("serialize");
+        assert!(
+            re_serialized.contains("azure_api_version"),
+            "serialized output must carry the field: {re_serialized}"
+        );
+        assert!(
+            re_serialized.contains("2024-10-21"),
+            "serialized output must carry the version: {re_serialized}"
+        );
+    }
+
+    /// Back-compat: a config that OMITS `azure_api_version` everywhere
+    /// (the pre-Azure shape every existing config uses) must still
+    /// load, validate, and the field must be `None`. This is the
+    /// "behave exactly as today" guarantee — the new field is purely
+    /// additive and never required.
+    #[test]
+    fn provider_azure_api_version_omitted_means_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        cfg.providers.push(Provider {
+            id: "azure-legacy".into(),
+            base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
+            kind: "azure-openai".into(),
+            auth: Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "AZURE_OPENAI_API_KEY".into(),
+            },
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: None,
+        });
+        cfg.default_provider = "azure-legacy".into();
+
+        // Validate accepts the legacy shape.
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "azure config without azure_api_version must still validate; got: {}",
+            errs.join("\n")
+        );
+
+        // And the wire-level invariant: a TOML/JSON config that
+        // never declared `azure_api_version` parses with the field
+        // == None. The runtime then resolves to env var or default
+        // at `OpenAiProvider::new` time (covered by the
+        // `azure_api_version_resolution_precedence` unit test).
+        let legacy_toml = r#"
+[[providers]]
+id = "azure-legacy"
+base_url = "https://res.openai.azure.com/openai/deployments/gpt4o"
+kind = "azure-openai"
+auth = { type = "api_key_header", header = "api-key", var = "AZURE_OPENAI_API_KEY" }
+paid = false
+billing = "metered"
+"#;
+        let overlay: VendorOverlay =
+            toml::from_str(legacy_toml).expect("legacy azure overlay must parse");
+        assert_eq!(
+            overlay.providers[0].azure_api_version, None,
+            "absent azure_api_version must deserialize to None (back-compat)"
+        );
+
+        // And the serialized output must NOT include the field when
+        // it's None — the `skip_serializing_if = "Option::is_none"`
+        // annotation keeps legacy config serializations bit-identical
+        // (so a config reload doesn't diff-pollute the on-disk file).
+        let serialized = toml::to_string(&overlay.providers[0]).expect("serialize");
+        assert!(
+            !serialized.contains("azure_api_version"),
+            "absent azure_api_version must NOT pollute serialized output: {serialized}"
+        );
+    }
+
+    /// The config field accepts any non-empty string the operator
+    /// pins — including a custom preview version that's not the
+    /// built-in default. The runtime never validates the format
+    /// (Azure's Data Plane treats unknown versions as the latest
+    /// supported GA version), so the parse contract is "preserve
+    /// verbatim, send verbatim".
+    #[test]
+    fn provider_azure_api_version_preserves_operator_pinned_versions_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers.clear();
+        // Three distinct shapes an operator might pin: a preview
+        // version with a suffix, a custom data-plane version, and
+        // the built-in GA version. Each round-trips verbatim.
+        let pinned_versions = ["2024-10-21", "2024-12-01-preview", "2025-01-01"];
+        for (i, v) in pinned_versions.iter().enumerate() {
+            cfg.providers.push(Provider {
+                id: format!("azure-{i}"),
+                base_url: format!("https://res.openai.azure.com/openai/deployments/gpt4o-{i}"),
+                kind: "azure-openai".into(),
+                auth: Auth::ApiKeyHeader {
+                    header: "api-key".into(),
+                    var: format!("AZURE_KEY_{i}"),
+                },
+                paid: false,
+                billing: BillingMode::Metered,
+                subscription: None,
+                serves: Vec::new(),
+                azure_api_version: Some((*v).to_string()),
+            });
+        }
+        // Set the default_provider so the validate() step doesn't
+        // reject the config for "default_provider not among
+        // configured providers" — `cfg.providers.clear()` left the
+        // default pointing at the now-removed `default` placeholder.
+        cfg.default_provider = "azure-0".into();
+        // All three validate (the version string is opaque to the
+        // engine — Azure's Data Plane handles the version negotiation
+        // at request time).
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "all three pinned versions must validate; got: {}",
+            errs.join("\n")
+        );
+        // And each pinned version survives a JSON round-trip.
+        let json = serde_json::to_string(&cfg.providers).expect("serialize");
+        let re_parsed: Vec<Provider> = serde_json::from_str(&json).expect("re-parse");
+        for (i, v) in pinned_versions.iter().enumerate() {
+            assert_eq!(
+                re_parsed[i].azure_api_version.as_deref(),
+                Some(*v),
+                "version {v:?} must survive JSON round-trip (found {:?})",
+                re_parsed[i].azure_api_version
+            );
+        }
     }
 }

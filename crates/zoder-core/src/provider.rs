@@ -383,11 +383,20 @@ fn redact(s: &str) -> String {
 /// Normalize an endpoint URL: the configured base may or may not already carry
 /// the `/v1` version segment, so we never emit `/v1/v1/...`. `azure-openai`
 /// uses its own deployment route + `?api-version`.
-fn endpoint_url(base_url: &str, kind: &str, suffix: &str) -> String {
+///
+/// For `kind == "azure-openai"`, the `api_version` argument (when `Some`) is
+/// the explicit per-provider override (the `Provider::azure_api_version`
+/// field, which already won over the env var at [`OpenAiProvider`] construction
+/// time). When `None`, the helper falls back to the `AZURE_OPENAI_API_VERSION`
+/// env var, then to the built-in default `"2024-10-21"`. The non-Azure
+/// branches ignore this argument.
+fn endpoint_url(base_url: &str, kind: &str, suffix: &str, api_version: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
     if kind == "azure-openai" {
-        let ver =
-            std::env::var("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "2024-10-21".to_string());
+        let ver = api_version
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok())
+            .unwrap_or_else(|| "2024-10-21".to_string());
         return format!("{base}/{suffix}?api-version={ver}");
     }
     if base.ends_with("/v1") || base.contains("/v1/") {
@@ -774,6 +783,18 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     request_timeout: Duration,
     idle_timeout: Duration,
+    /// Resolved Azure OpenAI Data Plane `api-version` for
+    /// `kind == "azure-openai"` providers. Populated at construction time
+    /// from the precedence documented on [`crate::config::Provider::azure_api_version`]:
+    ///   1. `Provider::azure_api_version` (per-provider),
+    ///   2. `AZURE_OPENAI_API_VERSION` env var (host-wide),
+    ///   3. built-in default `"2024-10-21"`.
+    ///
+    /// For non-Azure providers this is `None` (the helper still resolves
+    /// the same precedence at call time, but storing the resolved value
+    /// here keeps `endpoint()` allocation-free for every Azure call once
+    /// the provider is constructed).
+    azure_api_version: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -795,6 +816,28 @@ impl OpenAiProvider {
             .as_ref()
             .map(|s| s.effective_account_id())
             .unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
+        // Azure Data Plane `api-version` resolution at construction time:
+        // per-provider `Provider::azure_api_version` wins, then the
+        // host-wide `AZURE_OPENAI_API_VERSION` env var, then the built-in
+        // default. Non-Azure providers leave this as `None` — the env-var
+        // fallback in `endpoint_url` only fires when `kind == "azure-openai"`
+        // anyway, so storing the resolved value (or `None`) here keeps the
+        // hot path branch-free for the openai-chat / anthropic / responses
+        // cases. Resolved once so every chat call carries the same wire
+        // string and a config-field change is picked up on the next
+        // `OpenAiProvider::new(&cfg)` cycle (the long-lived provider cache
+        // is keyed by `Provider.id`, so a config reload triggers a rebuild).
+        let azure_api_version = if p.kind == "azure-openai" {
+            Some(
+                p.azure_api_version
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok())
+                    .unwrap_or_else(|| "2024-10-21".to_string()),
+            )
+        } else {
+            None
+        };
         Ok(Self {
             base_url: p.base_url.trim_end_matches('/').to_string(),
             kind: p.kind.clone(),
@@ -817,6 +860,7 @@ impl OpenAiProvider {
                 DEFAULT_REQUEST_TIMEOUT_S,
             )),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
+            azure_api_version,
         })
     }
 
@@ -845,7 +889,12 @@ impl OpenAiProvider {
     /// the deployment path) with a `?api-version` (override via
     /// `AZURE_OPENAI_API_VERSION`).
     fn endpoint(&self, suffix: &str) -> String {
-        endpoint_url(&self.base_url, &self.kind, suffix)
+        endpoint_url(
+            &self.base_url,
+            &self.kind,
+            suffix,
+            self.azure_api_version.as_deref(),
+        )
     }
 
     async fn read_limited_body(
@@ -952,6 +1001,15 @@ impl OpenAiProvider {
             // kind (including `custom` and `azure-openai`).
             return responses_body(req);
         }
+        // Azure OpenAI intentionally falls through to the openai-chat
+        // body builder: Azure's chat-completions body (`model`,
+        // `messages`, `max_tokens`, `temperature`, `stream`,
+        // `stream_options.include_usage`, `reasoning_effort`) is
+        // structurally identical to OpenAI's, so a parallel
+        // `azure_body()` helper would just duplicate the openai-chat
+        // builder. The Azure wire adapter therefore differs from the
+        // openai-chat branch ONLY in endpoint + auth header (see
+        // [`Self::request`]) — every body field is shared.
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
@@ -1014,6 +1072,37 @@ impl OpenAiProvider {
             }
             return rb;
         }
+        if self.is_azure() {
+            // Native Azure OpenAI wire adapter:
+            //   * endpoint: POST {base}/chat/completions?api-version=…
+            //     (the base already encodes the deployment route per the
+            //     Azure OpenAI wire contract — `endpoint_url` adds the
+            //     `?api-version` from the resolved `azure_api_version`).
+            //   * headers: `api-key: <key>` (NOT `Authorization: Bearer …`).
+            //     Azure authenticates with the literal `api-key` header on
+            //     every Data Plane request; the bearer-shape credential the
+            //     pre-resolved `auth_header` would emit is rejected with 401.
+            //     `azure_api_key()` resolves the configured credential
+            //     verbatim and strips a defensive `Bearer ` prefix if an
+            //     operator copy-pasted a JWT into the env var (matches the
+            //     Anthropic branch's safety net).
+            //   * body: the openai-chat shape — Azure's chat-completions
+            //     body is structurally identical to OpenAI's, so `body()`
+            //     falls through to the chat-completions builder for
+            //     `kind == "azure-openai"` (no parallel `azure_body()`
+            //     helper to keep the wire surface in lockstep with the
+            //     chat branch — mirrors how the openai-responses slice
+            //     avoided duplicating code for the byte-for-byte-shared
+            //     auth path).
+            let mut rb = self
+                .client
+                .post(self.endpoint("chat/completions"))
+                .json(&self.body(req));
+            if let Some(key) = self.azure_api_key() {
+                rb = rb.header("api-key", key);
+            }
+            return rb;
+        }
         let mut rb = self
             .client
             .post(self.endpoint("chat/completions"))
@@ -1043,6 +1132,22 @@ impl OpenAiProvider {
         self.kind == "openai-responses"
     }
 
+    /// `true` when this provider is configured to use the native Azure
+    /// OpenAI wire shape (`POST {base}/chat/completions?api-version=...`
+    /// with an `api-key: <key>` header — NOT `Authorization: Bearer …`).
+    /// Sibling of [`Self::is_anthropic`] and [`Self::is_responses`]; the
+    /// body builder falls through to the openai-chat shape (Azure's
+    /// chat-completions body is structurally identical to OpenAI's — see
+    /// [`Self::body`] for the "azure reuses the chat body" contract), and
+    /// only the endpoint + auth header differ. The deployment itself is
+    /// encoded in the configured `base_url`
+    /// (`…/openai/deployments/<deployment>`) per the Azure OpenAI wire
+    /// contract, so the adapter does NOT maintain a separate deployment
+    /// field — every SDK / curl example builds the URL the same way.
+    fn is_azure(&self) -> bool {
+        self.kind == "azure-openai"
+    }
+
     /// Resolve the raw credential for an Anthropic provider call. Returns
     /// `None` when no credential is configured (Anthropic will respond 401
     /// with the same classification as an OpenAI 401 — the request still
@@ -1062,6 +1167,30 @@ impl OpenAiProvider {
                 .map(|tok| strip_bearer_prefix(&tok).to_string()),
             Auth::ApiKeyHeader { .. } => self.auth.resolve(),
         }
+    }
+
+    /// Resolve the raw credential for an Azure OpenAI provider call.
+    /// Azure authenticates with an `api-key: <key>` HEADER (NOT
+    /// `Authorization: Bearer …`), and the configured credential is the
+    /// api-key value verbatim — no `Bearer ` prefix to strip and no
+    /// header-name remap. `ApiKeyHeader { header: "api-key", … }` (the
+    /// recommended shape in `config.microsoft.toml`) sends the value
+    /// as-is. `Env { var }` / `Bearer { token }` also feed the same raw
+    /// value through — an operator who stored the Azure key in
+    /// `AZURE_OPENAI_API_KEY` and configured `Env { var }` is supported
+    /// without ceremony. Returns `None` when no credential is configured
+    /// (Azure will respond 401 with the same classification an OpenAI 401
+    /// would surface; the existing `classify_err -> from_status(401)`
+    /// path picks it up).
+    fn azure_api_key(&self) -> Option<String> {
+        // `strip_bearer_prefix` is a no-op for the canonical
+        // `api-key <32-hex-chars>` shape but is called defensively so a
+        // future operator who copy-pastes a `Bearer eyJ...` JWT into the
+        // env var still gets the bare token sent to Azure. Mirrors the
+        // safety net the Anthropic branch applies for the same reason.
+        self.auth
+            .resolve()
+            .map(|tok| strip_bearer_prefix(&tok).to_string())
     }
 
     /// Chat call. If `sink` is Some, decoded content is written to it live
@@ -2457,27 +2586,37 @@ mod tests {
             endpoint_url(
                 "https://api.example.com/v1",
                 "openai-chat",
-                "chat/completions"
+                "chat/completions",
+                None
             ),
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(
-            endpoint_url("https://api.example.com/v1/", "openai-chat", "models"),
+            endpoint_url("https://api.example.com/v1/", "openai-chat", "models", None),
             "https://api.example.com/v1/models"
         );
         assert_eq!(
-            endpoint_url("https://gw.example.com", "openai-chat", "chat/completions"),
+            endpoint_url(
+                "https://gw.example.com",
+                "openai-chat",
+                "chat/completions",
+                None
+            ),
             "https://gw.example.com/v1/chat/completions"
         );
     }
 
     #[test]
     fn endpoint_url_azure_uses_deployment_route_no_v1() {
+        let _guard = AZURE_API_VERSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
         let u = endpoint_url(
             "https://res.openai.azure.com/openai/deployments/gpt4o",
             "azure-openai",
             "chat/completions",
+            None,
         );
         assert_eq!(
             u,
@@ -2485,6 +2624,440 @@ mod tests {
         );
         assert!(!u.contains("/v1/"), "azure route must not inject /v1");
         std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
+
+    /// `Provider::azure_api_version` field (when `Some`) wins over both
+    /// the env var and the built-in default — that's the per-provider
+    /// override path an operator uses when they host multiple Azure
+    /// deployments with different pinned Data Plane versions.
+    #[test]
+    fn endpoint_url_azure_explicit_api_version_overrides_env_var() {
+        let _guard = AZURE_API_VERSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-08-01");
+        let u = endpoint_url(
+            "https://res.openai.azure.com/openai/deployments/gpt4o",
+            "azure-openai",
+            "chat/completions",
+            Some("2024-10-21"),
+        );
+        assert_eq!(
+            u,
+            "https://res.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21",
+            "explicit api_version arg must beat the env var override"
+        );
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
+
+    /// With neither an explicit arg nor an env var, the helper falls
+    /// through to the built-in default `"2024-10-21"`. The default is
+    /// pinned here so a future bump is a single, intentional change
+    /// rather than a silent drift across every Azure host.
+    #[test]
+    fn endpoint_url_azure_falls_back_to_builtin_default() {
+        let _guard = AZURE_API_VERSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+        let u = endpoint_url(
+            "https://res.openai.azure.com/openai/deployments/gpt4o",
+            "azure-openai",
+            "chat/completions",
+            None,
+        );
+        assert!(
+            u.ends_with("?api-version=2024-10-21"),
+            "absent arg + absent env var must yield the built-in default; got {u}"
+        );
+    }
+
+    /// The api_version argument is azure-only — non-Azure kinds ignore
+    /// it entirely (no query string, no behavior change for the
+    /// `/v1/...` chat / responses routes).
+    #[test]
+    fn endpoint_url_ignores_api_version_for_non_azure_kinds() {
+        // Even if a future caller passes Some, the non-Azure branches
+        // must NOT add `?api-version=…` (only Azure accepts that param
+        // — OpenAI / Anthropic would 400).
+        let u = endpoint_url(
+            "https://api.openai.com/v1",
+            "openai-chat",
+            "chat/completions",
+            Some("2024-10-21"),
+        );
+        assert_eq!(u, "https://api.openai.com/v1/chat/completions");
+        assert!(
+            !u.contains("api-version"),
+            "non-azure must not leak api-version: {u}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Azure OpenAI native wire adapter — unit tests.
+    //
+    // These tests pin the wire-shaping helpers
+    // (`is_azure` / `azure_api_key` / the resolved `azure_api_version`)
+    // in isolation. The end-to-end integration coverage (mocked HTTP
+    // path, response decoder, error envelope classification) lives in
+    // `tests/provider.rs::azure_*` and reuses the existing OpenAI
+    // chat-completions response parser (Azure returns
+    // OpenAI-standard `chat.completion` / `chat.completion.chunk`
+    // shapes — no Azure-specific response code, by design).
+    //
+    // The pinned properties mirror the Anthropic / Responses unit-test
+    // blocks above:
+    //   * `kind == "azure-openai"` resolves `azure_api_version` in the
+    //     documented precedence (config field -> env var -> default).
+    //   * `is_azure()` discriminates correctly against every other kind.
+    //   * `azure_api_key()` resolves the credential verbatim for the
+    //     three supported `Auth` variants (None / Env / ApiKeyHeader),
+    //     matching the docs in `config.microsoft.toml`.
+    //   * The OpenAI-chat body builder is reused for Azure — the
+    //     `kind == "azure-openai"` branch falls through to the chat
+    //     body without any parallel `azure_body()` helper.
+    // -----------------------------------------------------------------
+
+    fn azure_provider_fixture(
+        kind: &str,
+        auth: Auth,
+        azure_api_version: Option<&str>,
+    ) -> OpenAiProvider {
+        let cfg = Provider {
+            id: "azure-test".into(),
+            base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
+            kind: kind.into(),
+            auth,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: azure_api_version.map(|s| s.to_string()),
+        };
+        OpenAiProvider::new(&cfg).expect("fixture provider must build")
+    }
+
+    /// Mutex that serializes the small number of unit tests in this
+    /// module that flip the shared `AZURE_OPENAI_API_VERSION` env
+    /// var. Cargo runs tests in parallel by default, and the env-var
+    /// read inside `OpenAiProvider::new` is non-atomic against
+    /// concurrent `std::env::set_var` calls — without this guard,
+    /// the precedence test races with `endpoint_url_azure_*` and
+    /// `azure_endpoint_url_*` (each of which mutates the same
+    /// variable) and reports spurious failures. Holding the mutex
+    /// for the entire `set_var → fixture → assert → remove_var`
+    /// window is the lightest acceptable isolation without pulling
+    /// in a test-only `serial_test` dependency.
+    static AZURE_API_VERSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn is_azure_is_true_only_for_azure_openai_kind() {
+        let azure = azure_provider_fixture("azure-openai", Auth::None, None);
+        assert!(
+            azure.is_azure(),
+            "azure-openai must enable the Azure branch"
+        );
+
+        let chat = azure_provider_fixture("openai-chat", Auth::None, None);
+        assert!(
+            !chat.is_azure(),
+            "openai-chat must NOT take the Azure branch"
+        );
+
+        let responses = azure_provider_fixture("openai-responses", Auth::None, None);
+        assert!(
+            !responses.is_azure(),
+            "openai-responses must NOT take the Azure branch (Responses uses Bearer)"
+        );
+
+        let anthropic = azure_provider_fixture("anthropic", Auth::None, None);
+        assert!(
+            !anthropic.is_azure(),
+            "anthropic must NOT take the Azure branch"
+        );
+
+        // `custom` falls through to the openai-chat byte-for-byte
+        // contract — the Azure branch is gated on the exact literal
+        // string so a custom gateway operator isn't accidentally
+        // routed to the Azure wire shape.
+        let custom = azure_provider_fixture("custom", Auth::None, None);
+        assert!(!custom.is_azure(), "custom must NOT take the Azure branch");
+
+        // Empty / unset kind defaults to "openai-chat" via
+        // `#[serde(default = "default_kind")]` — same byte-identical
+        // guarantee, must NOT take the Azure branch.
+        let empty = azure_provider_fixture("", Auth::None, None);
+        assert!(
+            !empty.is_azure(),
+            "empty kind must NOT take the Azure branch"
+        );
+    }
+
+    #[test]
+    fn azure_api_version_resolution_precedence() {
+        // Pin the resolution precedence the runtime applies at
+        // `OpenAiProvider::new` time:
+        //
+        //   1. `Provider::azure_api_version` (per-provider field)
+        //   2. `AZURE_OPENAI_API_VERSION` env var (host-wide)
+        //   3. built-in default `"2024-10-21"`
+        //
+        // The helper-level env-var fallback is also covered by
+        // `endpoint_url_azure_*` (which read the var at helper-call
+        // time, not at construction); here we focus on the
+        // `OpenAiProvider::new` constructor. Holding the
+        // `AZURE_API_VERSION_TEST_LOCK` mutex for the duration of
+        // each sub-case serializes this test against the other
+        // unit tests in the binary that also flip the same env
+        // var — without the lock, cargo's parallel test runner
+        // would race us.
+        let _guard = AZURE_API_VERSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // (a) Provider field wins — the most specific override. Set
+        // the env var to a SENTINEL distinct from the field value
+        // so a parallel test flipping the var would be observably
+        // distinct.
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "precedence-a-env");
+        let p = azure_provider_fixture("azure-openai", Auth::None, Some("precedence-a-field"));
+        assert_eq!(
+            p.azure_api_version.as_deref(),
+            Some("precedence-a-field"),
+            "explicit azure_api_version field must beat the env var"
+        );
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+
+        // (b) Field absent, env var set — env var wins. The
+        // helper-level fallback (the actual API-version resolution
+        // at wire time) is exercised by `endpoint_url_azure_*`
+        // above; here we just confirm the constructor reads the
+        // env var under the documented precedence.
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "precedence-b-env");
+        let p = azure_provider_fixture("azure-openai", Auth::None, None);
+        assert_eq!(
+            p.azure_api_version.as_deref(),
+            Some("precedence-b-env"),
+            "absent field must fall through to the env var"
+        );
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+
+        // (c) Both absent — built-in default wins.
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+        let p = azure_provider_fixture("azure-openai", Auth::None, None);
+        assert_eq!(
+            p.azure_api_version.as_deref(),
+            Some("2024-10-21"),
+            "absent field + absent env var must yield the built-in default"
+        );
+
+        // (d) Non-Azure providers always have `azure_api_version = None`
+        // — the field is otherwise dead state, and storing the
+        // resolved default on every provider would muddy diffs in
+        // serialization snapshots. The env var is set so any
+        // parallel test that resolves an Azure provider doesn't
+        // accidentally leak into this assertion; the `kind`
+        // branch in `OpenAiProvider::new` short-circuits before
+        // reading it. (We're holding the test lock so the env
+        // var here is the one we set.)
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "precedence-d-env");
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        assert!(
+            p.azure_api_version.is_none(),
+            "non-azure providers must leave azure_api_version unset"
+        );
+        let p = azure_provider_fixture("anthropic", Auth::None, None);
+        assert!(
+            p.azure_api_version.is_none(),
+            "anthropic providers must leave azure_api_version unset"
+        );
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
+
+    #[test]
+    fn azure_api_key_resolves_every_auth_variant() {
+        // `None` auth: no credential, no api-key header (Azure will
+        // 401 and the existing classification pipeline picks it up —
+        // same surface every other kind produces for missing creds).
+        let p = azure_provider_fixture("azure-openai", Auth::None, None);
+        assert!(
+            p.azure_api_key().is_none(),
+            "Auth::None must yield no api-key header"
+        );
+
+        // `Env { var }`: the canonical Azure config (`auth = { type =
+        // "env", var = "AZURE_OPENAI_API_KEY" }` works the same as
+        // the explicit `api_key_header` shape, because Azure's
+        // credential is the api-key value verbatim — no Bearer
+        // prefix.
+        let var = "ZODER_TEST_AZURE_API_KEY_ENV";
+        std::env::set_var(var, "azure-key-from-env");
+        let p = azure_provider_fixture("azure-openai", Auth::Env { var: var.into() }, None);
+        assert_eq!(
+            p.azure_api_key().as_deref(),
+            Some("azure-key-from-env"),
+            "Auth::Env must feed the raw credential to the api-key header"
+        );
+        std::env::remove_var(var);
+
+        // `ApiKeyHeader { header, var }` with `header = "api-key"` —
+        // the explicit shape `config.microsoft.toml` recommends. The
+        // header name itself is irrelevant on the wire adapter side
+        // (Azure requires `api-key` regardless), so the test only
+        // verifies the value flows through.
+        let var = "ZODER_TEST_AZURE_API_KEY_HEADER";
+        std::env::set_var(var, "azure-key-from-header");
+        let p = azure_provider_fixture(
+            "azure-openai",
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: var.into(),
+            },
+            None,
+        );
+        assert_eq!(
+            p.azure_api_key().as_deref(),
+            Some("azure-key-from-header"),
+            "Auth::ApiKeyHeader must feed the raw credential to the api-key header"
+        );
+        std::env::remove_var(var);
+
+        // `Bearer { token }`: not the documented Azure shape, but
+        // safe-by-construction — the helper strips a defensive
+        // `Bearer ` prefix (matches the Anthropic branch's safety
+        // net for an operator who copy-pastes a JWT into the env
+        // var) and forwards the bare token.
+        let p = azure_provider_fixture(
+            "azure-openai",
+            Auth::Bearer {
+                token: "raw-azure-key".into(),
+            },
+            None,
+        );
+        assert_eq!(
+            p.azure_api_key().as_deref(),
+            Some("raw-azure-key"),
+            "Auth::Bearer must strip the leading `Bearer ` for Azure"
+        );
+        let p = azure_provider_fixture(
+            "azure-openai",
+            Auth::Bearer {
+                token: "Bearer raw-azure-key".into(),
+            },
+            None,
+        );
+        assert_eq!(
+            p.azure_api_key().as_deref(),
+            Some("raw-azure-key"),
+            "an explicit `Bearer ` prefix must be stripped before the api-key header"
+        );
+    }
+
+    #[test]
+    fn azure_body_falls_through_to_openai_chat_shape() {
+        // Azure's chat-completions body is structurally identical to
+        // OpenAI's — there is NO `azure_body()` helper, and the body
+        // builder falls through to the chat-completions branch for
+        // `kind == "azure-openai"`. Pin the byte-for-byte contract so
+        // a future refactor that accidentally introduces a parallel
+        // body builder fails this test.
+        let p = azure_provider_fixture("azure-openai", Auth::None, None);
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![
+                Message::new("system", "be terse"),
+                Message::new("user", "hi"),
+            ],
+            max_tokens: 32,
+            temperature: 0.5,
+            stream: true,
+            show_reasoning: false,
+            reasoning_effort: Some("medium".into()),
+        };
+        let body = p.body(&req);
+        // The chat-completions shape MUST carry `messages`,
+        // `max_tokens`, `temperature`, `stream`, `stream_options`,
+        // `reasoning_effort` — and MUST NOT carry the Responses-only
+        // `input` / `max_output_tokens` / `reasoning` fields.
+        assert_eq!(body["model"], "gpt-4o");
+        assert_eq!(body["max_tokens"], 32);
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "streaming Azure calls must request include_usage (chat-shape)"
+        );
+        assert_eq!(body["reasoning_effort"], "medium");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2, "all messages pass through verbatim");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "be terse");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hi");
+        // No Responses-shaped fields leak.
+        assert!(
+            body.get("input").is_none(),
+            "Azure body must not carry Responses `input`: {body}"
+        );
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "Azure body must not carry Responses `max_output_tokens`: {body}"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "Azure body must not carry Responses `reasoning` object: {body}"
+        );
+    }
+
+    /// Azure's resolved endpoint URL must include BOTH the deployment
+    /// route (the `base_url` is expected to encode it — Azure's URL
+    /// contract treats the deployment as a path segment) AND the
+    /// `?api-version=` query string. The `?api-version` is what makes
+    /// the request Azure-shaped and byte-distinguishes it from the
+    /// openai-chat branch (which carries neither).
+    #[test]
+    fn azure_endpoint_url_is_deployment_plus_api_version() {
+        let _guard = AZURE_API_VERSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Reset the env var for determinism.
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+        let p = azure_provider_fixture("azure-openai", Auth::None, Some("2024-10-21"));
+        let url = p.endpoint("chat/completions");
+        assert_eq!(
+            url,
+            "https://res.openai.azure.com/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21",
+            "endpoint must keep the deployment in the path and append api-version"
+        );
+        assert!(
+            !url.contains("/v1/"),
+            "azure endpoint must not inject /v1: {url}"
+        );
+
+        // And the openai-chat path on the SAME base_url must yield a
+        // different URL — that's the regression guard against the
+        // Azure branch silently falling through to the chat branch.
+        // (The Azure-shaped base `…/openai/deployments/gpt4o` doesn't
+        // end in `/v1` and doesn't contain `/v1/`, so the openai-chat
+        // branch's normalizer DOES inject `/v1/` — a key part of the
+        // byte-distinguishing wire shape between the two branches on
+        // the same base. The Azure branch keeps the URL
+        // deployment-scoped AND adds `?api-version=`. Together that's
+        // two independent byte-level distinctions from the chat path.)
+        let chat = azure_provider_fixture("openai-chat", Auth::None, None);
+        let chat_url = chat.endpoint("chat/completions");
+        assert_ne!(
+            chat_url, url,
+            "openai-chat and azure-openai must produce distinct URLs on the same base"
+        );
+        assert_eq!(
+            chat_url, "https://res.openai.azure.com/openai/deployments/gpt4o/v1/chat/completions",
+            "openai-chat on the same Azure-shaped base_url must inject /v1 (no api-version)"
+        );
+        assert!(
+            !chat_url.contains("api-version"),
+            "openai-chat branch must NOT carry api-version (Azure-only): {chat_url}"
+        );
     }
 
     #[test]
@@ -2811,6 +3384,7 @@ mod tests {
                 account_id: account_id.map(|s| s.to_string()),
             }),
             serves: vec!["MiniMax-".into()],
+            azure_api_version: None,
         }
     }
 
