@@ -174,7 +174,7 @@ fn persist_agentic_counter_at(
         );
         let period_id = match window.reset {
             zoder_core::config::ResetKind::CalendarMonthly => {
-                zoder_core::utilization::period_id_for(now)
+                crate::utilization::period_id_for(now)
             }
             zoder_core::config::ResetKind::CalendarDaily => {
                 Some(now.format("%Y-%m-%d").to_string())
@@ -205,7 +205,7 @@ pub(crate) fn persist_agentic_counter(
     provider: &zoder_core::config::Provider,
     tokens_used: u64,
 ) -> bool {
-    let Some(path) = zoder_core::utilization::default_store_path() else {
+    let Some(path) = crate::utilization::default_store_path() else {
         return false;
     };
     persist_agentic_counter_at(provider, tokens_used, &path, Utc::now())

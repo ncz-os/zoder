@@ -1693,14 +1693,49 @@ fn effective_counter_percent(counter: &CounterWindow, now: DateTime<Utc>) -> Opt
 /// rows written by an older binary (Finding #3). The pre-fix code
 /// stored `used_tokens / cap` (a fraction, commonly in [0, 1] but greater
 /// than 1 once a cap was exceeded); the new code
-/// stores the same value times 100 (a percentage in [0, 100]). Any
-/// v1 row in the legacy fractional range `0..=2` is multiplied by 100 in
-/// place. The upper bound covers exhausted legacy counters such as `1.2`
-/// (120%) while leaving obvious percentage-scale values such as `85` alone.
-/// The caller additionally gates this migration on the persisted schema
-/// version, preventing legitimate sub-2% values in v2 from being corrupted.
+/// stores the same value times 100 (a percentage in [0, 100]).
+///
+/// The migration has two branches (Z-12):
+///
+/// 1. `cap` is `Some` — recompute from `used_tokens / cap * 100`. The
+///    pre-fix v1 code may have stored a stale or fractional
+///    `used_percent`; the recomputation is the source of truth and is
+///    what the existing
+///    `legacy_counter_percent_migration_recomputes_from_tokens_and_cap`
+///    test pins.
+///
+/// 2. `cap` is `None` (PercentOnly window or "cap not yet recorded") —
+///    we cannot recompute. Preserve the stored `used_percent`,
+///    converting the legacy fractional range `0..=2` to the percentage
+///    range `0..=200` by multiplying by 100. Dropping the stored value
+///    here would make `decide_account`'s `used_percent.is_some()` filter
+///    exclude the window entirely, restoring full headroom on a
+///    near-exhausted cap-less budget. A `None` stored value with
+///    `cap = None` stays `None` — we have no signal and must not
+///    fabricate one.
+///
+/// The caller additionally gates this migration on the persisted
+/// schema version, preventing legitimate sub-2% values in v2 from being
+/// corrupted.
 fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
-    cw.used_percent = compute_used_percent(cw.used_tokens, cw.cap);
+    if cw.cap.is_some() {
+        // cap=Some: source-of-truth recompute. The v1 store may have
+        // stored a stale or fractional value; used_tokens/cap*100 wins.
+        cw.used_percent = compute_used_percent(cw.used_tokens, cw.cap);
+        return;
+    }
+    // cap=None: preserve the stored reading (with legacy-fractional
+    // -> percentage conversion). compute_used_percent returns None
+    // here unconditionally, so we cannot delegate. Mirroring the
+    // cap=Some branch's 0..=2 upper bound covers exhausted legacy
+    // counters (e.g. 1.2 -> 120.0) without touching legitimate
+    // percentage-scale values (e.g. 85.0 -> 85.0). A None stored value
+    // stays None (no signal, no fabrication).
+    if let Some(p) = cw.used_percent {
+        if (0.0..=2.0).contains(&p) {
+            cw.used_percent = Some(p * 100.0);
+        }
+    }
 }
 
 impl UtilizationRecord {
@@ -2011,6 +2046,38 @@ impl UtilizationStore {
         // subtraction. A provider that occasionally reports 0 usage
         // (streaming-usage off, usage field absent) still wants a row
         // touch but never a negative balance.
+        //
+        // Z-11 (rolling-window monotonicity vs. stale-clock / OOO
+        // capture): the rolling-window cutoff is computed against the
+        // capture's `now`, and `last_updated` is unconditionally
+        // rewritten to `now` at the end of this method. A stale-clock
+        // capture (now < last_updated) would therefore (a) recompute
+        // the cutoff against the stale `now` and drop just-recorded
+        // in-window increments on the next sum, AND (b) roll
+        // `last_updated` backwards, marking the window
+        // `TelemetryHealth::Degraded` on the next routing decision and
+        // excluding it from `decide_account`'s `observable` set. With
+        // `tokens_used > 0` the failure mode widens: the stale capture
+        // also pushes a phantom `CounterIncrement` at the stale
+        // timestamp, attributing usage to a time the provider never
+        // reported. Either failure mode restores full headroom on a
+        // near-exhausted window — the exact FALSE-headroom symptom the
+        // 2026-07-08 review flagged.
+        //
+        // Reject the capture as a no-op when `now < last_updated` on a
+        // rolling window. The calendar-reset branch above has already
+        // run, so a genuinely new period has already been reset (the
+        // new period's `last_updated` is set at the end of this
+        // method). A genuine reset for a non-calendar rolling window
+        // cannot happen via clock motion alone — only via the operator
+        // explicitly setting `rolling_hours` or clearing `increments`.
+        //
+        // The guard is scoped to `rolling_hours.is_some()` so calendar
+        // windows and the non-rolling accumulator are unaffected
+        // (pinned by `non_rolling_clock_rollback_capture_preserves_used_tokens`).
+        if entry.rolling_hours.is_some() && now < entry.last_updated {
+            return entry.used_tokens;
+        }
         if let Some(hours) = entry.rolling_hours {
             let cutoff = now - chrono::Duration::hours(i64::from(hours));
             entry
@@ -4491,5 +4558,206 @@ mod tests {
              looked like an imminent reset"
         );
         assert_eq!(ad.binding_window.as_deref(), Some("5h"));
+    }
+
+    // =====================================================================
+    // Z-11 / Z-12 failing-first pins (2026-07-08 adversarial review).
+    //
+    // The 2026-07-08 review of zoder's utilization tracking flagged two
+    // defects that together let the router see FALSE headroom on a
+    // near-exhausted budget, so a heavy user would silently fall through
+    // to the free tier or a cap-less chargeback instead of being gated.
+    //
+    // Each test below pins one defect at the public-method boundary.
+    // They MUST fail against the pre-fix code in this module and MUST
+    // pass once the corresponding fix lands in `record_counter` (Z-11)
+    // and `migrate_fractional_counter_percent` (Z-12).
+    //
+    // Path note: the 2026-07-08 task description named the path
+    // `crates/zoder-cli/src/utilization.rs`, but this module is owned
+    // by the `zoder-core` crate — it is what the CLI binary depends
+    // on for every counter read/write. The defects and their fixes
+    // are necessarily in `zoder-core/src/utilization.rs`. The CLI
+    // crate exposes a thin re-export at
+    // `crates/zoder-cli/src/utilization.rs` for binary-local imports.
+    // =====================================================================
+
+    // ----- Z-11: rolling-window used_tokens monotonicity -----
+
+    /// Z-11 main pin. Record two real increments inside a 5h rolling
+    /// window, then feed a stale-clock capture with `tokens_used = 0`
+    /// at an `now` earlier than `last_updated`. Pre-fix zeros the
+    /// window; post-fix is a no-op.
+    #[test]
+    fn rolling_window_used_tokens_not_zeroed_by_stale_clock_capture() {
+        let mut store = UtilizationStore::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
+        store.set_counter_rolling_hours(Provider::MiniMax, "default", MM_PLAN, "5h", Some(5), t0);
+        store.set_counter_cap(Provider::MiniMax, "default", MM_PLAN, "5h", Some(100.0), t0);
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 50.0, t1);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 45.0, t1);
+        let used_after_stale =
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 0.0, t0);
+        assert_eq!(used_after_stale, 95.0);
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 95.0);
+        assert_eq!(counter.used_percent, Some(95.0));
+        assert_eq!(counter.increments.len(), 2);
+        assert_eq!(counter.last_updated, t1);
+    }
+
+    /// Z-11 secondary pin: stale-clock capture with `tokens_used > 0`
+    /// must NOT push a phantom increment AND drop real in-window
+    /// increments. Pre-fix summed only the phantom increment.
+    #[test]
+    fn rolling_window_clock_rollback_capture_is_a_no_op() {
+        let mut store = UtilizationStore::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
+        store.set_counter_rolling_hours(Provider::MiniMax, "default", MM_PLAN, "5h", Some(5), t0);
+        store.set_counter_cap(Provider::MiniMax, "default", MM_PLAN, "5h", Some(100.0), t0);
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 50.0, t1);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 45.0, t1);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 999.0, t0);
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 95.0);
+        assert_eq!(counter.last_updated, t1);
+        assert_eq!(counter.increments.len(), 2);
+    }
+
+    /// Non-breaking contract: the clock-rollback guard is scoped to
+    /// `rolling_hours.is_some()`, so non-rolling accumulators are
+    /// unaffected. Pre-fix and post-fix must both preserve used_tokens.
+    #[test]
+    fn non_rolling_clock_rollback_capture_preserves_used_tokens() {
+        let mut store = UtilizationStore::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
+        store.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(100.0),
+            t0,
+        );
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", 60.0, t0);
+        let t_stale = t0 - chrono::Duration::seconds(1);
+        let used_after_stale = store.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            0.0,
+            t_stale,
+        );
+        assert_eq!(used_after_stale, 60.0);
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 60.0);
+    }
+
+    // ----- Z-12: v1->v2 migration preserves used_percent when cap = None -----
+
+    /// Z-12 main pin: migrate a legacy v1 record with `used_percent = 85`
+    /// and `cap = None` through `UtilizationStore::open_unlocked` (which
+    /// triggers `migrate_fractional_counter_percent`). Pre-fix dropped
+    /// the stored 85 to None; post-fix preserves it.
+    #[test]
+    fn legacy_counter_percent_migration_preserves_stored_percent_when_cap_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless.json");
+        let counter = serde_json::json!({
+            "provider": "mini_max",
+            "account_id": "default",
+            "plan": "max",
+            "window_name": "percent_only",
+            "used_tokens": 85_000.0,
+            "used_percent": 85.0,
+            "last_updated": "2026-07-04T12:00:00Z"
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {"percent_only": counter}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        let cw = migrated.counters.get("percent_only").unwrap();
+        assert_eq!(cw.used_percent, Some(85.0));
+    }
+
+    /// Z-12 secondary pin: legacy fractional values (1.2 -> 120,
+    /// 0.85 -> 85) with cap = None must be converted by the
+    /// 0..=2 -> 0..=200 fractional-to-percentage rule.
+    #[test]
+    fn legacy_counter_percent_migration_converts_legacy_fraction_when_cap_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless-fractional.json");
+        let row = |name: &str, used_percent: f64| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": 0.0,
+                "used_percent": used_percent,
+                "last_updated": "2026-07-04T12:00:00Z"
+            })
+        };
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    "exhausted": row("exhausted", 1.2),
+                    "ok": row("ok", 0.85),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        assert_eq!(migrated.counters["exhausted"].used_percent, Some(120.0));
+        assert_eq!(migrated.counters["ok"].used_percent, Some(85.0));
+    }
+
+    /// Non-breaking contract: a v1 row with BOTH `used_percent = None`
+    /// AND `cap = None` must stay None after migration.
+    #[test]
+    fn legacy_counter_percent_migration_stays_none_when_stored_is_none_and_cap_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless-none.json");
+        let counter = serde_json::json!({
+            "provider": "mini_max",
+            "account_id": "default",
+            "plan": "max",
+            "window_name": "truly_unknown",
+            "used_tokens": 0.0,
+            "last_updated": "2026-07-04T12:00:00Z"
+        });
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {"truly_unknown": counter}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        let cw = &migrated.counters["truly_unknown"];
+        assert!(cw.used_percent.is_none());
     }
 }
