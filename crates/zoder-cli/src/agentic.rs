@@ -1000,6 +1000,12 @@ pub(crate) struct ReviewOutput {
 
 /// Best-effort parse of a model's reply into a `ReviewOutput`: extract the first
 /// balanced-looking `{...}` and decode it; on failure, wrap the raw text.
+///
+/// Z-2 — verdicts are normalized (`trim` + ASCII lowercase) when stored so
+/// every downstream consumer sees the canonical form. Defense in depth:
+/// comparison functions (`loop_review_ok`, `verdict_rank`) ALSO normalize
+/// at the point of comparison so direct `ReviewOutput` construction in
+/// tests or other call sites is also safe.
 fn parse_review(raw: &str) -> ReviewOutput {
     let trimmed = raw.trim();
     let candidate = match (trimmed.find('{'), trimmed.rfind('}')) {
@@ -1008,7 +1014,12 @@ fn parse_review(raw: &str) -> ReviewOutput {
     };
     if let Ok(r) = serde_json::from_str::<ReviewOutput>(candidate) {
         if !r.verdict.is_empty() || !r.summary.is_empty() || !r.findings.is_empty() {
-            return r;
+            return ReviewOutput {
+                verdict: r.verdict.trim().to_ascii_lowercase(),
+                summary: r.summary,
+                findings: r.findings,
+                next_steps: r.next_steps,
+            };
         }
     }
     ReviewOutput {
@@ -1025,7 +1036,14 @@ fn parse_review(raw: &str) -> ReviewOutput {
 }
 
 fn verdict_rank(v: &str) -> u8 {
-    match v {
+    // Z-2: verdicts must rank case- and whitespace-insensitively. Real LLM
+    // output drifts casing (`"BLOCK"`, `"Request_Changes"`, `"REJECT"`) and
+    // padding (`" approve "`). Case-sensitive matching previously ranked
+    // those as 0 (approve), so an explicit block was carried as the
+    // "approve / unknown" branch and the review aggregator's
+    // worst-down-the-line rank promotion never fired.
+    let normalized = v.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "request_changes" | "reject" | "block" => 2,
         "comment" | "neutral" => 1,
         _ => 0, // approve / unknown
@@ -2487,6 +2505,27 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
         .count()
 }
 
+/// Synthesize the `ReviewOutput` used when the loop's review phase cannot
+/// produce a verdict at all — most commonly a `phase_watchdog` wall-clock
+/// timeout around `complete_once`, or a reviewer chain that exhausted with
+/// 0/N reviewers completing.
+///
+/// **Fail-CLOSED.** Mirrors the all-failed → `"request_changes"` mapping
+/// in the standalone `cmd_review` `aggregate_review` (line ~1967):
+/// a review that never happened must NOT silently look like an
+/// approving/comment review, so the synthesized verdict is the explicit
+/// blocker `"request_changes"` rather than the non-blocking `"comment"`.
+/// Centralizing this here (vs. an inline `ReviewOutput { ... }` literal
+/// at the call site) lets `cmd_loop` and the test matrix share a single
+/// source of truth for what an unreviewed iteration looks like.
+fn synthesize_review_phase_failure(msg: &str) -> ReviewOutput {
+    ReviewOutput {
+        verdict: "request_changes".into(),
+        summary: format!("reviewer {msg}"),
+        ..Default::default()
+    }
+}
+
 /// Fail-closed predicate: did the reviewer authorize this iteration to be
 /// considered for resolution? This is the ONE place the explicit reviewer
 /// verdict is consulted — the finding-severity heuristic (`blocking`)
@@ -2494,12 +2533,22 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
 /// `block`. A reviewer that returns `approve` OR a non-blocking comment
 /// with zero heuristic-blocking findings is OK; every other explicit
 /// verdict blocks resolution regardless of finding counts.
+///
+/// Verdict comparison is **case- and whitespace-insensitive**: real LLM
+/// output drifts (`"BLOCK"`, `"Request_Changes"`, `" approve "`), and
+/// case-sensitive matches previously let explicit `request_changes`-class
+/// verdicts be silently downgraded to non-blocking. The normalization
+/// (`trim` + ASCII lowercase) runs at the point of comparison so any
+/// ReviewOutput construction site — `parse_review`, the
+/// review-phase-failure synthesizer, or direct fixtures — gets the same
+/// fail-closed semantics.
 fn loop_review_ok(r: &ReviewOutput, blocking: usize) -> bool {
-    let explicit_block = matches!(r.verdict.as_str(), "request_changes" | "reject" | "block");
+    let v = r.verdict.trim().to_ascii_lowercase();
+    let explicit_block = matches!(v.as_str(), "request_changes" | "reject" | "block");
     if explicit_block {
         return false;
     }
-    r.verdict == "approve" || blocking == 0
+    v == "approve" || blocking == 0
 }
 
 /// All signals needed by [`decide_loop_resolution`] for one iteration.
@@ -3014,11 +3063,16 @@ nits).\n",
                 // surfacing an Elapsed here means the entire provider request
                 // hung (TCP never returned) — record as a timeout-error
                 // review so the next author turn sees the wall-clock context.
-                ReviewOutput {
-                    verdict: "comment".into(),
-                    summary: format!("reviewer {msg}"),
-                    ..Default::default()
-                }
+                //
+                // Z-1 REGRESSION GUARD: the synthesized ReviewOutput MUST be
+                // fail-closed. With a non-blocking `"comment"` verdict, the
+                // downstream `loop_review_ok` / `decide_loop_resolution`
+                // treated the iteration as "approved" on a green check and
+                // reported RESOLVED — even though no reviewer had actually
+                // run. The synthesizer (above) emits `"request_changes"` for
+                // exactly this reason; see its doc comment and the
+                // `review_phase_failure_synthesis_is_request_changes` test.
+                synthesize_review_phase_failure(&msg)
             }
         };
         final_verdict = review.verdict.clone();
@@ -4786,6 +4840,274 @@ mod loop_resolution_tests {
             },
             1
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Z-1 REGRESSION: review-phase failure synthesis is fail-CLOSED.
+    //
+    // `cmd_loop`'s inline review path produces a synthesized `ReviewOutput`
+    // when `phase_watchdog(complete_once)` returns `Err` — either a
+    // wall-clock timeout around a hung provider request, or a reviewer
+    // chain that exhausted with 0/N reviewers completing. Pre-fix the
+    // synthesized verdict was the non-blocking `"comment"`, so the
+    // subsequent `loop_review_ok` / `decide_loop_resolution` treated the
+    // iteration as approved on a green check and reported `RESOLVED` —
+    // even though no reviewer had actually run. The fix funnels the
+    // synthesis through `synthesize_review_phase_failure` and pins that
+    // helper's verdict to the explicit blocker `"request_changes"`.
+    //
+    // These tests are the anti-gaming gate: they exercise the REAL
+    // decision functions (`synthesize_review_phase_failure`,
+    // `loop_review_ok`, `decide_loop_resolution`), not a reimplementation.
+    // The first test ("the synthesizer itself is request_changes") is
+    // the minimal pin; the second ("the loop's resolution decision
+    // refuses the synthesized shape") drives the same input through
+    // `decide_loop_resolution` so the fix can't be satisfied by, e.g.,
+    // lying about the verdict in the helper while the decision function
+    // still treats it as approve.
+    // -----------------------------------------------------------------------
+
+    /// The synthesis helper for a review-phase failure MUST emit
+    /// `"request_changes"`, NOT `"comment"`. A `"comment"` synthesis is
+    /// fail-OPEN: `loop_review_ok` returns `true` on
+    /// `"comment" + zero blocking findings`, and the loop's
+    /// resolution predicate then resolves the iteration without ever
+    /// having been reviewed.
+    ///
+    /// Pre-fix: literal `"comment".into()` at the `Err` branch (the
+    /// inline synthesis). Test would fail because the helper returned
+    /// `"comment"`.
+    /// Post-fix: helper returns `"request_changes"`. Test passes.
+    #[test]
+    fn review_phase_failure_synthesis_is_request_changes() {
+        let r = synthesize_review_phase_failure("review phase timed out after 900s (killed)");
+        assert_eq!(
+            r.verdict, "request_changes",
+            "Z-1 REGRESSION: the review-phase failure synthesizer must emit the \
+             explicit blocker `request_changes`, not the non-blocking `comment`. \
+             Otherwise a review-phase timeout / zero-reviewer outcome would cause \
+             `loop_review_ok` + `decide_loop_resolution` to mark the loop RESOLVED \
+             with the diff never reviewed."
+        );
+        // The summary MUST mention the review-phase context so the next
+        // author turn sees what happened. The literal prefix is the only
+        // reasonable witness.
+        assert!(
+            r.summary.starts_with("reviewer "),
+            "summary must carry the `reviewer <reason>` shape so the next \
+             author turn can grep for it; got: {:?}",
+            r.summary
+        );
+    }
+
+    /// The synthesized ReviewOutput shape MUST be fail-closed at the
+    /// resolution gate. This pins the END-TO-END invariant through
+    /// `decide_loop_resolution` (the function `cmd_loop` actually calls)
+    /// rather than the helper alone — so the fix can't satisfy the spec
+    /// by changing only the helper text while leaving a downstream
+    /// case-insensitive-but-still-non-blocking path in place.
+    ///
+    /// Shape: passing --check + substantive diff + the synthesis
+    /// outcome. Pre-fix behavior: with verdict="comment" and zero
+    /// blocking findings, `decide_loop_resolution` returns true (loop
+    /// resolves). Post-fix: verdict="request_changes" → returns false
+    /// (loop does NOT resolve). The test asserts the latter.
+    ///
+    /// Note: the test deliberately feeds the post-fix verdict shape
+    /// (the synthesizer's output, not the pre-fix "comment" string),
+    /// because the assertion ("does NOT resolve") is what the spec
+    /// requires; if a future refactor changed the helper's verdict
+    /// literal back to "comment" the SYNTHESIZER test above would
+    /// still catch it.
+    #[test]
+    fn review_phase_failure_outcome_does_not_resolve_via_decide_loop_resolution() {
+        // Use the real synthesizer — same call site as `cmd_loop`.
+        let synthesized =
+            synthesize_review_phase_failure("review phase timed out after 900s (killed)");
+        let signals = loop_signals_from_review(
+            DiffSubstance::Substantive,
+            true,       // --check was configured
+            Some(true), // --check passed
+            &synthesized,
+        );
+        assert!(
+            !decide_loop_resolution(&signals, false),
+            "Z-1 REGRESSION (e2e): a synthesized review-phase failure must NOT \
+             resolve the loop on a green check + substantive diff. Pre-fix the \
+             synthesizer used `comment`, which `loop_review_ok` treated as a \
+             non-blocking review, and `decide_loop_resolution` returned true."
+        );
+        // And not under `--accept-on-green` either — the explicit blocker
+        // cannot be overridden by the operator's opt-in to a passing check.
+        assert!(
+            !decide_loop_resolution(&signals, true),
+            "Z-1 REGRESSION (e2e, --accept-on-green): an unreviewed iteration \
+             (review-phase failure synthesis) must NOT resolve, even when the \
+             operator opts into `--accept-on-green`."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Z-2 REGRESSION: verdict comparisons are case- and whitespace-
+    // insensitive. Real LLM output drifts casing/padding
+    // (`"BLOCK"`, `"Request_Changes"`, `"REJECT"`, `" approve "`); the
+    // pre-fix code matched verdicts against exact lowercase literals
+    // (`"request_changes" | "reject" | "block"`), so a cased-out request
+    // was ranked 0 (approve) and the loop resolved the iteration as if
+    // the reviewer had approved.
+    //
+    // The pins exercise the REAL decision functions (`loop_review_ok`,
+    // `verdict_rank`) directly so the fix can't be gamed by, e.g.,
+    // normalizing in a wrapper that the production code never calls.
+    // -----------------------------------------------------------------------
+
+    /// Mixed/upper-case explicit block verdicts are BLOCKING, not
+    /// silently approved. Each variant matches one of the three
+    /// rank-2 literals (`request_changes` / `reject` / `block`) only
+    /// after `.trim().to_ascii_lowercase()`.
+    #[test]
+    fn loop_review_ok_blocks_mixed_case_verdicts() {
+        // Each tuple: (verdict string literal to feed in, human label).
+        // Every label is the rank-2 literal the pre-fix code failed to
+        // recognize because of casing drift.
+        let cases: &[&str] = &[
+            "BLOCK",             // matches "block"
+            "Request_Changes",   // matches "request_changes"
+            "REJECT",            // matches "reject"
+            " Request_Changes ", // padding + mixed case
+            "reject",            // already lowercase — sanity baseline
+            "block",             // already lowercase — sanity baseline
+        ];
+        for v in cases {
+            // Build the ReviewOutput directly (bypassing `parse_review`)
+            // so the comparison function is the ONLY thing standing
+            // between us and the pre-fix bug.
+            let r = ReviewOutput {
+                verdict: (*v).into(),
+                ..Default::default()
+            };
+            assert!(
+                !loop_review_ok(&r, 0),
+                "Z-2 REGRESSION: `loop_review_ok` must treat verbatim \
+                 `{v:?}` (padded / mixed / uppercase) as BLOCKING, not as \
+                 approve. Pre-fix the comparison was case-sensitive and \
+                 `{v:?}` ranked 0 → approve."
+            );
+        }
+    }
+
+    /// Padded / mixed-case approve verdicts are APPROVE — the inverse
+    /// half of the same normalization. This pins the non-gaming
+    /// half: a reviewer returning `" approve "` must still pass the
+    /// gate as a valid non-blocking review.
+    #[test]
+    fn loop_review_ok_approves_padded_mixed_case_approve() {
+        let cases: &[&str] = &[" approve ", "Approve", "APPROVE", " Approve "];
+        for v in cases {
+            let r = ReviewOutput {
+                verdict: (*v).into(),
+                ..Default::default()
+            };
+            assert!(
+                loop_review_ok(&r, 0),
+                "Z-2 REGRESSION (positive): `loop_review_ok` must treat verbatim \
+                 `{v:?}` as an approving verdict. The normalized form must be \
+                 `approve` (not anything that would fall through to rank 0 by \
+                 accident)."
+            );
+        }
+    }
+
+    /// `verdict_rank` must also be case- and whitespace-insensitive —
+    /// the same fix has to apply at the aggregator's `worst_rank`
+    /// promotion. A rank-0 misclassification here would let a mixed-
+    /// case `BLOCK` from the reviewer be ignored by the aggregator's
+    /// `worst_rank >= 2` check, so this is the second player in the
+    /// Z-2 defense.
+    #[test]
+    fn verdict_rank_is_case_and_whitespace_insensitive() {
+        // Rank 2 across all the LLM-cased variants.
+        for v in [
+            "request_changes",
+            "REQUEST_CHANGES",
+            "Request_Changes",
+            "reject",
+            "REJECT",
+            "Reject",
+            "block",
+            "BLOCK",
+            "Block",
+            "  block  ",
+            " Block ",
+        ] {
+            assert_eq!(
+                verdict_rank(v),
+                2,
+                "verdict_rank({v:?}) must be 2 (rank of explicit blocker)"
+            );
+        }
+        // Rank 1 for comment / neutral.
+        for v in [
+            "comment",
+            "COMMENT",
+            "Comment",
+            "neutral",
+            "NEUTRAL",
+            " Neutral ",
+        ] {
+            assert_eq!(
+                verdict_rank(v),
+                1,
+                "verdict_rank({v:?}) must be 1 (rank of comment / neutral)"
+            );
+        }
+        // Rank 0 for approve / unknown / empty.
+        for v in [
+            "approve",
+            "APPROVE",
+            "Approve",
+            " approve ",
+            "",
+            "unknown_thing",
+        ] {
+            assert_eq!(
+                verdict_rank(v),
+                0,
+                "verdict_rank({v:?}) must be 0 (rank of approve / unknown)"
+            );
+        }
+    }
+
+    /// End-to-end: a mixed-case `"Request_Changes"` ReviewOutput fed
+    /// through `decide_loop_resolution` must NOT resolve. This pins the
+    /// full loop gate, not just `loop_review_ok` in isolation, so a
+    /// future refactor that normalizes at `loop_review_ok` but breaks
+    /// the `s.verdict.clone()` handoff into `decide_loop_resolution`
+    /// will be caught here too.
+    #[test]
+    fn decide_loop_resolution_blocks_mixed_case_request_changes() {
+        // Direct construction (no `parse_review`) — the only thing
+        // between this input and the resolution decision is the
+        // comparison-function normalization.
+        let review = ReviewOutput {
+            verdict: "Request_Changes".into(),
+            summary: "mixed-case explicit block".into(),
+            findings: vec![],
+            next_steps: vec![],
+        };
+        let signals = loop_signals_from_review(
+            DiffSubstance::Substantive,
+            true,
+            Some(true), // --check passed
+            &review,
+        );
+        assert!(
+            !decide_loop_resolution(&signals, false),
+            "Z-2 REGRESSION (e2e): `decide_loop_resolution` must NOT treat a \
+             mixed-case `Request_Changes` verdict as approve. Pre-fix the \
+             verdict field was matched case-sensitively and this iteration \
+             leaked through as RESOLVED."
+        );
     }
 }
 
