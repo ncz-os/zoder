@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-07-07",
+  "generated": "2026-07-08",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -27,17 +27,17 @@
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 8.0
     },
-    "aion-labs/aion-1.0": {
-      "input_usd_per_mtok": 4.0,
-      "output_usd_per_mtok": 8.0
-    },
-    "aion-labs/aion-1.0-mini": {
-      "input_usd_per_mtok": 0.7,
-      "output_usd_per_mtok": 1.4
-    },
     "aion-labs/aion-2.0": {
       "input_usd_per_mtok": 0.7999999999999999,
       "output_usd_per_mtok": 1.5999999999999999
+    },
+    "aion-labs/aion-3.0": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 6.0
+    },
+    "aion-labs/aion-3.0-mini": {
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 1.4
     },
     "aion-labs/aion-rp-llama-3.1-8b": {
       "input_usd_per_mtok": 0.7999999999999999,
@@ -467,6 +467,22 @@
       "input_usd_per_mtok": 1.38,
       "output_usd_per_mtok": 11.0
     },
+    "azure/eu/gpt-5.4": {
+      "input_usd_per_mtok": 2.75,
+      "output_usd_per_mtok": 16.5
+    },
+    "azure/eu/gpt-5.4-2026-03-05": {
+      "input_usd_per_mtok": 2.75,
+      "output_usd_per_mtok": 16.5
+    },
+    "azure/eu/gpt-5.5": {
+      "input_usd_per_mtok": 5.5,
+      "output_usd_per_mtok": 33.0
+    },
+    "azure/eu/gpt-5.5-2026-04-23": {
+      "input_usd_per_mtok": 5.5,
+      "output_usd_per_mtok": 33.0
+    },
     "azure/eu/o1-2024-12-17": {
       "input_usd_per_mtok": 16.5,
       "output_usd_per_mtok": 66.0
@@ -882,6 +898,22 @@
     "azure/us/gpt-5.1-chat": {
       "input_usd_per_mtok": 1.38,
       "output_usd_per_mtok": 11.0
+    },
+    "azure/us/gpt-5.4": {
+      "input_usd_per_mtok": 2.75,
+      "output_usd_per_mtok": 16.5
+    },
+    "azure/us/gpt-5.4-2026-03-05": {
+      "input_usd_per_mtok": 2.75,
+      "output_usd_per_mtok": 16.5
+    },
+    "azure/us/gpt-5.5": {
+      "input_usd_per_mtok": 5.5,
+      "output_usd_per_mtok": 33.0
+    },
+    "azure/us/gpt-5.5-2026-04-23": {
+      "input_usd_per_mtok": 5.5,
+      "output_usd_per_mtok": 33.0
     },
     "azure/us/o1-2024-12-17": {
       "input_usd_per_mtok": 16.5,
@@ -10596,8 +10628,8 @@
       "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.8999999999999999,
-      "output_usd_per_mtok": 2.8600000000000003
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 3.0
     },
     "z-ai/glm-5v-turbo": {
       "input_usd_per_mtok": 1.2,
