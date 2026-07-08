@@ -417,11 +417,11 @@ pub struct Config {
     /// Default (`backend = None`) is byte-for-byte identical to the prior
     /// behavior — the loop consults the string denylist only. Selecting
     /// `backend = "seatbelt"` on a macOS host wraps `sh -c` in
-    /// `/usr/bin/sandbox-exec -p <profile>`; the same selection on a
-    /// non-macOS host errors at runtime with a clear "unsupported on this
-    /// platform" message (see
-    /// `crates/zoder-cli/src/exec_safety::wrap_spawn_command`). Linux
-    /// backends (bubblewrap / Landlock) are a documented follow-up.
+    /// `/usr/bin/sandbox-exec -p <profile>`; selecting `backend =
+    /// "linux_bubblewrap"` on a Linux host wraps `sh -c` in `bwrap <argv>
+    /// -- sh -c <cmd>`. Either backend selected on the wrong host errors
+    /// at runtime with a clear "unsupported on this platform" message
+    /// (see `crates/zoder-cli/src/exec_safety::wrap_spawn_command`).
     #[serde(default)]
     pub exec_safety: ExecSafetyConfig,
 }
@@ -649,30 +649,32 @@ fn subscription_window_exhausted(
 // `crates/zoder-cli/src/exec_safety.rs`) is a pre-spawn STRING denylist — a
 // guard rail, not a containment boundary. The types below are the
 // opt-in OS-level sandbox BACKEND that actually wraps the spawned child in an
-// OS containment primitive (macOS seatbelt / future Linux landlock+bwrap).
+// OS containment primitive (macOS seatbelt, Linux bubblewrap).
 //
 // Default = `ExecSandbox::None` = exactly the legacy "denylist only" behavior,
-// byte-for-byte. Selecting `Seatbelt` on a host that is not running macOS is a
-// HARD ERROR (`Err("…unsupported on this platform")`) at the call site, not a
-// silent fallback — see `crates/zoder-cli/src/exec_safety::wrap_spawn_command`
-// for the dispatch contract.
+// byte-for-byte. Selecting `Seatbelt` on a host that is not running macOS, or
+// `LinuxBubblewrap` on a host that is not running Linux, is a HARD ERROR
+// (`Err("…unsupported on this platform")`) at the call site, not a silent
+// fallback — see `crates/zoder-cli/src/exec_safety::wrap_spawn_command` for
+// the dispatch contract.
 //
-// Linux support is a documented follow-up: the policy enum and the dispatch
-// site are designed to admit a future `Linux(Bubblewrap)` variant without
-// changing the current behavior. We deliberately do NOT stub a Linux variant
-// in this change — a half-implemented sandbox backend that pretends to
-// contain is worse than none (see exec_safety module doc on the "half-working
-// platform-specific code" failure mode).
+// We deliberately do NOT silently fall back to `None` on the wrong host — a
+// half-implemented sandbox backend that pretends to contain is worse than
+// none (see exec_safety module doc on the "half-working platform-specific
+// code" failure mode). Landlock is a possible follow-up but is intentionally
+// out of scope here: it would require a kernel-version-gated Rust crate and
+// the bwrap wire-up already covers the deny-network + cwd-bind
+// least-privilege surface the seatbelt backend provides on macOS.
 // ---------------------------------------------------------------------------
 
 /// Concrete OS-sandbox backend the loop should wrap `--check` execution in.
 ///
 /// `serde` shape is intentionally a plain lowercase tag so the operator's
 /// `config.json` / overlay TOML reads naturally (`"backend": "seatbelt"`).
-/// Unknown variants deserialize to `None` via the custom `Deserialize` impl
-/// below so a typo or a not-yet-implemented backend in a new build does not
-/// turn into a hard config load failure (forward-compat — preserves the
-/// "config keeps loading" contract the rest of `Config` already follows).
+/// Unknown variants deserialize to `Unsupported` via the `#[serde(other)]`
+/// fallback below so a typo or a not-yet-implemented backend in a new build
+/// does not turn into a hard config load failure (forward-compat — preserves
+/// the "config keeps loading" contract the rest of `Config` already follows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecSandbox {
@@ -685,11 +687,41 @@ pub enum ExecSandbox {
     /// platform the call site MUST reject this with a clear "unsupported on
     /// this platform" error rather than silently downgrading to `None`.
     Seatbelt,
+    /// Linux bubblewrap (`bwrap`) — an external userspace-sandbox wrapper
+    /// invoked as `bwrap <args> -- <cmd>`. Mirrors seatbelt's
+    /// "external-wrapper approach" 1:1 (the macOS backend invokes
+    /// `/usr/bin/sandbox-exec`; the Linux backend invokes `/usr/bin/bwrap`
+    /// when present on `$PATH`). We chose **bubblewrap over landlock** for
+    /// this initial wiring for two reasons:
+    ///
+    ///   1. **Symmetry with seatbelt**: both macOS seatbelt and the bubblewrap
+    ///      wrapper are external binaries invoked with a generated
+    ///      declarative profile/argv. The dispatch site, the platform-guard
+    ///      error, the cross-platform `cfg` contract, and the test surface
+    ///      all slot in with zero shape changes.
+    ///   2. **No new dependency**: bwrap is a single binary the operator
+    ///      installs system-wide (`apt install bubblewrap`, `dnf install
+    ///      bubblewrap`, etc.). Wiring `landlock` instead would mean adding
+    ///      a kernel-version-gated Rust crate, conditional compilation
+    ///      across `target_os = "linux"` × kernel `>= 5.13`, and a much
+    ///      larger surface to test. Bubblewrap's `--unshare-net` and
+    ///      `--bind` flags give us the same deny-network + cwd-bind
+    ///      guarantees from userspace without that surface area.
+    ///
+    /// On any non-Linux platform the call site MUST reject this with a
+    /// clear "unsupported on this platform" error rather than silently
+    /// downgrading to `None` — the same cross-platform contract seatbelt
+    /// establishes (inverted: Linux variant off-Linux is the error path,
+    /// not seatbelt off-mac).
+    LinuxBubblewrap,
     /// Forward-compat catch-all: a future build (or a typo) that names a
     /// backend this binary doesn't implement. We deserialize unknown tags
     /// into this variant so a config keeps loading — the dispatch site is
     /// the single place that surfaces the unsupported-backend error to the
-    /// operator when they actually try to use it.
+    /// operator when they actually try to use it. Kept LAST so the
+    /// `#[serde(other)]` fallback matches tags not enumerated above; any
+    /// new variant must be added BEFORE this arm so it deserializes
+    /// correctly.
     #[serde(other)]
     Unsupported,
 }
@@ -748,6 +780,66 @@ impl Default for SeatbeltProfileOptions {
     }
 }
 
+/// Per-call-site knobs of the Linux bubblewrap wrapper. Each field maps to
+/// one bwrap argv entry (or block thereof) so the generated argv is
+/// auditable end-to-end (see
+/// `crates/zoder-cli/src/exec_safety::generate_bubblewrap_argv`). Mirrors
+/// `SeatbeltProfileOptions` 1:1 so an operator who has one profile block can
+/// copy the shape across to the other backend without re-reading docs.
+///
+/// Default deny-network + bind-workdir semantics match the macOS seatbelt
+/// profile's defaults — the two backends are intentionally symmetric so the
+/// operator-visible "least-privilege" contract is the same regardless of
+/// host OS.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxBubblewrapProfileOptions {
+    /// Isolate the network namespace (`--unshare-net`). Default `true` —
+    /// most `--check` commands (`cargo test`, `pytest`) do not need network
+    /// and a compromised test must not silently phone home. Operators who
+    /// run network-dependent checks flip this to `false`; the argv then
+    /// omits the `--unshare-net` flag.
+    #[serde(default = "default_bwrap_unshare_net")]
+    pub unshare_net: bool,
+    /// Mount `/tmp` (and `/var/tmp` as a symlink-fallback) read-write
+    /// inside the sandbox. Default `true` because `cargo`, `pytest`,
+    /// `node`, and almost every common `--check` writes intermediates there.
+    /// Operators on hardened hosts can flip this off; the argv then omits
+    /// the tmp bind mounts and any tool that needs scratch space will fail
+    /// loudly.
+    #[serde(default = "default_bwrap_allow_tmp")]
+    pub allow_tmp: bool,
+    /// Read access to `/home` (read-only bind; no writes). Default `false`
+    /// because most builds either inline everything they need under the
+    /// working dir or fail loudly — granting read access to `/home`
+    /// effectively exposes `~/.cargo`, `~/.npm`, etc. Operators who need
+    /// those to be visible flip this to `true`; the argv then includes a
+    /// `--ro-bind /home /home` entry. Writes to `/home` remain denied
+    /// because the bind is read-only.
+    #[serde(default = "default_bwrap_allow_home_read")]
+    pub allow_home_read: bool,
+}
+
+fn default_bwrap_unshare_net() -> bool {
+    true
+}
+fn default_bwrap_allow_tmp() -> bool {
+    true
+}
+fn default_bwrap_allow_home_read() -> bool {
+    false
+}
+
+impl Default for LinuxBubblewrapProfileOptions {
+    fn default() -> Self {
+        Self {
+            unshare_net: default_bwrap_unshare_net(),
+            allow_tmp: default_bwrap_allow_tmp(),
+            allow_home_read: default_bwrap_allow_home_read(),
+        }
+    }
+}
+
 /// `[exec_safety]` block from `config.json` / an overlay TOML. Owns the
 /// opt-in OS-sandbox backend selection and the per-backend profile knobs.
 /// Absent block or absent `backend` = `ExecSandbox::None` = current behavior.
@@ -760,12 +852,19 @@ pub struct ExecSafetyConfig {
     /// their cross-platform contracts.
     #[serde(default)]
     pub backend: ExecSandbox,
-    /// Per-backend profile knobs. Currently only consulted when
+    /// Per-backend profile knobs. Currently consulted when
     /// `backend == ExecSandbox::Seatbelt`; ignored otherwise so an operator
     /// who later flips the backend from `None` to `Seatbelt` doesn't have
     /// to also move their profile options.
     #[serde(default)]
     pub seatbelt: SeatbeltProfileOptions,
+    /// Per-backend profile knobs for the Linux bubblewrap wrapper.
+    /// Consulted when `backend == ExecSandbox::LinuxBubblewrap`; ignored
+    /// otherwise so an operator who flips the backend from `Seatbelt` (on
+    /// a Mac) to `LinuxBubblewrap` (on a Linux box) doesn't have to also
+    /// move their profile options.
+    #[serde(default)]
+    pub linux_bubblewrap: LinuxBubblewrapProfileOptions,
 }
 
 impl Config {
