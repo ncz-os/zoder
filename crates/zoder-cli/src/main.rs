@@ -9,6 +9,7 @@ use fs2::FileExt;
 mod agentic;
 mod exec_safety;
 mod goose;
+mod utilization;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
