@@ -218,6 +218,21 @@ struct Cli {
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
+    /// Persist the engine-side session id between `zoder` invocations
+    /// so follow-up runs resume the same engine session instead of
+    /// spinning up a fresh one every time. The id is stored under
+    /// `~/.zoder/sessions/engine_sessions.json`, keyed per
+    /// `(engine_kind, canonical-cwd)` so different repos / engines
+    /// don't cross-talk. Default OFF (every pre-this-flag run created
+    /// a fresh session; toggling this flag is the only thing that
+    /// changes behavior).
+    ///
+    /// The driver falls back to creating a fresh session automatically
+    /// when the engine rejects a resume (e.g. the session was
+    /// evicted server-side since the last run), so a stale id never
+    /// hard-fails a run.
+    #[arg(long = "persist-session", global = true)]
+    persist_session: bool,
     /// Hard wall-clock budget for a single `loop` phase (author, `--check`,
     /// review), in seconds (default 900). The watchdog kills the spawned
     /// child AND its process group when the budget elapses, so a wedged
@@ -3897,9 +3912,10 @@ mod cli_switch_regression_tests {
         saved.save(&sessions).unwrap();
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
-        let got = resolve_engine_session_id(&cli, &sessions, None)
-            .expect("--continue with a prior session must resolve")
-            .expect("--continue must yield a session id");
+        let got =
+            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
+                .expect("--continue with a prior session must resolve")
+                .expect("--continue must yield a session id");
         assert_eq!(
             got, original.id,
             "--continue must attach to the prior session, not mint a fresh one"
@@ -3916,8 +3932,9 @@ mod cli_switch_regression_tests {
         std::fs::create_dir_all(&sessions).unwrap();
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
-        let err = resolve_engine_session_id(&cli, &sessions, None)
-            .expect_err("--continue with no prior session must be a hard error");
+        let err =
+            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
+                .expect_err("--continue with no prior session must be a hard error");
         let msg = err.to_string();
         assert!(
             msg.contains("--continue") && msg.contains("no prior session"),
@@ -3936,8 +3953,9 @@ mod cli_switch_regression_tests {
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
-        let got = resolve_engine_session_id(&cli, &sessions, None)
-            .expect("no --session/--continue must not error");
+        let got =
+            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
+                .expect("no --session/--continue must not error");
         assert!(got.is_none(), "fresh invocation must yield None");
     }
 
@@ -3954,9 +3972,10 @@ mod cli_switch_regression_tests {
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "explicit-id"])
             .unwrap();
-        let got = resolve_engine_session_id(&cli, &sessions, None)
-            .expect("explicit --session must succeed")
-            .expect("explicit --session must yield Some");
+        let got =
+            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
+                .expect("explicit --session must succeed")
+                .expect("explicit --session must yield Some");
         assert_eq!(
             got, "explicit-id",
             "--session <id> must beat --continue regardless of what's in the sessions dir"
@@ -3974,9 +3993,14 @@ mod cli_switch_regression_tests {
 
         let cli =
             Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "from-cli"]).unwrap();
-        let got = resolve_engine_session_id(&cli, &sessions, Some("from-loop"))
-            .expect("override must succeed")
-            .expect("override must yield Some");
+        let got = resolve_engine_session_id(
+            &cli,
+            &sessions,
+            zoder_core::EngineKind::Zeroclaw,
+            Some("from-loop"),
+        )
+        .expect("override must succeed")
+        .expect("override must yield Some");
         assert_eq!(got, "from-loop");
     }
 }
@@ -4277,12 +4301,20 @@ mod ledger_integrity_tests {
 ///      every time. With this helper, an `--continue` without a prior
 ///      session is rejected with a clear error (instead of fabricating an
 ///      empty context) and the engine continues the real prior thread.
+///   4. `--persist-session` engine-side session record (the
+///      persistent-goose-sessions slice): if the operator opted in
+///      via the flag and the engine-session store has a fresh record
+///      for this `(engine_kind, cwd)`, return that id. Returns `None`
+///      (= "mint a fresh session") when the flag is off, when no
+///      record is on disk, or when the only record is stale (older
+///      than the freshness window or scoped to a different cwd).
 ///
 /// Both Zeroclaw and Goose accept a session id through the same
 /// `AgentOptions.session_id` field, so this lookup is engine-agnostic.
 fn resolve_engine_session_id(
     cli: &Cli,
     sessions_dir: &Path,
+    engine_kind: EngineKind,
     session_override: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     if let Some(id) = session_override {
@@ -4300,6 +4332,24 @@ fn resolve_engine_session_id(
             )
         })?;
         return Ok(Some(session.id));
+    }
+    if cli.persist_session {
+        // PERSISTENT-SESSIONS SLICE: with `--persist-session` set, look
+        // up the engine-side store. The lookup is best-effort: a
+        // corrupt file or IO error must NOT fail the run (the
+        // engine fallback would mint a fresh session anyway), so we
+        // collapse any non-`Ok(Some)` into `Ok(None)`.
+        let store_path = sessions_dir.join("engine_sessions.json");
+        let cfg = zoder_core::engine_rpc::session_store::StoreConfig::new(&store_path);
+        let scope = zoder_core::engine_rpc::session_store::make_scope(
+            zoder_core::engine_rpc::engine_kind_scope(engine_kind),
+            &agentic_cwd(cli)?,
+        );
+        if let Ok(Some(rec)) =
+            zoder_core::engine_rpc::session_store::EngineSessionStore::load(&cfg, &scope)
+        {
+            return Ok(Some(rec.session_id));
+        }
     }
     Ok(None)
 }
@@ -4438,8 +4488,12 @@ pub(crate) async fn agentic_turn(
     // same path as the model/routing resolution keeps `--continue` errors
     // co-located with the other early-validation steps, before we commit to
     // an engine dispatch.
-    let engine_session_id =
-        resolve_engine_session_id(cli, &eng.cfg.sessions_dir(), session_override.as_deref())?;
+    let engine_session_id = resolve_engine_session_id(
+        cli,
+        &eng.cfg.sessions_dir(),
+        engine_kind,
+        session_override.as_deref(),
+    )?;
 
     // The Goose path SPAWNS its own engine process (`goose acp` over stdio)
     // and does not use `opts.socket`. We must NOT touch the zeroclaw daemon
@@ -4551,6 +4605,20 @@ pub(crate) async fn agentic_turn(
         // run. The agentic gates continue to be byte-identical
         // for a project without project-instructions files.
         project_instructions: load_project_instructions(&cwd),
+        // PERSISTENT-SESSIONS SLICE: wire `--persist-session` into
+        // the driver. Default OFF (no flag set) preserves today's
+        // "always-fresh-session" wire shape byte-for-byte; with
+        // the flag, the driver consults the engine-session store
+        // at `~/.zoder/sessions/engine_sessions.json` before
+        // session/new (load-before) and writes the returned id
+        // back (save-after). The store path is the established
+        // `Config::sessions_dir()` location — no new dotfile.
+        persist_session_id: cli.persist_session,
+        session_store_path: if cli.persist_session {
+            Some(eng.cfg.sessions_dir().join("engine_sessions.json"))
+        } else {
+            None
+        },
     };
 
     let started = std::time::Instant::now();

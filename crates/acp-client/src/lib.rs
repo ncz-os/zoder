@@ -18,6 +18,8 @@
 //! via `engine_cost::fetch_engine_cost` (a windowed `cost/query`). Token counts
 //! surfaced here (from `context_usage`) are best-effort for live display.
 
+pub mod session_store;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,6 +28,19 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Child;
+
+/// Convert an `EngineKind` into the canonical scope prefix the
+/// persistence layer uses. Kept here (rather than in `session_store`)
+/// so the wire layer can build the scope key without taking a
+/// dependency on the store's API surface — and so a future engine
+/// (non-`goose`, non-`zeroclaw`) only needs to know to update this
+/// one helper to keep the persistence key stable.
+pub fn engine_kind_scope(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Zeroclaw => "zeroclaw",
+        EngineKind::Goose => "goose",
+    }
+}
 
 /// How to reach the ACP engine. Today: an already-running daemon over its
 /// Unix socket. Future: spawn a child process (e.g. `goose acp`) and speak
@@ -490,6 +505,37 @@ pub struct AgentOptions {
     /// decoupled from filesystem IO (parity with how
     /// [`Self::mcp_servers`] is handed in pre-serialized).
     pub project_instructions: Option<String>,
+    /// When `true`, the driver CONSULTS the engine-session persistence
+    /// store at [`Self::session_store_path`] before creating a new
+    /// session, and writes the returned `session_id` to that store
+    /// after a successful run. When the persisted id's scope
+    /// (`<engine_kind>:<canonical-cwd>`) differs from the current
+    /// scope OR the record is older than the store's freshness
+    /// window (default 7 days), the driver treats the record as
+    /// absent and creates a fresh session exactly like the OFF path.
+    /// When the engine REJECTS a resume (`session/new` returns a
+    /// JSON-RPC error reply after the client sent a known
+    /// `session_id`), the driver overwrites the stale record with
+    /// the new session id from the fallback create — the next run
+    /// resumes the new session, not the dead one.
+    ///
+    /// Default `false` (NON-BREAKING): today's wire shape is
+    /// always-create-new and every pre-this-slice run expects that.
+    /// The CLI opts in explicitly via a `--persist-session` flag so
+    /// a turn that worked yesterday keeps the same wire shape
+    /// tomorrow unless the operator asked for persistence.
+    pub persist_session_id: bool,
+    /// Filesystem location for the engine-session persistence file
+    /// (used only when [`Self::persist_session_id`] is `true`). The
+    /// store is a tiny JSON object — one record per
+    /// `<engine_kind, canonical-cwd>` scope — under
+    /// `~/.zoder/sessions/engine_sessions.json` by convention. The CLI
+    /// populates this from `Config::sessions_dir()` so this layer stays
+    /// decoupled from the zoder home layout. `None` with
+    /// `persist_session_id = true` is a configuration error surfaced at
+    /// the dispatch site, not here, so existing call sites stay
+    /// byte-for-byte identical.
+    pub session_store_path: Option<PathBuf>,
 }
 
 impl AgentOptions {
@@ -529,6 +575,13 @@ impl AgentOptions {
             // this when AGENTS.md / CLAUDE.md is present at the repo
             // root.
             project_instructions: None,
+            // PERSISTENT-SESSIONS SLICE: default OFF to preserve
+            // today's wire shape (every run starts a fresh session).
+            // The CLI explicitly opts in via `--persist-session`; with
+            // the default OFF every existing call site produces the
+            // same JSON-RPC frames as before this slice.
+            persist_session_id: false,
+            session_store_path: None,
         }
     }
 }
@@ -726,6 +779,23 @@ async fn drive<F: FnMut(AgentEvent)>(
     // this instant and returns whatever has accumulated (outcome="timeout"),
     // rather than the caller dropping the future and losing all partial work.
     let deadline = tokio::time::Instant::now() + opts.timeout;
+
+    // PERSISTENT-SESSIONS SLICE: when the CLI opted in, look for a
+    // non-stale record for this (engine, cwd) scope BEFORE sending
+    // `session/new`. A `None` here drives the same "fresh session"
+    // path as the OFF case — the wire shape is identical, so a
+    // first-run-after-enable still produces a session/new without
+    // `session_id` in the params.
+    let scope = session_store::make_scope(engine_kind_scope(EngineKind::Zeroclaw), &opts.cwd);
+    let mut effective_session_id: Option<String> = opts.session_id.clone();
+    if effective_session_id.is_none() && opts.persist_session_id {
+        if let Some(store_path) = opts.session_store_path.as_ref() {
+            let cfg = session_store::StoreConfig::new(store_path);
+            if let Ok(Some(rec)) = session_store::EngineSessionStore::load(&cfg, &scope) {
+                effective_session_id = Some(rec.session_id);
+            }
+        }
+    }
     let conn = connect_transport(&EngineTransport::UnixSocket(opts.socket.clone())).await?;
     let mut reader = BufReader::new(conn.reader);
     let mut write_half = conn.writer;
@@ -745,11 +815,21 @@ async fn drive<F: FnMut(AgentEvent)>(
     read_result(&mut reader, "init").await?;
 
     // 2. session/new (acp = Code mode: pins cwd, excludes long-term memory tools).
+    //
+    // PERSISTENT-SESSIONS SLICE: when `effective_session_id` is
+    // `Some`, the params include a `session_id` field per the
+    // existing wire contract (~L805-807). If the engine returns a
+    // JSON-RPC error reply — meaning the persisted id is unknown /
+    // expired on the server side — we clear the stale record (so
+    // the NEXT run doesn't keep failing the same way) and retry
+    // `session/new` with no `session_id` to mint a fresh one. A
+    // non-error failure (timeout, dropped connection) is surfaced
+    // unchanged so the caller can decide.
     let mut new_params = serde_json::Map::new();
     new_params.insert("agent_alias".into(), json!(opts.agent_alias));
     new_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
     new_params.insert("chat_mode".into(), json!("acp"));
-    if let Some(sid) = &opts.session_id {
+    if let Some(sid) = &effective_session_id {
         new_params.insert("session_id".into(), json!(sid));
     }
     write_frame(
@@ -762,7 +842,48 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    let new_res = read_result(&mut reader, "new").await?;
+    let new_res = match read_result_inner(&mut reader, "new").await? {
+        Ok(v) => v,
+        Err(msg) => {
+            // Engine rejected the resume. The persisted id is stale
+            // by definition — drop it so the next run doesn't keep
+            // tripping the same error — and retry without a
+            // session_id so the server mints a fresh one. The new
+            // id will be persisted at the end of `drive`.
+            if opts.persist_session_id && effective_session_id.is_some() {
+                if let Some(store_path) = opts.session_store_path.as_ref() {
+                    let cfg = session_store::StoreConfig::new(store_path);
+                    if let Err(e) = session_store::EngineSessionStore::clear(&cfg, &scope) {
+                        eprintln!(
+                            "zoder: warning: failed to clear stale engine-session record ({scope}): {e}"
+                        );
+                    }
+                }
+            }
+            // Retry without session_id.
+            let mut retry_params = serde_json::Map::new();
+            retry_params.insert("agent_alias".into(), json!(opts.agent_alias));
+            retry_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
+            retry_params.insert("chat_mode".into(), json!("acp"));
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "method": "session/new",
+                    "params": Value::Object(retry_params),
+                }),
+            )
+            .await?;
+            // A retry-failure is fatal (any repeated error here means
+            // the engine itself is misbehaving — not a stale id).
+            read_result(&mut reader, "new").await.map_err(|_| {
+                anyhow!(
+                    "engine error on session/new: {msg} (and the fresh-create retry also failed)"
+                )
+            })?
+        }
+    };
     let session_id = new_res
         .get("session_id")
         .and_then(Value::as_str)
@@ -965,6 +1086,13 @@ async fn drive<F: FnMut(AgentEvent)>(
         }
     };
 
+    // PERSISTENT-SESSIONS SLICE: persisting the (potentially-freshly-
+    // minted) session id so the NEXT run resumes it. Errors are
+    // surfaced as a stderr warning rather than failed: a write error
+    // here is non-fatal (the current run already succeeded), and a
+    // missed save just means the next run starts fresh — the same
+    // outcome as if persistence were OFF.
+    persist_session_after(&session_id, opts, &scope);
     Ok(AgentRun {
         session_id,
         outcome,
@@ -985,6 +1113,36 @@ fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
             let t = tool.to_ascii_lowercase();
             DEFAULT_AUTO_APPROVE.iter().any(|a| t == *a)
         }
+    }
+}
+
+/// PERSISTENT-SESSIONS SLICE: persist `session_id` to the
+/// engine-session store when the caller opted in. Reads
+/// `opts.persist_session_id` and `opts.session_store_path`; a
+/// no-op when persistence is OFF or no path is configured (the
+/// CLI guarantees both are set together when it opts in, so the
+/// `None` path here is only hit in tests).
+///
+/// A write failure here is logged as a warning rather than
+/// returned as an error: the run itself already succeeded, and a
+/// missed save simply means the next run will create a fresh
+/// session — exactly the same outcome as if persistence had been
+/// OFF. There's no point failing the run on what is essentially
+/// a cache write.
+fn persist_session_after(session_id: &str, opts: &AgentOptions, scope: &str) {
+    if !opts.persist_session_id {
+        return;
+    }
+    let Some(store_path) = opts.session_store_path.as_ref() else {
+        return;
+    };
+    let cfg = session_store::StoreConfig::new(store_path);
+    // The path here is whatever the caller threaded through; we
+    // don't know which engine the caller intended for the scope
+    // key, so use `scope` directly (built by the driver based on
+    // its engine_kind_scope helper).
+    if let Err(e) = session_store::EngineSessionStore::save_with_scope(&cfg, scope, session_id) {
+        eprintln!("zoder: warning: failed to persist engine-session record ({scope}): {e}");
     }
 }
 
@@ -1969,6 +2127,23 @@ where
 {
     let deadline = tokio::time::Instant::now() + opts.timeout;
 
+    // PERSISTENT-SESSIONS SLICE: when the CLI opted in, look for a
+    // non-stale record for this (engine, cwd) scope BEFORE sending
+    // `session/new`. A `None` here drives the same "fresh session"
+    // path as the OFF case — the wire shape is identical, so a
+    // first-run-after-enable still produces a session/new without
+    // `sessionId` in the params.
+    let scope = session_store::make_scope(engine_kind_scope(EngineKind::Goose), &opts.cwd);
+    let mut effective_session_id: Option<String> = opts.session_id.clone();
+    if effective_session_id.is_none() && opts.persist_session_id {
+        if let Some(store_path) = opts.session_store_path.as_ref() {
+            let cfg = session_store::StoreConfig::new(store_path);
+            if let Ok(Some(rec)) = session_store::EngineSessionStore::load(&cfg, &scope) {
+                effective_session_id = Some(rec.session_id);
+            }
+        }
+    }
+
     // 1. initialize. Standard ACP uses camelCase fields. We send our highest
     //    supported version; the server replies with its own; we use the min
     //    of the two (the canonical "negotiate" step). We don't hardcode
@@ -2015,25 +2190,35 @@ where
     //    omit zeroclaw's `agent_alias` / `chat_mode` — goose doesn't know
     //    what they mean and would either ignore or error on them.
     //
+    //    PERSISTENT-SESSIONS SLICE: when an effective session id is
+    //    available (either hand-set via `opts.session_id` or loaded
+    //    from the persistence store), it is included as `sessionId`
+    //    so the engine can resume an existing session. An
+    //    unrecognized / expired id surfaces as a JSON-RPC error
+    //    reply; we clear the stale record and retry without
+    //    `sessionId` to mint a fresh session.
+    //
     //    `mcpServers` is populated by the CLI from the parsed engine-config
     //    server specs (see `zoder_core::to_acp_mcp_servers`); an empty
     //    `opts.mcp_servers` keeps today's wire shape (`[]`) so this slice
     //    is NON-BREAKING when no servers are configured.
-    let new_params = json!({
-        "cwd": opts.cwd.to_string_lossy(),
-        "mcpServers": opts.mcp_servers,
-    });
+    let mut new_params = serde_json::Map::new();
+    new_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
+    new_params.insert("mcpServers".into(), json!(opts.mcp_servers));
+    if let Some(sid) = &effective_session_id {
+        new_params.insert("sessionId".into(), json!(sid));
+    }
     write_frame(
         write_half,
         &json!({
             "jsonrpc": "2.0",
             "id": "new",
             "method": "session/new",
-            "params": new_params,
+            "params": Value::Object(new_params),
         }),
     )
     .await?;
-    let new_res = match tokio::time::timeout_at(deadline, read_result(reader, "new")).await {
+    let new_res = match tokio::time::timeout_at(deadline, read_result_inner(reader, "new")).await {
         Ok(r) => r?,
         // session/new timed out. No session id was ever issued, so we
         // cannot send a `session/cancel` (it would carry an empty
@@ -2043,6 +2228,51 @@ where
                 "goose session/new timed out after {:?}",
                 opts.timeout
             ))
+        }
+    };
+    let new_res = match new_res {
+        Ok(v) => v,
+        Err(msg) => {
+            // Engine rejected a resume. The persisted id is stale
+            // by definition — drop it so the next run doesn't keep
+            // tripping the same error — and retry without a
+            // sessionId so the engine mints a fresh one.
+            if opts.persist_session_id && effective_session_id.is_some() {
+                if let Some(store_path) = opts.session_store_path.as_ref() {
+                    let cfg = session_store::StoreConfig::new(store_path);
+                    if let Err(e) = session_store::EngineSessionStore::clear(&cfg, &scope) {
+                        eprintln!(
+                            "zoder: warning: failed to clear stale engine-session record ({scope}): {e}"
+                        );
+                    }
+                }
+            }
+            let mut retry_params = serde_json::Map::new();
+            retry_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
+            retry_params.insert("mcpServers".into(), json!(opts.mcp_servers));
+            write_frame(
+                write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "method": "session/new",
+                    "params": Value::Object(retry_params),
+                }),
+            )
+            .await?;
+            let retry =
+                match tokio::time::timeout_at(deadline, read_result_inner(reader, "new")).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "goose session/new timed out after {:?}",
+                            opts.timeout
+                        ))
+                    }
+                };
+            retry.map_err(|retry_msg| {
+                anyhow!("engine error on session/new: {msg} (and the fresh-create retry also failed: {retry_msg})")
+            })?
         }
     };
     let session_id: Option<String> = new_res
@@ -2493,6 +2723,12 @@ where
         }
     };
 
+    // PERSISTENT-SESSIONS SLICE: persisting the (potentially-freshly-
+    // minted) session id so the NEXT run resumes it. Same
+    // rationale as the zeroclaw driver: a write failure here is
+    // a warning, not a run failure (a missed save means the next
+    // run starts fresh, identical to the OFF path).
+    persist_session_after(&session_id, opts, &scope);
     Ok(AgentRun {
         session_id,
         outcome,
@@ -2543,6 +2779,21 @@ async fn read_result(
     reader: &mut (impl AsyncBufReadExt + Unpin),
     want_id: &str,
 ) -> anyhow::Result<Value> {
+    read_result_inner(reader, want_id)
+        .await?
+        .map_err(|msg| anyhow!("engine error on {want_id}: {msg}"))
+}
+
+/// Lower-level variant that returns the engine-error message as `Err`
+/// (without an anyhow wrapper) so the caller can decide whether the
+/// error is recoverable in its context. Used by the persistence-aware
+/// `session/new` sites to distinguish a JSON-RPC error reply (which
+/// triggers the resume-rejected fallback in the persistent-sessions
+/// slice) from any other IO/protocol failure.
+async fn read_result_inner(
+    reader: &mut (impl AsyncBufReadExt + Unpin),
+    want_id: &str,
+) -> anyhow::Result<Result<Value, String>> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -2564,10 +2815,11 @@ async fn read_result(
             let msg = err
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("engine error on {want_id}: {msg}");
+                .unwrap_or("unknown error")
+                .to_string();
+            return Ok(Err(msg));
         }
-        return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
+        return Ok(Ok(frame.get("result").cloned().unwrap_or(Value::Null)));
     }
 }
 
@@ -3452,6 +3704,12 @@ mod tests {
             // verbatim. A test that wants to exercise the prepended
             // block sets it explicitly.
             project_instructions: None,
+            // PERSISTENT-SESSIONS SLICE: default OFF in tests so the
+            // existing assertions (which assert the wire shape is
+            // always-create-new) keep passing byte-for-byte. Tests
+            // that exercise persistence set this explicitly.
+            persist_session_id: false,
+            session_store_path: None,
         }
     }
 
@@ -4296,6 +4554,418 @@ mod tests {
         // initialize + session/prompt must remain unchanged in shape.
         assert_eq!(frames[0]["method"], "initialize");
         assert_eq!(frames[2]["method"], "session/prompt");
+    }
+
+    // -----------------------------------------------------------------
+    // PERSISTENT-SESSIONS SLICE — resume + save + fall-back wiring.
+    //
+    // Tests below exercise:
+    //   * explicit `opts.session_id` is forwarded to `session/new` as
+    //     `sessionId` (the resume wire-shape lock);
+    //   * persistence disabled / store empty = byte-for-byte the same
+    //     wire shape as the pre-this-slice driver (regression guard);
+    //   * persistence enabled + fresh record in the store = the
+    //     loaded id is what reaches `session/new`;
+    //   * persistence enabled + the engine replies with a
+    //     `session/new` error (the "stale id" path) = the driver
+    //     retries without `sessionId`, saves the new id, and the
+    //     stale record is overwritten (no panic, no double-counted
+    //     session ids).
+    // -----------------------------------------------------------------
+
+    /// Mock variant for the persistent-sessions tests. Behaves like
+    /// [`run_mock`] EXCEPT the FIRST `session/new` response is an
+    /// error reply (the engine telling us our persisted id is gone),
+    /// and the SECOND `session/new` (the fallback fresh-create)
+    /// succeeds with `sessionId = recovered_id`. Asserts that the
+    /// client sent exactly two `session/new` requests: one with
+    /// `sessionId` populated (the resume), one without (the
+    /// fallback).
+    async fn run_mock_session_new_rejected_then_recovers(
+        server: MockGoose,
+        engine_io: tokio::io::DuplexStream,
+        recovered_id: &'static str,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+        let (r, mut w) = tokio::io::split(engine_io);
+        let mut r = tokio::io::BufReader::new(r);
+
+        async fn read_one(
+            r: &mut tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+            received: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        ) {
+            let mut line = String::new();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                received.lock().unwrap().push(v);
+            }
+        }
+        async fn write_one(
+            w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            v: serde_json::Value,
+        ) {
+            let s = serde_json::to_string(&v).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+        }
+
+        // 1. read initialize -> reply.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocolVersion": 1 }
+            }),
+        )
+        .await;
+
+        // 2. read session/new (resume) -> error.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "error": { "code": -32004, "message": "session not found" }
+            }),
+        )
+        .await;
+
+        // 3. read session/new (fallback fresh create) -> success.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "result": { "sessionId": recovered_id }
+            }),
+        )
+        .await;
+
+        // 4. outbound updates (session/update notifications, etc.).
+        for frame in &server.outbound {
+            let parsed: serde_json::Value = serde_json::from_str(frame).unwrap();
+            write_one(&mut w, parsed.clone()).await;
+        }
+
+        // 5. read session/prompt -> terminal reply.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "prompt",
+                "result": { "stopReason": "end_turn" }
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn goose_drive_session_new_includes_session_id_when_resuming() {
+        // Forwarding test: when the CLI hands us an `opts.session_id`,
+        // the goose `session/new` params MUST carry `sessionId` so the
+        // engine can resume. This is the single non-persistence smoke
+        // test for the resume wire contract; the persistence tests
+        // below build on the same plumbing.
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.session_id = Some("goose-stored-1".to_string());
+        let (frames, run, _events) =
+            drive_against_mock_with_opts(vec![], false, ApprovalPolicy::Allowlist, opts).await;
+        let new = &frames[1];
+        assert_eq!(new["method"], "session/new");
+        let np = &new["params"];
+        assert_eq!(
+            np["sessionId"], "goose-stored-1",
+            "session/new must forward opts.session_id as sessionId"
+        );
+        // And the returned id is what the mock chose — NOT the input
+        // one. (Goose ignores the resume hint and mints fresh; the
+        // driver records whatever the server actually returned.)
+        assert_eq!(run.session_id, "goose-test-session-1");
+    }
+
+    #[tokio::test]
+    async fn goose_drive_default_opts_keep_todays_wire_shape() {
+        // Regression guard for the "persistence OFF preserves byte-
+        // for-byte behavior" promise at the module level:
+        // `goose_opts` builds an AgentOptions with both
+        // `persist_session_id = false` and `session_id = None`; the
+        // session/new frame MUST NOT contain `sessionId`, and a
+        // second run with the same opts MUST produce identical
+        // frames (no implicit cache lookup introduces a hidden
+        // `sessionId`).
+        let (frames1, _, _) = drive_against_mock_with_opts(
+            vec![],
+            false,
+            ApprovalPolicy::Allowlist,
+            goose_opts(None),
+        )
+        .await;
+        let (frames2, _, _) = drive_against_mock_with_opts(
+            vec![],
+            false,
+            ApprovalPolicy::Allowlist,
+            goose_opts(None),
+        )
+        .await;
+        for (label, frames) in [("run-1", &frames1), ("run-2", &frames2)] {
+            let new = &frames[1];
+            assert_eq!(new["method"], "session/new");
+            assert!(
+                new["params"].get("sessionId").is_none(),
+                "{label}: persistence OFF must NOT add sessionId to session/new"
+            );
+        }
+        // Bit-for-bit identical session/new between two runs.
+        assert_eq!(
+            frames1[1], frames2[1],
+            "two consecutive runs with persist_session_id=false must emit identical session/new frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn goose_drive_persistence_enabled_uses_stored_id_on_resume() {
+        // Persistence ON + a fresh record in the store + the engine
+        // would accept a resume = the loaded id (NOT the seeded mock
+        // value) reaches `session/new` as `sessionId`, and the
+        // returned id survives to AgentRun (engine passthrough).
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("engine_sessions.json");
+        let cfg = session_store::StoreConfig::new(&store_path);
+        session_store::EngineSessionStore::save(
+            &cfg,
+            "goose",
+            &PathBuf::from("/tmp"),
+            "goose-stored-1",
+        )
+        .unwrap();
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.persist_session_id = true;
+        opts.session_store_path = Some(store_path.clone());
+        let (frames, run, _events) =
+            drive_against_mock_with_opts(vec![], false, ApprovalPolicy::Allowlist, opts).await;
+        let new = &frames[1];
+        assert_eq!(
+            new["params"]["sessionId"], "goose-stored-1",
+            "loaded store id must reach session/new as sessionId"
+        );
+        // The mock returns "goose-test-session-1" on success (any
+        // session/new success). Assert that the driver records
+        // whatever the engine actually returned, since the engine
+        // is the source of truth (some engines keep the same id on
+        // resume; some mint fresh).
+        assert_eq!(run.session_id, "goose-test-session-1");
+
+        // And the returned id was persisted (overwriting the seeded
+        // record).
+        let cfg = session_store::StoreConfig::new(&store_path);
+        let scope = session_store::make_scope("goose", &PathBuf::from("/tmp"));
+        let rec = session_store::EngineSessionStore::load(&cfg, &scope)
+            .unwrap()
+            .expect("session id must be saved after a successful run");
+        assert_eq!(rec.session_id, "goose-test-session-1");
+    }
+
+    #[tokio::test]
+    async fn goose_drive_persistence_enabled_persists_id_on_first_run() {
+        // First-run parity: persistence ON with no record yet on disk
+        // MUST emit `session/new` WITHOUT `sessionId` (same wire
+        // shape as the OFF path) AND save the returned id for the
+        // next run. This is the non-breaking guarantee — enabling
+        // persistence doesn't change what the first run sends.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("engine_sessions.json");
+        let cfg = session_store::StoreConfig::new(&store_path);
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.persist_session_id = true;
+        opts.session_store_path = Some(store_path.clone());
+        let (frames, run, _events) =
+            drive_against_mock_with_opts(vec![], false, ApprovalPolicy::Allowlist, opts).await;
+
+        let new = &frames[1];
+        assert!(
+            new["params"].get("sessionId").is_none(),
+            "first run with empty store must NOT carry sessionId (same as OFF)"
+        );
+        assert_eq!(run.session_id, "goose-test-session-1");
+
+        let scope = session_store::make_scope("goose", &PathBuf::from("/tmp"));
+        let rec = session_store::EngineSessionStore::load(&cfg, &scope)
+            .unwrap()
+            .expect("first run must persist its returned id");
+        assert_eq!(rec.session_id, "goose-test-session-1");
+    }
+
+    #[tokio::test]
+    async fn goose_drive_resume_rejected_falls_back_and_overwrites_stale_record() {
+        // Headline behavior of the slice: stale persisted id +
+        // engine error reply on session/new = the driver retries
+        // WITHOUT sessionId, the engine mints a fresh id, and the
+        // returned id overwrites the stale record on disk. The
+        // test asserts each step:
+        //   1. exactly TWO session/new frames hit the wire (the
+        //      failed resume + the successful fresh-create);
+        //   2. the first carries the seeded persisted id as
+        //      sessionId, the second does NOT;
+        //   3. AgentRun.session_id is the FRESH id, not the seeded
+        //      one;
+        //   4. the on-disk record was overwritten — the next run
+        //      sees the fresh id, not the stale one.
+        // If any of those change, the persistence guarantee is
+        // silently broken (a "successful" run would still carry
+        // the dead id), so each one is asserted independently.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("engine_sessions.json");
+        let cfg = session_store::StoreConfig::new(&store_path);
+        // Seed with a stale id.
+        session_store::EngineSessionStore::save(
+            &cfg,
+            "goose",
+            &PathBuf::from("/tmp"),
+            "goose-stale-dead",
+        )
+        .unwrap();
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = MockGoose {
+            received: received.clone(),
+            outbound: vec![],
+        };
+        let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
+        let server_handle = tokio::spawn(run_mock_session_new_rejected_then_recovers(
+            server,
+            engine_io,
+            "goose-recovered-fresh",
+        ));
+
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.persist_session_id = true;
+        opts.session_store_path = Some(store_path.clone());
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let run = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
+            events.push(ev);
+        })
+        .await
+        .expect("resume-rejected + fresh-create retry must succeed (no panic)");
+        let _ = server_handle.await;
+
+        let frames = received.lock().unwrap().clone();
+        // 4 frames expected: init / first-new / second-new / prompt.
+        // The two session/new frames are at indices 1 and 2.
+        assert_eq!(frames.len(), 4, "init / new / new / prompt");
+        let first_new = &frames[1];
+        let second_new = &frames[2];
+        assert_eq!(first_new["method"], "session/new");
+        assert_eq!(second_new["method"], "session/new");
+        assert_eq!(
+            first_new["params"]["sessionId"], "goose-stale-dead",
+            "the first session/new must carry the persisted (stale) id"
+        );
+        assert!(
+            second_new["params"].get("sessionId").is_none(),
+            "the fallback session/new must NOT carry sessionId (fresh-create path)"
+        );
+
+        // The fallback session/new must still carry cwd + mcpServers
+        // — regression guard that the retry params match the
+        // pre-failure params exactly (no silent loss of the cwd
+        // pin or MCP servers).
+        assert_eq!(second_new["params"]["cwd"], "/tmp");
+        assert!(second_new["params"]["mcpServers"].is_array());
+
+        assert_eq!(
+            run.session_id, "goose-recovered-fresh",
+            "AgentRun must record the freshly issued id (not the stale one)"
+        );
+        assert_eq!(run.outcome, "completed");
+
+        // The next run's load must see the recovered id, not the
+        // stale one — this is the persistence invariant the slice
+        // is built around.
+        let scope = session_store::make_scope("goose", &PathBuf::from("/tmp"));
+        let rec = session_store::EngineSessionStore::load(&cfg, &scope)
+            .unwrap()
+            .expect("record must survive (overwritten with fresh id)");
+        assert_eq!(
+            rec.session_id, "goose-recovered-fresh",
+            "stale record must be overwritten with the fresh id"
+        );
+    }
+
+    #[tokio::test]
+    async fn goose_drive_stale_record_is_treated_as_absent() {
+        // Defensive guard: a record older than the freshness window
+        // (or for a different scope) must NOT shadow the
+        // always-create path. The driver must emit session/new
+        // WITHOUT sessionId — exact parity with the OFF path — and
+        // overwrite the stale record with whatever the engine
+        // returns (so an unstick step happens implicitly on the
+        // next run).
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("engine_sessions.json");
+        let seed_cfg = session_store::StoreConfig::new(&store_path);
+        session_store::EngineSessionStore::save(
+            &seed_cfg,
+            "goose",
+            &PathBuf::from("/tmp"),
+            "goose-very-old",
+        )
+        .unwrap();
+        // Pin "now" to a future timestamp so the seeded record
+        // (just written) is read with zero_age on the load, then
+        // manipulate updated_unix directly via store-side round
+        // trip: rewrite the file with an updated_unix in the
+        // distant past. Simplest: re-save with a now in the past
+        // using StoreConfig::with_now (test seam).
+        let stale_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - (session_store::DEFAULT_MAX_AGE_SECS + 60);
+        let stale_cfg = session_store::StoreConfig::new(&store_path).with_now(stale_secs);
+        session_store::EngineSessionStore::save(
+            &stale_cfg,
+            "goose",
+            &PathBuf::from("/tmp"),
+            "goose-very-old",
+        )
+        .unwrap();
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.persist_session_id = true;
+        opts.session_store_path = Some(store_path.clone());
+        let (frames, run, _) =
+            drive_against_mock_with_opts(vec![], false, ApprovalPolicy::Allowlist, opts).await;
+        let new = &frames[1];
+        assert!(
+            new["params"].get("sessionId").is_none(),
+            "a stale record must NOT participate in resume (treated as absent)"
+        );
+        // And the recovered record now carries the FRESH id, not
+        // the stale one — the driver's save-after replaces the old
+        // record.
+        let scope = session_store::make_scope("goose", &PathBuf::from("/tmp"));
+        let rec = session_store::EngineSessionStore::load(
+            &session_store::StoreConfig::new(&store_path),
+            &scope,
+        )
+        .unwrap()
+        .expect("fresh id must be saved");
+        assert_eq!(rec.session_id, run.session_id);
+        assert_ne!(
+            rec.session_id, "goose-very-old",
+            "stale record must be replaced"
+        );
     }
 
     #[tokio::test]
@@ -5797,6 +6467,11 @@ mod goose_acp_real_turn {
             // real-engine oracle continues to send the raw prompt
             // verbatim (matches every other `AgentOptions` literal).
             project_instructions: None,
+            // PERSISTENT-SESSIONS SLICE: default OFF — the real-engine
+            // oracle is gated behind `#[ignore]` and only validates
+            // parity with the pre-this-slice fresh-create path.
+            persist_session_id: false,
+            session_store_path: None,
         };
         let mut conn = connect_transport(&transport)
             .await
