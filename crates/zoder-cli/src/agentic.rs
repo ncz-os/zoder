@@ -2345,6 +2345,54 @@ async fn run_check_watched(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // In-process sandbox backends (currently: `LinuxLandlock`) apply
+    // their ruleset via a `pre_exec` callback that runs in the child
+    // between `fork` and `exec`. This is the textbook way to apply
+    // Landlock's in-kernel ruleset to a spawned child: the
+    // `landlock_restrict_self` syscall restricts ONLY the calling
+    // thread (per-task struct, inherited across fork and exec), so
+    // calling it in the parent would also restrict zoder itself. The
+    // callback is `Send + 'static` because tokio's `Command` requires
+    // it (the closure is moved into the freshly-forked child).
+    //
+    // The wiring is `cfg(target_os = "linux")`-gated because the
+    // underlying `landlock` crate (and the `apply_*` helper) only
+    // builds on Linux. On every other host the dispatch itself returns
+    // `Err` before we get here, so this branch is dead code on macOS
+    // but the rest of the function still compiles.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ruleset) = plan.in_process_ruleset.clone() {
+            use std::os::unix::process::CommandExt;
+            // The closure captures the descriptor list by value (it's
+            // a `Vec<LandlockRuleDescriptor>` we cloned out of the
+            // plan) and returns a `std::io::Result<()>` so tokio's
+            // `Command::pre_exec` accepts it. The
+            // `apply_landlock_ruleset_in_child` helper handles every
+            // crate call; we just adapt the error type here. A
+            // failure inside the closure surfaces as a normal spawn
+            // error from `command.spawn()` below — the loop renders
+            // it through the same `(false, tail)` shape as a real
+            // command failure.
+            let closure = move || {
+                crate::exec_safety::apply_landlock_ruleset_in_child(&ruleset)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            };
+            command.pre_exec(closure);
+        }
+    }
+    // On non-Linux hosts `plan.in_process_ruleset` is always `None`
+    // (the dispatch returns `Err` if the operator picks `LinuxLandlock`
+    // on a non-Linux host), so the `pre_exec` wiring is dead code on
+    // macOS. The `#[allow(unused_mut)]` here is NOT needed because
+    // `command` is always mutated via the `arg` / `process_group` calls
+    // above; the comment exists only to mark the boundary for future
+    // readers who wonder why there's no `else` arm.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &plan.in_process_ruleset; // suppress dead-code on macOS
+    }
+
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return (false, format!("failed to spawn check `{cmd}`: {e}")),
@@ -2429,6 +2477,25 @@ fn run_check(
     let mut cmd_builder = std::process::Command::new(&plan.argv[0]);
     for arg in &plan.argv[1..] {
         cmd_builder.arg(arg);
+    }
+    // Mirror the production `run_check_watched` `pre_exec` wiring so
+    // the test helper actually applies the in-process ruleset when
+    // the operator (or a test) selects `LinuxLandlock`. Without this
+    // the test helper would spawn the child without the Landlock
+    // ruleset, contradicting the contract the production code
+    // implements. The wiring is `cfg(target_os = "linux")`-gated for
+    // the same reason as in `run_check_watched` — the underlying
+    // `landlock` crate only builds on Linux.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ruleset) = plan.in_process_ruleset.clone() {
+            use std::os::unix::process::CommandExt;
+            let closure = move || {
+                crate::exec_safety::apply_landlock_ruleset_in_child(&ruleset)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            };
+            cmd_builder.pre_exec(closure);
+        }
     }
     match cmd_builder.current_dir(cwd).output() {
         Ok(o) => {
