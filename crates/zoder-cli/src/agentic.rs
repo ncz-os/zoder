@@ -3631,18 +3631,23 @@ pub(crate) async fn cmd_transfer(cli: &crate::Cli) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JobMeta {
-    id: String,
-    kind: String,
-    status: String, // running | done | failed | cancelled
-    cwd: String,
-    pid: u32,
-    started: DateTime<Utc>,
+pub(crate) struct JobMeta {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    /// `running` | `done` | `failed` | `cancelled` — the same on-disk
+    /// vocabulary `status`/`result`/`cancel` already key on.
+    pub(crate) status: String,
+    pub(crate) cwd: String,
+    pub(crate) pid: u32,
+    pub(crate) started: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    finished: Option<DateTime<Utc>>,
+    pub(crate) finished: Option<DateTime<Utc>>,
 }
 
-fn jobs_dir() -> PathBuf {
+/// Resolved state-directory home: `$ZODER_HOME` or `~/.zoder`. Exposed at
+/// crate scope so the jobs-management subcommand resolves the SAME place
+/// `status` / `result` / `cancel` read from — never an independent path.
+pub(crate) fn jobs_dir() -> PathBuf {
     Config::home().join("jobs")
 }
 
@@ -3657,6 +3662,23 @@ pub(crate) fn active_job_dir() -> Option<PathBuf> {
 fn read_meta(dir: &Path) -> Option<JobMeta> {
     let raw = std::fs::read_to_string(dir.join("meta.json")).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Read every `<id>/meta.json` under `dir`, skipping entries that fail to
+/// parse. Sorted newest-started-first, matching `all_jobs()`. Used by both
+/// the in-process dispatcher and the `jobs list`/`jobs prune` subcommands
+/// (the latter passes an explicit `dir` so tests can point at a tempdir).
+pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
+    let mut jobs: Vec<JobMeta> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Some(m) = read_meta(&e.path()) {
+                jobs.push(m);
+            }
+        }
+    }
+    jobs.sort_by(|a, b| b.started.cmp(&a.started));
+    jobs
 }
 
 fn write_meta(dir: &Path, meta: &JobMeta) -> anyhow::Result<()> {
