@@ -43,8 +43,8 @@ pub use acp_client::{
 };
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use config::{
-    AliasedAgentConfig, Auth, BillingMode, Config, Provider, QuotaUnit, QuotaWindow,
-    SubscriptionPlan, Theme,
+    AliasedAgentConfig, Auth, BillingMode, Config, ExecSafetyConfig, ExecSandbox, Provider,
+    QuotaUnit, QuotaWindow, SeatbeltProfileOptions, SubscriptionPlan, Theme,
 };
 pub use corpus::{Corpus, ModelEntry, RefreshReport};
 pub use engine_cost::{
