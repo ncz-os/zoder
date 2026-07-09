@@ -2205,7 +2205,6 @@ async fn y8_live_classification_401_does_not_trip_breaker() {
 }
 
 #[tokio::test]
-#[ignore = "flaky under the parallel full-workspace test run (passes in isolation); the Y-8 live-529->Capacity classification + no-breaker-trip is covered by the always-run y8_live_classification_500 counter-test and the classify_err_* unit tests"]
 async fn y8_live_classification_529_does_not_trip_breaker() {
     // Anthropic-style 529 (overload) is in the Capacity bucket;
     // consult must skip the model for the cooldown and the breaker

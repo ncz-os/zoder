@@ -346,19 +346,25 @@ impl HealthStore {
     /// may be empty for legacy callers; the new field is left `None` in that
     /// case so the JSON stays minimal.
     ///
-    /// SPECIAL CASE: when `classification` is `Unauthorized` (HTTP 401/403
-    /// from the provider — i.e. the credential was rejected) this is NOT a
-    /// model-health failure. The model itself is fine; only the API key on
-    /// the operator's side is wrong. We must therefore NOT increment
-    /// `consecutive_failures`, NOT bump `failures`, and NOT stamp
-    /// `last_failure_unix` (which would otherwise pin the breaker open).
-    /// We still call `mark_checked` so the on-disk store records the
-    /// probe attempt, the provider that rejected it, and the unauthorized
-    /// classification — consult uses that to skip the model until the
-    /// operator updates the credential. Net effect: the model's breaker
-    /// state is preserved exactly as it was before, so a model whose key
-    /// is broken does not get bench-binned by `BREAKER_THRESHOLD`
-    /// consecutive auth errors.
+    /// SPECIAL CASE: when `classification.skips_consult()` is true — i.e.
+    /// `Capacity` (429/503/529 / `overloaded_error` / `rate_limit_error`),
+    /// `Unprovisioned` (404), or `Unauthorized` (401/403) — this is NOT a
+    /// model-health failure. In all three cases the model itself is fine:
+    /// the provider is transiently overloaded, the model isn't provisioned
+    /// for this key, or the credential was rejected. consult already skips
+    /// these by classification (`is_skipped_by_classification`), so counting
+    /// them against the breaker is both redundant and harmful — a healthy
+    /// model behind a temporarily overloaded provider would get bench-binned
+    /// for the full `BREAKER_THRESHOLD` cooldown after a handful of 529s.
+    /// We must therefore NOT increment `consecutive_failures`, NOT bump
+    /// `failures`, and NOT stamp `last_failure_unix` (which would otherwise
+    /// pin the breaker open) for any skip-class outcome. We still call
+    /// `mark_checked` so the on-disk store records the probe attempt, the
+    /// provider, and the classification — consult uses that to skip the
+    /// model until the transient/credential/provisioning condition clears.
+    /// Only a genuine `Error` (500 / network / timeout / decode) trips the
+    /// breaker. This matches the `skips_consult` doc contract: those classes
+    /// are skipped "regardless of breaker state".
     pub fn record_classified_failure(
         &mut self,
         model: &str,
@@ -368,14 +374,15 @@ impl HealthStore {
     ) {
         let h = self.models.entry(model.to_string()).or_default();
         h.calls = h.calls.saturating_add(1);
-        if classification == Classification::Unauthorized {
-            // Auth/credential rejection — model is unknown-healthy, only
-            // the key is wrong. Stamp the probe (so consult can render
-            // freshness + the unauthorized tag) but leave breaker state
-            // untouched. Truncate the error string the same way the
-            // failure path does so legacy readers see a consistent
-            // last_error length cap (still records WHAT went wrong, just
-            // does not count it as a model failure).
+        if classification.skips_consult() {
+            // Skip-class outcome (Capacity / Unprovisioned / Unauthorized) —
+            // the model is unknown-healthy; the condition is transient
+            // (overload), provisioning, or an operator-side credential. Stamp
+            // the probe (so consult can render freshness + the skip tag) but
+            // leave breaker state untouched. Truncate the error string the
+            // same way the failure path does so legacy readers see a
+            // consistent last_error length cap (still records WHAT went
+            // wrong, just does not count it as a model failure).
             h.last_error = Some(err.chars().take(160).collect());
             if !provider_id.is_empty() {
                 h.mark_checked(provider_id, classification);
@@ -779,8 +786,21 @@ mod tests {
         );
         let h = &s.models["model-b"];
         assert_eq!(h.calls, 1);
-        assert_eq!(h.failures, 1);
-        assert_eq!(h.consecutive_failures, 1);
+        // Unprovisioned is a skip-class outcome (skips_consult) — it must NOT
+        // count against the breaker (W1): consult already skips the model by
+        // classification, so failures/consecutive_failures/last_failure_unix
+        // stay untouched. Only a genuine Error trips the breaker.
+        assert_eq!(h.failures, 0, "Unprovisioned must not count as a failure");
+        assert_eq!(
+            h.consecutive_failures, 0,
+            "Unprovisioned must not increment consecutive_failures"
+        );
+        assert!(
+            h.last_failure_unix.is_none(),
+            "Unprovisioned must not stamp last_failure_unix (would arm breaker)"
+        );
+        // Diagnostics + classification are still recorded so consult can
+        // render the skip tag.
         assert_eq!(h.last_error.as_deref(), Some("boom"));
         assert_eq!(h.classification, Some(Classification::Unprovisioned));
         assert!(h.is_skipped_by_classification());
