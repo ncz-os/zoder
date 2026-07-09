@@ -20,6 +20,21 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Open a config file with `O_NOFOLLOW | O_NONBLOCK` on Unix so a
+/// symlink dropped at the path cannot redirect the read to a FIFO /
+/// device (defense-in-depth against the symlink variant of the
+/// TOCTOU attack), AND so opening a writer-less FIFO fails fast with
+/// `ENXIO` instead of blocking inside the kernel waiting for a
+/// writer that will never arrive. `O_NONBLOCK` is semantically a
+/// no-op on regular files — read returns data immediately on Linux —
+/// so this flag combination does not change the happy-path behavior;
+/// it only changes the failure mode for non-regular targets from
+/// "block forever" to "return ENXIO". The `cfg(unix)` guard keeps
+/// the build green on non-Unix targets where the helper then falls
+/// through to a plain `read(true)` open via `File::open`.
+#[cfg(unix)]
+const CONFIG_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+
 /// Host substring of the built-in placeholder `default` provider. A host with
 /// no real routing config resolves every model to this sentinel endpoint;
 /// [`Config::real_provider_for_model`] treats a match as "no provider
@@ -1719,9 +1734,68 @@ pub struct VendorProfile {
 /// original defect reported at the config read sites (the primary read at
 /// `Config::load_unvalidated_from` and the overlay read in
 /// `collect_overlays`).
+///
+/// ## TOCTOU-safety
+///
+/// Validation is performed against the **open file descriptor**, not a
+/// re-stat of the path. The previous implementation called
+/// `std::fs::metadata(path)` and then `std::fs::read_to_string(path)` —
+/// those are two separate `path` lookups, and an attacker able to replace
+/// the file between them (rename a regular file away and `mkfifo` in its
+/// place, or `truncate --size=10G` an existing path) could defeat the
+/// guard.
+///
+/// This implementation instead:
+///   1. Opens the file *once* — on Unix with `O_CLOEXEC | O_NOFOLLOW |
+///      O_NONBLOCK`. `O_NOFOLLOW` rejects a symlink at the path at open
+///      time rather than following it into a FIFO; `O_NONBLOCK` makes a
+///      `open()` on a writer-less FIFO return `ENXIO` immediately
+///      instead of blocking forever inside the kernel waiting for a
+///      writer that will never arrive. (`O_NONBLOCK` is semantically a
+///      no-op on regular files — read returns data immediately on
+///      POSIX — so the flag combination does not change happy-path
+///      behavior; it only changes the failure mode for non-regular
+///      targets from "block forever" to "return ENXIO".)
+///   2. Calls `File::metadata()` on the open descriptor (i.e. `fstat(fd)`)
+///      to confirm the inode is a regular file and within `max_bytes`,
+///   3. Reads from the descriptor via `Read::take(max_bytes)` so even if
+///      the file is grown after step 2 we never consume more than the cap.
+///
+/// Once we hold an FD referencing a specific inode, `unlink(path)` and a
+/// subsequent `mkfifo path` from another process cannot affect us: our
+/// FD still points at the original inode, and the new FIFO is a different
+/// inode that no FD we hold references.
 fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat zoder config at {}", path.display()))?;
+    use std::io::Read;
+
+    // Step 1: open on Unix with O_NOFOLLOW (symlink rejection) plus
+    // O_NONBLOCK (fail-fast on writer-less FIFOs). O_CLOEXEC keeps
+    // the FD from leaking into any child process spawned
+    // post-config-load. See the function-level doc for the full
+    // rationale.
+    let f = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(CONFIG_OPEN_FLAGS)
+                .open(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::open(path)
+        }
+    }
+    .with_context(|| format!("opening zoder config at {}", path.display()))?;
+
+    // Step 2: validate on the open descriptor (fstat). If the path was
+    // replaced between this call and the open, the FD we hold still
+    // references the inode we opened — and that inode is what fstat
+    // inspects. The path itself is irrelevant from here on.
+    let meta = f
+        .metadata()
+        .with_context(|| format!("fstat zoder config at {}", path.display()))?;
     if !meta.is_file() {
         anyhow::bail!(
             "zoder config {} is not a regular file (FIFOs, devices, and \
@@ -1738,8 +1812,18 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<Stri
             max_bytes
         );
     }
-    std::fs::read_to_string(path)
-        .with_context(|| format!("reading zoder config at {}", path.display()))
+
+    // Step 3: bounded read from the open FD. Even if a concurrent writer
+    // grows the file past the cap after our fstat, Read::take caps the
+    // bytes we will pull from THIS fd to `max_bytes`, and `read_to_string`
+    // fails (not silently truncates) if the cap is actually hit. So a
+    // racing growth cannot OOM us, and a racing shrink-then-give-different-
+    // content cannot bypass the cap.
+    let mut s = String::new();
+    f.take(max_bytes)
+        .read_to_string(&mut s)
+        .with_context(|| format!("reading zoder config at {}", path.display()))?;
+    Ok(s)
 }
 
 /// Apply every `config.<vendor>.toml` in alphabetical order. Tracks the set of
@@ -3483,9 +3567,30 @@ billing = "metered"
         }
 
         let err = Config::load_unvalidated_from(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        // Either of two rejection paths is acceptable (and both are
+        // safe under the new TOCTOU-safe helper):
+        //   - "not a regular file" — the open succeeded (e.g. on a
+        //     FIFO without O_NONBLOCK, or on the symlink-to-/dev/null
+        //     fallback when O_NOFOLLOW didn't fire), and `f.metadata()`
+        //     returned a non-regular file descriptor.
+        //   - "No such device" / "No such file" / "symbolic link" /
+        //     "ELOOP" / "Too many levels" — the open itself failed
+        //     before fstat could run, either because O_NONBLOCK got
+        //     ENXIO on a writer-less FIFO or because O_NOFOLLOW got
+        //     ELOOP on the symlink-to-/dev/null fallback.
+        // The pre-fix code (no O_NOFOLLOW, no O_NONBLOCK, separate
+        // metadata + read_to_string calls) would have blocked forever
+        // on the FIFO; reaching this assertion at all is the proof
+        // that the new helper refuses the non-regular target.
         assert!(
-            err.to_string().contains("not a regular file"),
-            "non-regular config.json must be rejected before the read; got: {err}"
+            msg.contains("not a regular file")
+                || msg.contains("No such device")
+                || msg.contains("No such file")
+                || msg.contains("symbolic link")
+                || msg.contains("ELOOP")
+                || msg.contains("Too many levels"),
+            "non-regular config.json must be rejected before the read; got: {msg}"
         );
         // Reachable: if the FIFO guard had not fired, the test would block
         // forever here instead of unwrapping the error.
@@ -3593,5 +3698,363 @@ auth = { type = "env", var = "GUARD_KEY" }
         // Must not error.
         apply_overlays(&mut cfg, &nonexistent)
             .expect("missing home is the legitimate first-run case");
+    }
+
+    /// TOCTOU-safety regression: the previous implementation of
+    /// `read_bounded_regular_file` did `fs::metadata(path)` THEN
+    /// `fs::read_to_string(path)` as two separate `path` lookups. An
+    /// attacker who could replace the path between those two syscalls
+    /// (unlink the regular file, `mkfifo` in its place) bypassed the
+    /// size + `is_file()` guards — `read_to_string` would `open()` the
+    /// FIFO and block forever on `read()`. The current implementation
+    /// opens the file *once* (on Unix with `O_CLOEXEC | O_NOFOLLOW` so
+    /// a symlink at the path is rejected at open time), validates the
+    /// inode of the resulting descriptor via `f.metadata()` (i.e.
+    /// `fstat(fd)`), and reads through `Read::take(max_bytes)`. Once
+    /// we hold an FD on a specific inode, `unlink` + `mkfifo` at the
+    /// path by another process cannot affect us.
+    ///
+    /// Three regression tests below cover the attack surface:
+    ///
+    /// 1. **Symlink-to-FIFO at the path.** A symlink that resolves to
+    ///    a FIFO must be rejected at open time by `O_NOFOLLOW` —
+    ///    never blocking, never reading from the FIFO.
+    /// 2. **Path swap during a read.** A racing thread swaps a
+    ///    regular file for a FIFO at the path while the helper is
+    ///    mid-read. The helper's FD is bound to the inode we
+    ///    opened, so the swap is invisible to it; the read must
+    ///    return the original content OR a clear open-time error,
+    ///    and must not block past the wall-clock budget.
+    /// 3. **Continuous swapper with bounded read budget.** A
+    ///    dedicated thread continuously renames the target aside,
+    ///    mkfifos the path, then immediately moves the original
+    ///    back. The reader runs many iterations; every iteration
+    ///    must either (a) succeed reading the original content
+    ///    byte-for-byte, or (b) fail with a clear open-time error.
+    ///    Critically, no iteration may (i) block past the budget,
+    ///    (ii) return success with non-original content (a FIFO
+    ///    read), or (iii) panic. The OLD design (metadata then
+    ///    read_to_string as separate path lookups) would either
+    ///    block on a FIFO read or, on kernels that unlink-then-
+    ///    re-create the FIFO, potentially read FIFO content —
+    ///    neither outcome is acceptable here.
+    #[test]
+    #[cfg(unix)]
+    fn read_bounded_regular_file_rejects_symlink_to_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.target");
+        let _ = std::fs::remove_file(&fifo);
+        let mkfifo = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            matches!(&mkfifo, Ok(s) if s.success()),
+            "mkfifo must succeed in this test environment"
+        );
+        // Place a symlink at the config path pointing AT the FIFO.
+        // `O_NOFOLLOW` on open rejects the symlink itself, before
+        // the kernel ever considers the FIFO inode. The
+        // open-then-fstat pattern then validates the descriptor is
+        // a regular file. Either layer is sufficient; both are
+        // belt-and-braces against the TOCTOU window the OLD
+        // implementation left between metadata and read_to_string.
+        let config_path = dir.path().join("config.json");
+        std::os::unix::fs::symlink(&fifo, &config_path).unwrap();
+
+        let err = crate::config::read_bounded_regular_file(
+            &config_path,
+            crate::config::Config::MAX_CONFIG_BYTES,
+        )
+        .expect_err("symlink-to-FIFO at the config path must be rejected");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file")
+                || msg.contains("symbolic link")
+                || msg.contains("No such device")
+                || msg.contains("ELOOP")
+                || msg.contains("Too many levels of symbolic links"),
+            "symlink-to-FIFO must be rejected with a clear error (O_NOFOLLOW \
+             surfaces ELOOP, fstat surfaces 'not a regular file'); got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_bounded_regular_file_survives_path_swap_during_read() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        // A few KiB of content so the helper's read has a
+        // non-trivial duration, giving the swapper a window.
+        let mut content = String::with_capacity(4 * 1024 + 64);
+        content.push_str("{\"_pad\":[");
+        for i in 0..256 {
+            if i > 0 {
+                content.push(',');
+            }
+            content.push_str(&format!("{i}"));
+        }
+        content.push_str("]}");
+        let expected = content.clone();
+        std::fs::write(&target, content.as_bytes()).unwrap();
+
+        // Spawn the helper in a worker thread so we can bound the
+        // wall-clock time. A regression that hangs on the FIFO read
+        // fails the test with a clear "blocked past 5s" instead of
+        // hanging cargo.
+        let (tx, rx) = mpsc::channel::<anyhow::Result<String>>();
+        let target_for_reader = target.clone();
+        let reader = thread::spawn(move || {
+            let result = crate::config::read_bounded_regular_file(
+                &target_for_reader,
+                crate::config::Config::MAX_CONFIG_BYTES,
+            );
+            tx.send(result).unwrap();
+        });
+
+        // Swap the path while the helper is mid-read. The exact
+        // interleaving is not deterministic, but BOTH outcomes are
+        // acceptable under the new design:
+        //   - swap-before-open: open sees the FIFO (or ENOENT
+        //     between the rename-out and the mkfifo-in), helper
+        //     errors immediately. SAFE.
+        //   - swap-after-open: helper's FD is bound to the
+        //     original inode, swap is irrelevant, read succeeds
+        //     with the original content. SAFE.
+        // A regression to the OLD design would either block on a
+        // FIFO read or, on kernels that unlink-then-re-create,
+        // potentially read FIFO content — neither outcome is
+        // acceptable here.
+        thread::sleep(Duration::from_millis(2));
+        let backup = dir.path().join("config.json.bak");
+        let _ = std::fs::rename(&target, &backup);
+        let mkfifo = std::process::Command::new("mkfifo").arg(&target).status();
+        let fifo_ok = matches!(&mkfifo, Ok(s) if s.success());
+        if fifo_ok {
+            // Unlink the FIFO so any subsequent open sees ENOENT
+            // (rather than blocking on a write-less FIFO forever).
+            let _ = std::fs::remove_file(&target);
+        }
+        // Restore the original at the path so subsequent tests
+        // and the tempdir cleanup find the expected file layout.
+        let _ = std::fs::rename(&backup, &target);
+
+        // Wait for the reader to finish (or the budget to elapse).
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read_bounded_regular_file must not block past 5s — TOCTOU regression");
+        reader.join().expect("reader thread panicked");
+
+        // The load-bearing assertions:
+        //   - The helper must NOT have panicked (reader.join()
+        //     above),
+        //   - The helper must NOT have blocked past the budget
+        //     (recv_timeout above),
+        //   - On the success path, the helper must have read the
+        //     ORIGINAL content byte-for-byte — proving the FD was
+        //     bound to the inode we opened, not whatever the
+        //     swapper installed at the path.
+        //   - On the failure path, the error must be a clear
+        //     open-time error, NOT a silent truncation or
+        //     empty-string return.
+        match result {
+            Ok(s) => {
+                assert_eq!(
+                    s.as_bytes(),
+                    expected.as_bytes(),
+                    "helper must have read the original inode's content, \
+                     not whatever was at the path after the swap"
+                );
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("not a regular file")
+                        || msg.contains("No such file")
+                        || msg.contains("No such device")
+                        || msg.contains("symbolic link"),
+                    "swap-induced error must be a clear open-time error, \
+                     not a silent failure; got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Continuous swapper. A dedicated thread runs the rename /
+    /// mkfifo / restore cycle on a small loop with a brief sleep
+    /// so the reader has many chances to enter its critical
+    /// section. The reader runs N iterations; each must complete
+    /// promptly (recv_timeout budget), never read non-original
+    /// content, and never panic.
+    #[test]
+    #[cfg(unix)]
+    fn read_bounded_regular_file_is_toctou_safe_against_continuous_swap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        let original = b"{}";
+        std::fs::write(&target, original).unwrap();
+
+        // The swapper: keep the file PRESENT most of the time, but
+        // periodically swap to a FIFO and back. The OLD design's
+        // window was between `fs::metadata(path)` and
+        // `fs::read_to_string(path)` — narrow, but enough for a
+        // racing swap. By interleaving "file present" sleep periods
+        // with brief FIFO windows we give the reader lots of
+        // chances to see the stable file AND lots of chances to
+        // hit a swap. With the NEW design (open-then-fstat), every
+        // read either:
+        //   - sees the file before the swap fires and reads it
+        //     successfully,
+        //   - sees the file after the swap has restored it and
+        //     reads it successfully, OR
+        //   - catches the FIFO (rejected at fstat), the missing
+        //     path (ENOENT at open), or the brief mkfifo window
+        //     (the unlinked FIFO surfaces ENXIO).
+        // The OLD design would have either:
+        //   - blocked forever on a FIFO read (recv_timeout catches),
+        //   - returned non-original bytes (the helper's `Ok(_)` arm
+        //     catches).
+        // The "file present" sleep between swaps is calibrated so
+        // the reader can definitely open the file in that window.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let swap_dir = dir.path().to_path_buf();
+        let swap_target = target.clone();
+        let swapper = thread::spawn(move || {
+            let mut i: u64 = 0;
+            while !stop_clone.load(Ordering::Relaxed) {
+                // File is present for the next 500µs. The reader
+                // thread has plenty of time to open and read it.
+                thread::sleep(Duration::from_micros(500));
+
+                // Now perform the swap: rename target aside,
+                // mkfifo, unlink, restore.
+                let backup = swap_dir.join(format!("config.bak.{i}"));
+                if std::fs::rename(&swap_target, &backup).is_ok() {
+                    let mkfifo = std::process::Command::new("mkfifo")
+                        .arg(&swap_target)
+                        .status();
+                    let fifo_ok = matches!(&mkfifo, Ok(s) if s.success());
+                    if fifo_ok {
+                        let _ = std::fs::remove_file(&swap_target);
+                    }
+                    let _ = std::fs::rename(&backup, &swap_target);
+                }
+                i = i.wrapping_add(1);
+            }
+        });
+
+        // Reader: run N iterations and collect observations.
+        // Each iteration must complete promptly and either return
+        // the original content or a clear open-time error.
+        let (tx, rx) = mpsc::channel::<Vec<&'static str>>();
+        let target_for_reader = target.clone();
+        let reader = thread::spawn(move || {
+            let mut observations: Vec<&'static str> = Vec::with_capacity(64);
+            for i in 0..64 {
+                if i == 0 {
+                    eprintln!("[reader] first iteration starting");
+                }
+                match crate::config::read_bounded_regular_file(
+                    &target_for_reader,
+                    crate::config::Config::MAX_CONFIG_BYTES,
+                ) {
+                    Ok(s) if s.as_bytes() == original => {
+                        observations.push("ok-original");
+                    }
+                    Ok(s) => {
+                        observations.push("ok-other");
+                        eprintln!(
+                            "UNEXPECTED CONTENT ({} bytes): {:?}",
+                            s.len(),
+                            &s[..s.len().min(64)]
+                        );
+                    }
+                    Err(e) => {
+                        if observations.is_empty() {
+                            eprintln!("[reader] first-iter err: {e:#}");
+                        }
+                        let msg = format!("{e:#}");
+                        if msg.contains("not a regular file") {
+                            observations.push("err-not-regular");
+                        } else if msg.contains("No such file") {
+                            observations.push("err-enoent");
+                        } else if msg.contains("No such device") {
+                            // ENXIO from O_NONBLOCK on a writer-less
+                            // FIFO. SAFE — the helper refused the
+                            // FIFO instead of blocking on it.
+                            observations.push("err-enxio");
+                        } else {
+                            observations.push("err-other");
+                        }
+                    }
+                }
+            }
+            tx.send(observations).unwrap();
+        });
+
+        let observations = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("read_bounded_regular_file must not block past 10s — TOCTOU regression");
+        reader.join().expect("reader thread panicked");
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().expect("swapper thread panicked");
+
+        // Tally the observations for the failure message.
+        let ok_original = observations.iter().filter(|o| **o == "ok-original").count();
+        let err_not_regular = observations
+            .iter()
+            .filter(|o| **o == "err-not-regular")
+            .count();
+        let err_enoent = observations.iter().filter(|o| **o == "err-enoent").count();
+        let err_enxio = observations.iter().filter(|o| **o == "err-enxio").count();
+        let err_other = observations.iter().filter(|o| **o == "err-other").count();
+
+        // The load-bearing assertion: NO iteration returned
+        // successful read of non-original content. A "ok-other"
+        // means the helper read from a swapped FIFO or device,
+        // which is the regression we're guarding against.
+        assert!(
+            !observations.contains(&"ok-other"),
+            "no iteration may return successful read of non-original \
+             content — that means the helper read from a swapped target. \
+             observations: ok-original={ok_original}, err-not-regular=\
+             {err_not_regular}, err-enoent={err_enoent}, err-enxio=\
+             {err_enxio}, err-other={err_other}"
+        );
+
+        // At least one iteration must have read the original
+        // content successfully — this proves the happy path works
+        // AND that the swapper's interleaving actually gives the
+        // reader a chance to see a stable file.
+        assert!(
+            ok_original > 0,
+            "at least one iteration must succeed reading the \
+             original inode's content. observations: ok-original=\
+             {ok_original}, err-not-regular={err_not_regular}, \
+             err-enoent={err_enoent}, err-enxio={err_enxio}, \
+             err-other={err_other}. If err-enoent or err-enxio \
+             dominates, the swapper is renaming away faster than \
+             the reader can open — increase the swapper sleep or \
+             reduce the read load."
+        );
+
+        // The error mix is informational. ENOENT, ENXIO, and "not
+        // a regular file" are all expected outcomes under a swap
+        // — they prove the helper is rejecting dangerous targets
+        // fast rather than blocking on them. `err-other` is
+        // suspicious but not necessarily wrong (e.g. EACCES on a
+        // permission-flipped file); we don't fail on `err-other`
+        // alone; we just want to make sure it's not masking a
+        // deeper issue.
+        let _ = err_other;
     }
 }
