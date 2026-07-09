@@ -52,16 +52,25 @@ pub struct ModelPrice {
     pub off_peak: Option<OffPeak>,
 }
 
-/// Off-peak (time-of-day) rates + the UTC window they apply in. Minutes are
-/// minutes-of-day UTC in `[0, 1440)`; a window may wrap midnight (`start > end`).
+/// Off-peak (time-of-day) rates + the UTC window they apply in.
+/// `window_start_utc_min` is a real minute-of-day UTC in `[0, 1439]`.
+/// `window_end_utc_min` is an EXCLUSIVE end-of-day boundary in `[0, 1440]`;
+/// `1440` is a legitimate value meaning "the end of the day" (= 24:00 /
+/// midnight), so a window `(0, 1440)` covers the entire day including the
+/// last minute at 23:59 UTC. A window may wrap midnight (`start > end`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OffPeak {
     #[serde(default)]
     pub input_usd_per_mtok: f64,
     #[serde(default)]
     pub output_usd_per_mtok: f64,
+    /// Minute-of-day UTC at which the off-peak window starts, inclusive.
+    /// Range: `[0, 1439]`.
     #[serde(default)]
     pub window_start_utc_min: u32,
+    /// Minute-of-day UTC at which the off-peak window ends, EXCLUSIVE.
+    /// Range: `[0, 1440]`. `1440` = end-of-day (midnight), so a window
+    /// `(0, 1440)` covers the full day including minute 1439 (23:59 UTC).
     #[serde(default)]
     pub window_end_utc_min: u32,
 }
@@ -221,7 +230,35 @@ fn validate_model_price(
     // Optional off-peak (time-of-day) block; absent/malformed → no off-peak.
     if let Some(op) = obj.get("off_peak").and_then(|v| v.as_object()) {
         let num = |k: &str| op.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
-        let umin = |k: &str| (op.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32).min(1439);
+        // Clamp one window minute field to its inclusive maximum, warning on
+        // out-of-range values (e.g. a typo like 1500) instead of silently
+        // swallowing them. `warn` is the callback the loader passes in so the
+        // warning is captured by tests (and forwarded to stderr in production).
+        //
+        // window_start_utc_min is a real minute-of-day: valid in [0, 1439].
+        // window_end_utc_min is an EXCLUSIVE end boundary: valid in [0, 1440],
+        // where 1440 is the legitimate "end of day" sentinel (= 24:00 / midnight)
+        // so a window (0, 1440) covers the full day INCLUDING minute 1439 (23:59
+        // UTC). Previously the parser clamped BOTH fields with `.min(1439)`,
+        // which silently destroyed the legitimate 1440 end-of-day value and
+        // caused 23:59-UTC calls to be billed at the peak rate.
+        fn clamp_window_min(
+            op: &serde_json::Map<String, serde_json::Value>,
+            model_id: &str,
+            key: &str,
+            max: u32,
+            warn: &mut dyn FnMut(String),
+        ) -> u32 {
+            let raw = op.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if raw > max {
+                warn(format!(
+                    "model \"{model_id}\": off_peak.{key}={raw} > {max} (out of range), clamping to {max}"
+                ));
+                max
+            } else {
+                raw
+            }
+        }
         let op_input = num("input_usd_per_mtok");
         let op_output = num("output_usd_per_mtok");
         // C6-P2: an off-peak block is only honored when BOTH the input AND the
@@ -235,8 +272,20 @@ fn validate_model_price(
             price.off_peak = Some(OffPeak {
                 input_usd_per_mtok: op_input,
                 output_usd_per_mtok: op_output,
-                window_start_utc_min: umin("window_start_utc_min"),
-                window_end_utc_min: umin("window_end_utc_min"),
+                window_start_utc_min: clamp_window_min(
+                    op,
+                    model_id,
+                    "window_start_utc_min",
+                    1439,
+                    warn,
+                ),
+                window_end_utc_min: clamp_window_min(
+                    op,
+                    model_id,
+                    "window_end_utc_min",
+                    1440,
+                    warn,
+                ),
             });
         }
     }
@@ -582,6 +631,106 @@ mod tests {
         assert!(!op.active_at(30)); // 00:30 end, exclusive
         assert!(!op.active_at(600)); // 10:00, daytime peak
         assert!(!op.active_at(989)); // 16:29, just before window
+    }
+
+    /// Off-peak window end-of-day: `window_end_utc_min: 1440` is the legitimate
+    /// exclusive "end of day" sentinel (= 24:00 / midnight) so a window
+    /// `(0, 1440)` must cover the FULL day INCLUDING minute 1439 (23:59 UTC).
+    /// Before the fix the loader silently clamped any parsed minute to 1439,
+    /// collapsing this exact minute back into the peak window and billing
+    /// operators' last-minute-of-day calls at peak. The downstream
+    /// `active_at` comparison is already `<` (exclusive end), so honoring
+    /// `1440` is sufficient to restore the contract.
+    #[test]
+    fn off_peak_window_end_of_day_1440_covers_last_minute() {
+        let raw = serde_json::json!({
+            "input_usd_per_mtok": 6.0,
+            "output_usd_per_mtok": 18.0,
+            "off_peak": {
+                "input_usd_per_mtok": 0.50,
+                "output_usd_per_mtok": 1.50,
+                "window_start_utc_min": 0,
+                "window_end_utc_min": 1440
+            }
+        });
+        let mut warnings = Vec::new();
+        let p = validate_model_price("allday/op", &raw, &mut |w| warnings.push(w))
+            .expect("complete pair with end-of-day window must load");
+        // The end boundary must be preserved verbatim, not silently clamped.
+        let op = p.off_peak.clone().expect("off-peak kept");
+        assert_eq!(
+            op.window_end_utc_min, 1440,
+            "window_end_utc_min must be preserved as 1440 (got {})",
+            op.window_end_utc_min
+        );
+        // The whole day is in-window, including the last minute at 23:59 UTC.
+        // That is THE exact minute that was misclassified before the fix
+        // (clamped to 1439, so 23:59 fell outside the would-be-all-day window
+        // and got billed at peak).
+        assert!(op.active_at(0)); // 00:00 start, inclusive
+        assert!(op.active_at(720)); // 12:00
+        assert!(op.active_at(1438)); // 23:58
+        assert!(op.active_at(1439)); // 23:59
+        let cost = p.cost_io_at(1_000_000, 1_000_000, 1439);
+        assert!(
+            (cost - 2.0).abs() < 1e-9,
+            "23:59 UTC call must bill off-peak, got {cost}"
+        );
+    }
+
+    /// Out-of-range window minutes (e.g. a typo like 1500) must surface as a
+    /// warning AND clamp to the field's valid max, instead of being silently
+    /// rewritten -- matching how other out-of-range numeric config values
+    /// elsewhere in this loader are surfaced (warn, don't swallow).
+    #[test]
+    fn off_peak_window_out_of_range_minutes_warn_and_clamp() {
+        // 1500 on end is above the legitimate exclusive end (1440).
+        let raw = serde_json::json!({
+            "input_usd_per_mtok": 1.0,
+            "output_usd_per_mtok": 2.0,
+            "off_peak": {
+                "input_usd_per_mtok": 0.10,
+                "output_usd_per_mtok": 0.20,
+                "window_start_utc_min": 0,
+                "window_end_utc_min": 1500
+            }
+        });
+        let mut warnings = Vec::new();
+        let p = validate_model_price("typo/op", &raw, &mut |w| warnings.push(w))
+            .expect("model with typo'd end must still load (just warned)");
+        let op = p.off_peak.expect("off-peak kept");
+        assert_eq!(op.window_end_utc_min, 1440, "end clamped to 1440");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("window_end_utc_min=1500")),
+            "expected a warning naming the out-of-range value, got {:?}",
+            warnings
+        );
+
+        // 2000 on start is above the real-minute max (1439).
+        let raw2 = serde_json::json!({
+            "input_usd_per_mtok": 1.0,
+            "output_usd_per_mtok": 2.0,
+            "off_peak": {
+                "input_usd_per_mtok": 0.10,
+                "output_usd_per_mtok": 0.20,
+                "window_start_utc_min": 2000,
+                "window_end_utc_min": 1440
+            }
+        });
+        let mut warnings2 = Vec::new();
+        let p2 = validate_model_price("typo2/op", &raw2, &mut |w| warnings2.push(w))
+            .expect("model with typo'd start must still load (just warned)");
+        let op2 = p2.off_peak.expect("off-peak kept");
+        assert_eq!(op2.window_start_utc_min, 1439, "start clamped to 1439");
+        assert!(
+            warnings2
+                .iter()
+                .any(|w| w.contains("window_start_utc_min=2000")),
+            "expected a warning naming the out-of-range start, got {:?}",
+            warnings2
+        );
     }
 
     #[test]
