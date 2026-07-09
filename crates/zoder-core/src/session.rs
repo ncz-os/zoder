@@ -8,6 +8,15 @@
 use crate::provider::Message;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-process nonce for save() temp-file names.
+///
+/// Combined with the process id it makes each writer's temp file
+/// (`<stem>.json.tmp.<pid>.<nonce>`) unique, so two overlapping
+/// `zoder exec --session <shared-id>` fan-out writers can never compute
+/// the same temp path and clobber each other into a torn transcript.
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -93,14 +102,51 @@ impl Session {
         self.messages.push(Message::new(role, content));
     }
 
-    /// Persist atomically (temp file + rename) under `dir`.
+    /// Persist atomically (unique temp file + rename) under `dir`.
+    ///
+    /// C7-S1 (= S19 for sessions): the temp filename carries the process id AND
+    /// a monotonic nonce (`<stem>.json.tmp.<pid>.<nonce>`) so two concurrent
+    /// `zoder exec --session <shared-id>` fan-out writers can never share a temp
+    /// path -- otherwise an interleaved write+rename could promote a torn or
+    /// foreign temp file over the live transcript, losing messages. The temp is
+    /// removed on any error so a failed write never litters the sessions dir with
+    /// a half-written file a later reader could pick up. Mirrors the unique-temp
+    /// pattern in `corpus.rs` (C5-4) and `pricing.rs` (C6-P1).
     pub fn save(&mut self, dir: &Path) -> anyhow::Result<()> {
         self.updated = now();
         std::fs::create_dir_all(dir)?;
         let path = Self::path_in(dir, &self.id);
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
+        let data = serde_json::to_vec_pretty(self)?;
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+        // Write to the unique temp; on any failure remove it so it can never be
+        // renamed over the live transcript or left behind torn.
+        let f = match std::fs::File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::new(&f);
+            if let Err(e) = w.write_all(&data).and_then(|_| w.flush()) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        }
+        // Durability: flush the file contents to disk before the rename so a
+        // crash after rename cannot expose a zero-length transcript (matches
+        // utilization.rs).
+        if let Err(e) = f.sync_all() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -125,5 +171,63 @@ impl Session {
         }
         out.sort_by_key(|e| std::cmp::Reverse(e.1));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> PathBuf {
+        let mut d = std::env::temp_dir();
+        let uniq = format!(
+            "zoder-session-test-{}-{}",
+            std::process::id(),
+            SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        d.push(uniq);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // C7-S1: save() uses a unique temp filename and leaves no stray `.json.tmp`
+    // (deterministic or per-writer) behind, and the transcript reloads intact.
+    #[test]
+    fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let dir = tmpdir();
+        let mut sess = Session {
+            id: "shared-id".into(),
+            created: now(),
+            updated: 0,
+            messages: Vec::new(),
+        };
+        sess.push("user", "hello");
+        sess.push("assistant", "hi there");
+        sess.save(&dir).unwrap();
+
+        // The transcript is present and reloads with content intact.
+        let path = Session::path_in(&dir, "shared-id");
+        assert!(path.exists());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Session = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reloaded.id, "shared-id");
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[0].content, "hello");
+        assert_eq!(reloaded.messages[1].content, "hi there");
+
+        // No file matching `.json.tmp` (deterministic or per-writer) survives:
+        // the temp must be uniquely named AND renamed/removed, so only
+        // `shared-id.json` is left.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(".json.tmp"),
+                "stray temp file left behind: {name}"
+            );
+        }
+        // Belt-and-suspenders: the legacy deterministic temp path never exists.
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
