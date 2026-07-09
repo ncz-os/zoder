@@ -3451,6 +3451,9 @@ async fn read_result_inner(
         if frame.get("id").and_then(Value::as_str) != Some(want_id) {
             continue;
         }
+        if frame.get("method").is_some() {
+            continue;
+        }
         if let Some(err) = frame.get("error") {
             let msg = err
                 .get("message")
@@ -8159,6 +8162,53 @@ mod tests {
             .expect("legitimate frame must still parse after the cap fix");
         assert_eq!(res["protocolVersion"], 1);
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn read_result_inner_ignores_request_with_matching_id_until_response() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, mut engine_io) = tokio::io::duplex(8 * 1024);
+        let mut client = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(client_io);
+            read_result_inner(&mut reader, "init").await
+        });
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "session/request_permission",
+            "params": {}
+        });
+        let mut line = serde_json::to_string(&request).unwrap();
+        line.push('\n');
+        engine_io.write_all(line.as_bytes()).await.unwrap();
+        engine_io.flush().await.unwrap();
+
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut client).await;
+        assert!(
+            early.is_err(),
+            "read_result_inner returned on a request-shaped frame before the response: {early:?}"
+        );
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "result": { "protocolVersion": 1 }
+        });
+        let mut line = serde_json::to_string(&response).unwrap();
+        line.push('\n');
+        engine_io.write_all(line.as_bytes()).await.unwrap();
+        engine_io.shutdown().await.unwrap();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), &mut client)
+            .await
+            .expect("read_result_inner did not return after the true response")
+            .expect("reader task panicked")
+            .expect("read_result_inner errored")
+            .expect("engine returned an error response");
+        assert_eq!(res["protocolVersion"], 1);
     }
 }
 
