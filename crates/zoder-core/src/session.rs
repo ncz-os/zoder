@@ -12,12 +12,19 @@
 //! `save` — without any lock spanning load -> append -> save. The second
 //! process's atomic-rename save then silently overwrote the first process's,
 //! losing one turn. The fix is [`Session::mutate_locked`], which takes an
-//! exclusive `flock(2)` on a per-session sidecar `<id>.json.lock` for the
-//! entire load -> apply(f) -> save critical section, mirroring the pattern
-//! already used by `utilization::UtilizationStore::open` and
-//! `model_health::HealthStore::mutate_locked`. Callers that only need a
-//! best-effort read (`Session::latest`, the read-only `load_or_new` path
-//! for `list`) stay lock-free.
+//! exclusive lock on a per-session sidecar `<id>.json.lock` for the entire
+//! load -> apply(f) -> save critical section. The lock is the existence of
+//! the lockfile, acquired via an atomic `O_CREAT | O_EXCL` create — exactly
+//! the same pattern as `model_health::HealthStore::mutate_locked`. We do NOT
+//! use a kernel `flock(2)` here: under a kernel `flock(2)`-on-FD scheme,
+//! unlinking the lockfile does NOT release the kernel lock, so a stale-break
+//! fallback that removes the lockfile while another process still holds the
+//! FD would let two processes believe they own the lock simultaneously,
+//! reintroducing the lost-update bug. With the existence-of-file scheme, the
+//! file's presence IS the lock: only one FD-holder can win `create_new`, and
+//! the lock is released by removing the file in the RAII `Drop`. Callers
+//! that only need a best-effort read (`Session::latest`, the read-only
+//! `load_or_new` path for `list`) stay lock-free.
 //!
 //! ## Size cap (DEFECT 2 fix)
 //!
@@ -36,7 +43,6 @@
 //! inspection.
 
 use crate::provider::Message;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -331,8 +337,8 @@ impl Session {
     }
 
     /// Atomic locked read-modify-write (DEFECT 1 fix). Takes an
-    /// exclusive `flock(2)` on a per-session sidecar `<id>.json.lock`
-    /// file for the WHOLE load -> apply(f) -> save critical section, so
+    /// exclusive lock on a per-session sidecar `<id>.json.lock` file
+    /// for the WHOLE load -> apply(f) -> save critical section, so
     /// two concurrent `zoder exec --session <shared-id>` fan-out
     /// writers serialize instead of racing. Without this guard, P1
     /// loads a snapshot, P2 loads the same snapshot, P1 appends and
@@ -340,22 +346,31 @@ impl Session {
     /// saves — and P2's atomic-rename silently overwrites P1's, losing
     /// P1's turn with no error.
     ///
-    /// The lock is an MSRV-safe **lockfile** acquired via
-    /// `fs2::FileExt::try_lock_exclusive` (non-blocking `flock(2)` with
-    /// `LOCK_NB`, same `flock(2)`-based idiom
-    /// `utilization::UtilizationStore::acquire_lock` uses — kernel
-    /// releases the lock on FD close so a crashed process can't
-    /// deadlock the next caller on a real OS). Crucially, we use
-    /// `try_lock_exclusive` (NOT `lock_exclusive`): `lock_exclusive` is
-    /// a blocking call that only returns when the lock is acquired (or
-    /// on I/O error), so the bounded-retry + stale-break guards below
-    /// would be dead code if we used it — the whole call would block
-    /// forever on a leaked/wedged holder, hanging `zoder exec`. With
-    /// `try_lock_exclusive`, `WouldBlock` IS returned immediately when
-    /// another FD holds the lock, so the bounded retry loop, the
-    /// stale-lockfile break, and the `LOCK_TIMEOUT_MS` ceiling all
-    /// actually take effect and the caller cannot hang forever. The
-    /// lock is held by the `LockGuard` RAII wrapper and released on
+    /// **Locking scheme: file-existence, NOT kernel `flock(2)`.**
+    /// The lock IS the presence of the lockfile; acquisition is an
+    /// atomic `create_new` (`O_CREAT | O_EXCL`), release is
+    /// `remove_file` in the RAII `Drop`. Same pattern as
+    /// `model_health::HealthStore::mutate_locked`.
+    ///
+    /// Why NOT kernel `flock(2)` (e.g. `fs2::FileExt`)? Because under
+    /// `flock(2)` the lock is tied to the FD, not the path. A
+    /// stale-break fallback that unlinks the lockfile does NOT release
+    /// the kernel lock held by the other process's FD — so the next
+    /// `open(2)` would create a fresh lockfile, the next `flock(2)`
+    /// would acquire a NEW lock on the new FD, and two processes
+    /// would believe they hold exclusive access simultaneously. The
+    /// file-existence scheme has no such FD-vs-path mismatch: the
+    /// only way to release the lock is to remove the file, and the
+    /// only way to acquire is to create it, and both are atomic w.r.t.
+    /// each other on a POSIX-compliant filesystem.
+    ///
+    /// **Bounded retry + stale-break + timeout.** Acquisition spins
+    /// on `create_new` with a short sleep, up to `LOCK_TIMEOUT_MS`,
+    /// then fails with `TimedOut`. A lockfile whose mtime is older
+    /// than `LOCK_STALE_SECS` is treated as abandoned and force-broken.
+    /// `LOCK_STALE_SECS` is generously larger than the worst-case
+    /// legitimate critical section, so a live holder cannot be mistaken
+    /// for a stale one. The lock is held by the `LockGuard` RAII wrapper and released on
     /// Drop (including panic / early return). The closure sees a
     /// `Session` loaded from `path` UNDER the lock; its mutation is
     /// persisted by `save_locked` (unique-temp + fsync + rename) before
@@ -373,13 +388,14 @@ impl Session {
         let lock_path = Self::lockfile_path(&path);
         // Acquire the per-session lockfile (RAII: released on Drop,
         // incl. panic / early return) BEFORE loading, so the whole
-        // read-modify-write is exclusive. Same `flock(2)` idiom as
-        // `utilization::UtilizationStore::acquire_lock`; on process
-        // death the kernel closes the FD and releases the lock so a
-        // crashed holder can't deadlock the next caller on a real OS
-        // (and on NFS / leaked-FD edge cases the stale-break in
-        // `LockGuard::acquire` unlinks an abandoned lockfile rather
-        // than hanging).
+        // read-modify-write is exclusive. Same file-existence idiom
+        // as `model_health::HealthStore::mutate_locked`: on process
+        // death the lockfile is left on disk (no kernel-side state to
+        // clean up), and the next `acquire` either wins `create_new`
+        // or — if the lockfile is older than `LOCK_STALE_SECS` —
+        // breaks the stale entry via unlink + retry. Crucially, this
+        // scheme has no FD-vs-path race: the file's presence IS the
+        // lock, and only one process can ever win `create_new`.
         let _guard = LockGuard::acquire(&lock_path)?;
         // Load the freshest on-disk state UNDER the lock so we merge
         // onto whatever the previous holder just wrote. This
@@ -390,7 +406,8 @@ impl Session {
         let mut sess = Self::load_or_new(dir, id)?;
         f(&mut sess);
         Self::save_locked(&mut sess, dir)
-        // `_guard` drops here, releasing the lock.
+        // `_guard` drops here, removing the lockfile and releasing
+        // the lock.
     }
 
     /// List sessions (id, updated, message-count), newest first.
@@ -427,18 +444,24 @@ impl Session {
     }
 }
 
-/// RAII guard for the per-session `<id>.json.lock` lockfile. The
-/// `fs2::FileExt::try_lock_exclusive` `flock(2)` lock is held by the
-/// FD for the guard's lifetime, so the lock is released as soon as the
-/// guard drops (incl. panic / early return). The on-disk lockfile is
-/// left in place after the FD closes — the kernel releases the lock on
-/// close, and the next `acquire` simply reopens it. We do NOT remove
-/// the lockfile in `Drop` because `flock(2)` semantics are tied to
-/// the FD, not the path; removing the file would race with another
-/// process that just opened the same path for a fresh acquire.
+/// RAII guard for the per-session `<id>.json.lock` lockfile.
+/// The lock IS the presence of the lockfile (file-existence
+/// scheme), so the guard owns the path and removes it on Drop to
+/// release the lock. Acquisition is an atomic `create_new`
+/// (`O_CREAT | O_EXCL`) in [`LockGuard::acquire`], so two concurrent
+/// callers cannot both observe `Ok(_)` — only one wins, the other
+/// sees `AlreadyExists` and either waits, breaks a stale entry, or
+/// times out. The file-existence scheme is deliberately chosen over
+/// kernel `flock(2)` because unlinking the lockfile does NOT release
+/// a kernel `flock(2)` held on another process's FD, which would let
+/// two processes believe they held the lock simultaneously
+/// (reintroducing DEFECT 1 under stale-break timing). Here, the
+/// single source of truth is "does the file exist" — both acquire and
+/// release are atomic w.r.t. each other on a POSIX-compliant
+/// filesystem.
 #[derive(Debug)]
 struct LockGuard {
-    _file: std::fs::File,
+    path: PathBuf,
 }
 
 /// Default upper bound on how long `LockGuard::acquire` will wait for
@@ -454,12 +477,13 @@ const LOCK_TIMEOUT_MS: u64 = 5_000;
 const LOCK_RETRY_MS: u64 = 5;
 
 /// A lockfile whose mtime is older than this is treated as abandoned
-/// (a crashed holder that never closed its FD — defensive in case
-/// the kernel-side `flock(2)` cleanup didn't kick in, e.g. an NFS
-/// mount where flock is local-only and the kernel-side FD close was
-/// on a different node). Mirrors `model_health::LOCK_STALE_SECS`
-/// (30s). Generous relative to the critical section so a live holder
-/// is never mistaken for a stale one.
+/// (a crashed holder that died without removing the lockfile, e.g.
+/// OOM-kill, SIGKILL, panic in `mutate_locked` before Drop fires,
+/// or `kill -9` from the operator). Mirrors `model_health::LOCK_STALE_SECS`
+/// (30s). Generous relative to the critical section (load + apply +
+/// atomic-rename is sub-millisecond in practice) so a live holder is
+/// never mistaken for a stale one — even a 10× slower-than-expected
+/// holder finishes comfortably under `LOCK_STALE_SECS`.
 const LOCK_STALE_SECS: u64 = 30;
 
 impl LockGuard {
@@ -481,39 +505,55 @@ impl LockGuard {
         }
         let start = std::time::Instant::now();
         loop {
-            // Open (creating if needed) the sidecar lockfile. We use
-            // `create(true)` + `truncate(false)` so a stale lockfile
-            // from a previous run is left untouched (the lock is on
-            // the FD, not the contents).
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
+            // Atomic `O_CREAT | O_EXCL` create. This is the lock:
+            // exactly one racer wins, all others see `AlreadyExists`
+            // and spin-retry. Mirrors `model_health::LockGuard::acquire`.
+            match std::fs::OpenOptions::new()
+                .create_new(true)
                 .write(true)
-                .open(lock_path)?;
-            // `try_lock_exclusive` is `flock(2)` with `LOCK_NB`: it
-            // returns immediately. On a contended lock (another FD in
-            // this or another process holds the `flock(2)`) it returns
-            // `WouldBlock` rather than blocking. That is the
-            // non-blocking guarantee the bounded retry, stale-break,
-            // and timeout guards below depend on.
-            match f.try_lock_exclusive() {
-                Ok(()) => return Ok(LockGuard { _file: f }),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Drop the FD before retrying — otherwise we'd
-                    // accumulate FDs across retries and the stale-
-                    // detection mtime would be skewed by our own
-                    // opens.
-                    drop(f);
+                .open(lock_path)
+            {
+                // Won the race: the file's existence IS the lock.
+                // Stamp our PID into the lockfile so a future
+                // contender can check liveness before considering a
+                // stale-break. We write via truncate(false) — the
+                // lockfile must remain on disk after this so the
+                // existence-of-file scheme keeps the lock held.
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    let _ = file.write_all(format!("pid={}\n", std::process::id()).as_bytes());
+                    let _ = file.sync_all();
+                    return Ok(LockGuard {
+                        path: lock_path.to_path_buf(),
+                    });
+                }
+                // Someone else holds it — wait, break-if-confirmed-
+                // abandoned, or time out.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Defensive stale break: if the lockfile's mtime
-                    // is older than LOCK_STALE_SECS, a previous
-                    // holder likely died without releasing the
-                    // flock. We can't tell `flock(2)` to "take it
-                    // anyway" so we unlink the lockfile and retry —
-                    // the next `OpenOptions::create(true)` will
-                    // recreate it. Matches
-                    // `model_health::LockGuard::is_stale`.
-                    if Self::is_stale(lock_path) {
+                    // is older than LOCK_STALE_SECS AND the PID
+                    // recorded inside it no longer exists, a previous
+                    // holder died without removing the lockfile
+                    // (panic before Drop, OOM-kill, SIGKILL, etc.).
+                    // We require BOTH conditions — mtime-old alone is
+                    // not sufficient because a live holder's lockfile
+                    // could legitimately be old if the holder is
+                    // stuck inside a slow critical section (rare, but
+                    // possible). The PID check confirms the holder
+                    // is genuinely gone. PID-alive alone is also not
+                    // sufficient because PIDs are recycled: a fresh
+                    // unrelated process could hold the same PID,
+                    // and we'd be looking at a different process's
+                    // lockfile with a recycled PID. The combination
+                    // (old mtime + dead PID) is unambiguous: the
+                    // recorded holder is gone and the lock is
+                    // abandoned.
+                    //
+                    // Under the file-existence scheme, this break is
+                    // safe — unlinking the file is the ONLY way to
+                    // release the lock, and the next create_new will
+                    // sort out the single winner.
+                    if Self::is_stale(lock_path) && !Self::holder_pid_alive(lock_path) {
                         let _ = std::fs::remove_file(lock_path);
                         continue;
                     }
@@ -528,13 +568,14 @@ impl LockGuard {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(retry_ms));
                 }
+                // Any other error (e.g. permission) is fatal for acquisition.
                 Err(e) => return Err(e),
             }
         }
     }
 
     /// True when the lockfile's mtime is older than `LOCK_STALE_SECS`,
-    /// i.e. a crashed holder likely never closed its FD. Mirrors
+    /// i.e. a previous holder likely crashed before removing it. Mirrors
     /// `model_health::LockGuard::is_stale`. Metadata/time errors
     /// return false (treat as fresh) so a transient stat error
     /// can't cause us to break a live lock.
@@ -549,6 +590,92 @@ impl LockGuard {
             Ok(age) => age.as_secs() >= LOCK_STALE_SECS,
             Err(_) => false,
         }
+    }
+
+    /// True when the PID recorded inside the lockfile is alive (the
+    /// holder is still running). Used as the liveness half of the
+    /// stale-break heuristic: a lockfile with an old mtime AND a dead
+    /// PID is unambiguously abandoned and safe to break; a lockfile
+    /// with an old mtime AND a live PID might still be held by the
+    /// (slow) holder, so we wait instead of breaking.
+    ///
+    /// Returns `true` when the lockfile has no recorded PID (e.g.
+    /// written by an older version of this code, or written by a
+    /// test fixture) so we never break a lock whose holder cannot
+    /// be confirmed dead. This is the safe default — we'd rather
+    /// wait out the timeout than risk breaking a live lock.
+    ///
+    /// On non-Unix platforms this falls back to "assume alive" —
+    /// the same conservative default. (Session locking is only
+    /// exercised on Unix in this crate; the `#[cfg(unix)]` gate on
+    /// the only caller that relies on PID liveness keeps this safe.)
+    #[cfg(unix)]
+    fn holder_pid_alive(lock_path: &Path) -> bool {
+        // Read the recorded PID. Treat missing / unparseable as
+        // "alive" (conservative — wait, don't break).
+        //
+        // Defensive size cap: the lockfile should be a few dozen
+        // bytes at most (`pid=NNNN\n`). An unexpectedly-large
+        // lockfile is a sign of tampering or filesystem corruption,
+        // and we'd rather not slurp arbitrary content into memory
+        // just to find a PID. The cap is 64 bytes — generous for
+        // any plausible PID encoding, but small enough to bound
+        // the read.
+        let Ok(meta) = std::fs::metadata(lock_path) else {
+            return true;
+        };
+        if meta.len() > 64 {
+            return true;
+        }
+        let Ok(raw) = std::fs::read_to_string(lock_path) else {
+            return true;
+        };
+        let pid_str = raw
+            .trim()
+            .strip_prefix("pid=")
+            .unwrap_or(raw.as_str())
+            .trim();
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // `kill(pid, 0)` returns 0 if the process exists, -1/ESRCH
+        // if not. This is the standard liveness probe on POSIX and
+        // does NOT send a signal.
+        let r = unsafe { libc::kill(pid, 0) };
+        if r == 0 {
+            true
+        } else {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            // ESRCH = no such process. EPERM = exists but we lack
+            // permission to signal it (so it's alive, just owned by
+            // another user).
+            errno
+                != std::io::Error::from_raw_os_error(libc::ESRCH)
+                    .raw_os_error()
+                    .unwrap_or(0)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn holder_pid_alive(_lock_path: &Path) -> bool {
+        // On non-Unix we cannot probe PID liveness portably; assume
+        // alive so we never break a lock we can't confirm abandoned.
+        true
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // Release the lock by removing the lockfile. The
+        // existence-of-file scheme guarantees this is the ONLY way
+        // to release the lock, and a subsequent `create_new` will
+        // succeed. If the file is already gone (e.g. a stale-breaker
+        // removed it, or the filesystem was wiped), that's fine —
+        // the lock is released either way.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1513,11 +1640,17 @@ mod tests {
         }
     }
 
-    /// Lock acquire stale-break pin: a lockfile with an old mtime
-    /// (simulating a crashed holder that never released) must be
-    /// broken by the next acquirer rather than wedging it. We
+    /// Lock acquire stale-break pin: a lockfile whose recorded PID
+    /// is dead AND whose mtime is older than `LOCK_STALE_SECS` must
+    /// be broken by the next acquirer rather than wedging it. We
     /// simulate the "stale" condition by manually writing a
-    /// lockfile with a backdated mtime, then trying to acquire it.
+    /// lockfile with a backdated mtime and a recorded PID of a
+    /// process we are confident does not exist (a high number
+    /// unlikely to be recycled on the test host), then trying to
+    /// acquire it. Under the file-existence scheme, this is the
+    /// safe path: unlinking the stale file IS the lock release, so
+    /// the next `create_new` succeeds and only one acquirer can
+    /// ever observe `Ok(_)`.
     #[cfg(unix)]
     #[test]
     fn lock_acquire_breaks_stale_lockfile() {
@@ -1527,20 +1660,38 @@ mod tests {
         let path = Session::path_in(&dir, "stale-id");
         let lock_path = Session::lockfile_path(&path);
 
-        // Plant a lockfile with a mode 0o644 (so we can open+write
-        // it later) and a mtime far in the past (well beyond
-        // LOCK_STALE_SECS). `truncate(false)` is intentional — we
-        // want the lockfile to exist (so `OpenOptions::create` is
-        // a no-op and the mtime we set below sticks), but we don't
-        // care about the file contents (the `flock(2)` is on the
-        // FD, not the file body).
-        let f = std::fs::OpenOptions::new()
+        // Plant a lockfile with a mtime far in the past (well beyond
+        // LOCK_STALE_SECS), simulating a crashed holder that died
+        // without removing the lockfile, AND a recorded PID of a
+        // process that almost certainly does not exist on the test
+        // host. The stale-break heuristic requires BOTH an old mtime
+        // AND a dead PID (see
+        // `LockGuard::acquire_with_params`), so this fixture
+        // satisfies both.
+        //
+        // No contents or mode matter for the lock itself — the
+        // file-existence scheme only cares whether the file is on
+        // disk. We only write the `pid=...` line so the liveness
+        // probe can find a PID to check.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .mode(0o644)
             .open(&lock_path)
             .unwrap();
+        // PID 0 is the kernel scheduler on Linux and is never a
+        // user process; PID 0 to `kill -0` returns EPERM (not
+        // ESRCH) which `holder_pid_alive` treats as "alive" — so
+        // we avoid 0. Pick a high number that's very unlikely to
+        // be a live PID on a typical test host. (If the host
+        // happens to have a process with this PID, the test
+        // becomes a "live holder" test rather than a "stale"
+        // test — it would time out instead of succeed, which
+        // is still a safe failure mode.)
+        let dead_pid: i32 = 999_999;
+        f.write_all(format!("pid={dead_pid}\n").as_bytes()).unwrap();
         f.sync_all().unwrap();
         drop(f);
 
@@ -1551,9 +1702,119 @@ mod tests {
 
         // Acquiring must succeed (the stale-break unlinks the old
         // lockfile and re-creates it under our ownership). This
-        // validates the `Self::is_stale` branch in `LockGuard::acquire`.
+        // validates the BOTH-old-and-dead branch in
+        // `LockGuard::acquire_with_params`.
         let guard = LockGuard::acquire(&lock_path).expect("stale lock must be broken");
         drop(guard);
+    }
+
+    /// CRITICAL REGRESSION PIN (reviewer-flagged, C11-S4): the
+    /// previous `flock(2)`-based lock had a subtle race where a
+    /// stale-break fallback (unlink the lockfile) did NOT release the
+    /// kernel `flock(2)` held by the other process's FD — so the
+    /// next acquirer would create a fresh lockfile, acquire a NEW
+    /// kernel lock on the NEW FD, and TWO processes would believe
+    /// they held the lock simultaneously, reintroducing DEFECT 1's
+    /// lost-update race.
+    ///
+    /// Under the new file-existence scheme, this test would be
+    /// impossible to fail by construction: the file IS the lock, so
+    /// a live holder's lockfile cannot be unlinked by the contender.
+    /// This test pins that contract explicitly: simulate a live
+    /// holder (a real `LockGuard` plus a backdated mtime so the
+    /// contender would otherwise consider it stale), then have a
+    /// contender attempt to acquire with a short timeout. The
+    /// contender MUST observe `TimedOut`, NOT acquire the lock — even
+    /// though the lockfile is older than `LOCK_STALE_SECS`. A live
+    /// holder whose critical section exceeds `LOCK_STALE_SECS` (a
+    /// scenario that can't actually happen in production but is
+    /// well-defined for this regression pin) must NOT be broken by
+    /// the stale-break.
+    ///
+    /// If a future change reverts to a `flock(2)`-based scheme or
+    /// adds a different stale-break, this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn lock_acquire_does_not_break_lockfile_held_by_live_holder() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        let dir = tmpdir();
+        let path = Session::path_in(&dir, "live-but-old");
+        let lock_path = Session::lockfile_path(&path);
+
+        // Live holder: a real LockGuard is in scope, so the
+        // lockfile IS the lock under the file-existence scheme.
+        let holder = LockGuard::acquire(&lock_path).expect("initial acquire must succeed");
+
+        // Backdate the lockfile's mtime to well beyond
+        // LOCK_STALE_SECS — making it LOOK stale to the contender's
+        // is_stale() check, while the live holder is still in scope.
+        // If the stale-break path ever fires against a live holder
+        // under the file-existence scheme, this test catches it.
+        let past =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(LOCK_STALE_SECS + 60);
+        let past_ft = libc_filetime(past);
+        set_file_mtime(&lock_path, past_ft);
+
+        let holder = Arc::new(Mutex::new(Some(holder)));
+
+        // Contender: try to acquire with a 250ms timeout. Under
+        // the buggy `flock(2)`-on-FD scheme, the stale-break
+        // unlinks the lockfile but does NOT release the kernel
+        // lock — the contender then opens a fresh lockfile and
+        // acquires a new (independent) kernel lock, returning Ok.
+        // Under the fixed file-existence scheme, the lockfile
+        // STILL EXISTS (the holder's `Drop` hasn't fired) so
+        // `create_new` returns `AlreadyExists` on every iteration
+        // until the timeout fires.
+        let start = Instant::now();
+        let result = LockGuard::acquire_with_params(
+            &lock_path, /* timeout_ms */ 250, /* retry_ms */ 10,
+        );
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err(
+            "acquire_with_params MUST return Err when the lock is held by a live holder — \
+             if it returns Ok, the stale-break fired against a live holder and the file-existence \
+             contract is broken (reintroducing the DEFECT 1 lost-update race).",
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "error kind must be TimedOut (proves the contender hit the timeout path, not e.g. \
+             a hang panicking into a different error). Got: {err:?}"
+        );
+
+        // Sanity: elapsed time must be near the timeout, not instant
+        // (which would suggest the stale-break fired) and not way
+        // over (which would suggest a hang).
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "acquire_with_params returned TimedOut but only took {elapsed:?}; a stale-break \
+             may have fired early (the contender should have waited ~250ms before timing out)."
+        );
+        assert!(
+            elapsed < Duration::from_millis(250 + 2_000),
+            "acquire_with_params returned TimedOut but took {elapsed:?}; the wait should \
+             be ~250ms plus scheduler jitter, not 60s+. If this fires, the underlying lock \
+             is somehow blocking despite returning TimedOut."
+        );
+
+        // The lockfile MUST STILL EXIST — the live holder still
+        // owns it. If the stale-break fired, this would be gone.
+        assert!(
+            lock_path.exists(),
+            "lockfile MUST still exist while the live holder is in scope; \
+             its absence means the stale-break fired against a live holder \
+             (reintroducing the DEFECT 1 race)."
+        );
+
+        // Release the holder, then the contender must succeed
+        // immediately — proves the lock wasn't permanently corrupted.
+        drop(holder.lock().unwrap().take());
+        LockGuard::acquire(&lock_path).expect("post-release acquire must succeed");
     }
 
     #[cfg(unix)]
