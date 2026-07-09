@@ -59,6 +59,22 @@ pub enum Error {
 /// * `transport = unix_socket` + `endpoint = path` -> [`EngineTransport::UnixSocket`].
 /// * Anything else -> [`Error::UnsupportedTransport`] /
 ///   [`Error::UnsupportedEndpoint`].
+///
+/// # Trust boundary (security)
+///
+/// For `transport = stdio`, `endpoint.path` becomes the `command` of an
+/// [`EngineTransport::Stdio`], which `acp-client` feeds verbatim into
+/// `std::process::Command::new(...)`. The v1 schema only constrains that
+/// path to `minLength: 1` — it is otherwise an unrestricted string. That
+/// means **a descriptor accepted here is a code-execution primitive: the
+/// binary named by `endpoint.path` is spawned as-is.** This is only safe
+/// because descriptors are expected to come from a *trusted, checked-in
+/// source* (today: codegen-emitted `schema/*.descriptor.json` plus
+/// hand-authored fixtures, both reviewed in-tree). Do NOT call
+/// `derive_transport` on a descriptor loaded from an untrusted or
+/// user-supplied location without first gating the `endpoint.path` behind
+/// an out-of-band allow-list or provenance check; the descriptor format
+/// itself carries no such guarantee.
 pub fn derive_transport(desc: &AgentDescriptor) -> Result<EngineTransport, Error> {
     match desc.connection.transport {
         Transport::Stdio => match &desc.connection.endpoint {
