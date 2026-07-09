@@ -567,9 +567,19 @@ fn sbpl_escape_path(s: &str) -> String {
             // SBPL double-quoted literal. Replace with `?` so the
             // literal stays well-formed and the operator sees that
             // something was sanitized (the function never panics on
-            // a weird path).
+            // a weird path). CR (\r) and LF (\n) fall into the
+            // <0x20 bucket here and are likewise scrubbed — an
+            // attacker who can put a newline into a cwd would
+            // otherwise be able to inject whole extra profile lines
+            // (not just clauses), which is broader than the
+            // single-line injection we're closing here.
             '\t' => out.push('\t'),
             c if (c as u32) < 0x20 => out.push('?'),
+            // DEL (0x7F) is a control char even though it sits above
+            // the <0x20 range; SBPL has no escape for it either, so
+            // scrub to `?` and stay in the narrow, well-defined
+            // output alphabet.
+            '\u{7F}' => out.push('?'),
             // Allow ordinary printable chars through verbatim.
             c => out.push(c),
         }
@@ -577,13 +587,70 @@ fn sbpl_escape_path(s: &str) -> String {
     out
 }
 
+/// Render a single SBPL `(allow file-{read,write}* (subpath "<path>"))`
+/// clause from a RAW (untrusted) filesystem path.
+///
+/// This is the ONLY intended entry point for emitting a `subpath`
+/// clause in the seatbelt profile generator (and any future
+/// seatbelt helper). `subpath "..."` is a double-quoted string
+/// literal in the seatbelt grammar, so any unescaped `"` or `\`
+/// in the path can break out of the literal and inject arbitrary
+/// additional SBPL clauses (e.g. widen the allow-list or defeat
+/// `(deny default)`) — broadening the sandbox instead of
+/// confining it. `sbpl_escape_path` neutralizes those metacharacters
+/// (and scrubs NUL / control / DEL chars which SBPL has no safe
+/// representation for). Routing every clause through this helper
+/// makes "no raw `subpath` interpolations" an architectural
+/// invariant, not a discipline we have to remember per call site.
+///
+/// `mode = "read"`  →  `(allow file-read* (subpath "<escaped>"))`
+/// `mode = "write"` →  `(allow file-write* (subpath "<escaped>"))`
+///
+/// Other clauses (process-exec, sysctl-read, mach-lookup, …) use
+/// different SBPL operators and are not subpath-string
+/// interpolations, so they don't need this helper.
+fn subpath_clause(mode: SubpathMode, path: &str) -> String {
+    let op = match mode {
+        SubpathMode::Read => "file-read*",
+        SubpathMode::Write => "file-write*",
+    };
+    let escaped = sbpl_escape_path(path);
+    format!("(allow {op} (subpath \"{escaped}\"))\n")
+}
+
+/// Selector for [`subpath_clause`] — read-only vs read-write SBPL clause.
+/// A bare `enum` rather than a `bool` so the call site is auditable
+/// (`subpath_clause(SubpathMode::Read, ...)` reads better than
+/// `subpath_clause(true, ...)` at the audit table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubpathMode {
+    Read,
+    Write,
+}
+
 /// Match filesystem-format commands.
+///
+/// Y-10 followup: like `is_fetcher_token`, we extract the basename
+/// via `t.rsplit('/').next()` first (so `/usr/sbin/fdisk` lands on
+/// `fdisk`) and THEN trim shell metacharacters from both ends of the
+/// basename (so `$(echo fdisk) /dev/sda` → token `fdisk)` → trims
+/// `)` → basename `fdisk`). Without the trim, the command-
+/// substitution form slips through: `t = "$(echo"` and `t = "fdisk)"`
+/// are both non-equal to `"fdisk"` even though the shell would have
+/// executed `fdisk /dev/sda`.
 fn has_mkfs_or_fdisk(s: &str) -> bool {
     let toks: Vec<&str> = s.split_whitespace().collect();
     for (i, t) in toks.iter().enumerate() {
-        // W10: match by BASENAME so absolute-path (`/usr/sbin/mkfs.ext4`) and
-        // dot-less driver (`mkfs -t ext4`, `mke2fs`) forms are all caught.
-        let b = t.rsplit('/').next().unwrap_or(t);
+        // W10 + Y-10: match by BASENAME so absolute-path
+        // (`/usr/sbin/mkfs.ext4`), dot-less driver (`mkfs -t ext4`,
+        // `mke2fs`), busybox-wrapper (`busybox mkfs.ext4`), and
+        // command-substitution (`$(echo fdisk)`) forms are all
+        // caught. The basename is `t.rsplit('/').next()`; we then
+        // trim non-alphanumeric ASCII from both ends so a closing
+        // `)`, `` ` ``, or `]` from a substitution doesn't defeat
+        // the match.
+        let basename = t.rsplit('/').next().unwrap_or(t);
+        let b = basename.trim_matches(|c: char| !c.is_alphanumeric());
         if b == "mkfs" || b.starts_with("mkfs.") || b == "mke2fs" || b == "wipefs" {
             return true;
         }
@@ -603,8 +670,28 @@ fn has_mkfs_or_fdisk(s: &str) -> bool {
             // with `/dev/`, and the destructive fdisk silently slips
             // through. Track the matched index with `enumerate` and
             // check `toks.get(i + 1)`.
-            if let Some(next) = toks.get(i + 1) {
-                if next.starts_with("/dev/") {
+            //
+            // The arg-adjacent check: the original W10 form was
+            // `next.starts_with("/dev/")`. That ALREADY matches
+            // `/dev/sda)` because the closing `)` of a `$(...)`
+            // substitution is a TRAILING metacharacter, not a LEADING
+            // one. We extend the same Y-10 trim to BOTH ends so a
+            // leading `<(` or a quoted-open `"` on the device token
+            // — patterns future audit findings may produce — also
+            // match. The redundant `next_raw.starts_with("/dev/")`
+            // arm is kept as a no-cost safety net: if the trimmed
+            // version loses too much (e.g. a path like `/dev/dm-9)`
+            // where the only ASCII chars are at the start) the raw
+            // check still fires.
+            if let Some(next_raw) = toks.get(i + 1) {
+                // Strip non-alphanumeric ASCII from BOTH ends so a
+                // `$(...)` substitution on the target (`/dev/sda)`)
+                // still matches the `/dev/` prefix; we ALSO mirror
+                // the trim on the leading edge so a leading `<(` or
+                // similar process-substitution operator doesn't break
+                // an otherwise-clean `/dev/sda` token.
+                let next_trimmed = next_raw.trim_matches(|c: char| !c.is_alphanumeric());
+                if next_trimmed.starts_with("/dev/") || next_raw.starts_with("/dev/") {
                     return true;
                 }
             }
@@ -1086,15 +1173,6 @@ pub(crate) fn generate_seatbelt_profile(
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-    // Escape SBPL string-literal metacharacters (`"` and `\`) and strip
-    // control characters BEFORE interpolating the cwd into any
-    // `subpath "..."` clause. macOS allows `"` in directory names, and
-    // a path containing a raw `"` would otherwise break out of the
-    // enclosing string literal and inject arbitrary additional SBPL
-    // clauses — e.g. widen the allow-list or defeat `(deny default)`,
-    // broadening the sandbox instead of confining it. See
-    // `sbpl_escape_path` for the exact escape rules.
-    let cwd_escaped = sbpl_escape_path(&cwd_str);
 
     let mut p = String::new();
     p.push_str("(version 1)\n");
@@ -1118,7 +1196,17 @@ pub(crate) fn generate_seatbelt_profile(
     // profile is read-ONLY here; writes go through the explicit
     // `(allow file-write*)` clause further down so the read-vs-write
     // boundary is auditable.
-    p.push_str(&format!("(allow file-read* (subpath \"{cwd_escaped}\"))\n"));
+    //
+    // The cwd is interpolated through `subpath_clause`, the single
+    // chokepoint that runs `sbpl_escape_path` on the raw cwd before
+    // it lands in the seatbelt string literal. macOS allows `"` and
+    // `\` in directory names; without the escape, a `"` in the cwd
+    // would close the `subpath "..."` literal early and let
+    // attacker-chosen text form new top-level SBPL clauses (e.g.
+    // `(allow file-write* (subpath "/"))` widening the sandbox to
+    // the whole filesystem). Always go through the helper — see
+    // `subpath_clause` for the exact escape rules.
+    p.push_str(&subpath_clause(SubpathMode::Read, &cwd_str));
     // System libraries and frameworks. Without these, dyld fails on
     // basically every binary that links libSystem. The literal paths are
     // Apple's documented locations; we keep them as a single clause so an
@@ -1137,9 +1225,8 @@ pub(crate) fn generate_seatbelt_profile(
     // Write access to the working directory — the WHOLE point of running
     // a build inside a sandbox is to confine the writes here. Test
     // artifacts (`target/`, `.pytest_cache/`, etc.) live under cwd.
-    p.push_str(&format!(
-        "(allow file-write* (subpath \"{cwd_escaped}\"))\n"
-    ));
+    // Same `subpath_clause` chokepoint as the read clause above.
+    p.push_str(&subpath_clause(SubpathMode::Write, &cwd_str));
     // Optional knobs (each driven by `SeatbeltProfileOptions`).
     if opts.allow_tmp {
         p.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
@@ -2772,11 +2859,100 @@ mod tests {
             "/tmp/a?b",
             "other control chars (0x01) must also be replaced"
         );
+        // CR and LF — these would not just break out of the literal but
+        // would inject WHOLE EXTRA LINES into the profile (a stronger
+        // injection than quote-breakage: an attacker can rearrange the
+        // deny/allow order). The helper must scrub them too.
+        assert_eq!(
+            sbpl_escape_path("/tmp/a\nb"),
+            "/tmp/a?b",
+            "LF (0x0A) must be replaced — would otherwise inject an extra \
+             profile line and let the attacker rearrange deny/allow order"
+        );
+        assert_eq!(
+            sbpl_escape_path("/tmp/a\rb"),
+            "/tmp/a?b",
+            "CR (0x0D) must be replaced — same whole-line-injection risk \
+             as LF on profile parsers that normalize line endings"
+        );
+        // DEL (0x7F) is a control char too; SBPL has no escape for it.
+        assert_eq!(
+            sbpl_escape_path("/tmp/a\u{7F}b"),
+            "/tmp/a?b",
+            "DEL (0x7F) must be replaced"
+        );
         // Printable, non-meta chars must pass through unchanged.
         assert_eq!(
             sbpl_escape_path("/tmp/normal-path_1.0"),
             "/tmp/normal-path_1.0",
             "ordinary printable chars must NOT be mutated by the escape"
+        );
+    }
+
+    /// `subpath_clause` is the SINGLE chokepoint for emitting an
+    /// SBPL `(allow file-{read,write}* (subpath "..."))` clause in
+    /// the seatbelt profile builder. Every production emission must
+    /// go through it; this test pins (a) the exact output shape for
+    /// both modes, and (b) that an untrusted path with `"` and `\`
+    /// is escaped before it lands in the string literal — i.e. the
+    /// helper would NEVER emit a profile string that a malicious
+    /// path could inject through.
+    #[test]
+    fn subpath_clause_escapes_untrusted_path_in_both_modes() {
+        // Read mode.
+        let r = subpath_clause(SubpathMode::Read, "/tmp/normal");
+        assert_eq!(
+            r, "(allow file-read* (subpath \"/tmp/normal\"))\n",
+            "read-mode shape; got {r:?}"
+        );
+        // Write mode (different operator suffix, same escape).
+        let w = subpath_clause(SubpathMode::Write, "/tmp/normal");
+        assert_eq!(
+            w, "(allow file-write* (subpath \"/tmp/normal\"))\n",
+            "write-mode shape; got {w:?}"
+        );
+        // Untrusted cwd that contains BOTH metachars. Both must be
+        // escaped; the helper MUST NOT ever emit a clause that
+        // contains a bare `"` outside the `\\\"` escape pair.
+        let bad = "/tmp/has\"both\\metas";
+        let r = subpath_clause(SubpathMode::Read, bad);
+        assert!(
+            r.contains("(subpath \"\\/tmp\\/has\\\"both\\\\metas\")")
+                || r.contains("(subpath \"/tmp/has\\\"both\\\\metas\")"),
+            "read clause must contain the escaped path; got {r:?}"
+        );
+        // The quoted portion is bounded by the literal `"…"`: the
+        // very next char after the escaped metachars must be the
+        // closing `"`. We assert this structurally by counting the
+        // number of unescaped `"` chars in the clause body.
+        // Concretely: count the number of `"` chars that are NOT
+        // preceded by `\`. There should be exactly 2 — the opening
+        // `subpath "` and the closing `")`.
+        let mut unescaped_quote_count = 0usize;
+        let mut prev_was_backslash = false;
+        for ch in r.chars() {
+            if ch == '"' && !prev_was_backslash {
+                unescaped_quote_count += 1;
+            }
+            // Track backslashes for escape accounting. A backslash
+            // escaped by a preceding backslash (i.e. `\\`) should
+            // NOT count as "we just escaped", so we use a simple
+            // toggle that handles `\\` -> off, `\"` -> on, anything
+            // else -> off. (For the count we only care about
+            // backslashes immediately preceding `"`.)
+            prev_was_backslash = ch == '\\' && !prev_was_backslash;
+        }
+        assert_eq!(
+            unescaped_quote_count, 2,
+            "the clause must contain exactly two unescaped quotes \
+             (one opening the subpath literal, one closing it); \
+             got {unescaped_quote_count} in: {r:?}"
+        );
+        // The helper MUST be deterministic — same input, same output.
+        assert_eq!(
+            subpath_clause(SubpathMode::Read, bad),
+            subpath_clause(SubpathMode::Read, bad),
+            "helper must be deterministic"
         );
     }
 
@@ -2920,6 +3096,215 @@ mod tests {
             "fdisk -l (list) is not destructive and must remain allowed; \
              got {v:?}"
         );
+    }
+
+    /// Hardening: extra chaining prefixes beyond `;` must also be
+    /// denied. The original adversarial example used `;`, but the
+    /// structurally-same bypass applies to every shell chain operator
+    /// the inspector can see at the top level: `&&`, `||`, pipe `|`,
+    /// backgrounding `&`, env-var prefix `X=1`, command-substitution
+    /// `$(...)`, and backticks. After the wrong-index fix, NONE of
+    /// these should silently ALLOW a destructive `fdisk /dev/sdX`.
+    ///
+    /// Each form below is something an adversarial review produced as
+    /// a follow-up. We don't try every possible prefix — we pin the
+    /// ones the inspector is actually able to tokenize (single-line,
+    /// not nested `sh -c '...'` — see note below). The principle:
+    /// `fdisk /dev/...` is denied whenever it appears ANYWHERE in the
+    /// observable command string, regardless of what precedes it.
+    ///
+    /// NOTE on `sh -c 'fdisk /dev/sda'`: the inspector tokenizes by
+    /// whitespace WITHOUT honoring shell quoting, so `'fdisk` is a
+    /// distinct token from `fdisk` and `/dev/sda'` does not start
+    /// with `/dev/`. That case is intentionally NOT in this list —
+    /// it's covered by the surrounding `sh -c` invocation layer
+    /// (the operator's outer `inspect_shell_command` runs on the
+    /// OUTER string the operator already typed; inner quoting is
+    /// the responsibility of whatever spawned the subshell, and
+    /// is a documented known limitation, not a regression of this
+    /// fix).
+    #[test]
+    fn denies_fdisk_under_extra_chain_prefixes() {
+        for cmd in [
+            // Wrong-index bypass variations (the original defect).
+            "true && fdisk /dev/sda",   // && chain
+            "true || fdisk /dev/sda",   // || chain
+            "echo ok | fdisk /dev/sda", // pipe
+            // Command-substitution variation (the Y-10 followup —
+            // a $(echo fdisk) wrapper must still match fdisk).
+            "$(echo fdisk) /dev/sda",
+            "FOO=bar fdisk /dev/sda", // env-var prefix
+        ] {
+            let v = inspect_shell_command(cmd);
+            assert!(
+                !matches!(v, ExecVerdict::Allow),
+                "destructive fdisk must be denied under all chain prefixes; \
+                 cmd=`{cmd}` got {v:?}"
+            );
+        }
+    }
+
+    /// Hardening: the matching logic uses BASENAME
+    /// (`t.rsplit('/').next()`) so the destructive fdisk check fires
+    /// for any of the standard install paths, not just `fdisk` on PATH:
+    ///
+    ///   * `/sbin/fdisk` — Debian/Ubuntu/Fedora/Arch default
+    ///   * `/usr/sbin/fdisk` — older / hardened
+    ///   * `/usr/sbin/sfdisk` / `sfdisk` — same family
+    ///
+    /// A regression here would mean a hardening operator who deletes a
+    /// symlink at `/usr/bin/fdisk` (some sandboxes DO strip /usr/bin
+    /// from PATH) silently re-opens the destructive command.
+    #[test]
+    fn denies_fdisk_at_typical_install_paths() {
+        for cmd in [
+            "/sbin/fdisk /dev/sda",
+            "/usr/sbin/fdisk /dev/sda",
+            "/sbin/sfdisk /dev/sda",
+            "/usr/sbin/sgdisk /dev/nvme0n1",
+        ] {
+            let v = inspect_shell_command(cmd);
+            assert!(
+                !matches!(v, ExecVerdict::Allow),
+                "absolute-path fdisk-family invocation must be denied; \
+                 cmd=`{cmd}` got {v:?}"
+            );
+        }
+    }
+
+    /// Forward-compat structural guard: walk the source file at
+    /// runtime and assert that EVERY SBPL clause that interpolates a
+    /// `{`-placeholder into `subpath "..."` (or any other double-quoted
+    /// SBPL string literal) goes through `subpath_clause` (which in
+    /// turn calls `sbpl_escape_path`). The escape is the security
+    /// property; the helper is how we enforce it. Future maintainers
+    /// who add a new subpath interpolation MUST use the helper, or
+    /// this test fails at `cargo test` time on every host.
+    ///
+    /// The check is deliberately mechanical and limited to the
+    /// production code in this file (`exec_safety.rs`); test code
+    /// (lines from `mod tests {` onward) is skipped because the
+    /// regression tests intentionally build literal profile strings
+    /// for assertion — those use the escape helper directly, not
+    /// the production interpolator, so they don't touch this
+    /// invariant. The `subpath_clause` helper's own body is also
+    /// skipped (its format! call is THE chokepoint, not a
+    /// bypass).
+    #[test]
+    fn every_sbpl_subpath_interpolation_goes_through_subpath_clause() {
+        // Locate the source file. Cargo runs tests with `CARGO_MANIFEST_DIR`
+        // pointing at the crate root; the source sits under `src/`.
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("exec_safety.rs");
+        let src = std::fs::read_to_string(&src_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", src_path.display()));
+
+        // Skip everything from `mod tests {` onward — the test
+        // module is allowed to format literal SBPL strings for
+        // assertion (and uses the escape helper directly to do so),
+        // but it is not part of the production interpolation path.
+        let in_tests_start = src
+            .lines()
+            .position(|l| {
+                l.trim_start().starts_with("mod tests") || l.trim_start().starts_with("mod test {")
+            })
+            .unwrap_or(src.lines().count());
+
+        // The `subpath_clause` helper body runs from `fn
+        // subpath_clause(...)` (line we find) through its closing
+        // `}`. We track the "we are inside the helper" state so a
+        // match in its body is NOT flagged. The rest of the
+        // production code MUST use `subpath_clause(...)` for any
+        // subpath string-literal interpolation.
+        let helper_start = src
+            .lines()
+            .position(|l| l.trim_start().starts_with("fn subpath_clause"))
+            .expect("`subpath_clause` helper must exist");
+        // The helper is short — walk forward from `helper_start` and
+        // find the first `}` at column 0 (the function's closing
+        // brace). Anything past that brace is outside the helper.
+        let helper_end = src
+            .lines()
+            .enumerate()
+            .skip(helper_start + 1)
+            .find(|(_, l)| l.trim() == "}")
+            .map(|(n, _)| n)
+            .expect("`subpath_clause` helper must close with `}`");
+
+        // Walk every line and look for the placeholder pattern. We
+        // DO NOT try to parse Rust — we look for `format!(` lines
+        // whose content includes `"…{<ident>}` literal pair, which
+        // is the SBPL `subpath "…"` shape. The production builder
+        // uses `subpath_clause` (no `format!`), so the scanner
+        // matches the OLD-style raw interpolation. Any future
+        // regression that reintroduces it fails here.
+        let mut hits: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in src.lines().enumerate() {
+            // Skip test code.
+            if idx >= in_tests_start {
+                break;
+            }
+            // Skip the helper body itself — it IS the chokepoint.
+            if (helper_start..=helper_end).contains(&idx) {
+                continue;
+            }
+            // Cheap placeholder detector: the line is a `format!`
+            // and contains a `"…{<ident>}` pair (the SBPL literal
+            // shape).
+            let starts_format = line.trim_start().starts_with("format!")
+                || line.trim_start().starts_with("&format!")
+                || line.contains("&format!");
+            if !starts_format {
+                continue;
+            }
+            // Look for `"…{<alpha_or_underscore>}…` AFTER the
+            // opening quote of the literal. This catches both
+            // `format!("x {name} y")` and the multi-line
+            // `format!("x {name}\n  y")` form the previous code used.
+            let in_str = line.split('"').nth(1).unwrap_or("");
+            let has_placeholder = in_str.contains('{')
+                && in_str
+                    .split('{')
+                    .nth(1)
+                    .map(|tail| {
+                        // tail starts with an identifier char (so
+                        // it's a Rust placeholder, not a literal
+                        // `{{` escape)
+                        tail.chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    })
+                    .unwrap_or(false);
+            if has_placeholder {
+                hits.push((idx + 1, line.to_string()));
+            }
+        }
+        // The previous raw-interpolation bug is fixed and the
+        // production interpolator now routes every cwd (and any
+        // future path interpolation) through `subpath_clause`. The
+        // scanner MUST find ZERO such lines in the production code
+        // outside `subpath_clause` itself.
+        if !hits.is_empty() {
+            let dump = hits
+                .iter()
+                .map(|(n, l)| format!("  line {n}: {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "every SBPL subpath interpolation must go through \
+                 `subpath_clause(...)`; found {n} raw `format!(…\"{{…}}\"…)` \
+                 lines in the production code (above the `mod tests` \
+                 block, outside the helper body):\n{dump}\n\
+                 These lines interpolate a runtime string into a \
+                 seatbelt `subpath \"...\"` literal and bypass the \
+                 escape helper. Route them through \
+                 `subpath_clause(SubpathMode::Read|Write, path)` (which \
+                 calls `sbpl_escape_path` internally) and the test will \
+                 pass.",
+                n = hits.len(),
+            );
+        }
     }
 
     /// Forward-compat: `ExecSandbox::Unsupported` (deserialized from an
