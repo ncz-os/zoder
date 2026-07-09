@@ -5,6 +5,7 @@
 //! write-capable run. Everything routes through the same provider/engine + cost
 //! ledger as `exec`, so spend is captured uniformly.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -1277,6 +1278,19 @@ fn verdict_rank(v: &str) -> u8 {
 // Git diff acquisition.
 // ---------------------------------------------------------------------------
 
+const MAX_GIT_DIFF_BYTES: usize = 1 << 20; // 1 MiB
+const MAX_GIT_STDERR_BYTES: usize = 64 << 10; // 64 KiB
+
+struct CappedRead {
+    bytes: Vec<u8>,
+    limit_reached: bool,
+}
+
+struct CappedGitOutput {
+    stdout: String,
+    limit_reached: bool,
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -1292,6 +1306,141 @@ fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn read_to_byte_cap<R: Read>(mut reader: R, max: usize) -> std::io::Result<CappedRead> {
+    let mut bytes = Vec::with_capacity(max.min(8192));
+    let mut buf = [0_u8; 8192];
+    let mut remaining = max;
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        let n = reader.read(&mut buf[..want])?;
+        if n == 0 {
+            return Ok(CappedRead {
+                bytes,
+                limit_reached: false,
+            });
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        remaining -= n;
+    }
+    Ok(CappedRead {
+        bytes,
+        limit_reached: true,
+    })
+}
+
+fn drain_to_byte_cap<R: Read>(mut reader: R, max: usize) -> std::io::Result<CappedRead> {
+    let mut bytes = Vec::with_capacity(max.min(8192));
+    let mut buf = [0_u8; 8192];
+    let mut limit_reached = false;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(CappedRead {
+                bytes,
+                limit_reached,
+            });
+        }
+        let remaining = max.saturating_sub(bytes.len());
+        if remaining == 0 {
+            limit_reached = true;
+            continue;
+        }
+        let keep = remaining.min(n);
+        bytes.extend_from_slice(&buf[..keep]);
+        if keep < n || bytes.len() == max {
+            limit_reached = true;
+        }
+    }
+}
+
+fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> anyhow::Result<CappedGitOutput> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("git {} stdout was not piped", args.join(" ")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("git {} stderr was not piped", args.join(" ")))?;
+    let stderr_reader = std::thread::spawn(move || drain_to_byte_cap(stderr, MAX_GIT_STDERR_BYTES));
+
+    let stdout = match read_to_byte_cap(stdout, max_stdout) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(e).with_context(|| format!("reading git {} stdout", args.join(" ")));
+        }
+    };
+
+    let mut killed_after_cap = false;
+    let status = if stdout.limit_reached {
+        match child.try_wait()? {
+            Some(status) => status,
+            None => {
+                child
+                    .kill()
+                    .with_context(|| format!("stopping git {} after stdout cap", args.join(" ")))?;
+                killed_after_cap = true;
+                child.wait()?
+            }
+        }
+    } else {
+        child.wait()?
+    };
+
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("reading git {} stderr panicked", args.join(" ")))?
+        .with_context(|| format!("reading git {} stderr", args.join(" ")))?;
+
+    let capped_success = stdout.limit_reached && killed_after_cap;
+    if !(status.success() || capped_success) {
+        let mut err = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+        if stderr.limit_reached {
+            if !err.is_empty() {
+                err.push(' ');
+            }
+            err.push_str(&format!(
+                "[stderr truncated at {MAX_GIT_STDERR_BYTES} bytes]"
+            ));
+        }
+        return Err(anyhow!("git {} failed: {}", args.join(" "), err));
+    }
+
+    Ok(CappedGitOutput {
+        stdout: String::from_utf8_lossy(&stdout.bytes).to_string(),
+        limit_reached: stdout.limit_reached,
+    })
+}
+
+fn run_git_diff(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let capped = run_git_capped(cwd, args, MAX_GIT_DIFF_BYTES)?;
+    Ok(render_capped_git_diff(capped, MAX_GIT_DIFF_BYTES))
+}
+
+fn render_capped_git_diff(capped: CappedGitOutput, max_stdout: usize) -> String {
+    let mut stdout = capped.stdout;
+    if capped.limit_reached {
+        if !stdout.ends_with('\n') {
+            stdout.push('\n');
+        }
+        stdout.push_str(&format!(
+            "\n...[git diff truncated during acquisition at {max_stdout} bytes]...\n"
+        ));
+    }
+    stdout
 }
 
 /// Resolve a base ref for branch review: explicit `base`, else the upstream's
@@ -1338,11 +1487,11 @@ fn build_diff(
     };
     match effective {
         ReviewScope::WorkingTree => {
-            let mut d = run_git(cwd, &["diff", "HEAD"]).unwrap_or_default();
+            let mut d = run_git_diff(cwd, &["diff", "HEAD"]).unwrap_or_default();
             if d.trim().is_empty() {
                 // No tracked changes vs HEAD; fall back to staged + unstaged.
-                let staged = run_git(cwd, &["diff", "--cached"]).unwrap_or_default();
-                let unstaged = run_git(cwd, &["diff"]).unwrap_or_default();
+                let staged = run_git_diff(cwd, &["diff", "--cached"]).unwrap_or_default();
+                let unstaged = run_git_diff(cwd, &["diff"]).unwrap_or_default();
                 d = format!("{staged}\n{unstaged}");
             }
             // Surface untracked-but-not-ignored files. `git diff` only sees
@@ -1365,7 +1514,7 @@ fn build_diff(
         }
         ReviewScope::Branch => {
             let b = detect_base(cwd, base);
-            let d = run_git(cwd, &["diff", &format!("{b}...HEAD")])?;
+            let d = run_git_diff(cwd, &["diff", &format!("{b}...HEAD")])?;
             Ok((format!("branch (base {b})"), d))
         }
         ReviewScope::Auto => unreachable!(),
@@ -6657,6 +6806,53 @@ mod review_diff_soundness_tests {
             "gitignored paths must not appear in the working-tree diff: {diff}"
         );
         drop(dir);
+    }
+
+    /// REGRESSION: review diff acquisition must not buffer all of `git diff`
+    /// before the prompt-level `cap_diff` has a chance to trim it. The capped
+    /// git path reads at most the requested byte count, stops the child when
+    /// that limit is reached, and carries an explicit truncation marker forward.
+    #[test]
+    fn git_diff_acquisition_caps_stdout_before_prompt_cap() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+        let mut body = String::from("seed\n");
+        for i in 0..1500 {
+            body.push_str(&format!("line-{i:04}\n"));
+        }
+        std::fs::write(repo.join("README.md"), body).unwrap();
+
+        let full = run_git(&repo, &["diff", "HEAD"]).expect("uncapped fixture diff");
+        let cap = 512;
+        assert!(
+            full.len() > cap,
+            "fixture diff must exceed the test cap: len={} cap={cap}",
+            full.len()
+        );
+        assert!(
+            full.contains("line-1200"),
+            "fixture diff should contain content far beyond the cap"
+        );
+
+        let capped = run_git_capped(&repo, &["diff", "HEAD"], cap).expect("capped git diff");
+        assert!(
+            capped.limit_reached,
+            "capped git diff should report the acquisition cap was reached"
+        );
+        assert_eq!(
+            capped.stdout.len(),
+            cap,
+            "capped git diff must retain exactly the configured byte limit"
+        );
+        assert!(
+            !capped.stdout.contains("line-1200"),
+            "capped git diff must not retain bytes beyond the acquisition cap"
+        );
+
+        let rendered = render_capped_git_diff(capped, cap);
+        assert!(
+            rendered.contains("git diff truncated during acquisition at 512 bytes"),
+            "capped review diff should carry a visible acquisition-truncation marker: {rendered}"
+        );
     }
 
     /// REGRESSION: `cap_diff` must NOT panic when the cap lands in the
