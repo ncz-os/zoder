@@ -65,6 +65,23 @@ pub enum Classification {
     Unauthorized,
     /// Anything else: timeouts, decode errors, network, 5xx-other, etc.
     Error,
+    /// Forward-compat catch-all (C7-M1). A store written by a NEWER binary
+    /// may carry a classification token this build does not know (e.g. a
+    /// future "overloaded"). `#[serde(other)]` makes any unrecognized token
+    /// deserialize to `Unknown` instead of raising an "unknown variant"
+    /// serde error — which, on the whole-store `serde_json::from_str` in
+    /// [`HealthStore::load`], would otherwise be treated as corruption and
+    /// WIPE every model's history. `Unknown` is deliberately NEUTRAL: it is
+    /// not `Reachable` (so it never counts as healthy), it does NOT
+    /// `skips_consult` (so it never forces a skip on its own), and it does
+    /// NOT trip the breaker. It renders as the lowercase token "unknown".
+    /// Note: serde applies `other` only on the DESERIALIZE side; if this
+    /// build re-saves an `Unknown` it serializes as "unknown" (the original
+    /// future token is not preserved) — acceptable, because the required
+    /// property is that the surrounding store survives the round-trip, not
+    /// that the future token itself does.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Classification {
@@ -186,6 +203,9 @@ impl Classification {
             Classification::Unprovisioned => "unprovisioned",
             Classification::Unauthorized => "unauthorized",
             Classification::Error => "error",
+            // Forward-compat catch-all (C7-M1): a token from a newer binary
+            // we don't recognize. Neutral display; never treated as healthy.
+            Classification::Unknown => "unknown",
         }
     }
 }
@@ -284,7 +304,19 @@ impl HealthStore {
                 Err(e) => {
                     // Do not silently wipe history: warn and preserve the bad
                     // file for inspection before starting fresh.
-                    let backup = path.with_extension("json.corrupt");
+                    //
+                    // Unique suffix (C7-M1 bonus): a FIXED `health.json.corrupt`
+                    // name means a second downgrade clobbers the first backup.
+                    // Stamp the backup with unix-secs + pid + a monotonic nonce
+                    // so repeated corrupt loads each keep their own copy.
+                    let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+                    let stamp = format!(
+                        "json.corrupt.{}.{}.{}",
+                        now_unix(),
+                        std::process::id(),
+                        nonce
+                    );
+                    let backup = path.with_extension(stamp);
                     eprintln!(
                         "zoder: warning: health store {} is corrupt ({e}); backing up to {}",
                         path.display(),
@@ -1339,5 +1371,76 @@ mod tests {
         .unwrap();
         let reloaded = HealthStore::load(&path);
         assert_eq!(reloaded.models.get("fresh").map(|h| h.calls), Some(1));
+    }
+
+    // ---- C7-M1: forward-compat, no whole-store wipe on unknown token ----
+
+    #[test]
+    fn unknown_classification_token_round_trips_to_unknown_variant() {
+        // A token a newer binary might write ("overloaded") must NOT raise
+        // an "unknown variant" serde error; it must land on `Unknown`.
+        let back: Classification =
+            serde_json::from_str("\"overloaded\"").expect("unknown token must deserialize");
+        assert_eq!(back, Classification::Unknown);
+        // Unknown is neutral: not healthy, does not skip, has a display tag.
+        assert_ne!(Classification::Unknown, Classification::Reachable);
+        assert!(!Classification::Unknown.skips_consult());
+        assert_eq!(Classification::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn load_does_not_wipe_store_on_future_classification_token() {
+        // A health.json written by a NEWER binary carrying a future
+        // classification token ("overloaded") must load WITHOUT wiping the
+        // rest of the store. Before the `#[serde(other)]` fix this triggered
+        // "unknown variant `overloaded`" -> whole-store rename+default (all
+        // model history lost).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        // Two models: one with a known classification, one carrying the
+        // future/unknown token. Both must survive the load.
+        let json = r#"{
+            "models": {
+                "known-model": {
+                    "calls": 7, "failures": 1, "consecutive_failures": 0,
+                    "ewma_latency_ms": 42.0, "last_error": null,
+                    "classification": "reachable"
+                },
+                "future-model": {
+                    "calls": 3, "failures": 0, "consecutive_failures": 0,
+                    "ewma_latency_ms": null, "last_error": null,
+                    "classification": "overloaded"
+                }
+            }
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        let store = HealthStore::load(&path);
+        // Store NOT wiped: both models survived with their counters intact.
+        assert_eq!(
+            store.models.len(),
+            2,
+            "future token must not wipe the whole store"
+        );
+        let known = store.models.get("known-model").expect("known survives");
+        assert_eq!(known.calls, 7);
+        assert_eq!(known.classification, Some(Classification::Reachable));
+
+        let future = store.models.get("future-model").expect("future survives");
+        assert_eq!(future.calls, 3);
+        // The unrecognized token mapped to the neutral Unknown variant.
+        assert_eq!(future.classification, Some(Classification::Unknown));
+
+        // Breaker/skip semantics unaffected by Unknown: it is not skipped,
+        // and with zero consecutive failures the breaker stays closed.
+        assert!(!future.is_skipped_by_classification());
+        assert!(!future.breaker_open());
+        assert_eq!(future.state(), State::Healthy);
+
+        // The original file must still be present (no rename-to-.corrupt).
+        assert!(
+            path.exists(),
+            "load must not have renamed the store away as corrupt"
+        );
     }
 }

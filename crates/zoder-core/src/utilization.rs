@@ -1657,6 +1657,18 @@ pub struct UtilizationStore {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// C7-M2: set true when this store was loaded from a file whose
+    /// `schema_version` is GREATER than [`CURRENT_SCHEMA_VERSION`] — i.e.
+    /// written by a NEWER binary that may carry fields this build does not
+    /// know about. serde silently drops those unknown fields on parse, so
+    /// re-`save()`ing would rewrite the file with the higher version number
+    /// but the future data GONE (a version-lying, lossy downgrade). When
+    /// this flag is set, `save()` REFUSES to overwrite the file. Not
+    /// persisted (`#[serde(skip)]`); it is a load-time property of this
+    /// in-memory handle only, and defaults to `false` for every fresh /
+    /// in-memory / current-or-older store.
+    #[serde(skip)]
+    future_schema: bool,
     /// Sidecar lockfile. Held for the lifetime of the store; Drop
     /// closes the FD, which releases the `flock(2)`. `#[serde(skip)]`
     /// because the lock is a process-local handle, not part of the
@@ -1693,6 +1705,7 @@ impl Default for UtilizationStore {
             counters: BTreeMap::new(),
             schema_version: CURRENT_SCHEMA_VERSION,
             path: None,
+            future_schema: false,
             lock: None,
         }
     }
@@ -1891,6 +1904,7 @@ impl UtilizationStore {
                         counters: BTreeMap::new(),
                         schema_version: CURRENT_SCHEMA_VERSION,
                         path: Some(path.to_path_buf()),
+                        future_schema: false,
                         lock: Some(lock),
                     })
                 } else {
@@ -1898,6 +1912,12 @@ impl UtilizationStore {
                         serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
                     store.path = Some(path.to_path_buf());
                     store.lock = Some(lock);
+                    // C7-M2: a file from a NEWER binary (schema_version >
+                    // CURRENT) parsed fine because serde drops unknown
+                    // fields — but those dropped fields would be LOST if we
+                    // re-saved. Flag it so `save()` refuses to overwrite
+                    // with a downgraded body under the higher version number.
+                    store.future_schema = store.schema_version > CURRENT_SCHEMA_VERSION;
                     // Migrate legacy fractional `CounterWindow.used_percent`
                     // rows in place (Finding #3) — but ONLY for files that
                     // predate the percentage fix. The fix is gated on the
@@ -1921,6 +1941,7 @@ impl UtilizationStore {
                 counters: BTreeMap::new(),
                 schema_version: CURRENT_SCHEMA_VERSION,
                 path: Some(path.to_path_buf()),
+                future_schema: false,
                 lock: Some(lock),
             }),
             Err(e) => Err(UtilizationError::Io(e)),
@@ -1943,6 +1964,7 @@ impl UtilizationStore {
                         counters: BTreeMap::new(),
                         schema_version: CURRENT_SCHEMA_VERSION,
                         path: Some(path.to_path_buf()),
+                        future_schema: false,
                         lock: None,
                     })
                 } else {
@@ -1950,6 +1972,11 @@ impl UtilizationStore {
                         serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
                     store.path = Some(path.to_path_buf());
                     store.lock = None;
+                    // C7-M2: same future-version guard as `open()`. A
+                    // read-only handle can still `save()` (it just isn't
+                    // lock-protected), so it must refuse to downgrade a
+                    // newer-than-CURRENT file too.
+                    store.future_schema = store.schema_version > CURRENT_SCHEMA_VERSION;
                     // Same legacy-fraction migration as `open()` —
                     // read-only paths still want consistent 0..=100
                     // percents so reports / forecasts never render a
@@ -1970,6 +1997,7 @@ impl UtilizationStore {
                 counters: BTreeMap::new(),
                 schema_version: CURRENT_SCHEMA_VERSION,
                 path: Some(path.to_path_buf()),
+                future_schema: false,
                 lock: None,
             }),
             Err(e) => Err(UtilizationError::Io(e)),
@@ -2376,6 +2404,18 @@ impl UtilizationStore {
     /// during the write; callers that need to release it sooner should
     /// drop the store.
     pub fn save(&self) -> Result<(), UtilizationError> {
+        // C7-M2: refuse to overwrite a file written by a NEWER binary.
+        // serde dropped that file's future-only fields on load, so writing
+        // our in-memory view back would re-emit the higher `schema_version`
+        // with the future data GONE — a version-lying, lossy downgrade.
+        // Fail loudly instead; the operator (or a same-or-newer binary)
+        // owns that file.
+        if self.future_schema {
+            return Err(UtilizationError::FutureSchema {
+                found: self.schema_version,
+                current: CURRENT_SCHEMA_VERSION,
+            });
+        }
         let path = self.path.as_ref().ok_or(UtilizationError::NoPath)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(UtilizationError::Io)?;
@@ -2440,6 +2480,14 @@ pub enum UtilizationError {
     Parse(#[from] serde_json::Error),
     #[error("utilization: store has no path; open() with an explicit path first")]
     NoPath,
+    /// C7-M2: the on-disk file was written by a newer binary
+    /// (`schema_version` > this build's `CURRENT_SCHEMA_VERSION`). Saving
+    /// would drop fields this build cannot represent, so it is refused.
+    #[error(
+        "utilization: on-disk schema_version {found} is newer than this build supports \
+         (current {current}); refusing to save to avoid a lossy downgrade"
+    )]
+    FutureSchema { found: u32, current: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -5490,5 +5538,104 @@ mod tests {
         let store = UtilizationStore::open(&legacy_path).unwrap();
         assert_eq!(store.counters["three_x"].used_percent, Some(300.0));
         assert_eq!(store.counters["half"].used_percent, Some(50.0));
+    }
+
+    // ---- C7-M2: future-schema stores refuse a lossy downgrade save ----
+
+    /// A store written by a NEWER binary (`schema_version` > CURRENT) plus a
+    /// future-only field parses fine (serde drops the unknown field), but a
+    /// subsequent `save()` MUST refuse rather than re-emit the higher
+    /// version with the future data gone. The on-disk bytes must be
+    /// UNCHANGED after the refused save.
+    #[test]
+    fn save_refuses_to_downgrade_future_schema_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.json");
+        // schema_version = CURRENT+1, with an unknown top-level field a
+        // future binary might add. serde drops `future_only` on load.
+        let disk = serde_json::json!({
+            "schema_version": CURRENT_SCHEMA_VERSION + 1,
+            "records": {},
+            "counters": {},
+            "future_only": {"some": "future data"}
+        });
+        let original_bytes = serde_json::to_vec_pretty(&disk).unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+
+        // Loads without error (unknown field dropped).
+        let store = UtilizationStore::open(&path).unwrap();
+        assert_eq!(store.schema_version, CURRENT_SCHEMA_VERSION + 1);
+
+        // save() refuses with FutureSchema — no lossy overwrite.
+        let err = store
+            .save()
+            .expect_err("save must refuse a future-schema store");
+        assert!(
+            matches!(err, UtilizationError::FutureSchema { found, current }
+                if found == CURRENT_SCHEMA_VERSION + 1 && current == CURRENT_SCHEMA_VERSION),
+            "expected FutureSchema error, got {err:?}"
+        );
+
+        // The on-disk file is byte-for-byte unchanged: the future field survives.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, original_bytes,
+            "refused save must not have rewritten (and thus downgraded) the file"
+        );
+        let reparsed: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert!(
+            reparsed.get("future_only").is_some(),
+            "future-only field must still be present on disk"
+        );
+    }
+
+    /// The complement: a normal (`schema_version` <= CURRENT) store still
+    /// saves successfully — the guard must not regress ordinary writes.
+    #[test]
+    fn save_still_works_for_current_or_older_store() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Current-version store round-trips through save.
+        let cur_path = dir.path().join("current.json");
+        std::fs::write(
+            &cur_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "records": {},
+                "counters": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = UtilizationStore::open(&cur_path).unwrap();
+        store.save().expect("current-version store must save");
+        // Drop the handle to RELEASE its exclusive flock before re-opening
+        // the same path — otherwise the second `open()` blocks forever on
+        // `lock_exclusive()` (the store holds its lock until Drop).
+        drop(store);
+        // Reloads cleanly and is not flagged as future.
+        let reloaded = UtilizationStore::open(&cur_path).unwrap();
+        assert_eq!(reloaded.schema_version, CURRENT_SCHEMA_VERSION);
+        reloaded
+            .save()
+            .expect("reloaded current store must still save");
+        drop(reloaded);
+
+        // A legacy (schema_version = 1) store, which migrates UP to CURRENT
+        // on load, must also save (it is not a future store).
+        let legacy_path = dir.path().join("legacy.json");
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let legacy = UtilizationStore::open(&legacy_path).unwrap();
+        assert_eq!(legacy.schema_version, CURRENT_SCHEMA_VERSION);
+        legacy.save().expect("migrated legacy store must save");
     }
 }
