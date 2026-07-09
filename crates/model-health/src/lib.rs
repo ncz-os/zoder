@@ -410,6 +410,19 @@ impl HealthStore {
             .unwrap_or(false)
     }
 
+    /// `true` when the model's most recent classification marks it "skip for
+    /// now" (Unauthorized/Unprovisioned/Capacity). Mirrors `breaker_open`:
+    /// these classifications are breaker-neutral (W1), so the breaker stays
+    /// closed forever for a 401/404 model — routing must consult this too or
+    /// it will keep selecting a guaranteed-failed model. Unknown model =>
+    /// false (nothing recorded means nothing to skip).
+    pub fn is_skipped_by_classification(&self, model: &str) -> bool {
+        self.models
+            .get(model)
+            .map(|h| h.is_skipped_by_classification())
+            .unwrap_or(false)
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();

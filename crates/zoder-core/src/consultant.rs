@@ -65,6 +65,11 @@ pub fn consult(corpus: &Corpus, health: &HealthStore, opts: &ConsultOptions) -> 
         .filter(|m| !opts.free_only || m.free)
         .map(|m| {
             let breaker_open = health.breaker_open(&m.id);
+            // A model can be skip-for-now (Unauthorized/Unprovisioned/Capacity)
+            // while its breaker is closed: those classifications are
+            // breaker-neutral (W1). Fold that into availability so consult does
+            // not advertise a guaranteed-failed model as available.
+            let skipped = health.is_skipped_by_classification(&m.id);
             Advisory {
                 rank: 0, // assigned after sorting
                 model_id: m.id.clone(),
@@ -76,7 +81,7 @@ pub fn consult(corpus: &Corpus, health: &HealthStore, opts: &ConsultOptions) -> 
                 arena_label: m.arena_label(),
                 latency_class: m.latency_class.clone(),
                 breaker_open,
-                available: !breaker_open,
+                available: !breaker_open && !skipped,
             }
         })
         .collect();
@@ -198,6 +203,47 @@ mod tests {
         assert!(rows[2].breaker_open);
         assert!(!rows[2].available);
         assert!(rows[0].available && rows[1].available);
+    }
+
+    #[test]
+    fn skip_class_model_is_unavailable_despite_closed_breaker() {
+        // C2-2 regression on the consult path: a model stamped Unauthorized
+        // (401) is skip-for-now but breaker-neutral (W1), so its breaker stays
+        // CLOSED. consult must still report available=false, or it advertises a
+        // guaranteed-failed model as usable.
+        let skipped = model("a-skipped", Some(99.0));
+        let healthy = model("m-healthy", Some(70.0));
+        let corpus = Corpus {
+            models: vec![skipped.clone(), healthy.clone()],
+            ..Default::default()
+        };
+
+        let mut health = HealthStore::default();
+        health.record_classified_failure(
+            "a-skipped",
+            "401 Unauthorized",
+            "prov",
+            crate::health::Classification::Unauthorized,
+        );
+        // The trap: the breaker did NOT open.
+        assert!(
+            !health.breaker_open("a-skipped"),
+            "precondition: 401 must be breaker-neutral"
+        );
+
+        let rows = consult(&corpus, &health, &opts());
+        let skipped_row = rows.iter().find(|r| r.model_id == "a-skipped").unwrap();
+        assert!(
+            !skipped_row.breaker_open,
+            "breaker must stay closed for a 401 model"
+        );
+        assert!(
+            !skipped_row.available,
+            "a skip-classified model must be reported unavailable"
+        );
+        // The healthy model outranks it despite lower capability.
+        assert_eq!(rows[0].model_id, "m-healthy");
+        assert!(rows[0].available);
     }
 
     #[test]
