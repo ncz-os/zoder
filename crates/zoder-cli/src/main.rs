@@ -3160,7 +3160,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // Sessions: prepend prior transcript so follow-ups carry context.
     let sessions_dir = eng.cfg.sessions_dir();
-    let mut session: Option<Session> = if let Some(id) = &cli.session {
+    let session: Option<Session> = if let Some(id) = &cli.session {
         Some(Session::load_or_new(&sessions_dir, id)?)
     } else if cli.continue_ {
         Some(Session::latest(&sessions_dir)?.unwrap_or_else(|| Session::new("default")))
@@ -3409,11 +3409,23 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     health.record_success(&used_model, used_latency_ms);
     save_health(&health);
 
-    // Persist the turn to the session transcript.
-    if let Some(s) = session.as_mut() {
-        s.push("user", &prompt);
-        s.push("assistant", &res.content);
-        if let Err(e) = s.save(&sessions_dir) {
+    // Persist the turn to the session transcript. Use `mutate_locked`
+    // (DEFECT 1 fix) so the load -> append -> save critical section
+    // holds a per-session `flock(2)` for its full duration: two
+    // concurrent `zoder exec --session <shared-id>` processes that
+    // both reach this point will serialize, and each one will reload
+    // the freshest on-disk state (including the OTHER process's just-
+    // committed turn) before appending its own. The bare `s.save()`
+    // path is kept for compatibility, but is not safe under concurrent
+    // writers — prefer `mutate_locked` whenever a turn may race.
+    if let Some(s) = session.as_ref() {
+        let id = s.id.clone();
+        let prompt = prompt.clone();
+        let content = res.content.clone();
+        if let Err(e) = Session::mutate_locked(&sessions_dir, &id, |sess| {
+            sess.push("user", &prompt);
+            sess.push("assistant", &content);
+        }) {
             eprintln!("zoder: warning: failed to save session: {e}");
         }
     }
