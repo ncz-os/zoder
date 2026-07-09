@@ -1008,28 +1008,93 @@ pub(crate) struct ReviewOutput {
 /// comparison functions (`loop_review_ok`, `verdict_rank`) ALSO normalize
 /// at the point of comparison so direct `ReviewOutput` construction in
 /// tests or other call sites is also safe.
+/// Yield each balanced `{...}` substring of `s`, left to right. Brace
+/// counting is string-aware (braces inside JSON string literals, and `\"`
+/// escapes, are ignored) so a `{` in prose — or inside a string value —
+/// does not throw off the balance. Slices are taken only at ASCII `{`/`}`
+/// byte positions, which are always char boundaries.
+fn balanced_json_objects(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut esc = false;
+            let mut end = None;
+            let mut j = i;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            match end {
+                Some(e) => {
+                    out.push(&s[i..=e]);
+                    i = e + 1;
+                    continue;
+                }
+                None => break, // unbalanced from here on
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn parse_review(raw: &str) -> ReviewOutput {
     let trimmed = raw.trim();
-    let candidate = match (trimmed.find('{'), trimmed.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &trimmed[a..=b],
-        _ => trimmed,
-    };
-    if let Ok(r) = serde_json::from_str::<ReviewOutput>(candidate) {
-        if !r.verdict.is_empty() || !r.summary.is_empty() || !r.findings.is_empty() {
-            return ReviewOutput {
-                verdict: r.verdict.trim().to_ascii_lowercase(),
-                summary: r.summary,
-                findings: r.findings,
-                next_steps: r.next_steps,
-            };
+    // Y-3: scan for the first BALANCED `{...}` object that decodes as a
+    // ReviewOutput with a non-empty verdict, rather than `first-'{'..last-'}'`
+    // — which a stray `{` in prose before the JSON (or trailing prose after
+    // it) turns into invalid JSON, silently dropping a real `request_changes`
+    // and falling through to the (previously non-blocking) fallback. A
+    // chatty or hostile model could smuggle a `{` to neuter its own block.
+    for obj in balanced_json_objects(trimmed) {
+        if let Ok(r) = serde_json::from_str::<ReviewOutput>(obj) {
+            if !r.verdict.trim().is_empty() {
+                return ReviewOutput {
+                    verdict: r.verdict.trim().to_ascii_lowercase(),
+                    summary: r.summary,
+                    findings: r.findings,
+                    next_steps: r.next_steps,
+                };
+            }
         }
     }
+    // Y-4: no parseable verdict object → FAIL CLOSED. A review we cannot
+    // extract a verdict from (prose, a refusal like "I cannot review this",
+    // an empty `{}`) must BLOCK — the previous non-blocking `"comment"` let an
+    // unreviewed/refused iteration resolve as if approved. `request_changes`
+    // is the fail-closed verdict, mirroring `synthesize_review_phase_failure`.
     ReviewOutput {
-        verdict: "comment".into(),
-        summary: "Reviewer did not return structured JSON; raw output preserved below.".into(),
+        verdict: "request_changes".into(),
+        summary: "Reviewer did not return a parseable structured verdict; failing closed (request_changes). Raw output preserved below.".into(),
         findings: vec![Finding {
             severity: "info".into(),
-            title: "raw review".into(),
+            title: "unparseable review (fail-closed)".into(),
             body: trimmed.to_string(),
             location: None,
         }],
@@ -3968,6 +4033,63 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- Y-3 / Y-4: parse_review must not be gamed / fail closed ---------
+
+    #[test]
+    fn parse_review_extracts_verdict_after_stray_prose_brace() {
+        // Y-3: a stray `{` in prose before the real JSON must NOT prevent the
+        // real verdict from being read (the old first-'{'..last-'}' span made
+        // this invalid JSON → fell through to the fallback).
+        let raw = "Example of bad code: { x.unwrap() }. \
+                   My verdict: {\"verdict\":\"request_changes\",\"summary\":\"buffer overflow\"}";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "Y-3: the real request_changes verdict must survive a stray prose brace"
+        );
+    }
+
+    #[test]
+    fn parse_review_prefers_first_valid_verdict_object() {
+        // Two objects; the first is not a ReviewOutput-with-verdict, the
+        // second is — scanner must find the second.
+        let raw = "{\"note\":\"scratch\"} then {\"verdict\":\"approve\",\"summary\":\"ok\"}";
+        assert_eq!(parse_review(raw).verdict, "approve");
+    }
+
+    #[test]
+    fn parse_review_unparseable_fails_closed() {
+        // Y-4: a refusal / prose reply (HTTP 200, no JSON) must BLOCK, not
+        // resolve as a non-blocking comment.
+        assert_eq!(
+            parse_review("I cannot review this.").verdict,
+            "request_changes"
+        );
+    }
+
+    #[test]
+    fn parse_review_empty_object_fails_closed() {
+        // An empty `{}` (no verdict) must fail closed, not approve.
+        assert_eq!(parse_review("{}").verdict, "request_changes");
+        assert_eq!(parse_review("   ").verdict, "request_changes");
+    }
+
+    #[test]
+    fn parse_review_normal_approve_still_parses() {
+        // Regression guard: a well-formed approve is unaffected.
+        let r = parse_review("{\"verdict\":\"approve\",\"summary\":\"lgtm\",\"findings\":[]}");
+        assert_eq!(r.verdict, "approve");
+        assert_eq!(r.summary, "lgtm");
+    }
+
+    #[test]
+    fn parse_review_ignores_braces_inside_string_values() {
+        // A `}` inside a JSON string value must not prematurely close the
+        // object (string-aware brace counting).
+        let raw = "{\"verdict\":\"reject\",\"summary\":\"found a stray } and { in a regex\"}";
+        assert_eq!(parse_review(raw).verdict, "reject");
+    }
 
     /// Cwd for `run_check_watched` tests. The child `sh -c` doesn't care
     /// about the cwd — we just need a real, stable path to satisfy the
