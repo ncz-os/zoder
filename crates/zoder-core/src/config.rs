@@ -1059,6 +1059,14 @@ impl Config {
         Ok(resolved)
     }
 
+    /// Maximum trusted size of a single on-disk config file — the primary
+    /// `config.json` OR any `config.<vendor>.toml` overlay. Larger files are
+    /// rejected before the body is read: a tampered/oversized config can't be
+    /// trusted to drive routing, and a FIFO or device at the configured path
+    /// would otherwise block forever in `read_to_string` (or OOM the
+    /// process), before any validation logic runs.
+    pub(crate) const MAX_CONFIG_BYTES: u64 = 2_097_152; // 2 MiB — mirrors pricing.rs
+
     /// Load from $ZODER_HOME/config.json (if present, else sensible free-tier
     /// default) and then layer every `config.<vendor>.toml` in the same
     /// directory on top. See module docs for the layered-config model.
@@ -1102,8 +1110,11 @@ impl Config {
     pub fn load_unvalidated_from(home: &std::path::Path) -> anyhow::Result<Self> {
         let mut cfg = if home.join("config.json").exists() {
             let path = home.join("config.json");
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading zoder config at {}", path.display()))?;
+            // Bounded, regular-file-only read: see [`read_bounded_regular_file`].
+            // A FIFO at the configured path would otherwise block forever in
+            // `read_to_string` (before any validation runs), and an oversized
+            // file could OOM the process on every config load.
+            let raw = read_bounded_regular_file(&path, Config::MAX_CONFIG_BYTES)?;
             serde_json::from_str(&raw)
                 .with_context(|| format!("parsing zoder config at {}", path.display()))?
         } else {
@@ -1697,6 +1708,40 @@ pub struct VendorProfile {
     pub reviewer_model: Option<String>,
 }
 
+/// Read a regular file with a bounded byte cap, mirroring the guard used by
+/// `PricingCatalog::load` in `crates/zoder-core/src/pricing.rs`. Used for the
+/// primary `config.json` AND every `config.<vendor>.toml` overlay so a FIFO,
+/// device, symlink-to-non-regular-file, or unexpectedly huge file at the
+/// configured path is rejected BEFORE the body is read.
+///
+/// Without this guard, `read_to_string` would block forever on a FIFO (or
+/// OOM the process on a huge file), before any validation logic runs — the
+/// original defect reported at the config read sites (the primary read at
+/// `Config::load_unvalidated_from` and the overlay read in
+/// `collect_overlays`).
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat zoder config at {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "zoder config {} is not a regular file (FIFOs, devices, and \
+             symlinks to non-regular files are rejected before the read to \
+             avoid blocking or OOMing the process on every config load)",
+            path.display()
+        );
+    }
+    if meta.len() > max_bytes {
+        anyhow::bail!(
+            "zoder config {} rejected — {} bytes exceeds {} byte limit",
+            path.display(),
+            meta.len(),
+            max_bytes
+        );
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("reading zoder config at {}", path.display()))
+}
+
 /// Apply every `config.<vendor>.toml` in alphabetical order. Tracks the set of
 /// provider ids contributed by each vendor so `--vendor <name>` can filter
 /// the report. On any duplicate-id collision or ambiguous `default = true`,
@@ -1833,8 +1878,23 @@ fn collect_overlays(
     home: &Path,
     only_vendor: Option<&str>,
 ) -> anyhow::Result<Vec<(String, VendorOverlay)>> {
-    let Ok(rd) = std::fs::read_dir(home) else {
-        return Ok(Vec::new());
+    // Distinguish the legitimate "no overlay directory yet" case (`NotFound` —
+    // normal first run before `ZODER_HOME` has been created, or a fresh
+    // install) from any OTHER `read_dir` error (permission denied, the path
+    // is unexpectedly a file/symlink-to-file, I/O error, etc.). Silently
+    // collapsing the latter into "no overlays" is dangerous: a
+    // `config.<vendor>.toml` may exist on disk, but if `read_dir` fails for
+    // a real reason we would skip it and proceed with the wrong
+    // (non-overlaid) provider set — quietly wrong routing with no warning.
+    let rd = match std::fs::read_dir(home) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "enumerating vendor overlays under {}",
+                home.display()
+            )));
+        }
     };
     let mut entries: Vec<(String, PathBuf)> = rd
         .filter_map(|e| e.ok())
@@ -1866,7 +1926,10 @@ fn collect_overlays(
 
     let mut out = Vec::with_capacity(entries.len());
     for (vendor, path) in entries {
-        let raw = std::fs::read_to_string(&path)?;
+        // Same bounded, regular-file-only guard as the primary config read:
+        // a FIFO or an oversized overlay would otherwise block or OOM the
+        // process on every config load, before any validation runs.
+        let raw = read_bounded_regular_file(&path, Config::MAX_CONFIG_BYTES)?;
         let overlay: VendorOverlay =
             toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         if overlay.providers.is_empty() && !overlay.profile.default {
@@ -3395,5 +3458,140 @@ billing = "metered"
                 re_parsed[i].azure_api_version
             );
         }
+    }
+
+    /// DEFECT 1 (config read at line ~1105): a FIFO, symlink-to-FIFO, or any
+    /// non-regular file at `$ZODER_HOME/config.json` must be REJECTED by
+    /// `read_bounded_regular_file` BEFORE the body is read. The pre-fix code
+    /// called `fs::read_to_string` unconditionally, which blocks forever on a
+    /// FIFO (the open call never returns) on every config load. The fix must
+    /// short-circuit with a clear error.
+    #[test]
+    #[cfg(unix)]
+    fn load_unvalidated_rejects_non_regular_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // Try mkfifo first — the canonical way to fabricate a blocking
+        // path. If `mkfifo` isn't on PATH (uncommon), fall back to a
+        // symlink to /dev/null, which is also non-regular (`is_file()`
+        // returns false) but does not block on open.
+        let mkfifo_status = std::process::Command::new("mkfifo").arg(&path).status();
+        let fifo_ok = matches!(&mkfifo_status, Ok(s) if s.success());
+        if !fifo_ok {
+            std::fs::write(&path, b"").unwrap();
+            std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        }
+
+        let err = Config::load_unvalidated_from(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "non-regular config.json must be rejected before the read; got: {err}"
+        );
+        // Reachable: if the FIFO guard had not fired, the test would block
+        // forever here instead of unwrapping the error.
+    }
+
+    /// DEFECT 1 (overlay read at line ~1869): the same regular-file + size
+    /// guard must apply to `config.<vendor>.toml` overlays via
+    /// `read_bounded_regular_file`. An oversized overlay must be rejected
+    /// with a bounded-size error before the body is read (otherwise a huge
+    /// overlay OOMs the process on every config load).
+    #[test]
+    fn collect_overlays_rejects_oversized_overlay() {
+        use crate::config::Config;
+        let dir = tempfile::tempdir().unwrap();
+        // Write a TOML overlay whose declared size exceeds `MAX_CONFIG_BYTES`.
+        // The header is valid TOML so a sanity check that the helper, not the
+        // parser, is what fails.
+        let mut contents = String::from(
+            r#"
+[[providers]]
+id = "oversized-vendor"
+base_url = "https://example.com/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "OVRD_KEY" }
+
+# padding to push the file past the cap
+"#,
+        );
+        let cap = Config::MAX_CONFIG_BYTES as usize;
+        contents.push_str(&"x".repeat(cap + 1024));
+        std::fs::write(dir.path().join("config.oversized.toml"), contents).unwrap();
+
+        let mut cfg = Config::default_provider(dir.path());
+        let err = apply_overlays(&mut cfg, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("byte limit"),
+            "oversized overlay must be rejected by the size guard, not the parser; got: {msg}"
+        );
+    }
+
+    /// DEFECT 2 (read_dir enumeration at line ~1836): a `read_dir` failure
+    /// that is NOT `io::ErrorKind::NotFound` (e.g. `PermissionDenied` from a
+    /// `chmod 000` directory, or `NotADirectory` from a file at the home
+    /// path) must surface as an error to the caller — NOT be silently
+    /// swallowed into `Ok(Vec::new())`. Otherwise a real `config.<vendor>.toml`
+    /// overlay that exists on disk is quietly skipped and routing proceeds
+    /// with the wrong (non-overlaid) provider set.
+    #[test]
+    #[cfg(unix)]
+    fn collect_overlays_surfaces_non_notfound_read_dir_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Place a real overlay in the directory so the test would otherwise
+        // be observable as "overlay was silently skipped" if the bug
+        // regresses.
+        std::fs::write(
+            dir.path().join("config.guard.toml"),
+            r#"
+[[providers]]
+id = "guard-vendor"
+base_url = "https://example.com/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "GUARD_KEY" }
+"#,
+        )
+        .unwrap();
+        // Revoke all permissions so `read_dir` fails with `PermissionDenied`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut cfg = Config::default_provider(dir.path());
+        let err = apply_overlays(&mut cfg, dir.path()).unwrap_err();
+
+        // Restore permissions before any assertion (so tempdir cleanup
+        // works and so the test doesn't leave a 000'd dir behind if
+        // assertions fail).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("enumerating vendor overlays"),
+            "non-NotFound read_dir error must surface wrapped with context, not be silently swallowed; got: {msg}"
+        );
+        // The whole point: a guard-vendor overlay that exists on disk must
+        // NOT have been silently merged into cfg as if there were no
+        // overlays. If the bug regresses, `cfg.providers` would contain
+        // guard-vendor.
+        assert!(
+            cfg.providers.iter().all(|p| p.id != "guard-vendor"),
+            "overlay that exists on disk must not be silently skipped when read_dir fails; got providers: {:?}",
+            cfg.providers.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// DEFECT 2 sanity check: a `read_dir` error of kind `NotFound` (the
+    /// "no overlay directory yet" first-run case) must STILL keep silent
+    /// (return `Ok(Vec::new())`) — only non-`NotFound` errors must surface.
+    /// This test guards against the regression "fix always errors when home
+    /// doesn't exist yet", which would break every fresh install.
+    #[test]
+    fn collect_overlays_keeps_silent_on_missing_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist");
+        let mut cfg = Config::default_provider(&nonexistent);
+        // Must not error.
+        apply_overlays(&mut cfg, &nonexistent)
+            .expect("missing home is the legitimate first-run case");
     }
 }
