@@ -538,12 +538,48 @@ async fn complete_once(
                 kind,
                 status,
             }) => {
-                // Mirror the author path's `health.record_failure(model,
-                // &e.message)` so a chain-exhausting failure has the same
-                // observability trail a simple single-model failure does.
+                // Y-8: route the failure through the same classify + record
+                // path the author chain uses, so a reviewer call that hits
+                // a 401/403 (bad key) or 429/503/529 (capacity) does NOT
+                // trip the breaker on a healthy model. Pre-fix this
+                // reviewer fallback wrote `h.record_failure(model,
+                // &message)` unconditionally -- the previous round added
+                // classification on the author chain but missed this
+                // reviewer fallback, leaving an asymmetric "auth probe
+                // benches the reviewer on the third retry" defect. Now:
+                // classify -> record_classified_failure. The provider
+                // id is resolved from routing if available (consistent
+                // with author path / agentic turn) so the on-disk store
+                // sees the same stamp as the author's pre-gate entry.
                 if let Ok(eng) = Engine::load() {
                     let mut h = HealthStore::load(&eng.cfg.health_path);
-                    h.record_failure(model, &message);
+                    let provider_id = crate::RoutingContext::load(&eng.cfg)
+                        .ok()
+                        .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
+                        .map(|p| p.id.clone())
+                        .or_else(|| {
+                            eng.cfg
+                                .provider(model)
+                                .filter(|p| {
+                                    !p.base_url
+                                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                                })
+                                .map(|p| p.id.clone())
+                        })
+                        .unwrap_or_default();
+                    // When a status is present we route through
+                    // `Classification::from_status` so 401/403/429/503/529
+                    // land on the right bucket. The `FallbackWorthy` arm
+                    // only carries `kind + status`, so the typed body
+                    // fallback for the Anthropic branch (Y-14) does not
+                    // apply on this path -- the reviewer dispatcher
+                    // surfaces errors out of `stream_chat`, which
+                    // already populated `anthropic_error_body` upstream
+                    // if the wire carried it.
+                    let cls = status
+                        .map(zoder_core::Classification::from_status)
+                        .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
+                    h.record_classified_failure(model, &message, &provider_id, cls);
                     let _ = h.save();
                 }
                 tracing::debug!(

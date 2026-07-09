@@ -33,11 +33,11 @@ use zoder_core::{
     estimate_tokens, fetch_engine_cost, finops_cli, load_project_instructions, openai_costs,
     parse_mcp_servers_file, probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers,
     AgentEvent, AgentOptions, ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind,
-    Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider,
-    Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError,
-    RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State, SubscriptionPlan, Theme,
-    Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot, CostVerdict, Decision,
+    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
+    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
+    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
+    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 
 fn finops_task(cli: &Cli) -> &'static str {
@@ -1479,10 +1479,14 @@ fn cmd_gate(
 
     // Run the plan against the real PATH and produce the final report.
     let report = outcome.run(&mode);
-    // We treat the renderer as the canonical output and the exit code
-    // as the derived signal. Under strict posture, Yellow (some
-    // required tool missing) IS a block — that's the fail-closed
-    // contract. Under local-iterate, Yellow is just informational.
+
+    // Delegate the exit-code decision to the pure helper so the same
+    // contract is unit-testable. The actual `std::process::exit`
+    // stays here so the binary keeps the documented exit-code surface.
+    let code = gate_exit_code(&mode, &report);
+    if code != 0 {
+        std::process::exit(code);
+    }
     if json {
         let payload = serde_json::json!({
             "root": root_path.display().to_string(),
@@ -1522,29 +1526,54 @@ fn cmd_gate(
         print!("{}", render_probe(&outcome.probe));
     }
 
-    // Exit code (fail-closed posture, per docs/CI-PARITY-GATE.md):
-    //   Green -> 0
-    //   Yellow -> 0 (under both modes — Yellow means "something was
-    //     skipped, but nothing failed"; the report records what was
-    //     skipped and why, so the audit trail is complete and the
-    //     operator can act on it without the gate silently passing).
-    //     Under strict, a missing REQUIRED tool upgrades to Failed
-    //     (Yellow under strict therefore only means "an OPTIONAL tool was
-    //     missing", which is advisory.)
-    //   Red -> 1
-    //   Inconclusive (Z-6) -> 1: an empty / all-optional plan is
-    //     NOT a pass; the gate cannot certify it. Exit non-zero so
-    //     CI / approval flows block on it.
-    let code: i32 = match &report.status {
-        GateStatus::Green => 0,
-        GateStatus::Yellow { .. } => 0,
-        GateStatus::Red { .. } => 1,
-        GateStatus::Inconclusive => 1,
-    };
+    // Map (mode, report) -> exit code. Pure function so the same
+    // contract is unit-testable (see `gate_exit_code_*` tests); the
+    // CLI binary only decides whether to call `std::process::exit`.
+    //
+    // Y-13: under Strict mode, exit 0 ONLY when
+    // `is_authoritative_pass()` is true (i.e., the gate certifies "all
+    // required steps ran AND passed"). Yellow, Red, and Inconclusive
+    // all block convergence. Under `local-iterate` the prior contract
+    // is preserved — Yellow is advisory for the dev inner-loop, so a
+    // non-authoritative LocalIterate verdict still exits 0.
+    //
+    //   * Strict  + Green    -> 0  (`is_authoritative_pass() == true`)
+    //   * Strict  + Yellow   -> 1  (a skipped-required under Strict;
+    //                              the gate CANNOT certify "passed")
+    //   * Strict  + Red      -> 1
+    //   * Strict  + Inconclusive -> 1
+    //   * LocalIterate       -> existing contract preserved
+    //                            (Yellow -> 0; only Red / Inconclusive
+    //                            are non-zero under dev inner-loop mode)
+    let code = gate_exit_code(&mode, &report);
     if code != 0 {
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// Pure (mode, report) -> exit code helper for the `zoder gate`
+/// surface. Extracted out of [`cmd_gate`] so the Y-13 contract
+/// (`Strict + Yellow ⇒ non-zero`) is unit-testable without spinning
+/// up `std::process::exit`. See the docstring above for the matrix;
+/// the assertions in `gate_tests::y13_gate_exit_code_*` pin the
+/// load-bearing cells.
+fn gate_exit_code(mode: &GateMode, report: &GateReport) -> i32 {
+    match mode {
+        GateMode::Strict => {
+            if report.is_authoritative_pass() {
+                0
+            } else {
+                1
+            }
+        }
+        GateMode::LocalIterate => match &report.status {
+            GateStatus::Green => 0,
+            GateStatus::Yellow { .. } => 0,
+            GateStatus::Red { .. } => 1,
+            GateStatus::Inconclusive => 1,
+        },
+    }
 }
 
 /// The pure orchestrator for `zoder gate`. Given a repo root, detect
@@ -3123,7 +3152,16 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 break;
             }
             Err((e, fatal)) => {
-                health.record_failure(model_id, &e.message);
+                // Y-8: route the failure through the same classify + record
+                // path the `--probe --all` sweep uses, so a 401/403 from
+                // the API key OR a 429/503/529 capacity signal do NOT trip
+                // the breaker on a healthy model. Pre-fix this arm called
+                // `health.record_failure(model_id, &e.message)` unconditionally
+                // — three real auth rejections benched a working model for
+                // 300s. Now: classify -> record_classified_failure, with the
+                // provider-id already resolved at the top of the loop (`pid`).
+                let cls = classify_err(&e);
+                health.record_classified_failure(model_id, &e.message, &pid, cls);
                 last_err = Some(e);
                 if fatal {
                     // Output already partially shown; do not fall back.
@@ -4854,12 +4892,28 @@ pub(crate) async fn agentic_turn(
     // the caller can preserve partial output — but it is NOT a success: record it
     // as a failure so latency/health-aware routing learns this model couldn't
     // finish in budget (the BUG2 routing follow-up consumes this signal).
+    //
+    // Y-8: this arm now routes through the classified API so a policy /
+    // quota block or auth failure on this turn does not trip the breaker
+    // on a healthy model. There is no `ProviderError` here (the run
+    // outcome is a typed `AgentRun` with `outcome: completed | cancelled
+    // | failed`), so the message string carries no HTTP status to
+    // classify on — `Classification::Error` is the only safe default and
+    // matches what `record_failure` produced pre-fix. The routing key
+    // is the SAME one the pre-gate ledger entry uses so the on-disk
+    // store agrees across both writes.
+    let provider_id_for_record = routing
+        .real_provider_for_model(&eng.cfg, &model_used)
+        .map(|p| p.id.clone())
+        .unwrap_or_else(|| routed_provider.id.clone());
     if run.succeeded() {
         health.record_success(&model_used, elapsed_ms);
     } else {
-        health.record_failure(
+        health.record_classified_failure(
             &model_used,
             &format!("turn did not complete: {}", run.outcome),
+            &provider_id_for_record,
+            Classification::Error,
         );
     }
     save_health(&health);
@@ -6395,7 +6449,22 @@ async fn run_probe_default(
                 }
             }
             Err(e) => {
-                health.record_failure(id, &e.message);
+                // Y-8: classify the failure and route through
+                // `record_classified_failure` so a 401/403 (bad key) or
+                // 429/503/529 (transient capacity) on a real probe do NOT
+                // trip the breaker on a perfectly fine model. Pre-fix
+                // this arm called bare `record_failure` which
+                // unconditionally incremented `consecutive_failures` for
+                // every failed probe — the `--probe` command is the
+                // primary path operators use for routine health, so the
+                // defect was a particularly visible way to bench a
+                // working model behind a bad credential. The
+                // `--probe --all` sweep already used this exact pattern
+                // (see `run_probe_all` / `ProviderPlanRow::probe_one`
+                // below); applying it here closes the cross-CLI parity
+                // gap that the previous round narrowly missed.
+                let cls = classify_err(&e);
+                health.record_classified_failure(id, &e.message, &provider_cfg.id, cls);
                 if !quiet {
                     eprintln!("  FAIL {id}  {}", e.message);
                 }
@@ -8033,6 +8102,186 @@ mod gate_tests {
         );
         assert!(!report.is_failed());
         assert!(matches!(report.status, GateStatus::Inconclusive));
+    }
+
+    // -----------------------------------------------------------------
+    // Y-13: gate exit code must honor `is_authoritative_pass()` under
+    // Strict and the relaxed (Yellow=0) contract under LocalIterate.
+    // Pre-fix any Yellow Strict run exited 0, so
+    // `zoder gate && merge` treated a non-authoritative verdict as
+    // safe-to-merge — exactly the false-pass regression the API
+    // already exposes (see `GateReport::is_authoritative_pass`). The
+    // binary delegates the matrix to `gate_exit_code`; these tests
+    // exercise the matrix in isolation, so a future refactor that
+    // re-introduces the lenient Yellow-Strict=0 cell fails here.
+    // -----------------------------------------------------------------
+
+    /// Helper to build a `[StepResult]` from a name + outcome. Lives
+    /// here in the test module so the fixture shape stays close to
+    /// where it is consumed; the surface uses the real
+    /// `zoder_core::gate::StepResult` so a future `StepResult` field
+    /// change shows up as a compile error here rather than a silent
+    /// mismatch.
+    fn result(name: &str, required: bool, outcome: StepOutcome) -> zoder_core::gate::StepResult {
+        zoder_core::gate::StepResult {
+            step_name: name.into(),
+            required,
+            outcome,
+        }
+    }
+
+    /// Empty compat (the gate sees only locally-run steps) — used so
+    /// Y-13's contract is pinned on `status` alone, not on the
+    /// compatibility-induced downgrade path that already lives in
+    /// `GateReport::new`.
+    fn empty_compat() -> zoder_core::gate::CompatibilityReport {
+        zoder_core::gate::CompatibilityReport::default()
+    }
+
+    #[test]
+    fn y13_gate_exit_code_strict_yellow_skipped_required_is_nonzero() {
+        // The Y-13 pinned case. A Strict run that aggregates to Yellow
+        // because a REQUIRED step's CI-parity twin was skipped is the
+        // exact load-bearing cell the adversarial-review thread named.
+        // Pre-fix `cmd_gate` returned 0 unconditionally for Yellow,
+        // letting `zoder gate && merge` silently treat a non-authoritative
+        // verdict as safe-to-merge.
+        //
+        // We synthesize the Yellow-status report end-to-end via
+        // `GateReport::new(...)` so this test exercises the same
+        // matrix the CLI does: a passing lint step + a non-empty
+        // `compat.skipped` (e.g. an unverifiable CI job) downgrade to
+        // Yellow under Strict. The exit code is the load-bearing
+        // assertion: it MUST be non-zero so a `zoder gate && merge`
+        // shell chain does not silently pass.
+        let compat = zoder_core::gate::CompatibilityReport {
+            runnable: vec!["ci-extra".into()],
+            skipped: vec![("ci-extra".into(), "unverified locally".into())],
+            added_baseline: vec![],
+        };
+        let report = zoder_core::gate::GateReport::new(
+            vec![result("lint", true, StepOutcome::Passed)],
+            compat,
+            GateMode::Strict,
+        );
+        assert!(
+            matches!(report.status, GateStatus::Yellow { .. }),
+            "fixture must aggregate to Yellow so the test exercises the Y-13 \
+             Yellow-Strict contract: got {:?}",
+            report.status,
+        );
+        assert!(
+            !report.is_authoritative_pass(),
+            "non-empty compat.skipped must NOT be authoritative — the gate \
+             refuses to certify 'passed' when CI parity is unverified"
+        );
+        assert_eq!(
+            super::gate_exit_code(&GateMode::Strict, &report),
+            1,
+            "Y-13: Strict + Yellow must exit non-zero (the gate cannot \
+             certify 'passed' when required steps were skipped): {report:?}",
+        );
+    }
+
+    #[test]
+    fn y13_gate_exit_code_strict_green_still_passes() {
+        // Counter-test: a Strict run that genuinely passes (every
+        // required step ran and passed, no skipped CI parity) MUST
+        // still exit 0. Without this, the previous test could pass
+        // for the wrong reason (e.g. an over-eager `1` for everything).
+        let compat = empty_compat();
+        let report = zoder_core::gate::GateReport::new(
+            vec![
+                result("lint", true, StepOutcome::Passed),
+                result("build", true, StepOutcome::Passed),
+            ],
+            compat,
+            GateMode::Strict,
+        );
+        assert!(matches!(report.status, GateStatus::Green));
+        assert!(report.is_authoritative_pass());
+        assert_eq!(
+            super::gate_exit_code(&GateMode::Strict, &report),
+            0,
+            "Strict + Green must exit 0 (genuine authoritative pass): {report:?}",
+        );
+    }
+
+    #[test]
+    fn y13_gate_exit_code_strict_red_is_nonzero() {
+        // Sanity: Strict + Red (a failed required step) must remain
+        // non-zero. This was already correct pre-Y-13, but pinning
+        // it here so a future refactor of `gate_exit_code` that
+        // accidentally flips Red to 0 is caught.
+        let report = zoder_core::gate::GateReport::new(
+            vec![result("lint", true, StepOutcome::Failed)],
+            empty_compat(),
+            GateMode::Strict,
+        );
+        assert!(matches!(report.status, GateStatus::Red { .. }));
+        assert_eq!(
+            super::gate_exit_code(&GateMode::Strict, &report),
+            1,
+            "Strict + Red must remain non-zero: {report:?}",
+        );
+    }
+
+    #[test]
+    fn y13_gate_exit_code_strict_inconclusive_is_nonzero() {
+        // Sanity: Strict + Inconclusive (zero required steps ran —
+        // Z-6). The gate cannot certify a pass; exit non-zero. This
+        // was also already true pre-Y-13, but pin it so the contract
+        // holds under refactor.
+        let report = zoder_core::gate::GateReport::new(vec![], empty_compat(), GateMode::Strict);
+        assert!(matches!(report.status, GateStatus::Inconclusive));
+        assert_eq!(
+            super::gate_exit_code(&GateMode::Strict, &report),
+            1,
+            "Strict + Inconclusive must remain non-zero: {report:?}",
+        );
+    }
+
+    #[test]
+    fn y13_gate_exit_code_local_iterate_yellow_remains_zero() {
+        // LocalIterate preserves the pre-Y-13 contract: Yellow is
+        // advisory, exit 0, so the dev inner-loop is not blocked by
+        // "I have not yet installed every optional tool" noise. Pin
+        // this explicitly so a future refactor that aggressively
+        // promotes Yellow to 1 across BOTH modes is caught.
+        let compat = zoder_core::gate::CompatibilityReport {
+            runnable: vec!["ci-extra".into()],
+            skipped: vec![("ci-extra".into(), "unverified locally".into())],
+            added_baseline: vec![],
+        };
+        let report = zoder_core::gate::GateReport::new(
+            vec![result("lint", true, StepOutcome::Passed)],
+            compat,
+            GateMode::LocalIterate,
+        );
+        assert!(matches!(report.status, GateStatus::Yellow { .. }));
+        assert_eq!(
+            super::gate_exit_code(&GateMode::LocalIterate, &report),
+            0,
+            "LocalIterate + Yellow must remain exit 0 (advisory only): {report:?}",
+        );
+    }
+
+    #[test]
+    fn y13_gate_exit_code_local_iterate_red_is_nonzero() {
+        // LocalIterate + Red: a failed step is still a failure in the
+        // dev inner-loop, so we still exit 1. Pin it so the local
+        // branch's Red cell is regression-protected.
+        let report = zoder_core::gate::GateReport::new(
+            vec![result("lint", true, StepOutcome::Failed)],
+            empty_compat(),
+            GateMode::LocalIterate,
+        );
+        assert!(matches!(report.status, GateStatus::Red { .. }));
+        assert_eq!(
+            super::gate_exit_code(&GateMode::LocalIterate, &report),
+            1,
+            "LocalIterate + Red must remain non-zero: {report:?}",
+        );
     }
 
     #[test]

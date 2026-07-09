@@ -2,7 +2,8 @@ use std::time::Duration;
 use wiremock::matchers::{body_partial_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zoder_core::{
-    backoff_delay, Auth, BillingMode, ChatRequest, ErrKind, Message, OpenAiProvider, Provider,
+    backoff_delay, classify_err, Auth, BillingMode, ChatRequest, Classification, ErrKind,
+    HealthStore, Message, OpenAiProvider, Provider,
 };
 
 fn provider(base_url: &str) -> OpenAiProvider {
@@ -1115,6 +1116,129 @@ async fn anthropic_401_with_typed_error_envelope_is_classified_as_http() {
     assert!(err.message.contains("authentication_error"), "got: {err}");
 }
 
+/// Y-14: an Anthropic mid-stream SSE `event: error` carrying a typed
+/// `overloaded_error` envelope (the wire shape Anthropic uses to surface
+/// a 529 / capacity rejection after a 200 has been written to the
+/// stream) MUST:
+///   * populate `ProviderError::anthropic_error_body` with the raw frame
+///     payload (so `classify_err` can route through
+///     `from_anthropic_error_body`),
+///   * classify as `Capacity` via `classify_err` (NOT `Error`), so the
+///     breaker backs off instead of tripping on a perfectly fine model
+///     that's currently being rate-limited / overloaded.
+///
+/// Pre-fix the live SSE parser hard-coded `ErrKind::Http` /
+/// `status: None` on this branch and dumped the payload into
+/// `message`, so the existing `classify_err` saw only
+/// `kind: Http, status: None` and fell through to
+/// `classify_err_kind(ErrKind::Http) = Classification::Error` —
+/// breaking the breaker on every overload. Post-fix the typed
+/// envelope carries through `anthropic_error_body` and routes to
+/// `Capacity`.
+///
+/// The unit-level assertion (`classify_err_anthropic_*`) lives in
+/// `health_probe.rs`; this integration test drives the full
+/// `OpenAiProvider::stream_chat` -> `consume_stream_anthropic` path so a
+/// future refactor that drops the `anthropic_error_body.set(...)` call
+/// also fails this test.
+#[tokio::test]
+async fn anthropic_streaming_overloaded_error_frame_classifies_as_capacity() {
+    use zoder_core::{classify_err, Classification};
+
+    let server = MockServer::start().await;
+    let body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\
+\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded, try again\"}}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&anthropic_req("claude", true), None)
+        .await
+        .unwrap_err();
+
+    // Wire-side pins: kind/status show the underlying transport level
+    // signal.
+    assert_eq!(err.kind, ErrKind::Http);
+    assert!(
+        err.status.is_none(),
+        "mid-stream SSE error arrives on a 200 stream; status must stay None: got status={:?} err={}",
+        err.status,
+        err
+    );
+
+    // Y-14: the typed envelope must round-trip through
+    // `anthropic_error_body` so `classify_err` can reach
+    // `from_anthropic_error_body`. Without the field, the body would
+    // be lost -- the existing `consume_stream_anthropic` docstring
+    // explicitly notes that the body was previously in `message`
+    // only, which `classify_err` cannot read.
+    let body_str = err.anthropic_error_body.as_deref().unwrap_or_else(|| {
+        panic!("Y-14: anthropic_error_body must be populated for the SSE error frame; got: {err}")
+    });
+    assert!(
+        body_str.contains("overloaded_error"),
+        "anthropic_error_body must carry the original typed envelope: got {body_str}"
+    );
+
+    // Critical classification assertion: `Capacity`, NOT `Error`.
+    // This is the exact failure mode Y-14 names -- a 529-style
+    // overload tripping the breaker on a healthy model behind
+    // temporary provider pressure.
+    let cls = classify_err(&err);
+    assert_eq!(
+        cls,
+        Classification::Capacity,
+        "Anthropic mid-stream `overloaded_error` envelope must classify as Capacity \
+         so the breaker does NOT trip on a healthy model (Y-14): got {cls:?}, err={err}"
+    );
+    assert_ne!(
+        cls,
+        Classification::Error,
+        "Y-14 contract: must NOT regress to Error (would trip the breaker on overload)"
+    );
+}
+
+/// Y-14 companion: a mid-stream `authentication_error` SSE frame
+/// classifies as `Unauthorized` (never trip the breaker on a model
+/// whose only problem is the operator's API key).
+#[tokio::test]
+async fn anthropic_streaming_authentication_error_frame_classifies_as_unauthorized() {
+    use zoder_core::{classify_err, Classification};
+
+    let server = MockServer::start().await;
+    let body = "\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"bad api key\"}}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&anthropic_req("claude", true), None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.anthropic_error_body
+            .as_deref()
+            .is_some_and(|b| b.contains("authentication_error")),
+        "Y-14: authentication_error envelope must survive into anthropic_error_body; err={err}"
+    );
+    assert_eq!(classify_err(&err), Classification::Unauthorized);
+}
+
 // =====================================================================
 // OpenAI Responses API adapter — wire-level integration tests.
 //
@@ -1887,4 +2011,249 @@ async fn azure_401_with_openai_error_envelope_is_classified_as_http() {
     );
     std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_4");
     std::env::remove_var("AZURE_OPENAI_API_VERSION");
+}
+
+/// Y-19: `kind == "azure-openai"` providers short-circuit on
+/// `OpenAiProvider::list_models` and never send the malformed
+/// `…/openai/deployments/<dep>/models?api-version=…` URL to the
+/// backend. Pre-fix the Azure adapter built that URL by composing
+/// `endpoint_url(deployment_route, "azure-openai", "models", …)`, which
+/// the production Data Plane 404s — a daily `--probe --all` then prints
+/// a scary error for every Azure provider, even when the deployment is
+/// healthy. Post-fix `list_models` returns an `Err(...)` immediately on
+/// the `is_azure()` branch and callers (probe + consult) fall back to
+/// the operator-configured `model_ids`, which is exactly what the rest
+/// of the codebase already handles via `match … Err(_) => None` paths.
+///
+/// We do NOT mount a wiremock `200 /models` on the server: the entire
+/// point of the fix is that NO request ever hits the wire. A test that
+/// mistakenly hits the catch-all `wiremock` responder — which 404s by
+/// default — and inspects the resulting request log to find zero
+/// matches against `/openai/deployments/<dep>/models?api-version=…`
+/// catches a regression where the guard is removed.
+#[tokio::test]
+async fn azure_list_models_skips_deployment_nested_url() {
+    let _guard = AZURE_INTEG_API_VERSION_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Server has NO mocks mounted — any wire request would 404 in the
+    // request log. We assert the local Err path returns WITHOUT
+    // consulting the server.
+    let server = MockServer::start().await;
+    let p = azure_provider(
+        &format!("{}/openai/deployments/gpt4o", server.uri()),
+        Auth::None,
+        Some("2024-10-21"),
+    );
+
+    // Err shape pin: Err + ErrKind::Http + status=None. We do NOT match
+    // `azure-openai` with a specific Deployment-Nested-URL because the
+    // whole contract is "never contact the wire for /models on azure".
+    let err = p
+        .list_models()
+        .await
+        .expect_err("list_models on azure must short-circuit (not Ok + dummy)");
+    assert_eq!(
+        err.kind,
+        ErrKind::Http,
+        "Azure list_models short-circuit must surface a typed Err: {err}"
+    );
+    assert!(
+        err.status.is_none(),
+        "Azure list_models short-circuit must not carry an HTTP status: {err}"
+    );
+    // And the diagnostic must reference azure-openai so an operator
+    // looking at the stderr can tell WHY introspection failed (versus a
+    // generic "models list" timeout).
+    assert!(
+        err.message.to_lowercase().contains("azure"),
+        "Azure short-circuit diagnostic must mention 'azure' so the operator knows \
+         why introspection was skipped; got: {err}"
+    );
+
+    // Wire-side pin: the request log is empty. If the guard is removed,
+    // wiremock surfaces the catch-all 404 and the request log will have
+    // an entry — the assertions above still pass on the typed Err (the
+    // ErrKind::Http + Err from the openai fallback is similar), so the
+    // wire-level assertion is what makes this test trustworthy.
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "Azure list_models must NOT contact the wire (deployed under /deployments/<dep>); \
+         request log shows {n} request(s): {requests:?}",
+        n = received.len(),
+        requests = received
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>(),
+    );
+}
+
+// =====================================================================
+// Y-8: live error arms must classify before recording.
+//
+// The CLI's `cmd_exec_oneshot`, `--probe`, reviewer fallback, and
+// agentic-turn paths all record provider failures into a shared
+// `HealthStore`. Pre-fix every one of those arms used the bare
+// `record_failure(model, &e.message)` -- which unconditionally bumps
+// `consecutive_failures` -- so a 401/403 from a bad API key OR a
+// 429/503/529 capacity signal triped the breaker on a perfectly
+// healthy model after three requests, benching it for the 300s
+// cooldown. Post-fix the arms route through
+// `record_classified_failure(model, msg, provider_id, classify_err(&e))`
+// (per the `--probe --all` sweep, which already had this contract).
+//
+// These tests exercise the live classification + record flow
+// end-to-end against a wiremock provider so a future regression
+// that swaps back to the bare `record_failure` fails here even when
+// the model-health store-level tests still pass (those tests don't
+// drive a wire; the bare-vs-classified wiring is invisible from
+// `HealthStore`).
+// =====================================================================
+
+/// Helper: drive a chat call against a wiremock that returns the
+/// given status, then route the resulting `ProviderError` through
+/// `classify_err` + `record_classified_failure`. The exact shape the
+/// live arm (`cmd_exec_oneshot`, `run_probe_default`, agentic
+/// reviewer fallback) uses.
+async fn drive_live_arm(
+    p: &OpenAiProvider,
+    model: &str,
+    status: u16,
+    body: &str,
+) -> (ProviderError, Classification) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(status).set_body_string(body))
+        .mount(&server)
+        .await;
+    let mut p_local = provider(&server.uri());
+    // Swap base_url from the test fixture to point at the wiremock
+    // server (matches the live arm's behavior).
+    let cfg = Provider {
+        id: "test".into(),
+        base_url: server.uri(),
+        kind: "openai-chat".into(),
+        auth: Auth::None,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+        azure_api_version: None,
+    };
+    p_local = OpenAiProvider::new(&cfg).unwrap();
+    // Belt + braces: model is unused on the wire for the openai-chat
+    // path (it's in the body), but bind the local var to silence the
+    // warning without affecting the test.
+    let _ = model;
+
+    let req = ChatRequest {
+        model: "m".into(),
+        messages: vec![Message::new("user", "hi")],
+        max_tokens: 1,
+        temperature: Some(0.0),
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: None,
+    };
+    let err = p_local.stream_chat(&req, None).await.unwrap_err();
+    let cls = classify_err(&err);
+    (err, cls)
+}
+
+#[tokio::test]
+async fn y8_live_classification_401_does_not_trip_breaker() {
+    // Y-8 pinned case: a 401 from the live wire. The classifier must
+    // produce `Unauthorized`, and applying it via
+    // `record_classified_failure` must NOT trip the breaker after
+    // >> BREAKER_THRESHOLD calls (3 is the threshold; we hammer 5).
+    let err_body = r#"{"error":{"message":"invalid api key","type":"invalid_request_error"}}"#;
+    let (_server, _cfg) = {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(err_body))
+            .mount(&server)
+            .await;
+        (server.clone(), ())
+    };
+    let p = provider("http://example.invalid");
+    let (err, cls) = drive_live_arm(&p, "openai/gpt-4o", 401, err_body).await;
+    assert_eq!(err.status, Some(401));
+    assert_eq!(
+        cls,
+        Classification::Unauthorized,
+        "live 401 must classify as Unauthorized (not Error) so the breaker \
+         does NOT trip on bad credentials: err={err}"
+    );
+
+    // Drive the same path the live arm does: record_classified_failure
+    // with this classification. Even after >> BREAKER_THRESHOLD
+    // consecutive such calls the breaker must stay closed.
+    let mut h = HealthStore::default();
+    for _ in 0..(10) {
+        h.record_classified_failure("openai/gpt-4o", &err.message, "openrouter", cls);
+    }
+    assert!(
+        !h.breaker_open("openai/gpt-4o"),
+        "Y-8: a 401 path that records via classify_err -> record_classified_failure \
+         MUST leave the breaker closed (Unauthorized is a key-rejection, not a model \
+         failure); got breaker_open=true after 10 probes"
+    );
+}
+
+#[tokio::test]
+async fn y8_live_classification_529_does_not_trip_breaker() {
+    // Anthropic-style 529 (overload) is in the Capacity bucket;
+    // consult must skip the model for the cooldown and the breaker
+    // MUST stay closed -- a perfectly good model behind temporary
+    // provider pressure should not get benched.
+    let err_body = r#"{"error":{"message":"site overloaded","type":"overloaded_error"}}"#;
+    let p = provider("http://example.invalid");
+    let (err, cls) = drive_live_arm(&p, "anthropic/claude-3.7", 529, err_body).await;
+    assert_eq!(err.status, Some(529));
+    assert_eq!(
+        cls,
+        Classification::Capacity,
+        "live 529 must classify as Capacity (not Error): err={err}"
+    );
+
+    let mut h = HealthStore::default();
+    for _ in 0..(10) {
+        h.record_classified_failure("anthropic/claude-3.7", &err.message, "anthropic", cls);
+    }
+    assert!(
+        !h.breaker_open("anthropic/claude-3.7"),
+        "Y-8: a 529 path that records via classify_err -> record_classified_failure \
+         MUST leave the breaker closed (Capacity is a transient signal, not a model \
+         failure); got breaker_open=true after 10 probes"
+    );
+}
+
+#[tokio::test]
+async fn y8_live_classification_500_still_trips_breaker() {
+    // Counter-test: a generic 500 (no typed envelope, no overload tag)
+    // MUST still classify as `Error` and trip the breaker after
+    // BREAKER_THRESHOLD calls. Without this, the Y-8 fix could be
+    // incorrectly over-broad (e.g. always routing to Capacity).
+    let err_body = "internal server error";
+    let p = provider("http://example.invalid");
+    let (err, cls) = drive_live_arm(&p, "broken/model", 500, err_body).await;
+    assert_eq!(err.status, Some(500));
+    assert_eq!(
+        cls,
+        Classification::Error,
+        "live 500 must still classify as Error (the Y-8 fix is selective): err={err}"
+    );
+
+    let mut h = HealthStore::default();
+    for _ in 0..(3) {
+        h.record_classified_failure("broken/model", &err.message, "openrouter", cls);
+    }
+    assert!(
+        h.breaker_open("broken/model"),
+        "Y-8: a 500 path's consecutive_failures MUST still trip the breaker \
+         (we're not silently demoting Errors to Capacity); got breaker_open=false"
+    );
 }
