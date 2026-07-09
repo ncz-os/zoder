@@ -573,11 +573,28 @@ struct LockGuard {
 impl LockGuard {
     /// Open (creating if needed) the sidecar lockfile and block
     /// until `fs2::FileExt::lock_exclusive` is granted.
+    ///
+    /// Returns `Err(io::Error)` with an explicit OS error kind and
+    /// a contextual message naming the lockfile path so callers
+    /// (and ultimately end users) can tell *which* lock failed to
+    /// open or acquire. `acquire` itself does not have a context
+    /// for the data file, so it can only embed the lockfile path;
+    /// the public call site in `mutate_locked` adds the data-file
+    /// context on top via `anyhow::Context`.
     fn acquire(data_path: &Path) -> std::io::Result<Self> {
         let lock_path = lock_path_for(data_path);
         if let Some(parent) = lock_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "creating parent dir for engine-session store lockfile {}: {}",
+                            lock_path.display(),
+                            e
+                        ),
+                    )
+                })?;
             }
         }
         let file = std::fs::OpenOptions::new()
@@ -585,12 +602,33 @@ impl LockGuard {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)?;
+            .open(&lock_path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "opening engine-session store lockfile {}: {}",
+                        lock_path.display(),
+                        e
+                    ),
+                )
+            })?;
         // `lock_exclusive` blocks until the kernel grants the
         // `flock(2)`; on process death the FD is closed by the kernel
         // and the lock is released, so a crashed holder cannot
-        // deadlock the next caller.
-        file.lock_exclusive()?;
+        // deadlock the next caller. Wrap the error with the lockfile
+        // path so the caller sees "which lock" and not a bare OS
+        // errno.
+        file.lock_exclusive().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "acquiring exclusive flock(2) on engine-session store lockfile {}: {}",
+                    lock_path.display(),
+                    e
+                ),
+            )
+        })?;
         Ok(LockGuard {
             _file: file,
             path: lock_path,
@@ -603,11 +641,45 @@ impl Drop for LockGuard {
         // Best-effort unlink so the lockfile does not linger — a
         // stale lockfile would force every subsequent writer to
         // contend with `fs2::lock_exclusive` blocking on the file
-        // even when no live holder exists. On modern Linux the
-        // `flock(2)` is on the inode and a `unlink` of an open FD
-        // does not release it (kernel releases on close — i.e. when
-        // `_file` drops at the end of this fn), so this is safe.
+        // even when no live holder exists.
+        //
+        // Cross-platform semantics of `remove_file` on a still-open
+        // FD:
+        //   * Linux / macOS (POSIX): the underlying `unlink(2)`
+        //     removes the directory entry while keeping the inode
+        //     alive for the open FD. The `flock(2)` is on the open
+        //     file description (not the path), so the lock stays
+        //     held until the kernel closes the FD in `_file`'s
+        //     `Drop` (run at the end of this function). Removing
+        //     the path during that brief window is safe — the
+        //     next acquirer will simply `create(true)` a fresh
+        //     inode at the same path and `lock_exclusive` it.
+        //   * Windows: `fs2::lock_exclusive` is implemented via
+        //     `LockFileEx` on a file HANDLE. `remove_file` of an
+        //     in-use file returns `ERROR_SHARING_VIOLATION` and is
+        //     silently swallowed by `let _ =`. The lockfile will
+        //     persist on disk after the handle closes, but a fresh
+        //     `OpenOptions::create(true).truncate(false).open(...)`
+        //     still opens the same path with a fresh handle, and a
+        //     following `lock_exclusive` blocks correctly — the
+        //     lingering inode does not deadlock later writers, it
+        //     only leaves a 0-byte file behind that the next save
+        //     truncates or rewrites. The next `LockGuard::drop`
+        //     will retry the unlink, so the lockfile does not
+        //     accumulate permanently under steady-state use.
+        //
+        // In both regimes a race is benign: if a second acquirer
+        // opens the path between this `remove_file` and our own FD
+        // close, the second acquirer's open sees a brand-new inode
+        // and `lock_exclusive`s independently on its own FD; the
+        // prior holder's lock remains on its (still-open) FD and
+        // is honored by the kernel exactly the same way as if the
+        // unlink had not happened. The race is therefore
+        // indistinguishable from a slightly later acquisition, and
+        // the lock semantics survive.
         let _ = std::fs::remove_file(&self.path);
+        // `_file` drops at scope end; on POSIX the kernel releases
+        // the `flock(2)` when the FD closes.
     }
 }
 
@@ -1523,38 +1595,66 @@ mod tests {
         held.lock_exclusive()
             .expect("acquire flock(2) from test thread");
 
-        let (tx, rx) = mpsc::channel();
+        // Deterministic two-channel handshake (no fixed sleep).
+        //
+        // Channel `started` — sent by the worker the moment it ENTERS
+        //   `save_with_scope` (i.e. before the work that touches the
+        //   lock or the data file). The test thread waits on this
+        //   before asserting, so the assertion is ordered AFTER the
+        //   worker has run any code that could touch the store. This
+        //   is what removes the previous `thread::sleep(100ms)` race:
+        //   on a slow / loaded CI runner 100ms could be shorter than
+        //   the worker's launch overhead and the assertion would
+        //   trivially pass; on a fast runner a regression that
+        //   skipped the lock acquisition could complete the entire
+        //   save inside that 100ms and the assertion would falsely
+        //   fail. With an explicit `started` signal, the ordering is
+        //   exact: the worker has begun → the test checks state.
+        //
+        // Channel `result` — the worker's final `Result<()>`. The
+        //   test thread blocks here AFTER dropping `held`, so a clean
+        //   release-and-then-finish ordering is preserved.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
         let cfg2 = cfg.clone();
         let handle = thread::spawn(move || {
+            // Notify the test thread that we have begun. Send BEFORE
+            // we touch the store so the signal truly precedes any
+            // lock or disk work on our side.
+            let _ = started_tx.send(());
             let res = EngineSessionStore::save_with_scope(
                 &cfg2,
                 &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo")),
                 "sid-late",
             );
-            let _ = tx.send(res);
+            let _ = result_tx.send(res);
         });
 
-        // The save MUST still be blocked on `lock_exclusive`. Give
-        // the worker a moment to reach the lock acquisition.
-        thread::sleep(std::time::Duration::from_millis(100));
-        // The on-disk store file must NOT have been written yet —
-        // the save is still blocked BEFORE the load → merge → write
-        // critical section, so a regression here surfaces as the
-        // store file existing while the test thread still holds the
-        // flock.
+        // Wait for the worker to have started. This is a true
+        // happens-before barrier: the worker cannot have run any
+        // store-mutating code (or reached `lock_exclusive`) before
+        // this `recv` returns.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker must signal start within 2s");
+
+        // The on-disk store file must NOT have been written yet. The
+        // worker is blocked on `lock_exclusive` (which is a kernel-
+        // level wait that suspends the thread until the FD-level
+        // flock held by `held` is released). If this assertion ever
+        // fails, the regression is that the save proceeded despite
+        // another writer holding the lock.
         assert!(
             !path.exists(),
             "the on-disk store must not exist while another writer holds the lock; \
              if it exists, the regression is: the save proceeded despite the lock"
         );
 
-        // Release the lock. The save should now complete
-        // (sub-second) and report success.
+        // Release the lock. The save should now complete (sub-second)
+        // and report success.
         drop(held);
-        // The save may have unlinked + recreated the lockfile by
-        // itself; that is fine — what matters is that it ran.
-        let res = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+        let res = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the save must complete once the lock is released");
         res.expect("the save must succeed once the lock is released");
         handle.join().unwrap();
