@@ -1761,15 +1761,27 @@ fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
     }
     // cap=None: preserve the stored reading (with legacy-fractional
     // -> percentage conversion). compute_used_percent returns None
-    // here unconditionally, so we cannot delegate. Mirroring the
-    // cap=Some branch's 0..=2 upper bound covers exhausted legacy
-    // counters (e.g. 1.2 -> 120.0) without touching legitimate
-    // percentage-scale values (e.g. 85.0 -> 85.0). A None stored value
-    // stays None (no signal, no fabrication).
+    // here unconditionally, so we cannot delegate.
+    //
+    // Y-12 (2026-07-09): the prior round gated this branch on
+    // `(0.0..=2.0).contains(&p)`, which silently skipped a legacy
+    // row whose stored ratio was > 2.0 (e.g. a 3x-exhausted
+    // counter with `used_percent = 3.0`). The caller already gates
+    // us on `schema_version < 2`, so every value reaching this
+    // branch is KNOWN legacy — in v1 every `used_percent` was a
+    // bare ratio (never 0..100), and a ratio can legally exceed 2
+    // (a 300%-exhausted budget). Scaling only the 0..=2 subset
+    // left 3.0 unscaled and read as 3% in the post-migration
+    // schema — false headroom on a 3x-exhausted budget.
+    //
+    // The fix: in the cap=None branch, scale any legacy ratio by
+    // ×100 regardless of magnitude. The schema_version gate at the
+    // call site (not repeated here) keeps a real v2 0.049% reading
+    // from being multiplied to 4.9%. A None stored value stays
+    // None (no signal, no fabrication); a 0.0 value scales to 0.0
+    // (idempotent).
     if let Some(p) = cw.used_percent {
-        if (0.0..=2.0).contains(&p) {
-            cw.used_percent = Some(p * 100.0);
-        }
+        cw.used_percent = Some(p * 100.0);
     }
 }
 
@@ -2082,45 +2094,62 @@ impl UtilizationStore {
         // (streaming-usage off, usage field absent) still wants a row
         // touch but never a negative balance.
         //
-        // Z-11 (rolling-window monotonicity vs. stale-clock / OOO
-        // capture): the rolling-window cutoff is computed against the
-        // capture's `now`, and `last_updated` is unconditionally
-        // rewritten to `now` at the end of this method. A stale-clock
-        // capture (now < last_updated) would therefore (a) recompute
+        // Z-11 / Y-16 (rolling-window monotonicity vs. stale-clock /
+        // OOO capture): the rolling-window cutoff is computed against
+        // the capture's `now`, and `last_updated` is unconditionally
+        // rewritten at the end of this method. The naive pre-fix code
+        // let a stale-clock capture (now < last_updated) (a) recompute
         // the cutoff against the stale `now` and drop just-recorded
         // in-window increments on the next sum, AND (b) roll
         // `last_updated` backwards, marking the window
         // `TelemetryHealth::Degraded` on the next routing decision and
         // excluding it from `decide_account`'s `observable` set. With
-        // `tokens_used > 0` the failure mode widens: the stale capture
-        // also pushes a phantom `CounterIncrement` at the stale
-        // timestamp, attributing usage to a time the provider never
-        // reported. Either failure mode restores full headroom on a
-        // near-exhausted window — the exact FALSE-headroom symptom the
-        // 2026-07-08 review flagged.
+        // `tokens_used > 0` the failure mode widened further: the
+        // stale capture also pushed a phantom `CounterIncrement` at
+        // the stale timestamp, attributing usage to a time the provider
+        // never reported. Either failure mode restored full headroom
+        // on a near-exhausted window — the exact FALSE-headroom
+        // symptom the 2026-07-08 review flagged.
         //
-        // Reject the capture as a no-op when `now < last_updated` on a
-        // rolling window. The calendar-reset branch above has already
-        // run, so a genuinely new period has already been reset (the
-        // new period's `last_updated` is set at the end of this
-        // method). A genuine reset for a non-calendar rolling window
-        // cannot happen via clock motion alone — only via the operator
-        // explicitly setting `rolling_hours` or clearing `increments`.
+        // The first-round fix (Z-11) rejected the entire capture as a
+        // no-op when `now < last_updated`. That protected the sum but
+        // under-counted real usage during a legitimate NTP step-back
+        // on an active session: the user's tokens are still being
+        // consumed by the provider, the wall clock just moved
+        // backwards, and dropping the capture froze the window at its
+        // pre-rollback total until the clock caught up. A near-
+        // exhausted window that should have ticked into the cap_guard
+        // band thus appeared to have full headroom for the duration
+        // of the rollback — the same FALSE-headroom symptom, just on
+        // a different timeline.
+        //
+        // Y-16 (2026-07-09): instead of dropping the capture, CLAMP
+        // the observed timestamp to `max(now, last_updated)` so the
+        // bucket-timeline stays monotonic, and STILL accrue the
+        // tokens. The Z-11 protection against a STALE zero-token
+        // capture zeroing the sum is preserved by construction: a
+        // zero-token capture with `now < last_updated` clamps
+        // `observed_now` forward, the `tokens_used > 0` guard skips
+        // pushing an increment, the cutoff at `observed_now - hours`
+        // (which equals `last_updated - hours`) retains every prior
+        // in-window increment, and the recomputed sum is unchanged.
         //
         // The guard is scoped to `rolling_hours.is_some()` so calendar
         // windows and the non-rolling accumulator are unaffected
         // (pinned by `non_rolling_clock_rollback_capture_preserves_used_tokens`).
-        if entry.rolling_hours.is_some() && now < entry.last_updated {
-            return entry.used_tokens;
-        }
+        let observed_now = if entry.rolling_hours.is_some() && now < entry.last_updated {
+            entry.last_updated
+        } else {
+            now
+        };
         if let Some(hours) = entry.rolling_hours {
-            let cutoff = now - chrono::Duration::hours(i64::from(hours));
+            let cutoff = observed_now - chrono::Duration::hours(i64::from(hours));
             entry
                 .increments
                 .retain(|increment| increment.observed_at >= cutoff);
             if tokens_used.is_finite() && tokens_used > 0.0 {
                 entry.increments.push(CounterIncrement {
-                    observed_at: now,
+                    observed_at: observed_now,
                     tokens: tokens_used,
                 });
             }
@@ -2138,7 +2167,7 @@ impl UtilizationStore {
         // configuration never produces an exploded percent. Finding
         // #3: percent is in the 0..=100 scale, not the bare ratio.
         entry.used_percent = compute_used_percent(entry.used_tokens, entry.cap);
-        entry.last_updated = now;
+        entry.last_updated = observed_now;
         entry.used_tokens
     }
 
@@ -4739,11 +4768,17 @@ mod tests {
         assert_eq!(counter.last_updated, t1);
     }
 
-    /// Z-11 secondary pin: stale-clock capture with `tokens_used > 0`
-    /// must NOT push a phantom increment AND drop real in-window
-    /// increments. Pre-fix summed only the phantom increment.
+    /// Y-16 main pin (2026-07-09 re-review): a near-full rolling window
+    /// plus a same-or-newer-tokens capture whose `now` is slightly BEFORE
+    /// `last_updated` (NTP step-back during an active session) must STILL
+    /// accrue the tokens. Pre-fix (Z-11 round) dropped the capture
+    /// entirely, freezing `used_tokens` at 95.0 and producing false
+    /// headroom on a near-exhausted window until the clock caught up.
+    /// Post-fix clamps `observed_now = max(now, last_updated)` and pushes
+    /// the increment at `observed_now` so the bucket-timeline stays
+    /// monotonic. The captured 5 tokens push the total to 100.0.
     #[test]
-    fn rolling_window_clock_rollback_capture_is_a_no_op() {
+    fn rolling_window_clock_rollback_capture_with_tokens_still_accrues() {
         let mut store = UtilizationStore::default();
         let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
         store.set_counter_rolling_hours(Provider::MiniMax, "default", MM_PLAN, "5h", Some(5), t0);
@@ -4751,13 +4786,96 @@ mod tests {
         let t1 = t0 + chrono::Duration::minutes(30);
         let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 50.0, t1);
         let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 45.0, t1);
-        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 999.0, t0);
+        // NTP step-back: capture's `now` is slightly BEFORE last_updated
+        // but the user really did consume another 5 tokens. Y-16 must
+        // still accrue them so the near-exhausted window ticks into the
+        // cap_guard band on the next routing decision.
+        let t_stale = t1 - chrono::Duration::seconds(1);
+        let used_after_stale =
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 5.0, t_stale);
+        assert_eq!(used_after_stale, 100.0);
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 100.0);
+        assert_eq!(counter.used_percent, Some(100.0));
+        // `last_updated` MUST NOT roll backwards.
+        assert_eq!(counter.last_updated, t1);
+        // The clamped increment is stamped at `last_updated`, so the
+        // bucket-timeline stays monotonic and the rolling cutoff at
+        // `last_updated - 5h` retains every prior increment.
+        assert_eq!(counter.increments.len(), 3);
+        for inc in &counter.increments {
+            assert!(inc.observed_at >= t1 - chrono::Duration::hours(5));
+            assert!(inc.observed_at <= t1);
+        }
+        let last = counter.increments.last().unwrap();
+        assert_eq!(last.tokens, 5.0);
+        assert_eq!(last.observed_at, t1);
+    }
+
+    /// Y-16 secondary pin: a genuinely stale ZERO-token capture must
+    /// STILL not reduce the sum (Z-11 protection intact). Pre-Z-11
+    /// would zero the window; Y-16 clamps `observed_now` forward so
+    /// the cutoff at `last_updated - hours` retains every prior
+    /// in-window increment, the `tokens_used > 0` guard skips pushing
+    /// a phantom increment, and the recomputed sum is unchanged.
+    #[test]
+    fn rolling_window_clock_rollback_zero_token_capture_preserves_sum() {
+        let mut store = UtilizationStore::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
+        store.set_counter_rolling_hours(Provider::MiniMax, "default", MM_PLAN, "5h", Some(5), t0);
+        store.set_counter_cap(Provider::MiniMax, "default", MM_PLAN, "5h", Some(100.0), t0);
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 80.0, t1);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 15.0, t1);
+        // NTP step-back with a zero-token capture (e.g. provider sent
+        // a usage-absent heartbeat). Y-16 must keep the sum at 95.0
+        // AND must not roll `last_updated` backwards.
+        let t_stale = t1 - chrono::Duration::seconds(1);
+        let used_after_stale =
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 0.0, t_stale);
+        assert_eq!(used_after_stale, 95.0);
         let counter = store
             .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
             .unwrap();
         assert_eq!(counter.used_tokens, 95.0);
+        assert_eq!(counter.used_percent, Some(95.0));
         assert_eq!(counter.last_updated, t1);
         assert_eq!(counter.increments.len(), 2);
+    }
+
+    /// Y-16 monotonicity pin: after a clock-rollback capture (clamped
+    /// forward), a subsequent in-future capture must push a fresh
+    /// increment at its real `now` and recompute the cutoff against
+    /// that future timestamp — i.e. the bucket-timeline truly advances
+    /// once the clock catches up, and the sum continues to accrue
+    /// from real usage, not from phantom-or-stale tokens.
+    #[test]
+    fn rolling_window_recovers_after_clock_rollback_clamp() {
+        let mut store = UtilizationStore::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 4, 10, 0, 0).unwrap();
+        store.set_counter_rolling_hours(Provider::MiniMax, "default", MM_PLAN, "5h", Some(5), t0);
+        store.set_counter_cap(Provider::MiniMax, "default", MM_PLAN, "5h", Some(100.0), t0);
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 50.0, t1);
+        let _ = store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 45.0, t1);
+        // Stale capture during NTP step-back — clamps forward and accrues.
+        let t_stale = t1 - chrono::Duration::seconds(5);
+        let used_after_stale =
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 3.0, t_stale);
+        assert_eq!(used_after_stale, 98.0);
+        // Clock catches up — fresh capture strictly after t1 accrues
+        // at its real `now` and the cutoff advances correctly.
+        let t2 = t1 + chrono::Duration::minutes(10);
+        let used_after_real =
+            store.record_counter(Provider::MiniMax, "default", MM_PLAN, "5h", 1.0, t2);
+        assert_eq!(used_after_real, 99.0);
+        let counter = store
+            .get_counter(Provider::MiniMax, "default", MM_PLAN, "5h")
+            .unwrap();
+        assert_eq!(counter.last_updated, t2);
+        assert_eq!(counter.increments.len(), 4);
     }
 
     /// Non-breaking contract: the clock-rollback guard is scoped to
@@ -4794,10 +4912,27 @@ mod tests {
 
     // ----- Z-12: v1->v2 migration preserves used_percent when cap = None -----
 
-    /// Z-12 main pin: migrate a legacy v1 record with `used_percent = 85`
-    /// and `cap = None` through `UtilizationStore::open_unlocked` (which
-    /// triggers `migrate_fractional_counter_percent`). Pre-fix dropped
-    /// the stored 85 to None; post-fix preserves it.
+    /// Y-12 historical contract: this test was originally added in the
+    /// Z-12 round to pin "a v1 row with `used_percent = 85.0` and
+    /// `cap = None` must NOT be dropped to None during migration".
+    /// That round's narrow fix left any value > 2.0 unscaled on the
+    /// (mistaken) theory that it was already a percentage. The
+    /// Y-12 (2026-07-09) re-review recognized that in v1 every
+    /// `used_percent` was a bare ratio — a value of 85.0 stored
+    /// under v1 was a ratio of 85x (i.e. the user is 85x over
+    /// their cap, which is itself a malformed signal), not a
+    /// percentage. The pre-Z-12 code dropped the row to None
+    /// because `cap = None` and `used_tokens = 85_000` cannot
+    /// recompute a percent. The Z-12 round preserved it as 85.0
+    /// (still unscaled). The Y-12 round correctly scales it to
+    /// 8500.0 — the migration is the right place to do that, since
+    /// the v1 row is otherwise unreadable as a percentage.
+    ///
+    /// The companion test
+    /// `legacy_counter_percent_migration_rescales_legacy_above_two_when_cap_is_none`
+    /// pins the 3.0/0.5/10.0 cases end-to-end; this one pins the
+    /// 85.0 extreme value to make the migration's behavior on a
+    /// wildly-large legacy ratio explicit.
     #[test]
     fn legacy_counter_percent_migration_preserves_stored_percent_when_cap_is_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -4823,7 +4958,11 @@ mod tests {
         .unwrap();
         let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
         let cw = migrated.counters.get("percent_only").unwrap();
-        assert_eq!(cw.used_percent, Some(85.0));
+        // Y-12: a v1 ratio of 85.0 is a known-bare ratio and must be
+        // scaled by ×100 -> 8500.0 (i.e. the stored value is
+        // preserved, not dropped, AND it's now in the
+        // percentage-scale that downstream consumers expect).
+        assert_eq!(cw.used_percent, Some(8500.0));
     }
 
     /// Z-12 secondary pin: legacy fractional values (1.2 -> 120,
@@ -4889,5 +5028,193 @@ mod tests {
         let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
         let cw = &migrated.counters["truly_unknown"];
         assert!(cw.used_percent.is_none());
+    }
+
+    // =====================================================================
+    // Y-12 / Y-16 pins (2026-07-09 adversarial re-review).
+    //
+    // The 2026-07-09 re-review of zoder's utilization tracking flagged
+    // two GENERAL-CASE defects in the first-round (Z-11 / Z-12) fixes:
+    //
+    // Y-12 (MED): the `migrate_fractional_counter_percent` cap=None
+    //     branch gated the ×100 rescale on `(0.0..=2.0).contains(&p)`,
+    //     which silently left a legacy v1 ratio > 2.0 (e.g. 3.0 for
+    //     a 300%-exhausted budget) unscaled — read as 3% in the post-
+    //     migration schema and producing FALSE headroom on a 3x-
+    //     exhausted counter.
+    //
+    // Y-16 (LOW): the `record_counter` rolling-window guard returned
+    //     the entire capture when `now < last_updated`, which DROPPED
+    //     real usage during a legitimate NTP step-back on an active
+    //     session — same FALSE-headroom symptom, just on a different
+    //     timeline.
+    //
+    // The tests below pin both fixes at the public-method boundary.
+    // =====================================================================
+
+    // ----- Y-12: legacy >2.0 ratios rescaled regardless of magnitude -----
+
+    /// Y-12 main pin: a v1 row with `used_percent = 3.0` and `cap = None`
+    /// (a 3x-exhausted legacy counter) must migrate to 300.0, NOT stay
+    /// at 3.0 (the pre-fix bug). Pre-fix gated the rescale on
+    /// `(0.0..=2.0).contains(&p)` so 3.0 was left unscaled and read
+    /// as ~3% on a 300%-exhausted budget.
+    #[test]
+    fn legacy_counter_percent_migration_rescales_legacy_above_two_when_cap_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless-above-two.json");
+        let row = |name: &str, used_percent: f64| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": 0.0,
+                "used_percent": used_percent,
+                "last_updated": "2026-07-04T12:00:00Z"
+            })
+        };
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    // 3x-exhausted: the headline Y-12 case.
+                    "three_x": row("three_x", 3.0),
+                    // Still a fractional value: must keep working too.
+                    "half": row("half", 0.5),
+                    // A truly absurd value (>10x) must also scale.
+                    "ten_x": row("ten_x", 10.0),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        assert_eq!(migrated.counters["three_x"].used_percent, Some(300.0));
+        assert_eq!(migrated.counters["half"].used_percent, Some(50.0));
+        assert_eq!(migrated.counters["ten_x"].used_percent, Some(1000.0));
+        // Schema is bumped so a re-open does not re-migrate.
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Y-12 non-breaking contract: a non-legacy (schema_version >= 2)
+    /// row whose `used_percent` happens to land in `(0.0..=2.0)` (e.g.
+    /// MiniMax's 5.1B monthly cap with very low real usage giving a
+    /// 0.049% reading) must NOT be silently re-multiplied by 100. The
+    /// caller of `migrate_fractional_counter_percent` gates on
+    /// `schema_version < 2`, so a v2 row never enters the migration
+    /// function — this test pins that contract end-to-end.
+    #[test]
+    fn legacy_counter_percent_migration_skips_non_legacy_low_percent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_path = dir.path().join("current-v2-low-percent.json");
+        let counter = serde_json::json!({
+            "provider": "mini_max",
+            "account_id": "default",
+            "plan": "max",
+            "window_name": "tiny_use",
+            "used_tokens": 0.0,
+            "used_percent": 0.049,
+            "last_updated": "2026-07-04T12:00:00Z"
+        });
+        std::fs::write(
+            &current_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "records": {},
+                "counters": {"tiny_use": counter}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = UtilizationStore::open_unlocked(&current_path).unwrap();
+        let cw = &store.counters["tiny_use"];
+        // 0.049% must round-trip unchanged — NOT silently rescaled to 4.9%.
+        assert_eq!(cw.used_percent, Some(0.049));
+        // Re-opening an already-current file is idempotent: schema_version
+        // is NOT bumped again (it was already at CURRENT_SCHEMA_VERSION).
+        assert_eq!(store.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Y-12 negative-input contract: the pre-fix `(0.0..=2.0)` gate
+    /// filtered out negatives too. The new behavior scales any legacy
+    /// ratio by ×100. A negative ratio is malformed legacy data, and
+    /// the safest contract for the router is "do not invent a positive
+    /// reading" — but the existing `None`-preserving gate already does
+    /// that. We pin that an existing legacy fractional row is still
+    /// migrated correctly alongside a 3.0 row in the same file (no
+    /// off-by-one or shared-state bug introduced by removing the
+    /// magnitude gate).
+    #[test]
+    fn legacy_counter_percent_migration_handles_mixed_legacy_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless-mixed.json");
+        let row = |name: &str, used_percent: Option<f64>| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": 0.0,
+                "used_percent": used_percent,
+                "last_updated": "2026-07-04T12:00:00Z"
+            })
+        };
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    "tiny": row("tiny", Some(0.01)),
+                    "huge": row("huge", Some(7.5)),
+                    "missing": row("missing", None),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        assert_eq!(migrated.counters["tiny"].used_percent, Some(1.0));
+        assert_eq!(migrated.counters["huge"].used_percent, Some(750.0));
+        assert!(migrated.counters["missing"].used_percent.is_none());
+    }
+
+    /// Y-12 parallel-pin via the locked `open()` path (production
+    /// code path). Mirrors `open_unlocked` so any regression in
+    /// either caller is caught.
+    #[test]
+    fn legacy_counter_percent_migration_rescales_above_two_via_locked_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-v1-capless-above-two-locked.json");
+        let row = |name: &str, used_percent: f64| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": 0.0,
+                "used_percent": used_percent,
+                "last_updated": "2026-07-04T12:00:00Z"
+            })
+        };
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    "three_x": row("three_x", 3.0),
+                    "half": row("half", 0.5),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = UtilizationStore::open(&legacy_path).unwrap();
+        assert_eq!(store.counters["three_x"].used_percent, Some(300.0));
+        assert_eq!(store.counters["half"].used_percent, Some(50.0));
     }
 }
