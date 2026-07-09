@@ -2038,7 +2038,7 @@ pub(crate) async fn cmd_review(
         failed_models: failed_count,
     };
 
-    emit_reviews(cli, &aggregate);
+    let agg = emit_reviews(cli, &aggregate);
 
     // Critical regression guard (Finding #14): when NO reviewer completed
     // (e.g. the only configured reviewer 401'd, or every panel model timed
@@ -2063,6 +2063,21 @@ A review that no model produced must not be reported as success.",
     if failed_count > 0 && !cli.quiet {
         eprintln!(
             "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
+        );
+    }
+    // SC1 [CRITICAL]: a blocking aggregate verdict MUST break the process
+    // exit code. `cmd_review` used to `Ok(())` unconditionally after
+    // emitting the payload, so a `request_changes` / `reject` / `block`
+    // (or an unknown verdict, which `verdict_rank` fails closed to rank 2)
+    // still exited 0. Automation keyed on the exit code (and the
+    // background-job finalizer in main.rs, which stamps status from
+    // res.is_ok()) therefore read a BLOCK as APPROVE. Surface it as a
+    // nonzero exit AFTER `emit_reviews` has written result.json / printed
+    // the full diagnostic, so the operator still gets the complete trail.
+    if verdict_rank(&agg) >= 2 {
+        anyhow::bail!(
+            "review blocked: aggregate verdict `{agg}` requests changes \
+(a blocking review must not exit 0)"
         );
     }
     Ok(())
@@ -2149,7 +2164,7 @@ fn aggregate_review(
 /// is reflected in the payload as `complete: false` so downstream consumers
 /// (CI gates, dashboards) can distinguish a real "comment" verdict from a
 /// total-failure no-reviewer-actually-ran episode.
-fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) {
+fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     let (agg, all_failed, payload) = aggregate_review(
         aggregate.reviewers,
         aggregate.cost_usd,
@@ -2170,7 +2185,7 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) {
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
-        return;
+        return agg;
     }
 
     let status = if all_failed {
@@ -2217,6 +2232,8 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) {
         }
         println!();
     }
+
+    agg
 }
 
 // ---------------------------------------------------------------------------
@@ -5184,6 +5201,72 @@ mod tests {
         assert!(all_failed);
         assert_ne!(agg, "approve");
         assert_eq!(payload["complete"].as_bool(), Some(false));
+    }
+
+    // -----------------------------------------------------------------------
+    // SC1 [CRITICAL]: `cmd_review` must exit NONZERO when the reviewer panel
+    // blocks the diff. The exit-code decision in `cmd_review` is
+    // `verdict_rank(&agg) >= 2` over the aggregate verdict produced by
+    // `aggregate_review` (the same value `emit_reviews` now returns to
+    // `cmd_review`). These pins assert the exact gate: a blocking
+    // aggregate ranks >= 2 (=> bail/nonzero), a passing aggregate ranks
+    // < 2 (=> Ok/zero). A regression that lets a BLOCK verdict slip past
+    // the gate (the false-success bug) trips one of these.
+    // -----------------------------------------------------------------------
+
+    /// The gate `cmd_review` applies: rank of the aggregate verdict.
+    /// >= 2 means the panel blocked and `cmd_review` must `bail!`.
+    fn review_would_bail(reviews: &[(String, ReviewOutput)], ok: usize, failed: usize) -> bool {
+        let (agg, _, _) = aggregate_review(reviews, 0.0, ok + failed, ok, failed);
+        verdict_rank(&agg) >= 2
+    }
+
+    /// A successful reviewer voting `request_changes` blocks -> `cmd_review`
+    /// must exit nonzero (the SC1 false-success bug: it used to exit 0).
+    #[test]
+    fn cmd_review_bails_on_request_changes_verdict() {
+        let reviews = vec![("real".to_string(), rro("request_changes"))];
+        assert!(
+            review_would_bail(&reviews, 1, 0),
+            "request_changes aggregate must make cmd_review exit nonzero"
+        );
+    }
+
+    /// `reject` / `block` are the other explicit blocking verdicts.
+    #[test]
+    fn cmd_review_bails_on_reject_and_block_verdicts() {
+        for v in ["reject", "block", "BLOCK", " Request_Changes "] {
+            let reviews = vec![("real".to_string(), rro(v))];
+            assert!(
+                review_would_bail(&reviews, 1, 0),
+                "blocking verdict {v:?} must make cmd_review exit nonzero"
+            );
+        }
+    }
+
+    /// An unknown / hallucinated verdict fails closed (verdict_rank ranks it
+    /// 2), so `cmd_review` must also bail on it -> no silent approve.
+    #[test]
+    fn cmd_review_bails_on_unknown_verdict() {
+        let reviews = vec![("real".to_string(), rro("lgtm"))];
+        assert!(
+            review_would_bail(&reviews, 1, 0),
+            "unknown verdict must fail closed and make cmd_review exit nonzero"
+        );
+    }
+
+    /// `approve` (and a neutral `comment`) from a real reviewer are NOT
+    /// blocking -> `cmd_review` still returns Ok(()) / exit 0.
+    #[test]
+    fn cmd_review_does_not_bail_on_approve_or_comment() {
+        assert!(
+            !review_would_bail(&[("real".to_string(), rro("approve"))], 1, 0),
+            "approve must exit 0"
+        );
+        assert!(
+            !review_would_bail(&[("real".to_string(), rro("comment"))], 1, 0),
+            "a neutral comment (no blocker) must exit 0"
+        );
     }
 }
 
