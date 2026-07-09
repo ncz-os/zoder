@@ -2608,6 +2608,7 @@ dependencies = [
  "dirs",
  "fs2",
  "futures-util",
+ "libc",
  "model-health",
  "rand 0.8.6",
  "reqwest",

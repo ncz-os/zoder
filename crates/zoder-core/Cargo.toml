@@ -33,6 +33,7 @@ fs2 = "0.4"
 wiremock.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+libc = "0.2"
 
 # Integration test targets under tests/ are gated behind the
 # `integration-tests` feature so they don't run by default. They still
