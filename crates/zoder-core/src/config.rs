@@ -3643,6 +3643,20 @@ auth = { type = "env", var = "OVRD_KEY" }
     #[cfg(unix)]
     fn collect_overlays_surfaces_non_notfound_read_dir_errors() {
         use std::os::unix::fs::PermissionsExt;
+        // `chmod 000` cannot produce a `PermissionDenied` `read_dir` when the
+        // test runs as root: DAC permission checks are bypassed for uid 0 on
+        // every Unix this crate targets, so `read_dir` would succeed and the
+        // `unwrap_err()` below would panic on an `Ok` value -- a false
+        // failure of the TEST HARNESS, not of the code under test (CI runners
+        // commonly execute as root inside a container). Skip rather than
+        // assert something this environment cannot exercise.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping collect_overlays_surfaces_non_notfound_read_dir_errors: \
+                 running as root, chmod 000 cannot produce PermissionDenied"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         // Place a real overlay in the directory so the test would otherwise
         // be observable as "overlay was silently skipped" if the bug

@@ -1212,14 +1212,30 @@ mod corpus_io_tests {
             match Corpus::load_with_cap(&target_path, cap_b) {
                 Err(e) => {
                     let msg = e.to_string();
+                    // Two legitimate rejection shapes race here, both
+                    // correct: (a) the take-layer cap catches the read
+                    // once the file has grown past `cap_b` ("exceeds ...
+                    // byte cap"), or (b) the read lands mid-append -- the
+                    // writer's in-flight 4 KiB chunk is torn between the
+                    // valid JSON prefix and raw `A` filler -- producing a
+                    // syntactically invalid-but-still-under-cap read that
+                    // `serde_json` rejects as malformed. Both are the
+                    // guard correctly refusing a file that changed under
+                    // it; only silently ACCEPTING torn/oversized content
+                    // would be the real defect.
+                    let named_cap = msg.contains("exceeds") && msg.contains("byte cap");
+                    let torn_read = msg.contains("not valid JSON");
                     assert!(
-                        msg.contains("exceeds") && msg.contains("byte cap"),
-                        "iteration {i}: error must name the size cap, got: {msg}"
+                        named_cap || torn_read,
+                        "iteration {i}: error must name the size cap or reject a torn/invalid \
+                         read, got: {msg}"
                     );
-                    assert!(
-                        msg.contains(&target_path.display().to_string()),
-                        "iteration {i}: error must name the path, got: {msg}"
-                    );
+                    if named_cap {
+                        assert!(
+                            msg.contains(&target_path.display().to_string()),
+                            "iteration {i}: error must name the path, got: {msg}"
+                        );
+                    }
                 }
                 Ok(c) => {
                     // The loader accepted. The take-layer invariant is:
