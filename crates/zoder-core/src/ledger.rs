@@ -1,6 +1,14 @@
 //! Local spend ledger. Append-only JSONL, one record per model call
 //! (ts_utc, provider, model, tokens_in, tokens_out, cost_usd), with
 //! day/week/month/year rollups. SQLite is a drop-in later via the same shape.
+//!
+//! Concurrency note: the reserve->commit serialization relies on `fs2` /
+//! `flock(2)` advisory locking, which is unreliable over NFS (locks may be
+//! silently ignored or not propagate between clients). The ledger file MUST
+//! therefore live on a LOCAL filesystem. The default `~/.zoder/` is local; a
+//! future config that points the ledger at an NFS mount (for example an
+//! ARGONAS share) would weaken the reserve->commit serialization and must be
+//! avoided.
 
 use anyhow::Context;
 use chrono::{DateTime, Datelike, IsoWeek, Utc};
@@ -32,8 +40,10 @@ pub struct FinOpsTags {
 /// Maximum number of consecutive non-UTF-8 bytes we'll tolerate in a
 /// single line before giving up. Used as the upper bound for
 /// incremental `BufRead::fill_buf` consumption so an attacker can't pin the parser on a
-/// multi-gigabyte garbage line; matches `provider.rs`'s
-/// `MAX_LINE_BYTES` for streaming SSE.
+/// multi-gigabyte garbage line. This is a distinct, larger ceiling from
+/// `provider.rs`'s `MAX_LINE_BYTES` (1 MiB) for streaming SSE lines: a
+/// persisted ledger record can legitimately be larger than a single SSE
+/// frame, so this bound is set to 16 MiB rather than matching that constant.
 const MAX_LEDGER_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 /// Space allocated before a billable call. The completed entry is written into
 /// this already-allocated region, so a full filesystem cannot strand spend
