@@ -1802,6 +1802,14 @@ impl OpenAiProvider {
                 emitted,
             ));
         }
+        if !done {
+            return Err(fail(
+                ErrKind::Decode,
+                "stream ended before terminal [DONE] marker - likely a premature disconnect"
+                    .to_string(),
+                emitted,
+            ));
+        }
         if !saw_choice {
             return Err(fail(
                 ErrKind::Decode,
@@ -2144,6 +2152,14 @@ impl OpenAiProvider {
                 emitted,
             ));
         }
+        if !done {
+            return Err(fail(
+                ErrKind::Decode,
+                "anthropic stream ended before terminal message_stop marker - likely a premature disconnect"
+                    .to_string(),
+                emitted,
+            ));
+        }
         // Schema-invalid-2xx guard for the streaming path: a successful
         // Anthropic stream MUST carry at least one text delta; a body
         // that connects, handshakes, and then closes with `message_stop`
@@ -2463,6 +2479,14 @@ impl OpenAiProvider {
             return Err(fail(
                 ErrKind::Decode,
                 "stream ended with an incomplete SSE frame".to_string(),
+                emitted,
+            ));
+        }
+        if !done {
+            return Err(fail(
+                ErrKind::Decode,
+                "responses stream ended before terminal response.completed marker - likely a premature disconnect"
+                    .to_string(),
                 emitted,
             ));
         }
