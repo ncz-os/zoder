@@ -13,6 +13,11 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "process", "io-util", "time", "rt", "macros", "sync"] }
+# Advisory cross-process file lock (`flock(2)`) for serializing the engine-
+# session store's read-modify-write critical section — matches the existing
+# `crate::utilization` and `crate::ledger` idiom exactly so a single canonical
+# locking story holds across the workspace.
+fs2 = "0.4"
 # SIGKILL delivered to the whole process group (`kill(-pgid, SIGKILL)`) when
 # reaping a spawned ACP engine (goose), so tool grandchildren the engine forked
 # die with it instead of being reparented to init and leaking. The crate resolves
