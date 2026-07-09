@@ -1,8 +1,9 @@
-# GitLab CI — everyday Linux fmt/clippy/test gate for zoder.
+# GitLab CI — everyday Linux fmt/clippy/test gate plus scheduled advisories.
 # Runs on GitLab SaaS shared runners (free OSS-grant minutes) — NOT the fleet.
-# Canonical merge gate; macOS-native + release artifacts live in Buildkite (ncz-os).
+# Canonical merge gate; native + release artifacts live in GitHub Actions.
 stages:
   - check
+  - security
 
 rust-gate:
   stage: check
@@ -26,3 +27,24 @@ rust-gate:
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
+
+# RUSTSEC advisory scan. Runs on schedules and manual web pipelines, not on
+# every push, so newly-published advisories surface without unexpectedly
+# blocking ordinary merge work.
+advisory-scan:
+  stage: security
+  image: rust:1
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "cargo-deny-bin"
+    paths:
+      - .cargo/bin/
+  before_script:
+    - cargo deny --version || cargo install cargo-deny --locked
+  script:
+    - cargo deny check advisories
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
+    - if: "$CI_PIPELINE_SOURCE == \"web\""
