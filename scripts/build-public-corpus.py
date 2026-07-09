@@ -2,7 +2,7 @@
 """Build zoder's PUBLIC corpus + pricing artifacts from public data.
 
 Single source of truth for the daily-synced, public, self-serve artifacts that
-zoder and the tokenomics plugins pull (raw.githubusercontent.com/ncz-os/zoder/main/...):
+zoder and the tokenomics plugins pull (raw.githubusercontent.com/ncz-os/zoder/master/...):
 
   corpus/model_corpus.json   the classified routing corpus (zoder-core ModelEntry shape)
   pricing/catalog.json       per-token rates ({"models": {id: {input_usd_per_mtok, output_usd_per_mtok}}})
