@@ -6,7 +6,7 @@
 //!   * any consumer that wants to confirm a descriptor loaded from disk
 //!     matches the format before treating it as authoritative.
 
-use std::sync::OnceLock;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -56,11 +56,13 @@ pub fn validate_v1(descriptor: &Value) -> Result<(), ValidationError> {
 }
 
 /// Validate then return the [`crate::descriptor::AgentDescriptor`] if all
-/// shape + JSON-schema checks pass. Convenience wrapper for the common
-/// "load JSON, check it, deserialize" sequence.
+/// shape, JSON-schema, and semantic checks pass. Convenience wrapper for the
+/// common "load JSON, check it, deserialize" sequence.
 pub fn validate_and_parse(descriptor: &Value) -> Result<crate::descriptor::AgentDescriptor, Error> {
     validate_v1(descriptor)?;
-    serde_json::from_value(descriptor.clone()).map_err(Error::Deserialize)
+    let parsed = serde_json::from_value(descriptor.clone()).map_err(Error::Deserialize)?;
+    validate_config_surface(&parsed)?;
+    Ok(parsed)
 }
 
 /// Combined error type for [`validate_and_parse`].
@@ -85,6 +87,25 @@ fn validator() -> Result<&'static jsonschema::JSONSchema, String> {
     })
     .as_ref()
     .map_err(|e| e.clone())
+}
+
+fn validate_config_surface(desc: &crate::descriptor::AgentDescriptor) -> Result<(), Error> {
+    let Some(surface) = &desc.config_surface else {
+        return Ok(());
+    };
+
+    let mut seen = BTreeSet::new();
+    for (index, knob) in surface.knobs.iter().enumerate() {
+        if !seen.insert(knob.name.as_str()) {
+            return Err(ValidationError::Schema {
+                path: format!("/config_surface/knobs/{index}/name"),
+                message: format!("duplicate config_surface knob name `{}`", knob.name),
+            }
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
