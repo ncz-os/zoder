@@ -386,25 +386,76 @@ pub(crate) fn cmd_configure(edit: bool, validate: bool) -> anyhow::Result<()> {
     println!("recipes:       {}", recipes_dir().display());
     println!("jobs:          {}", Config::home().join("jobs").display());
 
-    let cfg = Config::load()?;
-    let errs = cfg.validate();
+    // Load WITHOUT the validate-and-bail baked into `Config::load` so that
+    // *this* function is the authority on how config problems are reported and
+    // which exit code `--validate` produces. A `Config::load()?` here would
+    // propagate an Err on any validation problem — hard-erroring with a
+    // generic message and burying the `config problems:` printout + the
+    // `--validate` exit branch below as dead code (C3-1).
+    //
+    // A genuinely unreadable/unparseable config (missing home, bad JSON, a
+    // trailing comma, …) comes back as an Err; surface it as a single config
+    // problem the same graceful way `mcp list` does, rather than a raw serde
+    // backtrace (C3-2).
+    let loaded = Config::load_unvalidated();
+    let errs = configure_problems(loaded.as_ref());
+
     if errs.is_empty() {
+        // Safe to unwrap: an Ok load with no validate() problems.
+        let cfg = loaded.expect("no problems implies Ok(cfg)");
         println!("\nproviders ({}):", cfg.providers.len());
         for p in &cfg.providers {
             let kind = if p.paid { "paid" } else { "free" };
             println!("  {:12} {:8} {}", p.id, kind, p.base_url);
         }
         println!("\nconfig OK");
-        Ok(())
+        return Ok(());
+    }
+
+    eprintln!("\nconfig problems:");
+    for e in &errs {
+        eprintln!("  - {e}");
+    }
+    match configure_exit_decision(&errs, validate) {
+        ConfigureOutcome::Exit(code) => std::process::exit(code),
+        ConfigureOutcome::Ok => Ok(()),
+    }
+}
+
+/// What `configure` should do once the config problems (if any) have been
+/// printed. Split out from [`cmd_configure`] so the exit *decision* is unit
+/// testable without spawning a process or capturing `std::process::exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigureOutcome {
+    /// Return `Ok(())` from `configure` (exit code 0).
+    Ok,
+    /// Terminate the process with this exit code.
+    Exit(i32),
+}
+
+/// Map a `Config::load_unvalidated()` result into the ordered list of config
+/// problems that `configure` should print. An empty list means the config is
+/// OK. A read/parse failure (bad JSON, missing home, trailing comma, …) is
+/// rendered as a single problem — the whole anyhow chain via `{:#}` — rather
+/// than hard-erroring the command (mirrors the graceful `mcp list` path).
+pub(crate) fn configure_problems(loaded: Result<&Config, &anyhow::Error>) -> Vec<String> {
+    match loaded {
+        Ok(cfg) => cfg.validate(),
+        Err(e) => vec![format!("{e:#}")],
+    }
+}
+
+/// Given the printed problem list and the `--validate` flag, decide how
+/// `configure` should terminate. With `--validate`, any problem is a nonzero
+/// exit; without it, the command still returns success (problems are advisory).
+/// An empty problem list is always `Ok`.
+pub(crate) fn configure_exit_decision(problems: &[String], validate: bool) -> ConfigureOutcome {
+    if problems.is_empty() {
+        ConfigureOutcome::Ok
+    } else if validate {
+        ConfigureOutcome::Exit(1)
     } else {
-        eprintln!("\nconfig problems:");
-        for e in &errs {
-            eprintln!("  - {e}");
-        }
-        if validate {
-            std::process::exit(1);
-        }
-        Ok(())
+        ConfigureOutcome::Ok
     }
 }
 
@@ -600,5 +651,147 @@ url = "https://mcp.kiwi.com"
             out.contains("https://mcp.kiwi.com"),
             "human output should include url; got:\n{out}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// configure tests — the problem-reporting + exit-decision logic behind
+// `zoder configure [--validate]`. Testing the pure helpers (not the process)
+// so `--validate`'s nonzero exit is verified without spawning a subprocess.
+//
+// C3-1: an invalid config must reach the problem-list + exit branch (it used
+//        to be dead code behind a bailing `Config::load()?`).
+// C3-2: a malformed config.json must be reported as one graceful problem, not
+//        a raw serde backtrace / hard bail.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod configure_tests {
+    use super::*;
+
+    #[test]
+    fn valid_config_yields_no_problems_and_ok_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [{
+                    "id": "acme",
+                    "base_url": "https://gw.acme.example/v1",
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"}
+                }],
+                "corpus_path": "/tmp/zoder-c3b/corpus.json",
+                "ledger_path": "/tmp/zoder-c3b/ledger.json",
+                "health_path": "/tmp/zoder-c3b/health.json",
+                "default_provider": "acme"
+            }"#,
+        )
+        .unwrap();
+        let loaded = Config::load_unvalidated_from(dir.path());
+        let problems = configure_problems(loaded.as_ref());
+        assert!(
+            problems.is_empty(),
+            "valid config has no problems: {problems:?}"
+        );
+        // Both with and without --validate: OK.
+        assert_eq!(
+            configure_exit_decision(&problems, true),
+            ConfigureOutcome::Ok
+        );
+        assert_eq!(
+            configure_exit_decision(&problems, false),
+            ConfigureOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn invalid_config_with_validate_exits_nonzero() {
+        // C3-1: duplicate provider id -> problem list is non-empty AND
+        // --validate must select a nonzero process exit. Previously this whole
+        // branch was unreachable because Config::load()? bailed first.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [
+                    {"id": "dup", "base_url": "https://a.example/v1", "kind": "openai-chat", "auth": {"type": "none"}},
+                    {"id": "dup", "base_url": "https://b.example/v1", "kind": "openai-chat", "auth": {"type": "none"}}
+                ],
+                "corpus_path": "/tmp/zoder-c3b/corpus.json",
+                "ledger_path": "/tmp/zoder-c3b/ledger.json",
+                "health_path": "/tmp/zoder-c3b/health.json",
+                "default_provider": "dup"
+            }"#,
+        )
+        .unwrap();
+        let loaded = Config::load_unvalidated_from(dir.path());
+        let problems = configure_problems(loaded.as_ref());
+        assert!(
+            problems.iter().any(|e| e.contains("duplicate provider id")),
+            "invalid config must produce a problem list: {problems:?}"
+        );
+        match configure_exit_decision(&problems, true) {
+            ConfigureOutcome::Exit(code) => assert_eq!(code, 1),
+            other => panic!("--validate on an invalid config must exit nonzero, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_config_without_validate_does_not_hard_bail() {
+        // C3-1: WITHOUT --validate the same invalid config must NOT hard-error
+        // out of load; the command reports problems and returns success.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{ "providers": [], "default_provider": "", "corpus_path": "/tmp/zoder-c3b/corpus.json", "ledger_path": "/tmp/zoder-c3b/ledger.json", "health_path": "/tmp/zoder-c3b/health.json" }"#,
+        )
+        .unwrap();
+        let loaded = Config::load_unvalidated_from(dir.path());
+        assert!(
+            loaded.is_ok(),
+            "an invalid-but-parseable config must not bail out of load"
+        );
+        let problems = configure_problems(loaded.as_ref());
+        assert!(
+            problems
+                .iter()
+                .any(|e| e.contains("no providers configured")),
+            "problems should be reported: {problems:?}"
+        );
+        assert_eq!(
+            configure_exit_decision(&problems, false),
+            ConfigureOutcome::Ok,
+            "without --validate the command still returns success"
+        );
+    }
+
+    #[test]
+    fn malformed_json_config_is_reported_gracefully() {
+        // C3-2: a trailing comma makes config.json unparseable. It must come
+        // back as ONE readable problem (mirroring `mcp list`), not a bail.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [
+                    {"id": "x", "base_url": "https://a.example/v1", "kind": "openai-chat", "auth": {"type": "none"}},
+                ],
+                "default_provider": "x"
+            }"#,
+        )
+        .unwrap();
+        let loaded = Config::load_unvalidated_from(dir.path());
+        assert!(loaded.is_err(), "malformed JSON must be an Err from load");
+        let problems = configure_problems(loaded.as_ref());
+        assert_eq!(problems.len(), 1, "one graceful problem: {problems:?}");
+        assert!(
+            problems[0].contains("parsing zoder config at"),
+            "problem should name the parse failure + path: {problems:?}"
+        );
+        // --validate on a malformed config still exits nonzero.
+        match configure_exit_decision(&problems, true) {
+            ConfigureOutcome::Exit(code) => assert_eq!(code, 1),
+            other => panic!("malformed config + --validate must exit nonzero, got {other:?}"),
+        }
     }
 }

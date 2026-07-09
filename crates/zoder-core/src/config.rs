@@ -16,6 +16,7 @@
 //! A duplicate provider `id` contributed by two overlays is a hard load error;
 //! fix the TOML, don't let the last-writer silently win.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1062,14 +1063,7 @@ impl Config {
     /// default) and then layer every `config.<vendor>.toml` in the same
     /// directory on top. See module docs for the layered-config model.
     pub fn load() -> anyhow::Result<Self> {
-        let home = Self::resolve_home()?;
-        let mut cfg = if home.join("config.json").exists() {
-            let raw = std::fs::read_to_string(home.join("config.json"))?;
-            serde_json::from_str(&raw)?
-        } else {
-            Self::default_provider(&home)
-        };
-        apply_overlays(&mut cfg, &home)?;
+        let cfg = Self::load_unvalidated()?;
         // Fail loud on a misconfigured merge (duplicate ids, missing
         // default_provider, bad base_urls, …) rather than discovering it at
         // call time.
@@ -1080,6 +1074,42 @@ impl Config {
                 problems.join("\n  - ")
             );
         }
+        Ok(cfg)
+    }
+
+    /// Read and merge the on-disk configuration WITHOUT running
+    /// [`Config::validate`]. Unlike [`Config::load`], a config with
+    /// validation problems (duplicate provider ids, empty providers, an
+    /// unresolved default_provider, …) is returned successfully so the caller
+    /// can decide how to surface those problems (e.g. `configure` prints them
+    /// as a problem list and picks the exit code itself).
+    ///
+    /// A genuinely *unreadable* config — a missing `$ZODER_HOME`, an I/O error,
+    /// or a `config.json` that is not valid JSON (a trailing comma, etc.) —
+    /// still returns `Err`, with a clean message the caller can render as a
+    /// single config problem rather than a raw backtrace.
+    ///
+    /// Other callers should keep using [`Config::load`], which validates.
+    pub fn load_unvalidated() -> anyhow::Result<Self> {
+        let home = Self::resolve_home()?;
+        Self::load_unvalidated_from(&home)
+    }
+
+    /// [`Config::load_unvalidated`] against an explicit home directory, so
+    /// tests can exercise the read/parse/overlay behavior against a temp dir
+    /// without touching the process-global `ZODER_HOME` env var (which would
+    /// race other tests). Still does NOT run `validate`.
+    pub fn load_unvalidated_from(home: &std::path::Path) -> anyhow::Result<Self> {
+        let mut cfg = if home.join("config.json").exists() {
+            let path = home.join("config.json");
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading zoder config at {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parsing zoder config at {}", path.display()))?
+        } else {
+            Self::default_provider(home)
+        };
+        apply_overlays(&mut cfg, home)?;
         Ok(cfg)
     }
 
@@ -2290,6 +2320,114 @@ auth = { type = "env", var = "ACME_KEY" }
         assert!(
             err.to_string().contains("duplicate provider id"),
             "overlay reusing base id 'default' must be rejected: {err}"
+        );
+    }
+
+    // ---------- load_unvalidated: read/parse without validate-and-bail ----------
+    //
+    // C3-1/C3-2: `configure` needs a load that surfaces validation problems to
+    // its OWN reporting/exit logic (not a bail) and that renders a malformed
+    // config.json as a clean error, not a raw serde backtrace.
+
+    #[test]
+    fn load_unvalidated_accepts_a_valid_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [{
+                    "id": "acme",
+                    "base_url": "https://gw.acme.example/v1",
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"}
+                }],
+                "corpus_path": "/tmp/zoder-c3b/corpus.json",
+                "ledger_path": "/tmp/zoder-c3b/ledger.json",
+                "health_path": "/tmp/zoder-c3b/health.json",
+                "default_provider": "acme"
+            }"#,
+        )
+        .unwrap();
+        let cfg =
+            Config::load_unvalidated_from(dir.path()).expect("a well-formed config.json loads");
+        assert!(
+            cfg.validate().is_empty(),
+            "a well-formed config has no validate() problems: {:?}",
+            cfg.validate()
+        );
+        assert!(cfg.providers.iter().any(|p| p.id == "acme"));
+    }
+
+    #[test]
+    fn load_unvalidated_returns_invalid_config_instead_of_bailing() {
+        // Duplicate provider ids are a validate() problem. `load()` would
+        // bail; `load_unvalidated` must RETURN the config so `configure` can
+        // report the problem itself (C3-1). It must NOT be an Err.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [
+                    {"id": "dup", "base_url": "https://a.example/v1", "kind": "openai-chat", "auth": {"type": "none"}},
+                    {"id": "dup", "base_url": "https://b.example/v1", "kind": "openai-chat", "auth": {"type": "none"}}
+                ],
+                "corpus_path": "/tmp/zoder-c3b/corpus.json",
+                "ledger_path": "/tmp/zoder-c3b/ledger.json",
+                "health_path": "/tmp/zoder-c3b/health.json",
+                "default_provider": "dup"
+            }"#,
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated_from(dir.path())
+            .expect("an INVALID-but-parseable config must load, not bail");
+        let problems = cfg.validate();
+        assert!(
+            problems.iter().any(|e| e.contains("duplicate provider id")),
+            "validate() should surface the duplicate id: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn load_unvalidated_reports_empty_providers_as_a_problem_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{ "providers": [], "default_provider": "", "corpus_path": "/tmp/zoder-c3b/corpus.json", "ledger_path": "/tmp/zoder-c3b/ledger.json", "health_path": "/tmp/zoder-c3b/health.json" }"#,
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated_from(dir.path())
+            .expect("empty-providers config parses; problems are for validate()");
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|e| e.contains("no providers configured")),
+            "empty providers must be a validate() problem: {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn load_unvalidated_reports_malformed_json_as_a_clean_error() {
+        // A trailing comma is not valid JSON. `load_unvalidated` must return a
+        // clean, contextual Err (rendered by `configure` as one config
+        // problem) rather than panicking or emitting a raw backtrace (C3-2).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [
+                    {"id": "x", "base_url": "https://a.example/v1", "kind": "openai-chat", "auth": {"type": "none"}},
+                ],
+                "default_provider": "x"
+            }"#,
+        )
+        .unwrap();
+        let err = Config::load_unvalidated_from(dir.path())
+            .expect_err("malformed config.json must be an Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parsing zoder config at"),
+            "error should name the parse step + path: {msg}"
         );
     }
 
