@@ -148,6 +148,27 @@ pub(crate) fn reconcile_policy_checked_turn(
     anyhow::bail!("policy violation during {turn_kind}: {failure} (exiting non-zero)")
 }
 
+/// Accepted `--tier` tokens. MUST stay in sync with the match arms in
+/// `zoder_core::router::Tier::parse` (the router keeps a catch-all `_ =>
+/// Tier::Auto`, so validation lives HERE at the CLI parse boundary to reject
+/// typos before they reach the router). Any token here parses to a real,
+/// non-default tier; `auto` is the explicit balanced default.
+const TIER_VALUES: &[&str] = &[
+    "fast",
+    "strong",
+    "codex",
+    "auto",
+    "single-pass",
+    "singlepass",
+    "single",
+    "oneshot",
+    "grind",
+    "loop",
+];
+
+/// Accepted `--reasoning` tokens (the documented reasoning-effort set).
+const REASONING_VALUES: &[&str] = &["minimal", "low", "medium", "high", "none"];
+
 #[derive(Parser, Clone)]
 #[command(
     name = "zoder",
@@ -163,8 +184,16 @@ struct Cli {
     /// Force a specific model id (skips routing).
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
-    /// Routing tier: fast | strong | auto (default auto).
-    #[arg(long, global = true, default_value = "auto")]
+    /// Routing tier: fast | strong | auto | single-pass | grind
+    /// (default auto). Out-of-set values are rejected at parse time so a
+    /// typo (e.g. `strogn`) can never silently downgrade to `auto` routing.
+    /// The accepted set mirrors `zoder_core::router::Tier::parse`.
+    #[arg(
+        long,
+        global = true,
+        default_value = "auto",
+        value_parser = clap::builder::PossibleValuesParser::new(TIER_VALUES)
+    )]
     tier: String,
     /// Allow paid models without interactive confirmation (scripts/CI).
     #[arg(long, global = true)]
@@ -192,7 +221,13 @@ struct Cli {
     show_reasoning: bool,
     /// Reasoning effort to request: minimal | low | medium | high | none
     /// (default: the model's own default). `none` asks it to skip thinking.
-    #[arg(long, global = true)]
+    /// Out-of-set values are rejected at parse time; the documented set is the
+    /// contract even though per-provider semantics vary (some drop the field).
+    #[arg(
+        long,
+        global = true,
+        value_parser = clap::builder::PossibleValuesParser::new(REASONING_VALUES)
+    )]
     reasoning: Option<String>,
     /// Relax the fail-closed free guard when a backend reports no telemetry.
     #[arg(long, global = true)]
@@ -4088,6 +4123,104 @@ mod default_exec_budget_tests {
             );
             assert_eq!(verdict, BudgetVerdict::WithinBudget);
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tier_reasoning_parse_tests {
+    //! C7-C1 / C7-C2: `--tier` and `--reasoning` used to accept ANY string.
+    //! `--tier` flowed into `Tier::parse`, whose catch-all `_ => Tier::Auto`
+    //! meant a typo (`--tier strogn`) silently downgraded to auto routing; and
+    //! `--reasoning` forwarded any string to the gateway to be silently dropped
+    //! or late-rejected. Both are now validated at clap parse time. These tests
+    //! pin that so a future cleanup cannot reintroduce silent acceptance.
+    use super::*;
+    use zoder_core::router::Tier;
+
+    #[test]
+    fn invalid_tier_value_is_rejected_at_parse_time() {
+        let res = Cli::try_parse_from(["zoder", "--tier", "strogn", "hi"]);
+        let err = match res {
+            Ok(_) => panic!("--tier strogn (typo) must be rejected at parse time"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--tier") && msg.contains("strogn"),
+            "clap error must name the offending flag and value; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_tier_values_parse_to_matching_tier() {
+        // Every accepted CLI token must round-trip through Tier::parse to a
+        // real tier (the historical bug: everything became Tier::Auto). The
+        // token set here MUST match TIER_VALUES / Tier::parse.
+        let cases = [
+            ("fast", Tier::Fast),
+            ("strong", Tier::Strong),
+            ("codex", Tier::Strong),
+            ("auto", Tier::Auto),
+            ("single-pass", Tier::SinglePass),
+            ("singlepass", Tier::SinglePass),
+            ("single", Tier::SinglePass),
+            ("oneshot", Tier::SinglePass),
+            ("grind", Tier::Grind),
+            ("loop", Tier::Grind),
+        ];
+        for (raw, want) in cases {
+            let cli = Cli::try_parse_from(["zoder", "--tier", raw, "hi"])
+                .unwrap_or_else(|e| panic!("--tier {raw} must parse: {e}"));
+            assert_eq!(cli.tier, raw, "--tier {raw} field value");
+            assert_eq!(Tier::parse(&cli.tier), want, "--tier {raw} -> tier");
+        }
+    }
+
+    #[test]
+    fn every_tier_values_token_maps_to_a_non_default_or_auto_tier() {
+        // Guard: no token in TIER_VALUES may be a dead alias that Tier::parse
+        // silently swallows to Auto unless it is literally "auto". This keeps
+        // TIER_VALUES in sync with the router's real accepted set.
+        for &tok in TIER_VALUES {
+            let t = Tier::parse(tok);
+            if tok != "auto" {
+                assert_ne!(
+                    t,
+                    Tier::Auto,
+                    "TIER_VALUES token {tok:?} parses to Auto but is not \"auto\" -- \
+                     it is a dead alias and must be removed from TIER_VALUES"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_reasoning_value_is_rejected_at_parse_time() {
+        let res = Cli::try_parse_from(["zoder", "--reasoning", "extreme", "hi"]);
+        let err = match res {
+            Ok(_) => panic!("--reasoning extreme must be rejected at parse time"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--reasoning") && msg.contains("extreme"),
+            "clap error must name the offending flag and value; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn valid_reasoning_values_parse() {
+        for raw in ["minimal", "low", "medium", "high", "none"] {
+            let cli = Cli::try_parse_from(["zoder", "--reasoning", raw, "hi"])
+                .unwrap_or_else(|e| panic!("--reasoning {raw} must parse: {e}"));
+            assert_eq!(cli.reasoning.as_deref(), Some(raw), "--reasoning {raw}");
+        }
+    }
+
+    #[test]
+    fn reasoning_unset_is_none() {
+        let cli = Cli::try_parse_from(["zoder", "hi"]).expect("no --reasoning must parse");
+        assert!(cli.reasoning.is_none(), "unset --reasoning stays None");
     }
 }
 
