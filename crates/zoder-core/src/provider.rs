@@ -82,7 +82,7 @@ impl Default for ErrKind {
 }
 
 /// A provider call failure with enough structure to drive retries + fallback.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, Default, thiserror::Error)]
 #[error("{message}")]
 pub struct ProviderError {
     pub message: String,
@@ -108,19 +108,6 @@ pub struct ProviderError {
     /// frame; `None` for every other path (HTTP headers, OpenAI-style
     /// envelopes, network failures, etc.).
     pub anthropic_error_body: Option<String>,
-}
-
-impl Default for ProviderError {
-    fn default() -> Self {
-        Self {
-            message: String::new(),
-            kind: ErrKind::default(),
-            status: None,
-            retry_after: None,
-            emitted: false,
-            anthropic_error_body: None,
-        }
-    }
 }
 
 impl ProviderError {
