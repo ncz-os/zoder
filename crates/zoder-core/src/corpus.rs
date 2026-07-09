@@ -6,6 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-writer nonce so two overlapping corpus saves in the same
+/// process never collide on the temp path. Combined with `std::process::id()`
+/// it makes the temp filename unique per writer (C5-4 / S19).
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -356,21 +362,43 @@ impl Corpus {
 
         let mut models = Vec::new();
         let mut skipped = 0usize;
-        match root.get("models").and_then(|v| v.as_array()) {
-            Some(arr) => {
-                for item in arr {
-                    match serde_json::from_value::<ModelEntry>(item.clone()) {
-                        Ok(m) if !m.id.is_empty() => models.push(m),
-                        _ => skipped += 1,
-                    }
-                }
-            }
+        let arr = match root.get("models").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
             None => anyhow::bail!("corpus {}: missing `models` array", path.display()),
+        };
+        let input_len = arr.len();
+        for item in arr {
+            match serde_json::from_value::<ModelEntry>(item.clone()) {
+                Ok(m) if !m.id.is_empty() => models.push(m),
+                _ => skipped += 1,
+            }
         }
         if skipped > 0 {
             eprintln!("zoder: warning: corpus skipped {skipped} invalid model entr{} (missing/invalid `id` or fields)",
                 if skipped == 1 { "y" } else { "ies" });
         }
+
+        // C5-3: a NON-EMPTY `models` array that yields zero usable entries (every
+        // element failed to deserialize or had an empty `id`) is a corrupt/misshaped
+        // corpus, not a legitimately-empty one. Fail loudly instead of returning a
+        // silent empty corpus that later surfaces as a confusing "no healthy free
+        // model" far downstream. A genuinely-empty `{"models":[]}` (input_len == 0)
+        // still loads Ok as an empty corpus.
+        if input_len > 0 && models.is_empty() {
+            anyhow::bail!(
+                "corpus {} parsed to 0 usable entries from {input_len} input entr{} (all had a missing/invalid `id` or failed to parse)",
+                path.display(),
+                if input_len == 1 { "y" } else { "ies" }
+            );
+        }
+
+        // C5-2: de-duplicate by `id`, LAST-WINS. The corpus file itself can carry
+        // two rows for one id (e.g. a stale/retired row plus a freshly-benched one);
+        // load() previously pushed both, so get()/ingest_free_chat's `find` returned
+        // the FIRST (stale) row and a doubly-listed id could appear twice in the
+        // fallback chain. Keeping the last occurrence lets a later (fresher) row win
+        // while preserving the original relative order of the survivors.
+        Self::dedup_by_id_last_wins(&mut models);
 
         Ok(Corpus {
             source: str_field("source"),
@@ -378,6 +406,30 @@ impl Corpus {
             count: models.len(),
             models,
         })
+    }
+
+    /// De-duplicate `models` by `id`, keeping the LAST occurrence of each id and
+    /// preserving the relative order of the surviving entries. Used by `load()`
+    /// so a corpus file with duplicate ids collapses to one entry per id.
+    fn dedup_by_id_last_wins(models: &mut Vec<ModelEntry>) {
+        // Index of the last occurrence of each id.
+        let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, m) in models.iter().enumerate() {
+            last.insert(m.id.as_str(), i);
+        }
+        if last.len() == models.len() {
+            return; // no duplicates, avoid the allocation/rebuild
+        }
+        let mut keep = vec![false; models.len()];
+        for &i in last.values() {
+            keep[i] = true;
+        }
+        let mut idx = 0usize;
+        models.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
     }
 
     pub fn get(&self, id: &str) -> Option<&ModelEntry> {
@@ -480,14 +532,33 @@ impl Corpus {
         promoted
     }
 
-    /// Persist atomically (temp file + rename).
+    /// Persist atomically (unique temp file + rename).
+    ///
+    /// C5-4 (= S19 for the corpus): the temp filename carries the process id AND
+    /// a monotonic nonce (`<stem>.json.tmp.<pid>.<nonce>`) so two overlapping
+    /// refreshes can never share a temp path — otherwise an interleaved
+    /// write+rename could promote a torn or foreign temp file over the live
+    /// corpus. The temp is removed on any error so a failed write never litters
+    /// the dir with a half-written file a later reader could pick up. Mirrors the
+    /// `write_atomic` pattern in `crates/model-health/src/lib.rs` (kept
+    /// self-contained here — no cross-crate dependency).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
+        let data = serde_json::to_vec_pretty(self)?;
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+        // Write to the unique temp; on any failure remove it so it can never be
+        // renamed over the live corpus or left behind torn.
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -637,5 +708,138 @@ mod capability_tests {
         assert_eq!(m.code_capability(), Some((82.6 + 91.7) / 2.0));
         assert_eq!(m.code_capability_source().as_deref(), Some("vals.ai"));
         assert!(m.value_score().is_some());
+    }
+}
+
+#[cfg(test)]
+mod corpus_io_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmpdir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        let uniq = format!(
+            "zoder-corpus-test-{}-{}",
+            std::process::id(),
+            SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        d.push(uniq);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    // C5-2: two entries sharing an id load to ONE entry (last-wins), and get()
+    // returns the surviving (last) one.
+    #[test]
+    fn duplicate_ids_collapse_last_wins() {
+        let dir = tmpdir();
+        // Two rows for "vendor/dup": the first is stale (low score), the second
+        // is fresh (high score). Last-wins must keep the fresh one. A distinct
+        // "vendor/other" row is kept to prove relative order survives.
+        let body = r#"{
+            "source": "test",
+            "models": [
+                {"id": "vendor/dup", "agentic_score": 0.10},
+                {"id": "vendor/other", "agentic_score": 0.50},
+                {"id": "vendor/dup", "agentic_score": 0.90}
+            ]
+        }"#;
+        let p = write_file(&dir, "corpus.json", body);
+        let c = Corpus::load(&p).unwrap();
+
+        // Exactly one entry for the duplicated id.
+        let dups: Vec<_> = c.models.iter().filter(|m| m.id == "vendor/dup").collect();
+        assert_eq!(
+            dups.len(),
+            1,
+            "duplicate id must collapse to a single entry"
+        );
+
+        // The surviving entry is the LAST occurrence (the fresh score).
+        assert_eq!(c.get("vendor/dup").unwrap().agentic_score, Some(0.90));
+        // The other id is untouched and still present.
+        assert_eq!(c.get("vendor/other").unwrap().agentic_score, Some(0.50));
+        // Total count reflects de-dup.
+        assert_eq!(c.models.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5-3: a non-empty file where every entry is unusable -> load() returns Err.
+    #[test]
+    fn all_invalid_entries_is_err() {
+        let dir = tmpdir();
+        // Two entries, both unusable: one has an empty id, one is missing `id`
+        // entirely (fails ModelEntry deser). Input was non-empty, usable == 0.
+        let body = r#"{
+            "models": [
+                {"id": ""},
+                {"host": "vendor", "leaf": "no-id"}
+            ]
+        }"#;
+        let p = write_file(&dir, "corpus.json", body);
+        let err = Corpus::load(&p).expect_err("all-invalid corpus must be an error");
+        assert!(
+            err.to_string().contains("0 usable entries"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5-3: a legitimately-empty `{"models":[]}` still loads Ok as an empty corpus.
+    #[test]
+    fn legitimately_empty_models_is_ok() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", r#"{"models": []}"#);
+        let c = Corpus::load(&p).expect("empty models array must load Ok");
+        assert_eq!(c.models.len(), 0);
+        assert_eq!(c.count, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5-4: save() uses a unique temp filename and leaves no stray `.json.tmp`.
+    #[test]
+    fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let dir = tmpdir();
+        let path = dir.join("corpus.json");
+        let c = Corpus {
+            source: "test".into(),
+            models: vec![ModelEntry {
+                id: "vendor/m".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+
+        // The corpus is present and reloads.
+        assert!(path.exists());
+        let reloaded = Corpus::load(&path).unwrap();
+        assert_eq!(reloaded.models.len(), 1);
+
+        // No deterministic `<stem>.json.tmp` and no per-writer temp remains: the
+        // temp must be uniquely named AND renamed/removed, so only `corpus.json`
+        // (plus any test artifacts) is left. Assert nothing matching `.json.tmp`
+        // survives in the dir.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(".json.tmp"),
+                "stray temp file left behind: {name}"
+            );
+        }
+        // Belt-and-suspenders: the legacy deterministic temp path never exists.
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
