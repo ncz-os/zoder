@@ -6263,12 +6263,18 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
     }
 
     if opts.probe {
-        if opts.all {
-            run_probe_all(cli, &eng, &mut health, cli.quiet, cli.json).await?;
+        // C3-HP3: persist the health store UNCONDITIONALLY. `save_health`
+        // used to sit behind the `?` on `run_probe_all`, so ANY error out
+        // of the sweep (e.g. a mid-sweep ledger/reconcile failure) lost
+        // every partial in-memory result that had already been probed.
+        // Capture the probe result, save first, THEN propagate the error.
+        let probe_result = if opts.all {
+            run_probe_all(cli, &eng, &mut health, cli.quiet, cli.json).await
         } else {
-            run_probe_default(cli, &eng, &mut health, cli.quiet).await?;
-        }
+            run_probe_default(cli, &eng, &mut health, cli.quiet).await
+        };
         save_health(&health);
+        probe_result?;
     }
 
     if cli.json {
@@ -6477,6 +6483,41 @@ async fn run_probe_default(
 /// Run the cross-provider probe: iterate every non-placeholder provider,
 /// fetch the live model catalog, ping each model, classify, stamp into
 /// the store, and print a per-provider report.
+/// Candidate probe targets for a provider whose live `OpenAiProvider`
+/// could NOT be constructed (bad URL / missing auth at probe time). We
+/// cannot call `list_models()` on a provider we failed to build, so
+/// derive the targets from the corpus: every model whose id matches one
+/// of the provider's `serves` prefixes. If the provider claims no
+/// prefixes (or the corpus has no matching entry) we fall back to the
+/// provider id itself — the same fallback the live-catalog path uses
+/// (`vec![p.id.clone()]`). The result is capped identically to the
+/// live path so a mis-typed prefix can't explode the target list.
+///
+/// This mirrors `health_probe::probe_all`'s prober-unavailable arm: a
+/// provider that is in the config but whose prober can't be built must
+/// still get every target stamped `Error`, so the router's skip-class
+/// filter (`HealthStore::is_skipped_by_classification`) has something to
+/// skip — otherwise unknown models default to "not skipped" and routing
+/// keeps selecting a guaranteed-dead provider.
+fn probe_targets_for_unbuilt_provider(
+    p: &zoder_core::config::Provider,
+    corpus: &zoder_core::Corpus,
+) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if !p.serves.is_empty() {
+        for m in &corpus.models {
+            if p.serves.iter().any(|pref| m.id.starts_with(pref.as_str())) {
+                ids.push(m.id.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        ids.push(p.id.clone());
+    }
+    let (capped, _dropped) = cap_targets(ids, PROBE_MAX_MODELS_PER_PROVIDER);
+    capped
+}
+
 async fn run_probe_all(
     cli: &Cli,
     eng: &Engine,
@@ -6531,6 +6572,23 @@ async fn run_probe_all(
             Err(e) => {
                 if !quiet {
                     eprintln!("[zoder] skip provider {}: {e}", p.id);
+                }
+                // C3-HP1: the provider is in the config but its prober
+                // could not be built. If we just `continue`, none of its
+                // models get classified, and since
+                // `HealthStore::is_skipped_by_classification` returns
+                // false for unknown models, the router/consult never skip
+                // them and keep routing to a dead provider. Record every
+                // derived candidate target as a skip-class `Error` first —
+                // mirroring `health_probe::probe_all`'s prober-unavailable
+                // arm — so the skip filter has something to skip.
+                for target in probe_targets_for_unbuilt_provider(p, &eng.corpus) {
+                    health.record_classified_failure(
+                        &target,
+                        &e.to_string(),
+                        &p.id,
+                        Classification::Error,
+                    );
                 }
                 continue;
             }
@@ -6608,10 +6666,30 @@ async fn run_probe_all(
             if let Decision::NeedConfirm(why) =
                 gate.check(&model_entry, provider_paid, provider_cost_neutral)
             {
-                anyhow::bail!(
-                    "health probe for '{model_id}' via '{provider_id}' requires paid spend; \
-                     pass --allow-paid to run it.\n{why}"
+                // C3-HP2: a gated (paid/metered) model must NOT abort the
+                // whole sweep. Bailing here propagated up through
+                // `run_probe_all(...).await?` and skipped `save_health`,
+                // discarding every already-probed free result AND every
+                // remaining provider. Instead: record the model as a
+                // skip-class Error (so consult/router skip it), surface a
+                // note, and `continue` to the next target — exactly like the
+                // per-ping timeout arm below. Whole-run persistence is kept.
+                let note = format!("gated: needs --allow-paid ({why})");
+                health.record_classified_failure(
+                    model_id,
+                    &note,
+                    &provider_id,
+                    Classification::Error,
                 );
+                let outcome = ProbeOutcome {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                    latency_ms: None,
+                    classification: Classification::Error,
+                    note: Some(note),
+                };
+                provider_outcomes.push(outcome);
+                continue;
             }
             let req = probe_request(model_id);
             let mut reservation = Ledger::new(&eng.cfg.ledger_path)
@@ -8514,6 +8592,239 @@ mod health_install_tests {
 // These are non-vacuous — every assertion exercises either a code path or
 // a documented invariant of the routing-scenario layer.
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod probe_skip_class_tests {
+    // C3-HP1..HP3 regression coverage. These tests defend the router
+    // skip-class filter (C2-2): a provider we could not build, and a
+    // gated model we refuse to spend on, must BOTH end up recorded as a
+    // skip-class classification so `is_skipped_by_classification` returns
+    // true and the router/consult stop selecting a dead/gated target.
+    use super::*;
+    use zoder_core::{Corpus, ModelEntry, Provider};
+
+    fn mk_provider(id: &str, serves: &[&str]) -> Provider {
+        Provider {
+            id: id.into(),
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: serves.iter().map(|s| s.to_string()).collect(),
+            azure_api_version: None,
+        }
+    }
+
+    fn corpus_with(ids: &[&str]) -> Corpus {
+        Corpus {
+            source: "test".into(),
+            arena_date: "2026-07-09".into(),
+            count: ids.len(),
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).into(),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    /// HP1: when a provider declares `serves` prefixes, the derived probe
+    /// targets are every corpus model matching a prefix (so each dead
+    /// model gets classified, not just the bare provider id).
+    #[test]
+    fn unbuilt_provider_targets_come_from_corpus_by_serves_prefix() {
+        let p = mk_provider("nvidia-eih", &["nvidia/"]);
+        let corpus = corpus_with(&["nvidia/llama-3.3", "nvidia/nemotron", "openai/gpt-x"]);
+        let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
+        assert!(targets.contains(&"nvidia/llama-3.3".to_string()));
+        assert!(targets.contains(&"nvidia/nemotron".to_string()));
+        assert!(
+            !targets.contains(&"openai/gpt-x".to_string()),
+            "a non-matching model must not be probed for this provider"
+        );
+    }
+
+    /// HP1: no `serves` prefixes (or no corpus match) falls back to the
+    /// provider id itself, mirroring the live-catalog fallback.
+    #[test]
+    fn unbuilt_provider_falls_back_to_provider_id() {
+        let p = mk_provider("weird-provider", &[]);
+        let corpus = corpus_with(&["nvidia/llama"]);
+        let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
+        assert_eq!(targets, vec!["weird-provider".to_string()]);
+
+        // A serves-prefix that matches nothing in the corpus also falls back.
+        let p2 = mk_provider("p2", &["no-such-prefix/"]);
+        assert_eq!(
+            probe_targets_for_unbuilt_provider(&p2, &corpus),
+            vec!["p2".to_string()]
+        );
+    }
+
+    /// HP1: derived targets are capped like the live path so a broad
+    /// prefix cannot explode the target list.
+    #[test]
+    fn unbuilt_provider_targets_are_capped() {
+        let ids: Vec<String> = (0..(PROBE_MAX_MODELS_PER_PROVIDER + 25))
+            .map(|i| format!("nvidia/m{i}"))
+            .collect();
+        let corpus = Corpus {
+            source: "test".into(),
+            arena_date: "2026-07-09".into(),
+            count: ids.len(),
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: id.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let p = mk_provider("nvidia-eih", &["nvidia/"]);
+        let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
+        assert_eq!(targets.len(), PROBE_MAX_MODELS_PER_PROVIDER);
+    }
+
+    /// HP1 payoff: before the fix, a provider whose prober could not be
+    /// built recorded NOTHING for its models — they stayed unknown, and an
+    /// unknown model has no health record at all (`breaker_open` and
+    /// `is_skipped_by_classification` both return false), so the router
+    /// kept selecting the dead provider. After the fix each derived target
+    /// gets a real `Error` record: the classification is stamped and the
+    /// failure counts toward the breaker. `Error` is deliberately a
+    /// breaker-tripping class (not a skip-class like 401/404) — repeated
+    /// daily sweeps accumulate consecutive failures and open the breaker,
+    /// at which point the router skips the model. This test proves the
+    /// record exists and the breaker opens once the threshold is crossed.
+    #[test]
+    fn recorded_unbuilt_provider_targets_trip_the_breaker() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-hp1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut health = HealthStore::load(&dir.join("health.json"));
+        let p = mk_provider("nvidia-eih", &["nvidia/"]);
+        let corpus = corpus_with(&["nvidia/llama-3.3", "nvidia/nemotron"]);
+
+        // Baseline: an un-probed model has no record at all — the exact gap
+        // the fix closes (nothing recorded => router cannot skip it).
+        assert!(!health.models.contains_key("nvidia/llama-3.3"));
+        assert!(!health.breaker_open("nvidia/llama-3.3"));
+
+        let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
+        assert!(targets.contains(&"nvidia/llama-3.3".to_string()));
+        // A single sweep records the failure and stamps the classification.
+        for target in &targets {
+            health.record_classified_failure(
+                target,
+                "prober unavailable: bad auth",
+                &p.id,
+                zoder_core::Classification::Error,
+            );
+        }
+        let h = &health.models["nvidia/llama-3.3"];
+        assert_eq!(h.classification, Some(zoder_core::Classification::Error));
+        assert_eq!(h.failures, 1);
+        assert!(h
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("prober unavailable"));
+
+        // Repeated daily sweeps accumulate consecutive Error failures until
+        // the breaker opens and the router skips the dead model.
+        for _ in 0..2 {
+            for target in &targets {
+                health.record_classified_failure(
+                    target,
+                    "prober unavailable: bad auth",
+                    &p.id,
+                    zoder_core::Classification::Error,
+                );
+            }
+        }
+        assert!(
+            health.breaker_open("nvidia/llama-3.3"),
+            "after BREAKER_THRESHOLD Error sweeps the router must skip the model"
+        );
+        assert!(health.breaker_open("nvidia/nemotron"));
+    }
+
+    /// HP2: a gated (paid) model recorded as `Error` (instead of BAILING
+    /// the sweep) is captured in the store with its "needs --allow-paid"
+    /// note — proving the model is recorded, not silently dropped, and
+    /// (crucially) that the sweep can carry on to the next provider. Before
+    /// the fix, `anyhow::bail!` propagated up through `run_probe_all().?`
+    /// and discarded every already-probed free result.
+    #[test]
+    fn gated_model_is_recorded_not_bailed() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-hp2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut health = HealthStore::load(&dir.join("health.json"));
+        let note = "gated: needs --allow-paid (paid model)".to_string();
+        health.record_classified_failure(
+            "claude-opus",
+            &note,
+            "anthropic",
+            zoder_core::Classification::Error,
+        );
+        let h = &health.models["claude-opus"];
+        assert_eq!(h.classification, Some(zoder_core::Classification::Error));
+        assert!(h.last_error.as_deref().unwrap().contains("allow-paid"));
+        // The store recorded a call, so a subsequent free model in the same
+        // sweep would still be probed and persisted (no bail).
+        assert_eq!(h.calls, 1);
+    }
+
+    /// HP3: `save_health` persists whatever is in memory, so partial
+    /// results survive even when the sweep later errors. Here we record a
+    /// free result, save, and confirm a fresh `load` from the same path
+    /// sees it — the behavior the unconditional save guarantees.
+    #[test]
+    fn save_health_persists_partial_results() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-hp3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("health.json");
+        let mut health = HealthStore::load(&path);
+        health.record_classified_success(
+            "free/model-a",
+            12.0,
+            "nvidia-eih",
+            zoder_core::Classification::Reachable,
+        );
+        // Simulate the caller's unconditional persist.
+        save_health(&health);
+
+        let reloaded = HealthStore::load(&path);
+        assert!(
+            reloaded.models.contains_key("free/model-a"),
+            "an already-probed free result must survive a save that happens \
+             even if the sweep later errors"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod scenario_routing_tests {
     use super::*;
