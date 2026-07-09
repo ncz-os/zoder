@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Consecutive failures that trip the breaker.
 const BREAKER_THRESHOLD: u32 = 3;
@@ -20,6 +21,13 @@ const BREAKER_COOLDOWN_SECS: i64 = 300;
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
+
+/// Monotonic per-process nonce so two concurrent `save()` calls in the same
+/// process never collide on the temp path. Combined with `std::process::id()`
+/// this makes every in-flight temp file unique across processes and threads,
+/// so a half-written temp from one writer can never be renamed over the live
+/// store by another (C4-MH1: torn file).
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -424,16 +432,160 @@ impl HealthStore {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
+        Self::write_atomic(&self.path, self)?;
+        Ok(())
+    }
+
+    /// Serialize `store` to `path` via a UNIQUE temp file then rename over the
+    /// target. The temp name carries the process id AND a monotonic nonce
+    /// (`<stem>.json.tmp.<pid>.<nonce>`) so two concurrent writers can never
+    /// share a temp path — that is what makes the rename atomic-swap safe
+    /// under real fan-out (C4-MH1: torn file). The temp is removed if the
+    /// write or rename fails, so a crash mid-write never litters the dir with
+    /// a stale half-written temp that a later reader could pick up.
+    fn write_atomic(path: &Path, store: &HealthStore) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        // Atomic write: serialize to a temp file then rename over the target so
-        // a crash mid-write can never truncate the live store.
-        let data = serde_json::to_string_pretty(self)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &self.path)?;
+        let data = serde_json::to_string_pretty(store)?;
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+        // Write to the unique temp; on any failure remove it so it can never
+        // be renamed over the live store or left behind torn.
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    /// Atomic locked read-modify-write. Takes an exclusive advisory lock on a
+    /// sibling lockfile (`<stem>.lock`) for the WHOLE load -> apply(f) -> save
+    /// critical section, so concurrent writers (the reviewer-panel `join_all`
+    /// fan-out, and daemon+CLI both doing load -> record -> save) serialize
+    /// and each one observes the latest on-disk state BEFORE applying its own
+    /// delta. This is the fix for C4-MH1's lost-update: without it P2 loads a
+    /// snapshot, P1 saves a recorded failure, then P2's save clobbers P1's
+    /// failure (a real failure is dropped and the breaker under-counts).
+    ///
+    /// The lock is an MSRV-safe **lockfile**: exclusive ownership is claimed by
+    /// `OpenOptions::create_new(true)` on `<stem>.lock` (stable since Rust 1.9,
+    /// no MSRV gap — unlike `File::lock`, which needs 1.89). `create_new` is an
+    /// atomic O_CREAT|O_EXCL create: exactly one racer wins; the losers see
+    /// `AlreadyExists` and spin-retry with a short sleep up to a bounded
+    /// timeout, returning an `io::Error` rather than hanging. A very old lock
+    /// (older than `LOCK_STALE_SECS`) is treated as abandoned and force-broken
+    /// so a crashed holder can't wedge the store forever. The lockfile is
+    /// removed by a `LockGuard` Drop, so it is cleaned up even on panic or
+    /// early return. The closure sees a store loaded from `path` UNDER the
+    /// lock; its mutation is persisted by `write_atomic` before the guard
+    /// drops. I/O errors from the load path are non-fatal (a fresh store is
+    /// used, mirroring `load`); lock-acquire and save failures propagate.
+    pub fn mutate_locked(path: &Path, f: impl FnOnce(&mut HealthStore)) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let lock_path = path.with_extension("lock");
+        // Acquire the lockfile (RAII: released on Drop, incl. panic / early
+        // return) BEFORE loading, so the whole read-modify-write is exclusive.
+        let _guard = LockGuard::acquire(&lock_path)?;
+        // Load the freshest on-disk state UNDER the lock so we merge onto
+        // whatever the previous holder just wrote.
+        let mut store = HealthStore::load(path);
+        f(&mut store);
+        HealthStore::write_atomic(path, &store).map_err(|e| std::io::Error::other(e.to_string()))
+        // `_guard` drops here, removing the lockfile.
+    }
+}
+
+/// Max time to wait for the health-store lockfile before giving up with a
+/// `TimedOut` error (rather than hanging a review or daemon flush forever).
+const LOCK_TIMEOUT_MS: u64 = 5_000;
+/// Poll interval while another writer holds the lock.
+const LOCK_RETRY_MS: u64 = 5;
+/// A lockfile older than this is treated as abandoned (a crashed holder that
+/// never removed it) and force-broken. Generous relative to the critical
+/// section (a load + serialize + rename is sub-millisecond), so a live holder
+/// is never mistaken for a stale one.
+const LOCK_STALE_SECS: u64 = 30;
+
+/// RAII guard for the `<stem>.lock` lockfile: owns exclusive access for the
+/// critical section and removes the file on Drop (so a panic or early return
+/// still releases the lock). Acquisition is an atomic `create_new` with a
+/// bounded spin-retry; a very old lock is treated as stale and broken.
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl LockGuard {
+    fn acquire(lock_path: &Path) -> std::io::Result<Self> {
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(lock_path)
+            {
+                // Won the race: we own the lock.
+                Ok(_file) => {
+                    return Ok(LockGuard {
+                        path: lock_path.to_path_buf(),
+                    });
+                }
+                // Someone else holds it — wait, break-if-stale, or time out.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if Self::is_stale(lock_path) {
+                        // Best-effort break of an abandoned lock. If removal
+                        // races another breaker, the next create_new attempt
+                        // sorts out the single winner.
+                        let _ = std::fs::remove_file(lock_path);
+                        continue;
+                    }
+                    if start.elapsed().as_millis() as u64 >= LOCK_TIMEOUT_MS {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out after {LOCK_TIMEOUT_MS}ms waiting for health-store lock {}",
+                                lock_path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_MS));
+                }
+                // Any other error (e.g. permission) is fatal for acquisition.
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// True when the lockfile's mtime is older than `LOCK_STALE_SECS`, i.e. a
+    /// crashed holder likely never cleaned it up. Metadata/time errors return
+    /// false (treat as fresh) so a transient stat error can't cause us to
+    /// break a live lock.
+    fn is_stale(lock_path: &Path) -> bool {
+        let Ok(meta) = std::fs::metadata(lock_path) else {
+            return false;
+        };
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        match modified.elapsed() {
+            Ok(age) => age.as_secs() >= LOCK_STALE_SECS,
+            // Clock moved backwards / mtime in the future: not stale.
+            Err(_) => false,
+        }
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // Best-effort release. If it's already gone (e.g. a stale-breaker
+        // removed it), that's fine.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1063,5 +1215,129 @@ mod tests {
             !h.breaker_open_at(now),
             "a tripped model past the cooldown must transition to half-open (probe-eligible)"
         );
+    }
+
+    // ---- C4-MH1: torn file + lost update ----
+
+    /// `save()` must never leave the deterministic legacy temp path
+    /// (`<stem>.json.tmp`) behind, and each writer's temp name must be unique
+    /// per process + nonce so two concurrent saves cannot share a temp file
+    /// (which is what allowed a torn temp to be renamed over the live store).
+    #[test]
+    fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let mut store = HealthStore::load(&path);
+        store.record_failure("m1", "boom");
+        store.save().unwrap();
+
+        // The live store exists and round-trips.
+        let reloaded = HealthStore::load(&path);
+        assert_eq!(reloaded.models.get("m1").map(|h| h.failures), Some(1));
+
+        // No leftover temp files of ANY shape (deterministic or unique) and no
+        // stray legacy `.json.tmp`.
+        let deterministic = path.with_extension("json.tmp");
+        assert!(
+            !deterministic.exists(),
+            "the deterministic legacy temp path must never be used/left behind"
+        );
+        let mut stray_tmps = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.contains(".json.tmp") {
+                stray_tmps.push(name);
+            }
+        }
+        assert!(
+            stray_tmps.is_empty(),
+            "save() must clean up its unique temp; found strays: {stray_tmps:?}"
+        );
+
+        // Two saves in the same process pick DISTINCT nonces, so their temp
+        // paths differ -- the property that prevents a torn shared temp.
+        let n0 = SAVE_NONCE.load(Ordering::Relaxed);
+        let t0 = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), n0));
+        let t1 = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            n0.wrapping_add(1)
+        ));
+        assert_ne!(t0, t1, "consecutive save temp paths must be unique");
+    }
+
+    /// LOST UPDATE (the real C4-MH1 bug): two sequential `mutate_locked` calls
+    /// on the same path, each recording a DIFFERENT model's failure, must BOTH
+    /// survive on reload. The pre-fix pattern (load snapshot -> record -> save)
+    /// would let the second writer's save clobber the first writer's recorded
+    /// failure because it loaded a stale snapshot. `mutate_locked` reloads the
+    /// freshest on-disk state under the lock before applying, so both persist.
+    #[test]
+    fn mutate_locked_serializes_and_does_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+
+        // Seed an on-disk store so both mutations merge onto real prior state.
+        HealthStore::mutate_locked(&path, |h| {
+            h.record_failure("seed", "seed");
+        })
+        .unwrap();
+
+        // P1 records model A's failure.
+        HealthStore::mutate_locked(&path, |h| {
+            h.record_classified_failure("model-a", "a down", "prov", Classification::Error);
+        })
+        .unwrap();
+        // P2 records a DIFFERENT model's failure. If P2 had loaded a stale
+        // snapshot and saved it, model-a's failure would be dropped.
+        HealthStore::mutate_locked(&path, |h| {
+            h.record_classified_failure("model-b", "b down", "prov", Classification::Error);
+        })
+        .unwrap();
+
+        let reloaded = HealthStore::load(&path);
+        assert_eq!(
+            reloaded.models.get("seed").map(|h| h.failures),
+            Some(1),
+            "the seed failure must survive both later mutations"
+        );
+        assert_eq!(
+            reloaded
+                .models
+                .get("model-a")
+                .map(|h| h.consecutive_failures),
+            Some(1),
+            "P1's failure must NOT be lost by P2's save (lost-update bug)"
+        );
+        assert_eq!(
+            reloaded
+                .models
+                .get("model-b")
+                .map(|h| h.consecutive_failures),
+            Some(1),
+            "P2's failure must persist"
+        );
+        // The lockfile is a create_new lockfile released by a Drop guard, so
+        // after each mutate_locked returns it MUST be gone -- a leftover
+        // lockfile would wedge the next writer until the stale timeout.
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the lockfile must be removed by the Drop guard after mutate_locked returns"
+        );
+    }
+
+    /// `mutate_locked` on a fresh path (no prior store) still persists the
+    /// applied delta -- the load-under-lock tolerates a missing file exactly
+    /// like `HealthStore::load`.
+    #[test]
+    fn mutate_locked_creates_store_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("health.json");
+        HealthStore::mutate_locked(&path, |h| {
+            h.record_success("fresh", 12.0);
+        })
+        .unwrap();
+        let reloaded = HealthStore::load(&path);
+        assert_eq!(reloaded.models.get("fresh").map(|h| h.calls), Some(1));
     }
 }
