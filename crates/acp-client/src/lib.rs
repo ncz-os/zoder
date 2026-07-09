@@ -36,10 +36,18 @@ use tokio::process::Child;
 /// any legitimate frame this driver has ever observed, and is small
 /// enough that a hostile or runaway engine that emits a giant line
 /// (or never sends a newline) cannot OOM the driver within the turn
-/// deadline. Frames larger than this cap surface as a clear
-/// "frame exceeds N-byte cap" error from the per-frame reader, so
-/// the caller can fail fast and surface a useful diagnostic instead
-/// of seeing a silent memory blow-up.
+/// deadline via a SINGLE frame. Frames larger than this cap surface
+/// as a clear "frame exceeds N-byte cap" error from the per-frame
+/// reader, so the caller can fail fast and surface a useful
+/// diagnostic instead of seeing a silent memory blow-up on one
+/// oversized frame.
+///
+/// NOTE: the cap is PER-FRAME. A continuous stream of
+/// well-formed-but-many sub-cap frames can still accumulate to
+/// arbitrarily large totals over a long turn; that case is bounded
+/// separately by [`MAX_CUMULATIVE_CONTENT_BYTES`] (which guards the
+/// cumulative size of the `content` accumulator + mirrored
+/// on_event/Text sink in `drive` / `drive_goose_io`).
 ///
 /// The cap is enforced via [`AsyncReadExt::take`] on the per-frame
 /// read; the underlying reader's buffered bytes (beyond the cap) are
@@ -51,7 +59,39 @@ use tokio::process::Child;
 /// an unbounded [`AsyncBufReadExt::read_line`] (the engine-session
 /// read loops in `drive`, `drive_goose_io`, and `cancel_session` all
 /// go through this constant).
+///
+/// Y-9: [`MAX_CUMULATIVE_CONTENT_BYTES`] was added to bound the
+/// running byte total of streamed `content` across frames, which
+/// the per-frame cap cannot constrain on its own (a hostile engine
+/// emitting a steady stream of sub-cap `agent_message_chunk` frames
+/// would otherwise grow `content` without bound across the turn
+/// deadline).
 pub(crate) const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cumulative byte cap on the streamed `content` accumulator (and
+/// its mirrored on_event/Text sink) inside a single turn of
+/// `drive` / `drive_goose_io`. The per-frame
+/// [`MAX_FRAME_BYTES`] cap (4 MiB) prevents a single oversized
+/// frame from OOMing the driver, but it cannot constrain a
+/// continuous stream of well-formed-but-many sub-cap frames over
+/// the default 900s turn deadline: a hostile / runaway engine
+/// that emits `agent_message_chunk` frames in a tight loop would
+/// otherwise accumulate gigabytes into `content` (plus the mirrored
+/// Text events the caller mirrors to its own sink).
+///
+/// 64 MiB is a small multiple of [`MAX_FRAME_BYTES`] (16x) that is
+/// comfortably larger than any legitimate turn the driver has ever
+/// observed in practice (a single tool-using agentic turn rarely
+/// crosses a few hundred KiB of assistant text), while small enough
+/// that hitting the cap means the engine is misbehaving — not that
+/// the operator asked for too much. When the cap is hit the driver
+/// bails the turn with a clear `InvalidData`-flavored error naming
+/// the cap, instead of growing unbounded.
+///
+/// Y-9: introduced to bound cumulative streamed `content` after the
+/// prior per-frame fix (Z-17) was shown to be insufficient against
+/// a continuous stream of sub-cap frames.
+pub(crate) const MAX_CUMULATIVE_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Convert an `EngineKind` into the canonical scope prefix the
 /// persistence layer uses. Kept here (rather than in `session_store`)
@@ -1136,7 +1176,17 @@ async fn drive<F: FnMut(AgentEvent)>(
     //    via [`read_frame_line_capped`]. A hostile / runaway engine
     //    that emits a single frame larger than the cap surfaces as
     //    an `io::Error` of `InvalidData` kind, NOT an OOM.
+    //
+    //    Y-9: the per-frame cap is NOT sufficient on its own —
+    //    a continuous stream of sub-cap `agent_message_chunk`
+    //    frames can accumulate gigabytes into `content` (and the
+    //    mirrored Text sink) across the turn deadline. The
+    //    `content_bytes` running total bounds the cumulative
+    //    size; once it crosses [`MAX_CUMULATIVE_CONTENT_BYTES`]
+    //    we bail the turn with a clear diagnostic instead of
+    //    growing unbounded.
     let mut content = String::new();
+    let mut content_bytes: u64 = 0;
     let mut input_tokens = 0u64;
     let mut tool_calls = 0u32;
     let mut line = String::new();
@@ -1201,7 +1251,24 @@ async fn drive<F: FnMut(AgentEvent)>(
         match kind {
             "agent_message_chunk" => {
                 if let Some(t) = params.get("text").and_then(Value::as_str) {
+                    // Y-9: track cumulative bytes appended into `content`
+                    // (and mirrored into the on_event/Text sink) and bail
+                    // the turn when the running total crosses
+                    // [`MAX_CUMULATIVE_CONTENT_BYTES`]. The per-frame
+                    // [`MAX_FRAME_BYTES`] cap cannot stop a steady stream
+                    // of well-formed sub-cap frames from accumulating
+                    // gigabytes over the turn deadline.
+                    let new_total = content_bytes.saturating_add(t.len() as u64);
+                    if new_total > MAX_CUMULATIVE_CONTENT_BYTES {
+                        bail!(
+                            "streamed content exceeded {MAX_CUMULATIVE_CONTENT_BYTES}-byte \
+                             cumulative cap (already appended {content_bytes} bytes across prior \
+                             frames; refusing to grow `content` unbounded); possible \
+                             hostile or runaway engine"
+                        );
+                    }
                     content.push_str(t);
+                    content_bytes = new_total;
                     on_event(AgentEvent::Text(t.to_string()));
                 }
             }
@@ -1284,7 +1351,30 @@ async fn drive<F: FnMut(AgentEvent)>(
                     .to_string();
                 if let Some(c) = params.get("content").and_then(Value::as_str) {
                     if !c.is_empty() {
+                        // Y-9: enforce the same cumulative cap on the
+                        // final `content` field, in case a hostile
+                        // engine front-loads the whole turn output
+                        // into the `turn_complete` payload rather
+                        // than a stream of chunks. The single frame
+                        // is already capped by [`MAX_FRAME_BYTES`]
+                        // (4 MiB), which is well below the 64 MiB
+                        // cumulative cap, but checking keeps the
+                        // invariant (final `content.len()` <=
+                        // [`MAX_CUMULATIVE_CONTENT_BYTES`]) explicit.
+                        if (c.len() as u64) > MAX_CUMULATIVE_CONTENT_BYTES {
+                            bail!(
+                                "turn_complete `content` of {} bytes exceeds \
+                                 {MAX_CUMULATIVE_CONTENT_BYTES}-byte cumulative cap; \
+                                 possible hostile or runaway engine",
+                                c.len()
+                            );
+                        }
                         content = c.to_string();
+                        // The loop breaks immediately below; the
+                        // streaming-loop's `content_bytes` counter
+                        // is no longer consulted, so we deliberately
+                        // do NOT update it here (would be a dead
+                        // write and trip `unused_assignments`).
                     }
                 }
                 break oc;
@@ -2557,6 +2647,14 @@ where
         },
     });
     let mut content = String::new();
+    // Y-9: cumulative byte cap on streamed `content` (see
+    // [`MAX_CUMULATIVE_CONTENT_BYTES`]). The per-frame
+    // [`MAX_FRAME_BYTES`] cap cannot stop a steady stream of
+    // well-formed sub-cap `agent_message_chunk` frames from
+    // accumulating gigabytes across the turn deadline, so the
+    // streaming loop tracks a running total and bails the turn
+    // when the cap is hit.
+    let mut content_bytes: u64 = 0;
     let mut input_tokens: u64 = 0;
     let mut tool_calls: u32 = 0;
     let mut line = String::new();
@@ -2682,7 +2780,26 @@ where
             // one (mirrors the zeroclaw turn_complete.content behavior).
             if let Some(c) = res.get("content").and_then(Value::as_str) {
                 if !c.is_empty() {
+                    // Y-9: enforce the cumulative cap on the
+                    // terminal `content`. The single frame is
+                    // already capped by [`MAX_FRAME_BYTES`] (4 MiB),
+                    // well below the 64 MiB cumulative cap, but
+                    // the explicit check keeps the invariant
+                    // consistent with the streaming chunk path.
+                    if (c.len() as u64) > MAX_CUMULATIVE_CONTENT_BYTES {
+                        bail!(
+                            "session/prompt terminal `content` of {} bytes exceeds \
+                             {MAX_CUMULATIVE_CONTENT_BYTES}-byte cumulative cap; \
+                             possible hostile or runaway engine",
+                            c.len()
+                        );
+                    }
                     content = c.to_string();
+                    // The loop breaks immediately below; the
+                    // streaming-loop's `content_bytes` counter is
+                    // no longer consulted, so we deliberately do
+                    // NOT update it here (would be a dead write
+                    // and trip `unused_assignments`).
                 }
             }
             break match stop_reason {
@@ -2868,7 +2985,19 @@ where
                 // We only surface text. `content.text` is the inline path.
                 let text = extract_text_content(update.get("content"));
                 if let Some(t) = text {
+                    // Y-9: enforce the cumulative cap before
+                    // appending. See [`MAX_CUMULATIVE_CONTENT_BYTES`].
+                    let new_total = content_bytes.saturating_add(t.len() as u64);
+                    if new_total > MAX_CUMULATIVE_CONTENT_BYTES {
+                        bail!(
+                            "streamed content exceeded {MAX_CUMULATIVE_CONTENT_BYTES}-byte \
+                             cumulative cap (already appended {content_bytes} bytes across prior \
+                             frames; refusing to grow `content` unbounded); possible \
+                             hostile or runaway engine"
+                        );
+                    }
                     content.push_str(&t);
+                    content_bytes = new_total;
                     on_event(AgentEvent::Text(t));
                 }
             }
@@ -2882,7 +3011,19 @@ where
             "agent_message" => {
                 // Final assistant message for the turn (ContentBlock).
                 if let Some(t) = extract_text_content(update.get("content")) {
+                    // Y-9: enforce the cumulative cap before
+                    // appending. See [`MAX_CUMULATIVE_CONTENT_BYTES`].
+                    let new_total = content_bytes.saturating_add(t.len() as u64);
+                    if new_total > MAX_CUMULATIVE_CONTENT_BYTES {
+                        bail!(
+                            "streamed content exceeded {MAX_CUMULATIVE_CONTENT_BYTES}-byte \
+                             cumulative cap (already appended {content_bytes} bytes across prior \
+                             frames; refusing to grow `content` unbounded); possible \
+                             hostile or runaway engine"
+                        );
+                    }
                     content.push_str(&t);
+                    content_bytes = new_total;
                     on_event(AgentEvent::Text(t));
                 }
             }
@@ -5593,6 +5734,225 @@ mod tests {
         assert!(
             msg.contains("cap") || msg.contains("exceeds") || msg.contains("too large"),
             "Z-17: expected an overflow / cap diagnostic from the streaming loop, got: {msg}"
+        );
+    }
+
+    /// Y-9: a hostile / runaway engine that emits a CONTINUOUS
+    /// STREAM of well-formed sub-cap `agent_message_chunk` frames
+    /// MUST be stopped by the cumulative `content`-size cap. The
+    /// Z-17 fix bounded the per-frame read; that fix is necessary
+    /// but not sufficient — a stream of, e.g., twenty 1 MiB frames
+    /// would each pass the per-frame cap, but `content` (and the
+    /// mirrored on_event/Text sink) would grow to 20 MiB+ without
+    /// bound across the default 900s turn deadline, OOMing the
+    /// driver.
+    ///
+    /// This test feeds `drive_goose_io` a stream of
+    /// `agent_message_chunk` frames whose cumulative `content`
+    /// payload EXCEEDS [`MAX_CUMULATIVE_CONTENT_BYTES`] and asserts
+    /// that the driver bails the turn with a clear
+    /// cumulative-cap diagnostic (NOT a per-frame cap diagnostic,
+    /// NOT a silent OOM, NOT a successful completion).
+    #[tokio::test]
+    async fn y9_drive_goose_io_streaming_loop_errors_on_cumulative_content_overflow() {
+        use tokio::io::AsyncWriteExt;
+        // Pick a frame payload small enough that no SINGLE frame
+        // trips the per-frame [`MAX_FRAME_BYTES`] cap, but large
+        // enough that a handful of frames push the cumulative
+        // `content` past [`MAX_CUMULATIVE_CONTENT_BYTES`].
+        // 1 MiB per chunk * (cap / 1 MiB + 2) chunks guarantees we
+        // cross the cap while staying well under the per-frame cap.
+        let chunk_bytes: usize = 1024 * 1024; // 1 MiB
+        let chunk_text: String = "a".repeat(chunk_bytes);
+        let chunks_needed: usize = (MAX_CUMULATIVE_CONTENT_BYTES as usize / chunk_bytes) + 2;
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Size the duplex generously so the server can buffer all
+        // the chunks it wants to emit.
+        let (client_io, engine_io) = tokio::io::duplex(MAX_CUMULATIVE_CONTENT_BYTES as usize * 2);
+        let recv = received.clone();
+        let server = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(engine_io);
+            let mut r = tokio::io::BufReader::new(r);
+            // 1. initialize -> ack
+            let mut line = String::new();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                recv.lock().unwrap().push(v);
+            }
+            let init_ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocolVersion": 1 }
+            });
+            let s = serde_json::to_string(&init_ack).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+            // 2. session/new -> success
+            line.clear();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                recv.lock().unwrap().push(v);
+            }
+            let new_ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "result": { "sessionId": "goose-y9-cumulative" }
+            });
+            let s = serde_json::to_string(&new_ack).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+            // 3. emit a continuous stream of well-formed
+            //    `agent_message_chunk` frames. Each frame is
+            //    well under MAX_FRAME_BYTES individually, but their
+            //    cumulative `text` payload exceeds
+            //    MAX_CUMULATIVE_CONTENT_BYTES. The driver MUST bail
+            //    the turn with a cumulative-cap diagnostic.
+            for i in 0..chunks_needed {
+                let frame = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "goose-y9-cumulative",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": chunk_text }
+                        }
+                    }
+                });
+                let s = serde_json::to_string(&frame).unwrap();
+                let _ = w.write_all(s.as_bytes()).await;
+                let _ = w.write_all(b"\n").await;
+                let _ = w.flush().await;
+                // Yield between chunks so the client has a chance
+                // to read and process each frame before we push
+                // the next. Without this the client could be
+                // blocked on a single big read instead of seeing
+                // the per-chunk cumulative growth.
+                tokio::task::yield_now().await;
+                if i % 8 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            // Hold the writer open past the bailout so the
+            // client's error is the cumulative-cap diagnostic, not
+            // an EOF / writer-dropped error.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        });
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.timeout = std::time::Duration::from_secs(5);
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let res = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
+            events.push(ev);
+        })
+        .await;
+        let _ = server.await;
+        let err = res.expect_err(
+            "Y-9: a continuous stream of sub-cap chunks whose cumulative content exceeds \
+             the cap must make drive_goose_io return Err",
+        );
+        let msg = format!("{err:?}");
+        // The diagnostic MUST mention cumulative + the cap value
+        // (so the operator can distinguish from a per-frame cap
+        // hit, which the Z-17 surface already names).
+        assert!(
+            msg.contains("cumulative"),
+            "Y-9: expected a cumulative-cap diagnostic (mentioning 'cumulative'), got: {msg}"
+        );
+        assert!(
+            msg.contains(&MAX_CUMULATIVE_CONTENT_BYTES.to_string()),
+            "Y-9: expected the diagnostic to name the cumulative cap value \
+             ({}), got: {msg}",
+            MAX_CUMULATIVE_CONTENT_BYTES
+        );
+        // Sanity-check: the driver must NOT have absorbed the
+        // full malicious stream — it must have stopped well before
+        // the cumulative cap. Counting Text events gives us a
+        // proxy for how much was appended (each chunk emits one
+        // Text event). The cap / chunk_bytes would be the max we
+        // expect to see PLUS one more chunk (the one that
+        // triggers the bailout); allow some slack to avoid
+        // racy off-by-ones across the cap boundary.
+        let text_events: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Text(_)))
+            .collect();
+        let max_text_events = chunks_needed; // upper bound — driver never sees more than this many
+        assert!(
+            text_events.len() < max_text_events,
+            "Y-9: driver should bail BEFORE absorbing the full malicious stream \
+             ({} chunks); saw {} Text events",
+            chunks_needed,
+            text_events.len()
+        );
+    }
+
+    /// Y-9 (positive half): a normal turn whose cumulative
+    /// streamed `content` is well under
+    /// [`MAX_CUMULATIVE_CONTENT_BYTES`] MUST complete unchanged.
+    /// Pins the regression-prevention contract that the new
+    /// cumulative cap does NOT interfere with legitimate turns.
+    #[tokio::test]
+    async fn y9_drive_goose_io_normal_turn_under_cumulative_cap_succeeds() {
+        // Build a turn with several sub-cap chunks whose total is
+        // a small fraction of the cap. The driver must return Ok
+        // and the run's `content` must equal the concatenated text.
+        let chunk1 = "hello, ".to_string();
+        let chunk2 = "world ".to_string();
+        let chunk3 = "from goose".to_string();
+        let outbound = vec![
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": chunk1 }
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": chunk2 }
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": chunk3 }
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "usage_update",
+                    "used": 7,
+                    "size": 131072
+                }),
+            ),
+        ];
+        let (_frames, run, _events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        assert_eq!(
+            run.outcome, "completed",
+            "Y-9 (positive): a normal turn well under the cumulative cap must still complete"
+        );
+        assert_eq!(
+            run.content,
+            format!("{chunk1}{chunk2}{chunk3}"),
+            "Y-9 (positive): the streamed chunks must be concatenated into `content` unchanged"
+        );
+        // Sanity: the cumulative total is well under the cap.
+        let total = (chunk1.len() + chunk2.len() + chunk3.len()) as u64;
+        assert!(
+            total < MAX_CUMULATIVE_CONTENT_BYTES,
+            "sanity: the test payload must stay under the cap"
         );
     }
 
