@@ -3768,6 +3768,27 @@ pub(crate) struct TurnResult {
     pub elapsed_ms: f64,
 }
 
+impl std::fmt::Debug for TurnResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-rolled to keep test logs readable and to avoid pulling in
+        // a Debug bound on every transitive type. We never print this in
+        // production paths — only in test `assert!` failures and the
+        // cost-reconciliation trace.
+        f.debug_struct("TurnResult")
+            .field("session_id", &self.run.session_id)
+            .field("outcome", &self.run.outcome)
+            .field("model", &self.model)
+            .field("alias", &self.alias)
+            .field("cost_usd", &self.cost_usd)
+            .field("cost_unknown", &self.cost_unknown)
+            .field("tokens_in", &self.tokens_in)
+            .field("tokens_out", &self.tokens_out)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("tool_calls", &self.run.tool_calls)
+            .finish()
+    }
+}
+
 /// Drive a single agentic turn against the engine: resolve the model (routing or
 /// `-m`), enforce the free/paid gate, run the loop in `cwd`, harvest cost/tokens,
 /// and write one ledger record. `session_override` (when `Some`) continues an

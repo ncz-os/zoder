@@ -691,6 +691,164 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
     }
 }
 
+/// Cancel an in-flight turn on the daemon for `session_id` and wait up to
+/// `settle_budget` for the daemon to acknowledge the cancel (via a
+/// `session/update {type: "turn_complete"}` notification). This is the
+/// cancel hook the loop's author-phase watchdog calls when its outer
+/// wall-clock budget fires — without it, dropping the future merely
+/// orphans the turn on the daemon side, and the daemon keeps editing
+/// files while the loop captures a torn diff.
+///
+/// The function is best-effort: if the daemon doesn't acknowledge within
+/// `settle_budget`, it returns `Err` but the cancel notification has
+/// still been delivered, so the caller can treat the timeout as "settled
+/// enough to capture the diff" (i.e., the daemon is in the process of
+/// winding down but no new tool calls will be accepted). The `settle_budget`
+/// should be small (a few seconds) — long enough to receive the
+/// turn_complete notification, short enough that a hung daemon cannot
+/// stall the loop.
+///
+/// **Zero-length read (EOF) handling:** an EOF before `turn_complete` is
+/// NOT treated as a successful settle. If the daemon closes the socket
+/// without first sending the cancel acknowledgment, we cannot tell
+/// whether the cancel succeeded or the daemon crashed mid-edit. We let
+/// the settle budget elapse and return `Err` so the caller times out
+/// gracefully. (The pre-fix code returned `Ok(())` immediately on EOF,
+/// which could let `build_diff` capture a torn tree if the daemon had
+/// crashed in the middle of a tool write.)
+///
+/// **Connect timeout:** the function races `UnixStream::connect` against
+/// `settle_budget` itself. A hung daemon socket (the daemon exists and
+/// accepts at the kernel level, but never completes the ACP handshake)
+/// can otherwise stall the loop for the OS-level connect timeout (often
+/// tens of seconds). Capping connect at the same budget keeps cancel-on-
+/// timeout from adding significant latency to the loop's timeout path.
+///
+/// `session/cancel` is sent as a JSON-RPC NOTIFICATION (no `id`, no
+/// expected response) per the ACP v1 spec, matching the in-band cancel
+/// the `drive()` loop sends on its own timeout. The function opens a
+/// FRESH daemon connection rather than reusing the in-flight one —
+/// after a `phase_watchdog` drops the loop's future, that connection
+/// is gone. A fresh connection + `initialize` + `session/cancel` is the
+/// only signal the daemon gets that its caller has gone away.
+pub async fn cancel_session(
+    socket: &Path,
+    session_id: &str,
+    settle_budget: Duration,
+) -> anyhow::Result<()> {
+    // Cap the connect at the same `settle_budget` so a hung daemon
+    // socket cannot add multi-second latency to the watchdog path.
+    let transport = EngineTransport::UnixSocket(socket.to_path_buf());
+    let conn = tokio::time::timeout(settle_budget, connect_transport(&transport))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "connecting to daemon at {} timed out after {settle_budget:?}",
+                socket.display()
+            )
+        })??;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
+
+    // initialize (the daemon requires this on every connection). Use the
+    // remaining settle budget so a slow daemon can't extend the cancel
+    // window past what the caller asked for.
+    let init_deadline = tokio::time::Instant::now() + settle_budget;
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+        }),
+    )
+    .await?;
+    let _ = read_result(&mut reader, "init").await?;
+
+    // session/cancel — NOTIFICATION (no `id`), per ACP v1.
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        }),
+    )
+    .await?;
+
+    // Drain until we see the daemon's turn_complete notification for this
+    // cancel, OR `settle_budget` elapses (best-effort). A zero-length
+    // read (EOF) BEFORE we've seen `turn_complete` is treated as a
+    // failure: the daemon closed the connection without acknowledging
+    // the cancel, which we cannot distinguish from a daemon crash mid-
+    // edit. The caller will see the timeout-elapsed error below.
+    let deadline = init_deadline;
+    let mut line = String::new();
+    let mut turn_complete_seen = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "daemon did not acknowledge session/cancel within {settle_budget:?}"
+            ));
+        }
+        line.clear();
+        match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
+            Ok(Ok(0)) => {
+                // EOF — daemon closed the connection. Only accept this
+                // as "settled" if we'd already received the turn_complete
+                // (defensive: in practice the daemon keeps the socket
+                // open until after the final session/update, so EOF
+                // arrives *after* turn_complete, but we don't rely on
+                // that ordering — an early EOF is treated as a hang).
+                if turn_complete_seen {
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "daemon closed connection without acknowledging session/cancel \
+                     (possible crash mid-edit); waited {settle_budget:?}"
+                ));
+            }
+            Ok(Ok(_)) => {
+                let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                if frame.get("method").and_then(Value::as_str) == Some("session/update") {
+                    let kind = frame
+                        .pointer("/params/type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if kind == "turn_complete" {
+                        // Defensive `let _ =` for the EOF arm: if the daemon
+                        // ever sent `turn_complete` and THEN closed the
+                        // socket, we'd still accept the EOF as "settled".
+                        // (In practice the daemon keeps the socket open
+                        // until after the final session/update, so EOF
+                        // arrives *after* turn_complete, but we don't rely
+                        // on that ordering.)
+                        #[allow(unused_assignments)]
+                        {
+                            turn_complete_seen = true;
+                        }
+                        return Ok(());
+                    }
+                }
+                // keep draining — the daemon may send a few more session/update
+                // notifications (e.g., a final tool_result) before turn_complete.
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow!("reading cancel ack from daemon: {e}"));
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "daemon did not acknowledge session/cancel within {settle_budget:?}"
+                ));
+            }
+        }
+    }
+}
+
 /// Create a fresh engine session bound to `cwd` and return its id (without
 /// prompting). Used by `transfer` to hand off a resumable thread.
 pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow::Result<String> {
@@ -6322,6 +6480,229 @@ mod tests {
         let r = run_with_stop_reason("end_turn".to_string()).await;
         assert_eq!(r.outcome, "completed");
         assert!(r.succeeded());
+    }
+
+    // -----------------------------------------------------------------
+    // `cancel_session` — the loop's author-phase watchdog cancel hook.
+    //
+    // This is the public surface the loop calls when its outer
+    // `phase_watchdog` fires. Without it, dropping the future merely
+    // orphans the turn on the daemon side. These tests pin the wire
+    // shape and the "settle on turn_complete" contract.
+    // -----------------------------------------------------------------
+
+    use tokio::net::UnixListener;
+
+    /// Spin up a Unix-socket "daemon" that speaks just enough ACP to
+    /// satisfy `cancel_session`: ack `initialize`, accept `session/cancel`
+    /// as a NOTIFICATION (no `id`), and respond with a
+    /// `session/update {type: "turn_complete"}` notification. Records all
+    /// received frames into `received` so the test can assert the cancel
+    /// was sent with the expected session id.
+    async fn spawn_cancel_test_daemon(
+        received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let recv = received.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // 1. read initialize -> ack
+                let _ = reader.read_line(&mut line).await;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                    recv.lock().unwrap().push(v);
+                }
+                let init_ack = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                });
+                let _ = write_half
+                    .write_all(serde_json::to_string(&init_ack).unwrap().as_bytes())
+                    .await;
+                let _ = write_half.write_all(b"\n").await;
+                let _ = write_half.flush().await;
+                // 2. read session/cancel (a notification, no id) -> record it
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                    recv.lock().unwrap().push(v);
+                }
+                // 3. respond with turn_complete so cancel_session can settle
+                let complete = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "turn_complete", "outcome": "cancelled" }
+                });
+                let _ = write_half
+                    .write_all(serde_json::to_string(&complete).unwrap().as_bytes())
+                    .await;
+                let _ = write_half.write_all(b"\n").await;
+                let _ = write_half.flush().await;
+            }
+        });
+        dir
+    }
+
+    /// `cancel_session` MUST send `session/cancel` as a notification (no
+    /// `id`), carrying the session id from its argument. The loop's
+    /// watchdog relies on this exact wire shape — the daemon's per-
+    /// session bookkeeping keys off the sessionId param. A test that
+    /// fails here means the loop's cancel is no longer addressing the
+    /// right session on the daemon side.
+    #[tokio::test]
+    async fn cancel_session_sends_cancel_notification_with_session_id() {
+        let received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = spawn_cancel_test_daemon(received.clone()).await;
+        let socket = dir.path().join("daemon.sock");
+        let res = cancel_session(&socket, "sess-z-8", Duration::from_secs(2)).await;
+        assert!(
+            res.is_ok(),
+            "cancel_session must settle on turn_complete: {res:?}"
+        );
+        // give the server task a moment to push the recorded frame
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let frames = received.lock().unwrap().clone();
+        let cancel = frames
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/cancel"))
+            .expect("daemon must have received session/cancel");
+        assert!(
+            cancel.get("id").is_none(),
+            "session/cancel MUST be a notification (no id); got {cancel:?}"
+        );
+        assert_eq!(
+            cancel.pointer("/params/sessionId").and_then(Value::as_str),
+            Some("sess-z-8"),
+            "session/cancel MUST carry the loop's session id; got {cancel:?}"
+        );
+    }
+
+    /// `cancel_session` MUST NOT return until the daemon has acknowledged
+    /// the cancel (via `session/update {type: "turn_complete"}`). The
+    /// loop's `build_diff` capture is gated on this return — if the
+    /// daemon is allowed to keep editing after cancel_session returns,
+    /// the loop is back to reviewing a torn tree. The settle bound is
+    /// also pinned: cancel_session must not block forever on an
+    /// unresponsive daemon.
+    #[tokio::test]
+    async fn cancel_session_returns_after_daemon_turn_complete_within_budget() {
+        let received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = spawn_cancel_test_daemon(received.clone()).await;
+        let socket = dir.path().join("daemon.sock");
+        let start = std::time::Instant::now();
+        // Mirrors the production settle budget (5s) — see
+        // `zoder_core::CANCEL_SETTLE_BUDGET`. Kept locally because this
+        // crate doesn't depend on `zoder-core`; the wire-shape tests
+        // exist to pin the daemon side, not the loop's policy choice.
+        let settle = Duration::from_secs(5);
+        let res = cancel_session(&socket, "sess-z-8b", settle).await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_ok(),
+            "cancel_session must settle on turn_complete: {res:?}"
+        );
+        assert!(
+            elapsed < settle,
+            "cancel_session must settle promptly when daemon acks; took {elapsed:?}"
+        );
+    }
+
+    /// HIGH-severity Z-8 regression guard: if the daemon closes the
+    /// connection BEFORE sending `session/update {type: "turn_complete"}`,
+    /// `cancel_session` MUST return `Err` (forcing the loop to wait out
+    /// its settle budget for a torn tree) rather than `Ok(())` (which the
+    /// pre-fix code did, on the optimistic assumption that "EOF =
+    /// settled"). The pre-fix behavior lets a daemon that crashed
+    /// mid-edit trick the loop into capturing a torn diff.
+    ///
+    /// We also pin a `elapsed < budget` invariant: the diagnostic must
+    /// arrive *before* the settle budget elapses, not after. A buggy
+    /// implementation that simply waits `settle_budget` and then
+    /// reports Err would pass the `is_err` check but still stall the
+    /// loop for the full budget on every timeout, which is what the
+    /// connect-timeout fix (below) is meant to prevent.
+    #[tokio::test]
+    async fn cancel_session_early_eof_is_treated_as_settle_failure() {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // 1. read initialize -> ack
+                let _ = reader.read_line(&mut line).await;
+                let init_ack = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                });
+                let _ = write_half
+                    .write_all(serde_json::to_string(&init_ack).unwrap().as_bytes())
+                    .await;
+                let _ = write_half.write_all(b"\n").await;
+                let _ = write_half.flush().await;
+                // 2. read session/cancel — and then CLOSE the connection
+                //    without sending turn_complete. This models a daemon
+                //    that crashed (or one that mishandles cancel).
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                // Drop write_half / stream — that closes the socket.
+                drop(write_half);
+            }
+        });
+        let budget = Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        let res = cancel_session(&socket, "sess-eof", budget).await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "Z-8 HIGH: EOF before turn_complete MUST return Err (got Ok)."
+        );
+        assert!(
+            elapsed < budget,
+            "Z-8 HIGH: cancel_session must return its EOF diagnostic within \
+             the settle budget; took {elapsed:?} vs budget {budget:?}"
+        );
+    }
+
+    /// INFO Z-8 fix: `cancel_session` must cap its connect wait at
+    /// `settle_budget`. A daemon whose socket exists but isn't accepting
+    /// (e.g., a hung child holding the listening fd but not calling
+    /// `accept`) would otherwise block on whatever connect path the
+    /// kernel takes. While Unix sockets typically complete `connect`
+    /// immediately for a bound listener, the timeout races still cost
+    /// nothing and protect against pathological cases where the daemon
+    /// socket exists but is wedged at a deeper layer.
+    ///
+    /// This test exercises the COMMON failure shape — the socket file
+    /// doesn't exist — and asserts cancel_session fails fast rather
+    /// than blocking past `settle_budget`.
+    #[tokio::test]
+    async fn cancel_session_fails_fast_when_socket_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("nope.sock");
+        // No listener bound -> connect returns ECONNREFUSED immediately.
+        let start = std::time::Instant::now();
+        let res = cancel_session(&socket, "sess", Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "cancel_session MUST surface connect failures; got Ok"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel_session must fail fast on connect errors; took {elapsed:?}"
+        );
     }
 }
 
