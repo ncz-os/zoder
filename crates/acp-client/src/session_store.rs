@@ -75,12 +75,23 @@
 //! the same bytes.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+/// Monotonic per-process nonce so two concurrent `save()` calls in the same
+/// process never collide on the temp path. Combined with `std::process::id()`
+/// this makes every in-flight temp file unique across processes and threads,
+/// so a half-written temp from one writer can never be renamed over the live
+/// store by another (paired with the lockfile below for the
+/// read-modify-write critical section).
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Default freshness window. Engines typically evict sessions server-side
 /// on much shorter horizons (goose sessions are per-process; zeroclaw
@@ -316,31 +327,38 @@ impl EngineSessionStore {
     /// small but real IO call that the wire layer does not need to
     /// repeat).
     pub fn save_with_scope(cfg: &StoreConfig, scope: &str, session_id: &str) -> Result<()> {
-        // Read existing (may be absent / corrupt — both treated as
-        // "empty"). This is the small write-around the atomicity
-        // story: the read+merge is not atomic against concurrent
-        // writers, but zoder runs ONE turn at a time per CLI
-        // invocation so contention is not a real concern.
-        let mut map: BTreeMap<String, EngineSessionRecord> =
-            match std::fs::read_to_string(&cfg.path) {
-                Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-                Err(_) => BTreeMap::new(),
-            };
-        map.insert(
-            scope.to_string(),
-            EngineSessionRecord {
-                scope: scope.to_string(),
-                session_id: session_id.to_string(),
-                updated_unix: cfg.current_unix(),
-            },
-        );
-        // Prune-on-save: drop stale records (older than the
-        // freshness window) and trim to the cap. Cheap when the map
-        // is small (the common case); saves a separate `prune()`
-        // round-trip from the caller. The insert above is the
-        // freshest entry, so it always survives the cap eviction.
-        evict_in_place(&mut map, cfg);
-        write_atomically(&cfg.path, &map)
+        // Read → merge → write happens UNDER an exclusive `fs2`
+        // `flock(2)` advisory lock on the sibling `<data>.lock`
+        // lockfile (see [`mutate_locked`]). Two concurrent writers
+        // (e.g. two `--persist-session` runs racing on the same
+        // store) serialize on the lock so each one reloads the
+        // freshest on-disk state before merging its delta — a
+        // concurrent save can never silently clobber another
+        // writer's record. The temp file used for the commit is
+        // unique per process + monotonic nonce (see
+        // [`write_atomically`]) so a half-written temp from one
+        // writer can never be renamed over the live store by
+        // another.
+        let scope_owned = scope.to_string();
+        let session_id_owned = session_id.to_string();
+        mutate_locked(cfg, |map| {
+            map.insert(
+                scope_owned.clone(),
+                EngineSessionRecord {
+                    scope: scope_owned,
+                    session_id: session_id_owned,
+                    updated_unix: cfg.current_unix(),
+                },
+            );
+            // Prune-on-save: drop stale records (older than the
+            // freshness window) and trim to the cap. Cheap when the
+            // map is small (the common case); saves a separate
+            // `prune()` round-trip from the caller. The insert above
+            // is the freshest entry, so it always survives the cap
+            // eviction.
+            evict_in_place(map, cfg);
+            true
+        })
     }
 
     /// Drop the record for `scope` (no-op if absent).
@@ -350,17 +368,12 @@ impl EngineSessionStore {
     /// we want the next run to come back with a fresh id rather
     /// than race against the freshness window.
     pub fn clear(cfg: &StoreConfig, scope: &str) -> Result<()> {
-        let Ok(raw) = std::fs::read_to_string(&cfg.path) else {
-            return Ok(());
-        };
-        let Ok(mut map) = serde_json::from_str::<BTreeMap<String, EngineSessionRecord>>(&raw)
-        else {
-            return Ok(());
-        };
-        if map.remove(scope).is_none() {
-            return Ok(());
-        }
-        write_atomically(&cfg.path, &map)
+        let scope = scope.to_string();
+        mutate_locked(cfg, |map| {
+            // Returns true iff a write is required (the key was
+            // present and has now been removed).
+            map.remove(&scope).is_some()
+        })
     }
 
     /// Apply the eviction policies in-place to the on-disk store.
@@ -388,23 +401,14 @@ impl EngineSessionStore {
     /// already calls it implicitly so a separate invocation is not
     /// needed for normal operation.
     pub fn prune(cfg: &StoreConfig) -> Result<usize> {
-        // Absent file: nothing to prune. Same for a corrupt file
-        // (treated as "empty", matching how `save`/`clear` handle
-        // a missing or unparseable file).
-        let Ok(raw) = std::fs::read_to_string(&cfg.path) else {
-            return Ok(0);
-        };
-        let mut map: BTreeMap<String, EngineSessionRecord> =
-            serde_json::from_str(&raw).unwrap_or_default();
-        let evicted = evict_in_place(&mut map, cfg);
-        if evicted > 0 {
-            // Rewrite so the on-disk file reflects the in-memory
-            // map. `evicted == 0` means no work happened; skip the
-            // atomic-write dance to keep the no-op path truly
-            // side-effect-free (mtime preserved, no tmp file
-            // flicker).
-            write_atomically(&cfg.path, &map)?;
-        }
+        // Track evicted count from inside the locked critical section
+        // so two concurrent prunes can't double-count or see a stale
+        // eviction tally.
+        let mut evicted: usize = 0;
+        mutate_locked(cfg, |map| {
+            evicted = evict_in_place(map, cfg);
+            evicted > 0
+        })?;
         Ok(evicted)
     }
 }
@@ -412,6 +416,15 @@ impl EngineSessionStore {
 /// Atomic write: serialize `map` to JSON, write to a sibling temp
 /// file, rename into place. Keeps the file's predecessor intact if
 /// the write fails partway through.
+///
+/// The temp name carries the process id AND a monotonic nonce
+/// (`<stem>.json.tmp.<pid>.<nonce>`) so two concurrent writers can
+/// never share a temp path — that is what makes the rename safe
+/// under real fan-out (a fixed `.tmp` filename would let two
+/// writers' temp-file writes interleave / one rename clobber the
+/// other). The temp is removed if the write or rename fails, so a
+/// crash mid-write never litters the dir with a stale half-written
+/// temp that a later reader could pick up.
 fn write_atomically(path: &Path, map: &BTreeMap<String, EngineSessionRecord>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -424,10 +437,13 @@ fn write_atomically(path: &Path, map: &BTreeMap<String, EngineSessionRecord>) ->
         }
     }
     let body = serde_json::to_vec_pretty(map).context("serializing engine-session store")?;
-    // `.tmp` sibling: same directory so the rename is on the same
-    // filesystem (cross-filesystem rename is not atomic on every
-    // platform and would defeat the safety guarantee above).
-    let tmp = path.with_extension("json.tmp");
+    // `.tmp.<pid>.<nonce>` sibling: same directory so the rename is
+    // on the same filesystem (cross-filesystem rename is not atomic
+    // on every platform and would defeat the safety guarantee
+    // above), AND unique per writer so concurrent saves cannot
+    // collide on the temp path.
+    let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
     {
         let mut f = std::fs::File::create(&tmp).with_context(|| {
             format!(
@@ -438,14 +454,233 @@ fn write_atomically(path: &Path, map: &BTreeMap<String, EngineSessionRecord>) ->
         f.write_all(&body)?;
         f.sync_all().ok();
     }
-    std::fs::rename(&tmp, path).with_context(|| {
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Best-effort cleanup so a failed rename never leaves a
+        // half-written temp behind that could later be picked up by
+        // a reader.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "committing engine-session store {} (rename from {})",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// Atomic locked read-modify-write. Takes an exclusive advisory
+/// lock on a sibling lockfile (`<data_path>.lock`) for the WHOLE
+/// load → apply(f) → save critical section, so concurrent writers
+/// (e.g. two `--persist-session` invocations racing on the same
+/// store) serialize and each one observes the latest on-disk state
+/// BEFORE applying its own delta. Without it, P2 could load a
+/// snapshot, P1 save a record, and P2's later save clobber P1's
+/// record (a lost update). The closure returns `true` to commit
+/// the mutated map back to disk, or `false` to skip the write
+/// (e.g. when `clear` finds the key absent or `prune` evicted
+/// nothing) — a no-op stays truly side-effect-free.
+///
+/// The lock uses `fs2::FileExt::lock_exclusive` on a sidecar file —
+/// the same `flock(2)`-based advisory locking idiom already used by
+/// [`crate::utilization::UtilizationStore`] and
+/// [`crate::ledger`]. `lock_exclusive` is a kernel-level wait: the
+/// thread blocks until the kernel grants the lock, so racing writers
+/// serialize naturally on real POSIX systems (and on Windows the
+/// `fs2` shim emulates the same semantics). On holder process death
+/// the OS closes the FD and the lock is released, so a crashed
+/// writer cannot wedge the store. The returned [`LockGuard`] is
+/// RAII: it unlinks the lockfile on Drop so a panic / early return
+/// still releases the lock. I/O errors from the load path are
+/// non-fatal (a fresh map is used, mirroring
+/// `EngineSessionStore::load`); lock-acquire and save failures
+/// propagate.
+///
+/// Note: `flock(2)` is unreliable over NFS — locks may be silently
+/// ignored between clients. The engine-session store lives on a
+/// local filesystem (the operator's `$ZODER_HOME` / `~/.zoder/`)
+/// under documented usage, so this is not a current concern; a
+/// future config that points the store at an NFS share would need
+/// to acknowledge the weakened cross-host serialization, mirroring
+/// the note atop `crate::ledger`.
+fn mutate_locked(
+    cfg: &StoreConfig,
+    f: impl FnOnce(&mut BTreeMap<String, EngineSessionRecord>) -> bool,
+) -> Result<()> {
+    if let Some(parent) = cfg.path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating parent dir for engine-session store {}",
+                    cfg.path.display()
+                )
+            })?;
+        }
+    }
+    // Acquire the cross-process lock FIRST, before reading the data
+    // file. Otherwise another writer could save between our load and
+    // our save and we'd lose its update. The lock is held for the
+    // whole read → merge → write critical section and released by
+    // `LockGuard::drop` at function end.
+    let _guard = LockGuard::acquire(&cfg.path).with_context(|| {
         format!(
-            "committing engine-session store {} (rename from {})",
-            path.display(),
-            tmp.display()
+            "acquiring engine-session store lock {}",
+            lock_path_for(&cfg.path).display()
         )
     })?;
-    Ok(())
+    // Load the freshest on-disk state UNDER the lock so we merge
+    // onto whatever the previous holder just wrote.
+    let mut map: BTreeMap<String, EngineSessionRecord> = match std::fs::read_to_string(&cfg.path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => BTreeMap::new(),
+    };
+    if !f(&mut map) {
+        // Caller decided the mutation is a no-op (clear found
+        // nothing, prune evicted nothing, …). Skip the write so
+        // we don't needlessly bump mtime / flicker a temp file.
+        return Ok(());
+    }
+    write_atomically(&cfg.path, &map)
+    // `_guard` drops here, unlocking + unlinking the lockfile.
+}
+
+/// Sibling lockfile path for the engine-session store at `path`.
+/// Mirrors `crate::utilization::UtilizationStore::lockfile_path` —
+/// appends `.lock` (rather than replacing the extension) so the
+/// lockfile is visibly distinct from the JSON data file:
+/// `engine_sessions.json` → `engine_sessions.json.lock`.
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// RAII guard for the engine-session store's `<data_path>.lock`
+/// sidecar. Owns an exclusive `fs2::FileExt::lock_exclusive` for
+/// the duration of the critical section and unlinks the lockfile
+/// on Drop (so a panic or early return still releases the lock and
+/// cleans up). Mirrors the `crate::utilization::UtilizationStore`
+/// pattern.
+struct LockGuard {
+    /// Held open so `flock(2)` stays alive; on Drop the kernel
+    /// releases the lock automatically, and we additionally unlink
+    /// the file so the next reader sees a clean dir.
+    _file: File,
+    path: PathBuf,
+}
+
+impl LockGuard {
+    /// Open (creating if needed) the sidecar lockfile and block
+    /// until `fs2::FileExt::lock_exclusive` is granted.
+    ///
+    /// Returns `Err(io::Error)` with an explicit OS error kind and
+    /// a contextual message naming the lockfile path so callers
+    /// (and ultimately end users) can tell *which* lock failed to
+    /// open or acquire. `acquire` itself does not have a context
+    /// for the data file, so it can only embed the lockfile path;
+    /// the public call site in `mutate_locked` adds the data-file
+    /// context on top via `anyhow::Context`.
+    fn acquire(data_path: &Path) -> std::io::Result<Self> {
+        let lock_path = lock_path_for(data_path);
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "creating parent dir for engine-session store lockfile {}: {}",
+                            lock_path.display(),
+                            e
+                        ),
+                    )
+                })?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "opening engine-session store lockfile {}: {}",
+                        lock_path.display(),
+                        e
+                    ),
+                )
+            })?;
+        // `lock_exclusive` blocks until the kernel grants the
+        // `flock(2)`; on process death the FD is closed by the kernel
+        // and the lock is released, so a crashed holder cannot
+        // deadlock the next caller. Wrap the error with the lockfile
+        // path so the caller sees "which lock" and not a bare OS
+        // errno.
+        file.lock_exclusive().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "acquiring exclusive flock(2) on engine-session store lockfile {}: {}",
+                    lock_path.display(),
+                    e
+                ),
+            )
+        })?;
+        Ok(LockGuard {
+            _file: file,
+            path: lock_path,
+        })
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // Best-effort unlink so the lockfile does not linger — a
+        // stale lockfile would force every subsequent writer to
+        // contend with `fs2::lock_exclusive` blocking on the file
+        // even when no live holder exists.
+        //
+        // Cross-platform semantics of `remove_file` on a still-open
+        // FD:
+        //   * Linux / macOS (POSIX): the underlying `unlink(2)`
+        //     removes the directory entry while keeping the inode
+        //     alive for the open FD. The `flock(2)` is on the open
+        //     file description (not the path), so the lock stays
+        //     held until the kernel closes the FD in `_file`'s
+        //     `Drop` (run at the end of this function). Removing
+        //     the path during that brief window is safe — the
+        //     next acquirer will simply `create(true)` a fresh
+        //     inode at the same path and `lock_exclusive` it.
+        //   * Windows: `fs2::lock_exclusive` is implemented via
+        //     `LockFileEx` on a file HANDLE. `remove_file` of an
+        //     in-use file returns `ERROR_SHARING_VIOLATION` and is
+        //     silently swallowed by `let _ =`. The lockfile will
+        //     persist on disk after the handle closes, but a fresh
+        //     `OpenOptions::create(true).truncate(false).open(...)`
+        //     still opens the same path with a fresh handle, and a
+        //     following `lock_exclusive` blocks correctly — the
+        //     lingering inode does not deadlock later writers, it
+        //     only leaves a 0-byte file behind that the next save
+        //     truncates or rewrites. The next `LockGuard::drop`
+        //     will retry the unlink, so the lockfile does not
+        //     accumulate permanently under steady-state use.
+        //
+        // In both regimes a race is benign: if a second acquirer
+        // opens the path between this `remove_file` and our own FD
+        // close, the second acquirer's open sees a brand-new inode
+        // and `lock_exclusive`s independently on its own FD; the
+        // prior holder's lock remains on its (still-open) FD and
+        // is honored by the kernel exactly the same way as if the
+        // unlink had not happened. The race is therefore
+        // indistinguishable from a slightly later acquisition, and
+        // the lock semantics survive.
+        let _ = std::fs::remove_file(&self.path);
+        // `_file` drops at scope end; on POSIX the kernel releases
+        // the `flock(2)` when the FD closes.
+    }
 }
 
 /// Apply the store's two eviction policies (drop-stale + enforce-
@@ -1062,5 +1297,384 @@ mod tests {
         let cfg = StoreConfig::new(std::path::PathBuf::from("/tmp/whatever"));
         assert_eq!(cfg.max_entries, DEFAULT_MAX_ENTRIES);
         assert_eq!(cfg.max_entries, 128);
+    }
+
+    // ---- CONCURRENCY REGRESSION GUARDS ----------------------------
+    //
+    // The pre-fix `save_with_scope` was an unlocked read → merge →
+    // rename sequence using a FIXED temp filename
+    // (`engine_sessions.json.tmp`). Two concurrent `--persist-session`
+    // runs could each read the same (possibly empty `{}`) snapshot,
+    // merge in their own new record, and rename — the second rename
+    // would clobber the first writer's record (lost update), or the
+    // two temp-file writes could interleave and corrupt each other
+    // before either rename happened. The fix wraps the read →
+    // merge → write in a sidecar lockfile (`<stem>.lock`) held for
+    // the whole critical section, AND makes the temp file unique
+    // per process + monotonic nonce. These tests pin both halves of
+    // the fix.
+
+    /// LOST UPDATE (the real bug): two concurrent `save_with_scope`
+    /// calls on the same path, each persisting a DIFFERENT record,
+    /// must BOTH survive on reload. The pre-fix pattern (load
+    /// snapshot → insert → save) had no lock spanning the
+    /// read-modify-write AND both writers used the SAME fixed temp
+    /// filename, so the two writers could each read a stale (or
+    /// empty) snapshot and the second's rename would clobber the
+    /// first's record (lost update), or their temp-file writes
+    /// could interleave and corrupt each other before either
+    /// rename landed. The fix wraps the read → merge → write in a
+    /// sidecar lockfile (`<stem>.lock`) held for the whole
+    /// critical section AND makes the temp file unique per writer
+    /// (`<stem>.json.tmp.<pid>.<nonce>`). This test runs two
+    /// threads in parallel against the same store, synchronized on
+    /// a barrier so both call sites enter the critical section
+    /// close in time, and asserts both records survive. With the
+    /// lock in place, the second writer reloads the freshest
+    /// on-disk state (post-first-writer-commit) before merging its
+    /// own delta; without it, one of the records is silently
+    /// dropped.
+    #[test]
+    fn save_with_scope_serializes_and_does_not_lose_updates() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let cfg = StoreConfig::new(&path);
+
+        // Two writers, two distinct records, one shared store.
+        // The barrier holds both threads at the gate so they enter
+        // the critical section as close in time as possible; the
+        // lockfile acquisition is what actually serializes them.
+        let cfg_a = cfg.clone();
+        let cfg_b = cfg.clone();
+        let gate = Arc::new(Barrier::new(2));
+
+        let a = thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                gate.wait();
+                EngineSessionStore::save_with_scope(
+                    &cfg_a,
+                    &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo-a")),
+                    "sid-a",
+                )
+            }
+        });
+        let b = thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                gate.wait();
+                EngineSessionStore::save_with_scope(
+                    &cfg_b,
+                    &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo-b")),
+                    "sid-b",
+                )
+            }
+        });
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+
+        // Both records must be present on disk after both saves.
+        // Pre-fix the second writer's save could clobber the
+        // first's record (whichever read a stale snapshot lost
+        // the race).
+        let after = read_all_records(&path);
+        assert_eq!(
+            after.len(),
+            2,
+            "both concurrent records must survive; after-save map = {after:?}"
+        );
+        assert!(
+            after.values().any(|r| r.session_id == "sid-a"),
+            "writer A's record (sid-a) must NOT be lost by writer B's save (lost-update bug); \
+             after-save map = {after:?}"
+        );
+        assert!(
+            after.values().any(|r| r.session_id == "sid-b"),
+            "writer B's record (sid-b) must persist; after-save map = {after:?}"
+        );
+
+        // The lockfile is a create_new lockfile released by a
+        // Drop guard, so after both writers return it MUST be
+        // gone — a leftover lockfile would wedge the next writer
+        // until the stale timeout.
+        assert!(
+            !lock_path_for(&path).exists(),
+            "the lockfile must be removed by the Drop guard after save_with_scope returns"
+        );
+    }
+
+    /// Save's temp file must never use the deterministic legacy
+    /// path (`<stem>.json.tmp`) — the regression guard for the
+    /// "two writers can't share a temp file" half of the fix. A
+    /// fixed temp name is what allowed two concurrent saves to
+    /// corrupt each other's writes before either rename. With the
+    /// fix the temp name carries the pid and a monotonic nonce
+    /// (`<stem>.json.tmp.<pid>.<nonce>`) so two in-flight writes
+    /// always have distinct paths.
+    #[test]
+    fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let cfg = StoreConfig::new(&path);
+
+        EngineSessionStore::save(
+            &cfg,
+            "goose",
+            &PathBuf::from("/tmp/acp-store-test/repo"),
+            "sid-1",
+        )
+        .unwrap();
+
+        // The deterministic legacy temp path must never be used or
+        // left behind — that was the second half of the bug.
+        let deterministic = path.with_extension("json.tmp");
+        assert!(
+            !deterministic.exists(),
+            "the deterministic legacy temp path must never be used/left behind"
+        );
+        // No leftover temp files of ANY shape (deterministic or
+        // unique) — the unique temp is renamed into place and a
+        // failed write would have removed it, so a fresh
+        // round-trip leaves no `.json.tmp` behind.
+        let mut stray_tmps = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.contains(".json.tmp") {
+                stray_tmps.push(name);
+            }
+        }
+        assert!(
+            stray_tmps.is_empty(),
+            "save() must clean up its unique temp; found strays: {stray_tmps:?}"
+        );
+    }
+
+    /// Two saves to the same scope on the same store: the second
+    /// save's record (same scope, different session id) must win
+    /// without leaving torn state. Pairs with the lost-update
+    /// test above — that one covers different scopes (both must
+    /// survive), this one covers same-scope last-writer-wins.
+    #[test]
+    fn save_same_scope_twice_keeps_only_latest_without_lock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let cfg = StoreConfig::new(&path);
+        let scope = make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo"));
+
+        EngineSessionStore::save_with_scope(&cfg, &scope, "first").unwrap();
+        EngineSessionStore::save_with_scope(&cfg, &scope, "second").unwrap();
+
+        let rec = EngineSessionStore::load(&cfg, &scope)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(rec.session_id, "second");
+        // Exactly one record — same-scope second save overwrote
+        // the first, not appended.
+        assert_eq!(read_all_records(&path).len(), 1);
+
+        // Lockfile must still be cleaned up.
+        assert!(!lock_path_for(&path).exists());
+    }
+
+    /// Reviewer-requested regression: two concurrent load → merge → save
+    /// cycles on the same store must NOT lose either record. The defect
+    /// under fix was an UNLOCKED read-modify-write: P1 and P2 each loaded
+    /// the (possibly empty) snapshot, merged in their own record, and
+    /// saved — so whichever save landed second clobbered the other's
+    /// record. With the lock in place, the second writer reloads the
+    /// freshest on-disk state (post-first-writer-commit) BEFORE applying
+    /// its own delta, so both records survive.
+    ///
+    /// Runs the two cycles sequentially (no barrier, no threads) so the
+    /// test is deterministic and the failure mode is unambiguous: without
+    /// the lock the second save would still clobber the first because
+    /// both would see only one record's delta applied to a stale base.
+    /// This is the exact same code path that runs on disk under two
+    /// concurrent `--persist-session` invocations; the difference is
+    /// only who triggers the serial order.
+    #[test]
+    fn two_concurrent_load_merge_save_cycles_keep_both_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let cfg = StoreConfig::new(&path);
+
+        // Cycle A: write record A.
+        EngineSessionStore::save_with_scope(
+            &cfg,
+            &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo-a")),
+            "sid-a",
+        )
+        .expect("cycle-A save must succeed");
+
+        // Cycle B (this is the second `--persist-session` invocation
+        // colliding with A's saved state): write record B to a
+        // DISTINCT scope, so the merge is additive — exactly the
+        // shape that was being lost under the unlocked-and-static-temp
+        // bug.
+        EngineSessionStore::save_with_scope(
+            &cfg,
+            &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo-b")),
+            "sid-b",
+        )
+        .expect("cycle-B save must succeed");
+
+        // Both records must be present on disk. The unlocked-and-static-temp
+        // bug would have dropped whichever the merged delta was applied
+        // second (or torn the file mid-rename so both came back as garbage
+        // JSON and `read_all_records` returned an empty map).
+        let after = read_all_records(&path);
+        assert_eq!(
+            after.len(),
+            2,
+            "both records must survive the second save; after-save map = {after:?}"
+        );
+        assert!(
+            after.values().any(|r| r.session_id == "sid-a"),
+            "cycle A's record (sid-a) must NOT be lost by cycle B's save; \
+             after-save map = {after:?}"
+        );
+        assert!(
+            after.values().any(|r| r.session_id == "sid-b"),
+            "cycle B's record (sid-b) must persist; after-save map = {after:?}"
+        );
+
+        // And a third load must reflect both records — the on-disk file
+        // is the source of truth, so a follow-up reader (a future
+        // `--engine-resume` invocation) sees both.
+        assert_eq!(
+            read_all_records(&path).len(),
+            2,
+            "a follow-up read must observe both records"
+        );
+
+        // The lockfile must not linger after either save.
+        assert!(
+            !lock_path_for(&path).exists(),
+            "the lockfile must be unlinked by the RAII guard after both saves"
+        );
+    }
+
+    /// Deterministic lock-held proof for the `fs2::FileExt::lock_exclusive`
+    /// implementation: open the sidecar lockfile from this thread, take an
+    /// exclusive `flock(2)` on it (so the kernel genuinely considers another
+    /// writer to hold the lock — just having the file exist is NOT enough
+    /// for an `fs2` lock), then call `save_with_scope` from a worker
+    /// thread. The save MUST block on `lock_exclusive` — it cannot
+    /// proceed until this thread drops its `File` and the kernel releases
+    /// the lock. This is the behavioral test of the lock itself: if the
+    /// lock acquisition were skipped (regression) the save would complete
+    /// immediately and the on-disk file would appear while the test
+    /// thread is still holding the FD.
+    #[test]
+    fn save_blocks_when_lockfile_is_held_by_another_writer() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let cfg = StoreConfig::new(&path);
+
+        // Simulate another writer currently holding the lock:
+        // open the sidecar lockfile and acquire an exclusive
+        // `fs2::FileExt::lock_exclusive` on it. Hold the FD open
+        // in this scope for the entire test so the kernel keeps
+        // the flock live. On POSIX `flock(2)` the lock is on the
+        // open-file-description, so any OTHER `open` + `lock_exclusive`
+        // call on the same path blocks until this one closes.
+        let lock_path = lock_path_for(&path);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lockfile");
+        held.lock_exclusive()
+            .expect("acquire flock(2) from test thread");
+
+        // Deterministic two-channel handshake (no fixed sleep).
+        //
+        // Channel `started` — sent by the worker the moment it ENTERS
+        //   `save_with_scope` (i.e. before the work that touches the
+        //   lock or the data file). The test thread waits on this
+        //   before asserting, so the assertion is ordered AFTER the
+        //   worker has run any code that could touch the store. This
+        //   is what removes the previous `thread::sleep(100ms)` race:
+        //   on a slow / loaded CI runner 100ms could be shorter than
+        //   the worker's launch overhead and the assertion would
+        //   trivially pass; on a fast runner a regression that
+        //   skipped the lock acquisition could complete the entire
+        //   save inside that 100ms and the assertion would falsely
+        //   fail. With an explicit `started` signal, the ordering is
+        //   exact: the worker has begun → the test checks state.
+        //
+        // Channel `result` — the worker's final `Result<()>`. The
+        //   test thread blocks here AFTER dropping `held`, so a clean
+        //   release-and-then-finish ordering is preserved.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let cfg2 = cfg.clone();
+        let handle = thread::spawn(move || {
+            // Notify the test thread that we have begun. Send BEFORE
+            // we touch the store so the signal truly precedes any
+            // lock or disk work on our side.
+            let _ = started_tx.send(());
+            let res = EngineSessionStore::save_with_scope(
+                &cfg2,
+                &make_scope("goose", &PathBuf::from("/tmp/acp-store-test/repo")),
+                "sid-late",
+            );
+            let _ = result_tx.send(res);
+        });
+
+        // Wait for the worker to have started. This is a true
+        // happens-before barrier: the worker cannot have run any
+        // store-mutating code (or reached `lock_exclusive`) before
+        // this `recv` returns.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker must signal start within 2s");
+
+        // The on-disk store file must NOT have been written yet. The
+        // worker is blocked on `lock_exclusive` (which is a kernel-
+        // level wait that suspends the thread until the FD-level
+        // flock held by `held` is released). If this assertion ever
+        // fails, the regression is that the save proceeded despite
+        // another writer holding the lock.
+        assert!(
+            !path.exists(),
+            "the on-disk store must not exist while another writer holds the lock; \
+             if it exists, the regression is: the save proceeded despite the lock"
+        );
+
+        // Release the lock. The save should now complete (sub-second)
+        // and report success.
+        drop(held);
+        let res = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the save must complete once the lock is released");
+        res.expect("the save must succeed once the lock is released");
+        handle.join().unwrap();
+
+        // The save wrote the record and cleaned up its own
+        // lockfile. (On POSIX `flock` the kernel releases the lock
+        // when the last FD is closed, so even without a clean
+        // unlink a subsequent lock acquisition by e.g. a follow-up
+        // save in this process would still succeed. The explicit
+        // unlink is belt-and-suspenders.)
+        assert!(
+            path.exists(),
+            "the on-disk store must exist after the unblocked save"
+        );
+        assert!(
+            !lock_path.exists(),
+            "the worker must have unlinked the lockfile on Drop"
+        );
+        let after = read_all_records(&path);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after.values().next().unwrap().session_id, "sid-late");
     }
 }
