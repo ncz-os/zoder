@@ -6,7 +6,7 @@
 use agent_descriptor::{
     consumer::{derive_transport, Error as ConsumerError},
     descriptor_id,
-    validate::{validate_and_parse, validate_v1},
+    validate::{validate_and_parse, validate_v1, Error as ValidateError, ValidationError},
     AgentDescriptor, Capabilities, ConformanceLevel,
 };
 use serde_json::Value;
@@ -448,4 +448,47 @@ fn c4_ad2_fully_valid_l2_descriptor_still_passes_both_entry_points() {
     let parsed = validate_and_parse(&d).expect("fully-valid L2 descriptor must parse");
     assert_eq!(parsed.conformance_level, ConformanceLevel::L2);
     assert!(parsed.config_surface.is_some());
+}
+
+#[test]
+fn l2_duplicate_config_surface_knob_names_fail_validate_and_parse() {
+    let mut d = minimal_l1_descriptor();
+    d["conformance_level"] = serde_json::json!(2);
+    d["config_surface"] = serde_json::json!({
+        "source": "env",
+        "schema": { "type": "object" },
+        "knobs": [
+            {
+                "name": "OPENAI_API_KEY",
+                "kind": "string",
+                "required": false,
+                "default": "plain-text-key",
+                "secret": false
+            },
+            {
+                "name": "OPENAI_API_KEY",
+                "kind": "secret_ref",
+                "required": true,
+                "secret": true,
+                "ref": "OPENAI_API_KEY"
+            }
+        ]
+    });
+
+    let err = validate_and_parse(&d)
+        .expect_err("duplicate config_surface knob names must fail validate_and_parse");
+    match &err {
+        ValidateError::Schema(ValidationError::Schema { path, message }) => {
+            assert_eq!(path, "/config_surface/knobs/1/name");
+            assert!(
+                message.contains("duplicate config_surface knob name"),
+                "error should explain the duplicate-name violation, got: {message}"
+            );
+            assert!(
+                message.contains("OPENAI_API_KEY"),
+                "error should name the duplicated knob, got: {message}"
+            );
+        }
+        other => panic!("expected schema-style validation error, got {other:?}"),
+    }
 }
