@@ -231,9 +231,10 @@ fn validate_model_price(
     if let Some(op) = obj.get("off_peak").and_then(|v| v.as_object()) {
         let num = |k: &str| op.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
         // Clamp one window minute field to its inclusive maximum, warning on
-        // out-of-range values (e.g. a typo like 1500) instead of silently
-        // swallowing them. `warn` is the callback the loader passes in so the
-        // warning is captured by tests (and forwarded to stderr in production).
+        // out-of-range values (e.g. a typo like 1500, or an attacker-crafted
+        // value larger than u32::MAX) instead of silently swallowing them.
+        // `warn` is the callback the loader passes in so the warning is
+        // captured by tests (and forwarded to stderr in production).
         //
         // window_start_utc_min is a real minute-of-day: valid in [0, 1439].
         // window_end_utc_min is an EXCLUSIVE end boundary: valid in [0, 1440],
@@ -242,6 +243,19 @@ fn validate_model_price(
         // UTC). Previously the parser clamped BOTH fields with `.min(1439)`,
         // which silently destroyed the legitimate 1440 end-of-day value and
         // caused 23:59-UTC calls to be billed at the peak rate.
+        //
+        // SECURITY: the raw value is read as `u64` (because JSON integers are
+        // arbitrary-width and an operator can supply `u32::MAX` or larger).
+        // We MUST compare against the *original* `u64` against the allowed
+        // range BEFORE casting to `u32` -- a naive `as u32` cast silently
+        // truncates values above `u32::MAX`, and the truncated value can land
+        // inside the valid range (e.g. `4_294_967_296_u64 as u32 == 0`,
+        // which the per-field check `0 <= max` would happily accept). An
+        // attacker who controls the catalog could use that path to inject
+        // an arbitrary minute-of-day and reshape the off-peak window. We
+        // also surface `u32::MAX`-exceeding values with a dedicated warning
+        // so the audit trail records the *original* value, not the truncated
+        // one -- otherwise the warning text would lie about what was loaded.
         fn clamp_window_min(
             op: &serde_json::Map<String, serde_json::Value>,
             model_id: &str,
@@ -249,15 +263,38 @@ fn validate_model_price(
             max: u32,
             warn: &mut dyn FnMut(String),
         ) -> u32 {
-            let raw = op.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let Some(raw_u64) = op.get(key).and_then(|v| v.as_u64()) else {
+                // Absent, non-numeric, or negative -- treat as 0. A negative
+                // value is not representable as `u64`; fall back to the
+                // missing-field default rather than rejecting the model.
+                return 0;
+            };
+            // Step 1: catch values that don't fit in `u32` BEFORE we cast.
+            // Without this check, `(raw_u64 as u32)` would silently truncate
+            // and the truncated value could land in the valid range, bypassing
+            // the warning entirely. We name the *original* value in the warning
+            // so operators can see what was actually written to the catalog.
+            if raw_u64 > u32::MAX as u64 {
+                warn(format!(
+                    "model \"{model_id}\": off_peak.{key}={raw_u64} exceeds u32::MAX ({}), out of range; clamping to {max}",
+                    u32::MAX
+                ));
+                return max;
+            }
+            // Safe to narrow now: `raw_u64 <= u32::MAX`.
+            let raw = raw_u64 as u32;
+            // Step 2: catch values within `u32::MAX` but above the per-field
+            // max (e.g. a typo like 1500 on the end field, whose max is 1440).
+            // Keep the original `u32` in the warning so it matches what the
+            // operator wrote (no need to print the upper bound here -- the
+            // dedicated u32::MAX branch above already covers that case).
             if raw > max {
                 warn(format!(
                     "model \"{model_id}\": off_peak.{key}={raw} > {max} (out of range), clamping to {max}"
                 ));
-                max
-            } else {
-                raw
+                return max;
             }
+            raw
         }
         let op_input = num("input_usd_per_mtok");
         let op_output = num("output_usd_per_mtok");
@@ -730,6 +767,174 @@ mod tests {
                 .any(|w| w.contains("window_start_utc_min=2000")),
             "expected a warning naming the out-of-range start, got {:?}",
             warnings2
+        );
+    }
+
+    /// SECURITY: window minute values larger than `u32::MAX` (4_294_967_295)
+    /// must NOT be silently truncated by a naive `as u32` cast before the
+    /// out-of-range check. JSON integers are arbitrary-width so an attacker
+    /// who controls the catalog can supply e.g. `4_294_967_296` (= `u32::MAX
+    /// + 1`), which casts to `0_u32` — and `0 <= 1440`, so the previous
+    /// code happily accepted it as a valid end-of-day-style minute and
+    /// emitted NO warning. Worse, picking a value like `2 * u32::MAX + 1`
+    /// truncates to `1`, letting the attacker pin the off-peak start at
+    /// minute-of-day `1` with no audit trail.
+    ///
+    /// The fix compares the *original* `u64` against `u32::MAX` BEFORE
+    /// casting and against the per-field `max` AFTER casting. A
+    /// `u32::MAX`-exceeding value must (a) trigger a warning naming the
+    /// *original* un-truncated value (so the audit trail is honest), and
+    /// (b) clamp to the per-field max instead of becoming a sneaky-valid
+    /// minute.
+    #[test]
+    fn off_peak_window_rejects_u32_max_exceeding_values_before_truncation() {
+        // Helper: build a minimal valid off-peak catalog entry with a
+        // caller-supplied window minute value.
+        let entry = |start: serde_json::Value, end: serde_json::Value| {
+            serde_json::json!({
+                "input_usd_per_mtok": 1.0,
+                "output_usd_per_mtok": 2.0,
+                "off_peak": {
+                    "input_usd_per_mtok": 0.10,
+                    "output_usd_per_mtok": 0.20,
+                    "window_start_utc_min": start,
+                    "window_end_utc_min": end
+                }
+            })
+        };
+
+        // --- Case 1: `u32::MAX + 1 = 4_294_967_296`. ---
+        // This is THE attack value: the OLD code cast it to 0_u32, then
+        // saw `0 <= 1440` and accepted it as a valid window_end with no
+        // warning. We must catch it.
+        // Note: `format!("{}", n_u64)` renders without underscores, so the
+        // warning text reads `4294967296`, not `4_294_967_296`.
+        let raw = entry(serde_json::json!(0), serde_json::json!(4_294_967_296_u64));
+        let mut warnings = Vec::new();
+        let p = validate_model_price("huge-end/op", &raw, &mut |w| warnings.push(w))
+            .expect("model with huge end must still load (just warned)");
+        let op = p.off_peak.expect("off-peak kept");
+        assert_eq!(
+            op.window_end_utc_min, 1440,
+            "u32::MAX+1 on end must clamp to 1440, not silently truncate to 0"
+        );
+        // The warning must name the ORIGINAL value, not the truncated one.
+        // The OLD code would have either (a) printed no warning at all
+        // (truncation landed inside the valid range), or (b) printed the
+        // truncated value. Either way the audit trail was useless.
+        assert!(
+            warnings.iter().any(|w| w.contains("4294967296")
+                && w.contains("window_end_utc_min")
+                && w.contains("exceeds u32::MAX")),
+            "expected a warning naming the ORIGINAL value 4294967296 \
+             and 'exceeds u32::MAX'; got {:?}",
+            warnings
+        );
+
+        // --- Case 2: `2 * u32::MAX + 1 = 8_589_934_591` truncates to 1. ---
+        // The OLD code would have silently accepted `start = 1` and
+        // enabled off-peak coverage from 00:01 UTC onwards with no
+        // warning whatsoever. The fix must catch it.
+        let raw2 = entry(
+            serde_json::json!(8_589_934_591_u64),
+            serde_json::json!(1440),
+        );
+        let mut warnings2 = Vec::new();
+        let p2 = validate_model_price("huge-start/op", &raw2, &mut |w| warnings2.push(w))
+            .expect("model with huge start must still load (just warned)");
+        let op2 = p2.off_peak.expect("off-peak kept");
+        assert_eq!(
+            op2.window_start_utc_min, 1439,
+            "u32::MAX*2+1 on start must clamp to 1439, not silently \
+             truncate to 1"
+        );
+        assert!(
+            warnings2.iter().any(|w| w.contains("8589934591")
+                && w.contains("window_start_utc_min")
+                && w.contains("exceeds u32::MAX")),
+            "expected a warning naming the ORIGINAL value 8589934591 \
+             and 'exceeds u32::MAX'; got {:?}",
+            warnings2
+        );
+
+        // --- Case 3: reviewer's example, `5_000_000_000`. ---
+        // Truncates to 705_032_704_u32, which is > 1440, so the OLD code
+        // DID warn -- but with the truncated value in the message
+        // (`window_end_utc_min=705032704`), hiding the actual magnitude
+        // from the operator. The fix must show the original value AND
+        // route through the dedicated `u32::MAX` branch.
+        let raw3 = entry(serde_json::json!(0), serde_json::json!(5_000_000_000_u64));
+        let mut warnings3 = Vec::new();
+        let p3 = validate_model_price("reviewer/op", &raw3, &mut |w| warnings3.push(w))
+            .expect("model with 5B end must still load (just warned)");
+        let op3 = p3.off_peak.expect("off-peak kept");
+        assert_eq!(op3.window_end_utc_min, 1440, "end clamped to 1440");
+        assert!(
+            warnings3
+                .iter()
+                .any(|w| w.contains("5000000000") && w.contains("exceeds u32::MAX")),
+            "expected a warning naming the ORIGINAL value 5000000000 \
+             and 'exceeds u32::MAX'; got {:?}",
+            warnings3
+        );
+        // And specifically the truncated value must NOT appear in the
+        // warning text -- that would mean we lost precision before warning.
+        assert!(
+            !warnings3.iter().any(|w| w.contains("705032704")),
+            "warning must not show truncated value 705032704; got {:?}",
+            warnings3
+        );
+
+        // --- Case 4: exact `u32::MAX = 4_294_967_295` on start. ---
+        // This is the boundary case: `u32::MAX as u32 == u32::MAX == 4294967295`,
+        // which is `> max (1439)`, so it MUST fall into the per-field
+        // out-of-range branch (the second warning template), NOT the
+        // `exceeds u32::MAX` branch. The fix must NOT misclassify a
+        // representable `u32` value as overflowing.
+        let raw4 = entry(serde_json::json!(u32::MAX as u64), serde_json::json!(1440));
+        let mut warnings4 = Vec::new();
+        let p4 = validate_model_price("boundary/op", &raw4, &mut |w| warnings4.push(w))
+            .expect("model with u32::MAX start must still load (just warned)");
+        let op4 = p4.off_peak.expect("off-peak kept");
+        assert_eq!(
+            op4.window_start_utc_min, 1439,
+            "u32::MAX on start must clamp to 1439 via the per-field branch"
+        );
+        // The warning should use the per-field template (no `exceeds u32::MAX`).
+        assert!(
+            warnings4
+                .iter()
+                .any(|w| w.contains("window_start_utc_min=4294967295") && w.contains("> 1439")),
+            "u32::MAX must take the per-field out-of-range branch, got {:?}",
+            warnings4
+        );
+        assert!(
+            !warnings4.iter().any(|w| w.contains("exceeds u32::MAX")),
+            "u32::MAX is representable and must NOT trigger the overflow branch; \
+             got {:?}",
+            warnings4
+        );
+
+        // --- Case 5: a negative integer in JSON. ---
+        // serde_json::Value::as_u64 returns None for negatives; we treat
+        // that as "missing/0" (matching the original semantics) rather
+        // than rejecting the model. This is the softest path; the test
+        // pins the behavior so a future refactor can't quietly start
+        // accepting negatives as large unsigned values.
+        let raw5 = entry(serde_json::json!(-5), serde_json::json!(1440));
+        let mut warnings5 = Vec::new();
+        let p5 = validate_model_price("negative/op", &raw5, &mut |w| warnings5.push(w))
+            .expect("model with negative start must still load (no warning)");
+        let op5 = p5.off_peak.expect("off-peak kept");
+        assert_eq!(
+            op5.window_start_utc_min, 0,
+            "negative JSON int on window minute must default to 0 (no cast)"
+        );
+        assert!(
+            warnings5.is_empty(),
+            "negative values must not produce a warning (defaulted silently); \
+             got {:?}",
+            warnings5
         );
     }
 
