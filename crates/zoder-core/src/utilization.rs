@@ -1152,7 +1152,7 @@ pub fn build_account_view(
                 (Some(p), _) if p.window_minutes == Some(header_window_minutes) => {
                     Some((p.used_percent, r.last_updated))
                 }
-                (Some(p), Some(s)) if s.window_minutes == Some(header_window_minutes) => {
+                (Some(_), Some(s)) if s.window_minutes == Some(header_window_minutes) => {
                     Some((s.used_percent, r.last_updated))
                 }
                 // Fallback: header snapshots that don't carry a
