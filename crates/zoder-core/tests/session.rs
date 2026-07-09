@@ -1,6 +1,7 @@
 use zoder_core::Session;
 
 #[test]
+#[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
 fn save_load_latest_and_list() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -27,6 +28,7 @@ fn save_load_latest_and_list() {
 }
 
 #[test]
+#[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
 fn id_is_path_safe() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
