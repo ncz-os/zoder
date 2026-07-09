@@ -499,7 +499,12 @@ mod tests {
         assert_eq!(nvidia_llama.provider_id.as_deref(), Some("nvidia-eih"));
         assert_eq!(nvidia_llama.classification, Some(Classification::Capacity));
         assert!(nvidia_llama.is_skipped_by_classification());
-        assert_eq!(nvidia_llama.failures, 1);
+        // Capacity is a skip-class outcome (W1): consult skips it by
+        // classification, so it must NOT count against the breaker.
+        assert_eq!(
+            nvidia_llama.failures, 0,
+            "Capacity must not count as a breaker failure"
+        );
 
         let claude = &s.models["anthropic/claude-3.7"];
         assert_eq!(claude.classification, Some(Classification::Reachable));
