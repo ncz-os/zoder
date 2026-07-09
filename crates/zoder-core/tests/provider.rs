@@ -53,6 +53,24 @@ async fn streaming_sse_is_assembled() {
 }
 
 #[tokio::test]
+async fn streaming_sse_eof_before_done_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(err.message.contains("terminal [DONE] marker"), "got: {err}");
+}
+
+#[tokio::test]
 async fn non_streaming_object_is_parsed() {
     let server = MockServer::start().await;
     let body = serde_json::json!({
@@ -1001,6 +1019,35 @@ data: {\"type\":\"message_stop\"}\n\
     assert_eq!(res.completion_tokens, Some(2));
 }
 
+#[tokio::test]
+async fn anthropic_streaming_eof_before_message_stop_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&anthropic_req("claude", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(
+        err.message.contains("terminal message_stop marker"),
+        "got: {err}"
+    );
+}
+
 /// Stream that closes via `message_stop` without producing any text
 /// delta — same schema-invalid-2xx contract as the non-streaming
 /// Z-23 placeholder start marker
@@ -1542,6 +1589,35 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\"
     // output_tokens from the same envelope.
     assert_eq!(res.prompt_tokens, Some(5));
     assert_eq!(res.completion_tokens, Some(2));
+}
+
+#[tokio::test]
+async fn responses_streaming_eof_before_completed_is_decode_error() {
+    let server = MockServer::start().await;
+    let body = "\
+event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\
+\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(serde_json::json!({"stream": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = responses_provider(&server.uri(), Auth::None);
+    let err = p
+        .stream_chat(&responses_req("gpt-5", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    assert!(
+        err.message.contains("terminal response.completed marker"),
+        "got: {err}"
+    );
 }
 
 /// Stream that closes via `response.completed` without producing any
