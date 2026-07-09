@@ -179,18 +179,64 @@ pub struct ConnectedTransport {
     /// — otherwise a timed-out or errored turn leaves a zombie `goose`
     /// process holding the agent's open file handles.
     pub child: Option<Child>,
+    /// Process-group id of the spawned stdio engine (the child leads its own
+    /// group because it is spawned with `.process_group(0)`, so `pgid == pid`).
+    /// `None` for [`EngineTransport::UnixSocket`] and on the (unexpected) path
+    /// where the child exposes no pid. [`Self::kill_child`] uses it to deliver
+    /// `kill(-pgid, SIGKILL)` to the WHOLE group, so tool subprocesses the
+    /// engine forked as GRANDCHILDREN (shell / build commands) die with it
+    /// instead of being reparented to init and leaking one subtree per
+    /// timed-out turn. Captured at spawn time — before the pid can be lost to a
+    /// race with the child exiting — so the group kill still targets the right
+    /// group even if the direct child has already been reaped by the OS by the
+    /// time we call `kill_child`.
+    pub pgid: Option<i32>,
 }
 
 impl ConnectedTransport {
     /// Kill and wait on the spawned stdio engine (if any). Idempotent and
     /// safe to call on every exit path; safe to call when there is no child.
     /// Called by the goose driver in its `Drop`-like guard before returning.
+    ///
+    /// SIGKILL is delivered to the child's WHOLE process group
+    /// (`kill(-pgid, SIGKILL)` on Unix), not just the direct `goose` pid.
+    /// goose forks its tool subprocesses (shell / build commands) as
+    /// GRANDCHILDREN; a single-pid kill would drop only `goose` and leave
+    /// those grandchildren reparented to init, leaking one subtree per
+    /// timed-out turn. Because the child was spawned with `.process_group(0)`
+    /// it leads its own group (`pgid == pid`), so one group kill takes the
+    /// whole subtree down. This mirrors the check path
+    /// (`agentic::run_check_watched` + `kill_process_group`).
+    ///
+    /// SIGKILL is used (not SIGTERM) because it is the only signal guaranteed
+    /// to work even if goose is stuck on a sync syscall or in a model retry
+    /// loop; we already gave it a chance to wind down via `session/cancel`.
+    /// On non-Unix targets (no process groups) we fall back to a single-pid
+    /// `start_kill()`.
     pub async fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // SIGKILL is the only signal guaranteed to work even if goose is
-            // stuck on a sync syscall or in a model retry loop; we already
-            // gave it a chance to wind down via `session/cancel`.
-            let _ = child.start_kill();
+            #[cfg(unix)]
+            {
+                if let Some(pgid) = self.pgid {
+                    // Negative pid => "the process group `pgid`". Best-effort:
+                    // the child may already be gone (ESRCH), which is fine — we
+                    // still `wait()` below to reap the direct child's zombie.
+                    // SAFETY: `libc::kill` is a plain syscall with no memory
+                    // safety obligations; a bad pgid just returns an errno.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                } else {
+                    // No pgid captured (e.g. child exposed no pid at spawn):
+                    // fall back to a single-pid kill so we at least reap goose.
+                    let _ = child.start_kill();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // No process groups on this platform — single-pid kill only.
+                let _ = child.start_kill();
+            }
             let _ = child.wait().await;
         }
     }
@@ -340,6 +386,7 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
                 reader: TransportReader::Unix(reader),
                 writer: TransportWriter::Unix(writer),
                 child: None,
+                pgid: None,
             })
         }
         EngineTransport::Stdio { command, args, env } => {
@@ -349,12 +396,30 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
                 .kill_on_drop(false);
+            // Detach the engine into its own process group so the driver can
+            // SIGKILL the WHOLE subtree on timeout/error — goose forks its tool
+            // subprocesses (shell / build commands) as grandchildren, and a
+            // single-pid kill would leave them reparented to init and leaking.
+            // Tokio maps `process_group(0)` to setpgid(pid, 0) on Unix (the
+            // child leads a fresh group with pgid == pid), with no extra fork.
+            // No-op on non-Unix; kept unconditional to keep the spawn shape
+            // identical across platforms (the group KILL is what's cfg-gated,
+            // in `kill_child`).
+            #[cfg(unix)]
+            cmd.process_group(0);
             for (k, v) in env {
                 cmd.env(k, v);
             }
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("spawning ACP engine `{command}`"))?;
+            // Capture the pgid NOW, at spawn, while the direct child is
+            // guaranteed live. Because of `.process_group(0)` the child leads
+            // its own group, so `child.id()` (its pid) IS the pgid. Capturing
+            // here (rather than in `kill_child`) means the group kill still
+            // targets the right group even if the direct `goose` pid has
+            // already been reaped by the OS by the time we tear down.
+            let pgid = child.id().map(|p| p as i32);
             // `.take()` detaches the half from the Child so dropping Child
             // doesn't auto-close them — and conversely dropping the half
             // doesn't signal the child (the Child owns the death semantics).
@@ -371,6 +436,8 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
                 writer: TransportWriter::ChildStdin(stdin),
                 // Retain the Child so the driver can reap it on timeout / error.
                 child: Some(child),
+                // Group kill target for `kill_child` (see field docs).
+                pgid,
             })
         }
     }
@@ -6800,6 +6867,11 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(false);
+        // Spawn in its own process group (as the production goose spawn does)
+        // so the group-kill path in `kill_child` (`kill(-pgid, SIGKILL)`)
+        // targets a real group led by this child.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn sleep");
         let pid = child.id().expect("child has pid");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -6808,6 +6880,7 @@ mod tests {
             reader: TransportReader::ChildStdout(stdout),
             writer: TransportWriter::ChildStdin(stdin),
             child: Some(child),
+            pgid: Some(pid as i32),
         };
         // Sanity: process is alive right now.
         // We use `libc::kill(pid, 0)` as a portable liveness probe (returns
@@ -6831,6 +6904,115 @@ mod tests {
         );
         // Idempotent: calling again is fine and doesn't panic.
         conn.kill_child().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_child_reaps_grandchild_process_group() {
+        // SB1 regression: goose forks its tool subprocesses (shell / build
+        // commands) as GRANDCHILDREN. Before the fix, `kill_child` sent a
+        // single-pid SIGKILL to only the direct `goose` process; the
+        // grandchildren were reparented to init and kept running, leaking one
+        // subtree per timed-out turn. The fix spawns the engine with
+        // `.process_group(0)` and delivers `kill(-pgid, SIGKILL)` to the whole
+        // group.
+        //
+        // This test builds that exact shape hermetically (no `goose` binary):
+        // a `/bin/sh` "parent" that forks a `sleep 600` GRANDCHILD, writes the
+        // grandchild's pid to a temp file, then blocks forever itself. We wrap
+        // the parent in a `ConnectedTransport` the same way the production
+        // spawn does (own process group, pgid captured), call `kill_child()`,
+        // and assert the GRANDCHILD is gone — which only holds if the kill went
+        // to the whole group, not just the direct child.
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        let pidfile_str = pidfile.to_str().expect("utf8 path").to_string();
+
+        // Parent shell: background a long sleep (the grandchild), record its
+        // pid, then wait forever so the parent stays alive until we kill it.
+        let script = format!("sleep 600 & echo $! > '{pidfile_str}'; while true; do sleep 1; done");
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(false)
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn parent shell");
+        let parent_pid = child.id().expect("parent has pid");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut conn = ConnectedTransport {
+            reader: TransportReader::ChildStdout(stdout),
+            writer: TransportWriter::ChildStdin(stdin),
+            child: Some(child),
+            // As the production spawn does: the child leads its own group, so
+            // its pid is the pgid.
+            pgid: Some(parent_pid as i32),
+        };
+
+        // Wait for the grandchild pid to appear in the pidfile (the parent
+        // shell needs a moment to fork the background sleep + write the file).
+        let mut grandchild_pid: Option<i32> = None;
+        for _ in 0..200 {
+            if let Ok(txt) = std::fs::read_to_string(&pidfile) {
+                if let Ok(n) = txt.trim().parse::<i32>() {
+                    if n > 0 {
+                        grandchild_pid = Some(n);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid must appear in the pidfile");
+
+        // Sanity: both parent and grandchild are alive before the reap.
+        let parent_alive = unsafe { libc::kill(parent_pid as libc::pid_t, 0) };
+        assert_eq!(parent_alive, 0, "parent must be alive before reap");
+        let gc_alive = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) };
+        assert_eq!(gc_alive, 0, "grandchild must be alive before reap");
+
+        // The reap under test: this MUST take the grandchild down via the
+        // group kill. A single-pid kill on the parent would leave the
+        // grandchild alive (the bug).
+        conn.kill_child().await;
+
+        // Give the OS a beat to tear the group down (kill is async wrt the
+        // grandchild's own reparent/exit), then poll for the grandchild to be
+        // gone. `kill(pid, 0)` returns -1/ESRCH once it's reaped.
+        let mut gc_gone = false;
+        for _ in 0..200 {
+            let alive = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) };
+            if alive == -1 {
+                gc_gone = true;
+                break;
+            }
+            // Best-effort: reap any adopted zombie so kill(0) reports ESRCH
+            // rather than lingering on a defunct entry (the grandchild is not
+            // our child, so we can't wait() it; we rely on init reaping it).
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Defensive: if the group kill regressed, don't leak the grandchild out
+        // of the test — take it down directly before asserting the failure.
+        if !gc_gone {
+            unsafe {
+                libc::kill(grandchild_pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        assert!(
+            gc_gone,
+            "grandchild (pid {grandchild_pid}) must be reaped by the process-group              kill in kill_child(); a single-pid kill on the parent would leak it              (this is the SB1 bug)"
+        );
+
+        // Idempotent second call must not panic.
+        conn.kill_child().await;
+        let _ = std::io::stdout().flush();
     }
 
     #[tokio::test]
@@ -6866,6 +7048,8 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(false);
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn /bin/sh -c 'sleep 60'");
         let pid = child.id().expect("spawned sleep child must have a pid");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -6874,6 +7058,7 @@ mod tests {
             reader: TransportReader::ChildStdout(stdout),
             writer: TransportWriter::ChildStdin(stdin),
             child: Some(child),
+            pgid: Some(pid as i32),
         };
 
         // Sanity: the process is alive right now.
@@ -6931,6 +7116,8 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(false);
+        #[cfg(unix)]
+        cmd2.process_group(0);
         let mut child2 = cmd2.spawn().expect("spawn second sleep child");
         let pid2 = child2.id().expect("second child must have pid");
         let stdin2 = child2.stdin.take().expect("piped stdin");
@@ -6939,6 +7126,7 @@ mod tests {
             reader: TransportReader::ChildStdout(stdout2),
             writer: TransportWriter::ChildStdin(stdin2),
             child: Some(child2),
+            pgid: Some(pid2 as i32),
         };
         let alive2_before = unsafe { libc::kill(pid2 as libc::pid_t, 0) };
         assert_eq!(alive2_before, 0, "second sleep child must be alive");
