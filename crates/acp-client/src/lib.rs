@@ -791,12 +791,19 @@ pub async fn cancel_session(
     let _ = read_result(&mut reader, "init").await?;
 
     // session/cancel — NOTIFICATION (no `id`), per ACP v1.
+    // Y-2: the zeroclaw daemon (this fn's target: it connects to the engine
+    // socket and its `initialize` uses snake_case `protocol_version`, and
+    // `session/new` returns `session_id`) keys the cancel on snake_case
+    // `session_id`. The previous camelCase `sessionId` made the daemon look up
+    // a non-existent `params.session_id`, so the cancel was a NO-OP — the
+    // author-timeout ghost turn kept editing and the loop reviewed a torn
+    // tree. (Goose uses its own in-turn cancel via stdio, not this path.)
     write_frame(
         &mut write_half,
         &json!({
             "jsonrpc": "2.0",
             "method": "session/cancel",
-            "params": { "sessionId": session_id },
+            "params": { "session_id": session_id },
         }),
     )
     .await?;
@@ -3052,7 +3059,14 @@ async fn read_frame_line_capped<R: AsyncBufRead + Unpin>(
     // misbehaving engine cannot wedge the driver on a non-UTF-8
     // byte in the payload (it'll just fail to JSON-parse, which
     // the caller already handles by skipping the frame).
-    *line = String::from_utf8_lossy(&buf).into_owned();
+    // Y-15: consume `buf` into the String directly on the valid-UTF-8 path
+    // (reuses the same allocation, no copy); fall back to the lossy copy only
+    // when the bytes aren't valid UTF-8. The previous
+    // `from_utf8_lossy(&buf).into_owned()` always allocated a second buffer.
+    *line = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    };
     Ok(true)
 }
 
@@ -6963,9 +6977,16 @@ mod tests {
             "session/cancel MUST be a notification (no id); got {cancel:?}"
         );
         assert_eq!(
-            cancel.pointer("/params/sessionId").and_then(Value::as_str),
+            cancel.pointer("/params/session_id").and_then(Value::as_str),
             Some("sess-z-8"),
-            "session/cancel MUST carry the loop's session id; got {cancel:?}"
+            "Y-2: session/cancel MUST carry the loop's session id under the \
+             snake_case `session_id` key the zeroclaw daemon reads (a \
+             camelCase `sessionId` is silently ignored → cancel is a no-op); \
+             got {cancel:?}"
+        );
+        assert!(
+            cancel.pointer("/params/sessionId").is_none(),
+            "Y-2: must NOT emit the camelCase `sessionId` the daemon ignores; got {cancel:?}"
         );
     }
 
