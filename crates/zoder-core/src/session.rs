@@ -1243,6 +1243,82 @@ mod tests {
         );
     }
 
+    /// Composition pin for DEFECT 1 (lock) + DEFECT 2 (size cap):
+    /// when `mutate_locked` is invoked against a session whose
+    /// on-disk transcript is already oversized, the locked mutation
+    /// must STILL enforce the size cap (via `load_or_new`'s
+    /// pre-read metadata check) and produce a fresh small
+    /// transcript under the lock — not slurp the giant file on the
+    /// way in, and not skip the lock because the body is empty.
+    ///
+    /// Without this guarantee, two failure modes could combine: (a)
+    /// the locked path could bypass the size cap and OOM, or (b)
+    /// the locked path could bypass the lock because the giant
+    /// file looks invalid. Pinning the composition explicitly means
+    /// a future change that, say, inlines `load_or_new` into
+    /// `mutate_locked` without re-implementing the size check is
+    /// caught by `cargo test`.
+    #[test]
+    fn mutate_locked_enforces_size_cap_under_lock() {
+        let dir = tmpdir();
+        let path = Session::path_in(&dir, "huge-locked");
+
+        // Plant an oversized on-disk transcript (above the cap).
+        // The body is NOT valid JSON (it's just spaces) but the
+        // size check fires BEFORE the body parse, so validity is
+        // irrelevant — the cap must trip on metadata alone.
+        let oversized = " ".repeat((MAX_TRANSCRIPT_BYTES + 8) as usize);
+        std::fs::write(&path, &oversized).unwrap();
+
+        // Run a locked mutation. Under the lock:
+        //   1. load_or_new sees the giant file's metadata,
+        //   2. trips the size cap, quarantines the giant file,
+        //   3. returns a fresh empty session,
+        //   4. the closure appends a turn,
+        //   5. save_locked writes a small transcript under the lock.
+        Session::mutate_locked(&dir, "huge-locked", |s| {
+            s.push("user", "first-turn-after-quarantine");
+        })
+        .expect("mutate_locked must succeed against an oversized on-disk transcript");
+
+        // The giant file is no longer at the live path's size — it
+        // was quarantined by the in-lock load_or_new, and the locked
+        // `save_locked` then wrote a fresh small transcript at the
+        // same live path. We confirm by size: the live file is now
+        // small (well under the cap), not the giant 8 MiB+ one.
+        let live_size = std::fs::metadata(&path)
+            .expect("the live transcript must exist (save_locked just wrote it)")
+            .len();
+        assert!(
+            live_size < MAX_TRANSCRIPT_BYTES,
+            "the live transcript must be small (under the cap) after a locked mutation against \
+             an oversized on-disk file; got {live_size} bytes — if this fires, the in-lock \
+             load_or_new did NOT trip the size cap and the giant body was either slurped or \
+             re-saved"
+        );
+
+        // The fresh small transcript is on disk at the live path
+        // and round-trips back to the single turn the closure
+        // appended (NOT the giant file's "content").
+        let reloaded = Session::load_or_new(&dir, "huge-locked").unwrap();
+        assert_eq!(reloaded.messages.len(), 1);
+        assert_eq!(
+            reloaded.messages[0].content, "first-turn-after-quarantine",
+            "the in-lock mutation must produce a fresh small transcript, not the giant file's body"
+        );
+
+        // Sanity: the quarantine destination has a `json.oversized.`
+        // stamp somewhere in the sessions dir.
+        let quarantined = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("json.oversized."));
+        assert!(
+            quarantined,
+            "the oversized file must be preserved under a `json.oversized.*` quarantine name"
+        );
+    }
+
     /// DEFECT 2 panic safety: a `quarantine_oversized` failure
     /// (e.g. the rename to the quarantine path itself errors out)
     /// must NOT prevent `load_or_new` from returning a fresh empty
