@@ -4040,7 +4040,18 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> an
 
 pub(crate) fn cmd_result(cli: &crate::Cli, job: Option<String>) -> anyhow::Result<()> {
     let m = resolve_job(job.as_deref(), false).ok_or_else(|| anyhow!("no matching job"))?;
-    let dir = jobs_dir().join(&m.id);
+    // W12: `m.id` is read from the job's own (attacker-writable) meta.json
+    // body, not the on-disk dir entry. Route the join through the same
+    // containment guard the prune-delete path uses (Y-20) so a crafted
+    // `../..`-style id cannot read a file outside the jobs tree.
+    let base = jobs_dir();
+    if !crate::jobs::job_id_is_contained_child(&base, &m.id) {
+        return Err(anyhow!(
+            "refusing job id {:?}: not a direct child of the jobs dir",
+            m.id
+        ));
+    }
+    let dir = base.join(&m.id);
     let result = std::fs::read_to_string(dir.join("result.json")).ok();
     if cli.json {
         let val: Value = result
@@ -4083,7 +4094,16 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
     unsafe {
         libc::kill(m.pid as i32, libc::SIGTERM);
     }
-    let dir = jobs_dir().join(&m.id);
+    // W12: guard the untrusted body id before writing meta.json (same
+    // containment check as the prune-delete path, Y-20).
+    let base = jobs_dir();
+    if !crate::jobs::job_id_is_contained_child(&base, &m.id) {
+        return Err(anyhow!(
+            "refusing job id {:?}: not a direct child of the jobs dir",
+            m.id
+        ));
+    }
+    let dir = base.join(&m.id);
     if let Some(mut meta) = read_meta(&dir) {
         meta.status = "cancelled".into();
         meta.finished = Some(Utc::now());

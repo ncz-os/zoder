@@ -349,26 +349,27 @@ fn dir_bytes(path: &Path) -> u64 {
 
 /// Recursively delete `path`. Used after we already confirmed we're in a
 /// job dir under `resolved_jobs_dir()` and that the meta says terminal.
-/// Implemented locally (instead of pulling in `remove_dir_all` from
-/// `tempfile` or another crate) to keep the dependency surface unchanged.
 fn remove_recursive(path: &Path) -> std::io::Result<()> {
-    // Y-21: stat with `symlink_metadata` (does NOT follow symlinks) and treat
-    // a symlink as a leaf — remove the LINK itself, never recurse through it.
-    // The previous `path.is_dir()`/`p.is_dir()` FOLLOW symlinks, so an in-tree
-    // symlink to a directory would have its target's contents recursively
-    // deleted (out-of-tree data loss).
+    // W11: for the directory case use `std::fs::remove_dir_all`, which since
+    // Rust 1.58 is implemented with `openat(O_NOFOLLOW)` / `unlinkat` and is
+    // TOCTOU-SAFE — a concurrent same-uid process cannot swap an in-tree
+    // subdirectory for a symlink mid-walk and redirect the delete out of tree.
+    // The previous hand-rolled `symlink_metadata` + `read_dir` + recurse walk
+    // had exactly that race window (between the stat that classified a
+    // subdirectory as a real dir and the `read_dir` of that same path) for
+    // EVERY subdirectory, not just the top level.
+    //
+    // Preserve the Y-21 top-level leaf/symlink handling: a symlink or a plain
+    // file at `path` is removed as a leaf (never followed); `remove_dir_all`
+    // is invoked only on a real directory (it would `ENOTDIR` on a symlink or
+    // file). `remove_dir_all` itself does not follow symlink ENTRIES either —
+    // it unlinks them as leaves — so an in-tree symlink to an external dir
+    // still has only the link removed, not its target's contents.
     let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
         return std::fs::remove_file(path);
     }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path)?.flatten() {
-            remove_recursive(&entry.path())?;
-        }
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
-    }
+    std::fs::remove_dir_all(path)
 }
 
 /// Y-20: a job's `id` is read from its own (attacker-writable) `meta.json`
@@ -378,7 +379,7 @@ fn remove_recursive(path: &Path) -> std::io::Result<()> {
 /// only a direct, separator-free child of `dir`: exactly one `Normal` path
 /// component — which excludes `..`, `.`, absolute roots, and prefixes — whose
 /// join stays a direct child of `dir`.
-fn job_id_is_contained_child(dir: &Path, id: &str) -> bool {
+pub(crate) fn job_id_is_contained_child(dir: &Path, id: &str) -> bool {
     use std::path::Component;
     let mut comps = Path::new(id).components();
     let single_normal =
@@ -785,7 +786,7 @@ mod tests {
         assert!(!job.exists(), "the job dir itself is removed");
         assert!(
             external_file.exists(),
-            "Y-21: symlink target contents must survive (only the link is removed)"
+            "Y-21/W11: symlink target contents must survive (only the link is              removed) — remove_dir_all unlinks symlink entries as leaves, it              does not follow them"
         );
     }
 
