@@ -518,19 +518,18 @@ pub fn pick_candidate_for_role(
 ) -> Option<String> {
     let classes = scenario.classes_for(role);
     for class in classes {
-        // Highest-rank candidate of this class.
-        let mut best: Option<&RoutableCandidate> = None;
-        for c in candidates.iter().filter(|c| c.class == *class) {
-            match best {
-                None => best = Some(c),
-                Some(b) if c.swe_rank > b.swe_rank => best = Some(c),
-                _ => {}
-            }
-        }
-        if let Some(c) = best {
-            if candidate_eligible(role, c, scenario, snapshot, allow_paid_runtime, now) {
-                return Some(c.model_id.clone());
-            }
+        let mut ranked: Vec<&RoutableCandidate> =
+            candidates.iter().filter(|c| c.class == *class).collect();
+        ranked.sort_by(|a, b| {
+            b.swe_rank
+                .partial_cmp(&a.swe_rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(c) = ranked
+            .into_iter()
+            .find(|c| candidate_eligible(role, c, scenario, snapshot, allow_paid_runtime, now))
+        {
+            return Some(c.model_id.clone());
         }
     }
     None
@@ -1262,6 +1261,44 @@ mod tests {
             pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
                 .as_deref(),
             Some("free-a")
+        );
+    }
+
+    #[test]
+    fn pick_candidate_uses_best_eligible_candidate_within_preferred_class() {
+        let scenario = RouteScenario::balanced();
+        let snap = snapshot_with_used(20.0, None);
+        let cands = vec![
+            candidate("free-low-eligible", ProviderClass::Free, 80.0),
+            candidate("free-high-eligible", ProviderClass::Free, 99.0),
+            candidate("sub-a", ProviderClass::Sub, 50.0),
+        ];
+
+        assert_eq!(
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
+            Some("free-high-eligible"),
+            "highest-ranked eligible candidate in the preferred class must win",
+        );
+    }
+
+    #[test]
+    fn pick_candidate_tries_lower_rank_candidate_in_same_class_when_top_is_ineligible() {
+        let scenario = RouteScenario::balanced();
+        let snap = snapshot_with_used(20.0, None);
+        let mut free_high_ineligible = candidate("free-high-ineligible", ProviderClass::Free, 99.0);
+        free_high_ineligible.healthy = false;
+        let cands = vec![
+            free_high_ineligible,
+            candidate("free-low-eligible", ProviderClass::Free, 80.0),
+            candidate("sub-a", ProviderClass::Sub, 90.0),
+        ];
+
+        assert_eq!(
+            pick_candidate_for_role(Role::Primary, &cands, &scenario, Some(&snap), false, now())
+                .as_deref(),
+            Some("free-low-eligible"),
+            "an ineligible top-ranked candidate must not skip lower-ranked eligible candidates in the same class",
         );
     }
 
