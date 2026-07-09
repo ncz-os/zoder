@@ -68,6 +68,19 @@ pub enum ErrKind {
     Decode,
 }
 
+impl Default for ErrKind {
+    /// Decode is the most neutral "we don't know what happened" default —
+    /// it's a no-information outcome that resolve to `Classification::Error`
+    /// via `classify_err`, which is exactly the right fallback when a caller
+    /// has to construct a `ProviderError` via `..Default::default()`. Picking
+    /// a more specific variant (Timeout / Server / Network) would silently
+    /// bias the breaker signal for the "no information" code paths, so we
+    /// deliberately pick the most-generic one.
+    fn default() -> Self {
+        ErrKind::Decode
+    }
+}
+
 /// A provider call failure with enough structure to drive retries + fallback.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
@@ -80,6 +93,34 @@ pub struct ProviderError {
     /// SAME model would duplicate visible output, so the caller must not retry
     /// it (it may still fall back to a different model).
     pub emitted: bool,
+    /// Y-14: raw payload from an Anthropic mid-stream `event: error` frame.
+    /// The Anthropic wire protocol surfaces 401/429/529 rejections as an SSE
+    /// error frame carried by a 200 response, so the HTTP status we attach
+    /// to the *chat* call is `None`. Without carrying the typed envelope
+    /// alongside the error, `classify_err` can only see `ErrKind::Http` /
+    /// `status: None` and lumps `overloaded_error` and `rate_limit_error`
+    /// into the breaker-tripping `Error` bucket. `classify_err` checks this
+    /// field FIRST (before `classify_err_kind`) so an
+    /// `overloaded_error` envelope classifies as `Capacity` instead of
+    /// `Error`, the same way a 529 from the headers does.
+    ///
+    /// `Some` only when the Anthropic SSE parser surfaced an inline error
+    /// frame; `None` for every other path (HTTP headers, OpenAI-style
+    /// envelopes, network failures, etc.).
+    pub anthropic_error_body: Option<String>,
+}
+
+impl Default for ProviderError {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            kind: ErrKind::default(),
+            status: None,
+            retry_after: None,
+            emitted: false,
+            anthropic_error_body: None,
+        }
+    }
 }
 
 impl ProviderError {
@@ -90,6 +131,7 @@ impl ProviderError {
             status: None,
             retry_after: None,
             emitted: false,
+            anthropic_error_body: None,
         }
     }
     /// Transient and safe to retry on the same model (nothing emitted yet).
@@ -959,7 +1001,25 @@ impl OpenAiProvider {
     }
 
     /// Fetch the live set of served model ids from the provider's models route.
+    ///
+    /// Y-19: `kind == "azure-openai"` is intentionally short-circuited. The
+    /// configured `base_url` is the deployment route
+    /// (`…/openai/deployments/<dep>`), but the OpenAI-compatible `/models`
+    /// endpoint lives at the account scope (`{account}/openai/models`) — so
+    /// naively composing `endpoint_url(base, "azure-openai", "models", …)`
+    /// would emit the malformed
+    /// `…/openai/deployments/<dep>/models?api-version=…` URL and Azure would
+    /// 404 it. Until we resolve the account-scope base explicitly, callers
+    /// fall back to the operator-configured `model_ids` (probe + consult
+    /// already handle an `Err` here as "use configured ids").
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        if self.is_azure() {
+            return Err(ProviderError::new(
+                ErrKind::Http,
+                "list_models not supported for azure-openai (deployment-scoped \
+                 base_url has no /models route; configure model_ids instead)",
+            ));
+        }
         let mut rb = self.client.get(self.endpoint("models"));
         if let Some((name, value)) = &self.auth_header {
             rb = rb.header(name.as_str(), value.as_str());
@@ -983,6 +1043,7 @@ impl OpenAiProvider {
                 status: Some(status.as_u16()),
                 retry_after: retry_after_header(resp.headers()),
                 emitted: false,
+                anthropic_error_body: None,
             });
         }
         let body = self.read_limited_body(resp, "models list").await?;
@@ -1279,6 +1340,7 @@ impl OpenAiProvider {
                 status: Some(code),
                 retry_after,
                 emitted: false,
+                anthropic_error_body: None,
             });
         }
         if req.stream {
@@ -1555,6 +1617,7 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            anthropic_error_body: None,
         };
         let mut done = false;
         let mut saw_choice = false;
@@ -1838,7 +1901,18 @@ impl OpenAiProvider {
         let mut stream = resp.bytes_stream();
         let mut response_bytes = 0usize;
         let mut buf: Vec<u8> = Vec::new();
+        // Y-14: the Anthropic SSE parser attaches the typed error frame's
+        // raw payload (`anthropic_error_body`) so `classify_err` can route an
+        // `overloaded_error` / `rate_limit_error` to `Capacity` and an
+        // `authentication_error` to `Unauthorized` -- identical to how a
+        // 529 / 401 in the HTTP headers would classify. The default `None`
+        // for non-Anthropic / non-error code paths keeps every other
+        // caller's classification pipeline unchanged. Using a `Cell` lets
+        // the existing 3-arg `fail` closure shape pick up the typed body
+        // without having to retrofit the signature at every call site.
+        let anthropic_error_body: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
         let fail = |kind: ErrKind, msg: String, emitted: bool| ProviderError {
+            anthropic_error_body: anthropic_error_body.take(),
             message: msg,
             kind,
             status: None,
@@ -1963,14 +2037,22 @@ impl OpenAiProvider {
                     // Top-level `error` envelope: Anthropic emits
                     // `event: error` with a body shaped like
                     // `{"type":"error","error":{"type":"authentication_error",...}}`.
-                    // Surface as Http; status code is not part of the
-                    // payload so we cannot classify from the body alone —
-                    // upstream callers relying on a 401/403/429 status
-                    // code should still hit the non-2xx branch in
-                    // `stream_chat` before this fires.
+                    //
+                    // Y-14: the typed envelope is the ONLY signal we get for
+                    // an Anthropic 401/429/529 mid-stream rejection (the HTTP
+                    // 200 that carried the body has no status to anchor on).
+                    // Carry the raw payload through `anthropic_error_body`
+                    // so `classify_err` routes an `overloaded_error` /
+                    // `rate_limit_error` to `Capacity` (consult skips, no
+                    // breaker trip) and an `authentication_error` /
+                    // `permission_error` to `Unauthorized` (key rejected,
+                    // no breaker trip), instead of the historical
+                    // hard-coded `Error` that benches a healthy model
+                    // behind a bad key or temporary overload.
                     if current_event.as_deref() == Some("error")
                         || val.get("type").and_then(|t| t.as_str()) == Some("error")
                     {
+                        anthropic_error_body.set(Some(payload.to_string()));
                         return Err(fail(
                             ErrKind::Http,
                             format!("anthropic stream error: {}", redact(payload)),
@@ -2173,6 +2255,7 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            anthropic_error_body: None,
         };
         let mut done = false;
         let mut saw_text = false;

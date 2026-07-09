@@ -102,11 +102,27 @@ pub struct ProbeOutcome {
     pub note: Option<String>,
 }
 
-/// Map a typed `ProviderError` to the classification we'll record. The HTTP
-/// status (when present) wins; the `ErrKind` decides only for the
-/// status-less cases (e.g. `RateLimit` shows up without a status code on
-/// some backends).
+/// Map a typed `ProviderError` to the classification we'll record. Precedence
+/// (most specific first):
+///
+/// 1. **Anthropic SSE error frame** (`err.anthropic_error_body`): an Anthropic
+///    mid-stream `event: error` arrived on a 200 connection carrying a typed
+///    envelope — `{"type":"error","error":{"type":"..."}}`. Headers carry no
+///    status, so without consulting the body the only signal `classify_err`
+///    would see is `ErrKind::Http` + `status: None`, which maps to
+///    `Classification::Error` and trips the breaker on a perfectly fine model
+///    behind a temp overload (`overloaded_error` -> `Capacity`) or bad key
+///    (`authentication_error` -> `Unauthorized`). Routing the body through
+///    `Classification::from_anthropic_error_body` here fixes that.
+/// 2. **HTTP status code** (when present and not just "Error"): 401/403
+///    unauthorised-skip, 404 unprovisioned, 429/503/529 capacity. Same
+///    precedence as before.
+/// 3. **ErrKind fallback**: status-less cases (`RateLimit` -> `Capacity`,
+///    everything else -> `Error`).
 pub fn classify_err(err: &ProviderError) -> Classification {
+    if let Some(body) = &err.anthropic_error_body {
+        return Classification::from_anthropic_error_body(body, err.status.unwrap_or(0));
+    }
     if let Some(code) = err.status {
         let from_status = Classification::from_status(code);
         if from_status != Classification::Error {
@@ -412,8 +428,7 @@ mod tests {
                 message: "404".into(),
                 kind: ErrKind::Http,
                 status: Some(404),
-                retry_after: None,
-                emitted: false,
+                ..Default::default()
             }),
         );
         openrouter.enqueue("anthropic/claude-3.7", Ok(ChatResult::default()));
@@ -425,8 +440,7 @@ mod tests {
                 message: "429".into(),
                 kind: ErrKind::RateLimit,
                 status: Some(429),
-                retry_after: None,
-                emitted: false,
+                ..Default::default()
             }),
         );
 
@@ -537,8 +551,7 @@ mod tests {
             message: "boom".into(),
             kind: ErrKind::RateLimit,
             status: Some(429),
-            retry_after: None,
-            emitted: false,
+            ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Capacity);
 
@@ -547,8 +560,7 @@ mod tests {
             message: "boom".into(),
             kind: ErrKind::RateLimit,
             status: None,
-            retry_after: None,
-            emitted: false,
+            ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Capacity);
 
@@ -557,8 +569,7 @@ mod tests {
             message: "boom".into(),
             kind: ErrKind::Network,
             status: None,
-            retry_after: None,
-            emitted: false,
+            ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Error);
 
@@ -567,10 +578,123 @@ mod tests {
             message: "boom".into(),
             kind: ErrKind::Server,
             status: Some(500),
-            retry_after: None,
-            emitted: false,
+            ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Error);
+    }
+
+    /// Y-14: an Anthropic mid-stream SSE `event: error` frame carrying a typed
+    /// `overloaded_error` envelope (the wire format for a 529 over a 200 stream
+    /// connection) must classify as `Capacity`, NOT `Error`. Pre-fix
+    /// `classify_err` only saw `ErrKind::Http` + `status: None`, so it fell
+    /// through to `classify_err_kind` -> `Error`, tripping the breaker on a
+    /// perfectly fine model whose only problem was a temporary provider overload.
+    /// Post-fix the typed body is plumbed through `anthropic_error_body` and
+    /// routed through `Classification::from_anthropic_error_body`, so the
+    /// breaker backs off exactly the same way it does for a header-borne 529.
+    ///
+    /// The runtime end-to-end pin lives in `consume_stream_anthropic` (provider
+    /// test) — this test pins the `classify_err`-side contract on its own so
+    /// `classify_err` is exercised directly without requiring a live server.
+    #[test]
+    fn classify_err_anthropic_overloaded_sse_envelope_is_capacity() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#;
+        // Anthropic SSE error -> status: None at the HTTP layer (the 200
+        // response that carried the body has already been written). The
+        // typed envelope is the ONLY signal we have.
+        let e = ProviderError {
+            message: "anthropic stream error: ...".into(),
+            kind: ErrKind::Http,
+            status: None,
+            anthropic_error_body: Some(body.into()),
+            ..Default::default()
+        };
+        let cls = classify_err(&e);
+        assert_eq!(
+            cls,
+            Classification::Capacity,
+            "Anthropic mid-stream overloaded_error must classify as Capacity \
+             so the breaker backs off instead of tripping on a healthy model"
+        );
+        // Belt + braces: the inverse case — Error — must NOT be the result,
+        // because that's the failure mode the fix exists to eliminate.
+        assert_ne!(
+            cls,
+            Classification::Error,
+            "Anthropic overloaded_error must NOT classify as Error (would trip the breaker)"
+        );
+        // and `classify_err` must skip the status-code branch entirely
+        // (status: None) — the typed envelope wins. Pin this so a future
+        // refactor that reorders the branches back to "status first" fails
+        // immediately.
+        assert!(
+            e.status.is_none(),
+            "fixture must leave status=None so the test exercises the typed-body branch"
+        );
+    }
+
+    /// Y-14 companion: an Anthropic mid-stream `rate_limit_error` SSE frame
+    /// classifies as `Capacity` (same bucket as header-borne 429).
+    #[test]
+    fn classify_err_anthropic_rate_limit_sse_envelope_is_capacity() {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        let e = ProviderError {
+            message: "anthropic stream error: ...".into(),
+            kind: ErrKind::Http,
+            status: None,
+            anthropic_error_body: Some(body.into()),
+            ..Default::default()
+        };
+        assert_eq!(classify_err(&e), Classification::Capacity);
+    }
+
+    /// Y-14 companion: an Anthropic mid-stream `authentication_error` SSE
+    /// frame classifies as `Unauthorized` (key rejected — never trip the
+    /// breaker on the model behind the bad credential).
+    #[test]
+    fn classify_err_anthropic_authentication_sse_envelope_is_unauthorized() {
+        let body =
+            r#"{"type":"error","error":{"type":"authentication_error","message":"bad api key"}}"#;
+        let e = ProviderError {
+            message: "anthropic stream error: ...".into(),
+            kind: ErrKind::Http,
+            status: None,
+            anthropic_error_body: Some(body.into()),
+            ..Default::default()
+        };
+        assert_eq!(classify_err(&e), Classification::Unauthorized);
+    }
+
+    /// Non-regression: a ProviderError with NO `anthropic_error_body` and
+    /// `status: None` and `kind: ErrKind::Http` still classifies as `Error`
+    /// (the historical behaviour). Pre-fix this is the only outcome path;
+    /// post-fix it's the fallback when neither body nor status carries a
+    /// signal — we must not silently flip it to something else.
+    #[test]
+    fn classify_err_no_body_no_status_http_still_errors() {
+        let e = ProviderError {
+            message: "boom".into(),
+            kind: ErrKind::Http,
+            status: None,
+            anthropic_error_body: None,
+            ..Default::default()
+        };
+        assert_eq!(classify_err(&e), Classification::Error);
+    }
+
+    /// Non-regression: when `anthropic_error_body` is `None`, a status-bearing
+    /// error still routes via the status code (preserves the existing
+    /// precedence chain — typed body only wins if a body is present).
+    #[test]
+    fn classify_err_status_wins_when_no_anthropic_body() {
+        let e = ProviderError {
+            message: "boom".into(),
+            kind: ErrKind::RateLimit,
+            status: Some(429),
+            anthropic_error_body: None,
+            ..Default::default()
+        };
+        assert_eq!(classify_err(&e), Classification::Capacity);
     }
 
     #[test]
