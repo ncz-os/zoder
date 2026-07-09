@@ -30,6 +30,17 @@ fs2 = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux-only: in-kernel Landlock ruleset, applied to the spawned child via
+# a `pre_exec` hook (no external binary). The companion to bubblewrap on
+# Linux: bubblewrap builds a new mount namespace from a userspace wrapper,
+# Landlock is a kernel LSM and is applied IN-PROCESS to the child. See
+# `crates/zoder-cli/src/exec_safety.rs::landlock_ruleset` for the ruleset
+# generator. Gated on `target_os = "linux"` so the macOS build (and any
+# other non-Linux host the loop may run on) doesn't pull the kernel-only
+# crate into its dependency graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 # Used by the reviewer-fallback-chain integration tests so the dispatcher
