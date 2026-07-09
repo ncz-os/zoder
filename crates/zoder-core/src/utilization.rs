@@ -1404,6 +1404,24 @@ pub fn decide_account(
         .filter(|w| w.used_percent.is_some() && w.health != TelemetryHealth::Degraded)
         .collect();
     if observable.is_empty() {
+        // Y-1: distinguish "never had telemetry" from "had telemetry but it's
+        // all Degraded (stale)". Z-18 hardened the single-snapshot `decide()`
+        // path to fail CLOSED on stale high-usage telemetry; this L4
+        // per-account path (which production prefers whenever an AccountView
+        // exists) must do the same. An account whose windows carried numeric
+        // readings that have since gone stale must fall back to Free — NOT
+        // silently revert to full-headroom PreferSub (which would keep
+        // spending a possibly-exhausted subscription). Only an account with
+        // ZERO numeric windows (truly no telemetry ever) takes the PreferSub
+        // baseline.
+        let had_numeric_telemetry = account.windows.iter().any(|w| w.used_percent.is_some());
+        if had_numeric_telemetry {
+            return AccountDecision {
+                decision: RouteDecision::FallBackToFree,
+                strength: 100.0,
+                binding_window: None,
+            };
+        }
         return AccountDecision {
             decision: RouteDecision::PreferSub,
             strength: 0.0,
@@ -3804,10 +3822,13 @@ mod tests {
     }
 
     #[test]
-    fn l4_only_degraded_windows_yields_prefer_sub_with_no_binding() {
-        // All windows Degraded -> observable set is empty ->
-        // PreferSub with strength 0.0 and binding_window = None. This
-        // is the "no trustworthy signal -> headroom baseline" invariant.
+    fn l4_all_degraded_but_previously_numeric_falls_back_to_free() {
+        // Y-1 REGRESSION: this test previously asserted PreferSub, which
+        // PINNED the bug — an account observed near its cap (95%/99%) whose
+        // telemetry has since gone Degraded (stale) would silently revert to
+        // full-headroom PreferSub and keep spending a possibly-exhausted sub.
+        // The account HAD numeric telemetry, so (per the Z-18 fail-closed
+        // contract) it must fall back to Free, NOT PreferSub.
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
         let d1 = WindowView {
             name: "5h".into(),
@@ -3834,9 +3855,13 @@ mod tests {
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
         let ad = decide_account(&acct, &knobs, now, None);
-        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "Y-1: an account that WAS observed near its cap but is now all-stale must fail closed, not PreferSub"
+        );
         assert!(ad.binding_window.is_none());
-        assert_eq!(ad.strength, 0.0);
+        assert_eq!(ad.strength, 100.0);
     }
 
     #[test]
