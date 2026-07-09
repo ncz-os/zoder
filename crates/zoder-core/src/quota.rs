@@ -62,13 +62,18 @@ pub struct WindowUsage {
 fn unit_amount(e: &Entry, unit: QuotaUnit) -> f64 {
     match unit {
         QuotaUnit::Tokens => e.tokens_in.saturating_add(e.tokens_out) as f64,
-        // Requests, Messages, and Sessions each contribute one to the
-        // rolling-window counter for the matching ledger entry. Distinct
-        // semantically (a single agent turn counts one in each unit), but
-        // the per-Entry contribution is the same: 1 per matching row.
-        // Multi-turn sessions would need an Entry-level `session_id`
-        // field that's out of scope for the declarative-config change.
-        QuotaUnit::Requests | QuotaUnit::Messages | QuotaUnit::Sessions => 1.0,
+        // Requests, Messages, and Sessions each contribute the row's
+        // underlying request count (`calls`) to the rolling-window counter.
+        // A compacted/rollup ledger row legitimately carries `calls > 1`
+        // (a rollup of many requests), so returning a hardcoded 1.0 here
+        // undercounts an exhausted window and lets the smart router keep
+        // routing to an account the provider will reject. Mirrors the
+        // per-call accounting in `finops.rs`, which sums `e.calls`.
+        // (Distinct units semantically -- a single agent turn counts one in
+        // each -- but the per-Entry contribution is the same `calls` count;
+        // a true multi-turn `Sessions` unit would need an Entry-level
+        // `session_id`, out of scope here.)
+        QuotaUnit::Requests | QuotaUnit::Messages | QuotaUnit::Sessions => e.calls as f64,
     }
 }
 
@@ -255,10 +260,15 @@ pub fn amortized_per_call(
         return 0.0;
     }
     let since = Utc::now() - Duration::days(30);
-    let calls = entries
+    // Sum the underlying request count (`e.calls`), NOT the number of ledger
+    // rows: a compacted/rollup row carries `calls > 1`, so counting rows
+    // overstates $/call (e.g. one row of 500 calls would read as $200/call
+    // instead of $0.40). Mirrors the `e.calls` accounting in `finops.rs`.
+    let calls: u64 = entries
         .iter()
         .filter(|e| e.provider == provider_id && e.ts_utc >= since)
-        .count();
+        .map(|e| e.calls)
+        .sum();
     if calls == 0 {
         0.0
     } else {
@@ -560,8 +570,124 @@ mod tests {
         let by_n = by_name(&out);
         assert_eq!(by_n["5h"].confidence.as_deref(), Some("observed"));
         assert_eq!(by_n["weekly"].confidence.as_deref(), Some("observed"));
-        // Note: `unit_amount` returns 1.0 per matching Entry for
-        // QuotaUnit::Messages, so two entries in-window → `used >= 2.0`.
+        // Note: `unit_amount` returns the row's `calls` count for
+        // QuotaUnit::Messages, so two per-call entries in-window → `used
+        // >= 2.0`. (Rollup rows with `calls > 1` are covered by
+        // `rolling_message_window_counts_underlying_calls_not_rows`.)
         assert!(by_n["5h"].used >= 2.0);
+    }
+
+    /// C8-Q1: a rolling Messages window must count each ledger row's
+    /// underlying request count (`calls`), not one-per-row. A single rollup
+    /// row of 500 calls against a 900-cap window is ~55.5% consumed, NOT
+    /// 1/900 (~0.11%). The old hardcoded `1.0`-per-row undercounted an
+    /// exhausted subscription and let the smart router keep routing to it.
+    #[test]
+    fn rolling_message_window_counts_underlying_calls_not_rows() {
+        let now = Utc::now();
+        let entry = Entry {
+            ts_utc: now - Duration::minutes(30),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 500,
+            violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
+        };
+        let window = w("5h", 5, 900.0, QuotaUnit::Messages);
+        let usage = window_usage_at(&[entry], "anthropic", &window, None, None, now);
+        assert_eq!(
+            usage.used, 500.0,
+            "one rollup row of 500 calls => used == 500"
+        );
+        assert!(
+            (usage.pct - 500.0 / 900.0).abs() < 1e-9,
+            "pct should be ~0.555 (500/900), got {}",
+            usage.pct
+        );
+        // Regression guard against the old behavior (1 row => used == 1).
+        assert!(usage.used > 1.0, "must not collapse a rollup row to 1");
+    }
+
+    /// C8-Q1 no-regression: a Tokens window already sums `tokens_in +
+    /// tokens_out` (an aggregate), and must be unaffected by the per-call
+    /// `calls` change — `calls` is not part of the tokens math.
+    #[test]
+    fn rolling_token_window_still_sums_tokens_after_calls_fix() {
+        let now = Utc::now();
+        let mk = |t_in: u64, t_out: u64, calls: u64| Entry {
+            ts_utc: now - Duration::minutes(10),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            host: String::new(),
+            tokens_in: t_in,
+            tokens_out: t_out,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls,
+            violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
+        };
+        // 300 + 200 (+ a nonzero `calls` on one row to prove it's ignored
+        // for tokens) + 400 + 100 == 1000 tokens.
+        let entries = vec![mk(300, 200, 7), mk(400, 100, 1)];
+        let window = w("5h", 5, 2000.0, QuotaUnit::Tokens);
+        let usage = window_usage_at(&entries, "anthropic", &window, None, None, now);
+        assert_eq!(usage.used, 1000.0, "tokens summed, `calls` ignored");
+        assert!((usage.pct - 0.5).abs() < 1e-9, "1000/2000 = 0.5");
+    }
+
+    /// C8-Q2: amortized $/call spreads the monthly fee over the underlying
+    /// request count (`sum(e.calls)`), not the number of ledger rows. One
+    /// rollup row of 500 calls under a $200 plan is $0.40/call, NOT $200.
+    #[test]
+    fn amortized_per_call_divides_by_underlying_calls_not_rows() {
+        let now = Utc::now();
+        let entry = Entry {
+            ts_utc: now - Duration::days(1),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 500,
+            violation: None,
+            tags: crate::ledger::FinOpsTags::default(),
+        };
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 200.0,
+            windows: vec![],
+            tier: Some("claude-max-20x".into()),
+            ..Default::default()
+        };
+        let cat = catalog();
+        let per_call = amortized_per_call(&[entry], "anthropic", &plan, &cat);
+        assert!(
+            (per_call - 0.40).abs() < 1e-9,
+            "200 / 500 calls = $0.40/call, got {per_call}"
+        );
+        // Regression guard against the old $200/row behavior.
+        assert!(per_call < 1.0, "must not divide the fee by 1 row");
+    }
+
+    /// C8-Q2 guard: zero underlying calls (no in-window entries) returns 0.0,
+    /// never a divide-by-zero.
+    #[test]
+    fn amortized_per_call_zero_calls_is_guarded() {
+        let plan = SubscriptionPlan {
+            monthly_fee_usd: 200.0,
+            windows: vec![],
+            tier: Some("claude-max-20x".into()),
+            ..Default::default()
+        };
+        let cat = catalog();
+        let per_call = amortized_per_call(&[], "anthropic", &plan, &cat);
+        assert_eq!(per_call, 0.0, "no calls => 0.0, not inf/NaN");
     }
 }
