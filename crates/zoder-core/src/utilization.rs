@@ -1188,12 +1188,23 @@ pub fn build_account_view(
         // "no header sighting" or "no numeric value", not "0% used".
         let counter_is_current = counter.is_none_or(|c| match cw.reset {
             crate::config::ResetKind::Rolling => true,
-            crate::config::ResetKind::CalendarMonthly => {
-                c.period_id.as_deref() == Some(now.format("%Y-%m").to_string().as_str())
-            }
-            crate::config::ResetKind::CalendarDaily => {
-                c.period_id.as_deref() == Some(now.format("%Y-%m-%d").to_string().as_str())
-            }
+            // A never-seeded calendar row loads with `period_id = None`
+            // (serde default) after an older binary wrote it (C4-U1).
+            // Treat `None` as "current" so its real, high used_percent
+            // flows through `effective_counter_percent` instead of
+            // collapsing to `Some(0.0)` (full headroom) and letting the
+            // router keep pinning an effectively-exhausted budget until
+            // the next `record_counter` re-seeds `period_id`. A row with
+            // a `Some(old-period)` id is genuinely stale and still
+            // reports 0%.
+            crate::config::ResetKind::CalendarMonthly => c
+                .period_id
+                .as_deref()
+                .is_none_or(|p| p == now.format("%Y-%m").to_string()),
+            crate::config::ResetKind::CalendarDaily => c
+                .period_id
+                .as_deref()
+                .is_none_or(|p| p == now.format("%Y-%m-%d").to_string()),
         });
         let used_percent: Option<f64> = match cw.observability {
             // Counter path: trust the store's stored percent whenever
@@ -4380,6 +4391,133 @@ mod tests {
         // Finding #3: percent is in 0..=100 — 250_000 / 1_000_000 = 25%.
         assert!((w.used_percent.unwrap() - 25.0).abs() < 1e-9);
         assert_eq!(w.health, TelemetryHealth::Fresh);
+    }
+
+    #[test]
+    fn never_seeded_calendar_monthly_counter_surfaces_real_percent_not_zero() {
+        // C4-U1: a legacy on-disk Counter/CalendarMonthly row written by
+        // an older binary loads with `period_id = None` (serde default).
+        // `record_counter` alone never seeds `period_id` (only a
+        // catalog-aware `set_counter_period_id` does), so a
+        // cap-bearing, heavily-used row can genuinely carry
+        // `period_id = None`. Such a never-seeded row must be treated as
+        // "current" and surface its REAL used_percent through the
+        // `build_account_view` projection -- not collapse to `Some(0.0)`
+        // (full headroom), which would let the router keep pinning an
+        // effectively-exhausted paid budget.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut s = UtilizationStore::default();
+        // set_counter_cap + record_counter WITHOUT set_counter_period_id
+        // => period_id stays None (the legacy never-seeded shape).
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(1_000.0),
+            now,
+        );
+        s.record_counter(Provider::MiniMax, "default", MM_PLAN, "monthly", 950.0, now);
+        // Precondition: the row really is never-seeded.
+        assert_eq!(
+            s.get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+                .expect("counter row must exist")
+                .period_id,
+            None,
+            "record_counter alone must not seed period_id"
+        );
+        let window = crate::config::QuotaWindow {
+            name: "monthly".into(),
+            hours: 720,
+            unit: crate::config::QuotaUnit::Tokens,
+            cap: Some(1_000.0),
+            models: None,
+            observability: crate::config::Observability::Counter,
+            reset: crate::config::ResetKind::CalendarMonthly,
+        };
+        let view = build_account_view(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            std::slice::from_ref(&window),
+            &s,
+            now,
+        );
+        let pct = view.windows[0]
+            .used_percent
+            .expect("never-seeded counter must surface a numeric percent");
+        // 950 / 1000 = 95%, NOT 0% (the pre-fix bug reported full headroom).
+        assert!((pct - 95.0).abs() < 1e-9, "expected ~95%, got {pct}");
+        // And the router must not treat the near-exhausted paid budget as
+        // idle: at ~95% used (>= cap_guard) it falls back to free rather
+        // than pinning the sub. The pre-fix bug reported 0% and returned
+        // PreferSub, keeping the sub pinned on an exhausted budget.
+        assert_eq!(
+            decide_account(&view, &RouteKnobs::default(), now, None).decision,
+            RouteDecision::FallBackToFree
+        );
+    }
+
+    #[test]
+    fn genuinely_stale_calendar_monthly_counter_still_reports_zero() {
+        // The dual of the fix: a row bound to a genuinely OLD period
+        // (period_id = Some("2026-06") viewed in July) is truly stale and
+        // must still report full headroom (Some(0.0)) -- only a
+        // never-seeded (None) row falls through to the real percent.
+        let june = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let july = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut s = UtilizationStore::default();
+        s.set_counter_cap(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some(1_000.0),
+            june,
+        );
+        s.set_counter_period_id(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            Some("2026-06".into()),
+            june,
+        );
+        s.record_counter(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            "monthly",
+            950.0,
+            june,
+        );
+        assert_eq!(
+            s.get_counter(Provider::MiniMax, "default", MM_PLAN, "monthly")
+                .expect("counter row must exist")
+                .period_id
+                .as_deref(),
+            Some("2026-06"),
+            "row must be bound to the old period"
+        );
+        let window = crate::config::QuotaWindow {
+            name: "monthly".into(),
+            hours: 720,
+            unit: crate::config::QuotaUnit::Tokens,
+            cap: Some(1_000.0),
+            models: None,
+            observability: crate::config::Observability::Counter,
+            reset: crate::config::ResetKind::CalendarMonthly,
+        };
+        let view = build_account_view(
+            Provider::MiniMax,
+            "default",
+            MM_PLAN,
+            std::slice::from_ref(&window),
+            &s,
+            july,
+        );
+        // Stale period => full headroom, NOT the old 95%.
+        assert_eq!(view.windows[0].used_percent, Some(0.0));
     }
 
     #[test]
