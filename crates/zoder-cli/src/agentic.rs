@@ -625,90 +625,50 @@ async fn complete_once(
 }
 
 /// Build the ordered reviewer candidate list `complete_once` walks.
-/// The head honors the existing precedence (per-invocation pin first,
-/// then per-agent pin, then scenario-derived head, then cross-family
-/// default). The tail is whatever fallbacks the operator has configured:
-/// a comma-separated `Config::reviewer_model` (or
-/// `[agents.<alias>].reviewer_model`) plus the scenario-routed
-/// `reviewer_chain` from `resolve_chain` minus the already-chosen head.
-/// Order is: explicit pin first, configured fallbacks next, scenario
-/// alternates last (so an operator's explicit override stays ahead of
-/// any auto-routing).
+///
+/// Precedence, highest first (matches the `complete_once` doc above and the
+/// `AgentOverride` contract in `config.rs`):
+///   1. explicit per-invocation pin (`--reviewer` / `--panel` → `model_override`);
+///   2. per-agent `[agents.<alias>].reviewer_model` pin;
+///   3. profile-level `Config::reviewer_model` chain (comma-separated);
+///   4. scenario-routed `reviewer_chain` from `resolve_chain` (tail fallbacks ONLY);
+///   5. cross-family default derived from the resolved author model, applied
+///      here (I/O) only when every source above was empty.
+///
+/// The operator's CONFIGURED reviewer pin (2/3) always outranks scenario
+/// auto-routing (4): auto-routing must never shadow a configured pin nor
+/// route a same-family reviewer ahead of a configured cross-family one. The
+/// pure ordering for 1--4 lives in `order_reviewer_candidates` so the
+/// precedence seam is unit-testable without I/O.
 fn build_reviewer_candidates(
     cli: &crate::Cli,
     model_override: Option<&str>,
     reviewer_chain: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let eng = Engine::load()?;
-    let mut out: Vec<String> = Vec::new();
 
     // Resolve the reviewer-model-side channel: any per-agent or profile-
-    // level `reviewer_model` override, treated as an ordered chain. This
-    // is the NEW contributor — it lets the reviewer path fan out the
-    // same way the author path already did.
+    // level `reviewer_model` override, treated as an ordered chain. Note
+    // `reviewer_models_for` already places the per-agent
+    // `[agents.<alias>].reviewer_model` pin at the head when present,
+    // falling through to the profile-level `Config::reviewer_model` chain.
     let config_chain = eng.cfg.reviewer_models_for(cli.agent.as_deref());
+    // The stand-alone per-agent pin, passed separately so the ordering
+    // helper can guarantee it seeds the head even if `config_chain` were
+    // ever to diverge from `reviewer_models_for`'s pin-first contract.
+    let agent_pin = eng.cfg.agent_reviewer_model(cli.agent.as_deref());
 
-    // Step 1 — explicit per-invocation pin (`--reviewer`, `--panel`):
-    // when set, the operator has named THIS model for THIS call, so it
-    // heads the chain regardless of any auto-routing. Fallbacks come
-    // from the config chain + scenario chain AFTER it, mirroring the
-    // author path's "explicit `-m` collapses primary to singleton but
-    // the reviewer chain stays independent" semantics.
-    if let Some(m) = model_override {
-        push_unique(&mut out, m);
-        for c in &config_chain {
-            push_unique(&mut out, c);
-        }
-        for c in reviewer_chain {
-            push_unique(&mut out, c);
-        }
-        return Ok(out);
-    }
+    let mut out = order_reviewer_candidates(
+        model_override,
+        agent_pin.as_deref(),
+        &config_chain,
+        reviewer_chain,
+    );
 
-    // Step 2 — scenario-routed reviewer chain head. When the active
-    // scenario produced a non-empty reviewer lane (e.g. balanced routing's
-    // sub-first preference), honor it; otherwise fall through to the
-    // explicit-pin resolution below. The tail of the scenario chain is
-    // preserved as additional fallbacks (preserves the existing `if let
-    // Some(first) = reviewer_chain.first()` semantics while turning the
-    // head into the first candidate in our ordered list).
-    let scenario_head = reviewer_chain.first().cloned();
-    if let Some(m) = scenario_head {
-        push_unique(&mut out, &m);
-        // The REST of the scenario chain (skipping the head) is also a
-        // pool of fallbacks — a second reviewer-lane sub, etc. — so
-        // layer those in.
-        for c in reviewer_chain.iter().skip(1) {
-            push_unique(&mut out, c);
-        }
-    }
-
-    // Step 3 — per-agent override (`[agents.<alias>].reviewer_model`)
-    // first, then profile-level `Config::reviewer_model` parsed as a
-    // chain. Mirrors the existing per-call resolution in the legacy
-    // `complete_once` body.
-    let mut config_pin_added = false;
-    if let Some(m) = eng.cfg.agent_reviewer_model(cli.agent.as_deref()) {
-        push_unique(&mut out, &m);
-        config_pin_added = true;
-    }
-    for c in &config_chain {
-        // Skip duplicates we already injected (e.g. if the per-agent pin
-        // was also the head of `config_chain`).
-        push_unique(&mut out, c);
-        config_pin_added = true;
-    }
-    // The legacy single-model `Config::reviewer_model` accessor path
-    // is independent of the chain parser above and mirrors the old
-    // behavior verbatim: when the user only set a profile-level pin
-    // AND it was already captured as a head via `config_chain`, the
-    // explicit fallback below is a no-op.
-    let _ = config_pin_added;
-
-    // Step 4 — last-ditch CROSS-FAMILY default derived from the AUTHOR
-    // model. Only added when nothing else produced a candidate; keeps
-    // legacy behavior intact for an operator who never set the
-    // `reviewer_model` config field at all.
+    // Last-ditch CROSS-FAMILY default derived from the AUTHOR model. Only
+    // added when nothing else produced a candidate; keeps legacy behavior
+    // intact for an operator who never set the `reviewer_model` config
+    // field at all.
     if out.is_empty() {
         let health = HealthStore::load(&eng.cfg.health_path);
         let routes = crate::resolve_chain(cli, &eng, &health)?;
@@ -718,6 +678,60 @@ fn build_reviewer_candidates(
     }
 
     Ok(out)
+}
+
+/// Pure reviewer-candidate ordering (no I/O), so the precedence seam is
+/// unit-testable. Precedence, highest first (matches the `complete_once`
+/// doc and `config.rs` `AgentOverride` contract):
+///
+///   1. explicit per-invocation pin (`--reviewer` / `--panel`, i.e.
+///      `model_override`) — when set it heads the chain and the configured
+///      + scenario chains supply fallbacks after it;
+///   2. per-agent `[agents.<alias>].reviewer_model` pin (`agent_pin`);
+///   3. profile-level `Config::reviewer_model` chain (`config_chain`, which
+///      already carries the per-agent pin at its head when present);
+///   4. scenario-routed reviewer chain (`reviewer_chain`) — LAST, as tail
+///      fallbacks only. Scenario auto-routing must NOT shadow an operator's
+///      configured `reviewer_model` pin, and must not be able to route a
+///      same-family reviewer ahead of a configured cross-family pin.
+///
+/// The cross-family default fallback is intentionally NOT applied here — it
+/// depends on the resolved author model (I/O) and is layered on by the
+/// caller when this returns empty.
+fn order_reviewer_candidates(
+    model_override: Option<&str>,
+    agent_pin: Option<&str>,
+    config_chain: &[String],
+    reviewer_chain: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // Step 1 — explicit per-invocation pin. When set, the operator named
+    // THIS model for THIS call, so it heads the chain regardless of any
+    // auto-routing. Configured + scenario chains follow as fallbacks.
+    if let Some(m) = model_override {
+        push_unique(&mut out, m);
+    }
+
+    // Step 2 — per-agent pin, then the profile-level config chain. These
+    // are the operator's CONFIGURED reviewer selection and outrank scenario
+    // auto-routing. (`config_chain` already carries `agent_pin` at its head
+    // when present; the explicit push here is defensive and dedup-safe.)
+    if let Some(m) = agent_pin {
+        push_unique(&mut out, m);
+    }
+    for c in config_chain {
+        push_unique(&mut out, c);
+    }
+
+    // Step 3 — scenario-routed reviewer chain, LAST. Its head is only a
+    // fallback once explicit + configured pins are exhausted, and its tail
+    // supplies further alternates.
+    for c in reviewer_chain {
+        push_unique(&mut out, c);
+    }
+
+    out
 }
 
 fn push_unique(out: &mut Vec<String>, candidate: &str) {
@@ -1969,8 +1983,11 @@ pub(crate) async fn cmd_review(
     // `complete_once` call so the default reviewer (the "head" of the
     // roster, before any `--panel` entries) honors the active scenario
     // and KNEMON gating. Pin precedence inside `complete_once` is
-    // unchanged: explicit `model_override` (per `--panel`) wins, then
-    // the first scenario-eligible reviewer, then the legacy fallback.
+    // unchanged: explicit `model_override` (per `--panel`) wins, then the
+    // operator-CONFIGURED reviewer (per-agent `[agents.<alias>].reviewer_model`
+    // pin, then profile-level `Config::reviewer_model`), then the
+    // scenario-eligible reviewer as a tail fallback, then the cross-family
+    // legacy default. Scenario auto-routing never shadows a configured pin.
     let eng = Engine::load().ok();
     let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
@@ -4209,6 +4226,87 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
+
+    #[test]
+    fn config_reviewer_pin_outranks_scenario_head() {
+        // The common case: no explicit `--reviewer`/`--panel` on the CLI
+        // (model_override = None), the scenario auto-routed a reviewer lane
+        // (non-empty `reviewer_chain`), AND the operator configured a
+        // profile-level `reviewer_model` pin (`config_chain`). The CONFIG
+        // PIN must head the resulting chain, not the scenario head --
+        // otherwise scenario auto-routing shadows the operator's pin and can
+        // route a same-family reviewer, defeating the cross-family gate.
+        let config_chain = vec!["config-reviewer".to_string()];
+        let scenario_chain = vec!["scenario-reviewer".to_string(), "scenario-alt".to_string()];
+        let out = order_reviewer_candidates(None, None, &config_chain, &scenario_chain);
+        assert_eq!(
+            out.first().map(String::as_str),
+            Some("config-reviewer"),
+            "C2-1: configured reviewer_model pin must head the chain, not the scenario head"
+        );
+        // Scenario entries are retained, but strictly as TAIL fallbacks.
+        assert_eq!(
+            out,
+            vec![
+                "config-reviewer".to_string(),
+                "scenario-reviewer".to_string(),
+                "scenario-alt".to_string(),
+            ],
+            "C2-1: config pin heads; scenario chain follows as tail fallbacks"
+        );
+    }
+
+    #[test]
+    fn per_agent_reviewer_pin_outranks_scenario_head() {
+        // Same seam via the per-agent `[agents.<alias>].reviewer_model` pin:
+        // it must also head the chain ahead of scenario auto-routing.
+        let scenario_chain = vec!["scenario-reviewer".to_string()];
+        let out = order_reviewer_candidates(None, Some("agent-pin-reviewer"), &[], &scenario_chain);
+        assert_eq!(
+            out.first().map(String::as_str),
+            Some("agent-pin-reviewer"),
+            "C2-1: per-agent reviewer_model pin must head the chain, not the scenario head"
+        );
+    }
+
+    #[test]
+    fn explicit_override_still_outranks_config_and_scenario() {
+        // Precedence #1 preserved: an explicit `--reviewer`/`--panel` pin
+        // (model_override = Some) still heads the chain, above BOTH the
+        // configured pin and the scenario head; the rest follow as fallbacks.
+        let config_chain = vec!["config-reviewer".to_string()];
+        let scenario_chain = vec!["scenario-reviewer".to_string()];
+        let out = order_reviewer_candidates(
+            Some("explicit-reviewer"),
+            Some("agent-pin-reviewer"),
+            &config_chain,
+            &scenario_chain,
+        );
+        assert_eq!(
+            out,
+            vec![
+                "explicit-reviewer".to_string(),
+                "agent-pin-reviewer".to_string(),
+                "config-reviewer".to_string(),
+                "scenario-reviewer".to_string(),
+            ],
+            "C2-1: explicit pin heads; then agent pin, config chain, scenario tail"
+        );
+    }
+
+    #[test]
+    fn scenario_head_used_only_when_no_pin_configured() {
+        // Legacy behavior preserved: with no explicit override and no
+        // configured pin, the scenario head is the first candidate.
+        let scenario_chain = vec!["scenario-reviewer".to_string(), "scenario-alt".to_string()];
+        let out = order_reviewer_candidates(None, None, &[], &scenario_chain);
+        assert_eq!(
+            out, scenario_chain,
+            "scenario chain seeds head+tail when no pin set"
+        );
+    }
 
     // ---- Y-3 / Y-4: parse_review must not be gamed / fail closed ---------
 
