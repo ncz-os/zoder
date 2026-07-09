@@ -25,9 +25,33 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Child;
+
+/// Maximum bytes the wire layer will buffer for a single JSON-RPC
+/// frame. ACP frames are small (a few KB for typical tool calls; a few
+/// hundred KB for the largest streamed text chunk the engine
+/// produces in practice). 4 MiB is an order of magnitude larger than
+/// any legitimate frame this driver has ever observed, and is small
+/// enough that a hostile or runaway engine that emits a giant line
+/// (or never sends a newline) cannot OOM the driver within the turn
+/// deadline. Frames larger than this cap surface as a clear
+/// "frame exceeds N-byte cap" error from the per-frame reader, so
+/// the caller can fail fast and surface a useful diagnostic instead
+/// of seeing a silent memory blow-up.
+///
+/// The cap is enforced via [`AsyncReadExt::take`] on the per-frame
+/// read; the underlying reader's buffered bytes (beyond the cap) are
+/// NOT discarded — they are left in the buffer for the next frame
+/// read, so a malformed frame cannot corrupt a subsequent legitimate
+/// one. The cap is PER-FRAME, not cumulative.
+///
+/// Z-17: introduced to bound the per-frame read that previously used
+/// an unbounded [`AsyncBufReadExt::read_line`] (the engine-session
+/// read loops in `drive`, `drive_goose_io`, and `cancel_session` all
+/// go through this constant).
+pub(crate) const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Convert an `EngineKind` into the canonical scope prefix the
 /// persistence layer uses. Kept here (rather than in `session_store`)
@@ -783,6 +807,12 @@ pub async fn cancel_session(
     // failure: the daemon closed the connection without acknowledging
     // the cancel, which we cannot distinguish from a daemon crash mid-
     // edit. The caller will see the timeout-elapsed error below.
+    //
+    // Z-17: the per-frame read is bounded by [`MAX_FRAME_BYTES`]
+    // via [`read_frame_line_capped`]. A hostile / runaway daemon
+    // that emits a single frame larger than the cap surfaces as an
+    // `io::Error`, NOT an OOM; we treat any per-frame read error
+    // here the same as any other read error (settle failure).
     let deadline = init_deadline;
     let mut line = String::new();
     let mut turn_complete_seen = false;
@@ -793,9 +823,9 @@ pub async fn cancel_session(
                 "daemon did not acknowledge session/cancel within {settle_budget:?}"
             ));
         }
-        line.clear();
-        match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
-            Ok(Ok(0)) => {
+        match tokio::time::timeout(remaining, read_frame_line_capped(&mut reader, &mut line)).await
+        {
+            Ok(Ok(false)) => {
                 // EOF — daemon closed the connection. Only accept this
                 // as "settled" if we'd already received the turn_complete
                 // (defensive: in practice the daemon keeps the socket
@@ -810,7 +840,7 @@ pub async fn cancel_session(
                      (possible crash mid-edit); waited {settle_budget:?}"
                 ));
             }
-            Ok(Ok(_)) => {
+            Ok(Ok(true)) => {
                 let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
@@ -978,11 +1008,17 @@ async fn drive<F: FnMut(AgentEvent)>(
     // `Some`, the params include a `session_id` field per the
     // existing wire contract (~L805-807). If the engine returns a
     // JSON-RPC error reply — meaning the persisted id is unknown /
-    // expired on the server side — we clear the stale record (so
-    // the NEXT run doesn't keep failing the same way) and retry
-    // `session/new` with no `session_id` to mint a fresh one. A
-    // non-error failure (timeout, dropped connection) is surfaced
-    // unchanged so the caller can decide.
+    // expired on the server side — we retry `session/new` with no
+    // `session_id` to mint a fresh one. The previous code also
+    // cleared the on-disk record on the reject path; that was
+    // Z-24-unsafe (a transient failure on the fresh-create retry
+    // would leave the operator with an empty store AND no
+    // session, for no reason) and is no longer done here — the
+    // success-path `persist_session_after` at the end of `drive`
+    // overwrites the record with the fresh id, and the failure
+    // path leaves it untouched. A non-error failure (timeout,
+    // dropped connection) is surfaced unchanged so the caller can
+    // decide.
     let mut new_params = serde_json::Map::new();
     new_params.insert("agent_alias".into(), json!(opts.agent_alias));
     new_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
@@ -1003,21 +1039,20 @@ async fn drive<F: FnMut(AgentEvent)>(
     let new_res = match read_result_inner(&mut reader, "new").await? {
         Ok(v) => v,
         Err(msg) => {
-            // Engine rejected the resume. The persisted id is stale
-            // by definition — drop it so the next run doesn't keep
-            // tripping the same error — and retry without a
-            // session_id so the server mints a fresh one. The new
-            // id will be persisted at the end of `drive`.
-            if opts.persist_session_id && effective_session_id.is_some() {
-                if let Some(store_path) = opts.session_store_path.as_ref() {
-                    let cfg = session_store::StoreConfig::new(store_path);
-                    if let Err(e) = session_store::EngineSessionStore::clear(&cfg, &scope) {
-                        eprintln!(
-                            "zoder: warning: failed to clear stale engine-session record ({scope}): {e}"
-                        );
-                    }
-                }
-            }
+            // Engine rejected the resume. The previous behavior
+            // was to clear the on-disk record here so the next
+            // run wouldn't keep tripping the same error — but
+            // that path was Z-24-unsafe: if the fresh-create
+            // retry below ALSO failed, the operator would be
+            // left with an empty store AND no session, for no
+            // reason. The fresh id (if the retry succeeds) is
+            // already persisted by `persist_session_after` at
+            // the end of `drive`, so there is no benefit to
+            // dropping the existing record on the reject path.
+            // We just retry without `session_id`; the
+            // success-path persist overwrites the record, the
+            // failure path leaves it untouched.
+            //
             // Retry without session_id.
             let mut retry_params = serde_json::Map::new();
             retry_params.insert("agent_alias".into(), json!(opts.agent_alias));
@@ -1089,38 +1124,45 @@ async fn drive<F: FnMut(AgentEvent)>(
 
     // 5. consume session/update notifications until turn_complete (or the
     //    deadline elapses, in which case we keep the partial turn).
+    //
+    //    Z-17: the per-frame read is bounded by [`MAX_FRAME_BYTES`]
+    //    via [`read_frame_line_capped`]. A hostile / runaway engine
+    //    that emits a single frame larger than the cap surfaces as
+    //    an `io::Error` of `InvalidData` kind, NOT an OOM.
     let mut content = String::new();
     let mut input_tokens = 0u64;
     let mut tool_calls = 0u32;
     let mut line = String::new();
     let outcome: String = loop {
-        line.clear();
-        let n = match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
-            // Budget exhausted. CANCEL the turn server-side so the engine stops
-            // editing files (otherwise a ghost agent keeps running after we
-            // return + fail the job), then preserve whatever streamed so far.
-            Err(_) => {
-                let _ = write_frame(
-                    &mut write_half,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": "cancel",
-                        "method": "session/cancel",
-                        "params": { "session_id": session_id },
-                    }),
-                )
-                .await;
-                // Best-effort: give the engine a moment to ack/wind down the turn.
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    reader.read_line(&mut line),
-                )
-                .await;
-                break "timeout".to_string();
-            }
-            Ok(r) => r.context("reading from engine")?,
-        };
-        if n == 0 {
+        let got_line =
+            match tokio::time::timeout_at(deadline, read_frame_line_capped(&mut reader, &mut line))
+                .await
+            {
+                // Budget exhausted. CANCEL the turn server-side so the engine stops
+                // editing files (otherwise a ghost agent keeps running after we
+                // return + fail the job), then preserve whatever streamed so far.
+                Err(_) => {
+                    let _ = write_frame(
+                        &mut write_half,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": "cancel",
+                            "method": "session/cancel",
+                            "params": { "session_id": session_id },
+                        }),
+                    )
+                    .await;
+                    // Best-effort: give the engine a moment to ack/wind down the turn.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        read_frame_line_capped(&mut reader, &mut line),
+                    )
+                    .await;
+                    break "timeout".to_string();
+                }
+                Ok(r) => r.context("reading from engine")?,
+            };
+        if !got_line {
             bail!("engine closed the connection before turn completed");
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
@@ -2353,8 +2395,15 @@ where
     //    from the persistence store), it is included as `sessionId`
     //    so the engine can resume an existing session. An
     //    unrecognized / expired id surfaces as a JSON-RPC error
-    //    reply; we clear the stale record and retry without
-    //    `sessionId` to mint a fresh session.
+    //    reply; we retry without `sessionId` to mint a fresh
+    //    session. Z-24: the previous code also cleared the
+    //    on-disk record on the reject path — that was unsafe
+    //    because a transient failure on the fresh-create retry
+    //    would leave the operator with an empty store AND no
+    //    session, for no reason. The success-path
+    //    `persist_session_after` at the end of `drive_goose_io`
+    //    overwrites the record with the fresh id, and the
+    //    failure path leaves it untouched.
     //
     //    `mcpServers` is populated by the CLI from the parsed engine-config
     //    server specs (see `zoder_core::to_acp_mcp_servers`); an empty
@@ -2391,20 +2440,18 @@ where
     let new_res = match new_res {
         Ok(v) => v,
         Err(msg) => {
-            // Engine rejected a resume. The persisted id is stale
-            // by definition — drop it so the next run doesn't keep
-            // tripping the same error — and retry without a
-            // sessionId so the engine mints a fresh one.
-            if opts.persist_session_id && effective_session_id.is_some() {
-                if let Some(store_path) = opts.session_store_path.as_ref() {
-                    let cfg = session_store::StoreConfig::new(store_path);
-                    if let Err(e) = session_store::EngineSessionStore::clear(&cfg, &scope) {
-                        eprintln!(
-                            "zoder: warning: failed to clear stale engine-session record ({scope}): {e}"
-                        );
-                    }
-                }
-            }
+            // Engine rejected a resume. Z-24: do NOT clear the
+            // on-disk record here. The previous behavior was to
+            // drop the record so the next run wouldn't keep
+            // tripping the same error — but if the fresh-create
+            // retry below also fails, the operator would be
+            // left with an empty store AND no session, for no
+            // reason. The fresh id (if the retry succeeds) is
+            // already persisted by `persist_session_after` at
+            // the end of `drive_goose_io`, so there is no
+            // benefit to dropping the existing record on the
+            // reject path. The success-path persist overwrites
+            // the record; the failure path leaves it untouched.
             let mut retry_params = serde_json::Map::new();
             retry_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
             retry_params.insert("mcpServers".into(), json!(opts.mcp_servers));
@@ -2522,19 +2569,28 @@ where
     let outcome: String = loop {
         // 3. Send `session/prompt` on the first iteration, BEFORE reading.
         //    Doing it here (inside the loop, after the reader is set up
-        //    but before the first `read_line`) is the actual deadlock
-        //    fix: the reader is now ready to drain any frames the
-        //    server emits in response.
+        //    but before the first `read_frame_line_capped`) is the
+        //    actual deadlock fix: the reader is now ready to drain any
+        //    frames the server emits in response.
+        //
+        //    Z-17: the per-frame read is bounded by
+        //    [`MAX_FRAME_BYTES`] via [`read_frame_line_capped`]; an
+        //    oversized / never-terminated frame surfaces as an
+        //    `io::Error`, not an OOM.
         if !prompt_sent {
             write_frame(write_half, &prompt_frame).await?;
             prompt_sent = true;
-            // Fall through to read_line on this same iteration so the
-            // reader is polled immediately after the write — no
-            // scheduler-induced gap between "sent prompt" and "ready
-            // to read reply".
+            // Fall through to read_frame_line_capped on this same
+            // iteration so the reader is polled immediately after the
+            // write — no scheduler-induced gap between "sent prompt"
+            // and "ready to read reply".
         }
-        line.clear();
-        let n = match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
+        let got_line = match tokio::time::timeout_at(
+            deadline,
+            read_frame_line_capped(reader, &mut line),
+        )
+        .await
+        {
             Err(_) => {
                 // Budget exhausted. Best-effort: ask goose to stop the turn
                 // so it doesn't keep editing files in the background after
@@ -2572,13 +2628,17 @@ where
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let drain_budget = remaining.min(Duration::from_millis(250));
                 if !drain_budget.is_zero() {
-                    let _ = tokio::time::timeout(drain_budget, reader.read_line(&mut line)).await;
+                    let _ = tokio::time::timeout(
+                        drain_budget,
+                        read_frame_line_capped(reader, &mut line),
+                    )
+                    .await;
                 }
                 break "timeout".to_string();
             }
             Ok(r) => r.context("reading from goose ACP engine")?,
         };
-        if n == 0 {
+        if !got_line {
             // Engine closed its end. If we never got an explicit stopReason,
             // assume the turn completed.
             break if content.is_empty() && tool_calls == 0 {
@@ -2931,6 +2991,71 @@ async fn write_frame(
     Ok(())
 }
 
+/// Read a single NDJSON line from `reader` into `line`, bounded by
+/// [`MAX_FRAME_BYTES`]. Returns:
+///
+/// * `Ok(true)`  — a complete line was read (the buffer ends with
+///   `\n`; the caller trims it as today).
+/// * `Ok(false)` — EOF reached before any bytes were read (the
+///   connection was closed cleanly between frames).
+/// * `Err`       — an I/O error, OR the line exceeded
+///   [`MAX_FRAME_BYTES`] bytes without a trailing `\n`. The error is
+///   reported as `io::ErrorKind::InvalidData` with a message naming
+///   the cap, so a misbehaving engine that emits a giant line (or
+///   never sends a newline) cannot OOM the driver — it fails fast
+///   with a useful diagnostic instead.
+///
+/// The cap is enforced via [`AsyncReadExt::take`]: the underlying
+/// reader's buffered bytes (beyond the cap) are NOT discarded —
+/// they remain in the buffer for the next frame read. The cap is
+/// PER-FRAME, not cumulative, so a malformed frame cannot corrupt a
+/// subsequent legitimate one.
+///
+/// Z-17: introduced to bound the per-frame read that previously
+/// used an unbounded [`AsyncBufReadExt::read_line`]. All wire-layer
+/// readers (the `read_result` handshake, the streaming
+/// session/update loop in `drive` / `drive_goose_io`, and the
+/// cancel-ack drain in `cancel_session`) route through this
+/// function.
+async fn read_frame_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> std::io::Result<bool> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let n = reader
+        .take(MAX_FRAME_BYTES)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        // EOF — engine closed the connection between frames.
+        line.clear();
+        return Ok(false);
+    }
+    if buf.last() != Some(&b'\n') {
+        // The cap was hit before any delimiter was found. Treat
+        // this as a hostile / runaway frame: the cap exists
+        // specifically so the driver cannot be OOMed by a single
+        // malformed line. We do NOT consume the line buffer
+        // (already empty — `line` was not touched yet) so a
+        // partial frame cannot "stick" into a subsequent
+        // legitimate one if the caller decides to continue.
+        line.clear();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "engine frame exceeds {MAX_FRAME_BYTES}-byte cap (no newline found within cap); \
+                 possible hostile or runaway engine"
+            ),
+        ));
+    }
+    // NDJSON requires UTF-8; lossily replace invalid bytes so a
+    // misbehaving engine cannot wedge the driver on a non-UTF-8
+    // byte in the payload (it'll just fail to JSON-parse, which
+    // the caller already handles by skipping the frame).
+    *line = String::from_utf8_lossy(&buf).into_owned();
+    Ok(true)
+}
+
 /// Read NDJSON frames until the response with `want_id` arrives (skipping
 /// notifications and unrelated responses). Returns the `result` value.
 async fn read_result(
@@ -2948,18 +3073,21 @@ async fn read_result(
 /// `session/new` sites to distinguish a JSON-RPC error reply (which
 /// triggers the resume-rejected fallback in the persistent-sessions
 /// slice) from any other IO/protocol failure.
+///
+/// Z-17: the inner read is now bounded by [`MAX_FRAME_BYTES`] via
+/// [`read_frame_line_capped`]. A hostile / runaway engine that emits
+/// a frame larger than the cap surfaces as an `io::ErrorKind::InvalidData`
+/// error, never an OOM.
 async fn read_result_inner(
     reader: &mut (impl AsyncBufReadExt + Unpin),
     want_id: &str,
 ) -> anyhow::Result<Result<Value, String>> {
     let mut line = String::new();
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
+        let got_line = read_frame_line_capped(reader, &mut line)
             .await
             .context("reading from engine")?;
-        if n == 0 {
+        if !got_line {
             bail!("engine closed the connection before responding to {want_id}");
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
@@ -5060,6 +5188,163 @@ mod tests {
         );
     }
 
+    /// Mock variant for the Z-24 test: behaves like
+    /// [`run_mock_session_new_rejected_then_recovers`] EXCEPT the
+    /// SECOND `session/new` (the fresh-create retry) ALSO returns a
+    /// JSON-RPC error reply, so the driver bails out at the
+    /// "fresh-create retry also failed" branch.
+    async fn run_mock_session_new_rejected_both_times(
+        server: MockGoose,
+        engine_io: tokio::io::DuplexStream,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+        let (r, mut w) = tokio::io::split(engine_io);
+        let mut r = tokio::io::BufReader::new(r);
+
+        async fn read_one(
+            r: &mut tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+            received: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        ) {
+            let mut line = String::new();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                received.lock().unwrap().push(v);
+            }
+        }
+        async fn write_one(
+            w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            v: serde_json::Value,
+        ) {
+            let s = serde_json::to_string(&v).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+        }
+
+        // 1. read initialize -> reply.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocolVersion": 1 }
+            }),
+        )
+        .await;
+
+        // 2. read session/new (resume) -> error.
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "error": { "code": -32004, "message": "session not found" }
+            }),
+        )
+        .await;
+
+        // 3. read session/new (fresh-create retry) -> ALSO error.
+        //    The driver must then bail out with the combined
+        //    "fresh-create retry also failed" diagnostic and
+        //    MUST NOT have cleared the on-disk record for this
+        //    scope (Z-24 invariant).
+        read_one(&mut r, &server.received).await;
+        write_one(
+            &mut w,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "error": { "code": -32004, "message": "engine on fire" }
+            }),
+        )
+        .await;
+
+        // Give the client a moment to read the error and bail out.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Z-24: when the engine rejects a resume AND the fresh-create
+    /// retry ALSO fails, the driver MUST NOT silently drop the
+    /// previously-stored session id from the persistence store.
+    /// Pre-fix code unconditionally called
+    /// `EngineSessionStore::clear` on a resume-reject, so a transient
+    /// failure (engine hiccup, network blip) on the retry would
+    /// leave the operator with an empty store AND no session — for
+    /// no reason. The post-fix code lets `persist_session_after`
+    /// decide what (if anything) to overwrite, so a failed run
+    /// preserves the prior record verbatim.
+    ///
+    /// The test seeds a valid record for "session-A" in the store,
+    /// passes an explicit `opts.session_id = "session-A"`, points
+    /// the mock at a server that returns a JSON-RPC error for BOTH
+    /// the resume AND the retry, and asserts the on-disk record is
+    /// still present and still "session-A" after the failed run.
+    #[tokio::test]
+    async fn z24_resume_reject_with_failing_retry_does_not_evict_store_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("engine_sessions.json");
+        let cfg = session_store::StoreConfig::new(&store_path);
+        // Seed with the SAME id the operator is going to ask us to
+        // resume. The store record is "valid" (in scope, fresh) and
+        // must survive a failed-resume/failed-retry untouched.
+        session_store::EngineSessionStore::save(&cfg, "goose", &PathBuf::from("/tmp"), "session-A")
+            .unwrap();
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = MockGoose {
+            received: received.clone(),
+            outbound: vec![],
+        };
+        let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
+        let server_handle =
+            tokio::spawn(run_mock_session_new_rejected_both_times(server, engine_io));
+
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        // Key: persistence ON + explicit session_id, so the driver
+        // takes the resume path. The store record happens to be for
+        // the same id ("session-A"), making the pre-fix clear()
+        // call a particularly nasty case: it would drop a valid
+        // record the operator might still be able to use on the
+        // NEXT run.
+        opts.persist_session_id = true;
+        opts.session_store_path = Some(store_path.clone());
+        opts.session_id = Some("session-A".to_string());
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let run = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
+            events.push(ev);
+        })
+        .await;
+        let _ = server_handle.await;
+        // Sanity: the resume + fresh-create retry both failed, so
+        // the driver must surface that combined error.
+        let err = run.expect_err(
+            "Z-24: drive_goose_io must return Err when both the resume and the fresh-create retry \
+             fail",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("fresh-create retry also failed") || msg.contains("retry also failed"),
+            "Z-24: expected the combined-resume-failure diagnostic, got: {msg}"
+        );
+
+        // The actual fix: the store record MUST still be present,
+        // and MUST still be the seeded "session-A" — the failed
+        // run MUST NOT have evicted a valid record the operator
+        // could still use.
+        let scope = session_store::make_scope("goose", &PathBuf::from("/tmp"));
+        let rec = session_store::EngineSessionStore::load(&cfg, &scope)
+            .unwrap()
+            .expect("Z-24: a failed resume-retry must NOT evict a valid store record");
+        assert_eq!(
+            rec.session_id, "session-A",
+            "Z-24: the seeded record must remain intact after a failed run; got {rec:?}"
+        );
+    }
+
     #[tokio::test]
     async fn goose_drive_stale_record_is_treated_as_absent() {
         // Defensive guard: a record older than the freshness window
@@ -5193,6 +5478,107 @@ mod tests {
         assert_eq!(
             utilization_count, 0,
             "Goose context-window usage is not subscription-quota telemetry"
+        );
+    }
+
+    /// Z-17 (end-to-end): a hostile engine that emits a single
+    /// `session/update` larger than [`MAX_FRAME_BYTES`] in the
+    /// streaming loop MUST surface as an `io::Error` from
+    /// `drive_goose_io` (the same `read_frame_line_capped` helper
+    /// gates the streaming read as well as the handshake read). The
+    /// pre-fix code would have buffered the whole oversized frame
+    /// and OOMed the driver; the post-fix code fails fast at the
+    /// cap with a useful diagnostic.
+    ///
+    /// The mock does the normal init/new handshake, then writes a
+    /// SINGLE `session/update`-shaped JSON object whose body is
+    /// `(MAX_FRAME_BYTES + 256)` bytes of `'x'` with no `\n` inside
+    /// the cap. The driver must reject the frame at the cap and
+    /// surface an `InvalidData`-flavored error.
+    ///
+    /// The server task keeps its writer alive after the oversized
+    /// write so the client bails on the cap (not on a writer-side
+    /// shutdown that would surface as a different error kind).
+    #[tokio::test]
+    async fn z17_drive_goose_io_streaming_loop_errors_on_oversized_frame() {
+        use tokio::io::AsyncWriteExt;
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (client_io, engine_io) = tokio::io::duplex((MAX_FRAME_BYTES as usize) * 2);
+        let recv = received.clone();
+        let server = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(engine_io);
+            let mut r = tokio::io::BufReader::new(r);
+            // 1. initialize -> ack
+            let mut line = String::new();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                recv.lock().unwrap().push(v);
+            }
+            let init_ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocolVersion": 1 }
+            });
+            let s = serde_json::to_string(&init_ack).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+            // 2. session/new -> success
+            line.clear();
+            let _ = r.read_line(&mut line).await;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                recv.lock().unwrap().push(v);
+            }
+            let new_ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "result": { "sessionId": "goose-overflow-test" }
+            });
+            let s = serde_json::to_string(&new_ack).unwrap();
+            let _ = w.write_all(s.as_bytes()).await;
+            let _ = w.write_all(b"\n").await;
+            let _ = w.flush().await;
+            // 3. send a session/update whose body is larger than the
+            //    cap, with no '\n' inside the cap. The driver MUST
+            //    reject this at the cap and surface the overflow.
+            let huge_body = "x".repeat(MAX_FRAME_BYTES as usize + 256);
+            let huge = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "goose-overflow-test",
+                    "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": huge_body } }
+                }
+            });
+            let s = serde_json::to_string(&huge).unwrap();
+            // Block until the whole oversized frame is in the
+            // duplex buffer. The duplex is sized at 2x MAX so this
+            // never blocks on backpressure from the client (the
+            // client can't drain faster than we fill).
+            let _ = w.write_all(s.as_bytes()).await;
+            // Yield a few times so the client gets to read before
+            // we drop `w` (which closes the writer and would
+            // surface as a different error kind).
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        });
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.timeout = std::time::Duration::from_secs(5);
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let res = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
+            events.push(ev);
+        })
+        .await;
+        let _ = server.await;
+        let err =
+            res.expect_err("Z-17: an oversized session/update must make drive_goose_io return Err");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("cap") || msg.contains("exceeds") || msg.contains("too large"),
+            "Z-17: expected an overflow / cap diagnostic from the streaming loop, got: {msg}"
         );
     }
 
@@ -6703,6 +7089,87 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "cancel_session must fail fast on connect errors; took {elapsed:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Z-17 [MED]: unbounded per-frame read_line -> OOM.
+    //
+    // The wire layer (drive / drive_goose_io / cancel_session) used
+    // to call `AsyncBufReadExt::read_line` with no cap. A hostile /
+    // buggy engine that emits a single NDJSON line longer than
+    // [`MAX_FRAME_BYTES`] (or never sends a newline) would make zoder
+    // buffer without limit and OOM within the turn deadline.
+    //
+    // The fix caps the per-frame read with
+    // `AsyncReadExt::take(MAX_FRAME_BYTES)` and surfaces a clear
+    // "frame exceeds N-byte cap" error when no newline is found
+    // inside the cap. These tests pin that behavior against the
+    // REAL `read_result` reader, not a reimplementation.
+    //
+    // Both tests use a `tokio::io::duplex` whose buffer is sized so
+    // the server can write the whole oversized frame in one shot
+    // (otherwise the server's `write_all` would block on the bounded
+    // buffer and the test would deadlock, not fail — which is
+    // exactly the bug we want to prevent).
+    // -----------------------------------------------------------------
+
+    /// Z-17: an oversized frame (no newline within [`MAX_FRAME_BYTES`])
+    /// must surface as a clear overflow error from the per-frame
+    /// reader. The reader must NOT buffer the line unboundedly; it
+    /// must fail fast at the cap.
+    #[tokio::test]
+    async fn z17_read_result_errors_on_oversized_frame() {
+        use tokio::io::AsyncWriteExt;
+        // 2x MAX so the server can push the whole frame in one
+        // write; otherwise it would block on the bounded buffer.
+        let buf = (MAX_FRAME_BYTES as usize) * 2;
+        let (client_io, mut engine_io) = tokio::io::duplex(buf);
+        let server = tokio::spawn(async move {
+            // MAX + 256 bytes of 'x' with no '\n' inside. We follow
+            // with a '\n' so a well-behaved NEXT-frame reader would
+            // not loop forever; the cap MUST trip on this single
+            // frame first.
+            let huge = vec![b'x'; MAX_FRAME_BYTES as usize + 256];
+            let _ = engine_io.write_all(&huge).await;
+            let _ = engine_io.write_all(b"\n").await;
+            let _ = engine_io.shutdown().await;
+        });
+        let mut r = tokio::io::BufReader::new(client_io);
+        let res = read_result(&mut r, "init").await;
+        let _ = server.await;
+        let err = res.expect_err("oversized frame MUST error, not buffer unboundedly");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("cap") || msg.contains("exceeds") || msg.contains("too large"),
+            "Z-17: expected an overflow / cap error, got: {msg}"
+        );
+    }
+
+    /// Z-17 (round-trip sanity): legitimate normal-sized frames
+    /// still parse unchanged. This is the non-breaking half of the
+    /// fix: capping the read MUST NOT change the behavior of
+    /// [`read_result`] for well-behaved engines.
+    #[tokio::test]
+    async fn z17_read_result_still_parses_legitimate_frames_under_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (client_io, mut engine_io) = tokio::io::duplex(8 * 1024);
+        let server = tokio::spawn(async move {
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocolVersion": 1 }
+            });
+            let mut s = serde_json::to_string(&frame).unwrap();
+            s.push('\n');
+            let _ = engine_io.write_all(s.as_bytes()).await;
+            let _ = engine_io.shutdown().await;
+        });
+        let mut r = tokio::io::BufReader::new(client_io);
+        let res = read_result(&mut r, "init")
+            .await
+            .expect("legitimate frame must still parse after the cap fix");
+        assert_eq!(res["protocolVersion"], 1);
+        let _ = server.await;
     }
 }
 
