@@ -1000,7 +1000,7 @@ data: {\"type\":\"message_stop\"}\n\
 
 /// Stream that closes via `message_stop` without producing any text
 /// delta — same schema-invalid-2xx contract as the non-streaming
-/// empty-content case. The decoder must surface ErrKind::Decode.
+/// Z-23 placeholder start marker
 #[tokio::test]
 async fn anthropic_streaming_with_no_text_delta_is_decode_error() {
     let server = MockServer::start().await;
@@ -1024,6 +1024,57 @@ data: {\"type\":\"message_stop\"}\n\
         .unwrap_err();
     assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
     assert!(err.message.contains("no text content"), "got: {err}");
+}
+
+/// Z-23: the SSE parser's blank-line branch (event-dispatch point)
+/// must reset `current_event` to its default. Pre-fix the parser
+/// tracked the most recent `event:` line in `current_event` but NEVER
+/// reset it on the blank line that terminated each frame, so a
+/// subsequent frame that OMITS the `event:` line would inherit the
+/// previous event type and be silently mis-parsed under whichever arm
+/// of the `match` the previous event had selected. The comment
+/// immediately above the blank-line branch literally says "Reset for
+/// the next frame; the next `event:` line will re-populate
+/// `current_event`" but no reset ever happened.
+///
+/// Drives the real `OpenAiProvider::stream_chat` SSE decoder
+/// end-to-end through a wiremock Anthropic-shaped stream whose first
+/// event sets `prompt_tokens` via `message_start`, and whose SECOND
+/// event OMITS `event:` but carries a data payload shaped like a
+/// `message_start` with a different `input_tokens`. With the bug,
+/// `current_event` stays "message_start" across the blank line, the
+/// second data is parsed as `message_start`, and `prompt_tokens` is
+/// silently overwritten to 999. With the fix, the blank-line dispatch
+/// point resets `current_event` to `None`, the second data falls
+/// through the `match` to `_ => {}`, and `prompt_tokens` stays at 5.
+///
+/// Non-regression: the rest of the well-formed Anthropic event
+/// sequence still produces the expected content + completion_tokens.
+#[tokio::test]
+async fn anthropic_streaming_resets_current_event_on_blank_line() {
+    let server = MockServer::start().await;
+    let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"usage\":{\"input_tokens\":999,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let p = anthropic_provider(&server.uri(), Auth::None);
+    let mut sink = Vec::new();
+    let res = p
+        .stream_chat(&anthropic_req("claude", true), Some(&mut sink))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.prompt_tokens,
+        Some(5),
+        "second SSE frame omitted `event:` and must NOT inherit message_start; got prompt_tokens={:?}",
+        res.prompt_tokens
+    );
+    assert_eq!(res.content, "hi");
+    assert_eq!(sink, b"hi");
+    assert_eq!(res.completion_tokens, Some(2));
 }
 
 /// Typed Anthropic error envelope on a 401 must surface as
