@@ -63,7 +63,7 @@ utilization (used/cap/pct, next reset, approaching) against those caps.
 ## 4. Design directives
 
 ### 4.1 Shared, curated tier-preset catalog (single source of truth)
-- New file in **ncz-os/zoder** main: `subscriptions/tiers.json`, **raw-pullable**
+- New file in **ncz-os/zoder** master: `subscriptions/tiers.json`, **raw-pullable**
   (same pattern as `corpus/model_corpus.json` + `bench/known-good-swe.json`), so
   zoder, the tokenomics plugin, and any other consumer resolve from one place.
 - **Schema** (per provider → list of tiers):

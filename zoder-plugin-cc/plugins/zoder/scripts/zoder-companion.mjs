@@ -101,7 +101,7 @@ function main() {
           "Install the matching build (it ships zerocode + zeroclaw alongside),\n" +
           "then set $ZODER_BIN or put the binary on PATH and re-run /zoder:setup.\n" +
           "Public build install:\n" +
-          "  curl -fsSL https://gitlab.com/ncz-os/zoder/-/raw/main/install.sh | sh"
+          "  curl -fsSL https://gitlab.com/ncz-os/zoder/-/raw/master/install.sh | sh"
       );
       process.exit(1);
     }
