@@ -1387,6 +1387,10 @@ async fn drive<F: FnMut(AgentEvent)>(
                 let approved = decide_approval_with_containment(
                     opts.approval,
                     &tool,
+                    // Zeroclaw's `approval_request` carries a canonical
+                    // `tool_name`, not an ACP semantic kind, so pass `None`
+                    // and let the name-based heuristic decide.
+                    None,
                     &params,
                     EngineKind::Zeroclaw,
                     &opts.writable_roots,
@@ -1466,6 +1470,51 @@ async fn drive<F: FnMut(AgentEvent)>(
     })
 }
 
+/// Semantic classification of a tool call, derived from the ACP v1
+/// `toolCall.kind` when present (the MACHINE tool category) and never
+/// from the human-rendered `toolCall.title`.
+///
+/// ACP v1 defines a small, fixed set of semantic kinds. We collapse them
+/// into the three security-relevant buckets this file already reasons about:
+///   * `Read`  — read/search/fetch: eligible for the Allowlist auto-approve.
+///   * `Write` — edit/delete/move: routed through writable-root containment.
+///   * `Exec`  — execute: an exec-class tool; NOT write-class, decided by the
+///     name-based policy (exec-arg inspection is a later slice).
+///
+/// Anything we do not recognize (e.g. `think`, `other`, or a novel kind) is
+/// `Other`, which means "fall back to the name/title heuristic" — we do NOT
+/// guess, and we never let an unknown kind widen the allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolKindCategory {
+    Read,
+    Write,
+    Exec,
+    Other,
+}
+
+/// Map an ACP v1 `toolCall.kind` string to a [`ToolKindCategory`]. Returns
+/// `None` for an empty/absent kind so the caller can fall back to the
+/// existing name-based heuristic (this is what keeps zeroclaw — which sends a
+/// canonical `tool_name` and no ACP kind — on its current code path).
+///
+/// The match is case-insensitive and covers the ACP v1 semantic kinds
+/// (`read`, `search`, `fetch`, `edit`, `delete`, `move`, `execute`) plus a
+/// couple of tolerant aliases (`write` as an edit synonym, `exec` for
+/// `execute`). Anything else maps to `Other` (fall back to the heuristic),
+/// NEVER to `Read` — an unrecognized kind must never widen auto-approval.
+fn acp_kind_category(kind: &str) -> Option<ToolKindCategory> {
+    let k = kind.trim().to_ascii_lowercase();
+    if k.is_empty() {
+        return None;
+    }
+    Some(match k.as_str() {
+        "read" | "search" | "fetch" => ToolKindCategory::Read,
+        "edit" | "delete" | "move" | "write" => ToolKindCategory::Write,
+        "execute" | "exec" => ToolKindCategory::Exec,
+        _ => ToolKindCategory::Other,
+    })
+}
+
 fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
     match policy {
         ApprovalPolicy::All => true,
@@ -1477,6 +1526,39 @@ fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
             let t = tool.to_ascii_lowercase();
             DEFAULT_AUTO_APPROVE.iter().any(|a| t == *a)
         }
+    }
+}
+
+/// Approval decision that consults the ACP tool CATEGORY (from
+/// `toolCall.kind`) for allowlist eligibility, falling back to the
+/// name-based [`decide_approval`] when no category is available.
+///
+/// SECURITY: this only ever WIDENS `Allowlist` on a `Read`-category tool
+/// (read/search/fetch), and it NEVER weakens a deny policy — under
+/// `ApprovalPolicy::None` every tool is denied, and under `Allowlist` an
+/// `Exec`/`Write`/`Other` category is NOT auto-approved by kind (it falls
+/// back to the exact name allowlist, which for those is a deny). The
+/// `All` branch is unchanged.
+fn decide_approval_categorized(
+    policy: ApprovalPolicy,
+    tool: &str,
+    category: Option<ToolKindCategory>,
+) -> bool {
+    match policy {
+        // `All` approves everything; `None` denies everything. Neither is
+        // influenced by the ACP category — the deny guarantee is absolute.
+        ApprovalPolicy::All => true,
+        ApprovalPolicy::None => false,
+        ApprovalPolicy::Allowlist => match category {
+            // A read-class ACP kind is allowlist-eligible regardless of the
+            // human-rendered title (the whole point of GD1): goose sends
+            // title="Read file src/main.rs", kind="read" — we approve it.
+            Some(ToolKindCategory::Read) => true,
+            // Exec/Write/Other never auto-approve by kind under Allowlist;
+            // fall back to the exact name allowlist (a deny for these).
+            // No kind: pure name-based decision (zeroclaw path, legacy).
+            Some(_) | None => decide_approval(ApprovalPolicy::Allowlist, tool),
+        },
     }
 }
 
@@ -1906,25 +1988,46 @@ fn pick_string_field(params: &Value, candidates: &[&str]) -> Option<String> {
 ///      fail-closed cause). The log goes through the `tracing`-free
 ///      `eprintln!` channel used elsewhere in this file (tests assert
 ///      on the return value; the log is for operators).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_approval_with_containment(
     policy: ApprovalPolicy,
     tool: &str,
+    kind: Option<&str>,
     params: &Value,
     engine: EngineKind,
     writable_roots: &[PathBuf],
     enforce: bool,
     trust_engine: bool,
 ) -> bool {
-    // Non-enforced path: exact behavior of `decide_approval` today.
+    // ACP v1 keys the decision on the MACHINE tool category
+    // (`toolCall.kind`), not the human-rendered `title`. When a kind is
+    // present we classify off it; otherwise we fall back to the name-based
+    // heuristic (zeroclaw sends a canonical `tool_name` and no kind).
+    let category = kind.and_then(acp_kind_category);
+
+    // Non-enforced path: exact behavior of `decide_approval` today, but
+    // allowlist eligibility is decided by the ACP kind when we have one
+    // (so a `read`-kind call with a human title like "Read file X" is
+    // still auto-approved under Allowlist instead of being rejected).
     if !enforce {
-        return decide_approval(policy, tool);
+        return decide_approval_categorized(policy, tool, category);
     }
     // Enforced path: only write/edit-class tools go through the
-    // containment check; everything else keeps today's name-based
-    // decision (so e.g. `read` is still allowed under Allowlist even
+    // containment check; everything else keeps the name/kind-based
+    // decision (so e.g. a `read` is still allowed under Allowlist even
     // when enforcement is on, regardless of `writable_roots`).
-    if !is_write_class_tool(engine, tool) {
-        return decide_approval(policy, tool);
+    //
+    // Write-class membership is driven by the ACP kind when present
+    // (edit/delete/move), else by the per-engine name matrix. An Exec or
+    // Read kind is explicitly NOT write-class.
+    let is_write = match category {
+        Some(ToolKindCategory::Write) => true,
+        Some(ToolKindCategory::Read) | Some(ToolKindCategory::Exec) => false,
+        // Unknown/absent kind: fall back to the name-based matrix.
+        Some(ToolKindCategory::Other) | None => is_write_class_tool(engine, tool),
+    };
+    if !is_write {
+        return decide_approval_categorized(policy, tool, category);
     }
     // Known write tool — extract the target path. Fail closed on any
     // shape mismatch: an unknown engine, an unknown write tool, or a
@@ -1957,17 +2060,17 @@ pub(crate) fn decide_approval_with_containment(
                 eprintln!("{reason}");
                 return false;
             }
-            // trust_engine=true: fall through to the name-based policy
-            // for unknown shapes. This is the future seam for
+            // trust_engine=true: fall through to the name/kind-based
+            // policy for unknown shapes. This is the future seam for
             // "exhaustively validated engine, accept whatever shape it
             // sends". The default `false` keeps the boundary fail-closed.
-            return decide_approval(policy, tool);
+            return decide_approval_categorized(policy, tool, category);
         }
     };
     // We have a target path. Resolve containment.
     let verdict = resolve_containment(&target, writable_roots);
     match verdict {
-        ContainmentVerdict::Inside => decide_approval(policy, tool),
+        ContainmentVerdict::Inside => decide_approval_categorized(policy, tool, category),
         ContainmentVerdict::Outside => {
             eprintln!(
                 "writable-root containment: denying {engine:?} tool {tool:?}: \
@@ -2830,7 +2933,14 @@ where
 
         // --- A) The `session/prompt` RESPONSE carries the terminal
         //        stopReason and ends the turn.
-        if frame.get("id").and_then(Value::as_str) == Some("prompt") {
+        //
+        // GD3: a JSON-RPC RESPONSE has NO `method` field; a REQUEST does.
+        // Gate on `method` being absent so a server frame that happens to
+        // carry id:"prompt" AND a `method` (a request) is NOT misread as
+        // the terminal prompt response and does not end the turn early.
+        if frame.get("method").is_none()
+            && frame.get("id").and_then(Value::as_str) == Some("prompt")
+        {
             if let Some(err) = frame.get("error") {
                 let msg = err
                     .get("message")
@@ -2912,6 +3022,17 @@ where
                 })
                 .unwrap_or("tool")
                 .to_string();
+            // GD1: the SECURITY decision keys on the ACP MACHINE category
+            // (`toolCall.kind`, an ACP v1 semantic kind: read/search/fetch/
+            // edit/delete/move/execute/...), NOT the human `title`. `title`
+            // is used only for the display AgentEvent below. When `kind` is
+            // absent we fall back to the name-based heuristic inside
+            // `decide_approval_with_containment`.
+            let tool_kind = req_params
+                .get("toolCall")
+                .and_then(|tc| tc.get("kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
             // Real ACP v1 spec: `optionId` is an OPAQUE server-side id; the
             // semantic meaning lives in `options[].kind` (one of
             // `allow_once`, `allow_always`, `reject_once`, `reject_always`).
@@ -2938,6 +3059,7 @@ where
             let approved = decide_approval_with_containment(
                 opts.approval,
                 &tool_name,
+                tool_kind.as_deref(),
                 &tool_args,
                 EngineKind::Goose,
                 &opts.writable_roots,
@@ -3077,20 +3199,29 @@ where
             }
             "agent_message" => {
                 // Final assistant message for the turn (ContentBlock).
+                //
+                // GD2: `agent_message` is AUTHORITATIVE — it REPLACES the
+                // accumulated `content` rather than appending to it. Goose
+                // may stream the reply as `agent_message_chunk`s AND then
+                // send a final `agent_message` carrying the full text; a
+                // naive append double-counts it ("hello worldhello world")
+                // and emits `Text` twice. By resetting `content`/
+                // `content_bytes` and treating this frame as the source of
+                // truth, the reply lands exactly ONCE regardless of whether
+                // chunks preceded it.
                 if let Some(t) = extract_text_content(update.get("content")) {
-                    // Y-9: enforce the cumulative cap before
-                    // appending. See [`MAX_CUMULATIVE_CONTENT_BYTES`].
-                    let new_total = content_bytes.saturating_add(t.len() as u64);
-                    if new_total > MAX_CUMULATIVE_CONTENT_BYTES {
+                    // Y-9: enforce the cumulative cap against the single
+                    // authoritative message. See [`MAX_CUMULATIVE_CONTENT_BYTES`].
+                    if (t.len() as u64) > MAX_CUMULATIVE_CONTENT_BYTES {
                         bail!(
-                            "streamed content exceeded {MAX_CUMULATIVE_CONTENT_BYTES}-byte \
-                             cumulative cap (already appended {content_bytes} bytes across prior \
-                             frames; refusing to grow `content` unbounded); possible \
-                             hostile or runaway engine"
+                            "terminal `agent_message` of {} bytes exceeds \
+                             {MAX_CUMULATIVE_CONTENT_BYTES}-byte cumulative cap; \
+                             possible hostile or runaway engine",
+                            t.len()
                         );
                     }
-                    content.push_str(&t);
-                    content_bytes = new_total;
+                    content = t.clone();
+                    content_bytes = t.len() as u64;
                     on_event(AgentEvent::Text(t));
                 }
             }
@@ -3868,6 +3999,7 @@ mod tests {
             let new_decision = decide_approval_with_containment(
                 *policy,
                 tool,
+                None,
                 &Value::Null,
                 EngineKind::Goose,
                 &[],
@@ -3900,6 +4032,7 @@ mod tests {
             !decide_approval_with_containment(
                 ApprovalPolicy::All,
                 "write_file",
+                None,
                 &goose_args,
                 EngineKind::Goose,
                 &[root_a.clone()],
@@ -3912,6 +4045,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::Allowlist,
             "write_file",
+            None,
             &goose_args,
             EngineKind::Goose,
             &[root_a.clone()],
@@ -3923,6 +4057,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "text_editor",
+            None,
             &text_editor_args,
             EngineKind::Goose,
             &[root_a.clone()],
@@ -3943,6 +4078,7 @@ mod tests {
         assert!(decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &goose_args,
             EngineKind::Goose,
             &[root_a.clone()],
@@ -3963,6 +4099,7 @@ mod tests {
         assert!(decide_approval_with_containment(
             ApprovalPolicy::Allowlist,
             "read",
+            None,
             &json!({ "path": outside_file.to_string_lossy() }),
             EngineKind::Goose,
             &[PathBuf::from("/some/unused/root")],
@@ -3985,6 +4122,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "write",
+            None,
             &json!({ "path": "/tmp/anything" }),
             EngineKind::Zeroclaw,
             &[],
@@ -3996,6 +4134,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "edit",
+            None,
             &json!({ "path": "/tmp/anything" }),
             EngineKind::Zeroclaw,
             &[],
@@ -4015,6 +4154,7 @@ mod tests {
         assert!(decide_approval_with_containment(
             ApprovalPolicy::All,
             "wipe_disk",
+            None,
             &json!({ "path": "/etc/passwd" }),
             EngineKind::Goose,
             &[],
@@ -4026,6 +4166,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &json!({}), // no file_path, no path
             EngineKind::Goose,
             &[],
@@ -4036,6 +4177,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &json!({ "file_path": 12345 }),
             EngineKind::Goose,
             &[],
@@ -4046,6 +4188,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &json!({ "file_path": "" }),
             EngineKind::Goose,
             &[],
@@ -4070,6 +4213,7 @@ mod tests {
         assert!(decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &json!({}), // no file_path
             EngineKind::Goose,
             &[root_a.clone()],
@@ -4082,6 +4226,7 @@ mod tests {
         assert!(!decide_approval_with_containment(
             ApprovalPolicy::All,
             "write_file",
+            None,
             &goose_args,
             EngineKind::Goose,
             &[root_a.clone()],
@@ -7344,6 +7489,232 @@ mod tests {
             reply["result"]["outcome"]["optionId"], "allow-id-MID",
             "matching is by kind, not by position — the allow-kind option is in \
              the middle and must still be picked"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // C3-GD1: the approval + containment decision must key on the ACP
+    // MACHINE tool `kind`, NOT the human-rendered `title`. Real goose puts
+    // a human label in `title` ("Read file src/main.rs") and the semantic
+    // category in `toolCall.kind` (read/edit/...). These tests use
+    // REALISTIC goose frames (human title + kind) — NOT canonical names
+    // stuffed into `title`.
+    // -----------------------------------------------------------------
+
+    /// GD1(a): under Allowlist, a permission request whose `title` is a
+    /// human label ("Read file src/main.rs") but whose ACP `kind` is
+    /// "read" MUST be auto-approved. Before the fix the driver keyed on
+    /// `title`, the Allowlist exact-match against ["read", ...] never
+    /// matched the human label, and safe reads were REJECTED — stalling
+    /// allowlisted runs.
+    #[tokio::test]
+    async fn goose_drive_allowlist_approves_by_acp_read_kind_not_title() {
+        let outbound = vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "perm-read-kind",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "goose-test-session-1",
+                "toolCall": {
+                    // Human label — exactly what real goose renders.
+                    "title": "Read file src/main.rs",
+                    // Machine category — the ACP v1 semantic kind.
+                    "kind": "read",
+                    "rawInput": { "path": "src/main.rs" }
+                },
+                "options": [
+                    { "optionId": "opt-A9F1", "name": "Allow once", "kind": "allow_once" },
+                    { "optionId": "opt-B2C3", "name": "Deny once", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string()];
+        let (frames, _run, events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        let reply = &frames[3];
+        assert_eq!(reply["id"], "perm-read-kind");
+        assert_eq!(
+            reply["result"]["outcome"]["outcome"], "selected",
+            "an ACP kind:\"read\" call must be allowlist-APPROVED regardless of the human title"
+        );
+        assert_eq!(
+            reply["result"]["outcome"]["optionId"], "opt-A9F1",
+            "must echo back the allow_once option's opaque server id"
+        );
+        // The display event uses the human title, not the kind.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Approval { tool, approved: true } if tool == "Read file src/main.rs"
+            )),
+            "Approval event should carry the human title for display and approved=true; got {events:?}"
+        );
+    }
+
+    /// GD1(b): with `enforce_writable_roots` ON, a permission request with
+    /// `kind:"edit"` and an out-of-writable-root path MUST be contained
+    /// (denied) even under ApprovalPolicy::All. Before the fix the
+    /// write-class containment keyed on canonical names in `title`
+    /// (text_editor/write_file), never matched goose's human title, and
+    /// an out-of-root edit sailed through under All.
+    #[tokio::test]
+    async fn goose_drive_containment_triggers_on_acp_edit_kind_out_of_root() {
+        let (_dir, root_a, _root_b, outside) = make_containment_dirs();
+        let evil = outside.join("passwd");
+        std::fs::write(&evil, "x").unwrap();
+        let outbound = vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "perm-edit-kind",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "goose-test-session-1",
+                "toolCall": {
+                    // Human label; the machine category is the `kind`.
+                    "title": "Edit /etc/passwd",
+                    "kind": "edit",
+                    // write_file's field name; path is OUTSIDE root_a.
+                    "rawInput": { "file_path": evil.to_string_lossy() }
+                },
+                "options": [
+                    { "optionId": "opt-allow", "name": "Allow once", "kind": "allow_once" },
+                    { "optionId": "opt-deny", "name": "Deny once", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string()];
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.writable_roots = vec![root_a.clone()];
+        opts.enforce_writable_roots = true;
+        let (frames, _run, events) = drive_against_mock_with_opts(
+            outbound,
+            false,
+            // Even ApprovalPolicy::All must be overridden by containment.
+            ApprovalPolicy::All,
+            opts,
+        )
+        .await;
+        let reply = &frames[3];
+        assert_eq!(reply["id"], "perm-edit-kind");
+        assert_eq!(
+            reply["result"]["outcome"]["outcome"], "selected",
+            "denials still SELECT the reject option so goose doesn't wedge"
+        );
+        assert_eq!(
+            reply["result"]["outcome"]["optionId"], "opt-deny",
+            "an ACP kind:\"edit\" targeting a path outside writable_roots MUST be contained \
+             (denied) even under ApprovalPolicy::All"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Approval { tool, approved: false } if tool == "Edit /etc/passwd"
+            )),
+            "containment denial must surface approved=false with the display title; got {events:?}"
+        );
+    }
+
+    /// GD2: goose may emit streaming `agent_message_chunk`s AND a final
+    /// `agent_message` carrying the full text. The reply must appear
+    /// exactly ONCE (the terminal `agent_message` is authoritative-REPLACE),
+    /// not doubled ("hello worldhello world"), and Text must not be emitted
+    /// twice for the same content.
+    #[tokio::test]
+    async fn goose_drive_agent_message_after_chunks_not_double_counted() {
+        let chunk = |t: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "goose-test-session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": t }
+                    }
+                }
+            })
+            .to_string()
+        };
+        let final_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "goose-test-session-1",
+                "update": {
+                    "sessionUpdate": "agent_message",
+                    "content": { "type": "text", "text": "hello world" }
+                }
+            }
+        })
+        .to_string();
+        let outbound = vec![chunk("hello "), chunk("world"), final_msg];
+        let (_frames, run, _events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        assert_eq!(
+            run.content, "hello world",
+            "final agent_message must REPLACE the accumulated chunk content, not append to it \
+             (append would yield the doubled \"hello worldhello world\")"
+        );
+    }
+
+    /// GD3: a server frame carrying id:"prompt" AND a `method` is a
+    /// REQUEST, not the terminal prompt RESPONSE. It must NOT be treated
+    /// as the prompt response (which would end the turn early). Here a
+    /// `session/request_permission` request reuses id:"prompt"; the driver
+    /// must answer it and continue, then end only on the REAL prompt
+    /// response.
+    #[tokio::test]
+    async fn goose_drive_method_bearing_frame_with_prompt_id_not_terminal() {
+        // A permission REQUEST that (adversarially) reuses id:"prompt".
+        let outbound = vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "prompt",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "goose-test-session-1",
+                "toolCall": { "title": "Read file x", "kind": "read" },
+                "options": [
+                    { "optionId": "opt-allow", "name": "Allow once", "kind": "allow_once" },
+                    { "optionId": "opt-deny", "name": "Deny once", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string()];
+        let (frames, run, events) =
+            drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
+        // GD3 proof: the driver must have REPLIED to the method-bearing
+        // id:"prompt" frame as a permission request. That reply is a frame
+        // carrying `result.outcome.outcome == "selected"`. WITHOUT the fix,
+        // branch A matches on id=="prompt" first, consumes the frame as the
+        // terminal prompt RESPONSE, ends the turn early, and NO such reply
+        // is ever written — so the presence of a `selected` reply is the
+        // load-bearing assertion.
+        let perm_reply = frames.iter().find(|f| {
+            f.get("result")
+                .and_then(|r| r.get("outcome"))
+                .and_then(|o| o.get("outcome"))
+                .and_then(serde_json::Value::as_str)
+                == Some("selected")
+        });
+        let reply = perm_reply.unwrap_or_else(|| {
+            panic!(
+                "the method-bearing id:\"prompt\" frame must be answered as a permission \
+                 request (a `selected` reply), NOT consumed as the terminal prompt response; \
+                 frames={frames:?}"
+            )
+        });
+        assert_eq!(
+            reply["id"], "prompt",
+            "the permission reply echoes the request id (which was \"prompt\")"
+        );
+        assert_eq!(reply["result"]["outcome"]["optionId"], "opt-allow");
+        // The turn still completed via the REAL (method-less) prompt response.
+        assert_eq!(run.outcome, "completed");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Approval { approved: true, .. })),
+            "the permission request (id:prompt + method) must be processed as an approval; got {events:?}"
         );
     }
 
