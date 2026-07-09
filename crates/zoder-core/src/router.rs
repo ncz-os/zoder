@@ -140,7 +140,14 @@ impl<'a> Router<'a> {
         let mut keyed: Vec<(f64, &ModelEntry)> = self
             .corpus
             .free_chat()
-            .filter(|m| !self.health.breaker_open(&m.id))
+            .filter(|m| {
+                // Skip open breakers AND models whose latest classification
+                // marks them skip-for-now (401/404/Capacity). Those are
+                // breaker-neutral (W1), so breaker_open stays false forever
+                // and, without this second guard, the router would re-select
+                // a guaranteed-failed model every run.
+                !self.health.breaker_open(&m.id) && !self.health.is_skipped_by_classification(&m.id)
+            })
             // Only models a real provider serves on this host (when known):
             // keeps auto-pick from selecting a free-pool model that would fall
             // through to the api.example.com placeholder default and fail.
@@ -148,7 +155,15 @@ impl<'a> Router<'a> {
             .map(|m| (Self::rank_key(m, tier), m))
             .filter(|(k, _)| *k > 0.0)
             .collect();
-        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        keyed.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic secondary key: equal rank keys preserved
+                // corpus insertion order, which is not stable across corpus
+                // refreshes, so route.primary could flip run-to-run. Break
+                // ties by model id (total order) — matches consult.
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
         keyed.into_iter().map(|(_, m)| m).collect()
     }
 
@@ -406,6 +421,88 @@ mod tests {
             route.primary, "unbacked-top",
             "None must not filter the pool"
         );
+    }
+
+    #[test]
+    fn skip_class_model_excluded_from_candidates_despite_closed_breaker() {
+        // C2-2 regression: a model stamped Unauthorized (401) is skip-for-now
+        // but breaker-neutral (W1) — its breaker stays CLOSED forever. The
+        // router must drop it from candidates() anyway, or it would re-select a
+        // guaranteed-failed model every run.
+        let mut health = HealthStore::default();
+        health.record_classified_failure(
+            "unbacked-top",
+            "401 Unauthorized",
+            "prov",
+            crate::health::Classification::Unauthorized,
+        );
+        // Sanity: the breaker did NOT open (that is the trap this guards).
+        assert!(
+            !health.breaker_open("unbacked-top"),
+            "precondition: 401 must be breaker-neutral"
+        );
+        assert!(health.is_skipped_by_classification("unbacked-top"));
+
+        let corpus = three_free_model_corpus();
+        let router = Router::new(&corpus, &health);
+        let ids: Vec<&str> = router
+            .candidates(Tier::Auto)
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(
+            !ids.contains(&"unbacked-top"),
+            "a skip-classified model must be excluded from candidates, got: {ids:?}"
+        );
+        // The other, healthy models remain selectable.
+        assert!(ids.contains(&"backed-hi") && ids.contains(&"backed-lo"));
+    }
+
+    #[test]
+    fn candidates_tie_break_is_deterministic_by_id() {
+        // C2-3: two models with an IDENTICAL rank_key must sort by id, not by
+        // corpus insertion order (which is not stable across refreshes). Build
+        // the same pair in both orders; the top candidate must be the same id.
+        fn tied_corpus(order_ab: bool) -> Corpus {
+            let a = ModelEntry {
+                family: "fa".into(),
+                ..benched("aaa-tie", 70.0)
+            };
+            let b = ModelEntry {
+                family: "fb".into(),
+                ..benched("zzz-tie", 70.0)
+            };
+            let models = if order_ab { vec![a, b] } else { vec![b, a] };
+            Corpus {
+                models: models
+                    .into_iter()
+                    .map(|mut m| {
+                        m.free = true;
+                        m.route_candidate = true;
+                        m.kind = "chat".into();
+                        m
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+        let health = HealthStore::default();
+        let corpus_ab = tied_corpus(true);
+        let corpus_ba = tied_corpus(false);
+        let first = |c: &Corpus| {
+            Router::new(c, &health)
+                .candidates(Tier::Auto)
+                .first()
+                .map(|m| m.id.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            first(&corpus_ab),
+            first(&corpus_ba),
+            "tied models must sort deterministically regardless of insertion order"
+        );
+        // And specifically by ascending id.
+        assert_eq!(first(&corpus_ab), "aaa-tie");
     }
 
     #[test]
