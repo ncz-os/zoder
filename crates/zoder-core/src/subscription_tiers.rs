@@ -49,6 +49,10 @@ use std::path::Path;
 /// is the same; the on-disk copy wins when it exists and parses.
 pub const TIERS_JSON_DEFAULT: &str = include_str!("../../../subscriptions/tiers.json");
 
+/// Maximum trusted tier-catalog size. Larger files are rejected before the body
+/// is read so an on-disk refresh cannot hang or allocate unexpectedly.
+const MAX_TIER_CATALOG_BYTES: u64 = 2_097_152; // 2 MiB
+
 /// How confident we are in a tier's caps. Drives display, never auth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -193,6 +197,32 @@ impl TierCatalog {
         }
     }
 
+    /// Validate catalog contents after JSON shape validation. Mirrors
+    /// [`crate::config::Config::validate`] by returning human-readable
+    /// problems; empty means valid.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+        for (provider_id, provider) in &self.providers {
+            for (tier_id, entry) in &provider.tiers {
+                for w in &entry.windows {
+                    if w.hours == 0 {
+                        errs.push(format!(
+                            "provider {provider_id} tier {tier_id} window {}: hours must be greater than zero",
+                            w.name
+                        ));
+                    }
+                    if w.cap.is_some_and(|c| !c.is_finite() || c <= 0.0) {
+                        errs.push(format!(
+                            "provider {provider_id} tier {tier_id} window {}: cap must be finite and positive",
+                            w.name
+                        ));
+                    }
+                }
+            }
+        }
+        errs
+    }
+
     /// Look up one provider's tier by id. Returns `None` for unknown
     /// provider/tier; the resolver treats that as a graceful warning rather
     /// than an error.
@@ -270,23 +300,59 @@ impl TierCatalog {
 /// hand-maintained.
 pub fn load_tier_catalog(path: Option<&Path>) -> TierCatalog {
     if let Some(p) = path {
-        if p.exists() {
-            match std::fs::read_to_string(p) {
-                Ok(raw) => match serde_json::from_str::<TierCatalog>(&raw) {
-                    Ok(c) => return c,
-                    Err(e) => {
-                        tracing::warn!(
-                            "tier catalog {} failed to parse: {e}; falling back to bundled default",
-                            p.display()
-                        );
-                    }
-                },
-                Err(e) => {
+        let meta = match std::fs::metadata(p) {
+            Ok(meta) => meta,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(
-                        "tier catalog {} could not be read: {e}; falling back to bundled default",
+                        "tier catalog {} could not be inspected: {e}; falling back to bundled default",
                         p.display()
                     );
                 }
+                return TierCatalog::bundled();
+            }
+        };
+        if !meta.is_file() {
+            tracing::warn!(
+                "tier catalog {} rejected: not a regular file; falling back to bundled default",
+                p.display()
+            );
+            return TierCatalog::bundled();
+        }
+        if meta.len() > MAX_TIER_CATALOG_BYTES {
+            tracing::warn!(
+                "tier catalog {} rejected: {} bytes exceeds {} limit; falling back to bundled default",
+                p.display(),
+                meta.len(),
+                MAX_TIER_CATALOG_BYTES
+            );
+            return TierCatalog::bundled();
+        }
+        match std::fs::read_to_string(p) {
+            Ok(raw) => match serde_json::from_str::<TierCatalog>(&raw) {
+                Ok(c) => {
+                    let problems = c.validate();
+                    if problems.is_empty() {
+                        return c;
+                    }
+                    tracing::warn!(
+                        "tier catalog {} failed validation: {}; falling back to bundled default",
+                        p.display(),
+                        problems.join("; ")
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "tier catalog {} failed to parse: {e}; falling back to bundled default",
+                        p.display()
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "tier catalog {} could not be read: {e}; falling back to bundled default",
+                    p.display()
+                );
             }
         }
     }
@@ -791,11 +857,105 @@ mod tests {
     }
 
     #[test]
+    fn load_tier_catalog_rejects_semantically_invalid_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = TierCatalog::bundled();
+        let cases = [
+            (
+                "zero-hours",
+                serde_json::json!({ "name": "zero", "hours": 0, "cap": 1.0 }),
+            ),
+            (
+                "negative-cap",
+                serde_json::json!({ "name": "negative", "hours": 5, "cap": -1.0 }),
+            ),
+        ];
+
+        for (case, window) in cases {
+            let path = dir.path().join(format!("{case}.json"));
+            let raw = serde_json::json!({
+                "version": 1,
+                "as_of": "2035-01-01",
+                "providers": {
+                    "invalid-test-provider": {
+                        "tiers": {
+                            "x": {
+                                "source": "test",
+                                "windows": [window]
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string();
+            std::fs::write(&path, raw).unwrap();
+
+            let cat = load_tier_catalog(Some(&path));
+            assert_eq!(
+                cat.as_of, bundled.as_of,
+                "{case} should use bundled fallback"
+            );
+            assert!(
+                !cat.providers.contains_key("invalid-test-provider"),
+                "{case} should reject the on-disk catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn load_tier_catalog_rejects_non_regular_and_oversized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = TierCatalog::bundled();
+
+        let non_regular = dir.path().join("tiers-dir");
+        std::fs::create_dir(&non_regular).unwrap();
+        let cat = load_tier_catalog(Some(&non_regular));
+        assert_eq!(
+            cat.as_of, bundled.as_of,
+            "directory path should use bundled fallback"
+        );
+
+        let oversized_path = dir.path().join("oversized.json");
+        let oversized = serde_json::json!({
+            "version": 1,
+            "as_of": "2035-01-01",
+            "disclaimer": "x".repeat(MAX_TIER_CATALOG_BYTES as usize),
+            "providers": {
+                "oversized-test-provider": {
+                    "tiers": {
+                        "x": {
+                            "source": "test",
+                            "windows": []
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        assert!(oversized.len() as u64 > MAX_TIER_CATALOG_BYTES);
+        std::fs::write(&oversized_path, oversized).unwrap();
+
+        let cat = load_tier_catalog(Some(&oversized_path));
+        assert_eq!(
+            cat.as_of, bundled.as_of,
+            "oversized valid JSON should use bundled fallback"
+        );
+        assert!(
+            !cat.providers.contains_key("oversized-test-provider"),
+            "oversized valid JSON must be rejected before it can win"
+        );
+    }
+
+    #[test]
     fn bundled_default_is_well_formed_and_complete() {
         // The bundled default must parse cleanly AND contain every (provider,
         // tier) shape we ship.
         let cat = TierCatalog::bundled();
         assert_eq!(cat.version, 1);
+        assert!(
+            cat.validate().is_empty(),
+            "bundled default must pass catalog validation"
+        );
         assert!(!cat.as_of.is_empty(), "as_of must be set");
         assert!(
             !cat.disclaimer.is_empty(),
