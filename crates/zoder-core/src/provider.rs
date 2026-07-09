@@ -1798,8 +1798,14 @@ impl OpenAiProvider {
                 if line.is_empty() {
                     // Blank line = end of frame. Nothing to dispatch —
                     // the per-line `event`/`data` updates above already
-                    // happened. Reset for the next frame; the next
-                    // `event:` line will re-populate `current_event`.
+                    // happened. Reset `current_event` to its default
+                    // (None) for the next frame, per the SSE spec
+                    // (each event stands alone; the event type from a
+                    // previous frame MUST NOT leak into a subsequent
+                    // frame that omits its own `event:` line). The next
+                    // `event:` line will re-populate `current_event`
+                    // before the next `data:` line is dispatched.
+                    current_event = None;
                     continue;
                 }
                 if let Some(ev) = line.strip_prefix("event:") {
@@ -2114,6 +2120,16 @@ impl OpenAiProvider {
                 })?;
                 let line = raw.trim_end_matches(['\r', '\n']);
                 if line.is_empty() {
+                    // Blank line = end of frame. Reset `current_event`
+                    // to its default (None) so the next frame's `data:`
+                    // line is paired with the correct envelope — the
+                    // SSE spec says each event stands alone, and the
+                    // Responses API parser uses `current_event` (with a
+                    // `val.type` fallback) to choose which dispatch arm
+                    // to take, so a stale value from the previous frame
+                    // would silently mis-classify a subsequent frame
+                    // that omits `event:`.
+                    current_event = None;
                     continue;
                 }
                 if let Some(ev) = line.strip_prefix("event:") {

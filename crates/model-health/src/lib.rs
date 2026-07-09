@@ -61,7 +61,7 @@ pub enum Classification {
 
 impl Classification {
     /// Map an HTTP status code to a classification. Anything not in {2xx,
-    /// 404, 429, 503, 401, 403} falls through to `Error`.
+    /// 404, 429, 503, 401, 403, 529} falls through to `Error`.
     pub fn from_status(status: u16) -> Self {
         match status {
             200..=299 => Classification::Reachable,
@@ -72,7 +72,16 @@ impl Classification {
             // Unauthorized so consult skips the model and the circuit
             // breaker does not open on the (perfectly fine) model behind it.
             401 | 403 => Classification::Unauthorized,
-            429 | 503 => Classification::Capacity,
+            // 429 (rate limit), 503 (service unavailable), and 529
+            // ("site is overloaded" — Cloudflare / Anthropic-style
+            // capacity signal) are all transient capacity outcomes:
+            // consult should temporarily skip the model and the breaker
+            // should back off rather than trip. Mapping 529 here
+            // guarantees the same bucket regardless of body shape — a
+            // non-JSON 529 body (HTML gateway error page, plain text)
+            // still lands on Capacity instead of falling through to
+            // Error and tripping the breaker on a perfectly fine model.
+            429 | 503 | 529 => Classification::Capacity,
             _ => Classification::Error,
         }
     }
@@ -238,8 +247,15 @@ impl ModelHealth {
         match self.last_failure_unix {
             // Open during cooldown; half-open (selectable) once it elapses.
             Some(ts) => now.saturating_sub(ts) < BREAKER_COOLDOWN_SECS,
-            // No timestamp recorded: stay open (conservative).
-            None => true,
+            // No timestamp recorded: allow a probe (half-open). A
+            // legacy or partially-populated record carries no cooldown
+            // anchor, so "permanently open" would mean "this model is
+            // permanently unusable"; the SSE spec / breaker contract is
+            // to instead let a probe through on the next routing pass so
+            // a healthy model can self-recover. The model still has to
+            // pass BREAKER_THRESHOLD consecutive failures before this
+            // branch fires, so the breaker keeps its safety net.
+            None => false,
         }
     }
 }
@@ -445,6 +461,66 @@ mod tests {
                 "{s} must classify as Error"
             );
         }
+    }
+
+    /// Z-22: HTTP 529 ("Site is overloaded", Cloudflare / Anthropic /
+    /// OpenAI-style capacity signal) MUST classify as `Capacity` -- same
+    /// bucket as 503 -- regardless of whether the response body is JSON,
+    /// HTML, or plain text. Pre-fix the `from_status` match had
+    /// `429 | 503 => Capacity` and `_ => Error`, so a 529 response with a
+    /// non-JSON body (e.g. an HTML gateway error page) fell through to
+    /// `Error`, which trips the breaker on a perfectly fine model that's
+    /// just being rate-limited by its own provider. Post-fix 529 joins
+    /// the Capacity bucket so the breaker backs off instead of opening.
+    ///
+    /// The assertion exercises the REAL `Classification::from_status` --
+    /// the same surface the HTTP-error branch in `OpenAiProvider` feeds
+    /// into `classify_err`, and the same surface the Anthropic typed
+    /// envelope (`from_anthropic_error_body`) defers to for unrecognized
+    /// error types. So a single pin covers both providers.
+    ///
+    /// Companion regression: the existing `from_anthropic_error_body`
+    /// already routes the TYPED `overloaded_error` envelope to Capacity
+    /// (see `anthropic_error_body_maps_typed_envelope_onto_classification`),
+    /// but a misbehaving gateway that emits a 529 with a NON-typed body
+    /// (HTML gateway error page, empty string, truncated body) used to
+    /// fall through to `from_status` and land on `Error` -- the fix
+    /// closes that gap.
+    #[test]
+    fn http_529_classifies_as_capacity_not_error() {
+        // The task-pinned assertion: 529 is a transient capacity signal,
+        // not a hard error. Skips-consult too -- the model is fine, the
+        // provider is just overloaded.
+        assert_eq!(
+            Classification::from_status(529),
+            Classification::Capacity,
+            "HTTP 529 (site overloaded) must classify as Capacity, same as 503, \
+             so the breaker backs off rather than trips on a perfectly fine model"
+        );
+        assert!(
+            Classification::from_status(529).skips_consult(),
+            "529 must behave like 503 for consult (transient skip, no breaker trip)"
+        );
+        // Sanity: 503 / 429 / 529 all land on the SAME variant. A future
+        // refactor that splits the bucket (e.g. adds a new `Overloaded`
+        // variant) is caught by this matrix pin.
+        assert_eq!(
+            Classification::from_status(529),
+            Classification::from_status(503),
+            "529 must match 503 -- both are transient capacity signals"
+        );
+        assert_eq!(
+            Classification::from_status(529),
+            Classification::from_status(429),
+            "529 must match 429 -- both are transient capacity signals"
+        );
+        // And 529 MUST NOT regress to Error: a tripped breaker on a
+        // perfectly fine model is exactly the failure mode Z-22 names.
+        assert_ne!(
+            Classification::from_status(529),
+            Classification::Error,
+            "529 must NOT classify as Error (would trip breaker on transient overload)"
+        );
     }
 
     #[test]
@@ -845,5 +921,114 @@ mod tests {
             Some(Classification::Reachable)
         );
         assert!(!s.breaker_open(model));
+    }
+
+    // ---------------------------------------------------------------------
+    // Z-21: legacy breaker record with consecutive_failures >= threshold but
+    // NO last_failure_unix must be PROBE-ELIGIBLE (half-open), not stuck
+    // OPEN forever. Pre-fix the `breaker_open_at` path keyed exclusively on
+    // the elapsed-since-failure cooldown and fell through to `None => true`,
+    // pinning the breaker open permanently — a partially-populated record
+    // written before the timestamp field shipped (or hand-edited, or
+    // populated by an older `record_failure` that did not stamp the unix
+    // field) would never recover. Post-fix the absence of a timestamp is
+    // treated as "we don't know when the failure happened, so let a probe
+    // through" rather than "never let a probe through".
+    //
+    // The test exercises the REAL `ModelHealth::breaker_open` path (the same
+    // surface `zoder-cli` and `zoder-core::router` consult) on a directly
+    // constructed `ModelHealth`, so a future refactor that moves the
+    // half-open gate stays covered. Companion assertions pin the
+    // non-regression contract: a healthy model stays closed, a fully-populated
+    // tripped model behaves exactly as before.
+    // ---------------------------------------------------------------------
+
+    /// The bug. A `ModelHealth` written before the `last_failure_unix`
+    /// field existed (or written with `None` by some legacy path) MUST NOT
+    /// be stuck OPEN forever -- the absence of a timestamp means "we don't
+    /// know when the failure was", not "never recover". The breaker should
+    /// treat this as half-open / probe-eligible, i.e. `breaker_open()`
+    /// returns `false`. Pre-fix this assertion fails because the
+    /// `last_failure_unix = None` branch returned `true` unconditionally.
+    #[test]
+    fn breaker_recovers_on_legacy_record_without_timestamp() {
+        let h = ModelHealth {
+            consecutive_failures: BREAKER_THRESHOLD,
+            last_failure_unix: None,
+            ..Default::default()
+        };
+        assert!(
+            !h.breaker_open(),
+            "legacy timestampless record with consecutive_failures >= threshold \
+             must be probe-eligible (half-open), not permanently OPEN"
+        );
+    }
+
+    /// Even when the legacy record is "really" tripped (failures well above
+    /// the threshold, no other fields populated), the absence of a
+    /// timestamp must STILL allow a probe. Pinned separately so a future
+    /// tweak that only fires for the boundary value is caught.
+    #[test]
+    fn breaker_recovers_on_legacy_record_far_above_threshold_without_timestamp() {
+        let h = ModelHealth {
+            consecutive_failures: BREAKER_THRESHOLD * 10,
+            last_failure_unix: None,
+            ..Default::default()
+        };
+        assert!(
+            !h.breaker_open(),
+            "a deeply tripped timestampless record must still be probe-eligible"
+        );
+    }
+
+    /// Non-regression: a healthy model (no failures at all) stays closed.
+    /// Without this, the new "None => false" branch could be passing only
+    /// because `breaker_open_at` short-circuits before the timestamp check.
+    #[test]
+    fn breaker_stays_closed_on_healthy_record_without_timestamp() {
+        let h = ModelHealth::default();
+        assert!(!h.breaker_open());
+    }
+
+    /// Non-regression: a properly-timestamped tripped record stays OPEN
+    /// during cooldown (the original behavior we MUST preserve). This is
+    /// the contract `zoder-cli` and `zoder-core::router` already rely on;
+    /// weakening it would silently re-introduce the original "breaker
+    // always open" failure mode on every record that does have a
+    /// timestamp.
+    #[test]
+    fn breaker_stays_open_on_tripped_record_within_cooldown() {
+        let now = now_unix();
+        let h = ModelHealth {
+            consecutive_failures: BREAKER_THRESHOLD,
+            // Recorded just now -- well within the cooldown window.
+            last_failure_unix: Some(now),
+            ..Default::default()
+        };
+        assert!(
+            h.breaker_open_at(now),
+            "a tripped model whose last failure is within the cooldown must stay OPEN"
+        );
+    }
+
+    /// Non-regression: a properly-timestamped tripped record whose
+    /// cooldown has elapsed transitions to half-open (selectable). This
+    /// is the OTHER half of the original contract and pins the existing
+    /// recovery path so the Z-21 fix doesn't accidentally re-pin the
+    /// breaker open on every call.
+    #[test]
+    fn breaker_transitions_to_half_open_after_cooldown_with_timestamp() {
+        let now = now_unix();
+        let h = ModelHealth {
+            consecutive_failures: BREAKER_THRESHOLD,
+            // Recorded BREAKER_COOLDOWN_SECS + 1 seconds ago -- outside the
+            // cooldown window.
+            last_failure_unix: Some(now - BREAKER_COOLDOWN_SECS - 1),
+            ..Default::default()
+        };
+        assert!(
+            !h.breaker_open_at(now),
+            "a tripped model past the cooldown must transition to half-open (probe-eligible)"
+        );
     }
 }
