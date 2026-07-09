@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 /// How a provider authenticates. Secrets are never stored in the repo; only
 /// references (env var names) or values supplied at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Auth {
     None,
@@ -58,6 +58,31 @@ pub enum Auth {
         header: String,
         var: String,
     },
+}
+
+/// Hand-written so a `{:?}` on an `Auth` (or anything that transitively
+/// contains one — a `Provider`, the whole `Config` — via a future
+/// tracing/log/anyhow/panic path) NEVER leaks a live secret. The
+/// `Bearer` inline token and the resolved value behind env-based variants
+/// are the only sensitive fields; every variant renders its shape and
+/// non-secret fields but redacts the token itself. `#[derive(Debug)]`
+/// would print `token: "sk-..."` verbatim regardless of call site.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::None => f.write_str("None"),
+            Auth::Env { var } => f.debug_struct("Env").field("var", var).finish(),
+            Auth::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"[redacted]")
+                .finish(),
+            Auth::ApiKeyHeader { header, var } => f
+                .debug_struct("ApiKeyHeader")
+                .field("header", header)
+                .field("var", var)
+                .finish(),
+        }
+    }
 }
 
 impl Auth {
@@ -975,19 +1000,69 @@ pub struct ExecSafetyConfig {
 }
 
 impl Config {
-    /// Config directory: $ZODER_HOME or ~/.zoder.
+    /// Config directory: `$ZODER_HOME` or `~/.zoder`.
+    ///
+    /// Infallible for the many display / path-join call sites. When neither
+    /// `ZODER_HOME` nor a real home directory can be resolved this falls back
+    /// to the relative `.zoder` — which is exactly the silent-wrong-dir
+    /// hazard. The loud check lives at the resolution entry point
+    /// [`Config::resolve_home`], which [`Config::load`] uses; callers that
+    /// need a trustworthy, absolute home should go through `resolve_home`.
     pub fn home() -> PathBuf {
-        if let Ok(h) = std::env::var("ZODER_HOME") {
-            return PathBuf::from(h);
+        Self::resolve_home().unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".zoder"))
+    }
+
+    /// Resolve the config home from the real environment, failing LOUD when
+    /// it cannot be trusted. This is the guard behind [`Config::load`]: an
+    /// empty `ZODER_HOME`, or an absent home directory with `ZODER_HOME`
+    /// unset, or any resolution that yields a non-absolute path (which would
+    /// be silently resolved against the current working directory and split
+    /// state across CWDs) is rejected with a clear error instead of loading
+    /// config/ledger/health from the wrong place.
+    pub fn resolve_home() -> anyhow::Result<PathBuf> {
+        Self::resolve_home_from(std::env::var("ZODER_HOME").ok(), dirs::home_dir())
+    }
+
+    /// Pure, env-free core of [`Config::resolve_home`] so the resolution rules
+    /// can be tested hermetically without mutating the process environment.
+    fn resolve_home_from(
+        zoder_home: Option<String>,
+        home_dir: Option<PathBuf>,
+    ) -> anyhow::Result<PathBuf> {
+        let resolved = match zoder_home {
+            Some(h) => {
+                if h.is_empty() {
+                    anyhow::bail!(
+                        "ZODER_HOME is set but empty; unset it or set it to an \
+                         absolute directory path"
+                    );
+                }
+                PathBuf::from(h)
+            }
+            None => home_dir
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot resolve home directory; set ZODER_HOME to an \
+                         absolute directory path"
+                    )
+                })?
+                .join(".zoder"),
+        };
+        if !resolved.is_absolute() {
+            anyhow::bail!(
+                "resolved zoder home {:?} is not an absolute path; set \
+                 ZODER_HOME to an absolute directory path",
+                resolved
+            );
         }
-        dirs::home_dir().unwrap_or_default().join(".zoder")
+        Ok(resolved)
     }
 
     /// Load from $ZODER_HOME/config.json (if present, else sensible free-tier
     /// default) and then layer every `config.<vendor>.toml` in the same
     /// directory on top. See module docs for the layered-config model.
     pub fn load() -> anyhow::Result<Self> {
-        let home = Self::home();
+        let home = Self::resolve_home()?;
         let mut cfg = if home.join("config.json").exists() {
             let raw = std::fs::read_to_string(home.join("config.json"))?;
             serde_json::from_str(&raw)?
@@ -2027,6 +2102,103 @@ mod tests {
         .expect("bearer yields a header");
         assert_eq!(name, "authorization");
         assert_eq!(value, "Bearer sk-test");
+    }
+
+    // ---- C2-5: Auth::Bearer must never leak its token under `{:?}` ----
+
+    #[test]
+    fn bearer_debug_redacts_the_inline_token() {
+        // A future tracing/log/anyhow/panic that formats an `Auth` (or a
+        // `Provider`/`Config` containing one) with `{:?}` must NOT print the
+        // secret. The hand-written Debug impl redacts it regardless of call
+        // site.
+        let rendered = format!(
+            "{:?}",
+            Auth::Bearer {
+                token: "sk-secret".into(),
+            }
+        );
+        assert!(
+            !rendered.contains("sk-secret"),
+            "Auth::Bearer Debug leaked the token: {rendered}"
+        );
+        assert!(
+            rendered.contains("[redacted]"),
+            "Auth::Bearer Debug should mark the token redacted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn non_secret_auth_variants_keep_useful_debug() {
+        // Env/ApiKeyHeader only carry the env var NAME (not the value) plus a
+        // header name — safe and useful to print. Keep them legible.
+        let env_dbg = format!(
+            "{:?}",
+            Auth::Env {
+                var: "MY_API_KEY".into()
+            }
+        );
+        assert!(env_dbg.contains("MY_API_KEY"), "{env_dbg}");
+        let hdr_dbg = format!(
+            "{:?}",
+            Auth::ApiKeyHeader {
+                header: "api-key".into(),
+                var: "MY_API_KEY".into(),
+            }
+        );
+        assert!(hdr_dbg.contains("api-key"), "{hdr_dbg}");
+        assert!(hdr_dbg.contains("MY_API_KEY"), "{hdr_dbg}");
+        assert_eq!(format!("{:?}", Auth::None), "None");
+    }
+
+    // ---- C2-4: home resolution fails LOUD instead of silently relative ----
+
+    #[test]
+    fn resolve_home_rejects_empty_zoder_home() {
+        // ZODER_HOME="" would become PathBuf::from("") -> relative -> config
+        // silently resolved against CWD. Must error.
+        let err = Config::resolve_home_from(Some(String::new()), Some(PathBuf::from("/home/op")))
+            .expect_err("empty ZODER_HOME must be rejected");
+        assert!(
+            err.to_string().contains("ZODER_HOME"),
+            "error should name ZODER_HOME: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_home_errors_when_home_dir_is_none_and_zoder_home_unset() {
+        // systemd/no-HOME/minimal-container/cron: home_dir() is None and
+        // ZODER_HOME unset. unwrap_or_default() used to yield "" -> `.zoder`
+        // relative. Must error instead.
+        let err = Config::resolve_home_from(None, None)
+            .expect_err("no home dir + no ZODER_HOME must be rejected");
+        assert!(
+            err.to_string().contains("home directory"),
+            "error should explain the missing home directory: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_home_rejects_relative_zoder_home() {
+        // A non-absolute ZODER_HOME is resolved against CWD -> split state.
+        let err = Config::resolve_home_from(Some("relative/dir".into()), None)
+            .expect_err("relative ZODER_HOME must be rejected");
+        assert!(
+            err.to_string().contains("absolute"),
+            "error should demand an absolute path: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_home_accepts_absolute_zoder_home_and_default_dotdir() {
+        assert_eq!(
+            Config::resolve_home_from(Some("/opt/zoder".into()), None).unwrap(),
+            PathBuf::from("/opt/zoder"),
+        );
+        assert_eq!(
+            Config::resolve_home_from(None, Some(PathBuf::from("/home/op"))).unwrap(),
+            PathBuf::from("/home/op/.zoder"),
+        );
     }
 
     #[test]
