@@ -1299,32 +1299,146 @@ async fn cmd_update(check_only: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Locate a co-shipped binary: next to the current exe, then on `$PATH`, then
-/// in `~/.local/bin`. zoder ships `zerocode` + `zeroclaw` beside itself.
+/// Locate a co-shipped binary. Precedence is TRUSTED-FIRST to prevent a
+/// poisoned-`$PATH` from hijacking the exec: (1) the dir next to the running
+/// exe (the co-ship location), (2) trusted install dirs (`~/.local/bin`,
+/// `~/.cargo/bin`), and ONLY as a last resort (3) `$PATH`. zoder ships
+/// `zerocode` + `zeroclaw` beside itself, so an attacker-controlled early
+/// `$PATH` entry (`.`, `~/bin`, `./node_modules/.bin`, …) must never win over
+/// the real co-shipped/trusted copy, since the result is `exec()`ed with
+/// zoder's env/tty/args. `$PATH` is retained only for the atypical case where
+/// the tool is not co-shipped and not in a trusted dir.
 fn locate_sibling(name: &str) -> Option<std::path::PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for d in std::env::split_paths(&path) {
-            let p = d.join(name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    let mut trusted: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        let p = std::path::PathBuf::from(home).join(".local/bin").join(name);
+        let home = std::path::PathBuf::from(home);
+        trusted.push(home.join(".local/bin"));
+        trusted.push(home.join(".cargo/bin"));
+    }
+    let path_dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    resolve_sibling(exe_dir.as_deref(), &trusted, &path_dirs, name)
+}
+
+/// Pure resolution core for [`locate_sibling`], factored out so the
+/// trusted-before-`$PATH` precedence is unit-testable without mutating process
+/// state. Returns the first existing `<dir>/<name>` file, checking `exe_dir`
+/// first, then every `trusted` dir in order, and `path_dirs` last.
+fn resolve_sibling(
+    exe_dir: Option<&std::path::Path>,
+    trusted: &[std::path::PathBuf],
+    path_dirs: &[std::path::PathBuf],
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = exe_dir {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for dir in trusted {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for dir in path_dirs {
+        let p = dir.join(name);
         if p.is_file() {
             return Some(p);
         }
     }
     None
+}
+
+#[cfg(test)]
+mod resolve_sibling_tests {
+    use super::resolve_sibling;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), b"#!/bin/sh\n").unwrap();
+    }
+
+    // A tool present in BOTH a trusted dir and a $PATH dir must resolve to the
+    // TRUSTED copy (poisoned-PATH cannot win). Hermetic: no process env mutation.
+    #[test]
+    fn trusted_dir_wins_over_path() {
+        let td = tempfile::tempdir().unwrap();
+        let trusted = td.path().join("trusted_bin");
+        let path_dir = td.path().join("path_bin");
+        touch(&trusted, "zerocode");
+        touch(&path_dir, "zerocode");
+
+        let trusted_dirs = vec![trusted.clone()];
+        let path_dirs = vec![path_dir.clone()];
+        let got =
+            resolve_sibling(None, &trusted_dirs, &path_dirs, "zerocode").expect("should resolve");
+        assert_eq!(got, trusted.join("zerocode"));
+        assert_ne!(got, path_dir.join("zerocode"));
+    }
+
+    // The exe-adjacent (co-ship) location has the highest precedence, above
+    // trusted dirs and $PATH.
+    #[test]
+    fn exe_dir_wins_over_all() {
+        let td = tempfile::tempdir().unwrap();
+        let exe_dir = td.path().join("exe");
+        let trusted = td.path().join("trusted_bin");
+        let path_dir = td.path().join("path_bin");
+        touch(&exe_dir, "zeroclaw");
+        touch(&trusted, "zeroclaw");
+        touch(&path_dir, "zeroclaw");
+
+        let trusted_dirs = vec![trusted];
+        let path_dirs = vec![path_dir];
+        let got = resolve_sibling(Some(&exe_dir), &trusted_dirs, &path_dirs, "zeroclaw")
+            .expect("should resolve");
+        assert_eq!(got, exe_dir.join("zeroclaw"));
+    }
+
+    // No regression: a tool present ONLY on $PATH is still found (the $PATH
+    // last-resort branch is retained).
+    #[test]
+    fn path_only_still_resolves() {
+        let td = tempfile::tempdir().unwrap();
+        let path_dir = td.path().join("path_bin");
+        touch(&path_dir, "zerocode");
+
+        let trusted_dirs: Vec<PathBuf> = Vec::new();
+        let path_dirs = vec![path_dir.clone()];
+        let got = resolve_sibling(None, &trusted_dirs, &path_dirs, "zerocode")
+            .expect("should resolve from PATH");
+        assert_eq!(got, path_dir.join("zerocode"));
+    }
+
+    // Nothing anywhere => None.
+    #[test]
+    fn missing_everywhere_is_none() {
+        let td = tempfile::tempdir().unwrap();
+        let trusted_dirs = vec![td.path().join("nope_trusted")];
+        let path_dirs = vec![td.path().join("nope_path")];
+        assert!(resolve_sibling(None, &trusted_dirs, &path_dirs, "zerocode").is_none());
+    }
+
+    // Earlier trusted dir wins over a later one.
+    #[test]
+    fn trusted_order_is_respected() {
+        let td = tempfile::tempdir().unwrap();
+        let first = td.path().join("local_bin");
+        let second = td.path().join("cargo_bin");
+        touch(&first, "zeroclaw");
+        touch(&second, "zeroclaw");
+        let trusted_dirs = vec![first.clone(), second];
+        let got = resolve_sibling(None, &trusted_dirs, &[], "zeroclaw").expect("should resolve");
+        assert_eq!(got, first.join("zeroclaw"));
+    }
 }
 
 /// Per-tool zerocode config dir under `$HOME`, and the default TUI theme seeded
@@ -1825,8 +1939,8 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
     maybe_spawn_daily_refresh();
     let bin = locate_sibling("zerocode").ok_or_else(|| {
         anyhow::anyhow!(
-            "zerocode binary not found (looked next to zoder, on PATH, and in \
-             ~/.local/bin).\nInstall the matching build — zoder ships zerocode + \
+            "zerocode binary not found (looked next to zoder, then in trusted install \
+             dirs ~/.local/bin and ~/.cargo/bin, then on PATH).\nInstall the matching build — zoder ships zerocode + \
              zeroclaw together."
         )
     })?;
@@ -3480,7 +3594,8 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     }
     let bin = locate_sibling("zeroclaw").ok_or_else(|| {
         anyhow::anyhow!(
-            "zeroclaw binary not found (looked next to zoder, on PATH, and in ~/.local/bin); \
+            "zeroclaw binary not found (looked next to zoder, then in trusted install dirs \
+             ~/.local/bin and ~/.cargo/bin, then on PATH); \
              cannot start the agentic engine"
         )
     })?;
