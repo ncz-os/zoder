@@ -1428,6 +1428,26 @@ pub fn decide_account(
             binding_window: None,
         };
     }
+    // W7: fail closed on a STALE near-cap window even when other windows are
+    // observable. `observable` excludes Degraded windows, so the fresh-only
+    // `hard_cap_breach` check below cannot see a weekly window last observed
+    // at/above cap_guard that has since gone Degraded. Without this veto a
+    // stale near-cap weekly masked by a fresh low 5h returns PreferSub and
+    // the account keeps spending a possibly-exhausted subscription — the same
+    // stale-high-usage hazard Y-1/Z-18 close for the all-degraded case, here
+    // for the mixed case. A Degraded window's reset_at is itself stale, so we
+    // cannot confirm imminence; fail closed unconditionally.
+    let stale_near_cap = account.windows.iter().any(|w| {
+        w.health == TelemetryHealth::Degraded
+            && w.used_percent.is_some_and(|u| u >= knobs.cap_guard)
+    });
+    if stale_near_cap {
+        return AccountDecision {
+            decision: RouteDecision::FallBackToFree,
+            strength: 100.0,
+            binding_window: None,
+        };
+    }
     // Binding window: max(used_percent * health_weight).
     let binding = observable
         .iter()
@@ -1781,7 +1801,11 @@ fn migrate_fractional_counter_percent(cw: &mut CounterWindow) {
     // None (no signal, no fabrication); a 0.0 value scales to 0.0
     // (idempotent).
     if let Some(p) = cw.used_percent {
-        cw.used_percent = Some(p * 100.0);
+        // W13: a legacy ratio must be non-negative — no budget is negatively
+        // consumed. A negative stored value is malformed; drop it to None
+        // rather than fabricate a signed "percent". Non-negative values scale
+        // ×100 as before (0.0 stays 0.0).
+        cw.used_percent = if p < 0.0 { None } else { Some(p * 100.0) };
     }
 }
 
@@ -3841,13 +3865,17 @@ mod tests {
         };
         let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
         let ad = decide_account(&acct, &knobs, now, None);
+        // W7: a Degraded window at/above cap_guard (95% >= 85%) is a stale
+        // near-cap signal. It must VETO PreferSub (fail closed) even though a
+        // fresh low window (50%) is observable — we cannot trust the sub is
+        // not exhausted. Pre-W7 this asserted PreferSub@50, pinning the bug.
         assert_eq!(
-            ad.binding_window.as_deref(),
-            Some("weekly"),
-            "Degraded 95% must be excluded — Fresh 50% binds instead"
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "W7: a stale near-cap Degraded window must fail closed, not be silently excluded"
         );
-        assert_eq!(ad.decision, RouteDecision::PreferSub);
-        assert!((ad.strength - 50.0).abs() < 1e-9);
+        assert!(ad.binding_window.is_none());
+        assert_eq!(ad.strength, 100.0);
     }
 
     #[test]
@@ -3891,6 +3919,114 @@ mod tests {
         );
         assert!(ad.binding_window.is_none());
         assert_eq!(ad.strength, 100.0);
+    }
+
+    #[test]
+    fn l4_degraded_sub_cap_window_still_excluded_and_prefersub() {
+        // A Degraded window BELOW cap_guard (70% < 85%) is not a near-cap
+        // hazard: it is excluded from binding (health_weight 0) and the fresh
+        // low window drives a normal PreferSub. Only a Degraded window at or
+        // above cap_guard triggers the W7 fail-closed veto.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let degraded_70 = WindowView {
+            name: "5h".into(),
+            used_percent: Some(70.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours: 5,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            has_credits: None,
+            windows: vec![degraded_70, weekly_fresh(50.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(ad.decision, RouteDecision::PreferSub);
+        assert_eq!(ad.binding_window.as_deref(), Some("weekly"));
+        assert!((ad.strength - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l4_stale_near_cap_weekly_masked_by_fresh_low_5h_falls_back() {
+        // W7 PROBE_A3: the common real shape — a weekly window observed at
+        // 99% has gone Degraded (stale) while a fresh 5h window reads a low
+        // 10%. Pre-W7 this returned PreferSub bound to the 5h (the weekly was
+        // dropped from `observable`), so the account kept spending a
+        // possibly-exhausted sub. It must fail closed.
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let stale_weekly = WindowView {
+            name: "weekly".into(),
+            used_percent: Some(99.0),
+            observability: crate::config::Observability::Header,
+            health: TelemetryHealth::Degraded,
+            reset_at: None,
+            hours: 168,
+        };
+        let acct = AccountView {
+            provider: Provider::Anthropic,
+            account_id: "a".into(),
+            plan: "max".into(),
+            has_credits: None,
+            windows: vec![stale_weekly, fresh_5h(10.0)],
+        };
+        let knobs = knobs_with(80.0, 85.0, BudgetMode::Block, None);
+        let ad = decide_account(&acct, &knobs, now, None);
+        assert_eq!(
+            ad.decision,
+            RouteDecision::FallBackToFree,
+            "W7: stale near-cap weekly masked by a fresh low 5h must fail closed"
+        );
+        assert!(ad.binding_window.is_none());
+    }
+
+    #[test]
+    fn w13_migrate_negative_legacy_ratio_becomes_none() {
+        // W13: Y-12 removed the (0.0..=2.0) gate and scaled every cap=None
+        // legacy used_percent by ×100 — turning a malformed negative ratio
+        // into a negative "percent". A negative ratio is nonsensical; drop it
+        // to None rather than fabricate a signed reading. A non-negative ratio
+        // still scales.
+        let dir = tempfile::tempdir().unwrap();
+        let now = "2026-07-04T12:00:00Z";
+        let pctonly = |name: &str, up: f64| {
+            serde_json::json!({
+                "provider": "mini_max",
+                "account_id": "default",
+                "plan": "max",
+                "window_name": name,
+                "used_tokens": 0.0,
+                "used_percent": up,
+                "last_updated": now
+            })
+        };
+        let legacy_path = dir.path().join("legacy-neg.json");
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "records": {},
+                "counters": {
+                    "neg": pctonly("neg", -0.5),
+                    "frac": pctonly("frac", 1.5)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let migrated = UtilizationStore::open_unlocked(&legacy_path).unwrap();
+        assert_eq!(
+            migrated.counters["neg"].used_percent, None,
+            "W13: a negative legacy ratio must migrate to None, not a signed percent"
+        );
+        assert_eq!(
+            migrated.counters["frac"].used_percent,
+            Some(150.0),
+            "W13: a non-negative legacy ratio still scales x100"
+        );
     }
 
     #[test]
