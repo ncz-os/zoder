@@ -7,7 +7,11 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -4262,6 +4266,26 @@ fn write_meta(dir: &Path, meta: &JobMeta) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn configure_background_worker_command(
+    command: &mut Command,
+    args: &[String],
+    dir: &Path,
+    out: std::fs::File,
+    err: std::fs::File,
+) {
+    command
+        .args(args)
+        .env("ZODER_JOB_DIR", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    // Detach the worker into its own process group so cancel can SIGTERM /
+    // SIGKILL the WHOLE subtree. `process_group(0)` maps to setpgid(pid, 0)
+    // on Unix, so the child leads a fresh group with pgid == pid.
+    #[cfg(unix)]
+    command.process_group(0);
+}
+
 /// Re-exec the current invocation as a detached worker writing to a new job dir.
 pub(crate) fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String> {
     let id = format!(
@@ -4279,12 +4303,9 @@ pub(crate) fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String>
         .collect();
     let out = std::fs::File::create(dir.join("output.txt"))?;
     let err = out.try_clone()?;
-    let child = std::process::Command::new(&exe)
-        .args(&args)
-        .env("ZODER_JOB_DIR", &dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+    let mut command = Command::new(&exe);
+    configure_background_worker_command(&mut command, &args, &dir, out, err);
+    let child = command
         .spawn()
         .with_context(|| format!("spawning background worker {}", exe.display()))?;
 
@@ -4335,6 +4356,86 @@ fn resolve_job(id: Option<&str>, running_only: bool) -> Option<JobMeta> {
             .into_iter()
             .find(|j| !running_only || j.status == "running"),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelSignalOutcome {
+    AlreadyFinished,
+    Signalled,
+}
+
+#[cfg(unix)]
+const CANCEL_TERM_GRACE: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(unix)]
+fn signed_positive_pid(pid: u32) -> Option<libc::pid_t> {
+    let signed = i32::try_from(pid).ok()?;
+    (signed > 0).then_some(signed as libc::pid_t)
+}
+
+#[cfg(unix)]
+fn process_group_alive(pgid: u32) -> bool {
+    let Some(pgid) = signed_positive_pid(pgid) else {
+        return false;
+    };
+    // SAFETY: signal 0 probes the process group without delivering a signal.
+    let r = unsafe { libc::kill(-pgid, 0) };
+    if r == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    err == libc::EPERM
+}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, sig: libc::c_int) -> anyhow::Result<bool> {
+    let Some(pgid) = signed_positive_pid(pgid) else {
+        return Ok(false);
+    };
+    // SAFETY: `pgid` is a positive pid_t; negating it targets the process
+    // group instead of one raw PID.
+    let r = unsafe { libc::kill(-pgid, sig) };
+    if r == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(err).with_context(|| format!("signalling process group {pgid} with signal {sig}"))
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(pgid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while process_group_alive(pgid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+    true
+}
+
+#[cfg(unix)]
+fn cancel_background_process_group(meta: &JobMeta) -> anyhow::Result<CancelSignalOutcome> {
+    if !crate::jobs::pid_alive(meta.pid) {
+        return Ok(CancelSignalOutcome::AlreadyFinished);
+    }
+    if !signal_process_group(meta.pid, libc::SIGTERM)? {
+        return Ok(CancelSignalOutcome::AlreadyFinished);
+    }
+    if !wait_for_process_group_exit(meta.pid, CANCEL_TERM_GRACE) && process_group_alive(meta.pid) {
+        let _ = signal_process_group(meta.pid, libc::SIGKILL);
+    }
+    Ok(CancelSignalOutcome::Signalled)
+}
+
+#[cfg(not(unix))]
+fn cancel_background_process_group(_meta: &JobMeta) -> anyhow::Result<CancelSignalOutcome> {
+    Ok(CancelSignalOutcome::Signalled)
 }
 
 pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> anyhow::Result<()> {
@@ -4433,10 +4534,6 @@ pub(crate) fn cmd_result(cli: &crate::Cli, job: Option<String>) -> anyhow::Resul
 
 pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Result<()> {
     let m = resolve_job(job.as_deref(), true).ok_or_else(|| anyhow!("no running job to cancel"))?;
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(m.pid as i32, libc::SIGTERM);
-    }
     // W12: guard the untrusted body id before writing meta.json (same
     // containment check as the prune-delete path, Y-20).
     let base = jobs_dir();
@@ -4447,6 +4544,10 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
         ));
     }
     let dir = base.join(&m.id);
+    if cancel_background_process_group(&m)? == CancelSignalOutcome::AlreadyFinished {
+        println!("job already finished: {}", m.id);
+        return Ok(());
+    }
     if let Some(mut meta) = read_meta(&dir) {
         meta.status = "cancelled".into();
         meta.finished = Some(Utc::now());
@@ -4612,6 +4713,145 @@ mod tests {
     /// `current_dir` argument.
     fn tmp_cwd() -> PathBuf {
         std::env::temp_dir()
+    }
+
+    fn meta_for_test_pid(pid: u32) -> JobMeta {
+        JobMeta {
+            id: "test-job".to_string(),
+            kind: "test".to_string(),
+            status: "running".to_string(),
+            cwd: tmp_cwd().to_string_lossy().to_string(),
+            pid,
+            started: Utc::now(),
+            finished: None,
+        }
+    }
+
+    fn read_pidfile(path: &Path) -> Option<u32> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        raw.trim().parse::<u32>().ok().filter(|pid| *pid > 0)
+    }
+
+    #[test]
+    fn configure_background_worker_command_sets_own_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = std::fs::File::create(dir.path().join("output.txt")).expect("output file");
+        let err = out.try_clone().expect("clone output");
+        let args = vec!["30".to_string()];
+        let mut command = std::process::Command::new("/bin/sleep");
+        configure_background_worker_command(&mut command, &args, dir.path(), out, err);
+        let mut child = command.spawn().expect("spawn sleep");
+        let pid = child.id();
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+
+        unsafe {
+            if pgid == pid as libc::pid_t {
+                libc::kill(-pgid, libc::SIGKILL);
+            } else {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = child.wait();
+
+        assert_eq!(
+            pgid, pid as libc::pid_t,
+            "background worker must lead its own process group so pgid == pid"
+        );
+    }
+
+    #[test]
+    fn cancel_dead_background_pid_is_safe_noop() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait true");
+        assert!(
+            !crate::jobs::pid_alive(pid),
+            "waited child pid {pid} must be confirmed dead before cancel"
+        );
+
+        let outcome =
+            cancel_background_process_group(&meta_for_test_pid(pid)).expect("cancel dead pid");
+        assert_eq!(
+            outcome,
+            CancelSignalOutcome::AlreadyFinished,
+            "dead recorded pid must be treated as already finished without signalling"
+        );
+    }
+
+    #[test]
+    fn cancel_running_background_job_kills_process_group_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 100 & echo $! > \"$PIDFILE\"; wait")
+            .env("PIDFILE", &pidfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn parent shell");
+        let parent_pid = child.id();
+
+        let mut grandchild_pid = None;
+        for _ in 0..200 {
+            if let Some(pid) = read_pidfile(&pidfile) {
+                grandchild_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid must be written");
+        assert!(
+            crate::jobs::pid_alive(parent_pid),
+            "parent pid {parent_pid} must be alive before cancel"
+        );
+        assert!(
+            crate::jobs::pid_alive(grandchild_pid),
+            "grandchild pid {grandchild_pid} must be alive before cancel"
+        );
+
+        let outcome =
+            cancel_background_process_group(&meta_for_test_pid(parent_pid)).expect("cancel job");
+        assert_eq!(outcome, CancelSignalOutcome::Signalled);
+
+        let mut parent_exited = false;
+        for _ in 0..200 {
+            if child.try_wait().expect("poll parent").is_some() {
+                parent_exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !parent_exited {
+            let _ = signal_process_group(parent_pid, libc::SIGKILL);
+            let _ = child.wait();
+        }
+        assert!(
+            parent_exited,
+            "cancel must terminate the direct background worker"
+        );
+
+        let mut grandchild_gone = false;
+        for _ in 0..200 {
+            if !crate::jobs::pid_alive(grandchild_pid) {
+                grandchild_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !grandchild_gone {
+            unsafe {
+                libc::kill(grandchild_pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        assert!(
+            grandchild_gone,
+            "cancel must terminate the worker's descendant process"
+        );
     }
 
     /// `run_check_watched` must kill a hung `sleep` child within the budget
