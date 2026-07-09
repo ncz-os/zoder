@@ -1,6 +1,6 @@
 ## Summary
 
-- **Base branch:** `main`
+- **Base branch:** `master`
 - **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
