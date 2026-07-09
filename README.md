@@ -566,8 +566,13 @@ zoder builds natively for:
   arches natively on GitHub (macOS + arm64-Linux + x86_64-Linux), publishes raw
   binaries to the GitLab `zoder-nightly` channel and tarballs to the GitHub
   `nightly` release. Tagged `v*` releases: `.github/workflows/release.yml`.
-- The per-push quality gate runs on **GitLab** (`.gitlab-ci.yml`): fmt / clippy
-  `-D warnings` / check (all + no-default) / nextest / cargo-deny.
+- The per-push quality gate runs on **GitLab** (`.gitlab-ci.yml`):
+  `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
+  `cargo test --workspace --locked --all-features`.
+- GitLab also runs a scheduled/manual RustSec advisory scan:
+  `cargo deny check advisories`. It is intentionally outside the per-push gate
+  so a newly-published advisory does not unexpectedly block ordinary merge work.
 
 ### Windows? Use WSL.
 
