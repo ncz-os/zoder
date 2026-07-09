@@ -13,6 +13,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-process nonce so two overlapping `save()` calls in the same
+/// process never collide on the temp path. Combined with `std::process::id()`
+/// it makes each writer's temp file (`<stem>.json.tmp.<pid>.<nonce>`) unique,
+/// so an interleaved write+rename can never promote a torn or foreign temp
+/// over the live catalog. Mirrors `write_atomic` in `crates/model-health` and
+/// `Corpus::save` (C5-4) -- self-contained, no cross-crate dependency.
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPrice {
@@ -107,8 +116,13 @@ impl ModelPrice {
     /// off-peak rate when its window is active, else the standard `cost_io`.
     pub fn cost_io_at(&self, tokens_in: u64, tokens_out: u64, utc_min: u32) -> f64 {
         if let Some(op) = &self.off_peak {
-            if op.active_at(utc_min)
-                && (op.input_usd_per_mtok > 0.0 || op.output_usd_per_mtok > 0.0)
+            // C6-P2: require BOTH off-peak components (> 0) to take the
+            // off-peak branch. A partial pair (only one set) would zero the
+            // missing component's charge in-window; falling through to
+            // `cost_io` bills the standard peak rate instead. Defense-in-depth
+            // -- the loader (`validate_model_price`) already rejects a partial
+            // off-peak pair, so a partial pair should never reach here.
+            if op.active_at(utc_min) && op.input_usd_per_mtok > 0.0 && op.output_usd_per_mtok > 0.0
             {
                 let in_part = (tokens_in as u128) as f64 * op.input_usd_per_mtok;
                 let out_part = (tokens_out as u128) as f64 * op.output_usd_per_mtok;
@@ -208,12 +222,23 @@ fn validate_model_price(
     if let Some(op) = obj.get("off_peak").and_then(|v| v.as_object()) {
         let num = |k: &str| op.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
         let umin = |k: &str| (op.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32).min(1439);
-        price.off_peak = Some(OffPeak {
-            input_usd_per_mtok: num("input_usd_per_mtok"),
-            output_usd_per_mtok: num("output_usd_per_mtok"),
-            window_start_utc_min: umin("window_start_utc_min"),
-            window_end_utc_min: umin("window_end_utc_min"),
-        });
+        let op_input = num("input_usd_per_mtok");
+        let op_output = num("output_usd_per_mtok");
+        // C6-P2: an off-peak block is only honored when BOTH the input AND the
+        // output rate are present (> 0) -- mirroring the standard-rate
+        // complete-pair check above. A partial pair (e.g. only input set) would
+        // otherwise default the missing component to 0.0 and bill ALL of that
+        // component's tokens at $0 in-window (peak $18 output silently vanishing
+        // to $0). Treat a partial pair as NO off-peak so the call falls through
+        // to the standard peak rate.
+        if op_input > 0.0 && op_output > 0.0 {
+            price.off_peak = Some(OffPeak {
+                input_usd_per_mtok: op_input,
+                output_usd_per_mtok: op_output,
+                window_start_utc_min: umin("window_start_utc_min"),
+                window_end_utc_min: umin("window_end_utc_min"),
+            });
+        }
     }
     Some(price)
 }
@@ -355,14 +380,36 @@ impl PricingCatalog {
         cat
     }
 
-    /// Atomic write (temp + rename).
+    /// Atomic write (unique temp file + rename).
+    ///
+    /// C6-P1 (= S19): the temp filename carries the process id AND a monotonic
+    /// nonce (`<stem>.json.tmp.<pid>.<nonce>`) so two overlapping `pricing
+    /// refresh` runs -- a single refresh does two `save()`s, to
+    /// `~/.zoder/pricing.json` and the engine dir -- can never share a temp
+    /// path. Otherwise an interleaved write+rename could promote a torn or
+    /// foreign temp over the live catalog, and a later `load()` of that torn
+    /// file would fall back to an EMPTY catalog, collapsing all cost
+    /// classification to $0. The temp is removed on any error so a failed write
+    /// never litters the dir with a half-written file a later reader could pick
+    /// up. Mirrors the `write_atomic` pattern in `crates/model-health/src/lib.rs`
+    /// and `Corpus::save` (kept self-contained here -- no cross-crate dep).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
+        let data = serde_json::to_vec_pretty(self)?;
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+        // Write to the unique temp; on any failure remove it so it can never be
+        // renamed over the live catalog or left behind torn.
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -415,15 +462,43 @@ impl PricingCatalog {
         }
         let ml = model.to_ascii_lowercase();
         let leaf = ml.rsplit('/').next().unwrap_or(&ml);
-        self.models.iter().find_map(|(k, v)| {
+        // C6-P3: a leaf/suffix fallback can match several distinct keys (e.g.
+        // `openai/gpt-4o` and `azure/gpt-4o` both leaf `gpt-4o`). Iterating a
+        // HashMap yields an arbitrary winner, so the returned price would be
+        // non-deterministic across runs. Resolve the collision deterministically
+        // AND fail-safe: pick the match with the highest effective rate
+        // (conservative for chargeback -- never undercharge), tie-broken by the
+        // lexicographically-first key so the result is stable regardless of map
+        // iteration order.
+        let rate = |p: &ModelPrice| -> f64 {
+            let mut r = p.usd_per_mtok;
+            if p.input_usd_per_mtok > r {
+                r = p.input_usd_per_mtok;
+            }
+            if p.output_usd_per_mtok > r {
+                r = p.output_usd_per_mtok;
+            }
+            r
+        };
+        let mut best: Option<(&String, &ModelPrice)> = None;
+        for (k, v) in self.models.iter() {
             let kl = k.to_ascii_lowercase();
             let key_leaf = kl.rsplit('/').next().unwrap_or(&kl);
             if kl == ml || key_leaf == leaf {
-                Some(v)
-            } else {
-                None
+                best = Some(match best {
+                    None => (k, v),
+                    Some((bk, bv)) => {
+                        let (bv_r, v_r) = (rate(bv), rate(v));
+                        if v_r > bv_r || (v_r == bv_r && k.as_str() < bk.as_str()) {
+                            (k, v)
+                        } else {
+                            (bk, bv)
+                        }
+                    }
+                });
             }
-        })
+        }
+        best.map(|(_, v)| v)
     }
 
     /// Chargeback for a call (legacy `f64` interface — collapses
@@ -481,6 +556,7 @@ fn minutes_of_day_utc(ts: DateTime<Utc>) -> u32 {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::atomic::{AtomicU32, Ordering as TestOrdering};
 
     fn deepseek_chat() -> ModelPrice {
         ModelPrice {
@@ -628,6 +704,186 @@ mod tests {
         assert!(
             c > 0.0 || !c.is_finite(),
             "cost must not silently wrap to zero (got {c})"
+        );
+    }
+
+    // A unique per-test temp dir under the OS temp root (no external tempfile
+    // dep in this crate's tests).
+    fn tmpdir() -> std::path::PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, TestOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "zoder_pricing_test_{}_{}_{}",
+            std::process::id(),
+            n,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// C6-P1 (S19): `save()` writes through a UNIQUE temp file and leaves no
+    /// stray `.json.tmp` -- neither the legacy deterministic `<stem>.json.tmp`
+    /// nor any per-writer temp survives. A leftover foreign/torn temp is exactly
+    /// what could get renamed over the live catalog, collapsing all pricing to
+    /// $0 on the next load.
+    #[test]
+    fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let dir = tmpdir();
+        let path = dir.join("pricing.json");
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "vendor/model".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        cat.save(&path).unwrap();
+
+        // The catalog is present and reloads with its content intact (NOT the
+        // empty-catalog fallback a torn temp would produce).
+        assert!(path.exists());
+        let reloaded = PricingCatalog::load(&path);
+        assert_eq!(reloaded.models.len(), 1);
+        assert!(reloaded.models.contains_key("vendor/model"));
+
+        // Two more saves in-process must not collide on a temp path and must
+        // leave nothing behind.
+        cat.save(&path).unwrap();
+        cat.save(&path).unwrap();
+
+        // No file matching `.json.tmp` (deterministic or per-writer) survives.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(".json.tmp"),
+                "stray temp file left behind: {name}"
+            );
+        }
+        // Belt-and-suspenders: the legacy deterministic temp path never exists.
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C6-P2: a PARTIAL off-peak entry (only the input rate set) must NOT zero
+    /// the output charge in-window. The loader rejects the partial pair, so an
+    /// in-window call bills output at the PEAK output rate (off-peak ignored).
+    /// A COMPLETE off-peak pair still applies both off-peak components.
+    #[test]
+    fn partial_off_peak_does_not_zero_output_complete_pair_still_applies() {
+        // Partial off-peak: only the input rate is present. Peak = 6.0 in +
+        // 18.0 out per Mtok.
+        let raw_partial = serde_json::json!({
+            "input_usd_per_mtok": 6.0,
+            "output_usd_per_mtok": 18.0,
+            "off_peak": {
+                "input_usd_per_mtok": 0.50,
+                // output_usd_per_mtok deliberately ABSENT -> partial pair
+                "window_start_utc_min": 0,
+                "window_end_utc_min": 1440
+            }
+        });
+        let mut warnings = Vec::new();
+        let p = validate_model_price("partial/op", &raw_partial, &mut |w| warnings.push(w))
+            .expect("standard rates are complete, model must load");
+        // The partial off-peak pair is discarded entirely.
+        assert!(
+            p.off_peak.is_none(),
+            "partial off-peak pair must be treated as no off-peak"
+        );
+        // In-window call (any minute -- the would-be window is all day) bills
+        // output at the PEAK rate, not $0. 1M out at peak $18 = 18.0.
+        let cost = p.cost_io_at(0, 1_000_000, 720);
+        assert!(
+            (cost - 18.0).abs() < 1e-9,
+            "output must bill at peak $18, got {cost}"
+        );
+
+        // A COMPLETE off-peak pair still applies BOTH off-peak components.
+        let raw_complete = serde_json::json!({
+            "input_usd_per_mtok": 6.0,
+            "output_usd_per_mtok": 18.0,
+            "off_peak": {
+                "input_usd_per_mtok": 0.50,
+                "output_usd_per_mtok": 1.50,
+                "window_start_utc_min": 0,
+                "window_end_utc_min": 1440
+            }
+        });
+        let mut warnings2 = Vec::new();
+        let pc = validate_model_price("complete/op", &raw_complete, &mut |w| warnings2.push(w))
+            .expect("complete pairs must load");
+        assert!(pc.off_peak.is_some(), "complete off-peak pair must be kept");
+        // 1M in + 1M out off-peak = 0.50 + 1.50 = 2.00.
+        let off = pc.cost_io_at(1_000_000, 1_000_000, 720);
+        assert!((off - 2.0).abs() < 1e-9, "complete off-peak {off}");
+
+        // Defense-in-depth: even if a partial off-peak somehow existed on the
+        // struct, cost_io_at falls through to peak rather than zeroing output.
+        let hand_partial = ModelPrice {
+            input_usd_per_mtok: 6.0,
+            output_usd_per_mtok: 18.0,
+            off_peak: Some(OffPeak {
+                input_usd_per_mtok: 0.50,
+                output_usd_per_mtok: 0.0, // partial: output missing
+                window_start_utc_min: 0,
+                window_end_utc_min: 1440,
+            }),
+            ..Default::default()
+        };
+        let hp = hand_partial.cost_io_at(0, 1_000_000, 720);
+        assert!(
+            (hp - 18.0).abs() < 1e-9,
+            "cost_io_at guard must fall through to peak, got {hp}"
+        );
+    }
+
+    /// C6-P3: a leaf-collision query resolves DETERMINISTICALLY and fail-safe --
+    /// the MAX-rate match is returned, and the result is identical across
+    /// repeated calls regardless of HashMap iteration order.
+    #[test]
+    fn leaf_collision_returns_deterministic_max_price() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "openai/gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 2.50,
+                output_usd_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        cat.models.insert(
+            "azure/gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 5.0,
+                output_usd_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        // The query leaf `gpt-4o` collides with both; the higher-rate azure
+        // entry (input 5.0) must win, stably.
+        let mut seen = None;
+        for _ in 0..64 {
+            let p = cat.lookup("vertex/gpt-4o").expect("leaf match");
+            let r = p.input_usd_per_mtok;
+            match seen {
+                None => seen = Some(r),
+                Some(prev) => assert!(
+                    (prev - r).abs() < 1e-12,
+                    "lookup non-deterministic across calls: {prev} vs {r}"
+                ),
+            }
+        }
+        assert!(
+            (seen.unwrap() - 5.0).abs() < 1e-9,
+            "must return the MAX-rate (azure) match, got {}",
+            seen.unwrap()
         );
     }
 }
