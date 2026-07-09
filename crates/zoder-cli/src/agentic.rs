@@ -1062,6 +1062,72 @@ pub(crate) struct ReviewOutput {
     next_steps: Vec<String>,
 }
 
+/// One reviewer slot in the panel. C5-1: the outcome (a real completion vs a
+/// reviewer that failed) is carried as a STRUCTURED discriminant, never by
+/// overloading the model-id `String`. Previously a failed slot was stored as
+/// `("error", ReviewOutput{..})` and the worst-verdict walk filtered on the
+/// literal model string `"error"` -- so an operator-reachable reviewer model
+/// LITERALLY named `error` (via `--panel error` or `reviewer_model="error"`)
+/// that SUCCEEDED with a blocking verdict had its vote silently dropped and
+/// the gate failed open (block -> approve, exit 0). The variant makes success
+/// vs failure unambiguous regardless of the model id.
+#[derive(Debug, Clone)]
+enum ReviewerSlot {
+    /// A reviewer that produced a structured completion. `model` is the
+    /// operator-supplied model id verbatim (may be any string, including
+    /// `"error"`); `review` is the parsed verdict/findings.
+    Ok { model: String, review: ReviewOutput },
+    /// A reviewer whose completion failed. `err` is the failure detail; it is
+    /// rendered as a synthetic non-voting `comment` record so the panel view
+    /// still lists the slot, but it NEVER counts toward the worst-rank walk.
+    Failed { model: String, err: String },
+}
+
+impl ReviewerSlot {
+    /// The reviewer's model id (the operator-supplied string, verbatim).
+    fn model(&self) -> &str {
+        match self {
+            ReviewerSlot::Ok { model, .. } => model,
+            ReviewerSlot::Failed { model, .. } => model,
+        }
+    }
+
+    /// Did this slot produce a real reviewer vote? Only `Ok` slots vote in the
+    /// worst-rank aggregate; `Failed` slots are excluded by VARIANT, not by
+    /// string-comparing the model id.
+    fn is_ok(&self) -> bool {
+        matches!(self, ReviewerSlot::Ok { .. })
+    }
+
+    /// The parsed review for an `Ok` slot; `None` for a `Failed` slot.
+    fn review(&self) -> Option<&ReviewOutput> {
+        match self {
+            ReviewerSlot::Ok { review, .. } => Some(review),
+            ReviewerSlot::Failed { .. } => None,
+        }
+    }
+
+    /// The verdict string as rendered in the panel view / JSON payload. A
+    /// `Failed` slot renders the synthetic non-voting `comment` verdict (it is
+    /// excluded from the worst-rank walk, so this display value never lifts or
+    /// lowers the aggregate).
+    fn display_verdict(&self) -> &str {
+        match self {
+            ReviewerSlot::Ok { review, .. } => review.verdict.as_str(),
+            ReviewerSlot::Failed { .. } => "comment",
+        }
+    }
+
+    /// The summary line for the panel view / JSON payload. For a `Failed` slot
+    /// this is the reviewer-failure detail.
+    fn display_summary(&self) -> String {
+        match self {
+            ReviewerSlot::Ok { review, .. } => review.summary.clone(),
+            ReviewerSlot::Failed { err, .. } => format!("reviewer failed: {err}"),
+        }
+    }
+}
+
 /// Best-effort parse of a model's reply into a `ReviewOutput`: extract the first
 /// balanced-looking `{...}` and decode it; on failure, wrap the raw text.
 ///
@@ -1955,7 +2021,10 @@ pub(crate) async fn cmd_review(
         emit_reviews(
             cli,
             &ReviewAggregate {
-                reviewers: &[(String::from("n/a"), out)],
+                reviewers: &[ReviewerSlot::Ok {
+                    model: String::from("n/a"),
+                    review: out,
+                }],
                 cost_usd: 0.0,
                 requested: 1,
                 ok_models: 1,
@@ -2025,17 +2094,18 @@ pub(crate) async fn cmd_review(
     let results = futures_util::future::join_all(futs).await;
 
     // Outcome accounting:
-    //   * `ok_models`            - the models whose completions succeeded.
-    //   * `failed_against_solo`  - the synthetic "error" record only wins
-    //                              when EVERY requested reviewer failed
-    //                              (i.e. the model label is meaningless because
-    //                              nothing in the roster reviewed any code).
+    //   * `ok_models`  - the reviewer slots whose completions succeeded
+    //                    (`ReviewerSlot::Ok`); only these cast a verdict vote.
+    //   * failures     - `ReviewerSlot::Failed` slots; excluded from the
+    //                    worst-rank walk by VARIANT (C5-1), never by matching a
+    //                    magic model-id string, so a real reviewer whose id
+    //                    happens to be "error" still votes.
     // The total failure -> bail-Ok bug fixed here: when `ok_models` is empty
     // the aggregate verdict does NOT default to "comment" (which would have
     // passed CI); the caller now sees a nonzero exit so a CI review gate
     // cannot be silently green-lit by a single 401 or by every panel model
     // timing out.
-    let mut reviews: Vec<(String, ReviewOutput)> = Vec::new();
+    let mut reviews: Vec<ReviewerSlot> = Vec::new();
     let mut total_cost = 0.0;
     let mut ok_models: usize = 0;
     for r in results {
@@ -2043,17 +2113,20 @@ pub(crate) async fn cmd_review(
             Ok(c) => {
                 ok_models += 1;
                 total_cost += c.cost_usd;
-                reviews.push((c.model, parse_review(&c.content)));
+                reviews.push(ReviewerSlot::Ok {
+                    model: c.model,
+                    review: parse_review(&c.content),
+                });
             }
             Err(e) => {
-                reviews.push((
-                    "error".into(),
-                    ReviewOutput {
-                        verdict: "comment".into(),
-                        summary: format!("reviewer failed: {e}"),
-                        ..Default::default()
-                    },
-                ));
+                // C5-1: a failed slot is a Failed VARIANT, not a magic
+                // model-id string. It has no `model` label to collide with a
+                // real reviewer named "error"; the worst-rank walk excludes it
+                // by variant. `model` here is only cosmetic ("(failed)").
+                reviews.push(ReviewerSlot::Failed {
+                    model: "(failed)".into(),
+                    err: format!("{e}"),
+                });
             }
         }
     }
@@ -2118,7 +2191,7 @@ A review that no model produced must not be reported as success.",
 /// instead of leaving the CI to guess whether the synthetic "comment" came
 /// from every reviewer failing or from a real reviewer rating the diff.
 struct ReviewAggregate<'a> {
-    reviewers: &'a [(String, ReviewOutput)],
+    reviewers: &'a [ReviewerSlot],
     cost_usd: f64,
     /// Number of reviewer slots the caller asked for (1 + `--panel` entries).
     requested: usize,
@@ -2135,22 +2208,24 @@ struct ReviewAggregate<'a> {
 /// surface as `complete=false` + a non-`approve` verdict, never a silent
 /// "comment" that lets CI think the review ran).
 fn aggregate_review(
-    reviews: &[(String, ReviewOutput)],
+    reviews: &[ReviewerSlot],
     cost_usd: f64,
     requested: usize,
     ok_models: usize,
     failed_models: usize,
 ) -> (String, bool, serde_json::Value) {
     let all_failed = ok_models == 0;
-    // Aggregate verdict = worst across reviewers that ACTUALLY completed;
-    // a synthetic "error/comment" record (model == "error") does NOT count
-    // as a successful reviewer vote and must not lift the aggregate. If
-    // every record is an error, fall through to "request_changes" so the
-    // rendered verdict visibly disagrees with the silent-Ok() CI exit.
+    // Aggregate verdict = worst across reviewers that ACTUALLY completed.
+    // C5-1: a slot's vote is counted iff it is an `Ok` VARIANT -- never by
+    // string-comparing the model id to "error". This is what lets a real
+    // reviewer model literally named "error" cast a blocking vote, while a
+    // genuinely `Failed` slot is still excluded. If every slot failed, fall
+    // through to "request_changes" so the rendered verdict visibly disagrees
+    // with the silent-Ok() CI exit.
     let worst_rank = reviews
         .iter()
-        .filter(|(m, _)| m.as_str() != "error")
-        .map(|(_, r)| r.verdict.as_str())
+        .filter_map(ReviewerSlot::review)
+        .map(|r| r.verdict.as_str())
         .map(verdict_rank)
         .max()
         .unwrap_or(0);
@@ -2176,12 +2251,13 @@ fn aggregate_review(
         "ok_models": ok_models,
         "failed_models": failed_models,
         "cost_usd": cost_usd,
-        "reviewers": reviews.iter().map(|(m, r)| json!({
-            "model": m,
-            "verdict": r.verdict,
-            "summary": r.summary,
-            "findings": r.findings,
-            "next_steps": r.next_steps,
+        "reviewers": reviews.iter().map(|slot| json!({
+            "model": slot.model(),
+            "verdict": slot.display_verdict(),
+            "summary": slot.display_summary(),
+            "findings": slot.review().map(|r| r.findings.clone()).unwrap_or_default(),
+            "next_steps": slot.review().map(|r| r.next_steps.clone()).unwrap_or_default(),
+            "ok": slot.is_ok(),
         })).collect::<Vec<_>>(),
     });
 
@@ -2235,28 +2311,32 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
         "verdict: {agg}   (${cost:.4})   [{status}]\n",
         cost = aggregate.cost_usd
     );
-    for (model, r) in aggregate.reviewers {
-        println!("── {model} :: {} ──", r.verdict);
-        if !r.summary.is_empty() {
-            println!("{}", r.summary);
+    for slot in aggregate.reviewers {
+        let model = slot.model();
+        println!("── {model} :: {} ──", slot.display_verdict());
+        let summary = slot.display_summary();
+        if !summary.is_empty() {
+            println!("{summary}");
         }
-        for f in &r.findings {
-            let loc = f
-                .location
-                .as_deref()
-                .map(|l| format!(" [{l}]"))
-                .unwrap_or_default();
-            println!("  • ({}) {}{}", f.severity, f.title, loc);
-            if !f.body.is_empty() {
-                for line in f.body.lines() {
-                    println!("      {line}");
+        if let Some(r) = slot.review() {
+            for f in &r.findings {
+                let loc = f
+                    .location
+                    .as_deref()
+                    .map(|l| format!(" [{l}]"))
+                    .unwrap_or_default();
+                println!("  • ({}) {}{}", f.severity, f.title, loc);
+                if !f.body.is_empty() {
+                    for line in f.body.lines() {
+                        println!("      {line}");
+                    }
                 }
             }
-        }
-        if !r.next_steps.is_empty() {
-            println!("  next:");
-            for s in &r.next_steps {
-                println!("    - {s}");
+            if !r.next_steps.is_empty() {
+                println!("  next:");
+                for step in &r.next_steps {
+                    println!("    - {step}");
+                }
             }
         }
         println!();
@@ -5394,20 +5474,30 @@ not run to max_iters"
         }
     }
 
+    /// An `Ok` reviewer slot: a real completion from `model` voting `verdict`.
+    fn ok_slot(model: &str, verdict: &str) -> ReviewerSlot {
+        ReviewerSlot::Ok {
+            model: model.into(),
+            review: rro(verdict),
+        }
+    }
+
+    /// A `Failed` reviewer slot (a reviewer whose completion errored). It casts
+    /// NO vote regardless of its label.
+    fn failed_slot(err: &str) -> ReviewerSlot {
+        ReviewerSlot::Failed {
+            model: "(failed)".into(),
+            err: err.into(),
+        }
+    }
+
     /// REGRESSION (Finding #14): when EVERY reviewer fails (e.g. the lone
     /// reviewer 401s, or every `--panel` model times out) the aggregate must
     /// surface `complete: false` and a NON-`approve` verdict. The old code
     /// produced `comment` here, which let CI believe the review ran.
     #[test]
     fn aggregate_review_marks_complete_false_when_every_reviewer_fails() {
-        let reviews = vec![(
-            "error".into(),
-            ReviewOutput {
-                verdict: "comment".into(),
-                summary: "reviewer failed: 401 Unauthorized".into(),
-                ..Default::default()
-            },
-        )];
+        let reviews = vec![failed_slot("401 Unauthorized")];
         let (agg, all_failed, payload) = aggregate_review(&reviews, 0.0, 1, 0, 1);
         assert!(all_failed, "ok_models=0 must flag all_failed");
         assert_ne!(
@@ -5424,26 +5514,16 @@ not run to max_iters"
         assert_eq!(payload["failed_models"].as_u64(), Some(1));
     }
 
-    /// REGRESSION (Finding #14): an explicit `comment` verdict from a
-    /// SUCCESSFUL reviewer (i.e. a real response, not an error record)
-    /// keeps the aggregate at `comment` — the synthetic "error/comment"
-    /// record from a failed reviewer must NOT lift the aggregate. The
-    /// fix ensures the worst-rank walk SKIPS the "error" model label.
+    /// REGRESSION (Finding #14 + C5-1): an `approve` from a SUCCESSFUL
+    /// reviewer alongside a `ReviewerSlot::Failed` slot keeps the aggregate at
+    /// `approve` — a failed slot casts no vote. The worst-rank walk now skips
+    /// failed slots by VARIANT (`filter_map(ReviewerSlot::review)`), not by
+    /// string-matching a magic model id.
     #[test]
     fn aggregate_review_ignores_error_records_when_computing_worst_verdict() {
-        // One real `approve` reviewer; one failed reviewer (synthetic "error/comment").
-        // The aggregate must be `approve`, NOT `comment`.
-        let reviews = vec![
-            ("real-model".into(), rro("approve")),
-            (
-                "error".into(),
-                ReviewOutput {
-                    verdict: "comment".into(),
-                    summary: "reviewer failed: timeout".into(),
-                    ..Default::default()
-                },
-            ),
-        ];
+        // One real `approve` reviewer; one `Failed` reviewer slot.
+        // The aggregate must be `approve` (the failed slot casts no vote).
+        let reviews = vec![ok_slot("real-model", "approve"), failed_slot("timeout")];
         let (agg, all_failed, payload) = aggregate_review(&reviews, 0.01, 2, 1, 1);
         assert!(!all_failed, "one successful reviewer -> not all-failed");
         assert_eq!(
@@ -5457,22 +5537,15 @@ not run to max_iters"
     }
 
     /// A blocking review from a successful reviewer still wins — the worst
-    /// rank walk is correct, just it ignores the synthetic "error" slots.
-    /// When one reviewer votes `request_changes` and another fails, the
-    /// aggregate must reflect the real blocking verdict.
+    /// rank walk ignores `Failed` slots (by variant). When one reviewer votes
+    /// `request_changes` and another fails, the aggregate must reflect the real
+    /// blocking verdict.
     #[test]
     fn aggregate_review_takes_worst_verdict_from_real_reviewers_only() {
         let reviews = vec![
-            ("real-a".into(), rro("request_changes")),
-            (
-                "error".into(),
-                ReviewOutput {
-                    verdict: "comment".into(),
-                    summary: "reviewer failed: 5xx".into(),
-                    ..Default::default()
-                },
-            ),
-            ("real-b".into(), rro("approve")),
+            ok_slot("real-a", "request_changes"),
+            failed_slot("5xx"),
+            ok_slot("real-b", "approve"),
         ];
         let (agg, _, payload) = aggregate_review(&reviews, 0.0, 3, 2, 1);
         assert_eq!(
@@ -5483,12 +5556,57 @@ not run to max_iters"
         assert_eq!(payload["cost_usd"].as_f64(), Some(0.0));
     }
 
+    /// C5-1 [MED]: a reviewer model LITERALLY named `error` (operator-reachable
+    /// via `--panel error` / `reviewer_model="error"`) that SUCCEEDS with a
+    /// blocking `request_changes` must still cast its blocking vote. The old
+    /// code stored a failed slot as `("error", ..)` and filtered the worst-rank
+    /// walk on the string `"error"`, so a real successful reviewer named
+    /// "error" had its block silently dropped -> gate failed OPEN (exit 0).
+    /// With the structured `ReviewerSlot` discriminant the vote is counted by
+    /// VARIANT, so the aggregate is `request_changes` (blocking), NOT `approve`.
+    #[test]
+    fn aggregate_counts_successful_reviewer_named_error_as_a_real_vote() {
+        // Slot 0: an `Ok` reviewer whose model id is the literal string
+        // "error", voting request_changes. Slot 1: a real `approve`.
+        let reviews = vec![
+            ok_slot("error", "request_changes"),
+            ok_slot("real-approver", "approve"),
+        ];
+        let (agg, all_failed, payload) = aggregate_review(&reviews, 0.0, 2, 2, 0);
+        assert!(!all_failed, "both slots succeeded -> not all-failed");
+        assert_eq!(
+            agg, "request_changes",
+            "a SUCCESSFUL reviewer named 'error' must cast its blocking vote (C5-1: must not be dropped by string-sentinel filtering)"
+        );
+        assert_eq!(payload["ok_models"].as_u64(), Some(2));
+        assert_eq!(payload["failed_models"].as_u64(), Some(0));
+        // The literal model id survives to the payload verbatim, and is marked
+        // as a real (ok) vote.
+        let slot0 = &payload["reviewers"][0];
+        assert_eq!(slot0["model"].as_str(), Some("error"));
+        assert_eq!(slot0["ok"].as_bool(), Some(true));
+        assert_eq!(slot0["verdict"].as_str(), Some("request_changes"));
+
+        // And the companion invariant still holds: a GENUINELY failed slot
+        // (Failed variant) alongside a real approve does NOT vote, so the
+        // aggregate stays `approve` -- a failed slot is not a blocking vote.
+        let mixed = vec![ok_slot("real-approver", "approve"), failed_slot("timeout")];
+        let (agg2, _, payload2) = aggregate_review(&mixed, 0.0, 2, 1, 1);
+        assert_eq!(
+            agg2, "approve",
+            "a Failed slot casts no vote -> aggregate stays approve"
+        );
+        assert_eq!(payload2["ok_models"].as_u64(), Some(1));
+        assert_eq!(payload2["failed_models"].as_u64(), Some(1));
+        assert_eq!(payload2["reviewers"][1]["ok"].as_bool(), Some(false));
+    }
+
     /// `complete: true` only when at least one model reported a real
     /// reviewer response. The flag exists precisely so downstream CI gates
     /// can stop trusting a `comment` aggregate verdict when `complete=false`.
     #[test]
     fn aggregate_review_complete_true_when_any_reviewer_succeeds() {
-        let reviews = vec![("solo".into(), rro("comment"))];
+        let reviews = vec![ok_slot("solo", "comment")];
         let (_, all_failed, payload) = aggregate_review(&reviews, 0.0, 1, 1, 0);
         assert!(!all_failed);
         assert_eq!(payload["complete"].as_bool(), Some(true));
@@ -5520,7 +5638,7 @@ not run to max_iters"
 
     /// The gate `cmd_review` applies: rank of the aggregate verdict.
     /// >= 2 means the panel blocked and `cmd_review` must `bail!`.
-    fn review_would_bail(reviews: &[(String, ReviewOutput)], ok: usize, failed: usize) -> bool {
+    fn review_would_bail(reviews: &[ReviewerSlot], ok: usize, failed: usize) -> bool {
         let (agg, _, _) = aggregate_review(reviews, 0.0, ok + failed, ok, failed);
         verdict_rank(&agg) >= 2
     }
@@ -5529,7 +5647,7 @@ not run to max_iters"
     /// must exit nonzero (the SC1 false-success bug: it used to exit 0).
     #[test]
     fn cmd_review_bails_on_request_changes_verdict() {
-        let reviews = vec![("real".to_string(), rro("request_changes"))];
+        let reviews = vec![ok_slot("real", "request_changes")];
         assert!(
             review_would_bail(&reviews, 1, 0),
             "request_changes aggregate must make cmd_review exit nonzero"
@@ -5540,7 +5658,7 @@ not run to max_iters"
     #[test]
     fn cmd_review_bails_on_reject_and_block_verdicts() {
         for v in ["reject", "block", "BLOCK", " Request_Changes "] {
-            let reviews = vec![("real".to_string(), rro(v))];
+            let reviews = vec![ok_slot("real", v)];
             assert!(
                 review_would_bail(&reviews, 1, 0),
                 "blocking verdict {v:?} must make cmd_review exit nonzero"
@@ -5552,7 +5670,7 @@ not run to max_iters"
     /// 2), so `cmd_review` must also bail on it -> no silent approve.
     #[test]
     fn cmd_review_bails_on_unknown_verdict() {
-        let reviews = vec![("real".to_string(), rro("lgtm"))];
+        let reviews = vec![ok_slot("real", "lgtm")];
         assert!(
             review_would_bail(&reviews, 1, 0),
             "unknown verdict must fail closed and make cmd_review exit nonzero"
@@ -5564,11 +5682,11 @@ not run to max_iters"
     #[test]
     fn cmd_review_does_not_bail_on_approve_or_comment() {
         assert!(
-            !review_would_bail(&[("real".to_string(), rro("approve"))], 1, 0),
+            !review_would_bail(&[ok_slot("real", "approve")], 1, 0),
             "approve must exit 0"
         );
         assert!(
-            !review_would_bail(&[("real".to_string(), rro("comment"))], 1, 0),
+            !review_would_bail(&[ok_slot("real", "comment")], 1, 0),
             "a neutral comment (no blocker) must exit 0"
         );
     }
