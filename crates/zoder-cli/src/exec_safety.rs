@@ -440,7 +440,8 @@ fn extract_trailing_pipe_shell(t: &str) -> Option<&str> {
 //
 // Cross-platform contract (mirrored by the `target_os = "macos"` /
 // `target_os = "linux"` / off-native `cfg` arms in `wrap_spawn_command`,
-// `seatbelt_plan`, and `linux_plan`, and by the test surface):
+// `seatbelt_plan`, `linux_plan`, and `linux_landlock_plan`, and by the
+// test surface):
 //   * `ExecSandbox::None`             — same on every OS. The dispatch site
 //                                       invokes `sh -c <cmd>` exactly as
 //                                       before; the returned plan's `argv`
@@ -466,13 +467,76 @@ fn extract_trailing_pipe_shell(t: &str) -> Option<&str> {
 //                                       unsupported on this platform — only
 //                                       Linux is wired up; …")`. Same
 //                                       hard-error-on-wrong-host policy.
+//   * `ExecSandbox::LinuxLandlock`    — second Linux backend. Built and
+//                                       tested on Linux; on every other OS
+//                                       the dispatch site returns
+//                                       `Err("…linux_landlock backend is
+//                                       unsupported on this platform — only
+//                                       Linux is wired up; …")`. Unlike
+//                                       bubblewrap, Landlock is a kernel
+//                                       LSM and the plan's argv is the
+//                                       LEGACY `[sh, -c, cmd]` shape — the
+//                                       ruleset is applied IN-PROCESS via a
+//                                       `pre_exec` hook (see
+//                                       [`linux_landlock_plan`] and
+//                                       [`apply_landlock_ruleset_in_child`]),
+//                                       not by wrapping the program.
 // ---------------------------------------------------------------------------
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use zoder_core::{
-    ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, SeatbeltProfileOptions,
+    ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions,
+    SeatbeltProfileOptions,
 };
+
+/// Pure-data description of a single Landlock filesystem rule. The
+/// `landlock` crate's `AccessFs` / `PathBeneath` types are `cfg(target_os
+/// = "linux")`-only and tie the rule to a concrete file descriptor, so
+/// they can't appear in a testable on-every-host descriptor struct. This
+/// type is the platform-independent mirror: a path (as `PathBuf`, no
+/// open()) and a coarse access tag that the `cfg`-gated applier expands
+/// into the right `landlock::AccessFs` bitflags at apply time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LandlockRuleDescriptor {
+    /// The filesystem path the rule attaches to. On Linux the
+    /// `apply_landlock_ruleset_in_child` helper opens this with
+    /// `O_PATH` and wraps it in a `PathBeneath<PathFd>`; on non-Linux
+    /// hosts the descriptor is never applied (the dispatch on
+    /// non-Linux returns `Err` before we get here).
+    pub path: PathBuf,
+    /// Coarse access tag. The expansion to `landlock::AccessFs`
+    /// bitflags is cfg-gated and lives in
+    /// [`apply_landlock_ruleset_in_child`].
+    pub access: LandlockAccess,
+}
+
+/// Coarse access tag for [`LandlockRuleDescriptor`]. Deliberately
+/// coarser than the `landlock::AccessFs` bitflags so the descriptor
+/// type stays cfg-independent (the `landlock` crate's `AccessFs` is
+/// `non_exhaustive` and gated on `target_os = "linux"`). The
+/// `apply_landlock_ruleset_in_child` cfg-gated helper expands each
+/// variant to the matching `AccessFs` bitflag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LandlockAccess {
+    /// `read_file` + `read_dir` (and the kernel-internal `execute` flag
+    /// is intentionally omitted — system paths like `/usr` need to be
+    /// walked but the kernel links the dynamic loader under `/lib`,
+    /// which is a separate rule that uses [`LandlockAccess::ReadExecute`]).
+    Read,
+    /// `Read` + `write_file` + `remove_file` + `remove_dir` +
+    /// `make_char` + `make_dir` + `make_reg` + `make_sock` +
+    /// `make_fifo` + `make_block` + `make_sym` + `truncate`. This is
+    /// the full set of "read-write" filesystem access rights in
+    /// Landlock ABI v1 (the minimum that runs on Linux 5.13+).
+    ReadWrite,
+    /// `Read` + `execute`. Required for paths the kernel will
+    /// `execve` (the dynamic linker under `/lib`, system binaries
+    /// under `/bin` and `/usr/bin`). Without `execute` even `sh` can't
+    /// start because the loader can't `execve` `ld-linux.so`.
+    ReadExecute,
+}
 
 /// What `wrap_spawn_command` decided the spawn should look like. The call
 /// site consumes `argv` (as `OsString`s — needed because the working
@@ -488,12 +552,15 @@ use zoder_core::{
 pub(crate) struct SandboxSpawnPlan {
     /// The argv that should be passed to `Command::new(argv[0]).args(&argv[1..])`.
     /// For the `None` backend this is exactly `[sh, -c, cmd]` — the legacy
-    /// shape, preserved byte-for-byte.
+    /// shape, preserved byte-for-byte. For `LinuxLandlock` the argv is
+    /// also `[sh, -c, cmd]` (the ruleset is applied in a `pre_exec` hook
+    /// rather than by wrapping the program), so the legacy argv shape is
+    /// preserved on Linux too.
     pub argv: Vec<OsString>,
-    /// True iff the spawn is wrapped in an OS-level sandbox (currently only
-    /// `Seatbelt`; future Linux variants will set this too). The call site
+    /// True iff the spawn is wrapped in an OS-level sandbox. The call site
     /// uses it for observability only — the argv above is already the
-    /// wrapped form.
+    /// wrapped form (or the legacy form, for backends that apply the
+    /// sandbox in-process rather than by wrapping).
     pub sandboxed: bool,
     /// The CANONICAL working directory the dispatch resolved `cwd` to
     /// (via `Path::canonicalize`). Exposed here so the production call
@@ -505,6 +572,19 @@ pub(crate) struct SandboxSpawnPlan {
     /// never diverge (no TOCTOU window where the policy protects one
     /// tree and the spawn runs in a different one).
     pub cwd: std::path::PathBuf,
+    /// IN-PROCESS ruleset to apply to the child between `fork` and `exec`
+    /// (i.e. via `Command::pre_exec`). `None` for backends that don't
+    /// need an in-process hook (the `None` default backend, `Seatbelt`,
+    /// and `LinuxBubblewrap` — those wrap the program instead of
+    /// restricting the child in-place). `Some(ruleset)` for
+    /// `LinuxLandlock`, which is the in-kernel Landlock LSM and applies
+    /// the ruleset directly to the spawned child via the `landlock`
+    /// crate. The descriptor type is a cfg-independent pure-data shape
+    /// so the ruleset itself is testable on every host (including this
+    /// Linux CI box); the actual `landlock::Ruleset` construction lives
+    /// behind `cfg(target_os = "linux")` in
+    /// [`apply_landlock_ruleset_in_child`].
+    pub in_process_ruleset: Option<Vec<LandlockRuleDescriptor>>,
 }
 
 /// Decide what argv to spawn for `cmd` given the operator's exec-safety
@@ -557,6 +637,7 @@ pub(crate) fn wrap_spawn_command(
             ],
             sandboxed: false,
             cwd: cwd_canonical,
+            in_process_ruleset: None,
         }),
         ExecSandbox::Seatbelt => {
             seatbelt_plan(&cwd_canonical, cmd, &policy.seatbelt).map(|mut p| {
@@ -569,6 +650,12 @@ pub(crate) fn wrap_spawn_command(
                 p.cwd = cwd_canonical;
                 p
             }),
+        ExecSandbox::LinuxLandlock => {
+            linux_landlock_plan(&cwd_canonical, cmd, &policy.linux_landlock).map(|mut p| {
+                p.cwd = cwd_canonical;
+                p
+            })
+        }
         // Forward-compat catch-all (the `#[serde(other)]` variant on
         // `ExecSandbox`): the operator's config named a backend this
         // build doesn't know about — a typo, or a future variant on a
@@ -579,10 +666,10 @@ pub(crate) fn wrap_spawn_command(
         ExecSandbox::Unsupported => {
             Err("exec_safety backend is set to a value this build does not \
              recognize — see zoder_core::ExecSandbox for the supported \
-             variants (currently `none`, `seatbelt`, and `linux_bubblewrap`). \
-             Set `exec_safety.backend = \"none\"` to restore the legacy \
-             denylist-only behavior, or upgrade zoder to a build that \
-             implements the named backend."
+             variants (currently `none`, `seatbelt`, `linux_bubblewrap`, and \
+             `linux_landlock`). Set `exec_safety.backend = \"none\"` to \
+             restore the legacy denylist-only behavior, or upgrade zoder to a \
+             build that implements the named backend."
                 .to_string())
         }
     }
@@ -635,6 +722,9 @@ fn seatbelt_plan(
         // own canonical value on the way out so the production
         // `.current_dir()` uses the same source of truth.
         cwd: cwd.to_path_buf(),
+        // Seatbelt is an external-wrapper backend (sandbox-exec),
+        // not an in-process ruleset — `pre_exec` is unused.
+        in_process_ruleset: None,
     })
 }
 
@@ -787,6 +877,10 @@ fn linux_plan(
         // way out so the production `.current_dir()` uses the
         // same source of truth.
         cwd: cwd.to_path_buf(),
+        // Bubblewrap is an external-wrapper backend (bwrap builds
+        // a new mount namespace outside the child), not an
+        // in-process ruleset — `pre_exec` is unused.
+        in_process_ruleset: None,
     })
 }
 
@@ -1004,6 +1098,320 @@ pub(crate) fn generate_bubblewrap_argv(
     argv.push(OsString::from("-c"));
     argv.push(OsString::from(cmd));
     argv
+}
+
+/// Build a Linux **Landlock** dispatch plan. Unlike [`linux_plan`], this
+/// backend does NOT wrap the argv with an external binary — Landlock is
+/// a kernel LSM applied in-process. The plan still returns the legacy
+/// `[sh, -c, cmd]` argv (so the operator's existing `--check` strings
+/// work unchanged) plus an `in_process_ruleset` that the call site
+/// wires into a `Command::pre_exec` hook on Linux. The hook compiles
+/// out on non-Linux hosts because the dispatch on non-Linux returns
+/// `Err` before we get here.
+///
+/// Platform contract (mirrors [`linux_plan`]):
+///   * `cfg(target_os = "linux")` — return a plan with the legacy argv
+///     + an in-process Landlock ruleset. The actual `landlock` crate
+///     calls happen in the call site's `pre_exec` hook, not here.
+///   * any other target — return `Err` with a clear unsupported message.
+///     This is what the unit tests assert on macOS CI / dev hosts; the
+///     regression guard keeps the cross-platform contract honest even
+///     though we can never actually invoke a kernel-LSM syscall on a
+///     non-Linux runner.
+#[allow(clippy::doc_lazy_continuation)] // bullet continuations need 6-space indent to satisfy the strict mode lint; we deliberately keep the 4-space form to match the other contract comments in this file (e.g. `seatbelt_plan`).
+fn linux_landlock_plan(
+    cwd: &std::path::Path,
+    cmd: &str,
+    opts: &LinuxLandlockProfileOptions,
+) -> Result<SandboxSpawnPlan, String> {
+    // The unsupported-on-this-platform path is platform-independent so
+    // the unit test can assert it from any host (including this Linux CI
+    // box). The actual Landlock ruleset application is Linux-only and
+    // is wired into the spawn site via a `pre_exec` hook, NOT into this
+    // dispatch — that keeps the dispatch itself a pure function of
+    // `(cwd, cmd, opts)` and unit-testable on every host (see the
+    // `landlock_ruleset_*` tests below).
+    if !cfg!(target_os = "linux") {
+        return Err(format!(
+            "linux_landlock backend is unsupported on this platform \
+             ({target}); only Linux is wired up in this build. Use \
+             `seatbelt` on macOS, or see \
+             crates/zoder-cli/src/exec_safety.rs module doc for the full \
+             backend matrix.",
+            target = std::env::consts::OS,
+        ));
+    }
+
+    // The argv is the legacy `sh -c <cmd>` shape — we do NOT wrap the
+    // program (Landlock is in-kernel; there is no wrapper binary to
+    // invoke). The ruleset descriptor travels alongside as
+    // `in_process_ruleset` so the call site can apply it via
+    // `Command::pre_exec`. The descriptor itself is built by the pure
+    // `landlock_ruleset` generator below so the ruleset CONTENT is
+    // testable on every host (including this Linux CI box).
+    let ruleset = landlock_ruleset(cwd, opts);
+    Ok(SandboxSpawnPlan {
+        argv: vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(cmd),
+        ],
+        sandboxed: true,
+        cwd: cwd.to_path_buf(),
+        in_process_ruleset: Some(ruleset),
+    })
+}
+
+/// Build the Landlock filesystem ruleset for the `LinuxLandlock` backend
+/// as a `Vec<LandlockRuleDescriptor>` — pure data, no I/O beyond
+/// `Path::canonicalize` (mirrors the bubblewrap/seatbelt generators).
+/// The function is deliberately cfg-INDEPENDENT (it does not touch the
+/// `landlock` crate) so the ruleset CONTENT is testable on every host,
+/// including this Linux CI box.
+///
+/// The ruleset's deny-by-default contract is enforced by the
+/// `landlock::Ruleset::default()` builder in
+/// [`apply_landlock_ruleset_in_child`]: Landlock is deny-by-default
+/// (every operation not explicitly allowed is denied), so this function
+/// only describes the allow-list. A missing rule means "deny" for that
+/// path.
+///
+/// Allow-list (matches the bubblewrap backend 1:1 so the operator-visible
+/// "least-privilege" contract is the same on every Linux host):
+///   * `/usr`, `/bin`, `/lib` — read+execute (the dynamic linker and
+///     system binaries live here; without `execute` `sh` itself can't
+///     `execve`).
+///   * `/etc` — read-only (DNS resolvers, timezone, locale data).
+///   * working directory — read+write (the WHOLE point of a sandboxed
+///     build is to confine writes to cwd).
+///   * `/tmp` (and `/var/tmp` as a symlink-fallback) — read+write
+///     (gated on `opts.allow_tmp`; `cargo`, `pytest`, `node` all
+///     write intermediates there).
+///   * `/home` — read-only (gated on `opts.allow_home_read`; flips on
+///     for builds that read `~/.cargo/config.toml`, `~/.gitconfig`,
+///     etc. without writing to `$HOME`).
+pub(crate) fn landlock_ruleset(
+    cwd: &std::path::Path,
+    opts: &LinuxLandlockProfileOptions,
+) -> Vec<LandlockRuleDescriptor> {
+    // Canonical POSIX form of the cwd. Landlock's `path_beneath` opens
+    // the path with `O_PATH` and the descriptor is bound to the
+    // resolved inode; a relative source would be resolved against the
+    // parent process's cwd and the child would see a different tree.
+    // We always want the canonical absolute form, so we canonicalize
+    // at ruleset-generation time and fall back to the literal input
+    // string when canonicalization fails (the path may not exist yet,
+    // e.g. a freshly-created `--check` target dir).
+    let cwd_str = cwd
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+
+    // We build the ruleset imperatively with `push` rather than a
+    // single `vec![…]` macro because several entries are conditional
+    // (`opts.allow_tmp`, `opts.allow_home_read`) and a `vec![…]` macro
+    // with inline `if` arms is harder to audit than the linear block
+    // below. The `#[allow(clippy::vec_init_then_push)]` documents the
+    // choice (mirrors the bubblewrap generator's choice).
+    #[allow(clippy::vec_init_then_push)]
+    let mut rules: Vec<LandlockRuleDescriptor> = Vec::new();
+
+    // Read+execute for system paths. Landlock's `execute` flag is
+    // required for the kernel to `execve` any binary (or shared
+    // library loaded by the dynamic linker) under the path; without
+    // it the process fails to start even when read access is allowed.
+    // `/usr` covers the toolchain, `/bin` is the hardlink-farm of
+    // essential utilities, and `/lib` (and `/lib64` via symlink) is
+    // where the dynamic linker lives. We pin these three as
+    // `ReadExecute` so a `--check` that needs to spawn `cargo` or `sh`
+    // inside the ruleset can actually do so.
+    for sys_path in &["/usr", "/bin", "/lib"] {
+        rules.push(LandlockRuleDescriptor {
+            path: PathBuf::from(sys_path),
+            access: LandlockAccess::ReadExecute,
+        });
+    }
+    // Read-only for `/etc`. DNS resolvers (`/etc/resolv.conf`),
+    // timezone (`/etc/localtime`), locale data (`/etc/locale.conf`),
+    // and TLS root certs (`/etc/ssl/certs`) all live here. A
+    // `--check` that needs to resolve hostnames or load a CA bundle
+    // reads this directory; without the rule every DNS lookup fails
+    // with a confusing "no such host" rather than a clear "sandbox
+    // blocked it". Read-only is intentional — a write to
+    // `/etc/resolv.conf` from a `--check` is a smell the operator
+    // should see.
+    rules.push(LandlockRuleDescriptor {
+        path: PathBuf::from("/etc"),
+        access: LandlockAccess::Read,
+    });
+
+    // Read+write for the working directory. This is the WHOLE point
+    // of running a build inside a sandbox: `cargo test` writes
+    // `target/`, `pytest` writes `.pytest_cache/`, etc. — all of
+    // which must land under cwd and be visible to the operator's
+    // host filesystem afterwards. The string is the canonicalized
+    // cwd so the rule attaches to the actual host tree.
+    rules.push(LandlockRuleDescriptor {
+        path: PathBuf::from(cwd_str),
+        access: LandlockAccess::ReadWrite,
+    });
+
+    // Optional tmp rules. Most `--check` commands (`cargo`, `pytest`,
+    // `node`) need scratch space; default is to allow tmp. Operators
+    // on hardened hosts flip `allow_tmp = false` and the ruleset
+    // then omits the tmp rules — any tool that needs scratch space
+    // will fail loudly. We pin BOTH `/tmp` and `/var/tmp` (the latter
+    // is a symlink-farm on most modern distros) so a tool that picks
+    // one or the other transparently sees the right path.
+    if opts.allow_tmp {
+        rules.push(LandlockRuleDescriptor {
+            path: PathBuf::from("/tmp"),
+            access: LandlockAccess::ReadWrite,
+        });
+        rules.push(LandlockRuleDescriptor {
+            path: PathBuf::from("/var/tmp"),
+            access: LandlockAccess::ReadWrite,
+        });
+    }
+
+    // Optional home-read rule. Grants READ-ONLY access to `/home`
+    // so `~/.cargo/config.toml`, `~/.gitconfig`, `~/.npmrc`, etc.
+    // are visible to the wrapped command. Writes to `/home` remain
+    // denied because the rule is `Read` — a `--check` that needs to
+    // write to `$HOME` is a smell the operator should notice.
+    if opts.allow_home_read {
+        rules.push(LandlockRuleDescriptor {
+            path: PathBuf::from("/home"),
+            access: LandlockAccess::Read,
+        });
+    }
+
+    rules
+}
+
+/// Apply a `LandlockRuleDescriptor` ruleset to the **current thread**
+/// via the `landlock` crate, exactly as a `pre_exec` callback would.
+///
+/// This is the only function in this module that touches the
+/// `landlock` crate. It is `cfg(target_os = "linux")`-gated because
+/// the `landlock` crate only builds on Linux — on every other host
+/// the dispatch in [`linux_landlock_plan`] returns `Err` before we
+/// ever reach this helper.
+///
+/// The function returns `Ok(())` only on a fully-enforced Landlock
+/// ruleset. Unsupported kernels, disabled Landlock, downgraded
+/// compatibility, or a failure to build/apply the ruleset all return
+/// `Err(String)` so selecting this backend can never silently run the
+/// command unsandboxed.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_landlock_ruleset_in_child(
+    rules: &[LandlockRuleDescriptor],
+) -> Result<(), String> {
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus,
+    };
+    // Translate the cfg-independent descriptor list into the
+    // `landlock::AccessFs` bitflags the crate consumes. We pin the
+    // ABI to `V1` (the minimum that runs on Linux 5.13+) so the
+    // bitflag set we OR together is the smallest portable one.
+    // Compatibility is set to `HardRequirement` below: if the running
+    // kernel cannot enforce these rights, backend selection fails
+    // closed instead of silently downgrading to an unsandboxed spawn.
+    let abi = landlock::ABI::V1;
+
+    // Build the ruleset handle, declaring we want to control every
+    // filesystem access right V1 knows about. `handle_access` is the
+    // builder method that names which rights the ruleset covers —
+    // any right NOT listed here is left to the kernel's default
+    // (which is "allow" for the root user; the ruleset never
+    // *tightens* beyond what it explicitly handles).
+    //
+    // The Landlock crate uses the builder pattern with three stages:
+    //   1. `Ruleset::default() → handle_access(...)` configures which
+    //      access rights the ruleset covers (a `Ruleset`).
+    //   2. `.create()` commits the configuration to a kernel
+    //      `landlock_create_ruleset()` syscall and returns a
+    //      `RulesetCreated` (a separate type) that we can append
+    //      rules to.
+    //   3. `add_rules(...).restrict_self()` adds the per-path
+    //      `PathBeneath<PathFd>` rules and finally calls
+    //      `landlock_restrict_self()` to make the ruleset active on
+    //      the calling thread.
+    //
+    // The compile error is non-obvious: `add_rules` is on
+    // `RulesetCreated`, NOT on `Ruleset`. The `create()` call is the
+    // transition point.
+    let mut ruleset_created = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| format!("landlock ruleset handle_access failed: {e}"))?
+        .create()
+        .map_err(|e| format!("landlock ruleset create failed: {e}"))?;
+
+    // Translate each descriptor into a `PathBeneath<PathFd>` rule and
+    // add it to the ruleset. We open the path with `O_PATH` (no
+    // actual read; Landlock just needs an inode reference). We use
+    // the `path_beneath_rules` helper which silently ignores paths
+    // that can't be opened; on real systems every descriptor here is
+    // a path that exists (cwd is canonicalized, system paths are
+    // /usr /bin /lib /etc /tmp /var/tmp /home), so a failure to
+    // open is a clear "host is broken" condition we surface
+    // verbatim.
+    for rule in rules {
+        let access = match rule.access {
+            LandlockAccess::Read => AccessFs::from_read(abi),
+            LandlockAccess::ReadWrite => AccessFs::from_all(abi),
+            LandlockAccess::ReadExecute => {
+                // `from_read` covers `read_file` + `read_dir`; we
+                // additionally OR in the `execute` flag (added in
+                // ABI v1) so the path can be `execve`'d.
+                let mut flags = AccessFs::from_read(abi);
+                flags |= AccessFs::Execute;
+                flags
+            }
+        };
+        // The crate's `add_rules` consumes an iterator; we build a
+        // single-element iterator per descriptor so the ruleset
+        // grows one rule at a time. The `path_beneath_rules` helper
+        // is the documented entry point for "create a rule from a
+        // path"; the `AccessFs` type is the bitflags set.
+        let rules_iter = landlock::path_beneath_rules([rule.path.as_path()], access);
+        ruleset_created = ruleset_created.add_rules(rules_iter).map_err(|e| {
+            format!(
+                "landlock ruleset add_rules failed for path {}: {e}",
+                rule.path.display()
+            )
+        })?;
+    }
+
+    // Restrict the calling thread. The Landlock LSM's
+    // `landlock_restrict_self` syscall restricts ONLY the calling
+    // thread (per-task struct, inherited across fork and exec), so
+    // this MUST be called from a `pre_exec` callback — the parent
+    // process (zoder itself) stays unrestricted. On success we
+    // inspect `RestrictionStatus` to verify the enforcement level.
+    // `FullyEnforced` is the only acceptable outcome. A partial or
+    // missing ruleset is a hard error because the operator explicitly
+    // selected this backend; running the child anyway would be a
+    // silent unsandboxed fallback.
+    let status = ruleset_created
+        .restrict_self()
+        .map_err(|e| format!("landlock restrict_self failed: {e}"))?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => Ok(()),
+        RulesetStatus::PartiallyEnforced => Err(format!(
+            "landlock ruleset was only partially enforced by the kernel ({status:?}); \
+             refusing to run the command without a fully enforced sandbox"
+        )),
+        RulesetStatus::NotEnforced => Err(format!(
+            "landlock ruleset was not enforced by the kernel ({status:?}); \
+             the sandbox is a no-op. This usually means the running kernel \
+             is too old to support Landlock (need Linux 5.13+) or the \
+             kernel was booted with `landlock_restrict_self=0`."
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -2029,6 +2437,7 @@ mod tests {
             backend: ExecSandbox::LinuxBubblewrap,
             seatbelt: SeatbeltProfileOptions::default(),
             linux_bubblewrap: LinuxBubblewrapProfileOptions::default(),
+            linux_landlock: LinuxLandlockProfileOptions::default(),
         };
         let plan =
             wrap_spawn_command(cwd, "cargo test --workspace", &policy).expect("Linux dispatch");
@@ -2392,6 +2801,364 @@ mod tests {
             "argv must contain exactly one `--chdir <canonical_cwd>`; \
              canonical_cwd={cwd_canonical:?}; got: {:?}",
             argv_strings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Linux Landlock backend.
+    //
+    // Mirrors the seatbelt + bubblewrap test blocks above. The Landlock
+    // backend's "profile" is a `Vec<LandlockRuleDescriptor>` (a pure-data
+    // ruleset description) rather than an SBPL `String` or a
+    // `Vec<OsString>`. The pure generator is testable on every host
+    // (including this Linux CI box); the actual `landlock::Ruleset`
+    // application is `cfg(target_os = "linux")`-gated and lives in
+    // `apply_landlock_ruleset_in_child` (NOT exercised by these tests —
+    // that helper requires a real Linux 5.13+ kernel to run the
+    // `landlock_restrict_self` syscall).
+    //
+    // The contract under test is:
+    //   1. default (None) backend leaves the command unchanged
+    //      — same regression guard as the seatbelt/bubblewrap blocks
+    //      above;
+    //   2. `landlock_ruleset` is a PURE function of `(cwd, opts)` — the
+    //      ruleset is deny-by-default, allows read+execute of system
+    //      paths, allows read+write of the working dir and /tmp, and
+    //      optionally allows read-only /home;
+    //   3. the `LinuxLandlock` dispatch returns the legacy `sh -c <cmd>`
+    //      argv (no wrap) on Linux, and a clear "unsupported on this
+    //      platform" error on every other OS — the cross-platform
+    //      contract the seatbelt/bubblewrap tests also pin.
+    // -----------------------------------------------------------------------
+
+    /// `landlock_ruleset` is a PURE function of `(cwd, opts)` — it never
+    /// touches the filesystem beyond `Path::canonicalize`, which
+    /// gracefully falls back to the literal input string when
+    /// canonicalization fails. That purity means we can — and should —
+    /// test the Landlock ruleset contract on macOS CI too, not only on
+    /// Linux hosts. This is the platform-independent regression guard:
+    /// if someone removes the deny-by-default / read+execute / workdir-
+    /// bind clauses, this test fails on every host (macOS, Linux, CI),
+    /// not only on the developer's Linux box.
+    #[test]
+    fn landlock_ruleset_default_options_allow_system_paths_and_workdir() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        // The ruleset generator canonicalizes the cwd internally
+        // (Landlock's `path_beneath` opens the path with `O_PATH` and
+        // binds the rule to the resolved inode; a relative source would
+        // be resolved against the parent shell's cwd and silently bind
+        // the wrong tree). Mirror that here so the test asserts on the
+        // SAME string the ruleset embeds, not the raw tempdir path.
+        let cwd_str = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let ruleset = landlock_ruleset(cwd, &zoder_core::LinuxLandlockProfileOptions::default());
+        // Well-formed: every rule has a non-empty path and a recognized
+        // access tag. The test below asserts on each individual clause;
+        // here we just pin the overall shape so a future "oops, emitted
+        // 0 rules" regression is caught even before the per-clause
+        // checks fire.
+        assert!(
+            !ruleset.is_empty(),
+            "default landlock ruleset must contain at least the system-path + \
+             workdir + tmp clauses; got empty ruleset"
+        );
+        for rule in &ruleset {
+            assert!(
+                !rule.path.as_os_str().is_empty(),
+                "every rule must have a non-empty path; got: {rule:?}"
+            );
+        }
+        // Deny-by-default is enforced by the `landlock::Ruleset`
+        // builder, not by a rule in the descriptor list. We pin that
+        // there is NO `ReadWrite` rule for an obviously-sensitive path
+        // like `/etc` or `/usr` — those MUST be read-only or
+        // read-execute, never read-write. (A read-write `/etc` would
+        // silently downgrade the sandbox to a no-op for the canonical
+        // sensitive-roots use case.)
+        for rule in &ruleset {
+            if rule.path == Path::new("/etc") {
+                assert_ne!(
+                    rule.access,
+                    LandlockAccess::ReadWrite,
+                    "/etc must NEVER be a read-write rule; got: {rule:?}"
+                );
+            }
+        }
+        // System paths MUST be read+execute. Without `execute` the
+        // kernel can't `execve` `sh` itself and the `--check` fails
+        // before the user's command runs.
+        for sys_path in ["/usr", "/bin", "/lib"] {
+            let rule = ruleset
+                .iter()
+                .find(|r| r.path == Path::new(sys_path))
+                .unwrap_or_else(|| {
+                    panic!("ruleset must contain a rule for {sys_path}; got: {ruleset:?}")
+                });
+            assert_eq!(
+                rule.access,
+                LandlockAccess::ReadExecute,
+                "system path {sys_path} must be read+execute; got: {rule:?}"
+            );
+        }
+        // Working dir MUST be read+write. This is the WHOLE point of
+        // running a build inside a sandbox: `cargo test` writes
+        // `target/`, `pytest` writes `.pytest_cache/`, etc.
+        let cwd_rule = ruleset
+            .iter()
+            .find(|r| r.path == Path::new(&cwd_str))
+            .unwrap_or_else(|| {
+                panic!(
+                    "ruleset must contain a rule for the canonical cwd ({cwd_str}); \
+                     got: {ruleset:?}"
+                )
+            });
+        assert_eq!(
+            cwd_rule.access,
+            LandlockAccess::ReadWrite,
+            "workdir must be read+write; got: {cwd_rule:?}"
+        );
+        // Default tmp rules MUST be present. Without them, almost every
+        // `--check` (cargo, pytest, node) fails with a confusing "no
+        // such file or directory" the operator can't triage. Operators
+        // who want tmp fully denied flip `allow_tmp = false` (covered
+        // by the dedicated test below).
+        assert!(
+            ruleset
+                .iter()
+                .any(|r| r.path == Path::new("/tmp") && r.access == LandlockAccess::ReadWrite),
+            "default ruleset must include a read+write rule for /tmp; got: {ruleset:?}"
+        );
+        assert!(
+            ruleset
+                .iter()
+                .any(|r| r.path == Path::new("/var/tmp") && r.access == LandlockAccess::ReadWrite),
+            "default ruleset must include a read+write rule for /var/tmp (symlink \
+             fallback to /tmp on most distros); got: {ruleset:?}"
+        );
+        // Default home-read: NOT present. A default-options ruleset
+        // must NOT grant read access to `/home` (the `allow_home_read`
+        // test below pins the `true`-side). Pinning both sides keeps
+        // the operator-visible "no implicit home-read" contract
+        // regression-safe.
+        assert!(
+            !ruleset.iter().any(|r| r.path == Path::new("/home")),
+            "default ruleset must NOT contain a /home rule; got: {ruleset:?}"
+        );
+    }
+
+    /// Optional knob honored: `allow_tmp = false` MUST drop both `/tmp`
+    /// and `/var/tmp` rules. (The default test above pins the
+    /// `true`-side; this test pins the `false`-side.)
+    #[test]
+    fn landlock_ruleset_allow_tmp_false_omits_tmp_rules() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let opts = zoder_core::LinuxLandlockProfileOptions {
+            allow_tmp: false,
+            ..Default::default()
+        };
+        let ruleset = landlock_ruleset(cwd, &opts);
+        assert!(
+            !ruleset.iter().any(|r| r.path == Path::new("/tmp")),
+            "allow_tmp=false must omit the /tmp rule; got: {ruleset:?}"
+        );
+        assert!(
+            !ruleset.iter().any(|r| r.path == Path::new("/var/tmp")),
+            "allow_tmp=false must omit the /var/tmp rule; got: {ruleset:?}"
+        );
+    }
+
+    /// Optional knob honored: `allow_home_read = true` MUST add a
+    /// read-only `/home` rule. Writes to `/home` remain denied because
+    /// the rule is `Read`, not `ReadWrite` — a `--check` that needs to
+    /// write to `$HOME` is a smell the operator should notice. Pin that
+    /// it doesn't appear with `ReadWrite` access.
+    #[test]
+    fn landlock_ruleset_allow_home_read_true_emits_read_only_home_rule() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let opts = zoder_core::LinuxLandlockProfileOptions {
+            allow_home_read: true,
+            ..Default::default()
+        };
+        let ruleset = landlock_ruleset(cwd, &opts);
+        let home_rule = ruleset
+            .iter()
+            .find(|r| r.path == Path::new("/home"))
+            .unwrap_or_else(|| {
+                panic!("allow_home_read=true must emit a /home rule; got: {ruleset:?}")
+            });
+        assert_eq!(
+            home_rule.access,
+            LandlockAccess::Read,
+            "allow_home_read=true must use the read-only Read variant, not \
+             ReadWrite; got: {home_rule:?}"
+        );
+        assert_ne!(
+            home_rule.access,
+            LandlockAccess::ReadWrite,
+            "home-read must NOT be ReadWrite; a writable /home would silently \
+             downgrade the sandbox; got: {home_rule:?}"
+        );
+    }
+
+    /// The ruleset is well-formed: every rule's path is absolute
+    /// (Landlock rejects relative paths at apply time, with a
+    /// `RulesetError::PathFd` that is hard to triage post-hoc). A
+    /// well-formed ruleset is a precondition for the `apply_*` helper
+    /// to succeed; this test pins the absolute-path invariant.
+    #[test]
+    fn landlock_ruleset_all_paths_are_absolute() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let ruleset = landlock_ruleset(cwd, &zoder_core::LinuxLandlockProfileOptions::default());
+        for rule in &ruleset {
+            assert!(
+                rule.path.is_absolute(),
+                "every rule path must be absolute (relative paths fail at \
+                 apply time with a confusing RulesetError); got: {}",
+                rule.path.display()
+            );
+        }
+    }
+
+    /// `ExecSandbox::LinuxLandlock` selected on a NON-Linux host (the
+    /// case for any macOS operator who copies an example config) MUST
+    /// surface a clear "unsupported on this platform" error rather than
+    /// attempting to invoke the Landlock LSM (which would fail with a
+    /// confusing "operation not supported" on macOS). This is the
+    /// cross-platform contract the brief explicitly asks us to pin —
+    /// the mirror image of the seatbelt off-macOS and bubblewrap
+    /// off-Linux tests.
+    #[test]
+    fn wrap_spawn_command_linux_landlock_off_linux_yields_unsupported_error() {
+        use std::path::Path;
+        let policy = ExecSafetyConfig {
+            backend: ExecSandbox::LinuxLandlock,
+            ..Default::default()
+        };
+        let result = wrap_spawn_command(Path::new("/tmp"), "echo hi", &policy);
+        if cfg!(target_os = "linux") {
+            // Linux host: dispatch succeeds and the plan carries the
+            // legacy argv + an in-process ruleset. We don't go further
+            // here — the dedicated Linux test below pins the wrapped
+            // shape.
+            let plan = result.expect("linux_landlock on Linux must succeed");
+            assert!(
+                plan.sandboxed,
+                "sandboxed flag must be set on Linux dispatch"
+            );
+            assert!(
+                plan.in_process_ruleset.is_some(),
+                "Linux dispatch must carry an in_process_ruleset; got: {plan:?}"
+            );
+            assert_eq!(
+                plan.argv[0].to_string_lossy(),
+                "sh",
+                "LinuxLandlock must NOT wrap the program — argv is the legacy \
+                 sh -c <cmd> shape; got: {plan:?}"
+            );
+        } else {
+            // Non-Linux host: dispatch MUST surface a clear
+            // unsupported-platform error. The test runs on every host
+            // so the contract is regression-safe on Linux too.
+            let err = result.expect_err(
+                "LinuxLandlock on a non-Linux host must be a hard error, \
+                 not a silent fallback to None or a confusing spawn failure",
+            );
+            assert!(
+                err.contains("linux_landlock backend is unsupported on this platform"),
+                "error must call out the unsupported-platform condition; got: {err}"
+            );
+            assert!(
+                err.contains(std::env::consts::OS),
+                "error must name the current OS so the operator can triage; got: {err}"
+            );
+        }
+    }
+
+    /// Linux-only assertion of the dispatch shape: when `LinuxLandlock`
+    /// is selected on a Linux host, the plan's argv is the LEGACY
+    /// `[sh, -c, cmd]` shape (NOT wrapped in an external binary) and
+    /// the plan carries a non-empty `in_process_ruleset`. Gated on
+    /// `target_os = "linux"` because the dispatch itself is gated —
+    /// see the platform branch in `linux_landlock_plan`. The dedicated
+    /// `landlock_ruleset_*` tests above pin the ruleset CONTENT
+    /// platform-independently; this test pins that the dispatch
+    /// actually wires the ruleset through to the `SandboxSpawnPlan`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrap_spawn_command_linux_landlock_on_linux_produces_legacy_argv_with_ruleset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let cwd_canonical = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let policy = ExecSafetyConfig {
+            backend: ExecSandbox::LinuxLandlock,
+            linux_landlock: zoder_core::LinuxLandlockProfileOptions::default(),
+            ..Default::default()
+        };
+        let plan =
+            wrap_spawn_command(cwd, "cargo test --workspace", &policy).expect("Linux dispatch");
+        assert!(
+            plan.sandboxed,
+            "LinuxLandlock plan must report sandboxed=true"
+        );
+        // The argv MUST be the legacy `[sh, -c, cmd]` shape — Landlock
+        // is in-kernel, there is no external wrapper binary. A
+        // dispatch that returned `["/usr/bin/landlock", ...]` would
+        // silently break the contract (no such binary exists on Linux
+        // either; Landlock is a kernel syscall, not a CLI).
+        assert_eq!(
+            plan.argv.len(),
+            3,
+            "LinuxLandlock argv must be exactly [sh, -c, cmd] (3 args); got: {:?}",
+            plan.argv
+        );
+        assert_eq!(plan.argv[0].to_string_lossy(), "sh");
+        assert_eq!(plan.argv[1].to_string_lossy(), "-c");
+        assert_eq!(
+            plan.argv[2].to_string_lossy(),
+            "cargo test --workspace",
+            "LinuxLandlock must pass the operator's literal cmd string through to sh -c"
+        );
+        // The plan MUST carry the in-process ruleset. Without it the
+        // call site has nothing to apply in `pre_exec` and the
+        // sandbox silently degenerates to a no-op.
+        let ruleset = plan
+            .in_process_ruleset
+            .as_ref()
+            .expect("Linux dispatch must carry an in_process_ruleset");
+        assert!(
+            !ruleset.is_empty(),
+            "in_process_ruleset must be non-empty; got: {ruleset:?}"
+        );
+        // The workdir rule MUST be present and use the canonical cwd,
+        // so the child sees a rule that matches the path it actually
+        // lives in.
+        let cwd_rule = ruleset
+            .iter()
+            .find(|r| r.path == std::path::Path::new(&cwd_canonical))
+            .unwrap_or_else(|| {
+                panic!(
+                    "ruleset must contain a rule for the canonical cwd ({cwd_canonical}); \
+                     got: {ruleset:?}"
+                )
+            });
+        assert_eq!(
+            cwd_rule.access,
+            LandlockAccess::ReadWrite,
+            "workdir rule must be read+write; got: {cwd_rule:?}"
         );
     }
 }

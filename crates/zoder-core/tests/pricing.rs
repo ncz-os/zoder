@@ -19,6 +19,16 @@ fn load_drops_invalid_models_keeps_valid() {
       }
     }"#;
     std::fs::write(&path, json).unwrap();
+    // The catalog loader rejects group/world-writable files
+    // (`PricingCatalog::load` checks `S_IWGRP | S_IWOTH`). The default
+    // umask on many CI hosts is 022 (file mode 0644, safe), but a host
+    // with umask 002 (e.g. some Debian/Ubuntu dev defaults) creates
+    // files with mode 0664 (group-writable) and the loader refuses to
+    // trust them. Pin the mode explicitly so the test isn't dependent
+    // on the host umask — we want to exercise the loader's content
+    // handling here, not its permission-check path (covered by the
+    // dedicated `load_rejects_world_writable_file` test below).
+    set_secure_permissions(&path);
 
     let cat = PricingCatalog::load(&path);
     assert!(cat.models.contains_key("good"));
@@ -27,6 +37,17 @@ fn load_drops_invalid_models_keeps_valid() {
     assert!(!cat.models.contains_key("neg")); // negative field dropped -> no rate -> skipped
     assert!(!cat.models.contains_key("notobj"));
     assert!((cat.baseline_usd_per_mtok - 1.5).abs() < 1e-9);
+}
+
+/// Pin a file to mode 0644 (owner read/write, others read) so the
+/// pricing-catalog loader's group/world-writable rejection doesn't fire
+/// on hosts whose default umask creates mode 0664 files. Unix-only.
+#[cfg(unix)]
+fn set_secure_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(path, perms).unwrap();
 }
 
 /// A group/world-writable catalog can't be trusted to drive chargeback and is
@@ -56,6 +77,7 @@ fn load_rejects_oversized_file() {
     let path = dir.path().join("pricing.json");
     let big = format!("{{\"models\":{{}},\"_pad\":\"{}\"}}", "a".repeat(3_000_000));
     std::fs::write(&path, big).unwrap();
+    set_secure_permissions(&path);
     let cat = PricingCatalog::load(&path);
     assert!(cat.models.is_empty());
 }
