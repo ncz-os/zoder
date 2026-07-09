@@ -3160,7 +3160,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // Sessions: prepend prior transcript so follow-ups carry context.
     let sessions_dir = eng.cfg.sessions_dir();
-    let mut session: Option<Session> = if let Some(id) = &cli.session {
+    let session: Option<Session> = if let Some(id) = &cli.session {
         Some(Session::load_or_new(&sessions_dir, id)?)
     } else if cli.continue_ {
         Some(Session::latest(&sessions_dir)?.unwrap_or_else(|| Session::new("default")))
@@ -3409,11 +3409,23 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     health.record_success(&used_model, used_latency_ms);
     save_health(&health);
 
-    // Persist the turn to the session transcript.
-    if let Some(s) = session.as_mut() {
-        s.push("user", &prompt);
-        s.push("assistant", &res.content);
-        if let Err(e) = s.save(&sessions_dir) {
+    // Persist the turn to the session transcript. Use `mutate_locked`
+    // (DEFECT 1 fix) so the load -> append -> save critical section
+    // holds a per-session `flock(2)` for its full duration: two
+    // concurrent `zoder exec --session <shared-id>` processes that
+    // both reach this point will serialize, and each one will reload
+    // the freshest on-disk state (including the OTHER process's just-
+    // committed turn) before appending its own. The bare `s.save()`
+    // path is kept for compatibility, but is not safe under concurrent
+    // writers — prefer `mutate_locked` whenever a turn may race.
+    if let Some(s) = session.as_ref() {
+        let id = s.id.clone();
+        let prompt = prompt.clone();
+        let content = res.content.clone();
+        if let Err(e) = Session::mutate_locked(&sessions_dir, &id, |sess| {
+            sess.push("user", &prompt);
+            sess.push("assistant", &content);
+        }) {
             eprintln!("zoder: warning: failed to save session: {e}");
         }
     }
@@ -4277,6 +4289,7 @@ mod cli_switch_regression_tests {
     /// Pin the happy path: `--continue` with an existing latest session
     /// returns that session's id (NOT a freshly-minted empty one).
     #[test]
+    #[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
     fn continue_resolves_to_latest_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
@@ -4338,6 +4351,7 @@ mod cli_switch_regression_tests {
     /// An explicit --session id always wins over --continue (continuation
     /// is an implicit selection; explicit is unambiguous).
     #[test]
+    #[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
     fn explicit_session_id_wins_over_continue() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");

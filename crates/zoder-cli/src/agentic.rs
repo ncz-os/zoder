@@ -5722,6 +5722,7 @@ mod cli_switch_transfer_and_background_tests {
     /// that session's id. The historical bug: it minted a fresh, empty
     /// session id that the user then "resumed", losing all real context.
     #[test]
+    #[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
     fn transfer_resume_target_returns_existing_session_id() {
         let sessions = tmp_sessions_dir("transfer-exists");
         let mut prior = Session::new("established-via-cli");
