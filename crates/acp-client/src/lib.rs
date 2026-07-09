@@ -1339,11 +1339,9 @@ async fn drive<F: FnMut(AgentEvent)>(
                     on_event(AgentEvent::Text(t.to_string()));
                 }
             }
-            "agent_thought_chunk" => {
-                if opts.show_reasoning {
-                    if let Some(t) = params.get("text").and_then(Value::as_str) {
-                        on_event(AgentEvent::Thought(t.to_string()));
-                    }
+            "agent_thought_chunk" if opts.show_reasoning => {
+                if let Some(t) = params.get("text").and_then(Value::as_str) {
+                    on_event(AgentEvent::Thought(t.to_string()));
                 }
             }
             "tool_call" => {
@@ -3190,11 +3188,9 @@ where
                     on_event(AgentEvent::Text(t));
                 }
             }
-            "agent_thought_chunk" => {
-                if opts.show_reasoning {
-                    if let Some(t) = extract_text_content(update.get("content")) {
-                        on_event(AgentEvent::Thought(t));
-                    }
+            "agent_thought_chunk" if opts.show_reasoning => {
+                if let Some(t) = extract_text_content(update.get("content")) {
+                    on_event(AgentEvent::Thought(t));
                 }
             }
             "agent_message" => {
@@ -3225,29 +3221,28 @@ where
                     on_event(AgentEvent::Text(t));
                 }
             }
-            "tool_call" | "tool_call_update" => {
+            "tool_call" | "tool_call_update" if kind == "tool_call" => {
                 // Spec: `toolCallId`, `title`, `kind`, `status`, `content`.
                 // The "call" arrives once (status pending) and updates
                 // arrive as `tool_call_update` with the same id. We count
-                // AND emit the ToolCall event ONLY for the initial call,
-                // never for progress updates: emitting on every status
-                // transition (pending -> in_progress -> completed) makes
-                // the CLI display "[tool] shell" once per transition, i.e.
-                // three "tool called" lines for one logical call. The
+                // AND emit the ToolCall event ONLY for the initial call
+                // (the `if kind == "tool_call"` match guard), never for
+                // progress updates: emitting on every status transition
+                // (pending -> in_progress -> completed) makes the CLI
+                // display "[tool] shell" once per transition, i.e. three
+                // "tool called" lines for one logical call. The
                 // `tool_calls` counter and the ToolCall event stream must
                 // agree on "one logical call == one event" — otherwise the
                 // counter says 1 but the CLI shows 3 invocations.
-                if kind == "tool_call" {
-                    tool_calls += 1;
-                    let name = update
-                        .get("title")
-                        .or_else(|| update.get("name"))
-                        .or_else(|| update.get("toolName"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_string();
-                    on_event(AgentEvent::ToolCall { name });
-                }
+                tool_calls += 1;
+                let name = update
+                    .get("title")
+                    .or_else(|| update.get("name"))
+                    .or_else(|| update.get("toolName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                on_event(AgentEvent::ToolCall { name });
             }
             "tool_result_update" | "tool_result" => {
                 let name = update

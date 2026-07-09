@@ -587,9 +587,10 @@ async fn complete_once(
                     // races the daemon/CLI, so a bare load -> record -> save
                     // would drop a concurrently-recorded failure (lost
                     // update). `mutate_locked` reloads the freshest on-disk
-                    // store under the flock, applies this delta, and writes
-                    // atomically before releasing -- so every panel model's
-                    // failure survives.
+                    // store under an advisory lockfile (create_new on
+                    // `<stem>.lock`, not a File::lock/flock), applies this
+                    // delta, and writes atomically before releasing -- so
+                    // every panel model's failure survives.
                     let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
                         h.record_classified_failure(model, &message, &provider_id, cls);
                     });

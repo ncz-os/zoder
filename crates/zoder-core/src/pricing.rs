@@ -745,6 +745,20 @@ mod tests {
         );
         cat.save(&path).unwrap();
 
+        // Test-only: the load security gate rejects any group- or
+        // world-writable catalog. Under a lax ambient umask (e.g. 0002,
+        // as on many CI runners) `save()`'s fs::write produces a 0664
+        // file, which would trip the gate and make `load` return the
+        // empty-catalog fallback -- a false failure of THIS test, which
+        // is about temp-file hygiene, not the perms gate. Normalize the
+        // catalog to 0600 so the reload below exercises the intended path
+        // regardless of the caller's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
         // The catalog is present and reloads with its content intact (NOT the
         // empty-catalog fallback a torn temp would produce).
         assert!(path.exists());
