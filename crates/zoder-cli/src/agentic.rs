@@ -2591,6 +2591,16 @@ async fn run_check_watched(
         // forks). Tokio translates `process_group(0)` to setpgid(pid, 0) on
         // Unix, giving us a clean per-child group without an extra fork.
         .process_group(0)
+        // SB2: reap the direct shell on the timeout/IO-error branch. The
+        // `join` future below moves `child` into `wait_with_output()`; on
+        // the `tokio::time::timeout` Elapsed branch that future is dropped
+        // WITHOUT the Child ever being `wait()`ed, so the direct shell pid
+        // would linger as a <defunct> zombie (the out-of-band group
+        // `libc::kill(-pgid, SIGKILL)` terminates it but never reaps it) and
+        // hold a PID slot until the whole zoder process exits. `kill_on_drop`
+        // makes tokio's reaper `waitpid` the direct pid when the future is
+        // dropped, closing the zombie leak over a long run.
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -3059,6 +3069,39 @@ pub(crate) fn turn_is_dead(turn: &Option<crate::TurnResult>) -> bool {
 ///     check-timeout streak by itself is a log-and-continue signal, not an
 ///     abort signal.
 const DEAD_STREAK_ABORT_THRESHOLD: usize = 2;
+
+/// SA1 liveness helper: decide the stall bookkeeping for the anti-gaming
+/// branch (green check + non-substantive diff) so the loop early-aborts on a
+/// *stable* non-substantive diff instead of burning every `--max-iters`.
+///
+/// A `WhitespaceOnly` / `CommentOnly` diff carries real `diff --git` / `+++`
+/// headers, so `diff.trim().is_empty()` is false and the ordinary
+/// `dead_streak` / `stall_streak` accounting never bumps for it. And the
+/// anti-gaming `continue` fires BEFORE the normal no-progress stall check, so
+/// without this the loop never stops on a repeated non-substantive diff.
+///
+/// Returns `(new_stall_streak, abort)`:
+///   * `repeated` (this iter's diff == the previous iter's diff, and we are
+///     past iter 1) -> `stall_streak + 1`, abort iff it reaches `stall_limit`.
+///   * a *changed* non-substantive diff -> reset `stall_streak` to 0 (the
+///     author is still churning something new; keep grinding until it stalls).
+///
+/// This ONLY makes the loop stop sooner; the caller still `continue`s / breaks
+/// WITHOUT resolving, so the substance gate is untouched and there is no
+/// false-resolve path.
+fn nonsubstantive_stall_step(
+    repeated: bool,
+    prev_stall_streak: usize,
+    stall_limit: usize,
+) -> (usize, bool) {
+    if repeated {
+        let next = prev_stall_streak + 1;
+        (next, next >= stall_limit)
+    } else {
+        (0, false)
+    }
+}
+
 fn update_loop_streaks(
     turn_failed: bool,
     check_timed_out: bool,
@@ -3613,7 +3656,31 @@ nits).\n",
  not substantive work (anti-gaming guard)"
                 );
             }
+            // SA1 liveness: a *stable* non-substantive diff (WhitespaceOnly /
+            // CommentOnly repeated verbatim each iteration) has real
+            // `diff --git`/`+++` headers, so `diff.trim().is_empty()` is false
+            // and neither `dead_streak` nor `stall_streak` bumps below. Because
+            // this anti-gaming `continue` fires BEFORE the stall check further
+            // down, the loop would otherwise never early-abort and burn all
+            // `--max-iters` re-authoring the same noise. Fold the stall
+            // accounting in here so a repeated non-substantive diff trips the
+            // same STALL_LIMIT abort. This does NOT relax the substance gate —
+            // we only stop *sooner*; the iteration still correctly refuses to
+            // resolve, so there is no false-resolve path.
+            let repeated = i > 1 && diff == prev_diff;
+            let (next_stall, abort) =
+                nonsubstantive_stall_step(repeated, stall_streak, STALL_LIMIT);
+            stall_streak = next_stall;
             prev_diff = diff.clone();
+            if abort {
+                if !cli.quiet {
+                    eprintln!(
+                        "[loop] iter {i}: no new progress for {stall_streak} \
+consecutive non-substantive iteration(s); stopping."
+                    );
+                }
+                break;
+            }
             continue;
         }
 
@@ -4246,6 +4313,84 @@ mod tests {
         );
     }
 
+    /// SB2 REGRESSION (Unix only): on the watchdog-timeout branch the raced
+    /// `wait_with_output()` future is DROPPED without the direct shell ever
+    /// being `wait()`ed. The out-of-band `kill(-pgid, SIGKILL)` terminates the
+    /// group but does not reap the direct pid, so pre-fix it lingered as a
+    /// `<defunct>` zombie holding a PID slot until the whole process exited.
+    /// The fix is `.kill_on_drop(true)` on the check Command, which makes
+    /// tokio's reaper `waitpid` the direct pid on drop. This test reproduces
+    /// the production timeout branch shape verbatim and asserts the direct
+    /// child pid is reaped (a manual `waitpid(pid, WNOHANG)` returns ECHILD —
+    /// "no such child" — rather than the pid, which would mean a zombie was
+    /// still awaiting reap).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_timeout_reaps_direct_child_no_zombie() {
+        use std::process::Stdio;
+        // Mirror the production builder: own process group + kill_on_drop.
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn sh -c sleep");
+        let pid = child.id().expect("child pid") as i32;
+        let pgid = pid; // process_group(0) => pgid == pid
+
+        // Race exactly as production does: the future consumes `child` via
+        // wait_with_output(); on timeout it is dropped (triggering
+        // kill_on_drop) and we group-kill out-of-band.
+        let join = async {
+            let out = child.wait_with_output().await?;
+            Ok::<_, std::io::Error>(out)
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), join).await;
+        assert!(
+            outcome.is_err(),
+            "the 30s child must time out under a 1s budget"
+        );
+        // Out-of-band group kill, exactly like `kill_process_group`.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+
+        // The direct pid MUST get reaped by tokio's kill_on_drop reaper. Poll
+        // a manual waitpid(WNOHANG): once reaped it returns -1/ECHILD. If the
+        // bug were back (no kill_on_drop, no wait), the pid would remain a
+        // reapable zombie and waitpid would return `pid` (or 0 while the
+        // SIGKILL is delivered). Give the async reaper a moment.
+        let mut reaped = false;
+        for _ in 0..200 {
+            let mut status: libc::c_int = 0;
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == -1 {
+                // ECHILD: tokio already reaped it — exactly what we want.
+                reaped = true;
+                break;
+            }
+            if r == pid {
+                // We just reaped a zombie ourselves: pre-fix symptom. Fail —
+                // production has no such manual reap, so it would leak.
+                panic!(
+                    "direct child {pid} was a ZOMBIE awaiting reap (SB2 bug is back); \
+kill_on_drop did not reap it"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            reaped,
+            "direct child {pid} was never reaped within budget (SB2: kill_on_drop \
+must reap the direct shell on the timeout branch)"
+        );
+    }
+
     /// Z-8 REGRESSION GUARD: when the author phase-watchdog fires, it MUST
     /// (a) issue a cancel to the daemon session, and (b) wait for the
     /// daemon to settle BEFORE returning. The pre-fix code dropped the
@@ -4764,6 +4909,55 @@ mod tests {
         assert_eq!(u.dead_streak, 0);
         assert_eq!(u.check_timeout_streak, 0);
         assert!(!u.abort);
+    }
+
+    /// SA1 REGRESSION: a *stable* non-substantive diff (e.g. WhitespaceOnly /
+    /// CommentOnly emitted verbatim every iteration) must trip the stall abort
+    /// within STALL_LIMIT instead of burning all `--max-iters`. The
+    /// anti-gaming branch calls `nonsubstantive_stall_step` to fold the stall
+    /// accounting in BEFORE its `continue`. Pre-fix, that branch bumped no
+    /// streak (the diff has real headers so `trim().is_empty()` is false), so
+    /// the loop never early-aborted. Here we drive the same helper the branch
+    /// uses and assert the abort fires exactly at the limit.
+    #[test]
+    fn nonsubstantive_stall_step_aborts_repeated_diff_within_limit() {
+        const LIMIT: usize = 3;
+        // iter 1: prev_diff is empty, so `repeated=false` -> streak resets.
+        let (s0, a0) = nonsubstantive_stall_step(false, 0, LIMIT);
+        assert_eq!(s0, 0);
+        assert!(!a0, "iter 1 must never abort");
+        // iters 2..: the identical non-substantive diff repeats -> streak climbs.
+        let (s1, a1) = nonsubstantive_stall_step(true, s0, LIMIT);
+        assert_eq!(s1, 1);
+        assert!(!a1);
+        let (s2, a2) = nonsubstantive_stall_step(true, s1, LIMIT);
+        assert_eq!(s2, 2);
+        assert!(!a2);
+        let (s3, a3) = nonsubstantive_stall_step(true, s2, LIMIT);
+        assert_eq!(s3, 3);
+        assert!(
+            a3,
+            "a stable non-substantive diff MUST abort at STALL_LIMIT ({LIMIT}), \
+not run to max_iters"
+        );
+    }
+
+    /// SA1 boundary: a *changed* non-substantive diff (author still churning
+    /// something new each round) must RESET the stall streak, so the loop
+    /// keeps grinding until the diff actually stabilizes — the abort only
+    /// targets a genuinely stuck author, never a moving one.
+    #[test]
+    fn nonsubstantive_stall_step_resets_on_changed_diff() {
+        const LIMIT: usize = 3;
+        // Build up a streak, then hit a non-repeated diff.
+        let (s1, _) = nonsubstantive_stall_step(true, 0, LIMIT);
+        assert_eq!(s1, 1);
+        let (s2, _) = nonsubstantive_stall_step(true, s1, LIMIT);
+        assert_eq!(s2, 2);
+        // Diff changed this round -> reset, no abort.
+        let (s_reset, abort) = nonsubstantive_stall_step(false, s2, LIMIT);
+        assert_eq!(s_reset, 0, "a changed diff must reset the stall streak");
+        assert!(!abort);
     }
 
     /// Engine returned Ok AND `outcome == "completed"` (turn_failed = false)
