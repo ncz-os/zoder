@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const BREAKER_THRESHOLD: u32 = 3;
 /// Cooldown before a tripped breaker allows a single half-open probe (seconds).
 const BREAKER_COOLDOWN_SECS: i64 = 300;
+/// Maximum trusted health-store JSON size. Larger stores are quarantined before
+/// reading so a corrupt/unbounded file cannot OOM the process.
+const MAX_HEALTH_STORE_BYTES: u64 = 2 * 1024 * 1024;
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
@@ -298,41 +301,54 @@ pub struct HealthStore {
 
 impl HealthStore {
     pub fn load(path: &Path) -> Self {
-        let mut store: HealthStore = match std::fs::read_to_string(path) {
-            Ok(s) => match serde_json::from_str(&s) {
-                Ok(st) => st,
-                Err(e) => {
-                    // Do not silently wipe history: warn and preserve the bad
-                    // file for inspection before starting fresh.
-                    //
-                    // Unique suffix (C7-M1 bonus): a FIXED `health.json.corrupt`
-                    // name means a second downgrade clobbers the first backup.
-                    // Stamp the backup with unix-secs + pid + a monotonic nonce
-                    // so repeated corrupt loads each keep their own copy.
-                    let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
-                    let stamp = format!(
-                        "json.corrupt.{}.{}.{}",
-                        now_unix(),
-                        std::process::id(),
-                        nonce
-                    );
-                    let backup = path.with_extension(stamp);
-                    eprintln!(
-                        "zoder: warning: health store {} is corrupt ({e}); backing up to {}",
-                        path.display(),
-                        backup.display()
-                    );
-                    if let Err(be) = std::fs::rename(path, &backup) {
-                        eprintln!("zoder: warning: could not back up corrupt health store: {be}");
+        let mut store: HealthStore = match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_HEALTH_STORE_BYTES => Self::quarantine_store(
+                path,
+                &format!(
+                    "is oversized ({} bytes exceeds {} limit)",
+                    meta.len(),
+                    MAX_HEALTH_STORE_BYTES
+                ),
+            ),
+            _ => match std::fs::read_to_string(path) {
+                Ok(s) => match serde_json::from_str(&s) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        // Do not silently wipe history: warn and preserve the bad
+                        // file for inspection before starting fresh.
+                        Self::quarantine_store(path, &format!("is corrupt ({e})"))
                     }
-                    HealthStore::default()
-                }
+                },
+                // Not present yet: a fresh store is expected, no warning.
+                Err(_) => HealthStore::default(),
             },
-            // Not present yet: a fresh store is expected, no warning.
-            Err(_) => HealthStore::default(),
         };
         store.path = path.to_path_buf();
         store
+    }
+
+    fn quarantine_store(path: &Path, reason: &str) -> Self {
+        // Unique suffix (C7-M1 bonus): a FIXED `health.json.corrupt`
+        // name means a second downgrade clobbers the first backup.
+        // Stamp the backup with unix-secs + pid + a monotonic nonce
+        // so repeated corrupt loads each keep their own copy.
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let stamp = format!(
+            "json.corrupt.{}.{}.{}",
+            now_unix(),
+            std::process::id(),
+            nonce
+        );
+        let backup = path.with_extension(stamp);
+        eprintln!(
+            "zoder: warning: health store {} {reason}; backing up to {}",
+            path.display(),
+            backup.display()
+        );
+        if let Err(be) = std::fs::rename(path, &backup) {
+            eprintln!("zoder: warning: could not back up corrupt health store: {be}");
+        }
+        HealthStore::default()
     }
 
     pub fn record_success(&mut self, model: &str, latency_ms: f64) {
@@ -957,6 +973,52 @@ mod tests {
             "skip_serializing_if=Option::is_none must not emit provider_id when absent: {raw}"
         );
         assert!(raw.contains("\"calls\": 7"));
+    }
+
+    #[test]
+    fn load_quarantines_oversized_store_before_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let padding = "x".repeat(usize::try_from(MAX_HEALTH_STORE_BYTES).unwrap());
+        let json = format!(
+            r#"{{
+  "models": {{
+    "would-load-without-size-cap": {{
+      "calls": 9,
+      "failures": 0,
+      "consecutive_failures": 0,
+      "ewma_latency_ms": null,
+      "last_error": null
+    }}
+  }},
+  "padding": "{padding}"
+}}"#
+        );
+        std::fs::write(&path, json).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_HEALTH_STORE_BYTES);
+
+        let store = HealthStore::load(&path);
+
+        assert!(
+            store.models.is_empty(),
+            "oversized health store must start fresh instead of loading models"
+        );
+        assert!(
+            !path.exists(),
+            "oversized health store must be moved aside for inspection"
+        );
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("health.json.corrupt."))
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "oversized load must create one corrupt-store backup: {backups:?}"
+        );
+        let backup_path = dir.path().join(&backups[0]);
+        assert!(std::fs::metadata(backup_path).unwrap().len() > MAX_HEALTH_STORE_BYTES);
     }
 
     #[test]
