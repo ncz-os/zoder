@@ -48,6 +48,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public defaults / tunables.
@@ -88,6 +89,25 @@ const FUTURE_TIMESTAMP_TOLERANCE_SECS: i64 = 60;
 
 /// On-disk filename under `$ZODER_HOME` (or `~/.zoder`).
 pub const UTILIZATION_FILENAME: &str = "utilization.json";
+
+/// Maximum trusted utilization-store size. Larger files are rejected BEFORE
+/// the body is read (C8-M1 / C8-M2): a 10 GiB `utilization.json` (from
+/// accumulated corruption or an attacker-writable path) cannot be slurped
+/// into memory just to fail JSON parse, which is what would OOM a routing/
+/// reporting daemon reading its own state. The cap matches
+/// [`crate::pricing::PricingCatalog::MAX_PRICE_BYTES`] -- the established
+/// size-cap idiom across the workspace stores -- rather than inventing a
+/// new constant. 2 MiB is far above any plausible real utilization store
+/// (counters + records are small per `(provider, account_id, plan)` row)
+/// while still bounding the read to a few MB even on a hot path.
+const MAX_UTILIZATION_BYTES: u64 = 2_097_152; // 2 MiB
+
+/// Monotonic nonce used to uniquely suffix quarantine-renames of an
+/// oversized utilization store (so two rejected opens don't clobber each
+/// other's backup copy). Combined with the process id and unix-seconds it
+/// mirrors the `.json.corrupt.{sec}.{pid}.{nonce}` convention already used
+/// by `crates/model-health/src/lib.rs` for the same purpose.
+static QUARANTINE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Enums.
@@ -1896,6 +1916,18 @@ impl UtilizationStore {
         // remains consistent — the typical wire-up is "open + record +
         // save" inside one short-lived scope).
         let lock = Self::acquire_lock(path)?;
+        // C8-M1: refuse-and-quarantine oversized files BEFORE the read.
+        // `fs::read` would otherwise slurp a multi-gigabyte
+        // `utilization.json` into the heap (oom hazard on a routing/
+        // reporting daemon) before serde has a chance to reject it.
+        // See `quarantine_oversized` for the rename-aside policy.
+        if let Err(e) = Self::refuse_oversized(path) {
+            // We hold the lock; release it before propagating so a
+            // follow-up open (after the operator moves the quarantine
+            // aside) doesn't deadlock on the sidecar `.lock`.
+            drop(lock);
+            return Err(e);
+        }
         match fs::read(path) {
             Ok(bytes) => {
                 if bytes.is_empty() {
@@ -1956,6 +1988,10 @@ impl UtilizationStore {
     /// use [`UtilizationStore::open`] (the locked variant) for that.
     pub fn open_unlocked(path: impl AsRef<Path>) -> Result<Self, UtilizationError> {
         let path = path.as_ref();
+        // C8-M1: same size-cap guard as `open()` — the read-only path
+        // (CLI `report`, etc.) has the same OOM-hazard profile, so the
+        // refuse-and-quarantine policy applies symmetrically.
+        Self::refuse_oversized(path)?;
         match fs::read(path) {
             Ok(bytes) => {
                 if bytes.is_empty() {
@@ -2026,6 +2062,90 @@ impl UtilizationStore {
         // released, so a crashed process can't deadlock the next caller.
         f.lock_exclusive().map_err(UtilizationError::Io)?;
         Ok(f)
+    }
+
+    /// C8-M1: refuse-and-quarantine an on-disk utilization store whose
+    /// `st_size` exceeds [`MAX_UTILIZATION_BYTES`]. Without this guard a
+    /// multi-gigabyte `utilization.json` (from accumulated corruption or
+    /// an attacker-writable path) would be `fs::read`-slurped into the
+    /// heap before serde gets a chance to reject the parse — risking
+    /// OOM in routing/reporting daemons on the ordinary `open()` path.
+    ///
+    /// Behavior:
+    ///   * File absent (`NotFound`) → `Ok`, the caller proceeds and the
+    ///     empty-fallthrough creates a fresh store.
+    ///   * File present and within the cap → `Ok`, the caller proceeds.
+    ///   * File present and over the cap → the file is renamed aside
+    ///     (quarantined) to `<path>.oversized.<sec>.<pid>.<nonce>` —
+    ///     mirroring the `.json.corrupt.<sec>.<pid>.<nonce>` convention
+    ///     used by `crates/model-health/src/lib.rs` for the same purpose
+    ///     — and a `UtilizationError::Oversized { .. }` is returned. The
+    ///     rename is best-effort: if it fails (e.g. cross-device link,
+    ///     permissions on the directory) we still refuse to read, but
+    ///     the quarantine path is reported as the original path so the
+    ///     operator can see what was rejected and intervene.
+    fn refuse_oversized(path: &Path) -> Result<(), UtilizationError> {
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            // `NotFound` (or any other stat failure) is the caller's
+            // problem to surface — `open()` already differentiates
+            // missing-file (silent empty store) from other errors.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(UtilizationError::Io(e)),
+        };
+        if !meta.is_file() {
+            // A socket / directory / fifo at the store path: not a JSON
+            // file, not something `fs::read` would safely consume.
+            // Delegate the error to the read path's `UtilizationError::Io`
+            // so the caller sees the same shape it always did.
+            return Ok(());
+        }
+        let size = meta.len();
+        if size <= MAX_UTILIZATION_BYTES {
+            return Ok(());
+        }
+        // Over the cap — refuse to read. Try to rename the original
+        // bytes aside so the operator can still inspect them.
+        let nonce = QUARANTINE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let stamp_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stamp = format!(
+            "json.oversized.{}.{}.{}",
+            stamp_secs,
+            std::process::id(),
+            nonce
+        );
+        let quarantine_path = path.with_extension(stamp);
+        let rename_result = fs::rename(path, &quarantine_path);
+        if let Err(ref e) = rename_result {
+            eprintln!(
+                "zoder: warning: utilization store {} is {size} bytes (cap {}); refused to \
+                 read into memory; quarantine rename to {} FAILED: {e} \
+                 -- original file left in place but will not be opened",
+                path.display(),
+                MAX_UTILIZATION_BYTES,
+                quarantine_path.display(),
+            );
+        } else {
+            eprintln!(
+                "zoder: warning: utilization store {} is {size} bytes (cap {}); refused to \
+                 read into memory and quarantined to {}",
+                path.display(),
+                MAX_UTILIZATION_BYTES,
+                quarantine_path.display(),
+            );
+        }
+        let quarantined_as = rename_result
+            .map(|_| quarantine_path)
+            .unwrap_or_else(|_| path.to_path_buf());
+        Err(UtilizationError::Oversized {
+            path: path.to_path_buf(),
+            size_bytes: size,
+            cap_bytes: MAX_UTILIZATION_BYTES,
+            quarantined_as,
+        })
     }
 
     /// Open a store at the default location. Returns `None` when neither
@@ -2446,27 +2566,48 @@ impl UtilizationStore {
             }
         };
 
-        // Write the temp file.
+        // Write the temp file. Each step cleans up the unique temp on
+        // failure so a mid-write error (ENOSPC, EIO, ...) can't leave
+        // an orphaned `.tmp.<pid>.<nanos>` accumulating under the
+        // store dir forever. The cleanup idiom matches the rest of the
+        // workspace stores (session.rs / corpus.rs / pricing.rs /
+        // model-health::write_atomic) rather than introducing a
+        // scope-guard struct just here.
         {
-            let mut f = fs::OpenOptions::new()
+            let mut f = match fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .open(&tmp)
-                .map_err(UtilizationError::Io)?;
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(UtilizationError::Io(e));
+                }
+            };
             use std::io::Write;
-            f.write_all(&bytes).map_err(UtilizationError::Io)?;
+            if let Err(e) = f.write_all(&bytes) {
+                let _ = fs::remove_file(&tmp);
+                return Err(UtilizationError::Io(e));
+            }
             // `sync_all` flushes the file's data AND metadata to disk
             // before the rename. Without it, a power loss between the
             // rename and the kernel's flush can leave the file empty
             // or partial.
-            f.sync_all().map_err(UtilizationError::Io)?;
+            if let Err(e) = f.sync_all() {
+                let _ = fs::remove_file(&tmp);
+                return Err(UtilizationError::Io(e));
+            }
         }
 
         // Atomic rename. On Unix this is guaranteed atomic for same-
         // filesystem renames; the temp file lives next to the data
         // file so this is always satisfied.
-        fs::rename(&tmp, path).map_err(UtilizationError::Io)?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(UtilizationError::Io(e));
+        }
         Ok(())
     }
 }
@@ -2488,6 +2629,24 @@ pub enum UtilizationError {
          (current {current}); refusing to save to avoid a lossy downgrade"
     )]
     FutureSchema { found: u32, current: u32 },
+    /// C8-M1: the on-disk utilization store exceeded [`MAX_UTILIZATION_BYTES`]
+    /// and was QUARANTINED (renamed aside) instead of being read into memory.
+    /// Reading a multi-gigabyte `utilization.json` (from accumulated corruption
+    /// or an attacker-writable path) into a routing/reporting daemon risks
+    /// OOM before parse can fail fast; refusing at metadata-check time is the
+    /// safe outcome. The original bytes have been preserved at the path
+    /// reported in `quarantined_as` (when the rename succeeded) for operator
+    /// inspection.
+    #[error(
+        "utilization: store at {path} is {size_bytes} bytes, exceeds the {cap_bytes} \
+         size cap; refused to read into memory and quarantined to {quarantined_as}"
+    )]
+    Oversized {
+        path: PathBuf,
+        size_bytes: u64,
+        cap_bytes: u64,
+        quarantined_as: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -5637,5 +5796,322 @@ mod tests {
         let legacy = UtilizationStore::open(&legacy_path).unwrap();
         assert_eq!(legacy.schema_version, CURRENT_SCHEMA_VERSION);
         legacy.save().expect("migrated legacy store must save");
+    }
+
+    // =====================================================================
+    // C8-M1 / C8-M2 pins (2026-07-09 adversarial re-review).
+    //
+    // The 2026-07-09 re-review flagged two LOW-severity defects in
+    // `crates/zoder-core/src/utilization.rs` against the live `fs::read` /
+    // `save()` paths:
+    //
+    // C8-M1 (LOW): the load path used `fs::read` with no size cap. A
+    //     multi-gigabyte `utilization.json` (accumulated corruption or an
+    //     attacker-writable path) was slurped into memory in full BEFORE
+    //     parse could fail, risking OOM in a routing/reporting daemon.
+    //
+    // C8-M2 (LOW): the atomic-save path left orphaned
+    //     `<name>.tmp.<pid>.<nanos>` files on every error branch
+    //     (write/sync/rename). Repeated failures (e.g. persistently full
+    //     disk) accumulated temp files indefinitely.
+    //
+    // The tests below pin both fixes at the public-method boundary.
+    // =====================================================================
+
+    // ----- C8-M1: size cap on load -----
+
+    /// C8-M1 main pin: an oversized `utilization.json` must NOT be read
+    /// into memory. The load path must refuse with `Oversized`, rename
+    /// the original bytes aside to a unique `.oversized.<sec>.<pid>.<nonce>`
+    /// quarantine path, and the original file path must no longer exist
+    /// (so a subsequent normal open sees a missing file → fresh store).
+    #[test]
+    fn load_refuses_oversized_file_and_quarantines_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        // Write just past the cap: MAX + 1 byte. Using bytes::repeat
+        // over a same-sized-buf would also work, but a sparse sparse
+        // allocation matches the failure mode (corrupt growth that
+        // crosses the threshold).
+        let over_cap: u64 = MAX_UTILIZATION_BYTES + 1;
+        // Use sparse allocation via set_len to avoid materializing
+        // actual bytes (saves heap + is the canonical way to test
+        // "file is too big for the cap, regardless of contents").
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(over_cap).unwrap();
+        drop(f);
+
+        let err = UtilizationStore::open(&path).expect_err("oversized file must refuse to load");
+        match &err {
+            UtilizationError::Oversized {
+                size_bytes,
+                cap_bytes,
+                quarantined_as,
+                ..
+            } => {
+                assert_eq!(*size_bytes, over_cap, "size_bytes must reflect reality");
+                assert_eq!(
+                    *cap_bytes, MAX_UTILIZATION_BYTES,
+                    "cap_bytes must be the constant, not a per-call value"
+                );
+                assert!(
+                    quarantined_as.exists()
+                        || path.exists(),
+                    "either the quarantine path or the original must still exist on disk; got quarantine={}",
+                    quarantined_as.display(),
+                );
+            }
+            other => panic!("expected Oversized error, got {other:?}"),
+        }
+        // Original file must be gone (renamed aside) so the next
+        // open() sees a missing-file empty store instead of trying
+        // to re-read the oversized bytes.
+        assert!(
+            !path.exists(),
+            "original utilization.json must be gone after quarantine; found at {}",
+            path.display()
+        );
+        // Open succeeds on a now-empty location (creates fresh store).
+        let reopened = UtilizationStore::open(&path).unwrap();
+        assert!(reopened.records.is_empty());
+        assert!(reopened.counters.is_empty());
+    }
+
+    /// C8-M1 unlocked-path pin: the same size cap must apply to
+    /// `open_unlocked()` (CLI `report`, etc. — read-only callers have
+    /// the same OOM-hazard profile).
+    #[test]
+    fn load_unlocked_refuses_oversized_file_and_quarantines_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_UTILIZATION_BYTES + 1).unwrap();
+        drop(f);
+
+        let err = UtilizationStore::open_unlocked(&path)
+            .expect_err("unlocked load must refuse oversized");
+        assert!(
+            matches!(&err, UtilizationError::Oversized { size_bytes, .. }
+                if *size_bytes == MAX_UTILIZATION_BYTES + 1),
+            "expected Oversized, got {err:?}"
+        );
+        assert!(!path.exists(), "original must be quarantined aside");
+    }
+
+    /// C8-M1 boundary pin: the threshold is `<=` cap, not `<` cap. A
+    /// file at exactly `MAX_UTILIZATION_BYTES` must pass the size
+    /// guard (otherwise we'd reject legitimate stores one byte short).
+    /// The parse may still fail (sparse-set-len zero-filled bytes are
+    /// not valid JSON); what matters for this test is that the failure
+    /// is NOT `Oversized`.
+    #[test]
+    fn load_accepts_file_at_cap_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_UTILIZATION_BYTES).unwrap();
+        drop(f);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_UTILIZATION_BYTES
+        );
+        let err = UtilizationStore::open_unlocked(&path)
+            .expect_err("sparse zero-padded file is not parseable; non-Oversized is what matters");
+        assert!(
+            !matches!(err, UtilizationError::Oversized { .. }),
+            "a file at exactly the cap must pass the size guard, got {err:?}"
+        );
+    }
+
+    /// C8-M1 idempotency pin: a second open of an oversized file
+    /// produces a SECOND quarantine (different nonce + sec suffix) so
+    /// repeated oversized opens don't clobber the previous backup.
+    #[test]
+    fn load_of_oversized_quarantines_each_time_with_a_unique_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        // First oversized file.
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(MAX_UTILIZATION_BYTES + 1).unwrap();
+        }
+        let _ = UtilizationStore::open(&path);
+        // File is now renamed aside; reset and try again.
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(MAX_UTILIZATION_BYTES + 2).unwrap();
+        }
+        let _ = UtilizationStore::open(&path);
+        // Two separate quarantines must now exist side by side
+        // (without clobbering each other — the unique nonce guards it).
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.contains("json.oversized.") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            quarantined.len() >= 2,
+            "two oversized opens must produce two distinct quarantine files; found {quarantined:?}"
+        );
+        // All distinct names.
+        let unique: std::collections::HashSet<_> = quarantined.iter().collect();
+        assert_eq!(
+            unique.len(),
+            quarantined.len(),
+            "quarantine filenames must all be distinct"
+        );
+    }
+
+    /// C8-M1 missing-file contract: a missing file is NOT an Oversized
+    /// error — the size check must short-circuit on `NotFound` and
+    /// let the caller create a fresh empty store. Preserved across the
+    /// fix so the absent → empty silent path still works.
+    #[test]
+    fn load_missing_file_is_not_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let store = UtilizationStore::open(&path).expect("missing file must open empty");
+        assert!(store.records.is_empty());
+        assert!(store.counters.is_empty());
+        // Same for the unlocked path.
+        let path2 = dir.path().join("does-not-exist-2.json");
+        let store2 = UtilizationStore::open_unlocked(&path2).expect("missing file must open empty");
+        assert!(store2.records.is_empty());
+    }
+
+    // ----- C8-M2: temp-file cleanup on every error path -----
+
+    /// C8-M2 main pin: a successful save leaves exactly ONE file
+    /// (`utilization.json`) and no `.tmp.*` orphans. This is the
+    /// baseline that the error-path tests below compare against.
+    #[test]
+    fn save_no_stray_tmp_on_success_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "records": {},
+                "counters": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = UtilizationStore::open(&path).unwrap();
+        store.save().expect("baseline save must succeed");
+        // The data file exists.
+        assert!(path.exists());
+        // No `.tmp` survives.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".tmp"),
+                "successful save must leave no .tmp; found {name}"
+            );
+        }
+    }
+
+    /// C8-M2 rename-error pin: when `fs::rename` fails (here simulated
+    /// by making the destination path a directory so rename(2) returns
+    /// `EISDIR` / `EEXIST`), the temp file at `<name>.tmp.<pid>.<nanos>`
+    /// must be cleaned up — NOT left behind to accumulate on every
+    /// subsequent failing save.
+    #[test]
+    fn save_cleans_up_tmp_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        // Pre-seed a current-version valid store so open() succeeds.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "records": {},
+                "counters": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = UtilizationStore::open(&path).unwrap();
+
+        // Force `fs::rename(<tmp>, <path>)` to fail: replace the
+        // target path with a DIRECTORY — rename(2) onto a non-empty
+        // directory fails with `EEXIST`/`ENOTDIR`/`EISDIR`. The exact
+        // error code is platform-dependent, but ALL platforms refuse.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = store.save().expect_err("rename onto a directory must fail");
+        let _ = err; // shape is UtilizationError::Io, locked variant.
+
+        // No `.tmp` file may remain in the directory.
+        let mut stray_tmps = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".tmp") {
+                stray_tmps.push(name);
+            }
+        }
+        assert!(
+            stray_tmps.is_empty(),
+            "save() must remove its unique temp on rename failure; found strays: {stray_tmps:?}"
+        );
+    }
+
+    /// C8-M2 multiple-failure pin: repeated failing saves must not
+    /// leak temp files. Each one creates a unique temp name (pid +
+    //  nanos), so without cleanup we'd accumulate one temp per failed
+    //  save. After three failing saves the directory must still hold
+    //  ZERO `.tmp` files.
+    #[test]
+    fn save_repeated_failures_do_not_leak_temps() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Three independent cycles, each opens a freshly-seeded
+        // store. The data path lives at a different filename each
+        // iteration so cycle N+1 doesn't collide with any leftover
+        // file / lockfile from cycle N's rename-aside.
+        for i in 0..3 {
+            let path = dir.path().join(format!("cycle-{i}.json"));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "records": {},
+                    "counters": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let store = UtilizationStore::open(&path).unwrap();
+
+            // Replace the data file with a DIRECTORY so rename(2)
+            // fails (`EEXIST` / `EISDIR`). We KNOW the data path is
+            // currently a regular file (we just wrote it), so
+            // `remove_file` is the correct unlink call here.
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let _ = store.save().expect_err("rename onto a directory must fail");
+
+            // Asserting inside the loop keeps all leaks pinned at
+            // once in a single failure message.
+            let stray_count = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .count();
+            assert_eq!(
+                stray_count, 0,
+                "iteration {i}: zero .tmp files may leak across failing saves, saw {stray_count}"
+            );
+        }
     }
 }
