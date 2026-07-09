@@ -552,7 +552,10 @@ async fn complete_once(
                 // with author path / agentic turn) so the on-disk store
                 // sees the same stamp as the author's pre-gate entry.
                 if let Ok(eng) = Engine::load() {
-                    let mut h = HealthStore::load(&eng.cfg.health_path);
+                    // Resolve the provider id BEFORE taking the health lock --
+                    // this is read-only routing config I/O and touches no
+                    // health state, so it must not extend the locked critical
+                    // section.
                     let provider_id = crate::RoutingContext::load(&eng.cfg)
                         .ok()
                         .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
@@ -579,8 +582,17 @@ async fn complete_once(
                     let cls = status
                         .map(zoder_core::Classification::from_status)
                         .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
-                    h.record_classified_failure(model, &message, &provider_id, cls);
-                    let _ = h.save();
+                    // C4-MH1: record + persist under an exclusive lock. This
+                    // reviewer fallback runs inside a `join_all` fan-out and
+                    // races the daemon/CLI, so a bare load -> record -> save
+                    // would drop a concurrently-recorded failure (lost
+                    // update). `mutate_locked` reloads the freshest on-disk
+                    // store under the flock, applies this delta, and writes
+                    // atomically before releasing -- so every panel model's
+                    // failure survives.
+                    let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+                        h.record_classified_failure(model, &message, &provider_id, cls);
+                    });
                 }
                 tracing::debug!(
                     model = %model,
