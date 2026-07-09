@@ -352,19 +352,38 @@ fn dir_bytes(path: &Path) -> u64 {
 /// Implemented locally (instead of pulling in `remove_dir_all` from
 /// `tempfile` or another crate) to keep the dependency surface unchanged.
 fn remove_recursive(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
+    // Y-21: stat with `symlink_metadata` (does NOT follow symlinks) and treat
+    // a symlink as a leaf — remove the LINK itself, never recurse through it.
+    // The previous `path.is_dir()`/`p.is_dir()` FOLLOW symlinks, so an in-tree
+    // symlink to a directory would have its target's contents recursively
+    // deleted (out-of-tree data loss).
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return std::fs::remove_file(path);
+    }
+    if meta.is_dir() {
         for entry in std::fs::read_dir(path)?.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                remove_recursive(&p)?;
-            } else {
-                std::fs::remove_file(&p)?;
-            }
+            remove_recursive(&entry.path())?;
         }
         std::fs::remove_dir(path)
     } else {
         std::fs::remove_file(path)
     }
+}
+
+/// Y-20: a job's `id` is read from its own (attacker-writable) `meta.json`
+/// body, NOT the on-disk directory name (`read_dir_jobs` returns the body id).
+/// A crafted id like `../../.ssh` or `/etc/x` would make `dir.join(id)` escape
+/// the jobs dir and let `remove_recursive` delete an arbitrary path. Accept
+/// only a direct, separator-free child of `dir`: exactly one `Normal` path
+/// component — which excludes `..`, `.`, absolute roots, and prefixes — whose
+/// join stays a direct child of `dir`.
+fn job_id_is_contained_child(dir: &Path, id: &str) -> bool {
+    use std::path::Component;
+    let mut comps = Path::new(id).components();
+    let single_normal =
+        matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none();
+    single_normal && dir.join(id).parent() == Some(dir)
 }
 
 pub(crate) struct JobsPruneArgs {
@@ -454,6 +473,22 @@ pub(crate) fn cmd_jobs_prune(cli: &crate::Cli, args: JobsPruneArgs) -> anyhow::R
         }
 
         let job_path = dir.join(&m.id);
+        // Y-20: never touch anything that isn't a direct child of the jobs
+        // dir. A crafted/corrupted meta.json `id` must not cause an
+        // out-of-tree delete — in dry-run OR live. Record it so the operator
+        // sees it was refused, never removed.
+        if !job_id_is_contained_child(&dir, &m.id) {
+            outcomes.push(PruneOutcome {
+                id: m.id.clone(),
+                dir: job_path,
+                bytes: 0,
+                result: PruneResult::Error(
+                    "unsafe job id (path traversal; not a direct child of the jobs dir) — skipped"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
         let bytes = dir_bytes(&job_path);
 
         if args.dry_run {
@@ -646,6 +681,112 @@ mod tests {
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
         path
+    }
+
+    /// Build a job dir with a SAFE on-disk name but a CRAFTED meta.json `id`
+    /// (the field prune historically trusted). Terminal + old + dead pid so it
+    /// passes the status/age/running filters and reaches the delete path.
+    fn make_crafted_meta_job(parent: &Path, dir_name: &str, crafted_id: &str) {
+        let dir = parent.join(dir_name);
+        fs::create_dir_all(&dir).unwrap();
+        let meta = JobMeta {
+            id: crafted_id.to_string(),
+            kind: "test".to_string(),
+            status: "done".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 999_998, // not a live pid
+            started: Utc::now() - Duration::days(30),
+            finished: Some(Utc::now()),
+        };
+        fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join("output.txt"), b"x").unwrap();
+    }
+
+    // ---- Y-20 / Y-21: prune path-safety ----------------------------------
+
+    #[test]
+    fn job_id_is_contained_child_rejects_traversal_and_absolute() {
+        let dir = Path::new("/home/u/.zoder/jobs");
+        // Safe: a single normal component.
+        assert!(job_id_is_contained_child(dir, "20260709-000000-1a2b"));
+        // Unsafe: parent traversal, absolute, nested, dot forms, empty.
+        assert!(!job_id_is_contained_child(dir, "../evil"));
+        assert!(!job_id_is_contained_child(dir, "../../.ssh"));
+        assert!(!job_id_is_contained_child(dir, "/etc/passwd"));
+        assert!(!job_id_is_contained_child(dir, "a/b"));
+        assert!(!job_id_is_contained_child(dir, ".."));
+        assert!(!job_id_is_contained_child(dir, "."));
+        assert!(!job_id_is_contained_child(dir, ""));
+    }
+
+    #[test]
+    fn prune_refuses_out_of_tree_meta_id() {
+        // Y-20: a job whose meta.json `id` escapes the jobs dir must NOT be
+        // deleted (nor its resolved out-of-tree target), in a LIVE prune.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ZODER_HOME", home.path());
+        let jobs_dir = home.path().join("jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+
+        // A sentinel OUTSIDE the jobs dir that a `../sentinel_outside` id hits.
+        let sentinel_dir = home.path().join("sentinel_outside");
+        fs::create_dir_all(&sentinel_dir).unwrap();
+        let sentinel_file = sentinel_dir.join("keep.txt");
+        fs::write(&sentinel_file, b"do not delete").unwrap();
+
+        make_crafted_meta_job(&jobs_dir, "safe-name", "../sentinel_outside");
+        make_crafted_meta_job(
+            &jobs_dir,
+            "safe-name-2",
+            "/tmp/zoder_abs_escape_should_not_be_touched",
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "jobs", "prune"]).unwrap();
+        let _ = cmd_jobs_prune(&cli, prune_args(None, None, false, false));
+
+        assert!(
+            sentinel_file.exists(),
+            "Y-20: an out-of-tree traversal id must NOT delete the sentinel"
+        );
+        assert!(
+            sentinel_dir.exists(),
+            "Y-20: traversal target dir must survive"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+    }
+
+    #[test]
+    fn remove_recursive_does_not_follow_symlinks() {
+        // Y-21: an in-tree symlink to an external dir must not have its
+        // target's contents deleted — only the link itself is removed.
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_file = external.path().join("precious.txt");
+        fs::write(&external_file, b"precious").unwrap();
+
+        let job = root.path().join("job");
+        fs::create_dir_all(&job).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(external.path(), job.join("link")).unwrap();
+
+        remove_recursive(&job).unwrap();
+        assert!(!job.exists(), "the job dir itself is removed");
+        assert!(
+            external_file.exists(),
+            "Y-21: symlink target contents must survive (only the link is removed)"
+        );
     }
 
     // ---- parse_duration --------------------------------------------------
