@@ -123,7 +123,7 @@ fn human_age(d: Duration) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // `libc::pid_t` is a SIGNED `i32` on every unix we care about
     // (Linux + macOS). `kill(pid, 0)` accepts that signed pid, but with
     // these SPECIAL values that would NOT mean "probe this pid":
@@ -158,7 +158,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
+pub(crate) fn pid_alive(_pid: u32) -> bool {
     // No portable existence probe; be conservative — refuse to prune any
     // job whose meta-status says `running`, regardless of pid.
     true
