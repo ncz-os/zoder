@@ -2,6 +2,8 @@
 //! a default-deny-paid policy gate, and a local spend ledger - over any
 //! OpenAI-compatible / LiteLLM fleet. Vendor-neutral; free-tier is the first target.
 
+use std::time::Duration;
+
 pub mod budget;
 pub mod config;
 pub mod consultant;
@@ -37,10 +39,16 @@ pub mod update;
 pub mod utilization;
 
 pub use acp_client::{
-    new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket,
+    cancel_session, new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket,
     write_tool_matrix, write_tool_matrix_human, AgentEvent, AgentOptions, AgentRun, ApprovalPolicy,
     EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
 };
+/// Settle budget the loop grants the daemon to ACK a `session/cancel` after
+/// the author-phase watchdog fires (see `cancel_session`). Canonical value
+/// referenced by `zoder-cli`'s author-phase wrapper and the `acp-client`
+/// wire-shape tests so a change here is exercised by the test that guards
+/// the loop's `build_diff` ordering.
+pub const CANCEL_SETTLE_BUDGET: Duration = Duration::from_secs(5);
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use config::{
     AliasedAgentConfig, Auth, BillingMode, Config, ExecSafetyConfig, ExecSandbox,

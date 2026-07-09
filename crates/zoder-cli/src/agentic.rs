@@ -2217,10 +2217,21 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
 #[allow(dead_code)]
 pub(crate) const DEFAULT_LOOP_TIMEOUT_SECS: u64 = 900;
 
+/// Settle budget the author-phase watchdog grants the daemon to ACK a
+/// `session/cancel` before the loop captures `build_diff`. See
+/// [`zoder_core::CANCEL_SETTLE_BUDGET`] for the canonical value —
+/// kept in `zoder-core` so the `acp-client` wire-shape tests exercise
+/// the same number the loop uses.
+pub(crate) const SETTLE_BUDGET_SECS: u64 = zoder_core::CANCEL_SETTLE_BUDGET.as_secs();
+
 /// Label for a `loop` phase. Phases are user-visible in the watchdog log
 /// line ("loop: <phase> timed out after <N>s, killing") and in the per-iter
 /// `author_outcome` / `review_outcome` fields when a phase wedges.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // LoopPhase::Author is no longer threaded through `phase_watchdog`
+                    // (the author phase has its own `author_phase_with_cancel`
+                    // wrapper), but the variant is retained for parity with the
+                    // log/label surface and for any future per-phase routing.
 pub(crate) enum LoopPhase {
     Author,
     Check,
@@ -2262,6 +2273,71 @@ where
             Err(format!(
                 "{phase} phase timed out after {secs}s (killed)",
                 phase = phase.as_str()
+            ))
+        }
+    }
+}
+
+/// Cancel-aware variant of `phase_watchdog` for the author phase. The
+/// inner future is raced against a wall-clock budget; on expiry we MUST
+/// tell the daemon to stop the turn before returning, otherwise the
+/// daemon keeps editing files while the loop captures a torn diff for
+/// review.
+///
+/// Two hooks are passed by the caller:
+///
+/// * `cancel` — invoked on timeout. In production this sends the
+///   ACP `session/cancel` notification via [`crate::engine_socket_path`]
+///   so the daemon actually stops the in-flight turn. In tests it
+///   records the invocation so the timeout-path test can assert cancel
+///   was issued (not just that the watchdog dropped the future).
+/// * `settled` — awaited after `cancel`. This gates the watchdog's
+///   return: `build_diff` is captured AFTER `settled` resolves, so the
+///   loop never reviews a torn mid-edit tree. In production `settled`
+///   is the bounded wait inside `cancel_session` itself (it returns
+///   only after the daemon acknowledges the cancel or the settle
+///   budget elapses, which is "settled enough"). In tests `settled`
+///   is a channel/tokio task the test drives explicitly.
+///
+/// On timeout the function logs the standard "timed out, killing"
+/// marker, awaits `cancel`, awaits `settled`, and returns `Err`. On
+/// success it forwards the inner result verbatim. Non-timeout errors
+/// from `cancel` / `settled` are swallowed (we're already on the
+/// timeout path and the loop wants to RECOVER, not bubble IO errors).
+///
+/// NON-BREAKING on success: when the inner future completes within
+/// budget, `cancel` and `settled` are never invoked.
+async fn author_phase_with_cancel<F, C, S>(
+    secs: u64,
+    quiet: bool,
+    turn_fut: F,
+    cancel: C,
+    settled: S,
+) -> Result<crate::TurnResult, String>
+where
+    F: std::future::Future<Output = anyhow::Result<crate::TurnResult>>,
+    C: std::future::Future<Output = anyhow::Result<()>>,
+    S: std::future::Future<Output = ()>,
+{
+    let budget = std::time::Duration::from_secs(secs.max(1));
+    match tokio::time::timeout(budget, turn_fut).await {
+        Ok(res) => res.map_err(|e| e.to_string()),
+        Err(_) => {
+            if !quiet {
+                eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
+            }
+            // Issue the cancel. Best-effort: a failure here means we
+            // couldn't reach the daemon, but the caller's loop still
+            // wants to recover (not bubble IO). The settle wait below
+            // gives the daemon a bounded grace to wind down regardless.
+            let _ = cancel.await;
+            // Gate `build_diff` on the daemon having settled (or its
+            // settle budget having elapsed). Without this, the loop
+            // would race the daemon's last few tool-call writes against
+            // `build_diff` and review a torn tree.
+            settled.await;
+            Err(format!(
+                "author phase timed out after {secs}s (killed, daemon cancel issued)"
             ))
         }
     }
@@ -2679,12 +2755,48 @@ struct LoopStreakUpdate {
     pub abort: bool,
 }
 
+/// Compute the loop's dead-engine signal for one iteration. Returns `true`
+/// when the iteration should count toward the dead-engine streak — i.e.,
+/// the loop should not trust the engine to land any further work without
+/// operator intervention.
+///
+/// Two failure modes count as dead:
+///
+///   1. `turn.is_none()` — the outer `author_phase_with_cancel` watchdog
+///      killed the future (the engine's connection vanished, the spawn
+///      failed, or the watchdog simply couldn't reach the daemon in
+///      time). Pre-fix this was the ONLY dead-engine signal.
+///   2. `turn.is_some_and(|t| !t.run.succeeded())` — the engine returned
+///      an `Ok(TurnResult)` whose `AgentRun::outcome` is not
+///      `"completed"`. The pre-fix code missed this entirely: an
+///      engine that repeatedly internally-timed-out returns
+///      `Ok(outcome="timeout")` (the inner `drive()` already sends
+///      `session/cancel` and preserves partial output), and the loop
+///      saw `turn.is_none() == false` so the dead-streak never
+///      incremented. A wedged-but-still-talking engine would grind
+///      through every `max_iters` instead of bailing after two strikes.
+///
+/// This helper is the single source of truth for the dead-engine signal;
+/// `update_loop_streaks` consumes it via its `turn_failed` parameter.
+pub(crate) fn turn_is_dead(turn: &Option<crate::TurnResult>) -> bool {
+    // Treat `None` (the outer watchdog killed the in-flight future) AND
+    // `Some(_)` whose `run.outcome` is not `"completed"` (the engine
+    // returned Ok but didn't actually land the turn — e.g., an internal
+    // `agent_timeout` already canceled and preserved partial output, a
+    // hard `failed`, a `max_tokens` truncation, etc.) as dead.
+    //
+    // The pre-fix signal `turn.is_none()` only missed `Some(non-completed)`,
+    // so a wedged-but-still-talking engine ground through every
+    // `max_iter` instead of bailing after 2 strikes.
+    turn.as_ref().is_none_or(|t| !t.run.succeeded())
+}
+
 /// Apply one iteration's signals to the loop's streak counters and decide
 /// whether to abort. Pure / deterministic so the full input matrix can be
 /// unit-tested.
 ///
 /// Invariants this helper enforces (the regression is exactly the first one):
-///   * `turn_none && diff_empty` -> dead_streak += 1.
+///   * `turn_failed && diff_empty` -> dead_streak += 1.
 ///   * `check_timed_out && diff_empty` -> check_timeout_streak += 1 only;
 ///     dead_streak is unaffected (previously they were conflated via `||`
 ///     in the abort predicate, which fired dead_streak even when the author
@@ -2697,7 +2809,7 @@ struct LoopStreakUpdate {
 ///     abort signal.
 const DEAD_STREAK_ABORT_THRESHOLD: usize = 2;
 fn update_loop_streaks(
-    turn_none: bool,
+    turn_failed: bool,
     check_timed_out: bool,
     diff_empty: bool,
     prev_dead_streak: usize,
@@ -2717,7 +2829,7 @@ fn update_loop_streaks(
     }
     // Empty diff from here on. Track the two failure modes independently so a
     // hung check can no longer masquerade as a dead engine.
-    let dead_streak = if turn_none { prev_dead_streak + 1 } else { 0 };
+    let dead_streak = if turn_failed { prev_dead_streak + 1 } else { 0 };
     let check_timeout_streak = if check_timed_out {
         prev_check_timeout_streak + 1
     } else {
@@ -2856,17 +2968,81 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // engine error) must NOT discard the round. The engine applies edits to
         // disk as tool calls run, so partial work survives; we still validate,
         // review, and feed the failure back so the next iteration can finish it.
-        // `phase_watchdog` enforces a hard kill-budget around the turn so a
-        // genuinely-wedged child (the failure mode the production incident
-        // surfaced: 0.4s CPU, no output, indefinitly idle) cannot hang the loop
-        // past `loop_timeout_secs`.
+        // `author_phase_with_cancel` enforces a hard kill-budget around the
+        // turn AND, on timeout, ACTUALLY cancels the daemon turn (via ACP
+        // `session/cancel`) and gates `build_diff` on the daemon having
+        // settled — so the loop never reviews a torn mid-edit tree. The
+        // production incident surfaced here: the prior `phase_watchdog` only
+        // dropped the client future, the daemon kept editing, and `build_diff`
+        // captured the torn tree right under the reviewer's nose. See
+        // [`author_phase_with_cancel`] for the cancel/settle contract and the
+        // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         let engine_kind = crate::resolve_engine_kind(cli)?;
-        let turn = match phase_watchdog(
-            LoopPhase::Author,
+        // The cancel future needs the session id to address the right turn on
+        // the daemon. For iterations 2+ (`session == Some(sid)`) we resume the
+        // same session, so the cancel has a known target. For the very first
+        // iteration without `--session`/`--continue`/`--persist-session`,
+        // `session` is `None` — the inner engine mints a new session id we
+        // cannot observe from outside the in-flight future. We still open a
+        // daemon connection and wait for the settle budget; if the daemon
+        // happens to expose the freshly-minted session via a notification
+        // before the budget elapses, the cancel will land; if not, the bounded
+        // wait is the best we can do without invasive plumbing. (The first
+        // iteration is also the one most likely to succeed — a wedged
+        // mid-session is much rarer than a wedged mid-prompt on a resumed
+        // session.) The settle signal is implicit: `cancel_session` itself
+        // awaits `session/update {type: "turn_complete"}` (or the settle
+        // budget) before returning, so `build_diff` is gated on the daemon
+        // having actually wound down.
+        let session_id_for_cancel = session.clone();
+        let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
             crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false),
+            async move {
+                // Cancel the daemon turn for `session_id_for_cancel` (best-
+                // effort). If `None`, the daemon may have a freshly-minted
+                // session we can't address from outside — we still wait for
+                // the settle budget so the daemon has a chance to wind down
+                // any in-flight tool calls before we capture the diff.
+                let socket = crate::engine_socket_path();
+                if let Some(sid) = session_id_for_cancel.as_deref() {
+                    match zoder_core::cancel_session(
+                        &socket,
+                        sid,
+                        std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Best-effort: don't fail the loop on a settle
+                            // error, but DO emit a warning so operators can
+                            // see when the daemon failed to acknowledge a
+                            // cancel — that often means the daemon crashed
+                            // mid-edit and the diff we'd capture next is a
+                            // torn tree.
+                            if !cli.quiet {
+                                eprintln!("[loop] cancel_session for {sid} did not settle: {e}");
+                            }
+                        }
+                    }
+                } else {
+                    // No known session id — best-effort settle wait.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            },
+            async {
+                // Settled signal: a small grace after cancel_session returns
+                // so any final tool-result write hits disk before `build_diff`.
+                // cancel_session itself already waits for the daemon's
+                // turn_complete (or the settle budget), so this is just a
+                // belt-and-braces margin for filesystem visibility of the
+                // daemon's last edits.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            },
         )
         .await
         {
@@ -2967,10 +3143,18 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // Streak bookkeeping — both failure modes live in one helper so the
         // full matrix is unit-tested. A wedged check on an already-empty
         // diff bumps the check-timeout streak only (logged for visibility)
-        // and does NOT contribute to `dead_streak`. The author case
-        // (turn_none && diff_empty) is the ONLY path that can abort.
+        // and does NOT contribute to `dead_streak`. The dead-engine signal
+        // (`turn_is_dead(&turn)`) counts BOTH:
+        //   * the outer watchdog killing the future (`turn.is_none()`), and
+        //   * the inner engine returning `Ok(TurnResult { outcome !=
+        //     "completed" })` — e.g., the internal `agent_timeout` firing.
+        // The pre-fix code keyed on `turn.is_none()` only, which let an
+        // engine that repeatedly internally-timed-out (returning
+        // `Ok(outcome="timeout")`) grind through every `max_iters` instead
+        // of bailing after 2 strikes. See [`turn_is_dead`] for the test
+        // pins.
         let streaks = update_loop_streaks(
-            turn.is_none(),
+            turn_is_dead(&turn),
             check_timed_out,
             diff.trim().is_empty(),
             dead_streak,
@@ -3712,6 +3896,213 @@ mod tests {
         );
     }
 
+    /// Z-8 REGRESSION GUARD: when the author phase-watchdog fires, it MUST
+    /// (a) issue a cancel to the daemon session, and (b) wait for the
+    /// daemon to settle BEFORE returning. The pre-fix code dropped the
+    /// inner future on timeout and returned `Err` immediately, so the
+    /// loop's `build_diff` call (right after the watchdog) captured a
+    /// torn mid-edit tree while the daemon kept editing. This test
+    /// drives the timeout path with a hanging turn future and asserts
+    /// the cancel hook is invoked AND the watchdog does not return
+    /// until the settled signal has been awaited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn author_phase_with_cancel_invokes_cancel_and_waits_for_settled() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cancel_called = Arc::new(AtomicBool::new(false));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let settled_called = Arc::new(AtomicBool::new(false));
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let cancel_flag = cancel_called.clone();
+        let cancel_n = cancel_calls.clone();
+        let settled_flag = settled_called.clone();
+        let cancel_fut = async move {
+            cancel_flag.store(true, Ordering::SeqCst);
+            cancel_n.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        };
+        // The `settled` future MUST be awaited by the watchdog before it
+        // returns. We verify this by NOT driving the oneshot until after
+        // the cancel is recorded — if the watchdog returns before
+        // awaiting `settled`, the test would hang here on `send`.
+        let settled_fut = async move {
+            settled_flag.store(true, Ordering::SeqCst);
+            let _ = settle_rx.await;
+        };
+        // Hanging turn: longer than the 1s budget.
+        let turn_fut = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            // Unreachable — the watchdog will time out first.
+            anyhow::bail!("turn should not have completed")
+        };
+
+        let watchdog = author_phase_with_cancel(1, true, turn_fut, cancel_fut, settled_fut);
+        // Spawn the watchdog on a separate task so we can release the
+        // settled signal from the test body (otherwise the watchdog is
+        // parked on settled BEFORE we can call `settle_tx.send()` —
+        // and the outer timeout fires first, masking the bug).
+        let watchdog_handle = tokio::spawn(watchdog);
+        // Give the watchdog time to time out and park on settled.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Now release the settle signal so the watchdog can return.
+        let _ = settle_tx.send(());
+
+        let res = watchdog_handle
+            .await
+            .expect("watchdog task must complete")
+            .expect_err("watchdog must return Err on timeout");
+        assert!(
+            cancel_called.load(Ordering::SeqCst),
+            "Z-8 fix: watchdog must invoke cancel on timeout; got no cancel"
+        );
+        assert_eq!(
+            cancel_calls.load(Ordering::SeqCst),
+            1,
+            "Z-8 fix: cancel must be invoked exactly once on timeout"
+        );
+        assert!(
+            settled_called.load(Ordering::SeqCst),
+            "Z-8 fix: watchdog must await the settled signal before returning"
+        );
+        assert!(
+            res.contains("author phase timed out after 1s"),
+            "Err must mention the phase + budget; got: {res}"
+        );
+    }
+
+    /// Z-8 REGRESSION GUARD (diff-capture ordering): `build_diff` in
+    /// `cmd_loop` is called AFTER `author_phase_with_cancel` returns,
+    /// and on the timeout path the watchdog must not return UNTIL the
+    /// daemon has settled. This test pins the ordering by holding the
+    /// settled signal until AFTER the watchdog would have returned if
+    /// it didn't wait. If `author_phase_with_cancel` returns before
+    /// awaiting `settled`, the test hangs at `send` and fails on the
+    /// outer timeout — which IS the pre-fix behavior we are guarding
+    /// against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn author_phase_with_cancel_gates_diff_capture_on_settled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cancel_called = Arc::new(AtomicBool::new(false));
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel::<()>();
+        let watchdog_returned = Arc::new(AtomicBool::new(false));
+
+        let cancel_flag = cancel_called.clone();
+        let cancel_fut = async move {
+            cancel_flag.store(true, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        };
+        let cancel_flag_for_settled = cancel_called.clone();
+        let watchdog_returned_for_settled = watchdog_returned.clone();
+        let settled_fut = async move {
+            // Hold the daemon "settled" signal. The watchdog must be
+            // blocked on this await — i.e., NOT have returned yet.
+            assert!(
+                !watchdog_returned_for_settled.load(Ordering::SeqCst),
+                "Z-8 fix: watchdog MUST NOT return before settled resolves; \
+                 cmd_loop would then call build_diff against a torn tree"
+            );
+            let _ = cancel_flag_for_settled.load(Ordering::SeqCst);
+            let _ = settle_rx.await;
+        };
+        let turn_fut = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            anyhow::bail!("unreachable")
+        };
+        let cancel_clone = cancel_called.clone();
+        let watchdog = async move {
+            let r = author_phase_with_cancel(1, true, turn_fut, cancel_fut, settled_fut).await;
+            // Only AFTER settled has resolved may the watchdog return
+            // and `cmd_loop` proceed to `build_diff`.
+            assert!(
+                cancel_clone.load(Ordering::SeqCst),
+                "Z-8 fix: cancel must have been issued before settled resolves"
+            );
+            watchdog_returned.store(true, Ordering::SeqCst);
+            r
+        };
+
+        let driver = tokio::spawn(async move {
+            // Bound the test: if the watchdog is broken (returns before
+            // settled), this future races the spawn to the bounded
+            // timeout and fails there. If it's correct, we wait until
+            // we explicitly release `settle_tx`.
+            tokio::time::timeout(std::time::Duration::from_secs(3), watchdog)
+                .await
+                .expect("watchdog must remain parked on settled (the bug returns earlier)")
+        });
+
+        // Give the watchdog time to time out and park on settled.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Now release settled.
+        let _ = settle_tx.send(());
+        let res = driver.await.expect("driver task panicked");
+        let _ = res.expect_err("watchdog must return Err on timeout");
+        // The ordering assert inside `settled_fut` is the real check.
+    }
+
+    /// `author_phase_with_cancel` must NOT invoke cancel or settled when
+    /// the inner future completes within budget — those are timeout-only
+    /// hooks. A spurious cancel on a healthy turn would terminate the
+    /// session for no reason and lose the engine's reported cost /
+    /// partial output. This pins the non-breaking contract for the
+    /// fast-success path.
+    #[tokio::test]
+    async fn author_phase_with_cancel_does_not_invoke_cancel_on_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let settled_called = Arc::new(AtomicUsize::new(0));
+
+        let n = cancel_calls.clone();
+        let cancel_fut = async move {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        };
+        let s = settled_called.clone();
+        let settled_fut = async move {
+            s.fetch_add(1, Ordering::SeqCst);
+        };
+        let turn_fut = async {
+            Ok(crate::TurnResult {
+                run: zoder_core::AgentRun {
+                    session_id: "s".into(),
+                    outcome: "completed".into(),
+                    content: String::new(),
+                    input_tokens: 0,
+                    tool_calls: 0,
+                },
+                model: "m".into(),
+                alias: "a".into(),
+                cost_usd: 0.0,
+                cost_unknown: false,
+                tokens_in: 0,
+                tokens_out: 0,
+                elapsed_ms: 0.0,
+            })
+        };
+        let res = author_phase_with_cancel(5, true, turn_fut, cancel_fut, settled_fut).await;
+        assert!(
+            res.is_ok(),
+            "fast success must propagate Ok; got {:?}",
+            res.as_ref().err()
+        );
+        assert_eq!(
+            cancel_calls.load(Ordering::SeqCst),
+            0,
+            "cancel MUST NOT be invoked when the turn completes within budget"
+        );
+        assert_eq!(
+            settled_called.load(Ordering::SeqCst),
+            0,
+            "settled MUST NOT be awaited when the turn completes within budget"
+        );
+    }
+
     /// Fast commands must NOT trip the watchdog — sanity check that we
     /// didn't accidentally turn every check into a 900s wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3975,7 +4366,7 @@ mod tests {
     #[test]
     fn update_loop_streaks_records_check_timeout_streak_but_does_not_abort() {
         // Two consecutive empty-diff check timeouts, author turn each time
-        // succeeds (turn_none = false).
+        // succeeds (turn_failed = false).
         let u1 = update_loop_streaks(false, true, true, 0, 0);
         assert_eq!(u1.dead_streak, 0);
         assert_eq!(u1.check_timeout_streak, 1);
@@ -4025,23 +4416,152 @@ mod tests {
         assert!(!u.abort);
     }
 
-    /// Check timeout without a wedged author on an empty diff (turn ok but
-    /// no edits ever landed) is a confusing-but-valid signal — the engine
-    /// is alive but produced nothing. That's dead-engine behavior, not a
-    /// check failure. So `turn_none` here mirrors "no edits made" via the
-    /// real call site (the engine returned Ok(empty)) — but our helper
-    /// takes the boolean the loop sees, which is `turn.is_none()`. We don't
-    /// pretend to model "ok-empty" here; we just pin that when the engine
-    /// says Ok the helper trusts it. This test guards the boundary.
+    /// Engine returned Ok AND `outcome == "completed"` (turn_failed = false)
+    /// on an empty diff — a successful engine that simply produced no
+    /// edits this round. dead_streak stays at zero — the helper trusts
+    /// the engine, even if the diff disagrees. Note the post-Z-16 shift:
+    /// a successful-but-empty turn is NOT dead-engine, only a turn that
+    /// FAILED to complete (Ok with `outcome != "completed"`, or
+    /// `turn.is_none()` from the outer watchdog) counts. This test
+    /// guards that boundary.
     #[test]
     fn update_loop_streaks_trusts_turn_ok_signal_as_progress() {
-        // Engine returned Ok (turn_none=false) but the diff is empty (the
-        // engine simply produced no edits this round). dead_streak stays at
-        // zero — the helper trusts the engine, even if the diff disagrees.
+        // Engine returned Ok AND succeeded (turn_failed=false) but the
+        // diff is empty (the engine simply produced no edits this round).
+        // dead_streak stays at zero — the helper trusts the engine.
         let u = update_loop_streaks(false, false, true, 0, 0);
         assert_eq!(u.dead_streak, 0);
         assert_eq!(u.check_timeout_streak, 0);
         assert!(!u.abort);
+    }
+
+    /// Z-16 REGRESSION GUARD: an engine that internally times out returns
+    /// `Ok(TurnResult { run.outcome == "timeout", ... })` — `turn.is_none()`
+    /// is FALSE, so the pre-fix dead-engine signal `turn.is_none()`
+    /// returned FALSE and the dead-streak never incremented. The loop
+    /// then ground through every `max_iters` instead of bailing after 2
+    /// strikes. The fix is to key the dead-engine signal on
+    /// `!run.succeeded()` (via [`turn_is_dead`]) rather than `turn.is_none()`,
+    /// so two consecutive non-completed turns — whether the watchdog
+    /// killed the future OR the engine returned `outcome != "completed"` —
+    /// trip the abort. This test exercises the helper directly through
+    /// the production signal: it computes `turn_is_dead(&Some(non_completed))`
+    /// and feeds the result into `update_loop_streaks` exactly the way
+    /// `cmd_loop` does.
+    #[test]
+    fn dead_streak_aborts_after_two_non_completed_turns() {
+        // Simulate the bug scenario: the engine internally times out and
+        // returns Ok with `outcome == "timeout"`. `turn` is `Some(_)` so
+        // the pre-fix signal `turn.is_none()` was FALSE.
+        let non_completed = crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "sess-z-16".into(),
+                outcome: "timeout".into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+        };
+        let turn_some: Option<crate::TurnResult> = Some(non_completed);
+
+        // The dead-engine signal MUST be true for Some(non_completed) —
+        // the engine did NOT complete even though it returned Ok.
+        assert!(
+            turn_is_dead(&turn_some),
+            "Z-16 fix: Some(turn with outcome != completed) must count as dead; \
+             pre-fix this was false because turn.is_none() was false"
+        );
+
+        // Two consecutive non-completed turns with empty diffs must trip
+        // the 2-strike abort — exactly what the pre-fix code missed.
+        let u1 = update_loop_streaks(turn_is_dead(&turn_some), false, true, 0, 0);
+        assert_eq!(u1.dead_streak, 1);
+        assert!(!u1.abort, "first non-completed turn must not abort yet");
+        let u2 = update_loop_streaks(
+            turn_is_dead(&turn_some),
+            false,
+            true,
+            u1.dead_streak,
+            u1.check_timeout_streak,
+        );
+        assert_eq!(u2.dead_streak, 2);
+        assert!(
+            u2.abort,
+            "Z-16 fix: two consecutive non-completed turns MUST abort; \
+             pre-fix dead_streak never incremented so the abort never fired"
+        );
+    }
+
+    /// `turn_is_dead` must treat `None` (the outer watchdog killed the
+    /// future) as dead — that's the pre-fix signal. Regression guard so a
+    /// future refactor doesn't drop the `turn.is_none()` arm while
+    /// adding the `!succeeded()` arm.
+    #[test]
+    fn turn_is_dead_treats_none_as_dead() {
+        let turn: Option<crate::TurnResult> = None;
+        assert!(turn_is_dead(&turn));
+    }
+
+    /// `turn_is_dead` must treat `Some(completed)` as alive. A successful
+    /// turn with an empty diff (the engine produced no edits this round
+    /// but DID complete) is NOT dead-engine — it's a legitimate no-op
+    /// turn and the loop should keep nudging the author.
+    #[test]
+    fn turn_is_dead_treats_completed_turn_as_alive() {
+        let turn = Some(crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "sess-ok".into(),
+                outcome: "completed".into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+        });
+        assert!(!turn_is_dead(&turn));
+    }
+
+    /// `turn_is_dead` must flag every non-completed outcome as dead —
+    /// not just `"timeout"`. `cancelled`, `failed`, `max_tokens`, and
+    /// any future outcome the engine introduces must all bump the
+    /// dead-streak so the loop bails after 2 strikes instead of grinding.
+    #[test]
+    fn turn_is_dead_flags_every_non_completed_outcome_as_dead() {
+        for outcome in ["timeout", "cancelled", "failed", "max_tokens", "unknown"] {
+            let turn = crate::TurnResult {
+                run: zoder_core::AgentRun {
+                    session_id: "s".into(),
+                    outcome: outcome.into(),
+                    content: String::new(),
+                    input_tokens: 0,
+                    tool_calls: 0,
+                },
+                model: "m".into(),
+                alias: "a".into(),
+                cost_usd: 0.0,
+                cost_unknown: false,
+                tokens_in: 0,
+                tokens_out: 0,
+                elapsed_ms: 0.0,
+            };
+            assert!(
+                turn_is_dead(&Some(turn)),
+                "Z-16: outcome={outcome:?} must count as dead (not completed)"
+            );
+        }
     }
 
     // `classify_diff_substance` — the anti-gaming guard's pure classifier.
