@@ -25,6 +25,18 @@ use zoder_core::{
 
 use crate::{Engine, ReviewScope};
 
+#[cfg(test)]
+static TEST_BACKGROUND_WORKER_COMMAND: std::sync::Mutex<Option<(PathBuf, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static FAIL_NEXT_WRITE_META: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static LAST_BACKGROUND_CHILD_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// The exact utilization-store identity used by both agentic capture and the
 /// routing reader. ChatGPT subscription tiers use Codex's `x-codex-*` header
 /// family even when the configured provider id is simply `openai`; include the
@@ -4262,8 +4274,31 @@ pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
 
 fn write_meta(dir: &Path, meta: &JobMeta) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
+    #[cfg(test)]
+    if FAIL_NEXT_WRITE_META.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected write_meta failure").into());
+    }
     std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(meta)?)?;
     Ok(())
+}
+
+fn background_worker_invocation() -> anyhow::Result<(PathBuf, Vec<String>)> {
+    #[cfg(test)]
+    {
+        let guard = TEST_BACKGROUND_WORKER_COMMAND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((exe, args)) = guard.as_ref() {
+            return Ok((exe.clone(), args.clone()));
+        }
+    }
+
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--background")
+        .collect();
+    Ok((exe, args))
 }
 
 fn configure_background_worker_command(
@@ -4296,31 +4331,31 @@ pub(crate) fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String>
     let dir = jobs_dir().join(&id);
     std::fs::create_dir_all(&dir)?;
 
-    let exe = std::env::current_exe().context("locating current executable")?;
-    let args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "--background")
-        .collect();
+    let (exe, args) = background_worker_invocation()?;
     let out = std::fs::File::create(dir.join("output.txt"))?;
     let err = out.try_clone()?;
     let mut command = Command::new(&exe);
     configure_background_worker_command(&mut command, &args, &dir, out, err);
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawning background worker {}", exe.display()))?;
+    #[cfg(test)]
+    LAST_BACKGROUND_CHILD_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
 
-    write_meta(
-        &dir,
-        &JobMeta {
-            id: id.clone(),
-            kind: kind.to_string(),
-            status: "running".into(),
-            cwd: cwd.to_string_lossy().to_string(),
-            pid: child.id(),
-            started: Utc::now(),
-            finished: None,
-        },
-    )?;
+    let meta = JobMeta {
+        id: id.clone(),
+        kind: kind.to_string(),
+        status: "running".into(),
+        cwd: cwd.to_string_lossy().to_string(),
+        pid: child.id(),
+        started: Utc::now(),
+        finished: None,
+    };
+    if let Err(err) = write_meta(&dir, &meta) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
     Ok(id)
 }
 
@@ -4732,6 +4767,31 @@ mod tests {
         raw.trim().parse::<u32>().ok().filter(|pid| *pid > 0)
     }
 
+    struct TestBackgroundWorkerCommandGuard {
+        previous: Option<(PathBuf, Vec<String>)>,
+    }
+
+    impl TestBackgroundWorkerCommandGuard {
+        fn new(exe: PathBuf, args: Vec<String>) -> Self {
+            let mut guard = TEST_BACKGROUND_WORKER_COMMAND
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = guard.replace((exe, args));
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestBackgroundWorkerCommandGuard {
+        fn drop(&mut self) {
+            let mut guard = TEST_BACKGROUND_WORKER_COMMAND
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = self.previous.take();
+            FAIL_NEXT_WRITE_META.store(false, std::sync::atomic::Ordering::SeqCst);
+            LAST_BACKGROUND_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn configure_background_worker_command_sets_own_process_group() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4756,6 +4816,49 @@ mod tests {
         assert_eq!(
             pgid, pid as libc::pid_t,
             "background worker must lead its own process group so pgid == pid"
+        );
+    }
+
+    #[test]
+    fn spawn_background_kills_child_when_meta_write_fails() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::EnvGuard::new(home_dir.path());
+        let _worker = TestBackgroundWorkerCommandGuard::new(
+            PathBuf::from("/bin/sleep"),
+            vec!["30".to_string()],
+        );
+        LAST_BACKGROUND_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+        FAIL_NEXT_WRITE_META.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err =
+            spawn_background("loop", &tmp_cwd()).expect_err("metadata write failure must surface");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected write_meta failure"),
+            "spawn_background must return the original write_meta error; got: {msg}"
+        );
+
+        let pid = LAST_BACKGROUND_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(pid > 0, "test must observe the spawned worker pid");
+
+        let mut gone = false;
+        for _ in 0..200 {
+            if !crate::jobs::pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !gone {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid as libc::pid_t, &mut status, 0);
+            }
+        }
+        assert!(
+            gone,
+            "spawn_background must kill and reap child pid {pid} after write_meta fails"
         );
     }
 
