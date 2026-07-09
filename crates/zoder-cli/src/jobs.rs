@@ -372,13 +372,11 @@ fn remove_recursive(path: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(path)
 }
 
-/// Y-20: a job's `id` is read from its own (attacker-writable) `meta.json`
-/// body, NOT the on-disk directory name (`read_dir_jobs` returns the body id).
-/// A crafted id like `../../.ssh` or `/etc/x` would make `dir.join(id)` escape
-/// the jobs dir and let `remove_recursive` delete an arbitrary path. Accept
-/// only a direct, separator-free child of `dir`: exactly one `Normal` path
-/// component — which excludes `..`, `.`, absolute roots, and prefixes — whose
-/// join stays a direct child of `dir`.
+/// Y-20 defense in depth: job readers canonicalize `id` to the on-disk
+/// directory name before prune sees it. Still accept only a direct,
+/// separator-free child of `dir`: exactly one `Normal` path component — which
+/// excludes `..`, `.`, absolute roots, and prefixes — whose join stays a
+/// direct child of `dir`.
 pub(crate) fn job_id_is_contained_child(dir: &Path, id: &str) -> bool {
     use std::path::Component;
     let mut comps = Path::new(id).components();
@@ -474,10 +472,9 @@ pub(crate) fn cmd_jobs_prune(cli: &crate::Cli, args: JobsPruneArgs) -> anyhow::R
         }
 
         let job_path = dir.join(&m.id);
-        // Y-20: never touch anything that isn't a direct child of the jobs
-        // dir. A crafted/corrupted meta.json `id` must not cause an
-        // out-of-tree delete — in dry-run OR live. Record it so the operator
-        // sees it was refused, never removed.
+        // Y-20 defense in depth: never touch anything that isn't a direct
+        // child of the jobs dir — in dry-run OR live. Record it so the
+        // operator sees it was refused, never removed.
         if !job_id_is_contained_child(&dir, &m.id) {
             outcomes.push(PruneOutcome {
                 id: m.id.clone(),
@@ -695,7 +692,7 @@ mod tests {
             kind: "test".to_string(),
             status: "done".to_string(),
             cwd: "/tmp".to_string(),
-            pid: 999_998, // not a live pid
+            pid: u32::MAX,
             started: Utc::now() - Duration::days(30),
             finished: Some(Utc::now()),
         };
@@ -760,6 +757,71 @@ mod tests {
         assert!(
             sentinel_dir.exists(),
             "Y-20: traversal target dir must survive"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+    }
+
+    #[test]
+    fn read_dir_jobs_uses_containing_dir_name_for_mismatched_meta_id() {
+        let root = fresh_temp_jobs_dir();
+        make_crafted_meta_job(&root, "decoy", "victim");
+
+        let got = agentic::read_dir_jobs(&root);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].id, "decoy",
+            "read_dir_jobs must use the containing directory name as the effective job id"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_uses_directory_name_not_mismatched_meta_id() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_path_buf();
+        std::env::set_var("ZODER_HOME", &home_path);
+        let jobs_dir = home_path.join("jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+
+        let victim = make_job(
+            &jobs_dir,
+            "victim",
+            "running",
+            std::process::id(),
+            Duration::seconds(0),
+            8,
+        );
+        let victim_sentinel = victim.join("output.txt");
+        make_crafted_meta_job(&jobs_dir, "decoy", "victim");
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "jobs",
+            "prune",
+            "--keep",
+            "0",
+            "--older-than",
+            "1s",
+        ])
+        .unwrap();
+        cmd_jobs_prune(&cli, prune_args(Some(0), Some("1s"), false, false)).expect("prune ok");
+
+        assert!(
+            victim_sentinel.exists(),
+            "prune must not delete the directory named only by the JSON id field"
+        );
+        assert!(
+            !jobs_dir.join("decoy").exists(),
+            "the stale mismatched entry is pruned by its actual directory name"
         );
 
         match prev {
@@ -850,6 +912,41 @@ mod tests {
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["newest", "mid", "oldest"]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_removes_matching_terminal_job_dir() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_path_buf();
+        std::env::set_var("ZODER_HOME", &home_path);
+        let jobs_dir = home_path.join("jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+
+        let matched = make_job(
+            &jobs_dir,
+            "matched",
+            "done",
+            u32::MAX,
+            Duration::days(30),
+            8,
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "jobs", "prune", "--older-than", "1s"]).unwrap();
+        cmd_jobs_prune(&cli, prune_args(None, Some("1s"), false, false)).expect("prune ok");
+
+        assert!(
+            !matched.exists(),
+            "normal matching id/directory jobs must still be pruned"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
     }
 
     #[test]
