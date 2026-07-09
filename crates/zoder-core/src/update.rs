@@ -25,7 +25,7 @@ pub fn current() -> &'static str {
 /// The one-liner that installs/updates to the latest release.
 pub fn install_command() -> String {
     format!(
-        "curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | sh",
+        "curl -fsSL https://raw.githubusercontent.com/{}/master/install.sh | sh",
         repo()
     )
 }

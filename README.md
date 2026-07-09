@@ -11,11 +11,11 @@ free-first, cost-governed, MNEMOS-first.**
 curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 ```
 
-Detects your OS/arch, verifies the SHA-256 checksum, and installs the
-version-matched trio — `zoder` (CLI), `zerocode` (TUI), `zeroclaw` (engine) — to
-`~/.local/bin`. Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
-Pin/automate: `… | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR=~/.local/bin sh`. Full
-options, manual, and source builds are [below](#install--build-targets).
+Detects your OS/arch, verifies the SHA-256 checksum, and installs the selected
+nightly channel build to `~/.local/bin` (`zoder`, plus `zerocode`/`zeroclaw` when
+published). Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
+Pin/automate: set `ZODER_CHANNEL=YYYY-MM-DD` or pass `--channel YYYY-MM-DD`.
+Full options, manual, and source builds are [below](#install--build-targets).
 
 **Quick usage:**
 
@@ -493,20 +493,30 @@ the by-model table.
 curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 ```
 
-Detects your OS/arch, downloads the version-matched trio for your platform,
-verifies the SHA-256 checksum, and installs `zoder` (CLI), `zerocode` (TUI), and
-`zeroclaw` (engine) to `~/.local/bin`.
+Detects your OS/arch, downloads the selected nightly channel build for your
+platform, verifies the SHA-256 checksum, and installs `zoder` (CLI) plus
+`zerocode` (TUI) and `zeroclaw` (engine) when those optional binaries are
+published for the channel.
 
-**Agent / non-interactive** (no prompts; pin the version + dir, fails with a
-machine-readable `zoder-install:` message on error):
+**Agent / non-interactive** (no prompts; pin the nightly channel + dir, exits
+nonzero on error):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh \
-  | ZODER_VERSION=v0.2.0 ZODER_BIN_DIR="$HOME/.local/bin" sh
+  | ZODER_CHANNEL=2026-07-09 ZODER_BIN_DIR="$HOME/.local/bin" sh
 ```
 
-Knobs: `ZODER_VERSION` (default `latest`), `ZODER_BIN_DIR` (default
-`~/.local/bin`), `ZODER_REPO`, `ZODER_NO_VERIFY=1` (skip checksum).
+The equivalent flag form:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh \
+  | sh -s -- --channel 2026-07-09 --bin-dir "$HOME/.local/bin"
+```
+
+Knobs: `ZODER_CHANNEL` / `--channel <name>` (default `master`; use `YYYY-MM-DD`
+to pin a nightly), `ZODER_BIN_DIR` / `--bin-dir <dir>` (default `~/.local/bin`),
+`ZODER_REPO` / `--repo <owner/repo>`, `ZODER_HOST` / `--host <host>`,
+`ZODER_NO_VERIFY=1` / `--no-verify`, `ZODER_NO_CORPUS=1` / `--no-corpus`.
 
 **Manual (tarball):** grab your platform's tarball from the GitHub **nightly**
 release <https://github.com/ncz-os/zoder/releases/tag/nightly> — refreshed every
