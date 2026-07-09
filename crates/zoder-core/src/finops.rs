@@ -189,7 +189,7 @@ fn median(nums: &[f64]) -> f64 {
     let mut s = nums.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let m = s.len() / 2;
-    if s.len() % 2 == 0 {
+    if s.len().is_multiple_of(2) {
         (s[m - 1] + s[m]) / 2.0
     } else {
         s[m]
