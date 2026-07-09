@@ -4289,6 +4289,7 @@ mod cli_switch_regression_tests {
     /// Pin the happy path: `--continue` with an existing latest session
     /// returns that session's id (NOT a freshly-minted empty one).
     #[test]
+    #[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
     fn continue_resolves_to_latest_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
@@ -4350,6 +4351,7 @@ mod cli_switch_regression_tests {
     /// An explicit --session id always wins over --continue (continuation
     /// is an implicit selection; explicit is unambiguous).
     #[test]
+    #[allow(deprecated)] // exercising the bare save() path in a single-process test fixture
     fn explicit_session_id_wins_over_continue() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");

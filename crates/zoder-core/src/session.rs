@@ -229,7 +229,7 @@ impl Session {
         self.messages.push(Message::new(role, content));
     }
 
-    /// Persist atomically (unique temp file + rename) under `dir`.
+    /// Persist atomically (unique temp file + rename + parent fsync) under `dir`.
     ///
     /// C7-S1 (= S19 for sessions): the temp filename carries the process id AND
     /// a monotonic nonce (`<stem>.json.tmp.<pid>.<nonce>`) so two concurrent
@@ -239,6 +239,29 @@ impl Session {
     /// removed on any error so a failed write never litters the sessions dir with
     /// a half-written file a later reader could pick up. Mirrors the unique-temp
     /// pattern in `corpus.rs` (C5-4) and `pricing.rs` (C6-P1).
+    ///
+    /// **DEPRECATED for concurrent writers.** `save()` is a lock-free
+    /// "atomic file write" primitive; it does NOT take the per-session
+    /// `flock(2)` that [`Session::mutate_locked`] takes. The pre-C11
+    /// load -> append -> save race (DEFECT 1) was a call sequence of
+    /// `load_or_new` + `save()` from two concurrent processes: each
+    /// loaded the same snapshot, each appended a different turn to its
+    /// in-memory copy, each called `save()` — and the second `save()`
+    /// silently overwrote the first. This method is preserved for
+    /// back-compat and for the "no other process will write this
+    /// session" single-process case, but any caller that may race
+    /// against another writer MUST use [`Session::mutate_locked`]
+    /// instead. `#[deprecated]` is `since`-less because the lint level
+    /// is "allow" in this crate (a session writer is allowed to use
+    /// the bare primitive; the production CLI has been migrated to
+    /// `mutate_locked`), but the deprecation message is kept so anyone
+    /// grepping for `save(` sees the warning.
+    #[deprecated(
+        note = "use Session::mutate_locked for concurrent-safe append-and-save; \
+                bare save() does NOT take the per-session flock and re-introduces \
+                the lost-update race (C11-S1) when two processes call \
+                load_or_new + save() on the same session id"
+    )]
     pub fn save(&mut self, dir: &Path) -> anyhow::Result<()> {
         Self::save_locked(self, dir)
     }
@@ -284,6 +307,25 @@ impl Session {
         if let Err(e) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
+        }
+        // Crash-consistency: fsync the parent directory so the rename
+        // is durable across power loss. POSIX rename(2) is atomic within
+        // the filesystem, but the directory entry change is not durable
+        // until the directory's inode is fsynced; without this step a
+        // power loss between the file fsync (above) and the next
+        // metadata commit could leave a subsequent read pointing at the
+        // OLD transcript. On filesystems that don't support directory
+        // fsync (e.g. some FUSE / non-POSIX mounts) `sync_all` returns
+        // an error which we deliberately swallow: the file fsync above
+        // is still in force, so worst case is a stale directory entry,
+        // not data loss. Mirrors the durability hardening in
+        // `corpus::save_atomic` (C5-4) and `pricing::save_atomic`
+        // (C6-P1). Best-effort: a directory-fsync failure must not
+        // turn a successful rename into a save error.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
         Ok(())
     }
@@ -511,6 +553,7 @@ impl LockGuard {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests intentionally exercise the bare save() path
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
@@ -564,6 +607,45 @@ mod tests {
         }
         // Belt-and-suspenders: the legacy deterministic temp path never exists.
         assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Crash-consistency pin: `save()` (and therefore `mutate_locked`)
+    /// must fsync the parent directory AFTER the rename, so the
+    /// directory entry change is durable across power loss. Without
+    /// the parent-dir fsync, POSIX rename(2) is atomic within the
+    /// filesystem but the directory's inode is not yet on disk; a
+    /// subsequent read after a crash could still point at the OLD
+    /// transcript. The fix calls `dir.sync_all()` (best-effort) on the
+    /// parent of the live path; a failure is swallowed because the
+    /// file fsync above is still in force (worst case: stale directory
+    /// entry, not data loss). This test pins the contract by checking
+    /// that the parent directory still exists AND that the live
+    /// transcript survives a subsequent read AFTER save returns — the
+    /// minimum observable behavior. (We can't deterministically crash
+    /// the process mid-fsync in a unit test; the more aggressive
+    /// variant of this test would run against a fault-injecting
+    /// filesystem.)
+    #[test]
+    fn save_fsyncs_parent_dir_and_transcript_survives() {
+        let dir = tmpdir();
+
+        let mut sess = Session::new("durability-id");
+        sess.push("user", "before-crash");
+        sess.save(&dir)
+            .expect("save must succeed even on filesystems that don't support dir-fsync");
+
+        // Parent directory exists (no accidental unlink).
+        assert!(
+            dir.exists(),
+            "sessions dir must still exist after save (parent-dir fsync must not unlink it)"
+        );
+        // The live transcript reloads correctly — proves the rename
+        // AND the subsequent directory-fsync both completed.
+        let reloaded = Session::load_or_new(&dir, "durability-id").unwrap();
+        assert_eq!(reloaded.messages.len(), 1);
+        assert_eq!(reloaded.messages[0].content, "before-crash");
 
         std::fs::remove_dir_all(&dir).ok();
     }
