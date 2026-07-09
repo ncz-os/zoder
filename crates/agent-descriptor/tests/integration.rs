@@ -343,3 +343,109 @@ fn consumer_rejects_unsupported_transport() {
         "expected UnsupportedTransport, got {err:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// C4-AD1 / C4-AD2 (schema<->struct authority reconciliation).
+//
+// Two validation entry points MUST agree on the same set of accepted
+// documents:
+//   * `validate_v1`        — JSON-Schema only (offered as a standalone check),
+//   * `validate_and_parse` — JSON-Schema *then* typed serde deserialize.
+//
+// Historically the schema was laxer than the `ConfigSurface`/conformance
+// contract: an L2 descriptor could omit `config_surface`, and a
+// `config_surface` could omit `source`/`schema` — both passed `validate_v1`
+// but the second failed the typed parse. These tests pin the reconciled,
+// stricter behavior.
+// ----------------------------------------------------------------------------
+
+/// A minimal, schema-valid L1 descriptor (no config_surface) as a JSON value.
+/// Callers mutate `conformance_level` / `config_surface` to build the cases.
+fn minimal_l1_descriptor() -> Value {
+    serde_json::json!({
+        "id": "ncz-os:agent-descriptor:probe:v1",
+        "name": "probe",
+        "agent_id": "ncz-os/probe",
+        "version": "0.0.1",
+        "schema_version": 1,
+        "conformance_level": 1,
+        "connection": {
+            "transport": "stdio",
+            "endpoint": { "kind": "path", "path": "/usr/bin/probe" },
+            "auth": null
+        },
+        "capabilities": { "acp_capable": true }
+    })
+}
+
+#[test]
+fn l1_without_config_surface_still_validates_and_parses() {
+    let d = minimal_l1_descriptor();
+    validate_v1(&d).expect("baseline L1 (no config_surface) must remain valid");
+    validate_and_parse(&d).expect("baseline L1 must also parse");
+}
+
+#[test]
+fn c4_ad1_l2_without_config_surface_now_fails_validate_v1() {
+    // conformance_level 2 with NO config_surface: previously passed
+    // validate_v1 (violating the ADR contract); must now FAIL the schema.
+    let mut d = minimal_l1_descriptor();
+    d["conformance_level"] = serde_json::json!(2);
+    // (no config_surface key)
+
+    let schema_err =
+        validate_v1(&d).expect_err("C4-AD1: L2 without config_surface must fail validate_v1");
+    // Both entry points must agree it is invalid.
+    let parse_err = validate_and_parse(&d)
+        .expect_err("C4-AD1: L2 without config_surface must fail validate_and_parse too");
+    let _ = (schema_err, parse_err);
+}
+
+#[test]
+fn c4_ad1_l2_with_null_config_surface_now_fails_validate_v1() {
+    // The `config_surface: null` branch must not satisfy the L2 requirement.
+    let mut d = minimal_l1_descriptor();
+    d["conformance_level"] = serde_json::json!(2);
+    d["config_surface"] = Value::Null;
+
+    validate_v1(&d).expect_err("C4-AD1: L2 with config_surface:null must fail validate_v1");
+}
+
+#[test]
+fn c4_ad2_config_surface_missing_source_schema_now_fails_validate_v1() {
+    // `{"config_surface": {"knobs": []}}` previously passed validate_v1 but
+    // failed the typed parse (serde requires `source` + `schema`). The schema
+    // now requires them too, so BOTH entry points reject it consistently.
+    let mut d = minimal_l1_descriptor();
+    d["conformance_level"] = serde_json::json!(2);
+    d["config_surface"] = serde_json::json!({ "knobs": [] });
+
+    validate_v1(&d)
+        .expect_err("C4-AD2: config_surface missing source/schema must now fail validate_v1");
+    validate_and_parse(&d)
+        .expect_err("C4-AD2: config_surface missing source/schema must fail validate_and_parse");
+}
+
+#[test]
+fn c4_ad2_fully_valid_l2_descriptor_still_passes_both_entry_points() {
+    // A complete L2 descriptor (config_surface with source + schema + knobs)
+    // must pass validate_v1 AND deserialize — the two authorities agree.
+    let mut d = minimal_l1_descriptor();
+    d["conformance_level"] = serde_json::json!(2);
+    d["config_surface"] = serde_json::json!({
+        "source": "toml",
+        "schema": { "type": "object" },
+        "knobs": [
+            {
+                "name": "default_provider",
+                "kind": "string",
+                "required": true
+            }
+        ]
+    });
+
+    validate_v1(&d).expect("fully-valid L2 descriptor must pass validate_v1");
+    let parsed = validate_and_parse(&d).expect("fully-valid L2 descriptor must parse");
+    assert_eq!(parsed.conformance_level, ConformanceLevel::L2);
+    assert!(parsed.config_surface.is_some());
+}

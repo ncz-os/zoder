@@ -174,4 +174,36 @@ mod tests {
         v.as_object_mut().unwrap().remove("config_surface");
         validate_v1(&v).expect("L1 should not require config_surface");
     }
+
+    #[test]
+    fn c4_ad1_l2_requires_config_surface() {
+        // C4-AD1: an L2 descriptor with NO config_surface must fail the schema
+        // (previously it passed, violating the ADR contract).
+        let mut v = minimal_descriptor(ConformanceLevel::L2);
+        v.as_object_mut().unwrap().remove("config_surface");
+        let err = validate_v1(&v).expect_err("L2 without config_surface must fail validate_v1");
+        assert!(matches!(err, ValidationError::Schema { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn c4_ad1_l2_rejects_null_config_surface() {
+        // C4-AD1: `config_surface: null` does not satisfy the L2 requirement.
+        let mut v = minimal_descriptor(ConformanceLevel::L2);
+        v["config_surface"] = json!(null);
+        let err = validate_v1(&v).expect_err("L2 with config_surface:null must fail validate_v1");
+        assert!(matches!(err, ValidationError::Schema { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn c4_ad2_config_surface_requires_source_and_schema() {
+        // C4-AD2: the schema now mirrors the ConfigSurface struct (serde
+        // requires `source` + `schema`). A config_surface with only `knobs`
+        // used to pass validate_v1 but fail the typed parse; now both agree.
+        let mut v = minimal_descriptor(ConformanceLevel::L2);
+        v["config_surface"] = json!({ "knobs": [] });
+        validate_v1(&v)
+            .expect_err("config_surface missing source/schema must now fail validate_v1");
+        validate_and_parse(&v)
+            .expect_err("config_surface missing source/schema must fail validate_and_parse");
+    }
 }

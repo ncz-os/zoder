@@ -72,6 +72,19 @@
       "default": {}
     }
   },
+  "allOf": [
+    {
+      "description": "conformance_level 2 mandates a config_surface (the ncz-os ADR contract); the `config_surface: null` branch is rejected because a null surface at L2 is not a real config surface.",
+      "if": {
+        "properties": { "conformance_level": { "const": 2 } },
+        "required": ["conformance_level"]
+      },
+      "then": {
+        "required": ["config_surface"],
+        "properties": { "config_surface": { "type": "object" } }
+      }
+    }
+  ],
   "$defs": {
     "connection": {
       "type": "object",
@@ -185,7 +198,7 @@
     "config_surface": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["knobs"],
+      "required": ["source", "schema", "knobs"],
       "properties": {
         "source": {
           "description": "How the agent loads its configuration file (json / toml / yaml / env).",
