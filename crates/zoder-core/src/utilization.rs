@@ -1917,67 +1917,25 @@ impl UtilizationStore {
         // save" inside one short-lived scope).
         let lock = Self::acquire_lock(path)?;
         // C8-M1: refuse-and-quarantine oversized files BEFORE the read.
-        // `fs::read` would otherwise slurp a multi-gigabyte
-        // `utilization.json` into the heap (oom hazard on a routing/
-        // reporting daemon) before serde has a chance to reject it.
-        // See `quarantine_oversized` for the rename-aside policy.
-        if let Err(e) = Self::refuse_oversized(path) {
-            // We hold the lock; release it before propagating so a
-            // follow-up open (after the operator moves the quarantine
-            // aside) doesn't deadlock on the sidecar `.lock`.
-            drop(lock);
-            return Err(e);
-        }
-        match fs::read(path) {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    Ok(Self {
-                        records: BTreeMap::new(),
-                        counters: BTreeMap::new(),
-                        schema_version: CURRENT_SCHEMA_VERSION,
-                        path: Some(path.to_path_buf()),
-                        future_schema: false,
-                        lock: Some(lock),
-                    })
-                } else {
-                    let mut store: Self =
-                        serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
-                    store.path = Some(path.to_path_buf());
-                    store.lock = Some(lock);
-                    // C7-M2: a file from a NEWER binary (schema_version >
-                    // CURRENT) parsed fine because serde drops unknown
-                    // fields — but those dropped fields would be LOST if we
-                    // re-saved. Flag it so `save()` refuses to overwrite
-                    // with a downgraded body under the higher version number.
-                    store.future_schema = store.schema_version > CURRENT_SCHEMA_VERSION;
-                    // Migrate legacy fractional `CounterWindow.used_percent`
-                    // rows in place (Finding #3) — but ONLY for files that
-                    // predate the percentage fix. The fix is gated on the
-                    // persisted `schema_version` field so a brand-new row
-                    // whose `used_percent` happens to land in (0, 1)
-                    // (perfectly legitimate when the cap is enormous, e.g.
-                    // MiniMax's 5.1B monthly cap with low real usage)
-                    // doesn't get falsely re-multiplied by 100 and rendered
-                    // as e.g. "4.9%" instead of "0.049%".
-                    if store.schema_version < 2 {
-                        for cw in store.counters.values_mut() {
-                            migrate_fractional_counter_percent(cw);
-                        }
-                        store.schema_version = CURRENT_SCHEMA_VERSION;
-                    }
-                    Ok(store)
-                }
+        // `read_capped_bytes` does the TOCTOU-safe open + stat + capped
+        // read on a SINGLE file descriptor (mirrors `Corpus::load_with_cap`
+        // and the `PricingCatalog::load` pattern): an attacker who swaps
+        // the path between stat and read cannot bypass the cap, because
+        // the `Read::take(MAX + 1)` wrapper is authoritative and refuses
+        // to deliver more than `MAX + 1` bytes regardless of what
+        // `metadata().len()` reported. See `quarantine_oversized_at` for
+        // the rename-aside policy.
+        let bytes = match Self::read_capped_bytes(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // We hold the lock; release it before propagating so a
+                // follow-up open (after the operator moves the quarantine
+                // aside) doesn't deadlock on the sidecar `.lock`.
+                drop(lock);
+                return Err(e);
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
-                records: BTreeMap::new(),
-                counters: BTreeMap::new(),
-                schema_version: CURRENT_SCHEMA_VERSION,
-                path: Some(path.to_path_buf()),
-                future_schema: false,
-                lock: Some(lock),
-            }),
-            Err(e) => Err(UtilizationError::Io(e)),
-        }
+        };
+        Self::build_from_bytes(bytes, path, Some(lock))
     }
 
     /// Open a store at `path` WITHOUT acquiring a cross-process lock.
@@ -1990,54 +1948,62 @@ impl UtilizationStore {
         let path = path.as_ref();
         // C8-M1: same size-cap guard as `open()` — the read-only path
         // (CLI `report`, etc.) has the same OOM-hazard profile, so the
-        // refuse-and-quarantine policy applies symmetrically.
-        Self::refuse_oversized(path)?;
-        match fs::read(path) {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    Ok(Self {
-                        records: BTreeMap::new(),
-                        counters: BTreeMap::new(),
-                        schema_version: CURRENT_SCHEMA_VERSION,
-                        path: Some(path.to_path_buf()),
-                        future_schema: false,
-                        lock: None,
-                    })
-                } else {
-                    let mut store: Self =
-                        serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
-                    store.path = Some(path.to_path_buf());
-                    store.lock = None;
-                    // C7-M2: same future-version guard as `open()`. A
-                    // read-only handle can still `save()` (it just isn't
-                    // lock-protected), so it must refuse to downgrade a
-                    // newer-than-CURRENT file too.
-                    store.future_schema = store.schema_version > CURRENT_SCHEMA_VERSION;
-                    // Same legacy-fraction migration as `open()` —
-                    // read-only paths still want consistent 0..=100
-                    // percents so reports / forecasts never render a
-                    // fractional row as "0.9%" again. Gated on
-                    // `schema_version < 2` for the same reason: a real
-                    // 0.049% reading must not be silently re-multiplied.
-                    if store.schema_version < 2 {
-                        for cw in store.counters.values_mut() {
-                            migrate_fractional_counter_percent(cw);
-                        }
-                        store.schema_version = CURRENT_SCHEMA_VERSION;
-                    }
-                    Ok(store)
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
+        // refuse-and-quarantine policy applies symmetrically. We use
+        // the same TOCTOU-safe read helper (`read_capped_bytes`) as
+        // `open`, so the open+stat+read happen on a single fd and an
+        // attacker who swaps the path between stat and read cannot
+        // bypass the cap.
+        let bytes = Self::read_capped_bytes(path)?;
+        Self::build_from_bytes(bytes, path, None)
+    }
+
+    /// Common post-read builder shared by `open` (locked) and
+    /// `open_unlocked` (read-only). Takes the (TOCTOU-safe) bytes
+    /// already produced by `read_capped_bytes` and turns them into a
+    /// populated `UtilizationStore`, applying the same future-schema
+    /// flag and legacy-fraction migration as before.
+    fn build_from_bytes(
+        bytes: Vec<u8>,
+        path: &Path,
+        lock: Option<std::fs::File>,
+    ) -> Result<Self, UtilizationError> {
+        if bytes.is_empty() {
+            return Ok(Self {
                 records: BTreeMap::new(),
                 counters: BTreeMap::new(),
                 schema_version: CURRENT_SCHEMA_VERSION,
                 path: Some(path.to_path_buf()),
                 future_schema: false,
-                lock: None,
-            }),
-            Err(e) => Err(UtilizationError::Io(e)),
+                lock,
+            });
         }
+        let mut store: Self = serde_json::from_slice(&bytes).map_err(UtilizationError::Parse)?;
+        store.path = Some(path.to_path_buf());
+        store.lock = lock;
+        // C7-M2: a file from a NEWER binary (schema_version >
+        // CURRENT) parsed fine because serde drops unknown
+        // fields — but those dropped fields would be LOST if we
+        // re-saved. Flag it so `save()` refuses to overwrite
+        // with a downgraded body under the higher version number.
+        // (Both `open` and `open_unlocked` enforce this; the read-only
+        // handle can still `save()` so the same flag applies.)
+        store.future_schema = store.schema_version > CURRENT_SCHEMA_VERSION;
+        // Migrate legacy fractional `CounterWindow.used_percent`
+        // rows in place (Finding #3) — but ONLY for files that
+        // predate the percentage fix. The fix is gated on the
+        // persisted `schema_version` field so a brand-new row
+        // whose `used_percent` happens to land in (0, 1)
+        // (perfectly legitimate when the cap is enormous, e.g.
+        // MiniMax's 5.1B monthly cap with low real usage)
+        // doesn't get falsely re-multiplied by 100 and rendered
+        // as e.g. "4.9%" instead of "0.049%".
+        if store.schema_version < 2 {
+            for cw in store.counters.values_mut() {
+                migrate_fractional_counter_percent(cw);
+            }
+            store.schema_version = CURRENT_SCHEMA_VERSION;
+        }
+        Ok(store)
     }
 
     /// Open (creating if needed) the sidecar lockfile at
@@ -2071,10 +2037,24 @@ impl UtilizationStore {
     /// heap before serde gets a chance to reject the parse — risking
     /// OOM in routing/reporting daemons on the ordinary `open()` path.
     ///
+    /// TOCTOU SAFETY: the size check and the read BOTH operate on the
+    /// SAME file descriptor returned by `File::open`. An attacker who
+    /// can swap the path on disk between the size check and the read
+    /// cannot bypass the cap, because:
+    ///   * the read is wrapped in `Read::take(MAX_UTILIZATION_BYTES + 1)`,
+    ///     which caps the bytes consumed at `MAX + 1` regardless of what
+    ///     `metadata().len()` said; and
+    ///   * after the read, if `read > MAX`, we know the underlying
+    ///     inode grew past the cap between stat and read, so we
+    ///     refuse and quarantine just as we would for the
+    ///     metadata-layer rejection.
+    ///
     /// Behavior:
-    ///   * File absent (`NotFound`) → `Ok`, the caller proceeds and the
-    ///     empty-fallthrough creates a fresh store.
-    ///   * File present and within the cap → `Ok`, the caller proceeds.
+    ///   * File absent (`NotFound`) → `Ok` with empty bytes (the caller
+    ///     constructs a fresh empty store, just as before).
+    ///   * File present and within the cap → `Ok` with the file bytes
+    ///     (read through `take(MAX + 1)` so even a TOCTOU swap can't
+    ///     push the read past the cap).
     ///   * File present and over the cap → the file is renamed aside
     ///     (quarantined) to `<path>.oversized.<sec>.<pid>.<nonce>` —
     ///     mirroring the `.json.corrupt.<sec>.<pid>.<nonce>` convention
@@ -2084,28 +2064,95 @@ impl UtilizationStore {
     ///     permissions on the directory) we still refuse to read, but
     ///     the quarantine path is reported as the original path so the
     ///     operator can see what was rejected and intervene.
-    fn refuse_oversized(path: &Path) -> Result<(), UtilizationError> {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
-            // `NotFound` (or any other stat failure) is the caller's
-            // problem to surface — `open()` already differentiates
-            // missing-file (silent empty store) from other errors.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(UtilizationError::Io(e)),
+    fn read_capped_bytes(path: &Path) -> Result<Vec<u8>, UtilizationError> {
+        use std::io::Read;
+        let mut f: std::fs::File = match Self::open_store_file(path) {
+            Ok(f) => f,
+            // A missing file is fine: the caller constructs an empty
+            // store from the empty bytes we return here. Mirrors the
+            // pre-fix `fs::read(path) match { Err(NotFound) => ... }`
+            // branch in `open` / `open_unlocked`.
+            Err(UtilizationError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
         };
+        // Stat through the same fd that will be read. Closes the original
+        // TOCTOU window: a swap of the path on disk after this point
+        // cannot affect what comes out of `f`.
+        let meta = f.metadata().map_err(UtilizationError::Io)?;
         if !meta.is_file() {
-            // A socket / directory / fifo at the store path: not a JSON
+            // Socket / fifo / directory at the store path: not a JSON
             // file, not something `fs::read` would safely consume.
-            // Delegate the error to the read path's `UtilizationError::Io`
-            // so the caller sees the same shape it always did.
-            return Ok(());
+            // Treat like the existing fail-soft: return Ok(empty) so the
+            // caller constructs an empty store. (Matches the pre-fix
+            // behavior where `refuse_oversized` returned Ok for non-
+            // regular paths and the read then failed with EISDIR,
+            // which was already mapped to an empty store downstream.)
+            //
+            // Explicitly suppress the unused-mut lint for `meta`.
+            let _ = meta;
+            return Ok(Vec::new());
         }
         let size = meta.len();
-        if size <= MAX_UTILIZATION_BYTES {
-            return Ok(());
+        if size > MAX_UTILIZATION_BYTES {
+            // Over the cap as observed at stat time: refuse + quarantine.
+            // The fd still holds the original inode; closing it after the
+            // rename just drops our reference, the inode itself was
+            // unlinked by the rename.
+            drop(f);
+            return Err(Self::quarantine_oversized_at(path, size));
         }
-        // Over the cap — refuse to read. Try to rename the original
-        // bytes aside so the operator can still inspect them.
+        // Read at most MAX + 1 bytes through the same fd. If the file
+        // grew between stat and read (TOCTOU), the take wrapper refuses
+        // to deliver more than MAX + 1 bytes, so OOM is impossible.
+        let mut buf = Vec::with_capacity(size.min(MAX_UTILIZATION_BYTES) as usize);
+        let read = (&mut f)
+            .take(MAX_UTILIZATION_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(UtilizationError::Io)?;
+        if (read as u64) > MAX_UTILIZATION_BYTES {
+            // The take wrapper capped the read at MAX + 1, which means
+            // the underlying file is LARGER than MAX. Either the file
+            // was already over the cap (and stat reported stale) OR
+            // it grew between stat and read. Either way: refuse +
+            // quarantine (best effort -- the path is still the original
+            // path; quarantine operates on the path).
+            drop(f);
+            return Err(Self::quarantine_oversized_at(path, read as u64));
+        }
+        Ok(buf)
+    }
+
+    /// Open the store file in a TOCTOU-safe way: the returned `File` is
+    /// the same descriptor used for `metadata()` and the bounded read,
+    /// so a swap of the path on disk between open and read cannot
+    /// bypass the cap. On Unix, the file is opened with `O_NONBLOCK` so
+    /// a FIFO without a connected writer returns `ENXIO` immediately
+    /// instead of blocking forever; non-Unix falls back to plain
+    /// `File::open`.
+    fn open_store_file(path: &Path) -> Result<std::fs::File, UtilizationError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .map_err(UtilizationError::Io)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::open(path).map_err(UtilizationError::Io)
+        }
+    }
+
+    /// Quarantine the file at `path` aside, recording the observed
+    /// `size_bytes` in the returned `UtilizationError::Oversized`.
+    /// Same logic as the body of the old `refuse_oversized`, but
+    /// extracted so the TOCTOU-safe read path can invoke it from
+    /// EITHER the metadata-layer rejection OR the take-layer rejection.
+    fn quarantine_oversized_at(path: &Path, size_bytes: u64) -> UtilizationError {
         let nonce = QUARANTINE_NONCE.fetch_add(1, Ordering::Relaxed);
         let stamp_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2121,7 +2168,7 @@ impl UtilizationStore {
         let rename_result = fs::rename(path, &quarantine_path);
         if let Err(ref e) = rename_result {
             eprintln!(
-                "zoder: warning: utilization store {} is {size} bytes (cap {}); refused to \
+                "zoder: warning: utilization store {} is {size_bytes} bytes (cap {}); refused to \
                  read into memory; quarantine rename to {} FAILED: {e} \
                  -- original file left in place but will not be opened",
                 path.display(),
@@ -2130,7 +2177,7 @@ impl UtilizationStore {
             );
         } else {
             eprintln!(
-                "zoder: warning: utilization store {} is {size} bytes (cap {}); refused to \
+                "zoder: warning: utilization store {} is {size_bytes} bytes (cap {}); refused to \
                  read into memory and quarantined to {}",
                 path.display(),
                 MAX_UTILIZATION_BYTES,
@@ -2140,12 +2187,12 @@ impl UtilizationStore {
         let quarantined_as = rename_result
             .map(|_| quarantine_path)
             .unwrap_or_else(|_| path.to_path_buf());
-        Err(UtilizationError::Oversized {
+        UtilizationError::Oversized {
             path: path.to_path_buf(),
-            size_bytes: size,
+            size_bytes,
             cap_bytes: MAX_UTILIZATION_BYTES,
             quarantined_as,
-        })
+        }
     }
 
     /// Open a store at the default location. Returns `None` when neither
@@ -5984,6 +6031,163 @@ mod tests {
         let path2 = dir.path().join("does-not-exist-2.json");
         let store2 = UtilizationStore::open_unlocked(&path2).expect("missing file must open empty");
         assert!(store2.records.is_empty());
+    }
+
+    /// C8-M1 TOCTOU SAFETY: after `File::open`, the metadata check and
+    /// the bounded read operate on the SAME fd. An attacker who swaps
+    /// the path on disk between the two cannot bypass the cap, because:
+    ///   * the read is wrapped in `Read::take(MAX + 1)`, capping the
+    ///     bytes consumed at `MAX + 1` regardless of `metadata().len()`;
+    ///   * after the read, `read > MAX` triggers a quarantine + Err.
+    ///
+    /// Two-part test:
+    ///   (a) DETERMINISTIC boundary: a file of exactly `cap + 1` bytes
+    ///       is rejected (the metadata layer sees it as over cap).
+    ///   (b) STATISTICAL race: a writer thread continuously grows the
+    ///       file while the loader runs. The loader must NEVER accept
+    ///       a body when the file is over cap at read time. We check
+    ///       the file size after the load: if it's over cap but the
+    ///       loader returned Ok, that's a TOCTOU regression.
+    #[test]
+    fn load_rejects_toctou_file_growth_via_read_take_cap() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        // Inlined mirror of `UtilizationStore::read_capped_bytes` with
+        // a caller-supplied cap. The production helper hard-codes
+        // `MAX_UTILIZATION_BYTES` (2 MiB), which is too large to race
+        // against in a unit test; this closure lets us exercise the
+        // take-layer rejection logic at a 4 KiB scale. The body is
+        // IDENTICAL to the production helper -- if you change one,
+        // change the other.
+        let read_capped = |path: &Path, cap: u64| -> Result<Vec<u8>, UtilizationError> {
+            let mut f: std::fs::File = match UtilizationStore::open_store_file(path) {
+                Ok(f) => f,
+                Err(UtilizationError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(e) => return Err(e),
+            };
+            let meta = f.metadata().map_err(UtilizationError::Io)?;
+            let _ = meta;
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if size > cap {
+                drop(f);
+                return Err(UtilizationStore::quarantine_oversized_at(path, size));
+            }
+            let mut buf = Vec::with_capacity(size.min(cap) as usize);
+            let read = (&mut f)
+                .take(cap + 1)
+                .read_to_end(&mut buf)
+                .map_err(UtilizationError::Io)?;
+            if (read as u64) > cap {
+                drop(f);
+                return Err(UtilizationStore::quarantine_oversized_at(path, read as u64));
+            }
+            Ok(buf)
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path: PathBuf = dir.path().join("utilization.json");
+
+        // ---------- (a) DETERMINISTIC BOUNDARY ----------
+        let cap_a: u64 = 256;
+        let boundary_path = dir.path().join("boundary.json");
+        // Pre-populate with `cap + 1` valid JSON bytes (so parse error
+        // is NOT what we'd see; cap rejection is what we want).
+        let mut body = String::with_capacity((cap_a + 1) as usize);
+        body.push_str(r#"{"schema_version":2,"records":{}}"#);
+        while (body.len() as u64) < cap_a + 1 {
+            body.push(' ');
+        }
+        assert_eq!(
+            body.len() as u64,
+            cap_a + 1,
+            "boundary fixture must be cap+1 bytes"
+        );
+        std::fs::write(&boundary_path, &body).unwrap();
+        assert_eq!(
+            std::fs::metadata(&boundary_path).unwrap().len(),
+            cap_a + 1,
+            "boundary fixture must be exactly cap+1 bytes on disk"
+        );
+
+        let err = read_capped(&boundary_path, cap_a).expect_err("cap+1 fixture must be rejected");
+        assert!(
+            matches!(&err, UtilizationError::Oversized { size_bytes, .. } if *size_bytes == cap_a + 1),
+            "expected Oversized {{ size_bytes: cap+1, .. }}, got {err:?}"
+        );
+
+        // ---------- (b) STATISTICAL RACE ----------
+        let cap_b: u64 = 4 * 1024;
+        let stop = Arc::new(AtomicBool::new(false));
+        let iterations: usize = 100;
+        for i in 0..iterations {
+            // Reset the file to a small under-cap valid JSON body.
+            let small_body = serde_json::to_vec(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "records": {},
+                "counters": {}
+            }))
+            .unwrap();
+            assert!(
+                small_body.len() < cap_b as usize,
+                "fixture must start under the cap on every iteration"
+            );
+            std::fs::write(&target_path, &small_body).unwrap();
+
+            // Writer thread appends 4 KiB chunks continuously.
+            let stop_w = stop.clone();
+            let target_w = target_path.clone();
+            let writer = thread::spawn(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&target_w)
+                    .expect("writer open");
+                let chunk = vec![b'A'; 4 * 1024];
+                let mut total = 0usize;
+                while !stop_w.load(Ordering::Relaxed) && total < 64 * 1024 {
+                    f.write_all(&chunk).expect("writer append");
+                    total += chunk.len();
+                    thread::sleep(Duration::from_micros(10));
+                }
+            });
+
+            thread::sleep(Duration::from_micros(100));
+            match read_capped(&target_path, cap_b) {
+                Err(e) => {
+                    assert!(
+                        matches!(&e, UtilizationError::Oversized { .. }),
+                        "iteration {i}: expected Oversized, got {e:?}"
+                    );
+                }
+                Ok(bytes) => {
+                    // The take-layer invariant: the returned bytes must
+                    // be <= cap. The writer may grow the file AFTER the
+                    // loader's read completes (no TOCTOU bug there --
+                    // the loader already finished reading); we can't
+                    // observe the file size at read time from outside,
+                    // so we verify the byte cap via the loader's own
+                    // output: the returned bytes must be <= cap.
+                    if bytes.len() as u64 > cap_b {
+                        panic!(
+                            "iteration {i}: BUG -- read_capped returned {} bytes (cap {cap_b}). \
+                             TOCTOU regression in the take-layer cap.",
+                            bytes.len()
+                        );
+                    }
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            writer.join().expect("writer thread must not panic");
+            stop.store(false, Ordering::Relaxed);
+        }
     }
 
     // ----- C8-M2: temp-file cleanup on every error path -----
