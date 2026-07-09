@@ -8185,8 +8185,7 @@ mod tests {
         engine_io.write_all(line.as_bytes()).await.unwrap();
         engine_io.flush().await.unwrap();
 
-        let early =
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut client).await;
+        let early = tokio::time::timeout(std::time::Duration::from_millis(50), &mut client).await;
         assert!(
             early.is_err(),
             "read_result_inner returned on a request-shaped frame before the response: {early:?}"
