@@ -345,7 +345,60 @@ pub struct Corpus {
 }
 
 impl Corpus {
+    /// Maximum trusted model-corpus size. Larger files are rejected before the
+    /// body is read so a misconfigured `corpus_path` pointing at a multi-GB JSON
+    /// can't OOM `Engine::load()`. The actual bundled corpus is ~1.6 MiB
+    /// (hundreds of models with descriptions and bench data); 8 MiB sits one
+    /// order of magnitude above real usage while staying bounded -- a typo'd
+    /// 64-bit `len()` would land in the `Err` path, not as an allocation.
+    const MAX_CORPUS_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+
+    /// Load a corpus from `path`, rejecting non-regular files (FIFO, socket,
+    /// device, directory) and any file larger than [`Self::MAX_CORPUS_BYTES`]
+    /// BEFORE the read so `Engine::load()` cannot hang on a FIFO or OOM on a
+    /// runaway JSON. Mirrors the size + is_file guard established in
+    /// `crates/zoder-core/src/pricing.rs` (`PricingCatalog::MAX_PRICE_BYTES`).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with_cap(path, Self::MAX_CORPUS_BYTES)
+    }
+
+    /// Internal loader that takes the byte cap as a parameter so tests can
+    /// override the production cap to prove the size guard fires without
+    /// requiring a multi-GB file. Production callers should use [`Self::load`].
+    /// `is_file()` and `len() > max_bytes` are checked against `std::fs::metadata`
+    /// BEFORE `read_to_string`, so a FIFO at `path` fails closed and an
+    /// oversized file never reaches the allocator.
+    fn load_with_cap(path: &Path, max_bytes: u64) -> anyhow::Result<Self> {
+        // Reject non-regular paths (FIFO / socket / device / directory) and
+        // oversized files BEFORE the read. `read_to_string` on a FIFO blocks
+        // forever; on a multi-GB file it OOMs. `metadata` reflects the path
+        // itself, not its target, so the guard is correct for symlinks too
+        // (a symlink to a giant file is still a regular file the kernel will
+        // happily read; a symlink to a FIFO is rejected -- both safe).
+        let meta = std::fs::metadata(path)
+            .map_err(|e| anyhow::anyhow!("corpus {}: cannot stat: {e}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "corpus {} is not a regular file (FIFO/socket/device/directory are not supported)",
+                path.display()
+            );
+        }
+        if meta.len() > max_bytes {
+            anyhow::bail!(
+                "corpus {} is {} bytes, which exceeds the {} byte cap ({} MiB); refusing to read into memory",
+                path.display(),
+                meta.len(),
+                max_bytes,
+                max_bytes / (1024 * 1024)
+            );
+        }
+        Self::load_unchecked(path)
+    }
+
+    /// Inner loader used once the size + is_file guards have passed. Splits the
+    /// cap-free path out so the production guard and the test override share
+    /// the exact same parsing/validation tail.
+    fn load_unchecked(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read corpus {}: {e}", path.display()))?;
         // Lenient parse: deserialize the models array element-by-element so one
@@ -839,6 +892,92 @@ mod corpus_io_tests {
         }
         // Belt-and-suspenders: the legacy deterministic temp path never exists.
         assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5-1: a moderately-sized fixture (well under the production 8 MiB cap) is
+    // rejected when the test uses a tighter cap, proving the size guard fires
+    // BEFORE the read. The same fixture loads Ok under the production cap, so
+    // we know the rejection is the cap firing and not content rejection. The
+    // error message must name the path, the cap, and the byte counts so an
+    // operator can diagnose a runaway corpus without re-running with --debug.
+    #[test]
+    fn load_rejects_oversized_under_test_cap_and_accepts_under_production_cap() {
+        let dir = tmpdir();
+        // Build a fixture with many small entries so the body is ~9 KiB -- well
+        // under MAX_CORPUS_BYTES (8 MiB) so production `load` accepts it, but
+        // over the 4 KiB test cap so the guard demonstrably fires. Using a
+        // moderately-sized fixture (vs. a multi-GB file) keeps the test cheap
+        // while still proving the cap-vs-content rejection.
+        let mut body = String::with_capacity(8 * 1024);
+        body.push_str(r#"{"source":"cap-test","models":["#);
+        for i in 0..200 {
+            if i > 0 {
+                body.push(',');
+            }
+            // Each entry is ~45 bytes; 200 entries ~9 KiB.
+            body.push_str(&format!(
+                r#"{{"id":"vendor/m{i:04}","host":"vendor","leaf":"m{i:04}"}}"#
+            ));
+        }
+        body.push_str("]}");
+        let on_disk = write_file(&dir, "corpus.json", &body);
+        let on_disk_size = std::fs::metadata(&on_disk).unwrap().len();
+        assert!(
+            on_disk_size > 4096 && on_disk_size < Corpus::MAX_CORPUS_BYTES,
+            "fixture must be over the test cap (4 KiB) and under the production cap (8 MiB); got {on_disk_size} bytes"
+        );
+
+        // 1) Tight cap -> Err naming the size violation, BEFORE any full read.
+        let err = Corpus::load_with_cap(&on_disk, 4096)
+            .expect_err("oversized fixture must be rejected under a 4 KiB cap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("byte cap"),
+            "error must name the size cap, got: {msg}"
+        );
+        assert!(
+            msg.contains(&on_disk.display().to_string()),
+            "error must name the path, got: {msg}"
+        );
+        assert!(
+            msg.contains("4096") && msg.contains(&on_disk_size.to_string()),
+            "error must name both the cap (4096) and the actual size ({on_disk_size}), got: {msg}"
+        );
+
+        // 2) Same fixture, production cap -> Ok with all 200 entries.
+        let c = Corpus::load(&on_disk).expect("fixture under 8 MiB must load Ok");
+        assert_eq!(c.models.len(), 200);
+        assert_eq!(c.count, 200);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // C5-1: a non-regular path (directory) is rejected with a clear error
+    // naming the path, BEFORE any read attempt. Without the is_file guard,
+    // `read_to_string` on a directory would either fail with a noisy OS error
+    // (Linux) or, in the FIFO case, hang forever -- the exact symptom the
+    // defect calls out. The directory case proves the guard exists; FIFOs
+    // are exercised by the same code path and would hang the test, so we
+    // skip a FIFO fixture deliberately.
+    #[test]
+    fn load_rejects_non_regular_path_with_clear_error() {
+        let dir = tmpdir();
+        // Point the loader at the directory itself. `read_to_string` on a
+        // directory would either error with EISDIR or, on some platforms,
+        // read the directory's raw bytes -- neither is what we want. The
+        // guard must trip on is_file() and bail with a clear message.
+        let err = Corpus::load(&dir).expect_err("loading a directory as a corpus must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a regular file"),
+            "error must name the path-type rejection reason, got: {msg}"
+        );
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "error must name the path, got: {msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
