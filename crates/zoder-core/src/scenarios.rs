@@ -1725,10 +1725,14 @@ mod tests {
     }
 
     #[test]
-    fn l4_sub_ranker_excludes_degraded_window_and_prefers_idle_observable() {
-        // A 95% degraded window on sub-a must NOT cause it to be
-        // dropped. With no other windows, sub-a is treated as headroom
-        // (Degraded-only => observable set empty => PreferSub).
+    fn l4_sub_ranker_degraded_only_sub_is_not_preferred() {
+        // Y-1 REGRESSION: this previously asserted the 95%-degraded sub was
+        // still picked ("Degraded-only => headroom => PreferSub"), which
+        // PINNED the bug. A sub observed at 95% whose telemetry has since
+        // gone stale must NOT be treated as headroom — decide_account now
+        // fails closed (FallBackToFree) for a previously-numeric all-degraded
+        // account, so the sub is no longer eligible and the picker declines
+        // it (caller falls back to free / another tier).
         let scenario = RouteScenario::balanced();
         let n = now();
         let degraded_only = view(
@@ -1744,8 +1748,6 @@ mod tests {
         );
         let cands = vec![candidate("sub-a", ProviderClass::Sub, 50.0)];
         let views = vec![Some(degraded_only)];
-        // Reviewer: sub only candidate -> PreferSub despite 95%
-        // degraded (the L4 "no observable signal = headroom" rule).
         assert_eq!(
             pick_candidate_for_role_with_account(
                 Role::Reviewer,
@@ -1757,8 +1759,8 @@ mod tests {
                 n,
             )
             .as_deref(),
-            Some("sub-a"),
-            "Degraded-only window must not demote a sub candidate"
+            None,
+            "Y-1: a previously-numeric but now all-degraded (stale) 95% sub must NOT be preferred (possibly exhausted)"
         );
     }
 
