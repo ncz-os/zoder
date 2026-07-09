@@ -869,22 +869,25 @@ pub async fn cancel_session(
 ) -> anyhow::Result<()> {
     // Cap the connect at the same `settle_budget` so a hung daemon
     // socket cannot add multi-second latency to the watchdog path.
+    let init_deadline = tokio::time::Instant::now() + settle_budget;
     let transport = EngineTransport::UnixSocket(socket.to_path_buf());
-    let conn = tokio::time::timeout(settle_budget, connect_transport(&transport))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "connecting to daemon at {} timed out after {settle_budget:?}",
-                socket.display()
-            )
-        })??;
+    let conn = tokio::time::timeout(
+        init_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        connect_transport(&transport),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "connecting to daemon at {} timed out after {settle_budget:?}",
+            socket.display()
+        )
+    })??;
     let mut reader = BufReader::new(conn.reader);
     let mut write_half = conn.writer;
 
     // initialize (the daemon requires this on every connection). Use the
     // remaining settle budget so a slow daemon can't extend the cancel
     // window past what the caller asked for.
-    let init_deadline = tokio::time::Instant::now() + settle_budget;
     write_frame(
         &mut write_half,
         &json!({
@@ -895,7 +898,10 @@ pub async fn cancel_session(
         }),
     )
     .await?;
-    let _ = read_result(&mut reader, "init").await?;
+    let remaining = init_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let _ = tokio::time::timeout(remaining, read_result(&mut reader, "init"))
+        .await
+        .map_err(|_| anyhow!("daemon did not respond to initialize within {settle_budget:?}"))??;
 
     // session/cancel — NOTIFICATION (no `id`), per ACP v1.
     // Y-2: the zeroclaw daemon (this fn's target: it connects to the engine
@@ -7993,6 +7999,54 @@ mod tests {
             elapsed < budget,
             "Z-8 HIGH: cancel_session must return its EOF diagnostic within \
              the settle budget; took {elapsed:?} vs budget {budget:?}"
+        );
+    }
+
+    /// HIGH-severity regression guard: a daemon can accept the cancel
+    /// connection and then stop responding before the `initialize` ack.
+    /// `cancel_session` is itself the watchdog cleanup path, so this
+    /// handshake read must be bounded by the same settle budget rather
+    /// than waiting forever.
+    #[tokio::test]
+    async fn cancel_session_times_out_when_initialize_response_never_arrives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, _write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let _ = release_rx.await;
+            }
+        });
+
+        let budget = Duration::from_millis(250);
+        let outer_timeout = Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        let raced =
+            tokio::time::timeout(outer_timeout, cancel_session(&socket, "sess-init", budget)).await;
+        let elapsed = start.elapsed();
+        let _ = release_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        let res = raced.expect(
+            "cancel_session must not hang when daemon accepts but never responds to initialize",
+        );
+        assert!(
+            res.is_err(),
+            "initialize response timeout must surface as Err, got Ok"
+        );
+        let err_text = format!("{:#}", res.unwrap_err());
+        assert!(
+            err_text.contains("initialize"),
+            "error should identify initialize timeout, got {err_text:?}"
+        );
+        assert!(
+            elapsed < outer_timeout,
+            "cancel_session must return before the test backstop; took {elapsed:?}"
         );
     }
 
