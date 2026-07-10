@@ -5293,11 +5293,18 @@ mod tests {
         // And a legitimate, in-bounds meta.json must still be
         // parsed end-to-end (regression guard against the cap
         // accidentally over-shooting).
+        // The JSON body's id must match the directory name: read_meta
+        // canonicalizes id from the containing directory (the
+        // filesystem identity), treating the body field as untrusted —
+        // see the jobs-prune confused-deputy fix. This fixture's intent
+        // is just "a legitimate in-bounds meta.json still round-trips",
+        // not the mismatch/canonicalization behavior itself (that has
+        // its own dedicated tests in jobs.rs).
         let good_job = dir.path().join("good-meta");
         std::fs::create_dir_all(&good_job).expect("mkdir good job dir");
-        write_meta(&good_job, &meta_for_test_id_pid("good-meta-id", 42)).expect("write good meta");
+        write_meta(&good_job, &meta_for_test_id_pid("good-meta", 42)).expect("write good meta");
         let parsed = read_meta(&good_job).expect("in-bounds meta.json must round-trip");
-        assert_eq!(parsed.id, "good-meta-id");
+        assert_eq!(parsed.id, "good-meta");
         assert_eq!(parsed.pid, 42);
     }
 
