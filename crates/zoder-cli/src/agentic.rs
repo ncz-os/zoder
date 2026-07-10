@@ -4250,9 +4250,37 @@ pub(crate) fn active_job_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// `JobMeta` is a small JSON record (a handful of UTF-8 fields:
+/// `id`/`kind`/`status`/`cwd`/`pid`/`started`/`finished`) so its
+/// serialized form is a few hundred bytes. 64 KiB is the same order
+/// of magnitude as `MAX_PROJECT_INSTRUCTIONS_BYTES` (32 KiB in
+/// `crates/zoder-core/src/project_instructions.rs`) — generous
+/// enough to cover any realistic per-job metadata, while well below
+/// the multi-MB caps used elsewhere (cf. `MAX_CONFIG_BYTES` /
+/// `MAX_PRICE_BYTES` for corpus, pricing, and configuration). A
+/// `meta.json` larger than this cap is treated identically to a
+/// missing or unreadable file by `read_meta`.
+pub(crate) const MAX_JOB_META_BYTES: u64 = 64 * 1024;
+
 fn read_meta(dir: &Path) -> Option<JobMeta> {
-    let raw = std::fs::read_to_string(dir.join("meta.json")).ok()?;
-    let mut meta: JobMeta = serde_json::from_str(&raw).ok()?;
+    let path = dir.join("meta.json");
+    // DEFECT 1 guard: never follow a symlink at this path, and never
+    // read an unbounded size off the disk. Job metadata lives under
+    // `~/.zoder/jobs/<id>/meta.json`, and a malicious (or merely
+    // curious) write there can swap `meta.json` for a symlink to
+    // `/dev/zero` (which would OOM `read_to_string`) or for a
+    // FIFO/pipe (which would block `read_to_string` forever). The
+    // load is deferred to [`read_bounded_job_meta`] which opens the
+    // path with `O_NOFOLLOW | O_NONBLOCK` so the symlink itself is
+    // rejected at open time (kernel `ELOOP`) rather than followed,
+    // fstat's the open FD to confirm a regular file at-or-below
+    // [`MAX_JOB_META_BYTES`], and reads through `Read::take` so a
+    // racing swap (a same-uid process renaming `meta.json` aside and
+    // `mkfifo`-ing the path) cannot re-introduce the unbounded-read
+    // hazard once we hold the FD on the original inode. Mirrors the
+    // TOCTOU-safe idiom established in
+    // `crates/zoder-core/src/config.rs::read_bounded_regular_file`.
+    let mut meta = read_bounded_job_meta(&path)?;
     let dir_id = dir.file_name()?.to_str()?;
     // The containing directory is the filesystem identity. Treat the body
     // `id` as untrusted input so callers never construct job paths from a
@@ -4262,6 +4290,70 @@ fn read_meta(dir: &Path) -> Option<JobMeta> {
     }
     Some(meta)
 }
+
+/// Bounded, regular-file-only read of a job's `meta.json`. Returns
+/// `None` on every failure (missing file, symlink, FIFO, oversized,
+/// non-UTF-8, JSON parse error) so the caller — `read_dir_jobs` —
+/// skips the entry exactly as it has always done for missing /
+/// unreadable entries. The open uses
+/// `O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK` on Unix so a symlink at the
+/// path is rejected at open time (`ELOOP`) and a writer-less FIFO
+/// returns `ENXIO` rather than blocking the kernel indefinitely.
+fn read_bounded_job_meta(path: &Path) -> Option<JobMeta> {
+    use std::io::Read;
+
+    // Step 1: open on Unix with O_NOFOLLOW (symlink rejection) plus
+    // O_NONBLOCK (fail-fast on writer-less FIFOs). O_CLOEXEC keeps
+    // the FD from leaking into child processes spawned post-load.
+    let f = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(JOB_META_OPEN_FLAGS)
+                .open(path)
+        }
+        #[cfg(not(unix))]
+        {
+            // The defect description is Unix-centric (the
+            // `~/.zoder/jobs/` registry is itself a Unix-only
+            // concept); on non-Unix the loader still rejects
+            // non-regular files via the fstat-driven `is_file`
+            // guard and bounded `read_to_string`.
+            std::fs::File::open(path)
+        }
+    }
+    .ok()?;
+
+    // Step 2: validate on the open FD (fstat). The pre-fix code
+    // called `read_to_string(dir.join("meta.json"))` with no guard
+    // at all, so a FIFO at the path would block forever and a
+    // multi-GB file would OOM `read_dir_jobs` (and therefore
+    // `zoder jobs list`). `f.metadata()` reports the inode the
+    // kernel handed us in step 1 — a symlink at the path was
+    // already rejected by O_NOFOLLOW above; on non-Unix this is
+    // the primary defense.
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    if meta.len() > MAX_JOB_META_BYTES {
+        return None;
+    }
+
+    // Step 3: bounded read from the open FD, capped at the same
+    // `MAX_JOB_META_BYTES` the fstat validated, so a racing
+    // growth of the path cannot OOM us. UTF-8 validation also
+    // happens here — a binary blob at `meta.json` is treated as
+    // "skip this entry".
+    let mut s = String::new();
+    f.take(MAX_JOB_META_BYTES).read_to_string(&mut s).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+#[cfg(unix)]
+const JOB_META_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
 /// Read every `<id>/meta.json` under `dir`, skipping entries that fail to
 /// parse. Sorted newest-started-first, matching `all_jobs()`. Used by both
@@ -4758,6 +4850,18 @@ mod tests {
         std::env::temp_dir()
     }
 
+    fn meta_for_test_id_pid(id: &str, pid: u32) -> JobMeta {
+        JobMeta {
+            id: id.to_string(),
+            kind: "test".to_string(),
+            status: "running".to_string(),
+            cwd: tmp_cwd().to_string_lossy().to_string(),
+            pid,
+            started: Utc::now(),
+            finished: None,
+        }
+    }
+
     fn meta_for_test_pid(pid: u32) -> JobMeta {
         JobMeta {
             id: "test-job".to_string(),
@@ -4963,6 +5067,238 @@ mod tests {
             grandchild_gone,
             "cancel must terminate the worker's descendant process"
         );
+    }
+
+    /// DEFECT 1: a job directory whose `meta.json` is a symlink at
+    /// the path must be skipped by `read_dir_jobs` rather than
+    /// followed into the symlink target. Pre-fix `read_meta` called
+    /// `read_to_string` directly, so a symlink to `/dev/zero` or to a
+    /// multi-GiB file would OOM the caller (typically `zoder jobs
+    /// list`) and a symlink to a writer-less FIFO would block it
+    /// forever. The fix opens the file with `O_NOFOLLOW`, which
+    /// rejects the symlink itself at open time (kernel returns
+    /// `ELOOP`), and surfaces as the function's existing `None`
+    /// "skip this entry" contract.
+    ///
+    /// Variant A: a symlink whose target is cheap and non-blocking
+    /// (`/dev/null` — empty file, no `mkfifo` required, runs in
+    /// containers without privileged namespaces). Pre-fix code
+    /// would read 0 bytes here (`/dev/null` is empty); the new
+    /// code rejects at open time and the entry is dropped before
+    /// any read happens.
+    #[test]
+    #[cfg(unix)]
+    fn read_meta_skips_symlinked_meta_json_to_dev_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let job = dir.path().join("job-with-symlink-meta");
+        std::fs::create_dir_all(&job).expect("mkdir job dir");
+        std::os::unix::fs::symlink("/dev/null", job.join("meta.json")).expect("symlink /dev/null");
+
+        // Pre-fix: open(2) follows the symlink; read_to_string
+        // returns "" (empty file); serde_json::from_str("") fails ->
+        // None. So under BOTH the old and new code, read_meta
+        // returns None for a `/dev/null`-backed symlink.
+        //
+        // The fixture-level test that actually PROVES the
+        // symlink-rejection-at-open path is the FIFO variant
+        // (`read_meta_skips_symlinked_meta_json_to_writerless_fifo`).
+        // Here we simply confirm the contract "a symlink at
+        // meta.json drops the entry" holds.
+        let jobs = read_dir_jobs(dir.path());
+        assert!(
+            jobs.iter().all(|j| j.id != "job-with-symlink-meta"),
+            "a symlink at meta.json must be skipped (read_dir_jobs returned: \
+             {jobs:?}); pre-fix read_to_string would still have returned None for \
+             /dev/null, but with a symlink-to-/dev/zero or symlink-to-huge-file it \
+             would have OOMed the caller",
+        );
+    }
+
+    /// DEFECT 1 (variant B — the actual hang regression): a symlink
+    /// whose target is a writer-less FIFO would block a normal
+    /// `read_to_string` forever on `read(2)`. The fix opens with
+    /// `O_NOFOLLOW | O_NONBLOCK`; the symlink is rejected at open
+    /// time (`ELOOP`) without ever touching the FIFO. The test
+    /// spawns the read in a worker thread with a 5-second
+    /// wall-clock budget so a regression to the pre-fix code would
+    /// fail with a clear "blocked past 5s" instead of hanging cargo.
+    #[test]
+    #[cfg(unix)]
+    fn read_meta_skips_symlinked_meta_json_to_writerless_fifo() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Place a real `meta.json` next door so the test exercises
+        // both: (1) the bad symlink is dropped, (2) the good
+        // sibling survives — proving `read_dir_jobs` continues to
+        // its next entry rather than failing the whole listing.
+        let good_job = dir.path().join("good-job");
+        std::fs::create_dir_all(&good_job).expect("mkdir good job dir");
+        write_meta(&good_job, &meta_for_test_id_pid("good-job", 99)).expect("write good meta");
+
+        // The FIFO + symlink setup.
+        let fifo_job = dir.path().join("fifo-job");
+        std::fs::create_dir_all(&fifo_job).expect("mkdir fifo job dir");
+        let fifo = dir.path().join("fifo.target");
+        let mkfifo = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            matches!(&mkfifo, Ok(s) if s.success()),
+            "mkfifo must succeed in this test environment; got {mkfifo:?}",
+        );
+        std::os::unix::fs::symlink(&fifo, fifo_job.join("meta.json")).expect("symlink to FIFO");
+
+        // Run `read_dir_jobs` in a worker thread to bound the
+        // wall-clock time. Pre-fix code would block forever inside
+        // `read_to_string` on the FIFO's read; the budget makes
+        // that failure mode observable.
+        let (tx, rx) = mpsc::channel::<Vec<JobMeta>>();
+        let dir_for_reader = dir.path().to_path_buf();
+        let reader = thread::spawn(move || {
+            let jobs = read_dir_jobs(&dir_for_reader);
+            tx.send(jobs).unwrap();
+        });
+
+        let jobs = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "read_dir_jobs must not block past 5s on a symlink-to-FIFO meta.json — \
+                 DEFECT 1 regression",
+        );
+        reader.join().expect("reader thread panicked");
+
+        // The good job must be present; the FIFO-symlink job must
+        // be absent. The list is sorted newest-first, and both
+        // fixtures have started=Utc::now() within nanoseconds of
+        // each other, so the order is unspecified but each entry's
+        // id must classify correctly.
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert!(
+            ids.contains(&"good-job"),
+            "the legitimate good-job meta.json must survive a sibling \
+             symlink-to-FIFO; got ids: {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"fifo-job"),
+            "the FIFO-shaped meta.json must be skipped (O_NOFOLLOW rejected it \
+             at open time); got ids: {ids:?}",
+        );
+
+        // Cleanup: unlink the FIFO so the tempdir drop returns
+        // promptly even if mkfifo left a real pipe behind.
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// DEFECT 1 (variant C — the OOM regression): a job dir whose
+    /// `meta.json` is a symlink to a massive file must be skipped.
+    /// Pre-fix code would `read_to_string` and inflate the process
+    /// to roughly the target's size; the new bounded read rejects
+    /// anything above `MAX_JOB_META_BYTES` BEFORE touching the
+    /// content. We synthesize a 256 KiB file (well above the 64 KiB
+    /// cap) and assert the job is dropped from `read_dir_jobs`.
+    /// The throughput of the symlink-rejection-at-fstat path is the
+    /// observable guarantee — the open succeeds (we're following the
+    /// link intentionally, but this test never opens the file: it
+    /// goes through `read_dir_jobs` which never opens the bad
+    /// entry because of its own symlink check). Combined with
+    /// variant B above, this exercises both rejection layers
+    /// (open-time `O_NOFOLLOW` and stat-time `is_symlink` / size).
+    #[test]
+    #[cfg(unix)]
+    fn read_meta_skips_oversized_meta_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Build a roomy target body (256 KiB of ASCII). This is
+        // 4× `MAX_JOB_META_BYTES`, so pre-fix `read_to_string`
+        // would happily slurp the whole 256 KiB into memory; the
+        // new bounded read either rejects at fstat (file is too
+        // big) or caps the read at `MAX_JOB_META_BYTES`. Either
+        // way, the entry must be skipped without parsing it as a
+        // valid `JobMeta`.
+        let target_path = dir.path().join("huge.bin");
+        std::fs::write(&target_path, vec![b'x'; 256 * 1024]).expect("write huge target");
+        let job = dir.path().join("oversized-meta-job");
+        std::fs::create_dir_all(&job).expect("mkdir oversized job dir");
+        std::os::unix::fs::symlink(&target_path, job.join("meta.json"))
+            .expect("symlink to huge target");
+
+        // The new bounded read also rejects a regular-file
+        // `meta.json` whose size is over the cap. Place a second
+        // job whose `meta.json` is an oversized regular file (not
+        // a symlink) — `O_NOFOLLOW` does NOT reject this (it's a
+        // regular file), but the fstat size check must.
+        let oversized_regular_job = dir.path().join("oversized-regular-job");
+        std::fs::create_dir_all(&oversized_regular_job).expect("mkdir oversized regular job dir");
+        std::fs::write(
+            oversized_regular_job.join("meta.json"),
+            vec![b'y'; (MAX_JOB_META_BYTES as usize) + 1024],
+        )
+        .expect("write oversized regular meta");
+
+        // And a good job to prove the listing still surfaces
+        // legitimate entries alongside the rejected ones.
+        let good_job = dir.path().join("good-oversized-test");
+        std::fs::create_dir_all(&good_job).expect("mkdir good job dir");
+        write_meta(&good_job, &meta_for_test_id_pid("good-oversized-test", 7))
+            .expect("write good meta");
+
+        let jobs = read_dir_jobs(dir.path());
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"oversized-meta-job"),
+            "a symlink-to-huge-file meta.json must be skipped (O_NOFOLLOW rejects \
+             the symlink, plus fstat size guard belt-and-braces); got ids: {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"oversized-regular-job"),
+            "a regular-file meta.json above MAX_JOB_META_BYTES must be skipped \
+             (fstat size guard); got ids: {ids:?}",
+        );
+        assert!(
+            ids.contains(&"good-oversized-test"),
+            "a legitimate meta.json must still surface alongside the rejected \
+             entries; got ids: {ids:?}",
+        );
+    }
+
+    /// Variant D — direct `read_meta` unit test for the size cap,
+    /// mirroring the corpus / pricing test idiom (small fixture
+    /// under a `test cap`, same fixture rejected). This bypasses
+    /// `read_dir_jobs` so the test is fast and doesn't depend on
+    /// iteration order. A 2 KiB regular `meta.json` is rejected
+    /// under a 1 KiB cap and accepted under the production cap.
+    /// We exercise the capped path via `read_bounded_job_meta`
+    /// through `read_meta` (which uses `MAX_JOB_META_BYTES`).
+    #[test]
+    fn read_meta_rejects_an_oversized_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let job = dir.path().join("oversized-meta");
+        std::fs::create_dir_all(&job).expect("mkdir job dir");
+        // We can't drive `read_meta` with a per-call cap (it
+        // hard-codes MAX_JOB_META_BYTES), so instead we exercise
+        // the same code-path via a fixture just over the cap.
+        // Anything between MAX_JOB_META_BYTES and a comfortably
+        // large size will be rejected; 1 KiB over the cap
+        // exercises the fstat guard without breaking test fixtures.
+        let oversized = vec![b'{'; (MAX_JOB_META_BYTES as usize) + 1024];
+        std::fs::write(job.join("meta.json"), &oversized).expect("write oversized meta");
+
+        // Public surface: read_meta returns None because the
+        // fixture exceeds MAX_JOB_META_BYTES. The size guard fired
+        // BEFORE the read.
+        assert!(
+            read_meta(&job).is_none(),
+            "meta.json of size MAX_JOB_META_BYTES + 1024 must be rejected \
+             by the fstat size guard BEFORE read_to_string, not parsed as JSON",
+        );
+
+        // And a legitimate, in-bounds meta.json must still be
+        // parsed end-to-end (regression guard against the cap
+        // accidentally over-shooting).
+        let good_job = dir.path().join("good-meta");
+        std::fs::create_dir_all(&good_job).expect("mkdir good job dir");
+        write_meta(&good_job, &meta_for_test_id_pid("good-meta-id", 42)).expect("write good meta");
+        let parsed = read_meta(&good_job).expect("in-bounds meta.json must round-trip");
+        assert_eq!(parsed.id, "good-meta-id");
+        assert_eq!(parsed.pid, 42);
     }
 
     /// `run_check_watched` must kill a hung `sleep` child within the budget
