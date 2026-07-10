@@ -121,66 +121,288 @@ fn resolve_recipe_path(arg: &str) -> PathBuf {
     dir.join(arg)
 }
 
+/// Read a recipe file at `path` with the same regular-file + size-cap
+/// guards that `crate::config::read_bounded_regular_file` applies to the
+/// main zoder config. Two threat models converge here:
+///
+///   * A `.json` recipe file that is a symlink to `/dev/zero` (or any
+///     other device / FIFO / dangling symlink) would block or OOM the
+///     process on the previous `fs::read_to_string` call. Detecting the
+///     symlink with `symlink_metadata` — the same idiom `jobs.rs` uses
+///     to refuse symlinks in this crate — catches the case before any
+///     read is attempted. Non-symlink non-regular files (FIFOs,
+///     character devices, sockets) are caught by `is_file()` on the same
+///     metadata.
+///   * A `.json` recipe file that is several GiB would slurp into memory
+///     before parsing fails, risking OOM on a lightweight listing. The
+///     size is checked up front against `max_bytes`; the actual read is
+///     wrapped in `Read::take(max_bytes + 1)` so a file that grew
+///     between the stat and the read still cannot exceed the cap.
+///
+/// `max_bytes` is the upper bound the caller wants to enforce; pass
+/// `Config::MAX_CONFIG_BYTES` (2 MiB) to mirror the existing
+/// pricing/config cap convention for files that need the full body.
+fn read_recipe_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat recipe {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "recipe {} is a symlink; refusing to follow (it may point \
+             outside the recipes dir, e.g. to /dev/zero, and would hang or \
+             OOM the process)",
+            path.display()
+        );
+    }
+    if !meta.is_file() {
+        anyhow::bail!(
+            "recipe {} is not a regular file (FIFOs, devices, sockets, and \
+             other non-regular files are rejected before the read to avoid \
+             blocking or OOMing the process)",
+            path.display()
+        );
+    }
+    if meta.len() > max_bytes {
+        anyhow::bail!(
+            "recipe {} rejected — {} bytes exceeds {} byte limit",
+            path.display(),
+            meta.len(),
+            max_bytes
+        );
+    }
+
+    let f =
+        std::fs::File::open(path).with_context(|| format!("opening recipe {}", path.display()))?;
+    let mut s = String::new();
+    f.take(max_bytes + 1)
+        .read_to_string(&mut s)
+        .with_context(|| format!("reading recipe {}", path.display()))?;
+    Ok(s)
+}
+
 pub(crate) async fn cmd_recipe(cli: &crate::Cli, action: &RecipeCmd) -> anyhow::Result<()> {
     match action {
-        RecipeCmd::List => {
-            let dir = recipes_dir();
-            let mut found = false;
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                        found = true;
-                        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                        let prompt = std::fs::read_to_string(&p)
-                            .ok()
-                            .and_then(|raw| serde_json::from_str::<Recipe>(&raw).ok())
-                            .map(|r| r.prompt)
-                            .unwrap_or_default();
-                        let preview: String = prompt.chars().take(60).collect();
-                        println!("{name:24}  {preview}");
-                    }
-                }
-            }
-            if !found {
-                println!(
-                    "no recipes in {} (create <name>.json: {{\"prompt\":\"...\"}})",
-                    dir.display()
-                );
-            }
-            Ok(())
-        }
-        RecipeCmd::Show { file } => {
-            let path = resolve_recipe_path(file);
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading recipe {}", path.display()))?;
-            println!("{raw}");
-            Ok(())
-        }
-        RecipeCmd::Run { file } => {
-            let path = resolve_recipe_path(file);
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading recipe {}", path.display()))?;
-            let recipe: Recipe = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing recipe {} (expected JSON)", path.display()))?;
+        RecipeCmd::List => cmd_recipe_list(&recipes_dir()),
+        RecipeCmd::Show { file } => cmd_recipe_show(file),
+        RecipeCmd::Run { file } => cmd_recipe_run(cli, file).await,
+    }
+}
 
-            // Apply recipe overrides onto a cloned Cli.
-            let mut rcli = cli.clone();
-            if rcli.model.is_none() {
-                rcli.model = recipe.model.clone();
+/// `recipe list` entry point: locks stdout and delegates to the
+/// testable inner writer.
+fn cmd_recipe_list(dir: &Path) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    cmd_recipe_list_write(dir, &mut out)
+}
+
+/// Test-friendly core of `recipe list`: enumerates `<dir>/*.json`,
+/// prints `<name>  <first-60-chars-of-prompt>` per entry, and skips
+/// files that are not regular files or are oversized (the
+/// bounded-read guard). The defense matches `pricing.rs` /
+/// `config.rs`: a symlink-to-`/dev/zero` or a multi-GiB recipe would
+/// otherwise hang or OOM `zoder recipe list`.
+fn cmd_recipe_list_write<W: std::io::Write>(dir: &Path, out: &mut W) -> anyhow::Result<()> {
+    let mut found = false;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
             }
-            if rcli.agent.is_none() {
-                rcli.agent = recipe.agent.clone();
-            }
-            if rcli.cd.is_none() {
-                rcli.cd = recipe.cwd.clone();
-            }
-            if recipe.oneshot {
-                rcli.oneshot = true;
-            }
-            // Route through the same dispatcher as a bare prompt.
-            crate::cmd_exec(&rcli, Some(recipe.prompt)).await
+            found = true;
+            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+            // Bounded read — same cap convention as `recipe show` /
+            // `recipe run` (2 MiB). The pre-fix code called
+            // `read_to_string` unconditionally, which hangs on a
+            // symlink-to-/dev/zero and OOMs on a multi-GiB recipe.
+            // Only a 60-character preview is rendered, but the cap is
+            // deliberately larger than that so a legitimate recipe
+            // whose `prompt` field is large (which appears FIRST in
+            // the JSON because it is the first struct field) still
+            // parses cleanly. Parse failures are still tolerated the
+            // same way the pre-fix code tolerated them (empty
+            // preview), but a symlink / FIFO / device / oversized
+            // entry is warned-and-skipped rather than blocking the
+            // listing.
+            let raw = match read_recipe_file(&p, Config::MAX_CONFIG_BYTES) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("zoder: warning: skipping recipe {} — {:#}", p.display(), e);
+                    continue;
+                }
+            };
+            let prompt = serde_json::from_str::<Recipe>(&raw)
+                .map(|r| r.prompt)
+                .unwrap_or_default();
+            let preview: String = prompt.chars().take(60).collect();
+            writeln!(out, "{name:24}  {preview}")?;
         }
+    }
+    if !found {
+        writeln!(
+            out,
+            "no recipes in {} (create <name>.json: {{\"prompt\":\"...\"}})",
+            dir.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// `recipe show <file>` entry point. Resolves the path the same way
+/// the pre-fix code did, then reads it via the bounded regular-file
+/// helper so a symlink, FIFO, device, or oversized file is rejected
+/// with a clear error instead of hanging the CLI.
+fn cmd_recipe_show(file: &str) -> anyhow::Result<()> {
+    let path = resolve_recipe_path(file);
+    let raw = read_recipe_file(&path, Config::MAX_CONFIG_BYTES)
+        .with_context(|| format!("reading recipe {}", path.display()))?;
+    println!("{raw}");
+    Ok(())
+}
+
+/// `recipe run <file>` entry point. Same bounded read as
+/// `recipe show`; the full prompt body is needed downstream, so the
+/// cap mirrors `Config::MAX_CONFIG_BYTES` (2 MiB) — the same magnitude
+/// the existing `pricing.rs` / `config.rs` "small text file" caps use
+/// rather than inventing a new bound.
+async fn cmd_recipe_run(cli: &crate::Cli, file: &str) -> anyhow::Result<()> {
+    let path = resolve_recipe_path(file);
+    let raw = read_recipe_file(&path, Config::MAX_CONFIG_BYTES)
+        .with_context(|| format!("reading recipe {}", path.display()))?;
+    let recipe: Recipe = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing recipe {} (expected JSON)", path.display()))?;
+
+    // Apply recipe overrides onto a cloned Cli.
+    let mut rcli = cli.clone();
+    if rcli.model.is_none() {
+        rcli.model = recipe.model.clone();
+    }
+    if rcli.agent.is_none() {
+        rcli.agent = recipe.agent.clone();
+    }
+    if rcli.cd.is_none() {
+        rcli.cd = recipe.cwd.clone();
+    }
+    if recipe.oneshot {
+        rcli.oneshot = true;
+    }
+    // Route through the same dispatcher as a bare prompt.
+    crate::cmd_exec(&rcli, Some(recipe.prompt)).await
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::*;
+
+    fn write_recipe(dir: &Path, name: &str, prompt: &str) -> PathBuf {
+        let p = dir.join(format!("{name}.json"));
+        std::fs::write(&p, serde_json::json!({ "prompt": prompt }).to_string())
+            .expect("write recipe");
+        p
+    }
+
+    /// DEFECT: `recipe list` must not follow a symlink at a `.json`
+    /// candidate path — pre-fix `read_to_string` would follow it into
+    /// whatever the link points at (a writer-less FIFO would hang the
+    /// listing forever; `/dev/zero` would OOM it). The bounded reader
+    /// rejects the symlink itself via `symlink_metadata` before any
+    /// read is attempted, so the entry is skipped (with a stderr
+    /// warning) rather than followed.
+    #[test]
+    fn recipe_list_skips_symlinked_json_to_dev_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/dev/null", dir.path().join("evil.json"))
+            .expect("symlink /dev/null");
+        write_recipe(dir.path(), "good", "a real recipe prompt");
+
+        let mut out: Vec<u8> = Vec::new();
+        cmd_recipe_list_write(dir.path(), &mut out).expect("list must not error");
+        let text = String::from_utf8(out).expect("utf8 output");
+
+        assert!(
+            text.contains("good"),
+            "the legitimate recipe must still be listed: {text:?}"
+        );
+        assert!(
+            !text.contains("evil"),
+            "a symlinked recipe must be skipped, not followed: {text:?}"
+        );
+    }
+
+    /// DEFECT (oversized variant): a `.json` recipe file larger than
+    /// the bounded-read cap must be skipped by `recipe list` rather
+    /// than read in full. Pre-fix code had no size check at all.
+    #[test]
+    fn recipe_list_skips_oversized_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let huge_prompt = "a".repeat((Config::MAX_CONFIG_BYTES as usize) + 4096);
+        write_recipe(dir.path(), "toobig", &huge_prompt);
+        write_recipe(dir.path(), "good", "short prompt");
+
+        let mut out: Vec<u8> = Vec::new();
+        cmd_recipe_list_write(dir.path(), &mut out).expect("list must not error");
+        let text = String::from_utf8(out).expect("utf8 output");
+
+        assert!(
+            text.contains("good"),
+            "the legitimately sized recipe must still be listed: {text:?}"
+        );
+        assert!(
+            !text.contains("toobig"),
+            "an oversized recipe must be skipped rather than read in full: {text:?}"
+        );
+    }
+
+    /// Regression guard for the ordinary path: a well-formed, small
+    /// recipe file must list with its 60-character prompt preview,
+    /// matching pre-fix behavior for the common case.
+    #[test]
+    fn recipe_list_shows_prompt_preview_for_normal_recipe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_recipe(dir.path(), "normal", "fix the bug in the parser please");
+
+        let mut out: Vec<u8> = Vec::new();
+        cmd_recipe_list_write(dir.path(), &mut out).expect("list must not error");
+        let text = String::from_utf8(out).expect("utf8 output");
+
+        assert!(
+            text.contains("normal") && text.contains("fix the bug in the parser please"),
+            "normal recipe must list its name + prompt preview: {text:?}"
+        );
+    }
+
+    /// `recipe show` must refuse a symlinked recipe path with a clear
+    /// error rather than following it — same hazard as `list`, applied
+    /// to the single-file read path.
+    #[test]
+    fn recipe_show_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("evil.json");
+        std::os::unix::fs::symlink("/dev/null", &link).expect("symlink /dev/null");
+
+        let err = read_recipe_file(&link, Config::MAX_CONFIG_BYTES)
+            .expect_err("a symlinked recipe must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error must name the symlink hazard: {err:#}"
+        );
+    }
+
+    /// `read_recipe_file` must reject a file above the given cap
+    /// before reading its full contents.
+    #[test]
+    fn read_recipe_file_rejects_oversized_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("big.json");
+        std::fs::write(&p, "a".repeat(4096)).expect("write");
+
+        let err = read_recipe_file(&p, 1024).expect_err("a file over the cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeds") || err.to_string().contains("limit"),
+            "error must name the size limit: {err:#}"
+        );
     }
 }
 
