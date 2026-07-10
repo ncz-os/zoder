@@ -172,7 +172,7 @@ fn read_recipe_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
         );
     }
 
-    let mut f =
+    let f =
         std::fs::File::open(path).with_context(|| format!("opening recipe {}", path.display()))?;
     let mut s = String::new();
     f.take(max_bytes + 1)
