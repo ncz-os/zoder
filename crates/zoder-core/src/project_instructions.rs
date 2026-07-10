@@ -52,6 +52,20 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+/// Flags used when opening a project-instructions candidate file on Unix.
+/// `O_NOFOLLOW` rejects a symlink at the path at open time rather than
+/// following it into a FIFO / device. `O_NONBLOCK` makes an `open()` on a
+/// writer-less FIFO return `ENXIO` instead of blocking inside the kernel
+/// waiting for a writer that will never arrive (semantically a no-op on
+/// regular files). `O_CLOEXEC` keeps the FD from leaking into any child
+/// process spawned after the prompt load. Mirrors the established idiom
+/// in `crates/zoder-core/src/config.rs::CONFIG_OPEN_FLAGS`.
+#[cfg(unix)]
+const INSTRUCTIONS_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+
 /// Maximum bytes of project-instructions text injected into the
 /// prompt. Mirrors the `MAX_RESPONSE_BYTES` constant in `provider.rs`
 /// (same unit, same style), with the byte ceiling tuned for a real
@@ -120,15 +134,38 @@ const CANDIDATE_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// This function never returns `Err`; a degenerate input (missing
 /// file, blank file, binary blob) maps cleanly to `Ok(None)`. The
 /// CLI can therefore call it without `.with_context()` plumbing.
+///
+/// ## Defense against symlink / FIFO / OOM attacks on the candidate
+/// path
+///
+/// A previous implementation called `std::fs::read_to_string(&path)`
+/// without ever stat'ing `path`, so a symlink to `/dev/zero` or to
+/// an attacker-controlled FIFO would either block forever (FIFO) or
+/// inflate the process to the size of `/dev/zero` (unbounded). This
+/// function now defers the read to [`read_bounded_instructions_file`]
+/// which opens the file *once* on Unix with
+/// `O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK` (rejecting symlinks at open
+/// time and writer-less FIFOs without blocking), validates the open
+/// FD's `fstat()` is a regular file within
+/// [`MAX_PROJECT_INSTRUCTIONS_BYTES`] + 1 bytes, and reads through
+/// `Read::take` so a racing growth past the cap cannot OOM the
+/// process. The +1 preserves the boundary "exactly at the cap" vs.
+/// "just over the cap" that the existing [`cap_to_max`] logic keys
+/// on: a file whose trimmed content fits at-or-below the cap is not
+/// truncated; a file whose trimmed content would land above the cap
+/// gets the [`TRUNCATION_MARKER`] appended.
 pub fn load_project_instructions(repo_root: &Path) -> Option<String> {
     for filename in CANDIDATE_FILES {
         let path = repo_root.join(filename);
-        // `std::fs::read_to_string` invalidates on non-UTF-8 content;
-        // for the operator's convenience file we treat that as
-        // "no instructions" rather than a hard error.
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => continue,
+        // Read on a regular file of size <= `MAX + 1` bytes, or return
+        // `None` so the loop falls through to the next candidate
+        // filename. A symlink/FIFO/device at `path` is rejected at
+        // open time by `O_NOFOLLOW | O_NONBLOCK`; an oversized file is
+        // rejected by the fstat size check. See the helper's doc for
+        // the full rationale.
+        let raw = match read_bounded_instructions_file(&path) {
+            Some(s) => s,
+            None => continue,
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -138,9 +175,82 @@ pub fn load_project_instructions(repo_root: &Path) -> Option<String> {
             // shadow a real CLAUDE.md sitting next to it.
             continue;
         }
+        // Marker rule (parity with the pre-fix behavior; the bounded
+        // read above guarantees the file we just read is at most
+        // `MAX + 1` bytes UTF-8-clean, so the existing
+        // `cap_to_max` semantics for "exactly at the cap" vs. "over"
+        // are preserved byte-for-byte):
+        //   * `trimmed.len() > MAX`            -> cap_to_max kicks in
+        //     (`text.len() <= MAX` is false), marker is appended.
+        //   * `trimmed.len() <= MAX`           -> cap_to_max passes
+        //     through, no marker.
         return Some(cap_to_max(trimmed));
     }
     None
+}
+
+/// Read at most [`MAX_PROJECT_INSTRUCTIONS_BYTES`] + 1 bytes from
+/// `path`, refusing to follow symlinks or block on FIFOs.
+///
+/// On Unix the file is opened with `O_CLOEXEC | O_NOFOLLOW |
+/// O_NONBLOCK` so a symlink at the path is rejected at open time
+/// (rather than followed into a FIFO / device) and a writer-less FIFO
+/// returns `ENXIO` immediately instead of blocking the kernel
+/// indefinitely. The open FD's `fstat()` is then validated: not a
+/// regular file -> reject; size above
+/// `MAX_PROJECT_INSTRUCTIONS_BYTES + 1` -> reject. Reading uses
+/// `Read::take(max)` so even if a concurrent writer grows the file
+/// past the cap between the fstat and the read, the loader consumes
+/// at most the bound.
+///
+/// Returns `None` for *every* failure (missing path, permission
+/// denied, symlink, FIFO, device, oversized, non-UTF-8). The caller
+/// treats `None` as "skip this candidate filename", which is the
+/// pre-existing contract for `load_project_instructions`.
+fn read_bounded_instructions_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let max_bytes = (MAX_PROJECT_INSTRUCTIONS_BYTES + 1) as u64;
+
+    // Step 1: open on Unix with O_NOFOLLOW + O_NONBLOCK so a symlink
+    // at the path is rejected at open time rather than followed, and
+    // a writer-less FIFO returns ENXIO instead of blocking. O_CLOEXEC
+    // keeps the FD from leaking into any subsequent child process.
+    let f = {
+        #[cfg(unix)]
+        {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(INSTRUCTIONS_OPEN_FLAGS)
+                .open(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::open(path)
+        }
+    }
+    .ok()?;
+
+    // Step 2: validate on the open FD (fstat). A symlink at the path
+    // was already rejected by O_NOFOLLOW in step 1 on Unix; the
+    // fstat-driven `is_file()` guard is belt-and-braces and is the
+    // primary defense on non-Unix builds.
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    if meta.len() > max_bytes {
+        return None;
+    }
+
+    // Step 3: bounded read from the open FD. Even if a racing writer
+    // grows the file past `max_bytes` after the fstat, `Read::take`
+    // caps the bytes we will pull from THIS fd to the bound, so an
+    // OOM attack between the stat and the read is mechanically
+    // impossible.
+    let mut s = String::new();
+    f.take(max_bytes).read_to_string(&mut s).ok()?;
+    Some(s)
 }
 
 /// Truncate `text` to at most [`MAX_PROJECT_INSTRUCTIONS_BYTES`] bytes,
@@ -266,33 +376,48 @@ mod tests {
         );
     }
 
+    /// DEFECT 2: a project-instructions candidate whose file size
+    /// exceeds the bounded-read cap (the sum of
+    /// [`MAX_PROJECT_INSTRUCTIONS_BYTES`] + 1) must NOT trigger
+    /// truncation-with-marker. Per the `load_project_instructions`
+    /// contract, an oversized/non-regular file is treated identically
+    /// to a missing or unreadable file: the loader skips it and moves
+    /// on to the next candidate filename, so a runaway
+    /// `AGENTS.md`/`CLAUDE.md` at the repo root cannot OOM
+    /// `zoder exec`/`zoder run`.
+    ///
+    /// Variant A: an oversized `AGENTS.md` with no `CLAUDE.md`
+    /// fallback must surface as `None` (the loader dropped the
+    /// oversized file and found nothing else).
     #[test]
-    fn oversized_file_is_truncated_with_marker() {
-        // File = 4 * cap. The cap is on the TRIMMED text; we hand the
-        // loader a body that is already > cap and zero whitespace at
-        // the edges so `.trim()` is a no-op.
+    fn oversized_agents_md_with_no_fallback_returns_none() {
         let body: String = "a".repeat(4 * MAX_PROJECT_INSTRUCTIONS_BYTES);
         let (_dir, root) = with_repo(&[("AGENTS.md", &body)]);
-        let loaded = load_project_instructions(&root).expect("must be loaded");
-        // Head is exactly the cap, in bytes, taken on a char boundary
-        // (every char is ASCII 'a' so the boundary is exact).
-        let head_len = MAX_PROJECT_INSTRUCTIONS_BYTES;
-        let head = &loaded[..head_len];
-        assert!(
-            head.chars().all(|c| c == 'a'),
-            "truncated head must be the first {head_len} bytes verbatim",
-        );
-        assert!(
-            loaded.ends_with(TRUNCATION_MARKER),
-            "truncated output must end with the marker; got tail: {:?}",
-            &loaded[loaded.len() - TRUNCATION_MARKER.len() - 20..],
-        );
-        // Total length is cap + marker (no tail of the original body
-        // leaked past the cap).
         assert_eq!(
-            loaded.len(),
-            MAX_PROJECT_INSTRUCTIONS_BYTES + TRUNCATION_MARKER.len(),
-            "truncation must drop all bytes past the cap",
+            load_project_instructions(&root),
+            None,
+            "4× cap-sized AGENTS.md must be skipped as if missing; \
+             pre-fix code would have truncated-with-marker, but the new \
+             bounded read rejects anything > MAX_PROJECT_INSTRUCTIONS_BYTES + 1 \
+             bytes BEFORE the read to prevent OOM on a runaway file",
+        );
+    }
+
+    /// DEFECT 2 (variant B): an oversized `AGENTS.md` with a real
+    /// `CLAUDE.md` fallback must surface the CLAUDE.md body verbatim.
+    /// The oversized AGENTS.md must be skipped without ever entering
+    /// the bounded read, so a typo'd AGENTS.md cannot shadow a real
+    /// CLAUDE.md sitting next to it.
+    #[test]
+    fn oversized_agents_md_falls_through_to_claude_md() {
+        let body: String = "a".repeat(4 * MAX_PROJECT_INSTRUCTIONS_BYTES);
+        let (_dir, root) =
+            with_repo(&[("AGENTS.md", &body), ("CLAUDE.md", "Use uv, not poetry.\n")]);
+        assert_eq!(
+            load_project_instructions(&root).as_deref(),
+            Some("Use uv, not poetry."),
+            "an oversized AGENTS.md must be skipped (not truncated) so the \
+             following CLAUDE.md is the file that reaches the prompt",
         );
     }
 
@@ -319,19 +444,38 @@ mod tests {
         assert!(loaded.ends_with(TRUNCATION_MARKER));
     }
 
+    /// Regression guard for the UTF-8 char-boundary floor in
+    /// `cap_to_max`: when the cap (MAX bytes) lands in the middle of
+    /// a multi-byte codepoint, the cut must walk back to the nearest
+    /// valid boundary so the sliced string remains valid UTF-8.
+    ///
+    /// To exercise a mid-codepoint cap with the new bounded read
+    /// (anything > `MAX_PROJECT_INSTRUCTIONS_BYTES + 1` is rejected
+    /// before the read), we use a 3-byte-per-char body that fits in
+    /// exactly `MAX + 1` bytes when constructed as `10923 * 'あ'`.
+    /// `MAX = 32 * 1024 = 32768`; `MAX + 1 = 32769`; `32769 / 3 = 10923`
+    /// so 10923 'あ's fit in `MAX + 1` bytes. The string is then
+    /// trimmed (no whitespace) and applied to `cap_to_max`, where
+    /// `text.len() = MAX + 1 > MAX` triggers the floor: `cut` starts
+    /// at `MAX = 32768`, walks back past byte 32767 (mid-codepoint,
+    /// not a boundary) and lands on 32766 (start of an 'あ', a valid
+    /// boundary). The output string is therefore valid UTF-8 — a
+    /// panic during `String` construction or slicing would have
+    /// aborted the test before reaching the `ends_with` assertion.
     #[test]
     fn cap_respects_utf8_char_boundaries() {
-        // Hand the loader a string of multi-byte chars (each 'é' is
-        // 2 bytes in UTF-8) so the cap would slice mid-codepoint
-        // without the `is_char_boundary` floor. The cap must land on
-        // an even byte index or this panics.
-        let body: String = "é".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES);
+        // `あ` is 3 bytes in UTF-8. 10923 chars = 32769 bytes = MAX + 1,
+        // so the body fits exactly at the bounded-read ceiling. The cap
+        // floor's job is exercised because MAX (32768) % 3 == 2, i.e.
+        // it falls inside a codepoint.
+        let body: String = "あ".repeat((MAX_PROJECT_INSTRUCTIONS_BYTES + 1) / 3);
+        assert_eq!(
+            body.len(),
+            MAX_PROJECT_INSTRUCTIONS_BYTES + 1,
+            "test fixture must size the body to exactly MAX + 1 bytes",
+        );
         let (_dir, root) = with_repo(&[("AGENTS.md", &body)]);
         let loaded = load_project_instructions(&root).expect("loaded");
-        // Walking back to the nearest char boundary reduces the cap
-        // by AT MOST one byte (since 'é' is 2 bytes wide). Verify the
-        // resulting head is valid UTF-8 (a panic check is implicit:
-        // `is_char_boundary` doing it would otherwise have aborted).
         assert!(
             std::str::from_utf8(loaded.as_bytes()).is_ok(),
             "cap must land on a char boundary",
@@ -344,6 +488,102 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bogus = dir.path().join("does-not-exist");
         assert_eq!(load_project_instructions(&bogus), None);
+    }
+
+    /// DEFECT 2: a project-instructions candidate that is a symlink
+    /// must NOT be followed into its target — pre-fix
+    /// `std::fs::read_to_string` would follow the link and either
+    /// block forever (link to a writer-less FIFO) or read until OOM
+    /// (link to `/dev/zero` or a multi-GB file). The new bounded
+    /// read opens with `O_NOFOLLOW | O_NONBLOCK` so a symlink at the
+    /// path is rejected at open time. Variant A: a symlink to
+    /// `/dev/null` (cheap; doesn't block, so the test runs on
+    /// minimal CI without `mkfifo`).
+    #[test]
+    #[cfg(unix)]
+    fn symlink_agents_md_to_dev_null_is_treated_as_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("AGENTS.md");
+        std::os::unix::fs::symlink("/dev/null", &link).expect("symlink to /dev/null");
+        // `/dev/null` is unreadable-but-infinite — pre-fix the
+        // unbounded `read_to_string` would either block on it (if it
+        // were a FIFO) or return EOF very quickly. Either way, the
+        // symlink itself must be REJECTED at open time by O_NOFOLLOW,
+        // surfacing as `None` (skip this candidate) and falling
+        // through to the next filename (`CLAUDE.md`, absent here) →
+        // None overall.
+        let root = dir.path().to_path_buf();
+        assert_eq!(
+            load_project_instructions(&root),
+            None,
+            "symlink at AGENTS.md must be rejected at open time (O_NOFOLLOW) \
+             and treated identically to a missing/unreadable candidate",
+        );
+    }
+
+    /// DEFECT 2 (variant B): when `AGENTS.md` is a symlink to a
+    /// writer-less FIFO (which would block a normal `read_to_string`
+    /// forever on `read(2)`), the bounded loader must short-circuit
+    /// on `O_NONBLOCK | O_NOFOLLOW` open-time errors and fall through
+    /// to `CLAUDE.md`. The test runs the bounded read in a worker
+    /// thread with a 5-second wall-clock budget so a regression that
+    /// reintroduces the blocking FIFO read fails the test with a
+    /// clear "blocked past 5s" instead of hanging cargo.
+    #[test]
+    #[cfg(unix)]
+    fn symlink_agents_md_to_writerless_fifo_falls_through_to_claude_md() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Place the FIFO under a sibling path so the test survives a
+        // partial failure (no FIFO left at `AGENTS.md`).
+        let fifo = dir.path().join("dead.fifo");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            matches!(&status, Ok(s) if s.success()),
+            "mkfifo must succeed in this test environment; got {status:?}",
+        );
+        // Symlink `AGENTS.md` at the FIFO. O_NOFOLLOW rejects the
+        // symlink at open time; O_NONBLOCK then ensures even a
+        // (pre-O_NOFOLLOW) open on a writer-less FIFO returns ENXIO
+        // immediately rather than blocking.
+        let link = dir.path().join("AGENTS.md");
+        std::os::unix::fs::symlink(&fifo, &link).expect("symlink to FIFO");
+        // Real CLAUDE.md sitting next to it. The bounded loader
+        // must skip the FIFO-shaped AGENTS.md and surface CLAUDE.md.
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "Loader must skip the symlink-to-FIFO.\n",
+        )
+        .expect("write CLAUDE.md");
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let root_for_reader = root.clone();
+        let reader = thread::spawn(move || {
+            let result = load_project_instructions(&root_for_reader);
+            tx.send(result).unwrap();
+        });
+        // Wall-clock budget: a regression to the pre-fix code would
+        // block inside `read_to_string` on the FIFO and never
+        // return, hanging cargo. recv_timeout gives a clear
+        // diagnostic instead.
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("load_project_instructions must not block past 5s on a FIFO-shaped AGENTS.md — TOCTOU/FIFO regression");
+        reader.join().expect("reader thread panicked");
+        assert_eq!(
+            result.as_deref(),
+            Some("Loader must skip the symlink-to-FIFO."),
+            "bounded loader must skip the symlink-to-FIFO AGENTS.md (rejected \
+             at open time by O_NOFOLLOW | O_NONBLOCK) and surface CLAUDE.md \
+             verbatim",
+        );
+        // Cleanup: unlink the FIFO manually so the tempdir drop
+        // returns promptly even if mkfifo left a real pipe behind.
+        let _ = std::fs::remove_file(&fifo);
     }
 
     #[test]
