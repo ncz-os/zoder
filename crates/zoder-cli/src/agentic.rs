@@ -4252,7 +4252,15 @@ pub(crate) fn active_job_dir() -> Option<PathBuf> {
 
 fn read_meta(dir: &Path) -> Option<JobMeta> {
     let raw = std::fs::read_to_string(dir.join("meta.json")).ok()?;
-    serde_json::from_str(&raw).ok()
+    let mut meta: JobMeta = serde_json::from_str(&raw).ok()?;
+    let dir_id = dir.file_name()?.to_str()?;
+    // The containing directory is the filesystem identity. Treat the body
+    // `id` as untrusted input so callers never construct job paths from a
+    // mismatched or crafted meta.json field.
+    if meta.id != dir_id {
+        meta.id = dir_id.to_string();
+    }
+    Some(meta)
 }
 
 /// Read every `<id>/meta.json` under `dir`, skipping entries that fail to
@@ -4519,10 +4527,9 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> an
 
 pub(crate) fn cmd_result(cli: &crate::Cli, job: Option<String>) -> anyhow::Result<()> {
     let m = resolve_job(job.as_deref(), false).ok_or_else(|| anyhow!("no matching job"))?;
-    // W12: `m.id` is read from the job's own (attacker-writable) meta.json
-    // body, not the on-disk dir entry. Route the join through the same
-    // containment guard the prune-delete path uses (Y-20) so a crafted
-    // `../..`-style id cannot read a file outside the jobs tree.
+    // W12/Y-20 defense in depth: `read_meta` canonicalizes `m.id` to the
+    // on-disk dir entry, and this containment guard still refuses any
+    // unexpected non-child id before reading from the jobs tree.
     let base = jobs_dir();
     if !crate::jobs::job_id_is_contained_child(&base, &m.id) {
         return Err(anyhow!(
@@ -4569,8 +4576,9 @@ pub(crate) fn cmd_result(cli: &crate::Cli, job: Option<String>) -> anyhow::Resul
 
 pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Result<()> {
     let m = resolve_job(job.as_deref(), true).ok_or_else(|| anyhow!("no running job to cancel"))?;
-    // W12: guard the untrusted body id before writing meta.json (same
-    // containment check as the prune-delete path, Y-20).
+    // W12/Y-20 defense in depth: `read_meta` canonicalizes `m.id` to the
+    // on-disk dir entry, and this containment guard still refuses any
+    // unexpected non-child id before writing into the jobs tree.
     let base = jobs_dir();
     if !crate::jobs::job_id_is_contained_child(&base, &m.id) {
         return Err(anyhow!(
