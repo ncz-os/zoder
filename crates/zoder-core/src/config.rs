@@ -1080,7 +1080,7 @@ impl Config {
     /// trusted to drive routing, and a FIFO or device at the configured path
     /// would otherwise block forever in `read_to_string` (or OOM the
     /// process), before any validation logic runs.
-    pub(crate) const MAX_CONFIG_BYTES: u64 = 2_097_152; // 2 MiB — mirrors pricing.rs
+    pub const MAX_CONFIG_BYTES: u64 = 2_097_152; // 2 MiB — mirrors pricing.rs
 
     /// Load from $ZODER_HOME/config.json (if present, else sensible free-tier
     /// default) and then layer every `config.<vendor>.toml` in the same
