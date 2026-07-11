@@ -1,3 +1,4 @@
+use zoder_core::pricing::OffPeak;
 use zoder_core::PricingCatalog;
 
 /// A single malformed model entry must not blank the whole catalog: valid
@@ -80,4 +81,40 @@ fn load_rejects_oversized_file() {
     set_secure_permissions(&path);
     let cat = PricingCatalog::load(&path);
     assert!(cat.models.is_empty());
+}
+
+#[test]
+fn off_peak_active_at_window_boundaries() {
+    // Test case 1: Full-day window { window_start_utc_min: 0, window_end_utc_min: 1440 }
+    let op1 = OffPeak {
+        input_usd_per_mtok: 0.0,
+        output_usd_per_mtok: 0.0,
+        window_start_utc_min: 0,
+        window_end_utc_min: 1440,
+    };
+    assert!(op1.active_at(1439)); // 23:59 UTC, inside
+    assert!(op1.active_at(0)); // 00:00 UTC, inside
+    assert!(op1.active_at(720)); // 12:00 UTC, inside
+
+    // Test case 2: Exclusive end: window { start: 60, end: 120 }
+    let op2 = OffPeak {
+        input_usd_per_mtok: 0.0,
+        output_usd_per_mtok: 0.0,
+        window_start_utc_min: 60,
+        window_end_utc_min: 120,
+    };
+    assert!(!op2.active_at(120)); // 02:00 UTC, exclusive end
+    assert!(op2.active_at(60)); // 01:00 UTC, start, inclusive
+    assert!(op2.active_at(119)); // 01:59 UTC, inside
+
+    // Test case 3: Midnight-wrapping window { start: 1380, end: 60 } (23:00 to 01:00)
+    let op3 = OffPeak {
+        input_usd_per_mtok: 0.0,
+        output_usd_per_mtok: 0.0,
+        window_start_utc_min: 1380,
+        window_end_utc_min: 60,
+    };
+    assert!(op3.active_at(1439)); // 23:59 UTC, inside (past midnight)
+    assert!(op3.active_at(30)); // 00:30 UTC, inside (past midnight)
+    assert!(!op3.active_at(120)); // 02:00 UTC, outside (daytime)
 }
