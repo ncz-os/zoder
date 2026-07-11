@@ -469,7 +469,11 @@ fn describe_enabled(spec: &McpServerSpec) -> &'static str {
 pub(crate) fn cmd_mcp(_cli: &crate::Cli, action: &McpCmd) -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    cmd_mcp_write(action, &engine_config_file(), &mut out)
+    let exit_code = cmd_mcp_write(action, &engine_config_file(), &mut out)?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 /// Inner, test-friendly form of `cmd_mcp` that reads the engine
@@ -483,7 +487,7 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
     action: &McpCmd,
     path: &Path,
     out: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     match action {
         McpCmd::List { json } => {
             // Engine config may legitimately be absent — the user
@@ -506,7 +510,7 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
                         out,
                         "add MCP servers under [mcp_servers.<name>] in the engine config."
                     )?;
-                    return Ok(());
+                    return Ok(0);
                 }
             };
 
@@ -517,7 +521,7 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
                 // `parse_mcp_servers_file` + `serde_json::to_value`.
                 let value = serde_json::to_string_pretty(&specs)?;
                 writeln!(out, "{value}")?;
-                return Ok(());
+                return Ok(0);
             }
 
             if specs.is_empty() {
@@ -526,7 +530,7 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
                     out,
                     "add them under [mcp_servers.<name>] in the engine config."
                 )?;
-                return Ok(());
+                return Ok(0);
             }
 
             writeln!(out, "MCP servers in {}:", path.display())?;
@@ -561,7 +565,327 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
                     describe_transport(spec),
                 )?;
             }
-            Ok(())
+            Ok(0)
+        }
+        McpCmd::Get { name, json } => {
+            let specs = match parse_mcp_servers_file(path) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    writeln!(
+                        out,
+                        "failed to parse engine config at {}: {e}",
+                        path.display()
+                    )?;
+                    writeln!(
+                        out,
+                        "add MCP servers under [mcp_servers.<name>] in the engine config."
+                    )?;
+                    return Ok(0);
+                }
+            };
+
+            // Find the server by name
+            match specs.iter().find(|s| &s.name == name) {
+                Some(spec) => {
+                    if *json {
+                        let value = serde_json::to_string_pretty(spec)?;
+                        writeln!(out, "{value}")?;
+                    } else {
+                        writeln!(out, "MCP server '{}' in {}:", name, path.display())?;
+                        writeln!(out, "  name:         {}", spec.name)?;
+                        writeln!(out, "  transport:    {}", transport_label(spec.transport))?;
+                        writeln!(out, "  enabled:      {}", describe_enabled(spec))?;
+                        writeln!(out, "  transport-detail: {}", describe_transport(spec))?;
+                    }
+                    Ok(0)
+                }
+                None => {
+                    // Server not found - list available servers and show error
+                    if specs.is_empty() {
+                        writeln!(out, "no MCP servers configured in {}.", path.display())?;
+                        writeln!(
+                            out,
+                            "add them under [mcp_servers.<name>] in the engine config."
+                        )?;
+                    } else {
+                        writeln!(out, "no MCP server named '{}' found.", name)?;
+                        writeln!(out, "available servers:")?;
+                        for spec in &specs {
+                            writeln!(out, "  - {}", spec.name)?;
+                        }
+                    }
+                    Ok(0)
+                }
+            }
+        }
+        McpCmd::Test { name } => {
+            let specs = match parse_mcp_servers_file(path) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    writeln!(
+                        out,
+                        "failed to parse engine config at {}: {e}",
+                        path.display()
+                    )?;
+                    writeln!(
+                        out,
+                        "add MCP servers under [mcp_servers.<name>] in the engine config."
+                    )?;
+                    return Ok(0);
+                }
+            };
+
+            // Find the server by name
+            match specs.iter().find(|s| &s.name == name) {
+                Some(spec) => {
+                    match spec.transport {
+                        McpTransportKind::Http => {
+                            // Test HTTP transport with a GET request
+                            if let Some(url) = &spec.url {
+                                let start_time = std::time::Instant::now();
+                                // Create a client with a 5-second timeout
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .build()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("failed to build HTTP client: {}", e)
+                                    })?;
+                                match client.get(url).send() {
+                                    Ok(response) => {
+                                        let duration = start_time.elapsed();
+                                        let status = response.status();
+                                        writeln!(out, "MCP server '{}' reachable via HTTP", name)?;
+                                        writeln!(out, "  URL: {}", url)?;
+                                        writeln!(
+                                            out,
+                                            "  Status: {} ({})",
+                                            status,
+                                            status.as_str()
+                                        )?;
+                                        writeln!(out, "  Latency: {:.2?}", duration)?;
+                                        // Exit code 0 for reachable
+                                        Ok(0)
+                                    }
+                                    Err(e) => {
+                                        let duration = start_time.elapsed();
+                                        writeln!(
+                                            out,
+                                            "MCP server '{}' unreachable via HTTP",
+                                            name
+                                        )?;
+                                        writeln!(out, "  URL: {}", url)?;
+                                        writeln!(out, "  Error: {} (after {:.2?})", e, duration)?;
+                                        // Exit code 1 for unreachable
+                                        Ok(1)
+                                    }
+                                }
+                            } else {
+                                writeln!(out, "MCP server '{}' has no URL for HTTP testing", name)?;
+                                Ok(1)
+                            }
+                        }
+                        McpTransportKind::Stdio => {
+                            // Test stdio transport by spawning the command
+                            if let Some(command) = &spec.command {
+                                let start_time = std::time::Instant::now();
+
+                                // Spawn the command with timeout
+                                let mut child = std::process::Command::new(command)
+                                    .args(&spec.args)
+                                    .envs(&spec.env)
+                                    .stdin(std::process::Stdio::piped())
+                                    .stdout(std::process::Stdio::piped())
+                                    .stderr(std::process::Stdio::piped())
+                                    .spawn()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "failed to spawn command {}: {}",
+                                            command,
+                                            e
+                                        )
+                                    })?;
+
+                                // Send minimal JSON-RPC 2.0 initialize request
+                                let initialize_request = r#"{"jsonrpc": "2.0", "method": "initialize", "id": 1, "params": {}}"#;
+                                if let Some(ref mut stdin) = child.stdin {
+                                    std::io::Write::write_all(stdin, initialize_request.as_bytes())
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("failed to write to stdin: {}", e)
+                                        })?;
+                                }
+
+                                // Wait for response with timeout using a helper thread approach
+                                let timeout = std::time::Duration::from_secs(5);
+
+                                // Use a helper thread to read with timeout. `child` is moved
+                                // into the thread since `wait_with_output` needs ownership;
+                                // the PID is captured beforehand so the timeout branch can
+                                // still kill the process without owning the `Child` handle.
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let child_pid = child.id();
+
+                                // Spawn a thread to wait for the child. Send errors are
+                                // ignored: if the main thread already gave up after a
+                                // timeout, the receiver is dropped and there's nothing to
+                                // deliver the (now-stale) result to.
+                                std::thread::spawn(move || match child.wait_with_output() {
+                                    Ok(output) => {
+                                        let _ = tx.send(Ok(output));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e));
+                                    }
+                                });
+
+                                // Wait for either the child to finish or timeout
+                                let result = match rx.recv_timeout(timeout) {
+                                    Ok(Ok(output)) => {
+                                        let duration = start_time.elapsed();
+                                        if output.status.success() {
+                                            let response = String::from_utf8_lossy(&output.stdout);
+                                            writeln!(
+                                                out,
+                                                "MCP server '{}' reachable via stdio",
+                                                name
+                                            )?;
+                                            writeln!(
+                                                out,
+                                                "  Command: {} {}",
+                                                command,
+                                                spec.args.join(" ")
+                                            )?;
+                                            writeln!(out, "  Response: {} bytes", response.len())?;
+                                            if !response.trim().is_empty() {
+                                                writeln!(
+                                                    out,
+                                                    "  Sample response: {}",
+                                                    response.trim()
+                                                )?;
+                                            }
+                                            writeln!(
+                                                out,
+                                                "  Status: {} (after {:.2?})",
+                                                output.status, duration
+                                            )?;
+                                            Ok(0)
+                                        } else {
+                                            let stderr = String::from_utf8_lossy(&output.stderr);
+                                            writeln!(
+                                                out,
+                                                "MCP server '{}' reachable but command failed",
+                                                name
+                                            )?;
+                                            writeln!(
+                                                out,
+                                                "  Command: {} {}",
+                                                command,
+                                                spec.args.join(" ")
+                                            )?;
+                                            writeln!(out, "  Error: {}", stderr.trim())?;
+                                            writeln!(
+                                                out,
+                                                "  Status: {} (after {:.2?})",
+                                                output.status, duration
+                                            )?;
+                                            Ok(1)
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        let duration = start_time.elapsed();
+                                        writeln!(out, "MCP server '{}' unreachable via stdio (error reading output)", name)?;
+                                        writeln!(
+                                            out,
+                                            "  Command: {} {}",
+                                            command,
+                                            spec.args.join(" ")
+                                        )?;
+                                        writeln!(out, "  Error: {} (after {:.2?})", e, duration)?;
+                                        Ok(1)
+                                    }
+                                    Err(_) => {
+                                        // Timeout reached - the `Child` itself was moved into
+                                        // the helper thread above, so it can't be killed via
+                                        // `child.kill()` here; signal it by PID instead. The
+                                        // helper thread's own `wait_with_output()` reaps it
+                                        // once the signal lands, so no separate wait is needed
+                                        // on this side.
+                                        let duration = start_time.elapsed();
+                                        #[cfg(unix)]
+                                        {
+                                            // SAFETY: child_pid was captured from a live Child
+                                            // via `.id()` before the Child was moved; sending
+                                            // SIGKILL to a PID that has already exited is a
+                                            // harmless no-op (ESRCH), not undefined behavior.
+                                            let rc = unsafe {
+                                                libc::kill(child_pid as i32, libc::SIGKILL)
+                                            };
+                                            if rc != 0 {
+                                                eprintln!(
+                                                    "Failed to kill child process {child_pid}: {}",
+                                                    std::io::Error::last_os_error()
+                                                );
+                                            }
+                                        }
+                                        #[cfg(not(unix))]
+                                        {
+                                            eprintln!(
+                                                "cannot forcibly kill child process {child_pid} on this platform; it may continue running in the background"
+                                            );
+                                        }
+                                        writeln!(
+                                            out,
+                                            "MCP server '{}' unreachable via stdio (timeout)",
+                                            name
+                                        )?;
+                                        writeln!(
+                                            out,
+                                            "  Command: {} {}",
+                                            command,
+                                            spec.args.join(" ")
+                                        )?;
+                                        writeln!(out, "  Timeout after {:.2?}", duration)?;
+                                        Ok(1)
+                                    }
+                                };
+
+                                result
+                            } else {
+                                writeln!(
+                                    out,
+                                    "MCP server '{}' has no command for stdio testing",
+                                    name
+                                )?;
+                                Ok(1)
+                            }
+                        }
+                        McpTransportKind::Unknown => {
+                            writeln!(
+                                out,
+                                "MCP server '{}' has unknown transport type and cannot be tested",
+                                name
+                            )?;
+                            Ok(1)
+                        }
+                    }
+                }
+                None => {
+                    // Server not found - list available servers and show error
+                    if specs.is_empty() {
+                        writeln!(out, "no MCP servers configured in {}.", path.display())?;
+                        writeln!(
+                            out,
+                            "add them under [mcp_servers.<name>] in the engine config."
+                        )?;
+                    } else {
+                        writeln!(out, "no MCP server named '{}' found.", name)?;
+                        writeln!(out, "available servers:")?;
+                        for spec in &specs {
+                            writeln!(out, "  - {}", spec.name)?;
+                        }
+                    }
+                    return Ok(1);
+                }
+            }
         }
     }
 }
@@ -701,7 +1025,7 @@ mod mcp_list_tests {
     /// Run the command with an in-memory buffer as "stdout" and
     /// return the captured text. Keeps the test off the real
     /// stdout so it doesn't race sibling tests.
-    fn run_capturing(action: &McpCmd, path: &Path) -> (String, anyhow::Result<()>) {
+    fn run_capturing(action: &McpCmd, path: &Path) -> (String, anyhow::Result<i32>) {
         let mut buf: Vec<u8> = Vec::new();
         let res = cmd_mcp_write(action, path, &mut buf);
         let s = String::from_utf8(buf).unwrap_or_default();
@@ -873,6 +1197,285 @@ url = "https://mcp.kiwi.com"
         assert!(
             out.contains("https://mcp.kiwi.com"),
             "human output should include url; got:\n{out}"
+        );
+    }
+
+    /// `mcp get <name>` tests
+    #[test]
+    fn mcp_get_existing_server_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Get {
+                name: "lookup".to_string(),
+                json: true,
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        let spec: zoder_core::McpServerSpec =
+            serde_json::from_str(&out).expect("json parses to McpServerSpec");
+        assert_eq!(spec.name, "lookup");
+        assert_eq!(spec.transport, zoder_core::McpTransportKind::Stdio);
+        assert_eq!(spec.command.as_deref(), Some("node"));
+        assert_eq!(spec.args, vec!["server.js".to_string()]);
+        assert!(spec.url.is_none());
+    }
+
+    #[test]
+    fn mcp_get_existing_server_human() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Get {
+                name: "lookup".to_string(),
+                json: false,
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        assert!(
+            out.contains("MCP server 'lookup' in"),
+            "output should contain server info; got:\n{out}"
+        );
+        assert!(
+            out.contains("name:         lookup"),
+            "output should contain name; got:\n{out}"
+        );
+        assert!(
+            out.contains("transport:    stdio"),
+            "output should contain transport info; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mcp_get_missing_server_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+
+[mcp_servers.mcp_kiwi_com]
+url = "https://mcp.kiwi.com"
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Get {
+                name: "nonexistent".to_string(),
+                json: false,
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        assert!(
+            out.contains("no MCP server named 'nonexistent' found"),
+            "output should contain error message; got:\n{out}"
+        );
+        assert!(
+            out.contains("available servers:"),
+            "output should list available servers; got:\n{out}"
+        );
+        assert!(
+            out.contains("- lookup"),
+            "output should list lookup server; got:\n{out}"
+        );
+        assert!(
+            out.contains("- mcp_kiwi_com"),
+            "output should list mcp_kiwi_com server; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mcp_get_no_servers_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[profile]
+primary_model = "openai/gpt-4o"
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Get {
+                name: "nonexistent".to_string(),
+                json: false,
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        assert!(
+            out.contains("no MCP servers configured in"),
+            "output should indicate no servers configured; got:\n{out}"
+        );
+    }
+
+    /// Test command unit tests
+    #[test]
+    fn mcp_test_unreachable_http_returns_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.test_http]
+url = "http://127.0.0.1:1"
+"#,
+        );
+
+        let start_time = std::time::Instant::now();
+        let (out, res) = run_capturing(
+            &McpCmd::Test {
+                name: "test_http".to_string(),
+            },
+            &path,
+        );
+        let duration = start_time.elapsed();
+
+        res.expect("cmd_mcp_write");
+        // Should return quickly (less than 10 seconds)
+        assert!(
+            duration < std::time::Duration::from_secs(10),
+            "Test should return promptly, not wait for timeout"
+        );
+        // Should report the unreachable HTTP server
+        assert!(
+            out.contains("unreachable via HTTP"),
+            "output should indicate unreachable HTTP server; got:\n{out}"
+        );
+        // NOTE: no separate "!out.contains(\"reachable via HTTP\")" check here --
+        // "unreachable via HTTP" itself contains "reachable via HTTP" as a
+        // substring, so that assertion was always false. The positive
+        // assertion above already pins the exact message.
+    }
+
+    #[test]
+    fn mcp_test_unreachable_stdio_returns_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.test_stdio]
+command = "sleep"
+args = ["10"]
+"#,
+        );
+
+        let start_time = std::time::Instant::now();
+        let (out, res) = run_capturing(
+            &McpCmd::Test {
+                name: "test_stdio".to_string(),
+            },
+            &path,
+        );
+        let duration = start_time.elapsed();
+
+        res.expect("cmd_mcp_write");
+        // Should return quickly (less than 10 seconds)
+        assert!(
+            duration < std::time::Duration::from_secs(10),
+            "Test should return promptly, not wait for timeout"
+        );
+        // Should report the unreachable stdio server
+        assert!(
+            out.contains("unreachable via stdio"),
+            "output should indicate unreachable stdio server; got:\n{out}"
+        );
+        // NOTE: no separate "!out.contains(\"reachable via stdio\")" check here --
+        // same substring gotcha as the HTTP test above.
+    }
+
+    #[test]
+    fn mcp_test_missing_server_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.lookup]
+command = "node"
+args = ["server.js"]
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Test {
+                name: "nonexistent".to_string(),
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        assert!(
+            out.contains("no MCP server named 'nonexistent' found"),
+            "output should contain error message; got:\n{out}"
+        );
+        assert!(
+            out.contains("available servers:"),
+            "output should list available servers; got:\n{out}"
+        );
+        assert!(
+            out.contains("- lookup"),
+            "output should list lookup server; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mcp_test_unknown_transport_reports_untestable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[mcp_servers.test_unknown]
+# `type` is set to an unrecognized value so `build_spec` treats this as a
+# real (if malformed) server entry rather than rejecting it outright --
+# a table with truly zero transport-hint fields (no type/command/cmd/url/uri)
+# is deliberately rejected upstream as "not a server entry at all" and never
+# reaches this command, so this is the only way to exercise the Unknown
+# transport branch of `mcp test`.
+type = "custom"
+"#,
+        );
+
+        let (out, res) = run_capturing(
+            &McpCmd::Test {
+                name: "test_unknown".to_string(),
+            },
+            &path,
+        );
+        res.expect("cmd_mcp_write");
+
+        assert!(
+            out.contains("has unknown transport type"),
+            "output should indicate unknown transport; got:\n{out}"
         );
     }
 }
