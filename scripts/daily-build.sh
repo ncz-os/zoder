@@ -47,11 +47,12 @@ if [ -z "$MODE" ]; then
   case "$host_short" in
     ULTRA|ultra*|Ultra*|MacBook*|macbook*)  MODE="ultra" ;;
     HYDRA|hydra*|Hydra*)                     MODE="hydra" ;;
+    TYDEUS|tydeus*|thor*)                    MODE="tydeus" ;;
   esac
 fi
 case "$MODE" in
-  ultra|hydra) ;;
-  *) log "ERROR: no daily-build role for host '$host_short' (set ZODER_BUILD_ROLE=ultra|hydra in ~/.zoder-build.env)"; exit 2 ;;
+  ultra|hydra|tydeus) ;;
+  *) log "ERROR: no daily-build role for host '$host_short' (set ZODER_BUILD_ROLE=ultra|hydra|tydeus in ~/.zoder-build.env)"; exit 2 ;;
 esac
 
 mkdir -p "$WORK"
@@ -101,6 +102,11 @@ case "$MODE" in
     ;;
   hydra)
     build_linux_in_docker linux/amd64
+    ;;
+  tydeus)
+    # Native arm64 Linux host (IGX Thor): arm64 container on arm64 hardware,
+    # so linux/arm64 runs with NO qemu emulation (unlike ULTRA's emulated path).
+    build_linux_in_docker linux/arm64
     ;;
 esac
 
