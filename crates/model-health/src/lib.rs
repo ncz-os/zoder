@@ -3,8 +3,9 @@
 //!
 //! The `Classification` enum + `provider_id` + `checked_at_unix` fields on
 //! [`ModelHealth`] were added to support the daily `--probe --all` sweep:
-//! `consult` reads them to know whether a stale entry should still be trusted
-//! or whether the model is `Capacity` / `Unprovisioned` and should be skipped.
+//! `consult` reads them to know whether a stale entry should still be trusted,
+//! whether a transient `Capacity` skip is still inside its TTL, or whether the
+//! model is permanently `Unprovisioned` / `Unauthorized` and should be skipped.
 //! Every new field has `#[serde(default)]` so existing on-disk stores load
 //! unchanged.
 
@@ -17,6 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const BREAKER_THRESHOLD: u32 = 3;
 /// Cooldown before a tripped breaker allows a single half-open probe (seconds).
 const BREAKER_COOLDOWN_SECS: i64 = 300;
+/// Time a transient Capacity classification suppresses consult routing. Thirty
+/// minutes is long enough to avoid hammering a rate-limited provider but short
+/// enough that recovered capacity is retried well before the daily probe sweep.
+const CAPACITY_CLASSIFICATION_TTL_SECS: i64 = 30 * 60;
 /// Maximum trusted health-store JSON size. Larger stores are quarantined before
 /// reading so a corrupt/unbounded file cannot OOM the process.
 const MAX_HEALTH_STORE_BYTES: u64 = 2 * 1024 * 1024;
@@ -178,8 +183,9 @@ impl Classification {
             // model itself is fine; the operator's API key is wrong).
             "authentication_error" | "permission_error" => Classification::Unauthorized,
             // Rate-limit + Anthropic's 529 overloaded_error are both
-            // transient capacity signals — consult should skip until
-            // the next probe, the same way 429 / 503 do.
+            // transient capacity signals — consult should temporarily
+            // skip them while the persisted Capacity classification is fresh,
+            // the same way 429 / 503 do.
             "rate_limit_error" | "overloaded_error" => Classification::Capacity,
             // Typed but unknown error name: defer to the status code so
             // 401/403/404/429/503 still map onto the right variant.
@@ -187,10 +193,12 @@ impl Classification {
         }
     }
 
-    /// `true` for outcomes that should make consult SKIP this model
-    /// regardless of breakder state: `Capacity` (transient),
-    /// `Unprovisioned` (permanent), and `Unauthorized` (key rejected — keep
-    /// retrying it does not help, the operator must fix the credential).
+    /// Static skip-class predicate, independent of breaker state and time:
+    /// `Capacity` (transient), `Unprovisioned` (permanent), and `Unauthorized`
+    /// (key rejected — retrying it does not help, the operator must fix the
+    /// credential). Router-facing skip checks apply a TTL to `Capacity` via
+    /// [`ModelHealth::is_skipped_by_classification`]; this pure mapping stays
+    /// time-agnostic for breaker-neutral recording logic.
     pub fn skips_consult(self) -> bool {
         matches!(
             self,
@@ -228,7 +236,8 @@ pub struct ModelHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     /// Outcome class of the most recent probe. Used by `consult` to skip
-    /// Capacity/Unprovisioned entries without re-pinging.
+    /// fresh Capacity entries temporarily and Unprovisioned/Unauthorized
+    /// entries permanently without re-pinging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<Classification>,
     /// Unix seconds of the most recent probe (success OR failure). consult
@@ -247,13 +256,24 @@ impl ModelHealth {
         self.classification = Some(classification);
     }
 
-    /// `true` when the most recent classification is `Capacity`,
-    /// `Unprovisioned`, or `Unauthorized`. consult treats these as "skip
-    /// for now" independent of the breaker.
+    /// `true` when the most recent classification should make consult skip the
+    /// model independent of breaker state. `Capacity` is transient and only
+    /// skips while `checked_at_unix` is inside `CAPACITY_CLASSIFICATION_TTL_SECS`;
+    /// legacy Capacity records with no timestamp are treated as expired so a
+    /// probe can run. `Unprovisioned` and `Unauthorized` remain permanent skips.
     pub fn is_skipped_by_classification(&self) -> bool {
-        self.classification
-            .map(Classification::skips_consult)
-            .unwrap_or(false)
+        self.is_skipped_by_classification_at(now_unix())
+    }
+
+    fn is_skipped_by_classification_at(&self, now: i64) -> bool {
+        match self.classification {
+            Some(Classification::Capacity) => self
+                .checked_at_unix
+                .map(|ts| now.saturating_sub(ts) < CAPACITY_CLASSIFICATION_TTL_SECS)
+                .unwrap_or(false),
+            Some(Classification::Unprovisioned | Classification::Unauthorized) => true,
+            Some(_) | None => false,
+        }
     }
 
     pub fn state(&self) -> State {
@@ -366,8 +386,9 @@ impl HealthStore {
 
     /// Success + the provider that served the probe + the classified outcome.
     /// Used by `zoder health --probe --all` so the persisted record carries
-    /// enough context for `consult` to show "last checked by provider X" and
-    /// to skip Capacity/Unprovisioned models.
+    /// enough context for `consult` to show "last checked by provider X", to
+    /// temporarily skip fresh Capacity outcomes, and to permanently skip
+    /// Unprovisioned/Unauthorized models.
     pub fn record_classified_success(
         &mut self,
         model: &str,
@@ -407,17 +428,20 @@ impl HealthStore {
     /// `Unprovisioned` (404), or `Unauthorized` (401/403) — this is NOT a
     /// model-health failure. In all three cases the model itself is fine:
     /// the provider is transiently overloaded, the model isn't provisioned
-    /// for this key, or the credential was rejected. consult already skips
-    /// these by classification (`is_skipped_by_classification`), so counting
-    /// them against the breaker is both redundant and harmful — a healthy
-    /// model behind a temporarily overloaded provider would get bench-binned
-    /// for the full `BREAKER_THRESHOLD` cooldown after a handful of 529s.
+    /// for this key, or the credential was rejected. consult already throttles
+    /// or skips these by classification (`is_skipped_by_classification`), so
+    /// counting them against the breaker is both redundant and harmful — a
+    /// healthy model behind a temporarily overloaded provider would get
+    /// bench-binned for the full `BREAKER_THRESHOLD` cooldown after a handful
+    /// of 529s.
     /// We must therefore NOT increment `consecutive_failures`, NOT bump
     /// `failures`, and NOT stamp `last_failure_unix` (which would otherwise
     /// pin the breaker open) for any skip-class outcome. We still call
     /// `mark_checked` so the on-disk store records the probe attempt, the
-    /// provider, and the classification — consult uses that to skip the
-    /// model until the transient/credential/provisioning condition clears.
+    /// provider, and the classification — consult uses that to skip fresh
+    /// Capacity outcomes until their TTL elapses, and to skip
+    /// credential/provisioning conditions until an operator or probe changes
+    /// the classification.
     /// Only a genuine `Error` (500 / network / timeout / decode) trips the
     /// breaker. This matches the `skips_consult` doc contract: those classes
     /// are skipped "regardless of breaker state".
@@ -466,12 +490,13 @@ impl HealthStore {
             .unwrap_or(false)
     }
 
-    /// `true` when the model's most recent classification marks it "skip for
-    /// now" (Unauthorized/Unprovisioned/Capacity). Mirrors `breaker_open`:
-    /// these classifications are breaker-neutral (W1), so the breaker stays
-    /// closed forever for a 401/404 model — routing must consult this too or
-    /// it will keep selecting a guaranteed-failed model. Unknown model =>
-    /// false (nothing recorded means nothing to skip).
+    /// `true` when the model's most recent classification marks it skipped:
+    /// fresh `Capacity` outcomes are skipped only until their TTL elapses,
+    /// while `Unauthorized` and `Unprovisioned` remain permanent skips. Mirrors
+    /// `breaker_open`: these classifications are breaker-neutral (W1), so the
+    /// breaker stays closed forever for a 401/404 model — routing must consult
+    /// this too or it will keep selecting a guaranteed-failed model. Unknown
+    /// model => false (nothing recorded means nothing to skip).
     pub fn is_skipped_by_classification(&self, model: &str) -> bool {
         self.models
             .get(model)
@@ -788,9 +813,9 @@ mod tests {
             ),
             Classification::Unauthorized
         );
-        // Rate-limit envelopes (HTTP 429) land on Capacity — consult
-        // skips until the next probe, the same way 429 already does in
-        // `from_status`.
+        // Rate-limit envelopes (HTTP 429) land on Capacity — consult skips
+        // fresh Capacity classifications temporarily, the same way 429
+        // already does in `from_status`.
         assert_eq!(
             Classification::from_anthropic_error_body(
                 r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
@@ -927,6 +952,70 @@ mod tests {
         // and the skippable predicate flips for Capacity/Unprovisioned.
         h.mark_checked("openrouter", Classification::Unprovisioned);
         assert!(h.is_skipped_by_classification());
+    }
+
+    #[test]
+    fn capacity_classification_skips_within_ttl() {
+        let now = 1_700_000_000;
+        let h = ModelHealth {
+            classification: Some(Classification::Capacity),
+            checked_at_unix: Some(now - CAPACITY_CLASSIFICATION_TTL_SECS + 1),
+            ..Default::default()
+        };
+
+        assert!(
+            h.is_skipped_by_classification_at(now),
+            "fresh Capacity classification must suppress consult routing"
+        );
+    }
+
+    #[test]
+    fn capacity_classification_expires_after_ttl() {
+        let now = 1_700_000_000;
+        let h = ModelHealth {
+            classification: Some(Classification::Capacity),
+            checked_at_unix: Some(now - CAPACITY_CLASSIFICATION_TTL_SECS - 1),
+            ..Default::default()
+        };
+
+        assert!(
+            !h.is_skipped_by_classification_at(now),
+            "expired Capacity classification must become probe-eligible"
+        );
+    }
+
+    #[test]
+    fn permanent_skip_classifications_ignore_capacity_ttl() {
+        let now = 1_700_000_000;
+        let old_timestamp = now - CAPACITY_CLASSIFICATION_TTL_SECS * 10;
+
+        for classification in [Classification::Unprovisioned, Classification::Unauthorized] {
+            let h = ModelHealth {
+                classification: Some(classification),
+                checked_at_unix: Some(old_timestamp),
+                ..Default::default()
+            };
+
+            assert!(
+                h.is_skipped_by_classification_at(now),
+                "{classification:?} must remain skipped regardless of timestamp age"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_classification_without_timestamp_is_not_skipped() {
+        let now = 1_700_000_000;
+        let h = ModelHealth {
+            classification: Some(Classification::Capacity),
+            checked_at_unix: None,
+            ..Default::default()
+        };
+
+        assert!(
+            !h.is_skipped_by_classification_at(now),
+            "legacy Capacity record without checked_at_unix must allow a probe"
+        );
     }
 
     #[test]
