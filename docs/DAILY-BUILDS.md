@@ -13,6 +13,13 @@ does not depend on GitLab fleet runners being online.
 | ULTRA | 192.168.207.60 | `aarch64-apple-darwin` | native `cargo` (rust-toolchain 1.94.1) |
 | ULTRA | 192.168.207.60 | `aarch64-unknown-linux-gnu` | native **arm64** `rust:1.94` Docker (Apple Silicon) |
 | HYDRA | 192.168.207.78 | `x86_64-unknown-linux-gnu` | **amd64** `rust:1.94` Docker |
+| TYDEUS | 192.168.207.73 | `aarch64-unknown-linux-gnu` | native arm64 `rust:1.94` Docker (real arm64 HW) |
+
+TYDEUS (IGX Thor, native arm64 **Linux**) builds `aarch64-unknown-linux-gnu` on
+real arm64 hardware with **no qemu emulation** — this supersedes ULTRA's
+*emulated* arm64-linux path (ULTRA runs the same arm64 container under emulation
+on Apple Silicon). ULTRA is left as-is for now; the operator may later prune
+ULTRA's `linux/arm64` step so only TYDEUS produces the linux-arm64 tarball.
 
 Linux targets build inside a pinned `rust:1.94` container so the release
 toolchain matches the GitLab quality gate exactly. macOS binaries build natively
@@ -25,12 +32,13 @@ the host, pulls the latest `main` of zoder, builds its target(s) via
 
 ## One-time host setup
 
-On **ULTRA** and **HYDRA**:
+On **ULTRA**, **HYDRA**, and **TYDEUS**:
 
 ```sh
 # 1. Secret env (NOT committed) — gitlab read token + the build role. Set the
 #    role explicitly (hostnames are unreliable; ULTRA reports "MacBookPersonal").
 #    ULTRA: ZODER_BUILD_ROLE=ultra   HYDRA: ZODER_BUILD_ROLE=hydra
+#    TYDEUS: ZODER_BUILD_ROLE=tydeus
 cat > ~/.zoder-build.env <<'EOF'
 export ZODER_PAT=glpat-xxxxxxxxxxxxxxxxxxxx
 export ZODER_BUILD_ROLE=ultra
@@ -41,12 +49,15 @@ EOF
 chmod 600 ~/.zoder-build.env
 
 # 2. Cron — staggered so the two hosts don't both hammer the zeroclaw clone at once.
-#    ULTRA at 03:30, HYDRA at 04:00 (local time). `package.sh` is on PATH via the
-#    checkout; the script self-locates the repo under ~/zoder-daily.
+#    ULTRA at 03:30, HYDRA at 04:00, TYDEUS at 04:30 (local time). `package.sh`
+#    is on PATH via the checkout; the script self-locates the repo under
+#    ~/zoder-daily.
 #    ULTRA crontab line:
 #      30 3 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
 #    HYDRA crontab line:
 #      0  4 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
+#    TYDEUS crontab line:
+#      30 4 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
 ```
 
 On first run the checkout under `~/zoder-daily/zoder` may not exist yet; seed it
