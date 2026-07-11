@@ -658,6 +658,11 @@ enum Cmd {
         /// Run detached as a tracked background job.
         #[arg(long)]
         background: bool,
+        /// After the run completes, write the final assistant message text to
+        /// this file (parent dirs are created). Mirrors codex / claude-code
+        /// `--output-last-message` so CI reads the result from a file.
+        #[arg(long = "output-last-message", value_name = "FILE")]
+        output_last_message: Option<String>,
     },
     /// Saved prompt/agent templates (goose `recipe` equivalent).
     Recipe {
@@ -1222,7 +1227,17 @@ async fn run() -> anyhow::Result<()> {
             text,
             instructions,
             background,
-        }) => goose::cmd_run(&cli, text.clone(), instructions.clone(), *background).await,
+            output_last_message,
+        }) => {
+            goose::cmd_run(
+                &cli,
+                text.clone(),
+                instructions.clone(),
+                *background,
+                output_last_message.clone(),
+            )
+            .await
+        }
         Some(Cmd::Recipe { action }) => goose::cmd_recipe(&cli, action).await,
         Some(Cmd::Mcp { action }) => goose::cmd_mcp(&cli, action),
         Some(Cmd::Configure { edit, validate }) => goose::cmd_configure(*edit, *validate),
@@ -2981,7 +2996,7 @@ async fn cmd_exec(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     if cli.oneshot {
         return cmd_exec_oneshot(cli, prompt).await;
     }
-    match cmd_exec_agentic(cli, prompt.clone()).await {
+    match cmd_exec_agentic(cli, prompt.clone(), None).await {
         Ok(()) => Ok(()),
         Err(e) if is_engine_unavailable(&e) => {
             if !cli.quiet {
@@ -5192,7 +5207,11 @@ pub(crate) async fn agentic_turn(
     })
 }
 
-pub(crate) async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+pub(crate) async fn cmd_exec_agentic(
+    cli: &Cli,
+    prompt: Option<String>,
+    output_last_message: Option<String>,
+) -> anyhow::Result<()> {
     if cli.dry_run {
         let eng = Engine::load()?;
         let health = HealthStore::load(&eng.cfg.health_path);
@@ -5220,6 +5239,10 @@ pub(crate) async fn cmd_exec_agentic(cli: &Cli, prompt: Option<String>) -> anyho
 
     let prompt = read_prompt(prompt)?;
     let t = agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
+
+    if let Some(path) = output_last_message.as_deref() {
+        goose::write_last_message(path, &t.run.content)?;
+    }
 
     if cli.json {
         println!(

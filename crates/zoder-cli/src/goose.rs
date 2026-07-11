@@ -66,6 +66,7 @@ pub(crate) async fn cmd_run(
     text: Option<String>,
     instructions: Option<String>,
     background: bool,
+    output_last_message: Option<String>,
 ) -> anyhow::Result<()> {
     let task = match (text, instructions) {
         (Some(t), _) => t,
@@ -79,7 +80,7 @@ pub(crate) async fn cmd_run(
         background,
         crate::agentic::active_job_dir().is_some(),
         crate::agentic::spawn_background,
-        async move { crate::cmd_exec_agentic(cli, Some(task2)).await },
+        async move { crate::cmd_exec_agentic(cli, Some(task2), output_last_message.clone()).await },
     )
     .await?;
     Ok(())
@@ -1015,5 +1016,45 @@ mod configure_tests {
             ConfigureOutcome::Exit(code) => assert_eq!(code, 1),
             other => panic!("malformed config + --validate must exit nonzero, got {other:?}"),
         }
+    }
+}
+
+/// Write the final assistant message `content` to `path`, creating any
+/// missing parent directories. Used by `zoder run --output-last-message`
+/// so CI/supervisors can read the result from a file instead of stdout.
+pub(crate) fn write_last_message(path: &str, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dir for {path}"))?;
+        }
+    }
+    std::fs::write(p, content).with_context(|| format!("writing last message to {path}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod goose_tests {
+    /// DEFECT: `write_last_message` must create parent directories
+    /// when they don't exist (the --output-last-message flag
+    /// can write to arbitrary paths, including nested ones).
+    #[test]
+    fn write_last_message_creates_parent_and_writes_output_last_message() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-olm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = dir.join("nested").join("last.txt");
+        let content = "final assistant message body";
+        super::write_last_message(target.to_str().unwrap(), content).unwrap();
+        let got = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(got, content);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
