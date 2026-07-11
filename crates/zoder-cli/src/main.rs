@@ -788,6 +788,20 @@ enum McpCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Get a single MCP server's configuration by name.
+    Get {
+        /// Name of the MCP server to get.
+        name: String,
+        /// Emit the server spec as structured JSON instead of
+        /// the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test if an MCP server is reachable by name.
+    Test {
+        /// Name of the MCP server to test.
+        name: String,
+    },
 }
 
 /// Review target selection for `review` / `adversarial-review`.
