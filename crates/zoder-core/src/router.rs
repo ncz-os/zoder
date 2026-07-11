@@ -177,7 +177,10 @@ impl<'a> Router<'a> {
     ) -> Vec<String> {
         let mut fallbacks: Vec<String> = Vec::new();
         for m in ranked.iter().filter(|m| m.id != primary_id) {
-            if m.family != primary_family && fallbacks.len() < 3 {
+            if fallbacks.len() >= 4 {
+                break;
+            }
+            if m.family != primary_family {
                 fallbacks.push(m.id.clone());
             }
         }
@@ -223,14 +226,55 @@ impl<'a> Router<'a> {
 
         let primary = ranked.first().ok_or_else(|| {
             match &self.backed {
-                // A backed model exists in the pool but every one is filtered by
-                // an open circuit breaker (all unhealthy right now) — distinct
-                // from "none configured", so the operator retries rather than
-                // reconfigures.
-                Some(b) if self.corpus.free_chat().any(|m| b.contains(&m.id)) => anyhow::anyhow!(
-                    "all backed free models are currently unhealthy (circuit breaker open) — \
-                     retry shortly, or pass `-m <backed-model>` to force one"
-                ),
+                // A backed model exists in the free pool, but every backed
+                // candidate was filtered out before ranking — distinct from
+                // "none configured", so diagnose the filter rather than
+                // reconfigure the provider set.
+                Some(b) if self.corpus.free_chat().any(|m| b.contains(&m.id)) => {
+                    let mut breaker_open = false;
+                    let mut skip_classified = false;
+                    let mut unscored = false;
+                    for m in self.corpus.free_chat().filter(|m| b.contains(&m.id)) {
+                        let breaker = self.health.breaker_open(&m.id);
+                        let skipped = self.health.is_skipped_by_classification(&m.id);
+                        let has_positive_rank = Self::rank_key(m, tier) > 0.0;
+                        breaker_open |= breaker;
+                        skip_classified |= skipped;
+                        unscored |= !breaker && !skipped && !has_positive_rank;
+                    }
+                    if breaker_open && !skip_classified && !unscored {
+                        anyhow::anyhow!(
+                            "all backed free models are currently unhealthy (circuit breaker open) — \
+                             retry shortly, or pass `-m <backed-model>` to force one"
+                        )
+                    } else {
+                        // The backed pool can also be empty because every
+                        // backed model was skipped by a fresh probe
+                        // classification (Capacity / Unauthorized /
+                        // Unprovisioned), or because none has usable score
+                        // data for this tier. Do not blame the breaker unless
+                        // it is the only filter at work; the remedies differ.
+                        let mut reasons = Vec::new();
+                        if breaker_open {
+                            reasons.push("breaker open");
+                        }
+                        if skip_classified {
+                            reasons.push("recent capacity/auth/provisioning classification");
+                        }
+                        if unscored {
+                            reasons.push("no positive score data");
+                        }
+                        if reasons.is_empty() {
+                            reasons.push("filtered from the routing pool");
+                        }
+                        anyhow::anyhow!(
+                            "all backed free models are unavailable ({}) — retry after transient \
+                             health clears, fix provider credentials/provisioning, refresh score \
+                             data, or pass `-m <backed-model>` to force one",
+                            reasons.join(" or ")
+                        )
+                    }
+                }
                 // The backed filter emptied the pool: this host has no free
                 // model served by a real (non-placeholder) provider. Auto-pick
                 // would otherwise have dialed the api.example.com placeholder.
@@ -347,6 +391,47 @@ mod tests {
         assert!(!route.fallbacks.contains(&"MiniMax-M3".to_string()));
     }
 
+    #[test]
+    fn fallback_chain_uses_four_cross_family_slots_before_same_family_topup() {
+        // Cross-family diversity owns the full fallback cap. A same-family
+        // model only tops up when fewer than four cross-family alternatives
+        // exist; it must not evict a higher-ranked fourth cross-family model.
+        let models = [
+            ModelEntry {
+                family: "alpha".into(),
+                ..benched("primary", 99.0)
+            },
+            ModelEntry {
+                family: "beta".into(),
+                ..benched("b1", 95.0)
+            },
+            ModelEntry {
+                family: "gamma".into(),
+                ..benched("c1", 94.0)
+            },
+            ModelEntry {
+                family: "delta".into(),
+                ..benched("d1", 93.0)
+            },
+            ModelEntry {
+                family: "epsilon".into(),
+                ..benched("e1", 92.0)
+            },
+            ModelEntry {
+                family: "alpha".into(),
+                ..benched("same-low", 50.0)
+            },
+        ];
+        let ranked: Vec<&ModelEntry> = models.iter().collect();
+        let fallbacks = Router::build_fallbacks(&ranked, "primary", "alpha");
+        let expected: Vec<String> = ["b1", "c1", "d1", "e1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(fallbacks, expected);
+        assert!(!fallbacks.contains(&"same-low".to_string()));
+    }
+
     fn three_free_model_corpus() -> Corpus {
         Corpus {
             models: vec![
@@ -456,6 +541,44 @@ mod tests {
         );
         // The other, healthy models remain selectable.
         assert!(ids.contains(&"backed-hi") && ids.contains(&"backed-lo"));
+    }
+
+    #[test]
+    fn backed_skip_classified_error_does_not_blame_circuit_breaker() {
+        // A skip-classified backed model (401/403/404/429/503/529) is filtered
+        // by classification while its breaker remains closed. The empty-pool
+        // error must point at the classification path, not the breaker.
+        let mut health = HealthStore::default();
+        health.record_classified_failure(
+            "backed-auth",
+            "401 Unauthorized",
+            "prov",
+            crate::health::Classification::Unauthorized,
+        );
+        assert!(!health.breaker_open("backed-auth"));
+        assert!(health.is_skipped_by_classification("backed-auth"));
+
+        let corpus = Corpus {
+            models: vec![ModelEntry {
+                family: "alpha".into(),
+                free: true,
+                route_candidate: true,
+                kind: "chat".into(),
+                ..benched("backed-auth", 90.0)
+            }],
+            ..Default::default()
+        };
+        let backed: std::collections::HashSet<String> = ["backed-auth".to_string()].into();
+        let router = Router::new(&corpus, &health).with_backed(Some(backed));
+        let err = router.select(Tier::Auto).unwrap_err().to_string();
+        assert!(
+            !err.contains("circuit breaker open"),
+            "classification-skipped model must not produce breaker-only error, got: {err}"
+        );
+        assert!(
+            err.contains("capacity/auth/provisioning classification"),
+            "expected classification-specific error, got: {err}"
+        );
     }
 
     #[test]
