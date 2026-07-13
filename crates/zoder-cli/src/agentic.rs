@@ -3473,6 +3473,7 @@ pub(crate) async fn cmd_loop(
             task_txt = crate::read_prompt(None)?;
         }
     }
+    crate::validate_task(&task_txt)?;
 
     let max_iters = max_iters.max(1);
     let mut session: Option<String> = None;
