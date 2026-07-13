@@ -2639,6 +2639,33 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
 #[allow(dead_code)]
 pub(crate) const DEFAULT_LOOP_TIMEOUT_SECS: u64 = 900;
 
+/// Validates that the loop timeout configuration is sensible.
+///
+/// Returns a warning message when `loop_timeout_secs <= agent_timeout_secs`,
+/// because the outer watchdog (loop-timeout) covers author + check + review
+/// phases — it must exceed the per-turn budget (agent-timeout) or can fire
+/// before even one turn completes.
+///
+/// When the relationship is correct (loop-timeout > agent-timeout), returns
+/// `None`.
+pub(crate) fn validate_loop_timeouts(
+    loop_timeout_secs: u64,
+    agent_timeout_secs: u64,
+) -> Option<String> {
+    if loop_timeout_secs <= agent_timeout_secs {
+        Some(format!(
+            "⚠️ TIMEOUT WARNING: --loop-timeout ({loop_timeout_secs}s) <= --agent-timeout ({agent_timeout_secs}s).\n\
+             The loop-phase watchdog must exceed the per-turn budget: loop-timeout covers \
+             author + check + review phases, while agent-timeout only covers the author turn.\n\
+             With this configuration the watchdog can fire before even one turn completes.\n\
+             Fix: raise --loop-timeout to at least {} (agent-timeout + check/review overhead).",
+            agent_timeout_secs + 60
+        ))
+    } else {
+        None
+    }
+}
+
 /// Settle budget the author-phase watchdog grants the daemon to ACK a
 /// `session/cancel` before the loop captures `build_diff`. See
 /// [`zoder_core::CANCEL_SETTLE_BUDGET`] for the canonical value —
@@ -3422,6 +3449,12 @@ fn update_loop_streaks(
 /// author/check/review child is hard-capped at this many seconds. On expiry
 /// the spawned process group is killed and the loop continues — never hangs.
 ///
+/// `agent_timeout_secs` is the per-turn engine budget (default 900,
+/// configurable via `--agent-timeout`). The loop-timeout must exceed this
+/// value — otherwise the outer watchdog fires before the first turn can
+/// complete, since the loop-phase budget also covers the check and review
+/// phases. A warning is emitted at loop start when this invariant is violated.
+///
 /// `allow_dangerous_check` opts out of the pre-exec denylist in
 /// [`crate::exec_safety::inspect_shell_command`] that runs against the
 /// `--check` command string before `sh -c` spawns it. Default is `false`;
@@ -3440,6 +3473,7 @@ pub(crate) async fn cmd_loop(
     accept_on_green: bool,
     background: bool,
     loop_timeout_secs: u64,
+    agent_timeout_secs: u64,
     allow_dangerous_check: bool,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
@@ -3472,6 +3506,12 @@ pub(crate) async fn cmd_loop(
         } else {
             task_txt = crate::read_prompt(None)?;
         }
+    }
+
+    // Validate timeout configuration: loop-timeout must exceed agent-timeout
+    // since it covers author + check + review phases, not just the author turn.
+    if let Some(warning) = validate_loop_timeouts(loop_timeout_secs, agent_timeout_secs) {
+        eprintln!("\n[zoder] {warning}");
     }
 
     let max_iters = max_iters.max(1);
@@ -8652,5 +8692,83 @@ mod commit_author_enforcement_tests {
         }));
         assert_eq!(v["status"], "failed");
         assert_eq!(v["reason"], "boom");
+    }
+
+    // ---- Loop timeout validation regression tests (issue #8) ----
+
+    /// When loop-timeout <= agent-timeout the validator must emit a diagnostic.
+    #[test]
+    fn validate_loop_timeouts_warns_when_loop_le_agent() {
+        let warn = validate_loop_timeouts(900, 900);
+        assert!(
+            warn.is_some(),
+            "loop_timeout == agent_timeout should trigger a warning"
+        );
+        let msg = warn.unwrap();
+        assert!(
+            msg.contains("--loop-timeout"),
+            "warning must name --loop-timeout"
+        );
+        assert!(
+            msg.contains("--agent-timeout"),
+            "warning must name --agent-timeout"
+        );
+        assert!(msg.contains("900"), "warning must name the actual values");
+        assert!(
+            msg.contains("check") && msg.contains("review"),
+            "warning must mention the check + review phases"
+        );
+    }
+
+    /// When loop-timeout == agent-timeout the validator must warn — the
+    /// watchdog fires before the first turn can even complete.
+    #[test]
+    fn validate_loop_timeouts_warns_on_equal_defaults() {
+        let warn = validate_loop_timeouts(900, 900);
+        assert!(warn.is_some(), "equal defaults must warn");
+        assert!(
+            warn.unwrap().contains("900"),
+            "must display the actual timeout values"
+        );
+    }
+
+    /// When loop-timeout > agent-timeout no warning is emitted — the
+    /// configuration is structurally valid.
+    #[test]
+    fn validate_loop_timeouts_ok_when_loop_exceeds_agent() {
+        let warn = validate_loop_timeouts(1200, 900);
+        assert!(warn.is_none(), "loop > agent should produce no warning");
+    }
+
+    /// Even a small margin (loop-timeout = agent-timeout + 1) is considered
+    /// valid — we only warn when the watchdog can structurally never let a
+    /// turn complete.
+    #[test]
+    fn validate_loop_timeouts_ok_with_one_second_margin() {
+        let warn = validate_loop_timeouts(901, 900);
+        assert!(warn.is_none(), "+1 margin should not warn");
+    }
+
+    /// A tiny loop-timeout with a large agent-timeout must warn.
+    #[test]
+    fn validate_loop_timeouts_warns_when_loop_is_tiny() {
+        let warn = validate_loop_timeouts(10, 900);
+        assert!(warn.is_some(), "tiny loop-timeout must warn");
+        let msg = warn.unwrap();
+        assert!(
+            msg.contains("10"),
+            "warning must show the actual loop value"
+        );
+        assert!(
+            msg.contains("900"),
+            "warning must show the actual agent value"
+        );
+    }
+
+    /// Raising both flags together with a wide margin should be clean.
+    #[test]
+    fn validate_loop_timeouts_ok_with_wide_margin() {
+        let warn = validate_loop_timeouts(3600, 1800);
+        assert!(warn.is_none(), "wide margin should not warn");
     }
 }
