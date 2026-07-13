@@ -883,7 +883,7 @@ pub(crate) fn cmd_mcp_write<W: std::io::Write>(
                             writeln!(out, "  - {}", spec.name)?;
                         }
                     }
-                    return Ok(1);
+                    Ok(1)
                 }
             }
         }
