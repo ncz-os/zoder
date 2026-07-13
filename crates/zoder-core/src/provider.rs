@@ -1814,9 +1814,17 @@ impl OpenAiProvider {
             ));
         }
         if !done {
+            // NOTE: The error message deliberately names `[DONE]` specifically.
+            // `finish_reason` is also accepted as a terminal signal on each
+            // individual SSE chunk (see the Y-2 guard above that sets `done =
+            // true` when `finish_reason` is present), but `[DONE]` is the
+            // canonical OpenAI chat-stream terminator — the one every well-formed
+            // response emits as the final SSE frame. Leading with `[DONE]` in the
+            // error message gives operators and engineers the most precise signal
+            // for triage (see gitlab.com/ncz-os/zoder MR !1 finding 1).
             return Err(fail(
                 ErrKind::Decode,
-                "stream ended before terminal marker (`[DONE]` or `finish_reason`) - likely a premature disconnect"
+                "stream ended before terminal [DONE] marker - likely a premature disconnect"
                     .to_string(),
                 emitted,
             ));
