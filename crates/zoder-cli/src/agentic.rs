@@ -2548,7 +2548,7 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // the fix for the DB2 field test where `rescue` timed out at 600s with
     // nothing to show for it.
     let engine_kind = crate::resolve_engine_kind(cli)?;
-    let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
+    let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json, None).await?;
 
     let ok = t.run.succeeded();
     let timed_out = t.run.outcome == "timeout";
@@ -3568,7 +3568,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
-            crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false),
+            crate::agentic_turn(
+                cli,
+                engine_kind,
+                author_prompt,
+                session.clone(),
+                false,
+                None,
+            ),
             async move {
                 // Cancel the daemon turn for `session_id_for_cancel` (best-
                 // effort). If `None`, the daemon may have a freshly-minted
