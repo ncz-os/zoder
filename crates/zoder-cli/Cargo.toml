@@ -26,6 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs = "5"
 fs2 = "0.4"
+reqwest = { workspace = true, features = ["blocking"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

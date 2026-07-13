@@ -6,6 +6,7 @@ members = [
     "crates/model-health",
     "crates/zoder-core",
     "crates/zoder-cli",
+    "crates/zoder-mcp-server",
 ]
 
 [workspace.package]
