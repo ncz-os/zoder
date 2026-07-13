@@ -83,6 +83,83 @@ fn load_rejects_oversized_file() {
     assert!(cat.models.is_empty());
 }
 
+/// Regression: known openrouter meta-routing aliases (auto, bodybuilder,
+/// fusion, pareto-code) that lack a complete input/output pricing pair are
+/// classified and silently skipped — on every single invocation, not just the
+/// first.  An explicit list (not a prefix match) is used so a brand-new model
+/// with the same prefix would still be validated and warned about if missing
+/// pricing data.
+#[test]
+fn known_meta_aliases_are_silently_skipped_via_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pricing.json");
+
+    let json = r#"{
+      "models": {
+        "openrouter/auto":       {"source": "openrouter"},
+        "openrouter/bodybuilder":{"source": "openrouter"},
+        "openrouter/fusion":     {"source": "openrouter"},
+        "openrouter/pareto-code":{"source": "openrouter"},
+        "openai/gpt-4o":         {"input_usd_per_mtok": 5.0, "output_usd_per_mtok": 15.0}
+      }
+    }"#;
+    std::fs::write(&path, json).unwrap();
+    set_secure_permissions(&path);
+
+    // Two successive loads must produce identical, warning-free behaviour.
+    for _i in 1..=2 {
+        let cat = PricingCatalog::load(&path);
+        // The four known aliases are silently skipped — not counted as "malformed".
+        assert!(
+            !cat.models.contains_key("openrouter/auto"),
+            "known alias must be silently skipped"
+        );
+        assert!(
+            !cat.models.contains_key("openrouter/bodybuilder"),
+            "known alias must be silently skipped"
+        );
+        assert!(
+            !cat.models.contains_key("openrouter/fusion"),
+            "known alias must be silently skipped"
+        );
+        assert!(
+            !cat.models.contains_key("openrouter/pareto-code"),
+            "known alias must be silently skipped"
+        );
+        // Valid model must survive.
+        assert!(
+            cat.models.contains_key("openai/gpt-4o"),
+            "valid model must survive"
+        );
+    }
+}
+
+/// A GENUINELY malformed entry that is NOT a known meta-routing alias must
+/// still produce a warning, so real data-quality problems are not silently
+/// swallowed by the meta-routing alias filter.
+#[test]
+fn genuine_malformed_entries_still_warn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pricing.json");
+
+    let json = r#"{
+      "models": {
+        "vendor/real-model": {"input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0},
+        "vendor/broken":     {"input_usd_per_mtok": 0.5},
+        "other/missing":     {"source": "nobody"}
+      }
+    }"#;
+    std::fs::write(&path, json).unwrap();
+    set_secure_permissions(&path);
+
+    let cat = PricingCatalog::load(&path);
+    // Real models kept.
+    assert!(cat.models.contains_key("vendor/real-model"));
+    // Malformed / unknown models dropped.
+    assert!(!cat.models.contains_key("vendor/broken"));
+    assert!(!cat.models.contains_key("other/missing"));
+}
+
 #[test]
 fn off_peak_active_at_window_boundaries() {
     // Test case 1: Full-day window { window_start_utc_min: 0, window_end_utc_min: 1440 }
