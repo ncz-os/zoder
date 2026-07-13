@@ -311,6 +311,8 @@ struct StreamChunk {
 #[derive(Deserialize)]
 struct StreamChoice {
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct Delta {
@@ -1721,6 +1723,15 @@ impl OpenAiProvider {
                         emitted,
                     )
                 })?;
+                // Y-2: accept `finish_reason` in a choice delta as a terminal
+                // marker alongside `[DONE]` — a final chunk carrying
+                // `finish_reason: "stop"` (or `"length"`, `"content_filter"`,
+                // etc.) means the model is done generating. Without this, a
+                // well-formed stream that ends via `finish_reason` is
+                // incorrectly flagged as truncated/incomplete.
+                if parsed.choices.iter().any(|c| c.finish_reason.is_some()) {
+                    done = true;
+                }
                 // Every successful frame must advance one of the two pieces of
                 // stream state we understand: completion choices, or concrete
                 // usage telemetry. Requiring `choices` and each choice's
@@ -1805,7 +1816,7 @@ impl OpenAiProvider {
         if !done {
             return Err(fail(
                 ErrKind::Decode,
-                "stream ended before terminal [DONE] marker - likely a premature disconnect"
+                "stream ended before terminal marker (`[DONE]` or `finish_reason`) - likely a premature disconnect"
                     .to_string(),
                 emitted,
             ));
