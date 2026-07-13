@@ -7651,6 +7651,37 @@ mod review_diff_soundness_tests {
             assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
         }
     }
+
+    /// REGRESSION: CJK (3-byte UTF-8) characters at the truncation boundary
+    /// must not panic. The old byte-index slice panicked with "byte index N is
+    /// not a char boundary". The fix snaps to the nearest char boundary before
+    /// slicing. We use a string with known CJK layout (3-byte characters) and
+    /// pick a cap that forces the head slice to land inside one of them.
+    #[test]
+    fn cap_diff_does_not_panic_on_cjk_boundary() {
+        // 20 ASCII chars + "测" (3 bytes) + "试" (3 bytes) + 20 ASCII chars.
+        let mut body = String::new();
+        for _ in 0..20 {
+            body.push('a');
+        }
+        body.push('测');
+        body.push('试');
+        for _ in 0..20 {
+            body.push('b');
+        }
+
+        // A cap that forces head_end = max * 3 / 4 to land inside "测".
+        // max = 28 => 28 * 3 / 4 = 21. "测" occupies bytes 20..23, so
+        // byte 21 is the middle of the first CJK character.
+        let capped = std::panic::catch_unwind(|| cap_diff(&body, 28));
+        let capped = capped.expect("cap_diff must not panic on a mid-CJK cap");
+
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        assert!(
+            capped.contains("truncated for length"),
+            "cap_diff should keep its truncation marker: {capped}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
