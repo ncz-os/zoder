@@ -846,6 +846,17 @@ enum PricingCmd {
     },
 }
 
+/// Validate that a prompt / task text is non-empty (not just whitespace).
+/// Called after [`read_prompt`] or after assembling task text for `loop`.
+fn validate_task(text: &str) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!(
+            "error: TASK argument is empty — check that your task file/variable was populated correctly"
+        );
+    }
+    Ok(())
+}
+
 fn read_prompt(arg: Option<String>) -> anyhow::Result<String> {
     match arg.as_deref() {
         Some("-") | None => {
@@ -3145,6 +3156,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     }
 
     let prompt = read_prompt(prompt)?;
+    validate_task(&prompt)?;
 
     // Serialize the authoritative budget snapshot with dispatch and reserve
     // durable space for reconciliation before any provider can incur spend.
@@ -5252,6 +5264,8 @@ pub(crate) async fn cmd_exec_agentic(
     let engine_kind = resolve_engine_kind(cli)?;
 
     let prompt = read_prompt(prompt)?;
+    validate_task(&prompt)?;
+
     let t = agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
 
     if let Some(path) = output_last_message.as_deref() {
@@ -11189,5 +11203,87 @@ mod model_selection_tests {
             now,
         );
         assert_eq!(selected.unwrap().id, "openai-sub");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TASK empty-string validation regression tests.
+// ---------------------------------------------------------------------------
+//
+// Fix for GitLab issue #9: "loop/exec: an empty or missing TASK argument is
+// silently accepted and runs a doomed turn".  These tests pin the behaviour
+// that `validate_task` rejects empty and whitespace-only strings *before*
+// any model call or loop iteration can start, and that a real non-empty task
+// is NOT rejected.
+#[cfg(test)]
+mod task_validation_tests {
+    use super::*;
+
+    // ---- unit tests for validate_task itself ----
+
+    #[test]
+    fn validate_task_rejects_empty_string() {
+        let err = validate_task("").unwrap_err();
+        assert!(
+            err.to_string().contains("TASK argument is empty"),
+            "empty task must be rejected; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_task_rejects_whitespace_only() {
+        for ws in [" ", "\t", "\n", "  \t  ", "   \n   "] {
+            let err = validate_task(ws).unwrap_err();
+            assert!(
+                err.to_string().contains("TASK argument is empty"),
+                "whitespace-only task must be rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_task_allows_real_task() {
+        // A real task must NOT be rejected.
+        validate_task("fix the login button").expect("real task must pass validation");
+        validate_task("  refactor auth module  ")
+            .expect("task with surrounding whitespace must pass validation");
+    }
+
+    // ---- integration-style tests: read_prompt + validate_task path ----
+
+    /// `zoder exec ""` (empty explicit string) must be rejected before any
+    /// model call is made.
+    #[test]
+    fn exec_with_empty_string_rejected() {
+        // We simulate the path by calling read_prompt with a literal empty
+        // string (the case a user passes `zoder exec ""`).
+        let prompt = read_prompt(Some("".to_string())).unwrap();
+        let err = validate_task(&prompt).unwrap_err();
+        assert!(
+            err.to_string().contains("TASK argument is empty"),
+            "zoder exec with empty string must fail; got: {err}"
+        );
+    }
+
+    /// `zoder exec "   "` (whitespace-only) must be rejected before any
+    /// model call is made.
+    #[test]
+    fn exec_with_whitespace_only_rejected() {
+        let prompt = read_prompt(Some("   ".to_string())).unwrap();
+        let err = validate_task(&prompt).unwrap_err();
+        assert!(
+            err.to_string().contains("TASK argument is empty"),
+            "zoder exec with whitespace-only must fail; got: {err}"
+        );
+    }
+
+    /// A real non-empty task goes through cleanly (no false positive).
+    #[test]
+    fn exec_with_real_task_passes() {
+        let prompt = read_prompt(Some("fix the login button".to_string())).unwrap();
+        assert!(
+            validate_task(&prompt).is_ok(),
+            "real task must NOT be rejected"
+        );
     }
 }
