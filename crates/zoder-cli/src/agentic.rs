@@ -8749,4 +8749,162 @@ mod commit_author_enforcement_tests {
         assert_eq!(v["status"], "failed");
         assert_eq!(v["reason"], "boom");
     }
+
+    #[tokio::test]
+    async fn loop_iteration_reports_passing_check_after_real_git_edit() {
+        let dir = tempfile::tempdir().expect("create scratch repo");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .expect("initialize git repo");
+        std::fs::write(cwd.join("iteration.txt"), "post-edit state\n")
+            .expect("write iteration edit");
+
+        // Exercise the same post-edit ordering as a real loop iteration.
+        let (_label, diff) = build_diff(cwd, ReviewScope::WorkingTree, None)
+            .expect("capture post-edit working tree");
+        assert!(diff.contains("post-edit state"));
+        let (ok, tail) = run_check_watched(
+            cwd,
+            "true",
+            30,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
+        let check_passed = Some(ok);
+
+        assert_eq!(check_passed, Some(true), "check tail: {tail}");
+    }
+
+    /// Z-7 REGRESSION GUARD: `--check` is spawned as a login shell so the
+    /// operator's interactive `PATH` (cargo in `~/.cargo/bin`, go in
+    /// `~/go/bin`, npm in `~/.npm-global/bin`, …) is visible to the
+    /// subprocess. Without `-l`, the child inherits the loop driver's
+    /// `PATH`, which on editor/CI/launchd-driven invocations does NOT
+    /// include those user dirs — the child reports `cargo: not found`
+    /// (or any equivalent "tool-on-PATH-not-found"), the per-iter
+    /// `check_passed` is `Some(false)`, and the per-iter table prints
+    /// `check=false` even when the same command exits 0 in a fresh
+    /// terminal. This test is the exact reproduction of that pattern:
+    /// we install a "tool" in a non-default `bin` dir, write a
+    /// `~/.profile` that adds it to `PATH` (the way every Linux box
+    /// the operator actually uses does), and drive the loop's
+    /// post-edit `build_diff` + `run_check_watched` pair against a
+    /// check that calls that tool. The pre-fix `sh -c` dispatch would
+    /// fail with "tool not found"; the post-fix `sh -l -c` dispatch
+    /// sources the profile and passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_spawns_login_shell_so_dotfiles_extend_path() {
+        // Synthetic operator home: a tempdir that we fully own.
+        // Mirrors the "user just installed rustup" / "user just put a
+        // `~/bin/cargo` shim there" / "user has a `~/.profile` that
+        // exports PATH" shape we observed in the field report.
+        let home = tempfile::tempdir().expect("home");
+        let home_path = home.path().to_path_buf();
+        // Fake `~/.local/bin/post-edit-check` — the tool the loop's
+        // `--check` is going to invoke. Exits 0 on success, exactly
+        // the contract a passing `cargo check --workspace` would have
+        // had if the operator's PATH were in scope. We `echo` PATH
+        // so a regression that drops the login flag is loud in the
+        // failure message (the operator can read the tail and see
+        // which PATH the child actually saw).
+        let local_bin = home_path.join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).expect("create ~/.local/bin");
+        let fake_tool = local_bin.join("post-edit-check");
+        std::fs::write(&fake_tool, "#!/bin/sh\necho PATH=$PATH\nexit 0\n")
+            .expect("write fake tool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tool, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x fake tool");
+        }
+        // Fake `~/.profile` — the ONLY place this tool gets added to
+        // PATH. Without `sh -l` sourcing this, the child never sees
+        // the tool and `--check` exits 127 / "not found".
+        std::fs::write(
+            home_path.join(".profile"),
+            "PATH=\"$HOME/.local/bin:$PATH\"\nexport PATH\n",
+        )
+        .expect("write ~/.profile");
+
+        // A scratch git repo is the right scope for `build_diff` (the
+        // loop captures the working-tree diff post-author, then runs
+        // the check); we don't need a real edit, an empty tree is
+        // fine — the check is what we're testing.
+        let repo = home_path.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+
+        // Run the check with HOME pointed at our fake operator home and
+        // an explicitly-stripped PATH so the only way `post-edit-check`
+        // can be discovered is via `~/.profile` being sourced. This is
+        // the exact scenario the bug report describes: the loop
+        // driver's PATH doesn't include the operator's toolchain, but
+        // a fresh terminal's PATH (which sources `~/.profile`) does.
+        //
+        // We need to set BOTH `ZODER_HOME` (the path the loop itself
+        // reads; the existing `EnvGuard` is enough for that) AND
+        // `HOME` (the path the login shell sources `~/.profile` from;
+        // a real `zoder loop` invocation inherits the operator's
+        // `HOME` from their terminal, so the equivalent here is to
+        // set it explicitly). The test's `EnvGuard` deliberately
+        // scopes only `ZODER_HOME` (it would be wrong for it to touch
+        // `HOME` — the lock would become unrelated to operator
+        // config). We restore `HOME` ourselves on the way out.
+        let _env_guard = crate::test_env::EnvGuard::new(&home_path);
+        let saved_path = std::env::var_os("PATH");
+        let saved_home = std::env::var_os("HOME");
+        // A PATH that has only the standard system dirs — no
+        // `~/.cargo/bin`, no `~/.local/bin`, no `~/bin`. The pre-fix
+        // `sh -c` child would inherit this and fail to find the tool.
+        std::env::set_var(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        std::env::set_var("HOME", &home_path);
+        // Wipe the few interactive-only env vars the login shell
+        // consults; some of them (LOGNAME/USER mismatch on systemd /
+        // launchd-driven launches, in particular) can cause `dash`'s
+        // `-l` mode to skip the profile when only `HOME` is set. The
+        // test's `HOME` is the only thing we want the login logic to
+        // see.
+        for v in ["USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR"] {
+            std::env::remove_var(v);
+        }
+        let (ok, tail) = run_check_watched(
+            &repo,
+            "post-edit-check",
+            30,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
+        // Restore PATH / HOME so the rest of the test suite / drop
+        // guard see sane values. (EnvGuard restores ZODER_HOME on drop;
+        // PATH and HOME are not in its scope by design — only
+        // ZODER_HOME is.)
+        match saved_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            ok,
+            "run_check_watched must source ~/.profile so the operator's \
+             toolchain (cargo in ~/.cargo/bin, go in ~/go/bin, …) is on \
+             PATH for the check; tail:\n{tail}"
+        );
+    }
 }
