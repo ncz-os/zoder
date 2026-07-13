@@ -67,7 +67,59 @@ async fn streaming_sse_eof_before_done_is_decode_error() {
         .await
         .unwrap_err();
     assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
-    assert!(err.message.contains("terminal [DONE] marker"), "got: {err}");
+    assert!(err.message.contains("terminal marker"), "got: {err}");
+}
+
+/// Y-2 regression: a streaming response whose last chunk carries
+/// `finish_reason: "stop"` MUST be accepted as a complete response,
+/// even when no `[DONE]` sentinel is present. The OpenAI chat-completions
+/// stream protocol uses `finish_reason` to signal completion, so the
+/// stream parser must treat it as a terminal marker alongside `[DONE]`.
+/// Without this guard a well-formed stream that ends via
+/// `finish_reason` is incorrectly flagged as truncated/incomplete.
+#[tokio::test]
+async fn streaming_sse_finish_reason_as_terminal_marker() {
+    let server = MockServer::start().await;
+    // Final chunk carries finish_reason: "stop" but no [DONE] sentinel.
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\
+                \"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let res = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(res.completion_tokens, Some(2));
+    assert_eq!(res.prompt_tokens, Some(3));
+}
+
+/// Y-2: `finish_reason: "length"` must also terminate the stream
+/// (it signals the model hit a token limit). The stream parser should
+/// treat any non-None `finish_reason` as terminal — the caller decides
+/// semantics downstream.
+#[tokio::test]
+async fn streaming_sse_finish_reason_length_terminates_stream() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"B\"},\"finish_reason\":\"length\"}],\
+                \"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let res = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "AB");
 }
 
 #[tokio::test]
