@@ -312,6 +312,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "POLICY", value_enum)]
     approve: Option<ApprovalArg>,
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
+    /// When used with `zoder loop`, this is the per-turn budget; the outer
+    /// loop-phase watchdog (`--loop-timeout`, default 900) must exceed this
+    /// value or the watchdog fires before the first turn completes.
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
     /// Persist the engine-side session id between `zoder` invocations
@@ -333,7 +336,13 @@ struct Cli {
     /// review), in seconds (default 900). The watchdog kills the spawned
     /// child AND its process group when the budget elapses, so a wedged
     /// child can never hang the loop indefinitely. `agent_timeout` controls
-    /// the engine's internal turn budget and is independent.
+    /// the engine's internal turn budget (default 900) and is independent.
+    ///
+    /// ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`.
+    /// The loop-phase watchdog covers the author turn *plus* the check and
+    /// review phases. If you raise `--agent-timeout` without also raising
+    /// `--loop-timeout`, the watchdog will still kill the loop at its (unchanged)
+    /// budget — you must bump both flags together.
     #[arg(long, global = true, value_name = "SECS")]
     loop_timeout: Option<u64>,
     /// Which agentic engine to drive the loop with: zeroclaw | goose
@@ -1294,6 +1303,8 @@ async fn run() -> anyhow::Result<()> {
             allow_dangerous_check,
             background,
         }) => {
+            let agent_timeout_secs = cli.agent_timeout.unwrap_or(900);
+            let loop_timeout_secs = cli.loop_timeout.unwrap_or(900);
             agentic::cmd_loop(
                 &cli,
                 task,
@@ -1305,7 +1316,8 @@ async fn run() -> anyhow::Result<()> {
                 *scope,
                 *accept_on_green,
                 *background,
-                cli.loop_timeout.unwrap_or(900),
+                loop_timeout_secs,
+                agent_timeout_secs,
                 *allow_dangerous_check,
             )
             .await
