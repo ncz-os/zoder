@@ -7509,6 +7509,64 @@ mod review_diff_soundness_tests {
         drop(dir);
     }
 
+    /// REGRESSION (b): when both a tracked-file modification AND a new
+    /// untracked file exist, the working-tree diff must include BOTH — the
+    /// tracked diff must not swallow the untracked hunk.
+    #[test]
+    fn build_diff_includes_both_tracked_modification_and_untracked_file() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+
+        // Modify an existing tracked file.
+        std::fs::write(repo.join("README.md"), "modified\n").unwrap();
+
+        // Add a brand-new untracked file.
+        let new_file = repo.join("new_feature.rs");
+        std::fs::write(&new_file, "pub fn new_thing() -> u32 { 42 }\n").unwrap();
+
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::WorkingTree, None).expect("build_diff ok");
+
+        // Must contain BOTH signals.
+        assert!(
+            !diff.trim().is_empty(),
+            "diff must be non-empty when both tracked + untracked changes exist"
+        );
+        // The tracked modification (README.md change).
+        assert!(
+            diff.contains("README.md"),
+            "diff should reference the modified tracked file: {diff}"
+        );
+        // The untracked new file.
+        assert!(
+            diff.contains("new_feature.rs"),
+            "diff should reference the new untracked file: {diff}"
+        );
+        assert!(
+            diff.contains("diff --git a/new_feature.rs b/new_feature.rs"),
+            "diff should contain a `diff --git` header for the new file: {diff}"
+        );
+        assert!(
+            diff.contains("new file mode"),
+            "diff should mark the untracked file as new: {diff}"
+        );
+    }
+
+    /// REGRESSION (c): when there are NO changes at all, the diff must be
+    /// empty — no false positives from stray untracked paths.
+    #[test]
+    fn build_diff_is_empty_when_no_changes() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+
+        // No modifications, no new files.
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::WorkingTree, None).expect("build_diff ok");
+
+        assert!(
+            diff.trim().is_empty(),
+            "diff must be empty when working tree has no changes: {diff}"
+        );
+    }
+
     /// REGRESSION: review diff acquisition must not buffer all of `git diff`
     /// before the prompt-level `cap_diff` has a chance to trim it. The capped
     /// git path reads at most the requested byte count, stops the child when
