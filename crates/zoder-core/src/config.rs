@@ -3945,9 +3945,9 @@ auth = { type = "env", var = "GUARD_KEY" }
         let swapper = thread::spawn(move || {
             let mut i: u64 = 0;
             while !stop_clone.load(Ordering::Relaxed) {
-                // File is present for the next 500µs. The reader
+                // File is present for the next 2ms. The reader
                 // thread has plenty of time to open and read it.
-                thread::sleep(Duration::from_micros(500));
+                thread::sleep(Duration::from_micros(2000));
 
                 // Now perform the swap: rename target aside,
                 // mkfifo, unlink, restore.
