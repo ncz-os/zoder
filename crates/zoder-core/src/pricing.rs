@@ -329,6 +329,25 @@ fn validate_model_price(
     Some(price)
 }
 
+/// Returns true when `model_id` is a known OpenRouter meta-routing alias that
+/// genuinely has no fixed per-token rate (it routes to whichever model OpenRouter
+/// picks).  These entries are intentionally missing input/output pricing data, so
+/// the loader can skip them without emitting a repeated "malformed" warning.
+///
+/// IMPORTANT: this is an **explicit list**, not a prefix match.  If a brand-new
+/// model happens to be added with the same prefix but is genuinely malformed, it
+/// will still pass through `validate_model_price` and produce a warning — so real
+/// data-quality problems are never silently swallowed.
+pub fn is_known_unpriceable_model(model_id: &str) -> bool {
+    matches!(
+        model_id.to_ascii_lowercase().as_str(),
+        "openrouter/auto"
+            | "openrouter/bodybuilder"
+            | "openrouter/fusion"
+            | "openrouter/pareto-code"
+    )
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PricingCatalog {
     #[serde(default)]
@@ -448,6 +467,13 @@ impl PricingCatalog {
             let mut skipped = 0usize;
             let mut warn = |m: String| eprintln!("zoder: warning: {m}");
             for (k, raw) in models {
+                // Known unpriceable meta-routing aliases have no fixed rate by design
+                // (they route to whichever model OpenRouter picks).  Skip them
+                // silently — only entries that aren't in the explicit list go through
+                // the full validation path so real data-quality problems still warn.
+                if is_known_unpriceable_model(k) {
+                    continue;
+                }
                 match validate_model_price(k, raw, &mut warn) {
                     Some(price) => {
                         cat.models.insert(k.clone(), price);
