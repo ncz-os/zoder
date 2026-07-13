@@ -12,8 +12,10 @@ curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 ```
 
 Detects your OS/arch, verifies the SHA-256 checksum, and installs the selected
-nightly channel build to `~/.local/bin` (`zoder`, plus `zerocode`/`zeroclaw` when
-published). Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
+nightly channel build to `~/.local/bin` (`zoder`). The nightly release bundles
+`zerocode` (TUI) and `zeroclaw` (engine) alongside zoder — the installer installs
+all three when the channel artifact exists (the installer treats them as optional
+only for backward compatibility with old channels that predate the trio). Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
 Pin/automate: set `ZODER_CHANNEL=YYYY-MM-DD` or pass `--channel YYYY-MM-DD`.
 Full options, manual, and source builds are [below](#install--build-targets).
 
@@ -22,7 +24,7 @@ Full options, manual, and source builds are [below](#install--build-targets).
 ```bash
 zoder "refactor this for readability" < src/foo.rs   # run a task on the best FREE model
 zerocode                                             # interactive pair-coding TUI
-zoder review        # multi-model code review → consensus verdict
+zoder review        # code review → structured verdict (add --panel M1,M2 for a multi-model panel)
 zoder loop          # author → validate → review → fix, until it passes
 zoder report        # spend + what the free path saved you, in dollars
 ```
@@ -100,8 +102,8 @@ zoder report
 | Command | What it does |
 |---|---|
 | `zoder "<prompt>"` / `zoder exec` | Run a task through the free-first router (codex-compatible; `-` reads stdin). |
-| `zoder review` | Fan a code review to a panel of models and reach a consensus verdict. |
-| `zoder loop` | Author → validate (build/test) → adversarial review → fix, looping until the check passes and the reviewer raises no blocking findings. Pass `--check "<cmd>"` to gate each iteration on a local command (e.g. `cargo test -p foo`), or `--reviewer <model>` for an adversarial second opinion. |
+| `zoder review` | Run a code review (single model by default). Pass `--panel M1,M2` to fan to additional reviewer models for a multi-model panel. Emits a structured JSON verdict. |
+| `zoder loop` | Author → validate (build/test) → adversarial review → fix, looping until the check passes and the reviewer raises no blocking findings. Pass `--check "<cmd>"` to gate each iteration on a local command (e.g. `cargo test -p foo`), or `--reviewer <model>` for an adversarial second opinion. Multi-model review (the `--panel` flag) is opt-in and only applies to the `review` command; `loop` always uses a single reviewer (configurable via `--reviewer` or the routed model). |
 | `zoder route` | Show the model the router would pick + the cross-family fallback chain. |
 | `zoder report` | Usage + chargeback report: daily/weekly/by-model, with the savings headline. Pass `--vendor <name>` to scope to a TOML-defined vendor (e.g. `enterprise`, `ibm`, `microsoft`). |
 | `zoder spend` | Raw spend rollups from the local ledger. |
@@ -316,9 +318,10 @@ same way `zoder`-the-CLI contains the zeroclaw engine. Until zodercode lands,
 brain. It provides the classified model **corpus**, the **free-first router**
 with cross-family fallback, the **default-deny-paid policy gate** with its
 anti-paid-fallback guard, per-model **health** (circuit breaker + measured
-latency), **multi-model review / agentic fix**, and the **headless dispatch**
-surface (`zoder exec -`) that lets a hive of workers run coding tasks
-unattended. It is the part that turns ZeroClaw into a *distribution*.
+latency), **adversarial review** (with an opt-in multi-model panel via
+`--panel`), and the **headless dispatch** surface (`zoder exec -`) that lets a
+hive of workers run coding tasks unattended. It is the part that turns
+ZeroClaw into a *distribution*.
 
 **Pricing engine + FinOps reporting.** A deterministic, conformance-tested
 pricing engine (with an optional live LiteLLM/OpenRouter cache) prices every call
@@ -495,8 +498,10 @@ curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/install.sh | sh
 
 Detects your OS/arch, downloads the selected nightly channel build for your
 platform, verifies the SHA-256 checksum, and installs `zoder` (CLI) plus
-`zerocode` (TUI) and `zeroclaw` (engine) when those optional binaries are
-published for the channel.
+`zerocode` (TUI) and `zeroclaw` (engine) — all three are bundled together in
+every nightly release. The installer marks zerocode and zeroclaw as optional
+only for backward compatibility with old channels that may predate the trio; a
+missing artifact is a warn-and-skip, never a fatal.
 
 **Agent / non-interactive** (no prompts; pin the nightly channel + dir, exits
 nonzero on error):
