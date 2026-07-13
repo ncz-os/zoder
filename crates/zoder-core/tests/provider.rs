@@ -70,6 +70,93 @@ async fn streaming_sse_eof_before_done_is_decode_error() {
     assert!(err.message.contains("terminal [DONE] marker"), "got: {err}");
 }
 
+/// Regression pin: when the SSE stream terminates without ever emitting a
+/// terminal marker (`[DONE]` or a `finish_reason`-bearing chunk), the parser
+/// MUST return a `Decode` error whose message **explicitly names `[DONE]`**.
+/// This gives operators and engineers the most precise diagnostic for triage —
+/// omitting `[DONE]` from the message would mask legitimate disconnect issues
+/// (see MR !1 finding 1 on gitlab.com/ncz-os/zoder).
+#[tokio::test]
+async fn eof_before_terminal_marker_error_message_mentions_done() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    // CRITICAL: the error message must include `[DONE]` so engineers can
+    // quickly diagnose a premature disconnect from the message alone.
+    assert!(
+        err.message.contains("[DONE]"),
+        "error message must mention [DONE] for triage; got: {err}"
+    );
+    // Also confirm the message references "terminal marker" / "disconnect"
+    // so the full diagnostic is preserved.
+    assert!(
+        err.message.contains("terminal") || err.message.contains("disconnect"),
+        "error message must be diagnostic; got: {err}"
+    );
+}
+
+/// Y-2 regression: a streaming response whose last chunk carries
+/// `finish_reason: "stop"` MUST be accepted as a complete response,
+/// even when no `[DONE]` sentinel is present. The OpenAI chat-completions
+/// stream protocol uses `finish_reason` to signal completion, so the
+/// stream parser must treat it as a terminal marker alongside `[DONE]`.
+/// Without this guard a well-formed stream that ends via
+/// `finish_reason` is incorrectly flagged as truncated/incomplete.
+#[tokio::test]
+async fn streaming_sse_finish_reason_as_terminal_marker() {
+    let server = MockServer::start().await;
+    // Final chunk carries finish_reason: "stop" but no [DONE] sentinel.
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\
+                \"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let res = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "Hello");
+    assert_eq!(res.completion_tokens, Some(2));
+    assert_eq!(res.prompt_tokens, Some(3));
+}
+
+/// Y-2: `finish_reason: "length"` must also terminate the stream
+/// (it signals the model hit a token limit). The stream parser should
+/// treat any non-None `finish_reason` as terminal — the caller decides
+/// semantics downstream.
+#[tokio::test]
+async fn streaming_sse_finish_reason_length_terminates_stream() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{\"content\":\"B\"},\"finish_reason\":\"length\"}],\
+                \"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let res = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "AB");
+}
+
 #[tokio::test]
 async fn non_streaming_object_is_parsed() {
     let server = MockServer::start().await;
