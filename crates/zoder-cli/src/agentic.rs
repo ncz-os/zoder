@@ -1248,9 +1248,16 @@ fn parse_review(raw: &str) -> ReviewOutput {
     if let Some(r) = worst {
         return r;
     }
-    // Y-4: no parseable verdict object → FAIL CLOSED. A review we cannot
-    // extract a verdict from (prose, a refusal like "I cannot review this",
-    // an empty `{}`) must BLOCK — the previous non-blocking `"comment"` let an
+    // Fallback for free-form prose: try to recover an explicit verdict keyword
+    // so a genuinely productive prose review is not treated identically to a
+    // broken reviewer. This is a clearly-separated, conservative path.
+    if let Some(recovered) = try_parse_verdict_from_prose(trimmed) {
+        return recovered;
+    }
+    // Y-4: no parseable verdict object AND no recoverable prose verdict → FAIL
+    // CLOSED. A review we cannot extract a verdict from (prose without any
+    // explicit verdict signal, a refusal like "I cannot review this", an empty
+    // `{}`) must BLOCK — the previous non-blocking `"comment"` let an
     // unreviewed/refused iteration resolve as if approved. `request_changes`
     // is the fail-closed verdict, mirroring `synthesize_review_phase_failure`.
     ReviewOutput {
@@ -1264,6 +1271,128 @@ fn parse_review(raw: &str) -> ReviewOutput {
         }],
         next_steps: vec![],
     }
+}
+
+/// Known verdict keywords (case-insensitive) that `verdict_rank` recognizes.
+/// The prose fallback only emits one of these; everything else is ignored.
+const KNOWN_VERDICTS: &[&str] = &[
+    "approve",
+    "request_changes",
+    "comment",
+    "reject",
+    "block",
+    "neutral",
+];
+
+/// Best-effort recovery of a `ReviewOutput` from free-form prose that does NOT
+/// contain parseable JSON. The strategy is deliberately conservative:
+///
+/// 1. Scan the prose for any unambiguous verdict keyword (case-insensitive,
+///    word-boundary or start-of-string anchored).
+/// 2. If found, emit a `ReviewOutput` with that verdict and the full prose as
+///    both `summary` and the body of a single `Finding`.
+/// 3. If NOT found, return `None` so the caller falls through to the existing
+///    fail-closed behavior in `parse_review`.
+///
+/// Safety: this never guesses a verdict. If no clear signal is present the
+/// function returns `None` and the caller still fails closed (`request_changes`).
+/// Check whether a keyword match at `keyword_pos` in `lowered` is bounded
+/// by non-alphanumeric characters (or start/end of string) on both sides.
+/// This turns a plain substring search into a word-boundary search.
+///
+/// Underscores are NOT considered alphanumeric, so `request_changes` is
+/// treated as a single token: the internal `_` does not break the match,
+/// but the outer edges still require non-alphanumeric boundaries.
+fn is_word_boundary(keyword_pos: usize, keyword: &str, lowered: &str) -> bool {
+    let start = keyword_pos;
+    let end = keyword_pos + keyword.len();
+
+    // Boundary before the keyword: must be start-of-string or a non-"word" char.
+    // A "word" character is alphanumeric or underscore (so "approve" inside
+    // "disapprove" or "approve_extra" does NOT match, while "request_changes"
+    // is treated as a single token whose internal underscore does not break
+    // the match but whose outer edges still require non-word boundaries).
+    let before_ok = if start == 0 {
+        true
+    } else {
+        let prev_byte = start - 1;
+        let mut i = prev_byte;
+        while i > 0 && !lowered.is_char_boundary(i) {
+            i -= 1;
+        }
+        if i == 0 {
+            !is_word_char(lowered.chars().next().unwrap())
+        } else {
+            let ch = lowered[i..].chars().next().unwrap();
+            !is_word_char(ch)
+        }
+    };
+
+    if !before_ok {
+        return false;
+    }
+
+    // Boundary after the keyword: must be end-of-string or a non-"word" char.
+    let after_ok = if end >= lowered.len() {
+        true
+    } else {
+        let ch = lowered[end..].chars().next().unwrap();
+        !is_word_char(ch)
+    };
+
+    after_ok
+}
+
+/// Returns true if `c` is a "word" character — alphanumeric or underscore.
+/// This is used to implement `\b`-like boundary checking without regex.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn try_parse_verdict_from_prose(raw: &str) -> Option<ReviewOutput> {
+    let lower = raw.to_ascii_lowercase();
+    // Search for each known verdict. Prefer the first match by position (i.e.
+    // the earliest-appearing verdict keyword in the prose). The match must
+    // satisfy word-boundary constraints on both sides — the keyword must not
+    // be a substring of a longer alphanumeric word (e.g. "disapprove" must
+    // NOT match "approve", and "blocking" must NOT match "block").
+    let mut best_pos: Option<usize> = None;
+    let mut best_verdict: Option<String> = None;
+    for &v in KNOWN_VERDICTS {
+        let mut offset = 0;
+        while let Some(pos) = lower[offset..].find(v).map(|p| p + offset) {
+            // Check word boundaries at this match position.
+            if is_word_boundary(pos, v, &lower) {
+                match &best_pos {
+                    Some(bp) if pos >= *bp => { /* keep earlier */ }
+                    _ => {
+                        best_pos = Some(pos);
+                        best_verdict = Some(v.to_string());
+                    }
+                }
+                break; // Found the boundary-anchored match for this keyword; move on.
+            }
+            // No boundary match at this position; keep looking past it.
+            offset = pos + 1;
+        }
+    }
+    let verdict = best_verdict?;
+    let verdict_lower = verdict.to_ascii_lowercase();
+    // Verdict must be present; now build the output.
+    Some(ReviewOutput {
+        verdict: verdict.clone(),
+        summary: format!(
+            "Reviewer produced free-form analysis (recovered verdict: {}).",
+            verdict_lower
+        ),
+        findings: vec![Finding {
+            severity: "info".into(),
+            title: format!("prose review – verdict: {verdict_lower}"),
+            body: raw.to_string(),
+            location: None,
+        }],
+        next_steps: vec![],
+    })
 }
 
 fn verdict_rank(v: &str) -> u8 {
@@ -4889,6 +5018,236 @@ mod tests {
         // object (string-aware brace counting).
         let raw = "{\"verdict\":\"reject\",\"summary\":\"found a stray } and { in a regex\"}";
         assert_eq!(parse_review(raw).verdict, "reject");
+    }
+
+    // ---- prose fallback: revert-to-prose recovery for free-form reviews ----
+
+    #[test]
+    fn prose_recovery_recovers_explicit_approve() {
+        // A real LLM response with "approve" buried in prose should be recovered.
+        let raw = "I looked at the code. The changes look good. My verdict is approve. The implementation is clean and follows best practices.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "approve",
+            "prose with explicit 'approve' must be recovered, not fail-closed"
+        );
+        assert!(
+            r.summary.to_ascii_lowercase().contains("approve"),
+            "recovered summary should mention the recovered verdict"
+        );
+    }
+
+    #[test]
+    fn prose_recovery_recovers_explicit_request_changes() {
+        // A prose review saying "I request changes" should be recovered.
+        let raw = "After reviewing the code, I see a potential buffer overflow in the parsing loop. I request changes to fix this security issue before merging.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "prose with 'request_changes' must be recovered"
+        );
+    }
+
+    #[test]
+    fn prose_recovery_recovers_explicit_reject() {
+        let raw = "The code has critical design flaws. The architecture does not match the requirements. My decision is reject this PR.";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "reject");
+    }
+
+    #[test]
+    fn prose_recovery_recovers_explicit_comment() {
+        let raw = "The code looks fine. This is just a style comment — no issues found. Comment: the naming conventions could be improved but it's not a blocker.";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "comment");
+    }
+
+    #[test]
+    fn prose_recovery_case_insensitive() {
+        // Mixed case should still be recovered.
+        let raw = "The code is solid. My verdict is APPROVE — let's merge it.";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "approve");
+    }
+
+    #[test]
+    fn prose_recovery_no_verdict_fails_closed() {
+        // Prose WITHOUT any recognizable verdict keyword must still fail closed.
+        let raw = "I looked at the code. The implementation seems reasonable but I have some concerns about edge cases that weren't addressed. The error handling could be better in places.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "prose without explicit verdict must still fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_recovery_early_verdict_wins() {
+        // If multiple verdicts appear, the earliest one in the prose wins.
+        let raw = "I think approve is fine, but after more analysis I request_changes due to a security concern.";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "approve");
+    }
+
+    #[test]
+    fn prose_recovery_mixed_json_and_prose_prefers_json() {
+        // When JSON is present alongside prose, the JSON path should still win.
+        let raw = "Here's my review:\n\n- Line 42 has a bug\n\n{\"verdict\":\"approve\",\"summary\":\"good code\",\"findings\":[]}";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "approve");
+        assert_eq!(r.summary, "good code");
+    }
+
+    #[test]
+    fn prose_recovery_verdict_in_prose_overrides_no_verdict_json() {
+        // A JSON object without a verdict falls through to prose fallback.
+        let raw = "{\"note\":\"review pending\"}\n\nMy verdict is approve — the code looks solid.";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "approve");
+    }
+
+    // ---- Word-boundary regression tests for try_parse_verdict_from_prose (issue #14) ----
+    // The prose-fallback path must NOT recover a verdict when the keyword
+    // appears only as a substring of a longer word (e.g. "disapprove" must
+    // not be recovered as "approve", and "blocking" must not be recovered
+    // as "block"). The fix added word-boundary checking on both sides.
+
+    #[test]
+    fn prose_disapprove_does_not_recover_as_approve() {
+        // "disapprove" contains "approve" as a substring; must NOT be
+        // recovered as approve. The reviewer meant the opposite — this
+        // test guarantees the fail-closed behavior prevents a wrong verdict
+        // from silently slipping through.
+        let raw = "I disapprove of this change — the API contract is broken.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"disapprove\" must NOT be recovered as \"approve\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_blocking_does_not_recover_as_block() {
+        // "blocking" contains "block" as a substring; must NOT be recovered
+        // as block. Prose like "no blocking issues here" should fail closed.
+        let raw = "There are no blocking issues here, the changes look fine.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"blocking\" must NOT be recovered as \"block\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_unblock_does_not_recover_as_block() {
+        // "unblock" contains "block" — must not be recovered as "block".
+        let raw = "I unblock this PR after verifying the integration tests.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"unblock\" must NOT be recovered as \"block\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_roadblock_does_not_recover_as_block() {
+        let raw = "There is a roadblock in the CI pipeline.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"roadblock\" must NOT be recovered as \"block\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_approved_does_not_recover_as_approve() {
+        // "approved" contains "approve" — must not be recovered as "approve".
+        let raw = "The changes look approved. Please proceed with the merge.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"approved\" must NOT be recovered as \"approve\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_commentary_does_not_recover_as_comment() {
+        // "commentary" contains "comment" — must not be recovered as "comment".
+        let raw = "This is just some commentary on the code style.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"commentary\" must NOT be recovered as \"comment\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_rejecting_does_not_recover_as_reject() {
+        // "rejecting" contains "reject" — must not be recovered as "reject".
+        let raw = "I am rejecting this PR due to security concerns.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"rejecting\" must NOT be recovered as \"reject\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_neutralize_does_not_recover_as_neutral() {
+        // "neutralize" contains "neutral" — must not be recovered as "neutral".
+        let raw = "The team decided to neutralize this approach.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"neutralize\" must NOT be recovered as \"neutral\" — fail closed"
+        );
+    }
+
+    #[test]
+    fn prose_request_changes_with_underscore_still_works() {
+        // "request_changes" contains an underscore — it should still match.
+        // Underscore is NOT treated as a word boundary, so "request_changes"
+        // as a single token should match when preceded/followed by
+        // non-alphanumeric chars.
+        let raw = "The review label was request_changes so I agree with this.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "\"request_changes\" must be recovered — underscore is not a boundary break"
+        );
+    }
+
+    #[test]
+    fn prose_block_as_standalone_word_still_works() {
+        // "block" used as its own word (not substring) should still recover.
+        let raw = "My decision: block — there are critical security issues.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "block",
+            "standalone \"block\" must still be recovered"
+        );
+    }
+
+    #[test]
+    fn prose_produce_correct_earliest_verdict_with_boundaries() {
+        // Multiple verdicts in prose, earliest boundary-anchored one wins.
+        // "approve" appears first as a standalone word; "block" appears
+        // later but inside "blocker" (another substring).
+        let raw = "I think approve is fine overall, but there is one blocker to fix.";
+        let r = parse_review(raw);
+        assert_eq!(
+            r.verdict, "approve",
+            "earliest standalone keyword \"approve\" wins over substring \"block\" in \"blocker\""
+        );
+    }
+
+    #[test]
+    fn prose_mixed_json_and_prose_still_prefers_json() {
+        // JSON path should still take priority over prose fallback.
+        let raw = "Here's my review:\n\n{\"verdict\":\"approve\",\"summary\":\"good code\",\"findings\":[]}";
+        let r = parse_review(raw);
+        assert_eq!(r.verdict, "approve");
+        assert_eq!(r.summary, "good code");
     }
 
     /// Cwd for `run_check_watched` tests. The child `sh -c` doesn't care
