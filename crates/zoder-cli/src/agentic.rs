@@ -2548,7 +2548,7 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // the fix for the DB2 field test where `rescue` timed out at 600s with
     // nothing to show for it.
     let engine_kind = crate::resolve_engine_kind(cli)?;
-    let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json).await?;
+    let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json, None).await?;
 
     let ok = t.run.succeeded();
     let timed_out = t.run.outcome == "timeout";
@@ -3507,6 +3507,7 @@ pub(crate) async fn cmd_loop(
             task_txt = crate::read_prompt(None)?;
         }
     }
+    crate::validate_task(&task_txt)?;
 
     // Validate timeout configuration: loop-timeout must exceed agent-timeout
     // since it covers author + check + review phases, not just the author turn.
@@ -3608,7 +3609,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
-            crate::agentic_turn(cli, engine_kind, author_prompt, session.clone(), false),
+            crate::agentic_turn(
+                cli,
+                engine_kind,
+                author_prompt,
+                session.clone(),
+                false,
+                None,
+            ),
             async move {
                 // Cancel the daemon turn for `session_id_for_cancel` (best-
                 // effort). If `None`, the daemon may have a freshly-minted
@@ -7542,6 +7550,64 @@ mod review_diff_soundness_tests {
         drop(dir);
     }
 
+    /// REGRESSION (b): when both a tracked-file modification AND a new
+    /// untracked file exist, the working-tree diff must include BOTH — the
+    /// tracked diff must not swallow the untracked hunk.
+    #[test]
+    fn build_diff_includes_both_tracked_modification_and_untracked_file() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+
+        // Modify an existing tracked file.
+        std::fs::write(repo.join("README.md"), "modified\n").unwrap();
+
+        // Add a brand-new untracked file.
+        let new_file = repo.join("new_feature.rs");
+        std::fs::write(&new_file, "pub fn new_thing() -> u32 { 42 }\n").unwrap();
+
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::WorkingTree, None).expect("build_diff ok");
+
+        // Must contain BOTH signals.
+        assert!(
+            !diff.trim().is_empty(),
+            "diff must be non-empty when both tracked + untracked changes exist"
+        );
+        // The tracked modification (README.md change).
+        assert!(
+            diff.contains("README.md"),
+            "diff should reference the modified tracked file: {diff}"
+        );
+        // The untracked new file.
+        assert!(
+            diff.contains("new_feature.rs"),
+            "diff should reference the new untracked file: {diff}"
+        );
+        assert!(
+            diff.contains("diff --git a/new_feature.rs b/new_feature.rs"),
+            "diff should contain a `diff --git` header for the new file: {diff}"
+        );
+        assert!(
+            diff.contains("new file mode"),
+            "diff should mark the untracked file as new: {diff}"
+        );
+    }
+
+    /// REGRESSION (c): when there are NO changes at all, the diff must be
+    /// empty — no false positives from stray untracked paths.
+    #[test]
+    fn build_diff_is_empty_when_no_changes() {
+        let (_dir, repo) = init_temp_repo_with_one_committed_file();
+
+        // No modifications, no new files.
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::WorkingTree, None).expect("build_diff ok");
+
+        assert!(
+            diff.trim().is_empty(),
+            "diff must be empty when working tree has no changes: {diff}"
+        );
+    }
+
     /// REGRESSION: review diff acquisition must not buffer all of `git diff`
     /// before the prompt-level `cap_diff` has a chance to trim it. The capped
     /// git path reads at most the requested byte count, stops the child when
@@ -7683,6 +7749,37 @@ mod review_diff_soundness_tests {
                 std::panic::catch_unwind(|| cap_diff(body, max)).expect("cap_diff must not panic");
             assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
         }
+    }
+
+    /// REGRESSION: CJK (3-byte UTF-8) characters at the truncation boundary
+    /// must not panic. The old byte-index slice panicked with "byte index N is
+    /// not a char boundary". The fix snaps to the nearest char boundary before
+    /// slicing. We use a string with known CJK layout (3-byte characters) and
+    /// pick a cap that forces the head slice to land inside one of them.
+    #[test]
+    fn cap_diff_does_not_panic_on_cjk_boundary() {
+        // 20 ASCII chars + "测" (3 bytes) + "试" (3 bytes) + 20 ASCII chars.
+        let mut body = String::new();
+        for _ in 0..20 {
+            body.push('a');
+        }
+        body.push('测');
+        body.push('试');
+        for _ in 0..20 {
+            body.push('b');
+        }
+
+        // A cap that forces head_end = max * 3 / 4 to land inside "测".
+        // max = 28 => 28 * 3 / 4 = 21. "测" occupies bytes 20..23, so
+        // byte 21 is the middle of the first CJK character.
+        let capped = std::panic::catch_unwind(|| cap_diff(&body, 28));
+        let capped = capped.expect("cap_diff must not panic on a mid-CJK cap");
+
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        assert!(
+            capped.contains("truncated for length"),
+            "cap_diff should keep its truncation marker: {capped}"
+        );
     }
 }
 
@@ -8770,5 +8867,162 @@ mod commit_author_enforcement_tests {
     fn validate_loop_timeouts_ok_with_wide_margin() {
         let warn = validate_loop_timeouts(3600, 1800);
         assert!(warn.is_none(), "wide margin should not warn");
+    }
+    #[tokio::test]
+    async fn loop_iteration_reports_passing_check_after_real_git_edit() {
+        let dir = tempfile::tempdir().expect("create scratch repo");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .expect("initialize git repo");
+        std::fs::write(cwd.join("iteration.txt"), "post-edit state\n")
+            .expect("write iteration edit");
+
+        // Exercise the same post-edit ordering as a real loop iteration.
+        let (_label, diff) = build_diff(cwd, ReviewScope::WorkingTree, None)
+            .expect("capture post-edit working tree");
+        assert!(diff.contains("post-edit state"));
+        let (ok, tail) = run_check_watched(
+            cwd,
+            "true",
+            30,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
+        let check_passed = Some(ok);
+
+        assert_eq!(check_passed, Some(true), "check tail: {tail}");
+    }
+
+    /// Z-7 REGRESSION GUARD: `--check` is spawned as a login shell so the
+    /// operator's interactive `PATH` (cargo in `~/.cargo/bin`, go in
+    /// `~/go/bin`, npm in `~/.npm-global/bin`, …) is visible to the
+    /// subprocess. Without `-l`, the child inherits the loop driver's
+    /// `PATH`, which on editor/CI/launchd-driven invocations does NOT
+    /// include those user dirs — the child reports `cargo: not found`
+    /// (or any equivalent "tool-on-PATH-not-found"), the per-iter
+    /// `check_passed` is `Some(false)`, and the per-iter table prints
+    /// `check=false` even when the same command exits 0 in a fresh
+    /// terminal. This test is the exact reproduction of that pattern:
+    /// we install a "tool" in a non-default `bin` dir, write a
+    /// `~/.profile` that adds it to `PATH` (the way every Linux box
+    /// the operator actually uses does), and drive the loop's
+    /// post-edit `build_diff` + `run_check_watched` pair against a
+    /// check that calls that tool. The pre-fix `sh -c` dispatch would
+    /// fail with "tool not found"; the post-fix `sh -l -c` dispatch
+    /// sources the profile and passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_check_watched_spawns_login_shell_so_dotfiles_extend_path() {
+        // Synthetic operator home: a tempdir that we fully own.
+        // Mirrors the "user just installed rustup" / "user just put a
+        // `~/bin/cargo` shim there" / "user has a `~/.profile` that
+        // exports PATH" shape we observed in the field report.
+        let home = tempfile::tempdir().expect("home");
+        let home_path = home.path().to_path_buf();
+        // Fake `~/.local/bin/post-edit-check` — the tool the loop's
+        // `--check` is going to invoke. Exits 0 on success, exactly
+        // the contract a passing `cargo check --workspace` would have
+        // had if the operator's PATH were in scope. We `echo` PATH
+        // so a regression that drops the login flag is loud in the
+        // failure message (the operator can read the tail and see
+        // which PATH the child actually saw).
+        let local_bin = home_path.join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).expect("create ~/.local/bin");
+        let fake_tool = local_bin.join("post-edit-check");
+        std::fs::write(&fake_tool, "#!/bin/sh\necho PATH=$PATH\nexit 0\n")
+            .expect("write fake tool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tool, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x fake tool");
+        }
+        // Fake `~/.profile` — the ONLY place this tool gets added to
+        // PATH. Without `sh -l` sourcing this, the child never sees
+        // the tool and `--check` exits 127 / "not found".
+        std::fs::write(
+            home_path.join(".profile"),
+            "PATH=\"$HOME/.local/bin:$PATH\"\nexport PATH\n",
+        )
+        .expect("write ~/.profile");
+
+        // A scratch git repo is the right scope for `build_diff` (the
+        // loop captures the working-tree diff post-author, then runs
+        // the check); we don't need a real edit, an empty tree is
+        // fine — the check is what we're testing.
+        let repo = home_path.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+
+        // Run the check with HOME pointed at our fake operator home and
+        // an explicitly-stripped PATH so the only way `post-edit-check`
+        // can be discovered is via `~/.profile` being sourced. This is
+        // the exact scenario the bug report describes: the loop
+        // driver's PATH doesn't include the operator's toolchain, but
+        // a fresh terminal's PATH (which sources `~/.profile`) does.
+        //
+        // We need to set BOTH `ZODER_HOME` (the path the loop itself
+        // reads; the existing `EnvGuard` is enough for that) AND
+        // `HOME` (the path the login shell sources `~/.profile` from;
+        // a real `zoder loop` invocation inherits the operator's
+        // `HOME` from their terminal, so the equivalent here is to
+        // set it explicitly). The test's `EnvGuard` deliberately
+        // scopes only `ZODER_HOME` (it would be wrong for it to touch
+        // `HOME` — the lock would become unrelated to operator
+        // config). We restore `HOME` ourselves on the way out.
+        let _env_guard = crate::test_env::EnvGuard::new(&home_path);
+        let saved_path = std::env::var_os("PATH");
+        let saved_home = std::env::var_os("HOME");
+        // A PATH that has only the standard system dirs — no
+        // `~/.cargo/bin`, no `~/.local/bin`, no `~/bin`. The pre-fix
+        // `sh -c` child would inherit this and fail to find the tool.
+        std::env::set_var(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        std::env::set_var("HOME", &home_path);
+        // Wipe the few interactive-only env vars the login shell
+        // consults; some of them (LOGNAME/USER mismatch on systemd /
+        // launchd-driven launches, in particular) can cause `dash`'s
+        // `-l` mode to skip the profile when only `HOME` is set. The
+        // test's `HOME` is the only thing we want the login logic to
+        // see.
+        for v in ["USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR"] {
+            std::env::remove_var(v);
+        }
+        let (ok, tail) = run_check_watched(
+            &repo,
+            "post-edit-check",
+            30,
+            false,
+            &zoder_core::ExecSafetyConfig::default(),
+        )
+        .await;
+        // Restore PATH / HOME so the rest of the test suite / drop
+        // guard see sane values. (EnvGuard restores ZODER_HOME on drop;
+        // PATH and HOME are not in its scope by design — only
+        // ZODER_HOME is.)
+        match saved_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            ok,
+            "run_check_watched must source ~/.profile so the operator's \
+             toolchain (cargo in ~/.cargo/bin, go in ~/go/bin, …) is on \
+             PATH for the check; tail:\n{tail}"
+        );
     }
 }
