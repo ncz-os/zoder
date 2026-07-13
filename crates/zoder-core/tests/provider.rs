@@ -67,7 +67,42 @@ async fn streaming_sse_eof_before_done_is_decode_error() {
         .await
         .unwrap_err();
     assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
-    assert!(err.message.contains("terminal marker"), "got: {err}");
+    assert!(err.message.contains("terminal [DONE] marker"), "got: {err}");
+}
+
+/// Regression pin: when the SSE stream terminates without ever emitting a
+/// terminal marker (`[DONE]` or a `finish_reason`-bearing chunk), the parser
+/// MUST return a `Decode` error whose message **explicitly names `[DONE]`**.
+/// This gives operators and engineers the most precise diagnostic for triage —
+/// omitting `[DONE]` from the message would mask legitimate disconnect issues
+/// (see MR !1 finding 1 on gitlab.com/ncz-os/zoder).
+#[tokio::test]
+async fn eof_before_terminal_marker_error_message_mentions_done() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Decode, "got: {err}");
+    // CRITICAL: the error message must include `[DONE]` so engineers can
+    // quickly diagnose a premature disconnect from the message alone.
+    assert!(
+        err.message.contains("[DONE]"),
+        "error message must mention [DONE] for triage; got: {err}"
+    );
+    // Also confirm the message references "terminal marker" / "disconnect"
+    // so the full diagnostic is preserved.
+    assert!(
+        err.message.contains("terminal") || err.message.contains("disconnect"),
+        "error message must be diagnostic; got: {err}"
+    );
 }
 
 /// Y-2 regression: a streaming response whose last chunk carries
