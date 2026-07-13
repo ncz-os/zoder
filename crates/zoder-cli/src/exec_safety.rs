@@ -1051,9 +1051,35 @@ pub(crate) fn wrap_spawn_command(
     match policy.backend {
         // Legacy path — must be byte-for-byte identical to the prior
         // behavior so a config-less host doesn't observe any change.
+        //
+        // The argv is `sh -l -c <cmd>` rather than the bare `sh -c <cmd>`
+        // we used to ship, for the same reason a real operator opens a
+        // fresh terminal to run their check: a non-login shell inherits
+        // the parent process's `PATH`, which (for the typical "zoder loop
+        // driven by an editor / CI job / launchd unit" caller) does NOT
+        // include `/home/<op>/.cargo/bin`. `sh -l -c` makes the child a
+        // login shell, so it sources `/etc/profile`, `/etc/profile.d/*`,
+        // and `$HOME/.profile` before running `<cmd>` — and the operator's
+        // `cargo` (and any other toolchain in `~/.local/bin`, `~/bin`,
+        // rustup's `~/.cargo/bin`, NixOS profile, etc.) becomes visible
+        // to the check exactly the way it is when the operator types the
+        // command into a fresh terminal themselves. The 2026-07-12
+        // production incident surfaced this as `sh: 1: cargo: not found`
+        // printed as the per-iter `check=false` even when the same
+        // `cargo check --workspace` exits 0 in a fresh terminal
+        // (gitlab.com/ncz-os/zoder issue #7).
+        //
+        // `-l` is POSIX-portable: every `/bin/sh` we ship on Linux, macOS,
+        // and the BSDs supports it, and the operator's dotfiles
+        // (if any) are the same one they use in every other terminal.
+        // We deliberately do NOT source `~/.bashrc` directly — that's a
+        // bashism, and `sh` here is POSIX / dash / ash on most distros.
+        // Login shells are the right abstraction: they're what every
+        // operator's interactive session already uses.
         ExecSandbox::None => Ok(SandboxSpawnPlan {
             argv: vec![
                 OsString::from("sh"),
+                OsString::from("-l"),
                 OsString::from("-c"),
                 OsString::from(cmd),
             ],
@@ -1132,7 +1158,13 @@ fn seatbelt_plan(
             OsString::from("/usr/bin/sandbox-exec"),
             OsString::from("-p"),
             OsString::from(profile),
+            // Z-7: invoke `sh` as a login shell so the wrapped
+            // process sees the operator's interactive PATH
+            // (cargo in ~/.cargo/bin, go in ~/go/bin, …) the same
+            // way a fresh terminal does. See the matching comment
+            // on the `ExecSandbox::None` arm for the rationale.
             OsString::from("sh"),
+            OsString::from("-l"),
             OsString::from("-c"),
             OsString::from(cmd),
         ],
@@ -1584,10 +1616,14 @@ pub(crate) fn generate_bubblewrap_argv(
     // OsString guarantees the argv slot is correct.
     argv.push(OsString::from("--"));
     // The wrapped command — exactly the legacy `sh -c <cmd>` shape, so
-    // the wrapped process sees an argv of `["sh", "-c", cmd]` and the
-    // operator's existing `--check` commands continue to work
-    // unchanged inside the sandbox.
+    // the wrapped process sees an argv of `["sh", "-l", "-c", cmd]` and
+    // the operator's existing `--check` commands continue to work
+    // unchanged inside the sandbox. Z-7: the `-l` (login shell) is the
+    // SAME flag the unwrapped None backend uses, so the check sees the
+    // operator's interactive PATH (cargo in ~/.cargo/bin, go in
+    // ~/go/bin, …) regardless of which sandbox backend is in effect.
     argv.push(OsString::from("sh"));
+    argv.push(OsString::from("-l"));
     argv.push(OsString::from("-c"));
     argv.push(OsString::from(cmd));
     argv
@@ -1645,7 +1681,12 @@ fn linux_landlock_plan(
     let ruleset = landlock_ruleset(cwd, opts);
     Ok(SandboxSpawnPlan {
         argv: vec![
+            // Z-7: see the matching comment on the `ExecSandbox::None`
+            // arm. The login flag is what sources `~/.profile` /
+            // `/etc/profile` and makes the operator's toolchain on
+            // PATH for the wrapped `sh -c` invocation.
             OsString::from("sh"),
+            OsString::from("-l"),
             OsString::from("-c"),
             OsString::from(cmd),
         ],
@@ -2614,26 +2655,40 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Default `ExecSafetyConfig::default()` must produce the legacy
-    /// unwrapped `sh -c <cmd>` argv. This is the byte-for-byte regression
-    /// guard the brief asks for: a config-less host (or any host whose
-    /// `exec_safety` block is absent) must observe exactly the same spawn
-    /// shape it did before this change.
+    /// `sh -c <cmd>` argv, with the `sh` invoked as a LOGIN shell (`-l`)
+    /// so the child sees the operator's interactive `PATH` — exactly what
+    /// a fresh terminal sources through `~/.profile` / `/etc/profile`. This
+    /// is the byte-for-byte regression guard the brief asks for: a
+    /// config-less host (or any host whose `exec_safety` block is absent)
+    /// must observe a known spawn shape that the operator can reproduce
+    /// in a terminal and get the same result.
+    ///
+    /// The `-l` is the Z-7 fix for gitlab.com/ncz-os/zoder issue #7: a
+    /// non-login `sh` only inherits the parent process's environment, so
+    /// an editor-driven or CI-driven `zoder loop` invocation would
+    /// `cargo: not found` even when the operator's interactive shell
+    /// could run `cargo check --workspace` cleanly. Pinning the
+    /// `["sh", "-l", "-c", cmd]` shape here is the explicit guarantee
+    /// that no future "small change" to the dispatch can silently drop
+    /// the login flag and reintroduce the bug.
     #[test]
-    fn wrap_spawn_command_default_backend_leaves_command_unchanged() {
+    fn wrap_spawn_command_default_backend_runs_check_in_login_shell() {
         use std::path::Path;
         let policy = ExecSafetyConfig::default();
         let plan = wrap_spawn_command(Path::new("/tmp"), "echo hi", &policy)
             .expect("None backend must always succeed (no platform guard)");
-        // Exact legacy shape: argv is [sh, -c, cmd]. Any change here
-        // breaks the byte-for-byte contract for config-less hosts.
+        // Exact dispatch shape: `sh -l -c <cmd>`. Any change here breaks
+        // the Z-7 contract for config-less hosts.
         assert_eq!(
             plan.argv,
             vec![
                 std::ffi::OsString::from("sh"),
+                std::ffi::OsString::from("-l"),
                 std::ffi::OsString::from("-c"),
                 std::ffi::OsString::from("echo hi"),
             ],
-            "None backend must preserve the legacy sh -c <cmd> argv verbatim"
+            "None backend must invoke the check as a login shell so the \
+             operator's PATH (cargo, go, pytest, …) is visible"
         );
         assert!(
             !plan.sandboxed,
@@ -2652,12 +2707,13 @@ mod tests {
         let plan = wrap_spawn_command(Path::new("/tmp"), cmd, &policy).unwrap();
         assert_eq!(
             plan.argv.len(),
-            3,
-            "default backend must produce exactly [sh, -c, cmd] (3 args)"
+            4,
+            "default backend must produce exactly [sh, -l, -c, cmd] (4 args)"
         );
         assert_eq!(plan.argv[0].to_string_lossy(), "sh");
-        assert_eq!(plan.argv[1].to_string_lossy(), "-c");
-        assert_eq!(plan.argv[2].to_string_lossy(), cmd);
+        assert_eq!(plan.argv[1].to_string_lossy(), "-l");
+        assert_eq!(plan.argv[2].to_string_lossy(), "-c");
+        assert_eq!(plan.argv[3].to_string_lossy(), cmd);
     }
 
     /// `generate_seatbelt_profile` is a PURE function of `(cwd, options)`
@@ -3399,8 +3455,8 @@ mod tests {
         let plan =
             wrap_spawn_command(cwd, "cargo test --workspace", &policy).expect("macOS dispatch");
         assert!(plan.sandboxed, "Seatbelt plan must report sandboxed=true");
-        // argv: [/usr/bin/sandbox-exec, -p, <profile>, sh, -c, <cmd>]
-        assert_eq!(plan.argv.len(), 6, "expected 6-element argv; got {plan:?}");
+        // argv: [/usr/bin/sandbox-exec, -p, <profile>, sh, -l, -c, <cmd>]
+        assert_eq!(plan.argv.len(), 7, "expected 7-element argv; got {plan:?}");
         assert_eq!(plan.argv[0].to_string_lossy(), "/usr/bin/sandbox-exec");
         assert_eq!(plan.argv[1].to_string_lossy(), "-p");
         // The profile is a multi-line SBPL string — assert the
@@ -3415,10 +3471,14 @@ mod tests {
             profile.contains(&format!("(allow file-read* (subpath \"{cwd_canonical}\"))")),
             "profile missing workdir read clause; profile was:\n{profile}"
         );
-        // The wrapped target is the legacy `sh -c <cmd>` shape.
+        // The wrapped target is the legacy `sh -l -c <cmd>` shape
+        // (Z-7: the `-l` login flag sources ~/.profile so the
+        // operator's toolchain is on PATH; the cargo test in the
+        // command body above would otherwise be `cargo: not found`).
         assert_eq!(plan.argv[3].to_string_lossy(), "sh");
-        assert_eq!(plan.argv[4].to_string_lossy(), "-c");
-        assert_eq!(plan.argv[5].to_string_lossy(), "cargo test --workspace");
+        assert_eq!(plan.argv[4].to_string_lossy(), "-l");
+        assert_eq!(plan.argv[5].to_string_lossy(), "-c");
+        assert_eq!(plan.argv[6].to_string_lossy(), "cargo test --workspace");
     }
 
     // -----------------------------------------------------------------------
@@ -3639,21 +3699,24 @@ mod tests {
         // The wrapped command must be the legacy `sh -c <cmd>` shape so
         // the operator's existing `--check` strings continue to work
         // unchanged inside the sandbox. The argv after `--` MUST be
-        // exactly `[sh, -c, cmd]`.
+        // exactly `[sh, -l, -c, cmd]` (Z-7: the login flag sources
+        // ~/.profile so the operator's toolchain is on PATH; the
+        // pre-fix `[sh, -c, cmd]` form would `cargo: not found`).
         let sep_idx = argv_strings
             .iter()
             .position(|a| a == "--")
             .expect("argv must contain the `--` separator");
         assert_eq!(
             argv_strings.len() - sep_idx - 1,
-            3,
-            "wrapped command after `--` must be exactly 3 args (sh, -c, cmd); got argv: {:?}",
+            4,
+            "wrapped command after `--` must be exactly 4 args (sh, -l, -c, cmd); got argv: {:?}",
             argv_strings
         );
         assert_eq!(argv_strings[sep_idx + 1], "sh");
-        assert_eq!(argv_strings[sep_idx + 2], "-c");
+        assert_eq!(argv_strings[sep_idx + 2], "-l");
+        assert_eq!(argv_strings[sep_idx + 3], "-c");
         assert_eq!(
-            argv_strings[sep_idx + 3],
+            argv_strings[sep_idx + 4],
             "cargo test --workspace --locked --all-features",
             "wrapped command after `--` must be the operator's literal cmd string"
         );
@@ -3846,21 +3909,25 @@ mod tests {
             "Linux dispatch must include `--bind <cwd> <cwd>` for the workdir; got: {:?}",
             argv_strings
         );
-        // The wrapped target is the legacy `sh -c <cmd>` shape.
+        // The wrapped target is the legacy `sh -l -c <cmd>` shape
+        // (Z-7: the login flag is the fix for gitlab.com/ncz-os/zoder
+        // issue #7 — the operator's toolchain is on PATH the same way
+        // it is in a fresh terminal).
         let sep_idx = argv_strings
             .iter()
             .position(|a| a == "--")
             .expect("Linux dispatch must contain the `--` separator");
         assert_eq!(
             argv_strings.len() - sep_idx - 1,
-            3,
-            "Linux dispatch wrapped command must be exactly 3 args (sh, -c, cmd); got argv: {:?}",
+            4,
+            "Linux dispatch wrapped command must be exactly 4 args (sh, -l, -c, cmd); got argv: {:?}",
             argv_strings
         );
         assert_eq!(argv_strings[sep_idx + 1], "sh");
-        assert_eq!(argv_strings[sep_idx + 2], "-c");
+        assert_eq!(argv_strings[sep_idx + 2], "-l");
+        assert_eq!(argv_strings[sep_idx + 3], "-c");
         assert_eq!(
-            argv_strings[sep_idx + 3],
+            argv_strings[sep_idx + 4],
             "cargo test --workspace",
             "Linux dispatch must pass the operator's literal cmd string through to sh -c"
         );
@@ -4577,7 +4644,8 @@ mod tests {
                 plan.argv[0].to_string_lossy(),
                 "sh",
                 "LinuxLandlock must NOT wrap the program — argv is the legacy \
-                 sh -c <cmd> shape; got: {plan:?}"
+                 sh -l -c <cmd> shape (Z-7: login flag sources ~/.profile so the \
+                 operator's toolchain is on PATH); got: {plan:?}"
             );
         } else {
             // Non-Linux host: dispatch MUST surface a clear
@@ -4600,7 +4668,7 @@ mod tests {
 
     /// Linux-only assertion of the dispatch shape: when `LinuxLandlock`
     /// is selected on a Linux host, the plan's argv is the LEGACY
-    /// `[sh, -c, cmd]` shape (NOT wrapped in an external binary) and
+    /// `[sh, -l, -c, cmd]` shape (NOT wrapped in an external binary) and
     /// the plan carries a non-empty `in_process_ruleset`. Gated on
     /// `target_os = "linux"` because the dispatch itself is gated —
     /// see the platform branch in `linux_landlock_plan`. The dedicated
@@ -4628,21 +4696,29 @@ mod tests {
             plan.sandboxed,
             "LinuxLandlock plan must report sandboxed=true"
         );
-        // The argv MUST be the legacy `[sh, -c, cmd]` shape — Landlock
+        // The argv MUST be the legacy `[sh, -l, -c, cmd]` shape — Landlock
         // is in-kernel, there is no external wrapper binary. A
         // dispatch that returned `["/usr/bin/landlock", ...]` would
         // silently break the contract (no such binary exists on Linux
-        // either; Landlock is a kernel syscall, not a CLI).
+        // either; Landlock is a kernel syscall, not a CLI). The `-l`
+        // is the Z-7 login flag (see `wrap_spawn_command_default_backend_runs_check_in_login_shell`).
         assert_eq!(
             plan.argv.len(),
-            3,
-            "LinuxLandlock argv must be exactly [sh, -c, cmd] (3 args); got: {:?}",
+            4,
+            "LinuxLandlock argv must be exactly [sh, -l, -c, cmd] (4 args); got: {:?}",
             plan.argv
         );
         assert_eq!(plan.argv[0].to_string_lossy(), "sh");
-        assert_eq!(plan.argv[1].to_string_lossy(), "-c");
+        // Z-7: the `-l` login flag is the fix for gitlab.com/ncz-os/zoder
+        // issue #7 — it sources ~/.profile so the operator's
+        // toolchain (cargo in ~/.cargo/bin, go in ~/go/bin, …) is
+        // visible to the check subprocess. Removing the `-l` would
+        // re-introduce the "per-iter check=false even when the same
+        // command exits 0 in a fresh terminal" failure mode.
+        assert_eq!(plan.argv[1].to_string_lossy(), "-l");
+        assert_eq!(plan.argv[2].to_string_lossy(), "-c");
         assert_eq!(
-            plan.argv[2].to_string_lossy(),
+            plan.argv[3].to_string_lossy(),
             "cargo test --workspace",
             "LinuxLandlock must pass the operator's literal cmd string through to sh -c"
         );
