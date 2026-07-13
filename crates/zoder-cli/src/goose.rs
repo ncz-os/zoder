@@ -67,6 +67,7 @@ pub(crate) async fn cmd_run(
     instructions: Option<String>,
     background: bool,
     output_last_message: Option<String>,
+    events_file: Option<String>,
 ) -> anyhow::Result<()> {
     let task = match (text, instructions) {
         (Some(t), _) => t,
@@ -80,7 +81,15 @@ pub(crate) async fn cmd_run(
         background,
         crate::agentic::active_job_dir().is_some(),
         crate::agentic::spawn_background,
-        async move { crate::cmd_exec_agentic(cli, Some(task2), output_last_message.clone()).await },
+        async move {
+            crate::cmd_exec_agentic(
+                cli,
+                Some(task2),
+                output_last_message.clone(),
+                events_file.clone(),
+            )
+            .await
+        },
     )
     .await?;
     Ok(())
