@@ -28,6 +28,32 @@ rust-gate:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
 
+# CLI surface drift check: regenerate the full --help output of every
+# subcommand from the live Clap command tree and fail if it no longer
+# matches the committed ZODER_CLI_SURFACE.txt snapshot.  See
+# `scripts/ci-generate-cli-surface.sh` and `ZODER_CLI_SURFACE.txt`.
+cli-surface:
+  stage: check
+  image: rust:1.93.0
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "cargo-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/
+      - target/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev >/dev/null
+    - rustup component add rustfmt clippy
+    - rustup default 1.94.1
+    - cargo --version && rustc --version
+  script:
+    - scripts/ci-generate-cli-surface.sh
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\""
+
 # RUSTSEC advisory scan. Runs on schedules and manual web pipelines, not on
 # every push, so newly-published advisories surface without unexpectedly
 # blocking ordinary merge work.
@@ -48,3 +74,28 @@ advisory-scan:
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
     - if: "$CI_PIPELINE_SOURCE == \"web\""
+
+# Clean-machine smoke test: builds zoder, verifies every subcommand
+# parses (help) and exercises core argument flags — no network calls,
+# no model API needed. See `scripts/tests/cli-smoke.sh`.
+cli-smoke:
+  stage: check
+  image: rust:1.93.0
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "cargo-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/
+      - target/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev >/dev/null
+    - rustup component add rustfmt clippy
+    - rustup default 1.94.1
+    - cargo --version && rustc --version
+  script:
+    - scripts/tests/cli-smoke.sh
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\""
