@@ -4545,7 +4545,7 @@ pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
             }
         }
     }
-    jobs.sort_by(|a, b| b.started.cmp(&a.started));
+    jobs.sort_by_key(|b| std::cmp::Reverse(b.started));
     jobs
 }
 
@@ -4656,7 +4656,7 @@ fn all_jobs() -> Vec<JobMeta> {
             }
         }
     }
-    jobs.sort_by(|a, b| b.started.cmp(&a.started));
+    jobs.sort_by_key(|b| std::cmp::Reverse(b.started));
     jobs
 }
 
