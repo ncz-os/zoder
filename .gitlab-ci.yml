@@ -46,7 +46,7 @@ cli-surface:
   before_script:
     - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev >/dev/null
     - rustup component add rustfmt clippy
-    - rustup default 1.94.1
+    - rustup default 1.96.1
     - cargo --version && rustc --version
   script:
     - scripts/ci-generate-cli-surface.sh
@@ -92,7 +92,7 @@ cli-smoke:
   before_script:
     - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev >/dev/null
     - rustup component add rustfmt clippy
-    - rustup default 1.94.1
+    - rustup default 1.96.1
     - cargo --version && rustc --version
   script:
     - scripts/tests/cli-smoke.sh
