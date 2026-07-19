@@ -430,7 +430,7 @@ pub(crate) fn cmd_jobs_prune(cli: &crate::Cli, args: JobsPruneArgs) -> anyhow::R
     // Stably sort: newest-first so a `--keep N` walks in chronological order.
     // `collect_jobs` already returns newest-first, but we re-assert so the
     // contract doesn't depend on an unrelated helper.
-    all.sort_by(|a, b| b.started.cmp(&a.started));
+    all.sort_by_key(|b| std::cmp::Reverse(b.started));
 
     // Iterate in chronological order; the `--keep N` floor is applied as
     // "skip the most-recent N FINISHED jobs, prune the rest of the finished
