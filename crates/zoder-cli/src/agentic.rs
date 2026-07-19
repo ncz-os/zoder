@@ -3483,6 +3483,24 @@ pub(crate) fn turn_is_dead(turn: &Option<crate::TurnResult>) -> bool {
     turn.as_ref().is_none_or(|t| !t.run.succeeded())
 }
 
+/// Refines [`turn_is_dead`] for dead-streak accounting only. A turn that
+/// made at least one real tool call engaged the engine successfully even
+/// when its outcome was not "completed" (e.g. an internal timeout firing
+/// after partial work already happened) - that is meaningfully different
+/// from a turn that never got a response at all, and must not count toward
+/// the same two-strikes abort threshold. `turn_is_dead` itself is
+/// unchanged and stays the correct raw signal for every other caller.
+fn counts_toward_dead_streak(turn: &Option<crate::TurnResult>, tool_calls: u32) -> bool {
+    // A None turn (the outer watchdog killed the in-flight future) carries
+    // no real data to inspect - it always counts as dead regardless of
+    // whatever tool_calls value the caller passed. The tool_calls
+    // exemption only applies when we have an actual turn to look at.
+    match turn {
+        None => true,
+        Some(_) => turn_is_dead(turn) && tool_calls == 0,
+    }
+}
+
 /// Apply one iteration's signals to the loop's streak counters and decide
 /// whether to abort. Pure / deterministic so the full input matrix can be
 /// unit-tested.
@@ -3899,8 +3917,9 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // `Ok(outcome="timeout")`) grind through every `max_iters` instead
         // of bailing after 2 strikes. See [`turn_is_dead`] for the test
         // pins.
+        let tool_calls_this_turn = turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0);
         let streaks = update_loop_streaks(
-            turn_is_dead(&turn),
+            counts_toward_dead_streak(&turn, tool_calls_this_turn),
             check_timed_out,
             diff.trim().is_empty(),
             dead_streak,
@@ -6547,6 +6566,55 @@ not run to max_iters"
                 "Z-16: outcome={outcome:?} must count as dead (not completed)"
             );
         }
+    }
+
+    fn fake_turn(outcome: &str, tool_calls: u32) -> crate::TurnResult {
+        crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s".into(),
+                outcome: outcome.into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn counts_toward_dead_streak_excludes_engaged_non_completed_turn() {
+        let turn = Some(fake_turn("timeout", 5));
+        assert!(
+            !counts_toward_dead_streak(&turn, 5),
+            "a turn that made real tool calls must not count toward the \
+             dead streak even when its outcome is not completed"
+        );
+    }
+
+    #[test]
+    fn counts_toward_dead_streak_includes_unengaged_non_completed_turn() {
+        let turn = Some(fake_turn("timeout", 0));
+        assert!(
+            counts_toward_dead_streak(&turn, 0),
+            "a turn with zero tool calls and a non-completed outcome is \
+             genuinely dead and must still count toward the streak"
+        );
+    }
+
+    #[test]
+    fn counts_toward_dead_streak_treats_none_turn_as_always_dead() {
+        // A watchdog-killed future carries no real data; it must count as
+        // dead regardless of whatever tool_calls value gets passed in
+        // (the real call site always computes 0 for a None turn, but the
+        // helper itself should not rely on that invariant to be correct).
+        assert!(counts_toward_dead_streak(&None, 0));
+        assert!(counts_toward_dead_streak(&None, 7));
     }
 
     // `classify_diff_substance` — the anti-gaming guard's pure classifier.
