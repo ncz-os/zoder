@@ -39,6 +39,7 @@ use zoder_core::{
     ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
     SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
+use zoder_mcp_server::{run_server, RoutingContext as McpRoutingContext};
 
 /// Serialize an AgentEvent to a JSONL line (one JSON object per line).
 /// Returns None if the event should not be serialized (e.g., empty events).
@@ -756,6 +757,11 @@ enum Cmd {
         #[arg(long)]
         validate: bool,
     },
+    /// Run the local MCP server over stdio. This is the same server as the
+    /// standalone `zoder-mcp-server` binary, including routing and SOP tools.
+    /// Global routing/agent flags do not affect the server protocol.
+    #[command(name = "mcp-server")]
+    McpServer,
     /// Generate shell completions (bash|zsh|fish|powershell|elvish).
     Completions {
         #[arg(value_enum)]
@@ -1343,6 +1349,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(Cmd::Recipe { action }) => goose::cmd_recipe(&cli, action).await,
         Some(Cmd::Mcp { action }) => goose::cmd_mcp(&cli, action),
+        Some(Cmd::McpServer) => run_server(McpRoutingContext::new()),
         Some(Cmd::Configure { edit, validate }) => goose::cmd_configure(*edit, *validate),
         Some(Cmd::Gate {
             root,
