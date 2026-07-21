@@ -2806,12 +2806,7 @@ pub(crate) const SETTLE_BUDGET_SECS: u64 = zoder_core::CANCEL_SETTLE_BUDGET.as_s
 /// line ("loop: <phase> timed out after <N>s, killing") and in the per-iter
 /// `author_outcome` / `review_outcome` fields when a phase wedges.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // LoopPhase::Author is no longer threaded through `phase_watchdog`
-                    // (the author phase has its own `author_phase_with_cancel`
-                    // wrapper), but the variant is retained for parity with the
-                    // log/label surface and for any future per-phase routing.
 pub(crate) enum LoopPhase {
-    Author,
     Check,
     Review,
 }
@@ -2819,7 +2814,6 @@ pub(crate) enum LoopPhase {
 impl LoopPhase {
     fn as_str(self) -> &'static str {
         match self {
-            LoopPhase::Author => "author",
             LoopPhase::Check => "check",
             LoopPhase::Review => "review",
         }
@@ -6104,7 +6098,6 @@ must reap the direct shell on the timeout branch)"
     /// Sanity check the phase label helper — a unit test in the strict sense.
     #[test]
     fn loop_phase_label_is_stable() {
-        assert_eq!(LoopPhase::Author.as_str(), "author");
         assert_eq!(LoopPhase::Check.as_str(), "check");
         assert_eq!(LoopPhase::Review.as_str(), "review");
     }
@@ -6112,7 +6105,7 @@ must reap the direct shell on the timeout branch)"
     /// `phase_watchdog` returns the inner future's value on success.
     #[tokio::test]
     async fn phase_watchdog_returns_inner_result_on_time() {
-        let res: Result<i32, String> = phase_watchdog(LoopPhase::Author, 5, true, async {
+        let res: Result<i32, String> = phase_watchdog(LoopPhase::Check, 5, true, async {
             Ok::<_, anyhow::Error>(42)
         })
         .await;
