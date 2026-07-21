@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use fs2::FileExt;
+use serde_json::{json, Value};
 mod agentic;
 mod exec_safety;
 mod goose;
@@ -747,6 +748,19 @@ enum Cmd {
         #[command(subcommand)]
         action: McpCmd,
     },
+    /// Standard Operating Procedure (SOP) workflow: drive a structured
+    /// runbook against the local zeroclaw engine's `sops/*` RPC surface.
+    /// SOPs are the documented way to execute a multi-step procedure
+    /// (init → advance → decide → complete) with a consistent, machine-
+    /// addressable contract. This subcommand family is a thin wrapper:
+    /// parse args, call the matching `sops/list`, `sops/run`, `sops/
+    /// runs`, or `sops/decide` method on the local zeroclaw engine, and
+    /// print a clean result (table for list, plain status for run /
+    /// status, confirmation for decide).
+    Sop {
+        #[command(subcommand)]
+        action: SopCmd,
+    },
     /// Show/validate/edit configuration (goose `configure` equivalent).
     Configure {
         /// Open the config file in $EDITOR.
@@ -874,6 +888,85 @@ enum McpCmd {
     Test {
         /// Name of the MCP server to test.
         name: String,
+    },
+}
+
+/// Subcommands for `zoder sop …`. Each is a thin wrapper over the
+/// zeroclaw engine's `sops/*` JSON-RPC surface (`crates/zeroclaw-runtime/
+/// src/rpc/dispatch.rs` around line 281 in the engine repo):
+///
+///   * `sop list`   → `sops/list`     — list every SOP registered with
+///     the engine. Prints a table by default; `--json` emits the raw
+///     engine response for tools/CI.
+///   * `sop run`    → `sops/run`      — start a new SOP run. The
+///     `--payload` flag accepts either an inline JSON object or a path
+///     to a JSON file (read up front and passed as `params.payload`).
+///   * `sop status` → `sops/runs`     — read the current status of one
+///     or more SOP runs (single `<run-id>` → one record; zero or many
+///     `<run-id>`s → same engine call, one record each, with a header
+///     so a no-id list call is visibly different from a one-id
+///     lookup).
+///   * `sop decide` → `sops/decide`   — submit a decision for a SOP
+///     run that is paused awaiting operator input. The `<decision>`
+///     arg is a free-form string (typically `approve | reject | skip`
+///     plus optional reason); the engine is the contract authority.
+///
+/// The `--json` flag on `list` / `status` / `decide` is honored for
+/// scripting parity with the rest of the CLI surface.
+#[derive(Subcommand, Clone)]
+enum SopCmd {
+    /// List the SOPs registered with the local zeroclaw engine.
+    List {
+        /// Emit the engine response as structured JSON instead of the
+        /// human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a new SOP run. `<name>` is the SOP identifier (as it
+    /// appears in `sop list`); `--payload` carries the runbook inputs
+    /// and accepts either an inline JSON object (`--payload '{"k":1}'`)
+    /// or a path to a JSON file (`--payload ./payload.json`). The
+    /// payload is forwarded as `params.payload` on `sops/run`; the
+    /// engine returns a `run_id` that is printed to stdout.
+    Run {
+        /// SOP name to run.
+        name: String,
+        /// Payload — either an inline JSON object or a path to a JSON
+        /// file. Parsed up front so a malformed payload is rejected
+        /// locally before the RPC is dispatched (no half-started runs
+        /// left on the engine).
+        #[arg(long, value_name = "JSON")]
+        payload: String,
+    },
+    /// Show the current status of one or more SOP runs. Pass zero
+    /// `<run-id>`s to read the full runs list; pass one or more to
+    /// fetch each named run. The `--json` flag emits the raw engine
+    /// response. Output is plain (one record per id, plus a one-line
+    /// header) — not a table, because individual SOP runs vary in
+    /// shape and a table would force a lossy projection.
+    Status {
+        /// Run id(s) to look up. Zero ids = list every run.
+        #[arg(value_name = "RUN_ID")]
+        run_ids: Vec<String>,
+        /// Emit the engine response as structured JSON instead of the
+        /// human-readable status block.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit an operator decision for a SOP run that is paused
+    /// awaiting input. `<decision>` is forwarded verbatim to the
+    /// engine; the contract for valid decisions (approve/reject/skip +
+    /// optional reason) is documented per-SOP in the engine.
+    Decide {
+        /// Run id of the paused SOP run.
+        run_id: String,
+        /// Decision string forwarded to `sops/decide` (e.g.
+        /// `approve`, `reject`, or `skip reason=…`).
+        decision: String,
+        /// Emit the engine response as structured JSON instead of the
+        /// human-readable confirmation.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1343,6 +1436,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(Cmd::Recipe { action }) => goose::cmd_recipe(&cli, action).await,
         Some(Cmd::Mcp { action }) => goose::cmd_mcp(&cli, action),
+        Some(Cmd::Sop { action }) => cmd_sop(&cli, action).await,
         Some(Cmd::Configure { edit, validate }) => goose::cmd_configure(*edit, *validate),
         Some(Cmd::Gate {
             root,
@@ -3089,6 +3183,874 @@ async fn try_model(
                 return Ok(Err((e, false)));
             }
         }
+    }
+}
+
+/// Dispatch a `zoder sop …` subcommand. This is the entry point invoked
+/// from `Cmd::Sop` in `main()`. It resolves the engine socket (via
+/// `engine_socket_path`, which honors `$ZEROCLAW_SOCKET` and falls back
+/// to `<data_dir>/daemon.sock`), delegates the actual RPC to
+/// `cmd_sop_with_socket`, and writes the result to stdout. Splitting
+/// the socket path resolution out of the RPC dispatch keeps the RPC
+/// path unit-testable: the tests inject a temp-dir Unix socket and a
+/// mock daemon that records every frame it receives, so the wire
+/// shape (method name, params, `id`) is asserted directly.
+async fn cmd_sop(_cli: &Cli, action: &SopCmd) -> anyhow::Result<()> {
+    let socket = engine_socket_path();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    cmd_sop_with_socket(&socket, action, &mut out).await
+}
+
+/// Inner, test-friendly form of [`cmd_sop`] that takes the engine
+/// socket path explicitly and writes the result to any `Write`. The
+/// public wrapper picks `engine_socket_path()` + stdout; tests inject a
+/// temp socket and an in-memory buffer so the parse + RPC dispatch is
+/// covered without standing up a real zeroclaw daemon or capturing
+/// stdout (which races sibling tests).
+///
+/// Wire layout (see `acp_client::sop_rpc_call`):
+///   1. `initialize` handshake (`protocol_version: 1`)
+///   2. `sops/list` | `sops/run` | `sops/runs` | `sops/decide` frame
+///      with the operator-supplied params
+///   3. The matching response's `result` is rendered as:
+///      - `list` → table by default; raw JSON if `--json`
+///      - `run`  → `run_id: …` line (and pretty-printed JSON if `--json`
+///        would apply; `run` has no `--json` per the CLI design — the
+///        `run_id` is the only stable contract for chaining)
+///      - `status` → one record per `<run-id>` (or every run when zero
+///        ids supplied), with a header line distinguishing the two
+///        modes; raw JSON if `--json`
+///      - `decide` → one-line confirmation (`recorded decision … for
+///        run …`); raw JSON if `--json`
+async fn cmd_sop_with_socket<W: std::io::Write>(
+    socket: &Path,
+    action: &SopCmd,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    use zoder_core::sop_rpc_call;
+    match action {
+        SopCmd::List { json } => {
+            let result = sop_rpc_call(socket, "list", json!({})).await?;
+            if *json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
+                return Ok(());
+            }
+            // The engine returns an array of SOP descriptors under
+            // either a top-level array or `sops` / `items` (any of the
+            // three is accepted as "the list"). Anything else is a
+            // contract violation — surface a clean error rather than
+            // silently dropping data.
+            let arr = result
+                .as_array()
+                .or_else(|| result.get("sops").and_then(Value::as_array))
+                .or_else(|| result.get("items").and_then(Value::as_array))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "sops/list returned a non-list payload: {}",
+                        serde_json::to_string(&result).unwrap_or_default()
+                    )
+                })?;
+            if arr.is_empty() {
+                writeln!(out, "no SOPs registered with the local zeroclaw engine.")?;
+                return Ok(());
+            }
+            // Compute stable column widths so the table lines up
+            // regardless of how many / how wide the names are. Names
+            // are short in practice, but the formatted output is meant
+            // to be readable, not minimal.
+            let name_w = arr
+                .iter()
+                .map(|s| {
+                    s.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+                .max(4);
+            let steps_w = arr
+                .iter()
+                .map(|s| {
+                    s.get("steps")
+                        .and_then(Value::as_u64)
+                        .map(|n| n.to_string().chars().count())
+                        .or_else(|| {
+                            s.get("steps")
+                                .and_then(Value::as_array)
+                                .map(|a| a.len().to_string().chars().count())
+                        })
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+                .max(5);
+            writeln!(out, "SOPs registered with the local zeroclaw engine:")?;
+            writeln!(
+                out,
+                "  {:<name_w$}  {:<steps_w$}  description",
+                "name", "steps",
+            )?;
+            for sop in arr {
+                let name = sop
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unnamed)");
+                let steps = sop
+                    .get("steps")
+                    .map(|v| match v {
+                        Value::Number(n) => n.to_string(),
+                        Value::Array(a) => a.len().to_string(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                let desc = sop.get("description").and_then(Value::as_str).unwrap_or("");
+                writeln!(out, "  {:<name_w$}  {:<steps_w$}  {}", name, steps, desc,)?;
+            }
+            Ok(())
+        }
+        SopCmd::Run { name, payload } => {
+            // Parse `--payload` up front: it accepts either an inline
+            // JSON object (`--payload '{"k":1}'`) or a path to a JSON
+            // file. A malformed payload is rejected locally before
+            // the RPC is dispatched — never start a run we can't
+            // describe on the wire.
+            let payload_value = parse_sop_payload(payload)?;
+            let result = sop_rpc_call(
+                socket,
+                "run",
+                json!({ "name": name, "payload": payload_value }),
+            )
+            .await?;
+            // The engine returns at minimum a `run_id`; print it so
+            // the operator can chain into `zoder sop status <id>` or
+            // `zoder sop decide <id> …`. We do not pretty-print the
+            // whole result — the `run_id` line is the only stable
+            // contract for downstream scripting, and dumping a
+            // possibly-engine-version-shaped blob here would tempt
+            // callers to grep a field that may move.
+            let run_id = result
+                .get("run_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[zoder] warning: sops/run returned no `run_id` field; raw result: {}",
+                        serde_json::to_string(&result).unwrap_or_default()
+                    );
+                    "(unknown)"
+                });
+            writeln!(out, "started SOP run {run_id} (name={name})")?;
+            Ok(())
+        }
+        SopCmd::Status { run_ids, json } => {
+            // The engine contract: zero ids = list every run; one-or-
+            // more ids = fetch each named run. The wire call is the
+            // same — `sops/runs` accepts an optional `run_ids` array.
+            let params = if run_ids.is_empty() {
+                json!({})
+            } else {
+                json!({ "run_ids": run_ids })
+            };
+            let result = sop_rpc_call(socket, "runs", params).await?;
+            if *json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
+                return Ok(());
+            }
+            // The engine returns either an array of runs or an object
+            // mapping run_id → record. Accept both shapes.
+            let entries: Vec<(String, Value)> = if let Some(arr) = result
+                .as_array()
+                .or_else(|| result.get("runs").and_then(Value::as_array))
+            {
+                arr.iter()
+                    .map(|r| {
+                        let id = r
+                            .get("run_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string();
+                        (id, r.clone())
+                    })
+                    .collect()
+            } else if let Some(obj) = result.as_object() {
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            } else {
+                writeln!(
+                    out,
+                    "sops/runs returned an unexpected payload shape: {}",
+                    serde_json::to_string(&result).unwrap_or_default()
+                )?;
+                return Ok(());
+            };
+            if entries.is_empty() {
+                if run_ids.is_empty() {
+                    writeln!(out, "no SOP runs on the local zeroclaw engine.")?;
+                } else {
+                    writeln!(out, "no SOP run found for: {}", run_ids.join(", "))?;
+                }
+                return Ok(());
+            }
+            // Header distinguishes "looked up specific ids" from
+            // "list every run" so an empty-after-filter result is
+            // visibly different from a zero-runs engine state.
+            if run_ids.is_empty() {
+                writeln!(out, "All SOP runs:")?;
+            } else {
+                writeln!(out, "SOP runs matching: {}", run_ids.join(", "))?;
+            }
+            for (id, rec) in entries {
+                let status = rec
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .or_else(|| rec.get("state").and_then(Value::as_str))
+                    .unwrap_or("?");
+                let step = rec
+                    .get("current_step")
+                    .or_else(|| rec.get("step"))
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                let name = rec
+                    .get("name")
+                    .or_else(|| rec.get("sop"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                writeln!(
+                    out,
+                    "  {}  status={}  step={}  name={}",
+                    id, status, step, name,
+                )?;
+            }
+            Ok(())
+        }
+        SopCmd::Decide {
+            run_id,
+            decision,
+            json,
+        } => {
+            let result = sop_rpc_call(
+                socket,
+                "decide",
+                json!({ "run_id": run_id, "decision": decision }),
+            )
+            .await?;
+            if *json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
+                return Ok(());
+            }
+            // The engine returns an ack-shaped record (`run_id`,
+            // `decision`, optionally `status` / `next_step`). Print
+            // the one-line confirmation; the raw `--json` mode is
+            // available for scripts that want the full envelope.
+            let recorded = result
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or(decision.as_str());
+            let next = result
+                .get("status")
+                .or_else(|| result.get("next_step"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if next.is_empty() {
+                writeln!(out, "recorded decision `{recorded}` for run {run_id}")?;
+            } else {
+                writeln!(
+                    out,
+                    "recorded decision `{recorded}` for run {run_id} → {next}"
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a `zoder sop run --payload` value to a `serde_json::Value`.
+///
+/// The flag accepts either an inline JSON literal
+/// (`--payload '{"k":1}'`) or a path to a JSON file
+/// (`--payload ./payload.json`). Detection is by leading byte: `{`
+/// means inline, anything else is treated as a path (paths that
+/// don't exist surface a clean error rather than being silently
+/// reparsed as a JSON literal). The dual shape keeps the operator's
+/// hands free for small ad-hoc invocations while still letting CI
+/// pass large payloads by file reference.
+fn parse_sop_payload(raw: &str) -> anyhow::Result<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--payload is empty (pass an inline JSON object or a path to a JSON file)");
+    }
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<Value>(trimmed)
+            .with_context(|| format!("--payload is not valid inline JSON: {trimmed}"));
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("reading --payload file {}", path.display()))?;
+    serde_json::from_slice::<Value>(&bytes)
+        .with_context(|| format!("--payload file {} is not valid JSON", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// `zoder sop` tests.
+//
+// Two layers of coverage, matching the existing `mcp` test surface:
+//
+//   1. Argument parsing — `Cli::try_parse_from(["zoder", "sop", …])`
+//      must yield the expected `SopCmd` variant with the expected
+//      fields populated. This pins the CLI surface (subcommand names,
+//      positional args, optional flags) so a clap refactor cannot
+//      silently drop or rename a knob the operator relies on.
+//
+//   2. RPC call shape — `cmd_sop_with_socket` is exercised against a
+//      mock Unix-socket "daemon" that records every frame the CLI
+//      sends. Tests assert:
+//         * the `initialize` handshake is the first frame sent,
+//         * the `sops/<method>` frame has the right `id` (`"sop-list"`,
+//           `"sop-run"`, …), the right method, and the right `params`,
+//         * the rendered stdout matches the expected human/JSON shape.
+//
+// The mock daemon pattern mirrors the existing `cancel_session` /
+// `new_session` tests in `acp-client/src/lib.rs` — bind a tempdir
+// Unix socket, spawn a task that records frames + replies with
+// canned `result` payloads, then drive the CLI against it.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sop_tests {
+    use super::*;
+
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// Spawn a mock zeroclaw daemon on a tempdir Unix socket.
+    ///
+    /// The daemon:
+    ///   * accepts exactly one connection (the CLI's only RPC call),
+    ///   * reads every NDJSON frame into `received` (cloned),
+    ///   * replies to `initialize` with `{"result":{"protocolVersion":1}}`,
+    ///   * replies to the `sops/<method>` request whose `id` is the
+    ///     next id supplied by the test (`sop-list` / `sop-run` /
+    ///     `sop-runs` / `sop-decide`) with the canned `result` JSON.
+    ///
+    /// Returns the tempdir (which keeps the socket path alive); tests
+    /// join the spawned task before asserting on `received`.
+    async fn spawn_mock_sop_daemon(
+        received: Arc<Mutex<Vec<Value>>>,
+        sop_reply: Value,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let recv = received.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                // 1. `initialize` -> ack.
+                let _ = reader.read_line(&mut line).await;
+                if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                    recv.lock().unwrap().push(v);
+                }
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+                // 2. `sops/<method>` -> canned ack.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let recorded = serde_json::from_str::<Value>(line.trim()).unwrap();
+                let id = recorded
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sop-unknown")
+                    .to_string();
+                recv.lock().unwrap().push(recorded);
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": sop_reply,
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        });
+        dir
+    }
+
+    /// Drive `cmd_sop_with_socket` from inside a `#[tokio::test]`.
+    /// `Handle::current().block_on(...)` panics when called from a
+    /// tokio test runtime ("Cannot start a runtime from within a
+    /// runtime"), so the helper is `async fn` and the tests
+    /// `await` it directly — this is the canonical tokio idiom.
+    async fn run_sop(socket: &std::path::Path, action: &SopCmd) -> (String, anyhow::Result<()>) {
+        let mut buf: Vec<u8> = Vec::new();
+        let res = cmd_sop_with_socket(socket, action, &mut buf).await;
+        let s = String::from_utf8(buf).unwrap_or_default();
+        (s, res)
+    }
+
+    // --- argument parsing -------------------------------------------------
+
+    #[tokio::test]
+    async fn sop_list_parses_without_args() {
+        let cli = Cli::try_parse_from(["zoder", "sop", "list"]).expect("parse");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::List { json } => assert!(!json),
+                _ => panic!("expected List variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_list_parses_json_flag() {
+        let cli =
+            Cli::try_parse_from(["zoder", "sop", "list", "--json"]).expect("parse with --json");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::List { json } => assert!(json),
+                _ => panic!("expected List variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_parses_name_and_inline_payload() {
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "sop",
+            "run",
+            "incident-response",
+            "--payload",
+            r#"{"severity":"high"}"#,
+        ])
+        .expect("parse run with inline payload");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::Run { name, payload } => {
+                    assert_eq!(name, "incident-response");
+                    assert_eq!(payload, r#"{"severity":"high"}"#);
+                }
+                _ => panic!("expected Run variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_status_parses_zero_or_more_run_ids() {
+        let cli = Cli::try_parse_from(["zoder", "sop", "status"]).expect("parse status no args");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::Status { run_ids, json } => {
+                    assert!(run_ids.is_empty(), "no ids passed");
+                    assert!(!json);
+                }
+                _ => panic!("expected Status variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["zoder", "sop", "status", "run-abc-1", "run-abc-2", "--json"])
+                .expect("parse status with ids + --json");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::Status { run_ids, json } => {
+                    assert_eq!(
+                        run_ids,
+                        vec!["run-abc-1".to_string(), "run-abc-2".to_string()]
+                    );
+                    assert!(json);
+                }
+                _ => panic!("expected Status variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_decide_parses_run_id_and_decision() {
+        let cli = Cli::try_parse_from(["zoder", "sop", "decide", "run-abc-1", "approve"])
+            .expect("parse decide");
+        match cli.cmd.expect("cmd present") {
+            Cmd::Sop { action } => match action {
+                SopCmd::Decide {
+                    run_id,
+                    decision,
+                    json,
+                } => {
+                    assert_eq!(run_id, "run-abc-1");
+                    assert_eq!(decision, "approve");
+                    assert!(!json);
+                }
+                _ => panic!("expected Decide variant"),
+            },
+            _ => panic!("expected Sop command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_missing_payload_is_a_parse_error() {
+        // clap rejects `--run NAME` without `--payload`, NOT silently
+        // empty-payloading. A missing payload would otherwise send
+        // an empty `params.payload` to the engine and start a run
+        // with no runbook inputs.
+        let res = Cli::try_parse_from(["zoder", "sop", "run", "incident-response"]);
+        let err = match res {
+            Ok(_) => panic!("missing --payload must be a parse error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--payload"),
+            "parse error must mention --payload so the operator can find the missing flag; got: {msg}"
+        );
+    }
+
+    // --- payload parsing --------------------------------------------------
+
+    #[tokio::test]
+    async fn parse_sop_payload_inline_json_round_trips() {
+        let v = parse_sop_payload(r#"  {"k":1, "arr":[1,2,3]}  "#).expect("inline JSON");
+        assert_eq!(v, serde_json::json!({"k": 1, "arr": [1, 2, 3]}));
+    }
+
+    #[tokio::test]
+    async fn parse_sop_payload_reads_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("payload.json");
+        std::fs::write(&path, br#"{"ticket":"OPS-42"}"#).expect("write payload");
+        let v = parse_sop_payload(path.to_str().unwrap()).expect("file payload");
+        assert_eq!(v, serde_json::json!({"ticket": "OPS-42"}));
+    }
+
+    #[tokio::test]
+    async fn parse_sop_payload_rejects_empty() {
+        let err = parse_sop_payload("   ").expect_err("empty payload must fail");
+        assert!(err.to_string().contains("--payload is empty"));
+    }
+
+    #[tokio::test]
+    async fn parse_sop_payload_rejects_malformed_inline() {
+        let err = parse_sop_payload("{not json").expect_err("malformed JSON must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inline JSON"),
+            "error must mention inline JSON so the operator knows we tried to parse the value as a literal; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sop_payload_missing_file_is_a_clean_error() {
+        let err = parse_sop_payload("/no/such/file/should/exist.json")
+            .expect_err("missing file must fail");
+        assert!(
+            err.to_string().contains("reading --payload file"),
+            "error must mention 'reading --payload file' so the operator can distinguish a missing-path failure from a malformed-payload failure; got: {err}"
+        );
+    }
+
+    // --- RPC call shape (mock daemon) ------------------------------------
+
+    #[tokio::test]
+    async fn sop_list_dispatches_sops_list_with_no_params_and_renders_table() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!([
+                {"name": "incident-response", "steps": 4, "description": "On-call paging"},
+                {"name": "deploy-rollback",    "steps": 2, "description": "Roll back a deploy"}
+            ]),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(&socket, &SopCmd::List { json: false }).await;
+        res.expect("cmd_sop_with_socket ok");
+        // First frame must be `initialize` (handshake precedes every call).
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[0].get("method").and_then(Value::as_str),
+            Some("initialize"),
+            "initialize handshake must be the first frame; got {frames:?}"
+        );
+        // Second frame must be `sops/list` with the expected id.
+        let list_frame = &frames[1];
+        assert_eq!(
+            list_frame.get("method").and_then(Value::as_str),
+            Some("sops/list"),
+            "second frame must be sops/list; got {list_frame:?}"
+        );
+        assert_eq!(
+            list_frame.get("id").and_then(Value::as_str),
+            Some("sop-list"),
+            "id must be 'sop-list' so log greps by method stay stable; got {list_frame:?}"
+        );
+        assert_eq!(
+            list_frame.get("params").cloned().unwrap_or(Value::Null),
+            Value::Object(serde_json::Map::new()),
+            "sops/list takes no params; got {list_frame:?}"
+        );
+        // Output must render a table with both names and the description column.
+        assert!(
+            out.contains("incident-response"),
+            "table must list incident-response; got:\n{out}"
+        );
+        assert!(
+            out.contains("deploy-rollback"),
+            "table must list deploy-rollback; got:\n{out}"
+        );
+        assert!(
+            out.contains("steps"),
+            "header must include the steps column; got:\n{out}"
+        );
+        assert!(
+            out.contains("description"),
+            "header must include the description column; got:\n{out}"
+        );
+        assert!(
+            out.contains("On-call paging"),
+            "description column must carry the SOP description; got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_list_json_emits_raw_engine_result() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!([{"name": "only-sop", "steps": 1, "description": "x"}]),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(&socket, &SopCmd::List { json: true }).await;
+        res.expect("cmd_sop_with_socket ok");
+        let parsed: Value = serde_json::from_str(out.trim())
+            .expect("--json output must be valid JSON; got:\n{out}");
+        let arr = parsed
+            .as_array()
+            .expect("--json output must be a JSON array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("name").and_then(Value::as_str), Some("only-sop"));
+    }
+
+    #[tokio::test]
+    async fn sop_run_dispatches_sops_run_with_name_and_payload_and_prints_run_id() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!({"run_id": "run-abc-1", "status": "started"}),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(
+            &socket,
+            &SopCmd::Run {
+                name: "incident-response".to_string(),
+                payload: r#"{"severity":"high","ticket":"OPS-42"}"#.to_string(),
+            },
+        )
+        .await;
+        res.expect("cmd_sop_with_socket ok");
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[1].get("method").and_then(Value::as_str),
+            Some("sops/run"),
+            "sop run must dispatch sops/run; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("id").and_then(Value::as_str),
+            Some("sop-run"),
+            "id must be 'sop-run' so log greps by method stay stable; got {frames:?}"
+        );
+        let params = &frames[1].get("params").cloned().unwrap();
+        assert_eq!(
+            params.get("name").and_then(Value::as_str),
+            Some("incident-response"),
+            "params.name must round-trip the SOP name; got {params:?}"
+        );
+        assert_eq!(
+            params.get("payload").cloned().unwrap(),
+            serde_json::json!({"severity": "high", "ticket": "OPS-42"}),
+            "params.payload must be the parsed JSON (not the raw string); got {params:?}"
+        );
+        assert!(
+            out.contains("run-abc-1"),
+            "stdout must include the engine's run_id so the operator can chain `sop status`; got:\n{out}"
+        );
+        assert!(
+            out.contains("incident-response"),
+            "stdout must echo the SOP name back; got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_status_with_ids_dispatches_sops_runs_with_run_ids_array() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!({
+                "run-abc-1": {"run_id": "run-abc-1", "status": "running", "current_step": "ack", "name": "incident-response"},
+                "run-abc-2": {"run_id": "run-abc-2", "status": "complete", "current_step": "done", "name": "deploy-rollback"}
+            }),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(
+            &socket,
+            &SopCmd::Status {
+                run_ids: vec!["run-abc-1".to_string(), "run-abc-2".to_string()],
+                json: false,
+            },
+        )
+        .await;
+        res.expect("cmd_sop_with_socket ok");
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[1].get("method").and_then(Value::as_str),
+            Some("sops/runs"),
+            "sop status must dispatch sops/runs; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("id").and_then(Value::as_str),
+            Some("sop-runs"),
+            "id must be 'sop-runs' so log greps by method stay stable; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1]
+                .pointer("/params/run_ids")
+                .cloned()
+                .unwrap_or(Value::Null),
+            serde_json::json!(["run-abc-1", "run-abc-2"]),
+            "params.run_ids must be forwarded as a JSON array; got {:?}",
+            frames[1].get("params")
+        );
+        // Header distinguishes "lookup by id" from "list every run"
+        // so a filter-zero result is visibly different from a
+        // zero-runs engine state.
+        assert!(
+            out.contains("matching:"),
+            "header must say 'matching:' when run ids were supplied; got:\n{out}"
+        );
+        assert!(out.contains("run-abc-1"));
+        assert!(out.contains("run-abc-2"));
+        assert!(
+            out.contains("running"),
+            "must surface status field; got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_status_without_ids_uses_empty_params_and_list_header() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!([
+                {"run_id": "run-1", "status": "running", "name": "incident-response"},
+                {"run_id": "run-2", "status": "complete", "name": "deploy-rollback"}
+            ]),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(
+            &socket,
+            &SopCmd::Status {
+                run_ids: Vec::new(),
+                json: false,
+            },
+        )
+        .await;
+        res.expect("cmd_sop_with_socket ok");
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[1].get("params").cloned().unwrap_or(Value::Null),
+            Value::Object(serde_json::Map::new()),
+            "sop status with no ids must send empty params (engine contract: list every run); got {:?}",
+            frames[1].get("params")
+        );
+        assert!(
+            out.contains("All SOP runs:"),
+            "header must say 'All SOP runs:' when zero ids supplied; got:\n{out}"
+        );
+        assert!(out.contains("run-1"));
+        assert!(out.contains("run-2"));
+    }
+
+    #[tokio::test]
+    async fn sop_decide_dispatches_sops_decide_with_run_id_and_decision() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(
+            received.clone(),
+            serde_json::json!({"run_id": "run-abc-1", "decision": "approve", "status": "advanced"}),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(
+            &socket,
+            &SopCmd::Decide {
+                run_id: "run-abc-1".to_string(),
+                decision: "approve".to_string(),
+                json: false,
+            },
+        )
+        .await;
+        res.expect("cmd_sop_with_socket ok");
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[1].get("method").and_then(Value::as_str),
+            Some("sops/decide"),
+            "sop decide must dispatch sops/decide; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("id").and_then(Value::as_str),
+            Some("sop-decide"),
+            "id must be 'sop-decide'; got {frames:?}"
+        );
+        let params = &frames[1].get("params").cloned().unwrap();
+        assert_eq!(
+            params.get("run_id").and_then(Value::as_str),
+            Some("run-abc-1"),
+            "params.run_id must round-trip; got {params:?}"
+        );
+        assert_eq!(
+            params.get("decision").and_then(Value::as_str),
+            Some("approve"),
+            "params.decision must round-trip; got {params:?}"
+        );
+        assert!(
+            out.contains("run-abc-1") && out.contains("approve") && out.contains("advanced"),
+            "stdout must include the run id, the recorded decision, and the engine's next-step status; got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_list_empty_engine_response_renders_no_sops_hint() {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let dir = spawn_mock_sop_daemon(received, serde_json::json!([])).await;
+        let socket = dir.path().join("daemon.sock");
+        let (out, res) = run_sop(&socket, &SopCmd::List { json: false }).await;
+        res.expect("cmd_sop_with_socket ok");
+        assert!(
+            out.contains("no SOPs registered"),
+            "empty list must render the 'no SOPs registered' hint; got:\n{out}"
+        );
     }
 }
 

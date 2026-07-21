@@ -39,9 +39,10 @@ pub mod update;
 pub mod utilization;
 
 pub use acp_client::{
-    cancel_session, new_session, run_agent, run_agent_dispatch, run_goose_agent, wait_for_socket,
-    write_tool_matrix, write_tool_matrix_human, AgentEvent, AgentOptions, AgentRun, ApprovalPolicy,
-    EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
+    cancel_session, new_session, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call,
+    wait_for_socket, write_tool_matrix, write_tool_matrix_human, AgentEvent, AgentOptions,
+    AgentRun, ApprovalPolicy, EngineKind, GooseProviderEnv, WriteToolMatrixRow,
+    DEFAULT_AUTO_APPROVE,
 };
 /// Settle budget the loop grants the daemon to ACK a `session/cancel` after
 /// the author-phase watchdog fires (see `cancel_session`). Canonical value

@@ -1083,6 +1083,67 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         .ok_or_else(|| anyhow!("session/new returned no session_id"))
 }
 
+/// Send a single `sops/*` JSON-RPC method call to the local zeroclaw
+/// engine and return its `result` payload.
+///
+/// `zoder sop {list,run,status,decide}` are thin wrappers over the
+/// engine's `sops/list`, `sops/run`, `sops/runs`, and `sops/decide`
+/// methods (`crates/zeroclaw-runtime/src/rpc/dispatch.rs` around line
+/// 281 in the engine repo). Each call:
+///   1. opens a Unix-socket transport to the daemon,
+///   2. sends an `initialize` handshake (matching `new_session` /
+///      `cancel_session` — every connection starts with the same
+///      `protocol_version: 1` handshake the daemon expects),
+///   3. sends the requested `sops/<method>` frame with `params`,
+///   4. drains until the matching response arrives and returns the
+///      `result` value as `serde_json::Value`.
+///
+/// `params` is forwarded verbatim — the engine is the contract
+/// authority for each method's parameter shape (`{name, payload}` for
+/// `sops/run`, `{run_id, decision}` for `sops/decide`, etc.). `id` is
+/// a stable `"sop-<method>"` so callers reading the raw NDJSON stream
+/// can grep by id; this matches the canonical `"init"` / `"new"` /
+/// `"prompt"` convention used by `run_agent` / `new_session` /
+/// `cancel_session`.
+///
+/// Returns the JSON-RPC `result` value (NOT the response envelope);
+/// any engine-side JSON-RPC `error` is surfaced as an anyhow error so
+/// the CLI exit code is non-zero on a contract violation, matching
+/// every other RPC helper in this crate.
+pub async fn sop_rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
+    let conn = connect_transport(&EngineTransport::UnixSocket(socket.to_path_buf())).await?;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
+    // 1. initialize handshake (required on every connection).
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+        }),
+    )
+    .await?;
+    read_result(&mut reader, "init").await?;
+    // 2. the actual `sops/<method>` request.
+    let id = format!("sop-{method}");
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": format!("sops/{method}"),
+            "params": params,
+        }),
+    )
+    .await?;
+    // 3. read the matching response (skipping any unrelated notifications
+    //    the engine may emit in between, e.g. `session/update`).
+    let result = read_result(&mut reader, &id).await?;
+    Ok(result)
+}
+
 /// Dispatch a single agentic turn to the selected engine.
 ///
 /// - `Zeroclaw` (default) drives the local daemon over its Unix socket using
@@ -8297,6 +8358,183 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "cancel_session must fail fast on connect errors; took {elapsed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `sop_rpc_call`: thin JSON-RPC client for the `sops/*` engine
+    // surface. Pinned here so the wire shape (handshake + `sops/<m>`
+    // + stable id) cannot drift from what `zoder sop …` builds.
+    // -----------------------------------------------------------------
+
+    /// Spawn a minimal mock daemon that acks `initialize` and then
+    /// answers the next `sops/<method>` request with the canned
+    /// `result`. Records every received frame into `received` so the
+    /// test can assert both the handshake and the request shape.
+    async fn spawn_sop_test_daemon(
+        received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        result: serde_json::Value,
+    ) -> tempfile::TempDir {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let recv = received.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // initialize -> ack
+                let _ = reader.read_line(&mut line).await;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                    recv.lock().unwrap().push(v);
+                }
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+                // sops/<method> -> canned ack
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let recorded = serde_json::from_str::<serde_json::Value>(line.trim()).unwrap();
+                let id = recorded
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sop-unknown")
+                    .to_string();
+                recv.lock().unwrap().push(recorded);
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        });
+        dir
+    }
+
+    /// `sop_rpc_call` MUST send `initialize` first (every connection
+    /// starts with the handshake), then `sops/<method>` with the
+    /// caller-supplied `id` (`"sop-<method>"`) and the caller-
+    /// supplied `params`. The `id` MUST be stable per-method so log
+    /// greps by method stay consistent.
+    #[tokio::test]
+    async fn sop_rpc_call_sends_initialize_then_sops_method_with_stable_id() {
+        let received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = spawn_sop_test_daemon(
+            received.clone(),
+            serde_json::json!({"sops": [{"name": "incident-response"}]}),
+        )
+        .await;
+        let socket = dir.path().join("daemon.sock");
+        let params = serde_json::json!({"name": "incident-response", "payload": {"k": 1}});
+        let result = sop_rpc_call(&socket, "run", params.clone())
+            .await
+            .expect("sop_rpc_call ok");
+        // The result envelope is returned as the engine's `result`.
+        let arr = result
+            .get("sops")
+            .and_then(Value::as_array)
+            .expect("returned `result` is the engine's `result`");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("name").and_then(Value::as_str),
+            Some("incident-response")
+        );
+        // Wire shape: initialize, then sops/run.
+        let frames = received.lock().unwrap().clone();
+        assert_eq!(
+            frames[0].get("method").and_then(Value::as_str),
+            Some("initialize"),
+            "sop_rpc_call MUST handshake before any sops/* call; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("method").and_then(Value::as_str),
+            Some("sops/run"),
+            "second frame must be sops/<method> with the `sops/` prefix; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("id").and_then(Value::as_str),
+            Some("sop-run"),
+            "id MUST be `sop-<method>` so downstream log greps stay consistent; got {frames:?}"
+        );
+        assert_eq!(
+            frames[1].get("params").cloned().unwrap(),
+            params,
+            "params MUST round-trip verbatim; got {:?}",
+            frames[1].get("params")
+        );
+    }
+
+    /// An engine JSON-RPC `error` reply MUST surface as `Err`, NOT a
+    /// silent `Ok(Value::Null)`. The CLI relies on the non-zero exit
+    /// code for a failed SOP call.
+    #[tokio::test]
+    async fn sop_rpc_call_engine_error_surfaces_as_err() {
+        use tokio::net::UnixListener;
+        let received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let recv = received.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // initialize -> ack
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+                // sops/list -> error
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let recorded = serde_json::from_str::<serde_json::Value>(line.trim()).unwrap();
+                let id = recorded
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sop-unknown")
+                    .to_string();
+                recv.lock().unwrap().push(recorded);
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32000, "message": "sop registry offline" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        });
+        let res = sop_rpc_call(&socket, "list", serde_json::json!({})).await;
+        assert!(
+            res.is_err(),
+            "engine error MUST surface as Err; got {res:?}"
+        );
+        let msg = res.expect_err("err").to_string();
+        assert!(
+            msg.contains("sop registry offline"),
+            "error must surface the engine's message so the operator sees the real reason; got: {msg}"
         );
     }
 

@@ -22,7 +22,7 @@ SUBCOMMANDS=(
   exec tui models update route consult spend report health finops
   providers config refresh pricing reconcile sessions
   review adversarial-review rescue status result cancel jobs
-  loop transfer session recipe mcp configure completions gate
+  loop transfer session recipe mcp sop configure completions gate
 )
 
 {
