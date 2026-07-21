@@ -296,8 +296,8 @@ struct Cli {
     /// Working directory for the agentic run (codex `-C`). Default: current dir.
     #[arg(short = 'C', long = "cd", global = true, value_name = "DIR")]
     cd: Option<String>,
-    /// Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode
-    /// picker). Default: alias derived from the routed/`-m` model.
+    /// Run as a specific zeroclaw agent alias (see the zerocode picker).
+    /// Default: alias derived from the routed/`-m` model.
     #[arg(long, global = true, value_name = "ALIAS")]
     agent: Option<String>,
     /// Pure single-shot completion (no tools/file edits). The default is the
@@ -855,9 +855,9 @@ enum McpCmd {
     /// List MCP servers/extensions configured in the engine config.
     List {
         /// Emit the parsed server specs as structured JSON instead of
-        /// the human-readable table. Stable contract — the future slice
-        /// that hands the same specs to the goose ACP `session/new`
-        /// reads this same shape.
+        /// the human-readable table. Stable contract — this is the same
+        /// shape handed to the goose ACP `session/new` path when the goose
+        /// engine is used.
         #[arg(long)]
         json: bool,
     },
