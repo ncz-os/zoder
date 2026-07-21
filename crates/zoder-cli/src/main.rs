@@ -30,11 +30,12 @@ use zoder_core::utilization::{
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
-    estimate_tokens, fetch_engine_cost, finops_cli, load_project_instructions, openai_costs,
-    parse_mcp_servers_file, probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers,
-    AgentEvent, AgentOptions, ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot, CostVerdict, Decision,
-    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
+    estimate_tokens, fetch_catalog_models, fetch_engine_cost, finops_cli,
+    load_project_instructions, merge_or_degrade, openai_costs, parse_mcp_servers_file,
+    probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers, AgentEvent, AgentOptions,
+    ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult,
+    Classification, Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind,
+    EnrichmentOutcome, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
     OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
     ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
     SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
@@ -971,6 +972,49 @@ impl Engine {
     }
 }
 
+/// Fetch the live `config/catalog-models` from the running zeroclaw daemon
+/// and fold it into the static corpus. Additive enrichment: when the
+/// daemon is unreachable, errors out, or returns an empty/unknown shape,
+/// the corpus is returned unchanged and the operator sees a clear
+/// diagnostic in the outcome. Never panics, never blocks longer than the
+/// RPC's own `QUERY_TIMEOUT`.
+///
+/// This is the helper that makes `zoder models`, `zoder consult`, and the
+/// setup/diagnostic surfaces show models the operator has *actually
+/// configured* on their running daemon — not just the ones in the
+/// benched-at-build-time static corpus. The static corpus remains the
+/// routing authority; the live catalog is an annotation layer on top.
+async fn enrich_with_live_catalog(cfg: &Config, corpus: &mut Corpus) -> Option<EnrichmentOutcome> {
+    // Skip the RPC entirely when the CLI is in a no-daemon mode (tests,
+    // embedded runs, etc.) — the `Engine::load` path doesn't set this
+    // today, but the hook is here so a future `ZODER_NO_DAEMON=1` or
+    // equivalent can short-circuit cleanly.
+    if std::env::var_os("ZODER_SKIP_CATALOG_ENRICHMENT").is_some() {
+        return None;
+    }
+    let socket = engine_socket_path();
+    if !socket.exists() {
+        // No daemon running — the most common operator state. Don't
+        // surface an error to the CLI: the static corpus is the
+        // authoritative fallback. The outcome's `error` would only
+        // confuse the operator on a fresh install.
+        return None;
+    }
+    // The fetch is best-effort with its own internal timeout. The merge
+    // helper degrades cleanly on any Err, so a daemon that returns
+    // `method not found` (older zeroclaw without `config/catalog-models`)
+    // is handled identically to a missing socket.
+    let rpc = fetch_catalog_models(&socket).await;
+    let outcome = merge_or_degrade(Some(corpus), rpc);
+    // The operator can always run with `--verbose` to see enrichment
+    // counts; we keep the default output quiet so the change is truly
+    // additive (no new lines on a fresh install). The `cfg` arg is
+    // reserved for a future "skip when [catalog].disable_enrichment is
+    // set" knob.
+    let _ = cfg;
+    Some(outcome)
+}
+
 /// Quota-aware routing context: a snapshot of (ledger entries, tier catalog)
 /// taken once per command execution so the smart router can consult window
 /// usage on the calling thread without re-reading `ledger.jsonl` and the
@@ -1169,10 +1213,12 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let result = match &cli.cmd {
-        Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
+        Some(Cmd::Models { free, paid, all }) => {
+            cmd_models(*free, *paid, *all, cli.json, cli.verbose).await
+        }
         Some(Cmd::Update { check }) => cmd_update(*check).await,
-        Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()),
-        Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit),
+        Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()).await,
+        Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit).await,
         Some(Cmd::Spend {
             period,
             since,
@@ -2132,8 +2178,35 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
     }
 }
 
-fn cmd_models(free: bool, paid: bool, all: bool, json: bool) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+async fn cmd_models(
+    free: bool,
+    paid: bool,
+    all: bool,
+    json: bool,
+    verbose: u8,
+) -> anyhow::Result<()> {
+    let mut eng = Engine::load()?;
+
+    // Live catalog enrichment: ask the running zeroclaw daemon for its
+    // current `config/catalog-models` and fold the answer into the
+    // corpus before display. The RPC is best-effort with its own
+    // timeout; a missing/erroring daemon is a no-op (the static
+    // corpus stays authoritative). `--verbose` makes the enrichment
+    // counts visible so the operator can confirm the live data
+    // actually arrived.
+    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
+    if verbose > 0 {
+        if let Some(out) = &enrichment {
+            if out.has_live_data() {
+                eprintln!(
+                    "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
+                    out.added, out.enriched, out.rows
+                );
+            } else if let Some(err) = &out.error {
+                eprintln!("[zoder] live catalog enrichment skipped: {err}");
+            }
+        }
+    }
 
     // JSON keeps the scriptable flag-filtered dump.
     if json {
@@ -2961,8 +3034,16 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     })
 }
 
-fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+    let mut eng = Engine::load()?;
+    // Live catalog enrichment: same posture as `zoder models` and
+    // `zoder consult`. The route preview is the operator's primary
+    // "what would actually run" diagnostic, so it should reflect the
+    // daemon's current catalog (a model that just rotated providers
+    // may be a different row than the static corpus shows). The RPC
+    // is best-effort: a missing/erroring daemon leaves the static
+    // corpus as the routing authority.
+    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
     let router = Router::new(&eng.corpus, &health)
         .with_primary(eng.cfg.primary_model.clone())
@@ -2972,6 +3053,18 @@ fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     // capability/health based, not prompt-content based (see roadmap).
     let task = prompt.filter(|p| p != "-" && !p.trim().is_empty());
     if cli.json {
+        if cli.verbose > 0 {
+            if let Some(out) = &enrichment {
+                if out.has_live_data() {
+                    eprintln!(
+                        "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
+                        out.added, out.enriched, out.rows
+                    );
+                } else if let Some(err) = &out.error {
+                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                }
+            }
+        }
         println!(
             "{}",
             serde_json::json!({
@@ -2982,6 +3075,18 @@ fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
             })
         );
     } else {
+        if cli.verbose > 0 {
+            if let Some(out) = &enrichment {
+                if out.has_live_data() {
+                    eprintln!(
+                        "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
+                        out.added, out.enriched, out.rows
+                    );
+                } else if let Some(err) = &out.error {
+                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                }
+            }
+        }
         if let Some(t) = &task {
             println!("task: {t}");
         }
@@ -2995,8 +3100,14 @@ fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
 /// coding capability, then SWE Elo (the router's own signals), so a human can
 /// choose deliberately. Text table by default; `--json` emits the `Advisory`
 /// list verbatim.
-fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow::Result<()> {
+    let mut eng = Engine::load()?;
+    // Live catalog enrichment: same as `zoder models`, so the advisory
+    // reflects what the daemon is actually serving right now (e.g. a
+    // model rotated from one provider to another), not just the
+    // benched-at-build-time static corpus. Best-effort; the static
+    // corpus is the fallback.
+    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
     let rows = zoder_core::consultant::consult(
         &eng.corpus,
@@ -3004,8 +3115,32 @@ fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow::Resu
         &zoder_core::consultant::ConsultOptions { free_only, limit },
     );
     if cli.json {
+        if cli.verbose > 0 {
+            if let Some(out) = &enrichment {
+                if out.has_live_data() {
+                    eprintln!(
+                        "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
+                        out.added, out.enriched, out.rows
+                    );
+                } else if let Some(err) = &out.error {
+                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                }
+            }
+        }
         println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
+    }
+    if cli.verbose > 0 {
+        if let Some(out) = &enrichment {
+            if out.has_live_data() {
+                eprintln!(
+                    "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
+                    out.added, out.enriched, out.rows
+                );
+            } else if let Some(err) = &out.error {
+                eprintln!("[zoder] live catalog enrichment skipped: {err}");
+            }
+        }
     }
     if rows.is_empty() {
         println!("no routable models in the corpus (run `zoder refresh`)");
