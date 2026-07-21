@@ -32,12 +32,13 @@ use zoder_core::{
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
     estimate_tokens, fetch_engine_cost, finops_cli, load_project_instructions, openai_costs,
     parse_mcp_servers_file, probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers,
-    AgentEvent, AgentOptions, ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot, CostVerdict, Decision,
-    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
-    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
-    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
-    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    AgentEvent, AgentOptions, AgentStatusEntry, AgentsStatusResult, ApprovalPolicy,
+    BillableReservation, BillingMode, BudgetVerdict, ChatRequest, ChatResult, Classification,
+    Config, Corpus, CostSnapshot, CostVerdict, Decision, EngineKind, Entry, GooseProviderEnv, Gran,
+    HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog,
+    PricingSource, ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole,
+    ScopeStat, Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
+    PROBE_PING_TIMEOUT_SECS,
 };
 
 /// Serialize an AgentEvent to a JSONL line (one JSON object per line).
@@ -296,8 +297,9 @@ struct Cli {
     /// Working directory for the agentic run (codex `-C`). Default: current dir.
     #[arg(short = 'C', long = "cd", global = true, value_name = "DIR")]
     cd: Option<String>,
-    /// Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode
-    /// picker). Default: alias derived from the routed/`-m` model.
+    /// Run as a specific zeroclaw agent alias (list aliases with `zoder agents`
+    /// or use the zerocode picker). Default: alias derived from the routed/`-m`
+    /// model.
     #[arg(long, global = true, value_name = "ALIAS")]
     agent: Option<String>,
     /// Pure single-shot completion (no tools/file edits). The default is the
@@ -447,6 +449,13 @@ enum Cmd {
         paid: bool,
         #[arg(long)]
         all: bool,
+    },
+    /// List zeroclaw agent aliases and their current availability/session status.
+    /// Pass an alias to show only that agent.
+    Agents {
+        /// Agent alias to inspect.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
     },
     /// Check for a newer zoder release and update to it. Without `--check`,
     /// re-runs the official installer to self-replace this binary.
@@ -1170,6 +1179,7 @@ async fn run() -> anyhow::Result<()> {
 
     let result = match &cli.cmd {
         Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
+        Some(Cmd::Agents { name }) => cmd_agents(name.as_deref(), cli.json).await,
         Some(Cmd::Update { check }) => cmd_update(*check).await,
         Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()),
         Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit),
@@ -2129,6 +2139,200 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
             .status()
             .map_err(|e| anyhow::anyhow!("failed to run zerocode ({}): {e}", bin.display()))?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn filter_agents(
+    mut status: AgentsStatusResult,
+    name: Option<&str>,
+) -> anyhow::Result<AgentsStatusResult> {
+    status.agents.sort_by(|a, b| a.alias.cmp(&b.alias));
+    if let Some(name) = name {
+        let agent = status
+            .agents
+            .into_iter()
+            .find(|agent| agent.alias == name)
+            .ok_or_else(|| anyhow::anyhow!("agent {name:?} was not found"))?;
+        status.agents = vec![agent];
+    }
+    Ok(status)
+}
+
+fn agent_status_label(agent: &AgentStatusEntry) -> &'static str {
+    if agent.enabled {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+fn render_agents_table(agents: &[AgentStatusEntry]) -> String {
+    if agents.is_empty() {
+        return "No zeroclaw agents are configured.\n".to_string();
+    }
+
+    let headers = ["agent", "status", "live", "persisted", "channels"];
+    let rows: Vec<[String; 5]> = agents
+        .iter()
+        .map(|agent| {
+            [
+                agent.alias.clone(),
+                agent_status_label(agent).to_string(),
+                agent.live_sessions.to_string(),
+                agent.persisted_sessions.to_string(),
+                if agent.channels.is_empty() {
+                    "—".to_string()
+                } else {
+                    agent.channels.join(", ")
+                },
+            ]
+        })
+        .collect();
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  {:<agent_width$}  {:<status_width$}  {:>live_width$}  {:>persisted_width$}  {:<channels_width$}\n",
+        headers[0],
+        headers[1],
+        headers[2],
+        headers[3],
+        headers[4],
+        agent_width = widths[0],
+        status_width = widths[1],
+        live_width = widths[2],
+        persisted_width = widths[3],
+        channels_width = widths[4],
+    ));
+    let rule_width = widths.iter().sum::<usize>() + 8;
+    out.push_str("  ");
+    out.push_str(&"─".repeat(rule_width));
+    out.push('\n');
+    for row in rows {
+        out.push_str(&format!(
+            "  {:<agent_width$}  {:<status_width$}  {:>live_width$}  {:>persisted_width$}  {:<channels_width$}\n",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            agent_width = widths[0],
+            status_width = widths[1],
+            live_width = widths[2],
+            persisted_width = widths[3],
+            channels_width = widths[4],
+        ));
+    }
+    out
+}
+
+async fn cmd_agents(name: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let socket = ensure_engine_daemon().await?;
+    let status = zoder_core::agents_status(&socket).await?;
+    let status = filter_agents(status, name)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print!("{}", render_agents_table(&status.agents));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod agents_command_tests {
+    use super::*;
+
+    fn agent(
+        alias: &str,
+        enabled: bool,
+        live_sessions: usize,
+        persisted_sessions: usize,
+        channels: &[&str],
+    ) -> AgentStatusEntry {
+        AgentStatusEntry {
+            alias: alias.to_string(),
+            enabled,
+            live_sessions,
+            persisted_sessions,
+            channels: channels
+                .iter()
+                .map(|channel| (*channel).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn agents_command_parses_list_and_single_agent_forms() {
+        let list = Cli::try_parse_from(["zoder", "agents"]).expect("agents list must parse");
+        assert!(matches!(list.cmd, Some(Cmd::Agents { name: None })));
+
+        let detail = Cli::try_parse_from(["zoder", "agents", "reviewer", "--json"])
+            .expect("agents detail must parse");
+        assert!(detail.json);
+        assert!(matches!(
+            detail.cmd,
+            Some(Cmd::Agents { name: Some(name) }) if name == "reviewer"
+        ));
+    }
+
+    #[test]
+    fn agents_command_rejects_more_than_one_name() {
+        let error = match Cli::try_parse_from(["zoder", "agents", "author", "reviewer"]) {
+            Ok(_) => panic!("only one optional agent name is supported"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unexpected argument 'reviewer'"),
+            "unexpected clap error: {error}"
+        );
+    }
+
+    #[test]
+    fn agents_filter_sorts_and_selects_exact_alias() {
+        let status = AgentsStatusResult {
+            agents: vec![
+                agent("reviewer", true, 1, 2, &["discord"]),
+                agent("author", true, 0, 0, &[]),
+            ],
+        };
+        let selected = filter_agents(status.clone(), Some("reviewer")).expect("detail filter");
+        assert_eq!(selected.agents.len(), 1);
+        assert_eq!(selected.agents[0].alias, "reviewer");
+
+        let sorted = filter_agents(status.clone(), None).expect("list filter");
+        assert_eq!(sorted.agents[0].alias, "author");
+        assert_eq!(sorted.agents[1].alias, "reviewer");
+        assert!(filter_agents(status, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn agents_table_formats_status_sessions_and_channels() {
+        let output = render_agents_table(&[
+            agent("author", true, 2, 5, &["discord", "matrix"]),
+            agent("reviewer", false, 0, 0, &[]),
+        ]);
+        assert_eq!(
+            output,
+            concat!(
+                "  agent     status       live  persisted  channels       \n",
+                "  ───────────────────────────────────────────────────────\n",
+                "  author    available       2          5  discord, matrix\n",
+                "  reviewer  unavailable     0          0  —              \n",
+            )
+        );
+    }
+
+    #[test]
+    fn agents_table_explains_empty_configuration() {
+        assert_eq!(
+            render_agents_table(&[]),
+            "No zeroclaw agents are configured.\n"
+        );
     }
 }
 

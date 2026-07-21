@@ -448,6 +448,48 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
 /// `zeroclaw_api::jsonrpc` and `engine_cost.rs`).
 const ACP_PROTOCOL_VERSION: u64 = 1;
 
+/// Timeout for a short, read-only daemon RPC (for example `agents/status`).
+/// These calls are used by CLI inventory commands and must not hang forever if
+/// the daemon accepts a socket connection but stops responding.
+const READ_ONLY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One configured zeroclaw agent returned by `agents/list`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AgentEntry {
+    pub alias: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+/// Result shape for the zeroclaw `agents/list` RPC method.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AgentsListResult {
+    #[serde(default)]
+    pub agents: Vec<AgentEntry>,
+}
+
+/// One configured zeroclaw agent plus its current session counts, returned by
+/// `agents/status`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AgentStatusEntry {
+    pub alias: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+/// Result shape for the zeroclaw `agents/status` RPC method.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AgentsStatusResult {
+    #[serde(default)]
+    pub agents: Vec<AgentStatusEntry>,
+}
+
 /// Tools auto-approved under [`ApprovalPolicy::Allowlist`] — **READ-ONLY only**.
 /// Write/exec tools (`shell`, `bash`, `edit`, `apply_patch`, `write`, `git`, …)
 /// are deliberately NOT here: they require explicit [`ApprovalPolicy::All`]
@@ -866,6 +908,61 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
             }
         }
     }
+}
+
+/// Call a single read-only zeroclaw JSON-RPC method after completing the
+/// daemon's required `initialize` handshake.
+///
+/// The complete connect → initialize → request exchange is bounded so CLI
+/// inventory commands fail with a useful error instead of hanging on a stale or
+/// wedged daemon socket.
+async fn read_only_rpc(socket: &Path, method: &str) -> anyhow::Result<Value> {
+    let exchange = async {
+        let conn = connect_transport(&EngineTransport::UnixSocket(socket.to_path_buf())).await?;
+        let mut reader = BufReader::new(conn.reader);
+        let mut writer = conn.writer;
+
+        write_frame(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "inventory-init",
+                "method": "initialize",
+                "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+            }),
+        )
+        .await?;
+        read_result(&mut reader, "inventory-init").await?;
+
+        write_frame(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "inventory-query",
+                "method": method,
+                "params": {},
+            }),
+        )
+        .await?;
+        read_result(&mut reader, "inventory-query").await
+    };
+
+    tokio::time::timeout(READ_ONLY_RPC_TIMEOUT, exchange)
+        .await
+        .map_err(|_| anyhow!("engine RPC {method} timed out after {READ_ONLY_RPC_TIMEOUT:?}"))?
+}
+
+/// List configured zeroclaw agents using the engine's `agents/list` method.
+pub async fn list_agents(socket: &Path) -> anyhow::Result<AgentsListResult> {
+    let result = read_only_rpc(socket, "agents/list").await?;
+    serde_json::from_value(result).context("decoding agents/list result")
+}
+
+/// Fetch configured zeroclaw agents and their current session counts using the
+/// engine's `agents/status` method.
+pub async fn agents_status(socket: &Path) -> anyhow::Result<AgentsStatusResult> {
+    let result = read_only_rpc(socket, "agents/status").await?;
+    serde_json::from_value(result).context("decoding agents/status result")
 }
 
 /// Cancel an in-flight turn on the daemon for `session_id` and wait up to
@@ -3694,6 +3791,113 @@ mod tests {
     use super::*;
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
+
+    #[tokio::test]
+    async fn agent_inventory_rpc_uses_initialize_then_requested_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agents.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.unwrap();
+            let init: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["protocol_version"], ACP_PROTOCOL_VERSION);
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "inventory-init",
+                    "result": {},
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let query: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(query["method"], "agents/status");
+            assert_eq!(query["params"], json!({}));
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "inventory-query",
+                    "result": {
+                        "agents": [{
+                            "alias": "author",
+                            "enabled": true,
+                            "live_sessions": 2,
+                            "persisted_sessions": 3,
+                            "channels": ["discord"]
+                        }]
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = agents_status(&socket).await.unwrap();
+        assert_eq!(result.agents.len(), 1);
+        assert_eq!(result.agents[0].alias, "author");
+        assert_eq!(result.agents[0].live_sessions, 2);
+        assert_eq!(result.agents[0].persisted_sessions, 3);
+        assert_eq!(result.agents[0].channels, vec!["discord"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agents_list_rpc_decodes_list_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agents-list.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({"jsonrpc": "2.0", "id": "inventory-init", "result": {}}),
+            )
+            .await
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let query: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(query["method"], "agents/list");
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "inventory-query",
+                    "result": {
+                        "agents": [{
+                            "alias": "reviewer",
+                            "enabled": false,
+                            "channels": []
+                        }]
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = list_agents(&socket).await.unwrap();
+        assert_eq!(result.agents.len(), 1);
+        assert_eq!(result.agents[0].alias, "reviewer");
+        assert!(!result.agents[0].enabled);
+        server.await.unwrap();
+    }
 
     // -----------------------------------------------------------------
     // PROJECT-INSTRUCTIONS SLICE — prompt composition regression guard.
