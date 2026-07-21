@@ -20,6 +20,7 @@
 
 pub mod session_store;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -781,10 +782,55 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 }
 
 /// Outcome of an agentic turn.
+///
+/// The string is the wire-level classification — consumers branch on it
+/// via `AgentRun::succeeded` (which tests `== "completed"`) or by direct
+/// string comparison (the `rescue` / `exec` commands test `== "timeout"`).
+///
+/// Recognized values:
+///   * `completed` — engine explicitly signalled `turn_complete` /
+///     `stopReason: end_turn` (i.e. reached the terminal marker), OR the
+///     engine closed the socket after streaming text AND every
+///     in-flight tool received its `tool_result` (clean partial). The
+///     streamed `content` is the final text.
+///   * `timeout` — wall-clock budget elapsed. The `content` and
+///     `tool_calls` reflect whatever had streamed before the deadline
+///     (partial work preserved).
+///   * `interrupted` — engine closed the socket (EOF) before the
+///     terminal marker AND at least one `tool_call` was emitted without
+///     a matching `tool_result` (the tool hung or was severed
+///     mid-execution). Also reported when a `tool_call` was emitted
+///     with no text and the engine vanished — distinct from `completed`
+///     because the tool's output is unobserved. `pending_tool_results`
+///     is tracked per tool name so a single unresolved tool among many
+///     is sufficient to flag the turn as `interrupted` (no false-zero
+///     race on stray or duplicate `tool_result` frames).
+///   * `failed` — empty mid-turn disconnect (engine closed without
+///     emitting any text OR tool calls) OR a JSON-RPC error response on
+///     a critical RPC, surfaced as `Err` by the driver. Reachable only
+///     when no `tool_call` was streamed; any `tool_call` on a
+///     closed-socket turn moves the outcome to `interrupted` instead.
+///
+/// State matrix (verified at the EOF branch of `drive`):
+///
+/// ```text
+///                  |  any pending tool  |  no pending tool  |  no pending tool
+///                  |                   |  + content == ""  |  + content != ""
+///                  |                   |  + tool_calls==0  |
+///   ---------------+-------------------+-------------------+-----------------
+///    text streamed |  interrupted      |  failed           |  completed
+///    no text       |  interrupted      |  failed           |  completed
+/// ```
+///
+/// `AgentRun::succeeded` is the canonical "did the turn reach a clean
+/// end" gate — it returns `true` ONLY for `completed`. `interrupted`,
+/// `timeout`, and `failed` all cause `succeeded()` to return `false` so
+/// the orchestrator treats them as a non-clean end (and the operator
+/// sees the partial transcript + a resumable session id).
 #[derive(Debug, Clone)]
 pub struct AgentRun {
     pub session_id: String,
-    /// `completed` | `cancelled` | `failed`.
+    /// `completed` | `timeout` | `interrupted` | `failed`.
     pub outcome: String,
     /// Final assistant content (concatenated text chunks; `content` on
     /// `turn_complete` wins if present).
@@ -1262,6 +1308,69 @@ async fn drive<F: FnMut(AgentEvent)>(
     let mut content_bytes: u64 = 0;
     let mut input_tokens = 0u64;
     let mut tool_calls = 0u32;
+    // RELIABILITY-AUDIT FIX (mid-turn disconnect, extended — v2):
+    //
+    // Tracks, **per tool name**, the number of `tool_call` frames received
+    // in this turn that did NOT receive a matching `tool_result` before
+    // the loop ended. The engine is expected to send one `tool_result`
+    // per `tool_call` before `turn_complete`; if the socket closes (or the
+    // deadline elapses) while ANY entry in this map is > 0, that tool's
+    // execution hung or was severed mid-execution and we MUST NOT
+    // classify the turn as `completed` — that would mislead the caller
+    // into thinking the tool's output was observed.
+    //
+    // Why a per-name `HashMap` and not a flat `u32` counter (the v1
+    // shape, REJECTED IN REVIEW)?
+    //
+    // A flat counter has a **false-zero race**: if a flaky engine emits
+    // a stray `tool_result` for a tool that was never called (or
+    // duplicates a `tool_result` for a tool that already had its result
+    // recorded), `saturating_sub(1)` drives the global counter toward
+    // zero even though at least one *distinct* in-flight `tool_call`
+    // remains unresolved. Concretely:
+    //
+    //     [ToolCall "edit_file"] -> [ToolCall "shell"] ->
+    //         [ToolResult "edit_file"] -> [ToolResult "shell" (stray)] ->
+    //             EOF
+    //
+    // …with a flat counter, the second `tool_result` (which has no
+    // matching `tool_call` in this turn — it could be a duplicate frame
+    // resent from a prior turn, or a bug in a misbehaving engine)
+    // would drop the global counter to 0 and we'd report
+    // `"completed"`. The `"shell"` tool's actual result never arrived
+    // and the caller would dispatch on a phantom success.
+    //
+    // The per-name `HashMap` makes decrement *name-scoped*: a stray
+    // `tool_result` for a name that has no entry is a no-op
+    // (`HashMap::get_mut` returns `None`); a duplicate `tool_result`
+    // for a name whose count has already hit zero is also a no-op.
+    // The turn is `interrupted` if and only if at least one distinct
+    // tool name is still pending at EOF. Two calls to the same tool
+    // (e.g. two `edit_file` invocations in one turn) are tracked
+    // under the same key with a count of 2 and require two distinct
+    // `tool_result` frames to close — preserving per-call correctness
+    // even when the wire only carries the tool's `name` (no
+    // per-call `toolCallId` on the zeroclaw side; see the ACP v1
+    // spec which does carry `toolCallId` but the engine we drive here
+    // does not emit it).
+    //
+    // Outcome at EOF (`turn_complete` arriving implicitly resets this
+    // to zero because the loop has exited):
+    //
+    //   * any entry > 0          -> `"interrupted"`  (a tool's result
+    //     is missing; the caller MUST NOT treat the turn as clean)
+    //   * otherwise, content ==
+    //     "" && tool_calls == 0 -> `"failed"`      (engine closed
+    //     without emitting anything; the operator can distinguish
+    //     "disconnected with no work" from "disconnected after
+    //     streaming useful work")
+    //   * otherwise              -> `"completed"`   (every tool that
+    //     was called received its result before the engine vanished;
+    //     text was streamed; the caller accepts the partial)
+    //
+    // In every case the function returns `Ok(AgentRun{..})` — NEVER
+    // `Err` — so partial work survives a severed connection.
+    let mut pending_tool_results: HashMap<String, u32> = HashMap::new();
     let mut line = String::new();
     let outcome: String = loop {
         let got_line =
@@ -1293,7 +1402,67 @@ async fn drive<F: FnMut(AgentEvent)>(
                 Ok(r) => r.context("reading from engine")?,
             };
         if !got_line {
-            bail!("engine closed the connection before turn completed");
+            // Mid-turn disconnect (EOF before `turn_complete`). The engine
+            // already streamed whatever it streamed — preserve the partial
+            // turn rather than discarding it as `bail!` did. The previous
+            // behavior was: any EOF before turn_complete surfaced as an
+            // `Err`, which made a daemon that crashed mid-edit (or a
+            // network blip that severed the socket) silently zero out the
+            // operator's turn even when text + tool calls had already
+            // streamed. `drive_goose_io` already returns a partial
+            // `AgentRun` on the same condition; this brings `drive` into
+            // line so both drivers share one wire-side EOF contract.
+            //
+            // Classification (ordered most-specific first):
+            //   1. ANY entry in `pending_tool_results` is > 0 ->
+            //      `"interrupted"`. The engine emitted at least one
+            //      `tool_call` that did NOT receive its matching
+            //      `tool_result` before the socket closed. The tool
+            //      hung or was severed mid-execution, and we MUST NOT
+            //      call that `completed` — the caller would
+            //      (incorrectly) treat the tool as having finished and
+            //      dispatch on a result that never streamed. The
+            //      per-name `HashMap` ensures this branch is also
+            //      taken when only ONE of N distinct tools is
+            //      unresolved: `[A] -> [B] -> [result A] -> EOF` is
+            //      `interrupted` because `B` is still pending, even
+            //      though `A` is closed. The v1 flat-counter code
+            //      would have called this `completed`.
+            //   2. `content.is_empty() && tool_calls == 0` ->
+            //      `"failed"`. The engine closed without emitting
+            //      anything; the turn is genuinely empty and we
+            //      surface that so the caller can distinguish
+            //      "engine disconnected with no output" from "engine
+            //      disconnected after streaming useful work". (Note:
+            //      this branch is REACHED only when `pending_tool_results`
+            //      is also empty, by the ordering above — a turn with
+            //      a `tool_call` and no text is `interrupted`, not
+            //      `failed`.)
+            //   3. otherwise -> `"completed"`. Text streamed AND
+            //      every tool that was called received its result
+            //      before EOF. The caller treats this as a clean end
+            //      with whatever the engine managed to produce before
+            //      vanishing.
+            //
+            // In every case the function returns `Ok(AgentRun{..})` —
+            // NEVER `Err` — so partial work survives.
+            //
+            // INVARIANT on `line`: `read_frame_line_capped` clears the
+            // caller's `line` buffer on EOF (and on the oversized-frame
+            // error path) before returning `Ok(false)`. That means when
+            // we reach this branch, there is no partial frame buffered
+            // for the next iteration to lose — every byte the engine
+            // emitted before closing is already in `content` /
+            // `tool_calls` / `pending_tool_results`. The break below
+            // happens AFTER all prior-iteration state is committed; no
+            // chunk is lost.
+            break if pending_tool_results.values().any(|n| *n > 0) {
+                "interrupted".to_string()
+            } else if content.is_empty() && tool_calls == 0 {
+                "failed".to_string()
+            } else {
+                "completed".to_string()
+            };
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -1352,19 +1521,67 @@ async fn drive<F: FnMut(AgentEvent)>(
             }
             "tool_call" => {
                 tool_calls += 1;
+                // RELIABILITY-AUDIT FIX (mid-turn disconnect, extended — v2):
+                // track this `tool_call` as pending under its tool
+                // name. On EOF (or timeout) we use the per-name map
+                // to classify the turn as `"interrupted"` if ANY
+                // distinct tool name is still pending. A `tool_call`
+                // that arrives WITHOUT a matching `tool_result` is
+                // the canonical "severed mid-tool-execution" shape
+                // — distinct from a clean `completed` turn. Two
+                // `tool_call`s for the SAME tool name (e.g. two
+                // `edit_file` invocations in one turn) increment
+                // the count to 2 and require two distinct
+                // `tool_result` frames to close, so per-call
+                // correctness is preserved even though the zeroclaw
+                // wire only carries the tool's `name` (no per-call
+                // `toolCallId`).
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
+                *pending_tool_results.entry(name.clone()).or_insert(0) += 1;
                 on_event(AgentEvent::ToolCall { name });
             }
             "tool_result" => {
+                // RELIABILITY-AUDIT FIX (mid-turn disconnect, extended — v2):
+                // a `tool_result` closes out ONE pending
+                // `tool_call` for the SAME tool name. The lookup
+                // is name-scoped so:
+                //
+                //   * A **stray** `tool_result` (engine emitted it
+                //     for a tool that was never called this turn,
+                //     or it's a duplicate frame from a prior turn
+                //     re-flushed onto the wire) is a NO-OP —
+                //     `HashMap::get_mut` returns `None` for an
+                //     absent key, OR saturating-subs a 0-count
+                //     entry. The counter is NOT driven toward a
+                //     false zero. This is the precise failure mode
+                //     the reviewer flagged in v1.
+                //   * A **duplicate** `tool_result` (the matching
+                //     `tool_call` already had its result recorded)
+                //     is also a NO-OP for the same reason.
+                //   * A **legitimate** `tool_result` for an
+                //     in-flight `tool_call` decrements that name's
+                //     count by one; two calls to the same tool
+                //     require two results.
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
+                if let Some(count) = pending_tool_results.get_mut(&name) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    // If `*count` just hit zero, leave the entry in
+                    // the map (a `HashMap::remove` here would force
+                    // a rehash for a state we already express with
+                    // a zero count). The EOF check uses
+                    // `values().any(|n| *n > 0)` which is indifferent
+                    // to zero-valued entries vs. absent keys.
+                }
                 on_event(AgentEvent::ToolResult { name });
             }
             "context_usage" => {
@@ -8208,6 +8425,1059 @@ mod tests {
             .expect("read_result_inner errored")
             .expect("engine returned an error response");
         assert_eq!(res["protocolVersion"], 1);
+    }
+
+    // -----------------------------------------------------------------
+    // RELIABILITY-AUDIT FIX — mid-turn disconnect returns partial AgentRun.
+    //
+    // `drive` (the zeroclaw streaming loop) used to `bail!` whenever the
+    // engine closed the socket before sending `turn_complete`. That
+    // discarded whatever text + tool calls had already streamed, which
+    // silently zeroed an operator's turn on a daemon crash or a network
+    // blip. `drive_goose_io` already returns a partial `AgentRun` on the
+    // same condition; this test pins the matching wire-side EOF
+    // contract for `drive`.
+    //
+    // We exercise the REAL `run_agent` (the public surface the loop
+    // calls) against a Unix-socket mock daemon that speaks just enough
+    // of the zeroclaw wire shape to satisfy the handshake, emits a
+    // single `agent_message_chunk`, then closes the socket — modeling
+    // "engine disconnected after streaming useful work". The pre-fix
+    // code returned `Err("engine closed the connection before turn
+    // completed")` and threw away the chunk. The post-fix code returns
+    // `Ok(AgentRun { content: "hello-partial", outcome: "completed",
+    // ..})` — partial work survives, and the function never returns
+    // `Err` on EOF alone.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn drive_returns_partial_agent_run_on_mid_turn_disconnect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // 1. read `initialize` -> ack.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // 2. read `session/new` (snake_case params / result on the
+                //    zeroclaw wire) -> ack.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-partial-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // 3. read `session/prompt` so we know the streaming loop
+                //    is now parked on `read_frame_line_capped` for
+                //    `session/update` notifications.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // 4. emit ONE `agent_message_chunk` notification (the
+                //    "partial work" the operator must not lose).
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "hello-partial"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // 5. close the socket BEFORE sending `turn_complete`.
+                //    This is the "engine disconnected after streaming
+                //    useful work" shape the finding describes.
+                drop(write_half);
+            }
+        });
+
+        // Use a generous timeout — the bug surfaces when the engine
+        // closes the socket, NOT when the turn deadline elapses.
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "say something then disconnect".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            // Match the rest of the test surface: enforcement off,
+            // trust off, writable root set to the synthetic cwd.
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        // Capture the streamed events so we can ALSO assert that the
+        // chunk reached the on_event sink before the EOF.
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let run = run_agent(&opts, |ev| events.push(ev)).await.expect(
+            "mid-turn disconnect must surface as a partial AgentRun, NOT Err \
+                 (pre-fix code bailed and discarded streamed content)",
+        );
+
+        // 1. Partial content MUST survive the EOF.
+        assert_eq!(
+            run.content, "hello-partial",
+            "mid-turn disconnect must preserve streamed content; got {:?}",
+            run.content
+        );
+
+        // 2. Partial work is reported as `completed` (mirrors
+        //    `drive_goose_io`'s EOF contract — empty turns are
+        //    `failed`, non-empty turns are `completed`).
+        assert_eq!(
+            run.outcome, "completed",
+            "non-empty mid-turn disconnect must be classified as `completed`; got {:?}",
+            run.outcome
+        );
+
+        // 3. The session id from the partial handshake is preserved.
+        assert_eq!(
+            run.session_id, "z-partial-1",
+            "session_id from session/new ack must survive the EOF; got {:?}",
+            run.session_id
+        );
+
+        // 4. The on_event/Text sink observed the chunk — proving the
+        //    streamed work was visible to the live-display path BEFORE
+        //    the function returned, not lost.
+        let saw_text = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Text(t) if t == "hello-partial"));
+        assert!(
+            saw_text,
+            "the streamed chunk MUST reach the on_event sink before the function returns; events: {events:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    // Companion to `drive_returns_partial_agent_run_on_mid_turn_disconnect`:
+    // pins the inverse case — a daemon that closes the socket BEFORE
+    // streaming anything. Pre-fix: `bail!`. Post-fix: `Ok(AgentRun {
+    // outcome: "failed", .. })` — never `Err`. The classification
+    // distinguishes "engine disconnected with no output" from "engine
+    // disconnected after streaming useful work" so the caller can
+    // branch on intent (retry vs. accept-partial).
+    #[tokio::test]
+    async fn drive_marks_outcome_failed_on_eof_before_any_output() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-empty-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // read `session/prompt` so the streaming loop is parked.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // NO `agent_message_chunk` — drop closes the socket
+                // without sending turn_complete. This is the
+                // "empty mid-turn disconnect" shape.
+                drop(write_half);
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "say something".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("EOF before any streamed output must surface as Ok, not Err");
+
+        assert!(
+            run.content.is_empty(),
+            "no chunk was sent, so `content` must be empty; got {:?}",
+            run.content
+        );
+        assert_eq!(
+            run.tool_calls, 0,
+            "no tool_call frame was sent, so `tool_calls` must be 0; got {:?}",
+            run.tool_calls
+        );
+        assert_eq!(
+            run.outcome, "failed",
+            "empty mid-turn disconnect must be classified as `failed` (NOT `completed`, NOT `timeout`); \
+             got {:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.session_id, "z-empty-1",
+            "session_id from the session/new ack must still survive the empty EOF; got {:?}",
+            run.session_id
+        );
+
+        let _ = server.await;
+    }
+
+    // Companion to `drive_returns_partial_agent_run_on_mid_turn_disconnect`:
+    // pins the case the reviewer flagged as the remaining ambiguity in the
+    // initial fix — a daemon that emits a `tool_call` frame, then closes the
+    // socket BEFORE the matching `tool_result` arrives. This is the
+    // "severed mid-tool-execution" shape.
+    //
+    // Pre-fix behavior: the turn was classified `completed` because the loop
+    // only inspected `content.is_empty() && tool_calls == 0`. The orchestrator
+    // / UI would treat the (never-streamed) tool output as if the tool had
+    // run to completion and dispatch on it — a silent correctness bug.
+    //
+    // Post-fix behavior: `pending_tool_results` is non-zero on EOF, so the
+    // turn is classified `"interrupted"` and `AgentRun::succeeded()` returns
+    // `false`. The operator / rescue command sees a non-clean end (a
+    // resumable session id is still preserved) instead of a false positive.
+    //
+    // The streamed text chunk DOES survive — the partial work is not lost —
+    // but the `outcome` distinguishes "clean end" from "tool severed mid-
+    // run" so the caller can branch on intent.
+    #[tokio::test]
+    async fn drive_marks_outcome_interrupted_on_eof_after_tool_call_before_result() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-severed-tool-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // read `session/prompt` so the streaming loop is parked.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // Stream some text (so the turn is NOT an empty EOF —
+                // empty EOF is `"failed"`, not `"interrupted"`).
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "starting edit"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Emit ONE `tool_call` — but never emit the matching
+                // `tool_result`, and never emit `turn_complete`. Then
+                // close the socket. This is the "engine severed
+                // mid-tool-execution" shape.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "tool_call",
+                        "name": "edit_file"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Drop closes the socket — engine is "gone". No
+                // `tool_result`, no `turn_complete`. Pre-fix code
+                // would have classified this as `"completed"`
+                // because `tool_calls > 0` and the EOF branch
+                // returned `"completed"` for any non-empty turn.
+                drop(write_half);
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "edit something then crash".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let run = run_agent(&opts, |ev| events.push(ev))
+            .await
+            .expect("mid-turn disconnect with a pending tool_call must surface as Ok, not Err");
+
+        // 1. Streamed content survives (we did NOT lose the partial work).
+        assert_eq!(
+            run.content, "starting edit",
+            "text streamed before the severed tool_call must survive the EOF; got {:?}",
+            run.content
+        );
+
+        // 2. `tool_calls` counter incremented exactly once (one `tool_call`
+        //    frame was emitted).
+        assert_eq!(
+            run.tool_calls, 1,
+            "exactly one tool_call frame was streamed; got {:?}",
+            run.tool_calls
+        );
+
+        // 3. THE NEW FIX: outcome must be `"interrupted"`, NOT
+        //    `"completed"`. This is the precise case the reviewer
+        //    flagged: a tool_call without a matching tool_result
+        //    MUST NOT be misreported as a successful turn.
+        assert_eq!(
+            run.outcome, "interrupted",
+            "EOF after a tool_call frame with no matching tool_result must be classified \
+             as `interrupted` (NOT `completed`); got {:?}",
+            run.outcome
+        );
+
+        // 4. `AgentRun::succeeded()` reflects the non-clean end so
+        //    the orchestrator / `rescue` / `exec` commands bail
+        //    rather than treating the (missing) tool output as a
+        //    successful result.
+        assert!(
+            !run.succeeded(),
+            "a severed tool_call must cause `succeeded()` to return false; \
+             the orchestrator must NOT treat this as a clean end"
+        );
+
+        // 5. Session id from the handshake survives (resumable).
+        assert_eq!(
+            run.session_id, "z-severed-tool-1",
+            "session_id from session/new ack must survive the severed EOF; got {:?}",
+            run.session_id
+        );
+
+        // 6. The on_event sink saw the text chunk AND the ToolCall
+        //    event — proving the live-display path observed the
+        //    tool hung mid-execution, not a phantom success.
+        let saw_text = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Text(t) if t == "starting edit"));
+        assert!(
+            saw_text,
+            "the streamed chunk MUST reach the on_event sink before the function returns; events: {events:?}"
+        );
+        let saw_tool_call = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ToolCall { name } if name == "edit_file"));
+        assert!(
+            saw_tool_call,
+            "the in-flight tool_call MUST reach the on_event sink before the function returns; \
+             events: {events:?}"
+        );
+        // And critically: no `ToolResult` was ever streamed (because
+        // the daemon was severed before sending one) — so the
+        // caller knows the tool's output is missing.
+        let saw_tool_result = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ToolResult { .. }));
+        assert!(
+            !saw_tool_result,
+            "no tool_result was streamed (engine severed mid-execution); \
+             events: {events:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    // -----------------------------------------------------------------
+    // RELIABILITY-AUDIT FIX v2 — per-name pending map, NOT a flat
+    // counter (REJECTED IN REVIEW).
+    //
+    // The previous fix used `pending_tool_results.saturating_sub(1)`
+    // on every `tool_result`. That has a false-zero race: if a flaky
+    // engine sends a `tool_result` for a tool that was never called
+    // this turn (a stray, possibly a duplicate frame flushed from a
+    // prior turn onto a reconnected socket), the global counter
+    // drops toward zero even though at least one distinct
+    // `tool_call` remains unresolved. The turn would be classified
+    // `"completed"` and the caller would dispatch on a phantom
+    // success.
+    //
+    // This test pins the EXACT scenario the reviewer flagged:
+    //
+    //   [ToolCall "edit_file"] -> [ToolCall "shell"]
+    //       -> [ToolResult "edit_file"]
+    //       -> [ToolResult "shell" (STRAY — never had a matching call this turn)]
+    //       -> EOF
+    //
+    // Pre-v2 (rejected): the global counter is 2 (two calls) then
+    // 1 (after `edit_file`'s result) then 0 (after the stray
+    // `shell` result, via `saturating_sub`). The EOF branch
+    // classifies the turn as `"completed"` — WRONG, `shell` was
+    // never called and never closed.
+    //
+    // Post-v2: `pending_tool_results` is a `HashMap<String, u32>`
+    // keyed by tool name. After `[ToolCall "edit_file"]` ->
+    // `[ToolCall "shell"]` the map is `{"edit_file": 1,
+    // "shell": 1}`. After `[ToolResult "edit_file"]` the map is
+    // `{"edit_file": 0, "shell": 1}`. The stray `[ToolResult
+    // "shell" (stray)]` is a no-op because... wait — `"shell"` is
+    // actually a legitimate pair here, so let me retell the
+    // scenario precisely:
+    //
+    //   [ToolCall "edit_file"] -> [ToolCall "shell"]
+    //       -> [ToolResult "edit_file"]
+    //       -> [ToolResult "shell" (LEGITIMATE — closes the shell call)]
+    //       -> [ToolResult "read_file" (STRAY — never called this turn)]
+    //       -> EOF
+    //
+    // In v1: counter is 2 -> 1 -> 0 -> would-have-gone-negative-but-
+    // saturating-sub keeps it at 0 -> classified `"completed"`.
+    //
+    // In v2: the stray `read_file` result does `get_mut("read_file")`
+    // which returns `None` (no entry), so the no-op branch is
+    // taken. The map is still `{"edit_file": 0, "shell": 0}` and
+    // `values().any(|n| *n > 0)` is `false`. But because text WAS
+    // streamed, the second clause is also false, so we fall through
+    // to `"completed"`. That's still correct here.
+    //
+    // The CRITICAL false-zero scenario is when the stray
+    // `tool_result` arrives while a *different* tool is still
+    // genuinely pending:
+    //
+    //   [ToolCall "edit_file"] -> [ToolCall "shell"]
+    //       -> [ToolResult "edit_file"]
+    //       -> [ToolResult "read_file" (STRAY)]
+    //       -> EOF
+    //
+    // In v1: counter is 2 -> 1 -> 0 -> `"completed"`. WRONG —
+    // `shell` never received its result.
+    //
+    // In v2: stray `read_file` is a no-op (no entry). Map is
+    // `{"edit_file": 0, "shell": 1}` -> `"interrupted"`. CORRECT.
+    //
+    // This test pins the v2 behavior so the race cannot silently
+    // regress.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn drive_stray_tool_result_does_not_cause_false_completed() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // handshake: ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // handshake: ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-stray-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // consume `session/prompt`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // Stream some text so the turn is non-empty.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "starting work"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Call `edit_file` and `shell`. TWO distinct tool names.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "shell" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Close `edit_file` legitimately.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_result", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // STRAY `tool_result` for `read_file` — `read_file`
+                // was NEVER called this turn. This is the exact
+                // shape the reviewer flagged as the v1 false-zero
+                // race trigger. In v1, `saturating_sub(1)` would
+                // drive the global counter to 0 and we'd report
+                // `"completed"`. In v2, the per-name `HashMap`
+                // lookup for `"read_file"` returns `None` and the
+                // decrement is a no-op — `shell` stays pending and
+                // the turn is correctly classified `"interrupted"`.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_result", "name": "read_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Close the socket. `shell` never received its
+                // result. `read_file` had no matching call this
+                // turn (stray). The v2 fix MUST recognize that
+                // `shell` is unresolved and report `"interrupted"`.
+                drop(write_half);
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "do work, then misbehave".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a stray tool_result must not turn the turn into Err");
+
+        // 1. Content survives.
+        assert_eq!(
+            run.content, "starting work",
+            "text streamed before the severed multi-tool turn must survive; got {:?}",
+            run.content
+        );
+        // 2. tool_calls counter reflects both calls.
+        assert_eq!(
+            run.tool_calls, 2,
+            "two tool_call frames were streamed; got {:?}",
+            run.tool_calls
+        );
+        // 3. CRITICAL: outcome is `"interrupted"`, NOT `"completed"`.
+        //    This is the exact case the reviewer flagged. A v1
+        //    (flat counter, REJECTED) implementation would fail
+        //    this assertion with `"completed"`.
+        assert_eq!(
+            run.outcome, "interrupted",
+            "stray tool_result for an unrelated tool must NOT cause a false `completed`; \
+             v1 flat-counter code would fail here. got {:?}",
+            run.outcome
+        );
+        // 4. `succeeded()` reflects the non-clean end.
+        assert!(
+            !run.succeeded(),
+            "a severed in-flight tool must cause `succeeded()` to return false; \
+             the orchestrator must NOT treat this as a clean end"
+        );
+        // 5. session_id from handshake survives (resumable).
+        assert_eq!(
+            run.session_id, "z-stray-1",
+            "session_id must survive the severed EOF; got {:?}",
+            run.session_id
+        );
+
+        let _ = server.await;
+    }
+
+    // -----------------------------------------------------------------
+    // RELIABILITY-AUDIT FIX v2 — companion to the stray-result test
+    // above, but for the **duplicate**-result shape: a `tool_result`
+    // arrives TWICE for the same tool whose matching `tool_call`
+    // was already closed by the first result. The duplicate must
+    // also be a no-op (no false zero), and the duplicate must NOT
+    // be allowed to drop a STILL-PENDING sibling tool's count.
+    //
+    // Wire shape (also reviews the scenario the reviewer cited):
+    //
+    //   [ToolCall "edit_file"] -> [ToolCall "shell"]
+    //       -> [ToolResult "edit_file"]
+    //       -> [ToolResult "edit_file" (DUPLICATE)]
+    //       -> EOF
+    //
+    // In v1: counter is 2 -> 1 -> 0 (duplicate still drives
+    // saturating-sub) -> `"completed"`. WRONG — `shell` is still
+    // pending.
+    //
+    // In v2: the duplicate `edit_file` result does
+    // `get_mut("edit_file")` which returns `Some(&mut 0)`, then
+    // the `if *count > 0` guard skips the decrement. Map stays
+    // `{"edit_file": 0, "shell": 1}` -> `"interrupted"`. CORRECT.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn drive_duplicate_tool_result_does_not_cause_false_completed() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // handshake: ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // handshake: ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-dup-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // consume `session/prompt`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // Stream some text.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "hi"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Call `edit_file` and `shell`.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "shell" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Close `edit_file` legitimately.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_result", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // DUPLICATE `edit_file` result. In v1, this would
+                // drive the global counter to 0 and the EOF
+                // classification would be `"completed"`. In v2,
+                // the per-name guard `if *count > 0` skips the
+                // decrement because `edit_file` is already at 0.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_result", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Close socket. `shell` still pending. The v2 fix
+                // MUST recognize that and report `"interrupted"`.
+                drop(write_half);
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "do work, then duplicate a frame".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a duplicate tool_result must not turn the turn into Err");
+
+        assert_eq!(run.content, "hi");
+        assert_eq!(run.tool_calls, 2);
+        assert_eq!(
+            run.outcome, "interrupted",
+            "duplicate tool_result must NOT cause a false `completed`; \
+             v1 flat-counter code would fail here. got {:?}",
+            run.outcome
+        );
+        assert!(!run.succeeded());
+        assert_eq!(run.session_id, "z-dup-1");
+
+        let _ = server.await;
+    }
+
+    // -----------------------------------------------------------------
+    // RELIABILITY-AUDIT FIX v2 — two calls to the SAME tool name
+    // (the wire carries `name`, not per-call `toolCallId`, on the
+    // zeroclaw surface). The per-name `HashMap` collapses the two
+    // calls into one entry with count 2; closing requires two
+    // distinct `tool_result` frames. If only one arrives and the
+    // engine disconnects, the turn MUST be `"interrupted"` —
+    // exactly one of the two calls is unresolved, and we cannot
+    // know which. This guards against a regression to a single-bit
+    // presence tracker (`HashSet<String>`), which would call this
+    // turn `"completed"` because the name `edit_file` is present
+    // once and the matching result closed its only entry.
+    //
+    // Wire shape:
+    //
+    //   [ToolCall "edit_file"] -> [ToolCall "edit_file"]
+    //       -> [ToolResult "edit_file"] (closes ONE)
+    //       -> EOF
+    //
+    // In a v2-regression (HashSet, single presence): set was
+    // {"edit_file"}, removed by the result -> empty -> `"completed"`.
+    // WRONG — one of the two calls is unresolved.
+    //
+    // In v2 (HashMap<String, u32> count): map is {"edit_file": 2},
+    // decremented to {"edit_file": 1}, EOF sees a 1 and reports
+    // `"interrupted"`. CORRECT.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn drive_two_calls_same_tool_one_result_marks_interrupted() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-twocall-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "editing twice"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Call `edit_file` TWICE — same tool name.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_call", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Only ONE `tool_result` arrives — closes one of
+                // the two, leaves the other pending.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "tool_result", "name": "edit_file" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                drop(write_half);
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "edit twice, then crash on the second".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a one-of-two-closed tool must not turn the turn into Err");
+
+        assert_eq!(run.content, "editing twice");
+        assert_eq!(
+            run.tool_calls, 2,
+            "two tool_call frames for edit_file were streamed"
+        );
+        assert_eq!(
+            run.outcome, "interrupted",
+            "two calls to the same tool with only one matching result MUST be `interrupted`; \
+             a HashSet-based regression would fail here with `completed`. got {:?}",
+            run.outcome
+        );
+        assert!(!run.succeeded());
+        assert_eq!(run.session_id, "z-twocall-1");
+
+        let _ = server.await;
     }
 }
 
