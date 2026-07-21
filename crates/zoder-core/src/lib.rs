@@ -21,6 +21,7 @@ pub use health_probe::{
     PROBE_PING_TIMEOUT_SECS, PROBE_PROMPT,
 };
 pub use model_health as health;
+pub mod catalog_models;
 pub mod ledger;
 pub mod mcp;
 pub mod policy;
@@ -50,6 +51,10 @@ pub use acp_client::{
 /// the loop's `build_diff` ordering.
 pub const CANCEL_SETTLE_BUDGET: Duration = Duration::from_secs(5);
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
+pub use catalog_models::{
+    fetch_catalog_models, merge_into_corpus, merge_or_degrade, CatalogModel, CatalogResponse,
+    EnrichmentOutcome,
+};
 pub use config::{
     AliasedAgentConfig, Auth, BillingMode, Config, ExecSafetyConfig, ExecSandbox,
     LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions, Provider, QuotaUnit, QuotaWindow,
