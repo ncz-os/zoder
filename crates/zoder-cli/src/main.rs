@@ -1171,7 +1171,7 @@ async fn run() -> anyhow::Result<()> {
     let result = match &cli.cmd {
         Some(Cmd::Models { free, paid, all }) => cmd_models(*free, *paid, *all, cli.json),
         Some(Cmd::Update { check }) => cmd_update(*check).await,
-        Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()),
+        Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()).await,
         Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit),
         Some(Cmd::Spend {
             period,
@@ -2961,13 +2961,164 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     })
 }
 
-fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+/// Add the daemon's own Quickstart view to a local routing/configuration
+/// diagnostic. This is intentionally best-effort: the existing zoder hint is
+/// still the source of truth when no daemon is available or the daemon predates
+/// the Quickstart RPC surface.
+async fn enrich_no_provider_diagnostic(socket: &Path, model: &str, local_hint: String) -> String {
+    let Ok(diagnostics) = zoder_core::fetch_quickstart_diagnostics(socket, model).await else {
+        return local_hint;
+    };
+    render_quickstart_diagnostic(&local_hint, &diagnostics)
+}
+
+/// Render only bounded, useful daemon fields. Raw JSON is intentionally not
+/// copied wholesale: provider responses can contain credentials or enormous
+/// schema metadata, while this error path must remain safe to print.
+fn render_quickstart_diagnostic(
+    local_hint: &str,
+    diagnostics: &zoder_core::engine_rpc::QuickstartDiagnostics,
+) -> String {
+    let mut lines = vec![local_hint.to_string()];
+    let state = diagnostics.state.as_ref();
+
+    let mut details = Vec::new();
+    if let Some(state) = state {
+        if let Some(completed) = state
+            .get("quickstart_completed")
+            .and_then(serde_json::Value::as_bool)
+        {
+            details.push(format!("quickstart_completed={completed}"));
+        }
+        for (key, label) in [
+            ("agents", "agents"),
+            ("model_providers", "model providers"),
+            ("unassigned_channels", "unassigned channels"),
+        ] {
+            if let Some(values) = state.get(key).and_then(serde_json::Value::as_array) {
+                let values: Vec<String> = values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .take(8)
+                    .map(ToString::to_string)
+                    .collect();
+                details.push(format!("{label}=[{}]", values.join(", ")));
+            }
+        }
+    }
+    if !details.is_empty() {
+        lines.push(format!("daemon quickstart state: {}", details.join("; ")));
+    }
+
+    if let Some(validation) = diagnostics.validation.as_ref() {
+        if validation.get("kind").and_then(serde_json::Value::as_str) == Some("errors") {
+            let errors = validation
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .take(8)
+                        .map(|error| {
+                            let field = error
+                                .get("field")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown field");
+                            let message = error
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("validation failed");
+                            format!("{field}: {message}")
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !errors.is_empty() {
+                lines.push(format!(
+                    "daemon quickstart validation: {}",
+                    errors.join("; ")
+                ));
+            }
+        }
+    }
+
+    for (provider_type, fields) in diagnostics.fields.iter().take(8) {
+        let field_names = fields
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|field| field.get("key").and_then(serde_json::Value::as_str))
+                    .take(16)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !field_names.is_empty() {
+            lines.push(format!(
+                "daemon quickstart fields ({provider_type}): {}",
+                field_names.join(", ")
+            ));
+        }
+    }
+
+    if lines.len() == 1 {
+        local_hint.to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+/// Resolve routing for an execution path and, only when the local resolver has
+/// no runnable model/provider, ask zeroclaw for its read-only Quickstart view.
+/// The synchronous resolver remains available for pure callers and tests.
+async fn resolve_chain_for_execution(
+    cli: &Cli,
+    eng: &Engine,
+    health: &HealthStore,
+) -> anyhow::Result<ResolvedRoutes> {
+    match resolve_chain(cli, eng, health) {
+        Ok(routes) => Ok(routes),
+        Err(error) if should_enrich_route_error(&error) => {
+            let model =
+                resolve_effective_primary(cli, eng).unwrap_or_else(|| "unknown".to_string());
+            let hint = error.to_string();
+            let enriched = enrich_no_provider_diagnostic(&engine_socket_path(), &model, hint).await;
+            Err(anyhow::anyhow!(enriched))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_enrich_route_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "no free model",
+        "no healthy free model",
+        "all backed free models",
+        "no model resolved",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let health = HealthStore::load(&eng.cfg.health_path);
     let router = Router::new(&eng.corpus, &health)
         .with_primary(eng.cfg.primary_model.clone())
         .with_backed(Some(backed_free_model_ids(&eng)));
-    let route = router.select(Tier::parse(&cli.tier))?;
+    let route = match router.select(Tier::parse(&cli.tier)) {
+        Ok(route) => route,
+        Err(error) if should_enrich_route_error(&error) => {
+            let model =
+                resolve_effective_primary(cli, &eng).unwrap_or_else(|| "unknown".to_string());
+            let hint = error.to_string();
+            let enriched = enrich_no_provider_diagnostic(&engine_socket_path(), &model, hint).await;
+            anyhow::bail!(enriched);
+        }
+        Err(error) => return Err(error),
+    };
     // Echo the task so the decision is traceable; routing is currently
     // capability/health based, not prompt-content based (see roadmap).
     let task = prompt.filter(|p| p != "-" && !p.trim().is_empty());
@@ -3129,7 +3280,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         primary: chain,
         reviewer: _,
         reason,
-    } = resolve_chain(cli, &eng, &health)?;
+    } = resolve_chain_for_execution(cli, &eng, &health).await?;
     let primary = chain
         .first()
         .ok_or_else(|| anyhow::anyhow!("no model resolved"))?
@@ -3152,17 +3303,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // while the subscription's rolling window has headroom and transparently
     // falls through to the metered path when the window is exhausted.
     let routing = RoutingContext::load(&eng.cfg)?;
-    let provider_cfg = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no real provider is configured for model '{primary}' — routing would fall through to \
-                 the {host} placeholder and fail. Configure a provider that serves it (e.g. in \
-                 ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass \
-                 `-m <backed-model>`.",
+    let provider_cfg = match routing.real_provider_for_model(&eng.cfg, &primary) {
+        Some(provider) => provider,
+        None => {
+            let local_hint = format!(
+                "no real provider is configured for model '{primary}' — routing would fall through to the {host} placeholder and fail. Configure a provider that serves it (e.g. in ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
                 host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-            )
-        })?;
+            );
+            let diagnostic =
+                enrich_no_provider_diagnostic(&engine_socket_path(), &primary, local_hint).await;
+            anyhow::bail!(diagnostic);
+        }
+    };
 
     // L2: --dry-run short-circuits before reading stdin and any paid confirm.
     if cli.dry_run {
@@ -4879,7 +5031,7 @@ pub(crate) async fn agentic_turn(
         primary: chain,
         reviewer: _,
         reason,
-    } = resolve_chain(cli, &eng, &health)?;
+    } = resolve_chain_for_execution(cli, &eng, &health).await?;
     let primary = chain
         .first()
         .cloned()
@@ -4897,17 +5049,18 @@ pub(crate) async fn agentic_turn(
     // transparently demoted to its metered sibling, so this guard only fires
     // when NEITHER path has a real backing provider.
     let routing = RoutingContext::load(&eng.cfg)?;
-    let routed_provider = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no real provider is configured for model '{primary}' — it would fall through to the \
-                 {host} placeholder and fail. Configure a provider that serves it, pin a backed model \
-                 via [profile].primary_model, or pass `-m <backed-model>`.",
+    let routed_provider = match routing.real_provider_for_model(&eng.cfg, &primary).cloned() {
+        Some(provider) => provider,
+        None => {
+            let local_hint = format!(
+                "no real provider is configured for model '{primary}' — it would fall through to the {host} placeholder and fail. Configure a provider that serves it, pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
                 host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-            )
-        })?;
+            );
+            let diagnostic =
+                enrich_no_provider_diagnostic(&engine_socket_path(), &primary, local_hint).await;
+            anyhow::bail!(diagnostic);
+        }
+    };
 
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
@@ -10514,6 +10667,39 @@ mod subscription_utilization_render_tests {
 
 #[cfg(test)]
 mod model_selection_tests {
+    #[test]
+    fn render_quickstart_diagnostic_includes_daemon_validation_and_fields() {
+        let diagnostics = zoder_core::engine_rpc::QuickstartDiagnostics {
+            state: Some(serde_json::json!({
+                "quickstart_completed": false,
+                "model_providers": [],
+                "unassigned_channels": ["telegram.default"]
+            })),
+            fields: vec![(
+                "openai".to_string(),
+                serde_json::json!({ "fields": [{ "key": "api_key" }] }),
+            )],
+            validation: Some(serde_json::json!({
+                "kind": "errors",
+                "errors": [{ "field": "api_key", "message": "API key is required" }]
+            })),
+        };
+        let rendered = render_quickstart_diagnostic("local hint", &diagnostics);
+        assert!(rendered.contains("local hint"));
+        assert!(rendered.contains("quickstart_completed=false"));
+        assert!(rendered.contains("api_key: API key is required"));
+        assert!(rendered.contains("daemon quickstart fields (openai): api_key"));
+    }
+
+    #[test]
+    fn render_quickstart_diagnostic_preserves_local_hint_without_daemon_content() {
+        let diagnostics = zoder_core::engine_rpc::QuickstartDiagnostics::default();
+        assert_eq!(
+            render_quickstart_diagnostic("local hint", &diagnostics),
+            "local hint"
+        );
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use zoder_core::Auth as ProviderAuth;

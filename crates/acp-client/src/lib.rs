@@ -1045,6 +1045,225 @@ pub async fn cancel_session(
     }
 }
 
+/// Read-only snapshot of zeroclaw's Quickstart diagnostic surface.
+///
+/// The daemon owns the schema and the exact contents of these values. Keep
+/// them as JSON rather than mirroring zeroclaw's rapidly-growing structs so an
+/// older or newer daemon remains a useful diagnostic source. The CLI renders
+/// only non-secret summary fields before showing this to an operator.
+#[derive(Debug, Clone, Default)]
+pub struct QuickstartDiagnostics {
+    /// Result of `quickstart/state`, when the daemon implements it.
+    pub state: Option<Value>,
+    /// Results of `quickstart/fields`, keyed by the requested provider type.
+    pub fields: Vec<(String, Value)>,
+    /// Result of `quickstart/validate`, when the daemon implements it.
+    pub validation: Option<Value>,
+}
+
+impl QuickstartDiagnostics {
+    /// Whether the daemon returned anything that can improve a local error.
+    #[must_use]
+    pub fn has_content(&self) -> bool {
+        self.state.is_some() || !self.fields.is_empty() || self.validation.is_some()
+    }
+}
+
+/// Maximum time spent asking the daemon for best-effort Quickstart data.
+/// Diagnostics must never make a failed route feel hung.
+const QUICKSTART_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Fetch zeroclaw's read-only Quickstart diagnostics over the daemon socket.
+///
+/// This deliberately does not call `quickstart/apply` (or any other mutating
+/// method). Each Quickstart method is optional so zoder can talk to older
+/// daemons: an unsupported method, malformed response, or individual handler
+/// error is ignored and the remaining methods are still attempted. A socket
+/// or handshake failure is returned so callers can retain their existing local
+/// hint unchanged.
+pub async fn fetch_quickstart_diagnostics(
+    socket: &Path,
+    model: &str,
+) -> anyhow::Result<QuickstartDiagnostics> {
+    let exchange = async {
+        let conn = connect_transport(&EngineTransport::UnixSocket(socket.to_path_buf())).await?;
+        let mut reader = BufReader::new(conn.reader);
+        let mut writer = conn.writer;
+
+        write_frame(
+            &mut writer,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "zoder-quickstart-init",
+                "method": "initialize",
+                "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+            }),
+        )
+        .await?;
+        read_result(&mut reader, "zoder-quickstart-init").await?;
+
+        let state = quickstart_request(
+            &mut reader,
+            &mut writer,
+            "state",
+            "quickstart/state",
+            json!({}),
+        )
+        .await;
+
+        // The provider picker is the part of Quickstart that most directly
+        // explains a zoder "no runnable provider" error. Ask for the daemon's
+        // own field map for every advertised provider type, while retaining a
+        // useful probe for older daemons that return state without the picker
+        // metadata.
+        let provider_types = state
+            .as_ref()
+            .and_then(|value| value.get("model_provider_types"))
+            .and_then(Value::as_array)
+            .map(|types| {
+                types
+                    .iter()
+                    .filter_map(|entry| entry.get("kind").and_then(Value::as_str))
+                    .filter(|kind| !kind.trim().is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let provider_types = if provider_types.is_empty() {
+            vec!["openai".to_string()]
+        } else {
+            provider_types
+        };
+        let mut fields = Vec::new();
+        for (index, provider_type) in provider_types.into_iter().enumerate() {
+            // A malicious/new daemon must not turn a diagnostic path into an
+            // unbounded request storm. The first eight provider types cover
+            // the useful field breakdown while keeping the request bounded.
+            if index >= 8 {
+                break;
+            }
+            let field_key = provider_type.clone();
+            if let Some(result) = quickstart_request(
+                &mut reader,
+                &mut writer,
+                &format!("fields-{index}"),
+                "quickstart/fields",
+                json!({ "section": "model_provider", "type_key": provider_type }),
+            )
+            .await
+            {
+                fields.push((field_key, result));
+            }
+        }
+
+        // `quickstart/validate` accepts a BuilderSubmission rather than a
+        // "validate current config" request. Send a deliberately read-only,
+        // daemon-derived proposal so validation errors can expose the exact
+        // missing/invalid field names from the daemon's schema. Existing
+        // profiles are selected from state when possible; no credentials are
+        // sent and the daemon never persists this submission.
+        let validation = quickstart_request(
+            &mut reader,
+            &mut writer,
+            "validate",
+            "quickstart/validate",
+            quickstart_validation_params(state.as_ref(), model),
+        )
+        .await;
+
+        Ok::<QuickstartDiagnostics, anyhow::Error>(QuickstartDiagnostics {
+            state,
+            fields,
+            validation,
+        })
+    };
+
+    tokio::time::timeout(QUICKSTART_TIMEOUT, exchange)
+        .await
+        .map_err(|_| anyhow!("quickstart diagnostics timed out after {QUICKSTART_TIMEOUT:?}"))?
+}
+
+/// Send one optional Quickstart request. `None` means unsupported method,
+/// invalid params on an older daemon, or a handler error; callers continue
+/// with the other read-only probes.
+async fn quickstart_request(
+    reader: &mut BufReader<TransportReader>,
+    writer: &mut TransportWriter,
+    id_suffix: &str,
+    method: &str,
+    params: Value,
+) -> Option<Value> {
+    let id = format!("zoder-quickstart-{id_suffix}");
+    write_frame(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await
+    .ok()?;
+    read_result(reader, &id).await.ok()
+}
+
+/// Build a valid, non-mutating Quickstart validation proposal. The daemon
+/// validates it against a clone of its current config; no apply call follows.
+fn quickstart_validation_params(state: Option<&Value>, model: &str) -> Value {
+    let provider_type = state
+        .and_then(|value| value.get("model_provider_types"))
+        .and_then(Value::as_array)
+        .and_then(|types| types.first())
+        .and_then(|entry| entry.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("openai");
+    let risk = state
+        .and_then(|value| value.get("risk_profiles"))
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("balanced");
+    let runtime = state
+        .and_then(|value| value.get("runtime_profiles"))
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            state
+                .and_then(|value| value.get("default_runtime_profile"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unbounded");
+    json!({
+        "submission": {
+            "model_provider": {
+                "mode": "fresh",
+                "value": {
+                    "provider_type": provider_type,
+                    "alias": "zoder-diagnostic",
+                    "model": model,
+                    "fields": {}
+                }
+            },
+            "risk_profile": { "mode": "existing", "value": risk },
+            "runtime_profile": { "mode": "existing", "value": runtime },
+            "memory": { "mode": "fresh", "value": "sqlite" },
+            "channels": [],
+            "peer_groups": [],
+            "agent": {
+                "name": "zoder-diagnostic",
+                "system_prompt": "",
+                "personality_file": null,
+                "personality_files": []
+            }
+        }
+    })
+}
 /// Create a fresh engine session bound to `cwd` and return its id (without
 /// prompting). Used by `transfer` to hand off a resumable thread.
 pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow::Result<String> {
@@ -3695,10 +3914,125 @@ mod tests {
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
 
-    // -----------------------------------------------------------------
-    // PROJECT-INSTRUCTIONS SLICE — prompt composition regression guard.
-    //
-    // These tests pin the contract `compose_session_prompt` exposes
+    #[tokio::test]
+    async fn quickstart_diagnostics_calls_read_only_methods_and_surfaces_content() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("quickstart.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "initialize" => json!({ "protocol_version": 1 }),
+                    "quickstart/state" => json!({
+                        "quickstart_completed": false,
+                        "agents": [],
+                        "model_providers": [],
+                        "model_provider_types": [{ "kind": "openai" }],
+                        "unassigned_channels": ["telegram.default"]
+                    }),
+                    "quickstart/fields" => json!({
+                        "fields": [{ "key": "api_key" }, { "key": "model" }]
+                    }),
+                    "quickstart/validate" => json!({
+                        "kind": "errors",
+                        "errors": [{ "field": "api_key", "message": "API key is required" }]
+                    }),
+                    other => panic!("unexpected method: {other}"),
+                };
+                let mut response = serde_json::to_string(&json!({
+                    "jsonrpc": "2.0", "id": id, "result": result
+                }))
+                .unwrap();
+                response.push('\n');
+                write.write_all(response.as_bytes()).await.unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+
+        let diagnostics = fetch_quickstart_diagnostics(&socket, "openai/gpt-4o")
+            .await
+            .unwrap();
+        assert!(diagnostics.has_content());
+        assert_eq!(
+            diagnostics.state.as_ref().unwrap()["quickstart_completed"],
+            false
+        );
+        assert_eq!(diagnostics.fields[0].0, "openai");
+        assert_eq!(diagnostics.validation.as_ref().unwrap()["kind"], "errors");
+        drop(diagnostics);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quickstart_diagnostics_falls_back_when_socket_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = fetch_quickstart_diagnostics(&dir.path().join("missing.sock"), "model")
+            .await
+            .expect_err("unreachable daemon must remain a recoverable diagnostic error");
+        assert!(err.to_string().contains("connecting to engine"));
+    }
+
+    #[tokio::test]
+    async fn quickstart_diagnostics_falls_back_when_methods_are_unsupported() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let response = if method == "initialize" {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "protocol_version": 1 }
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": { "code": -32601, "message": "method not found" }
+                    })
+                };
+                let mut line = serde_json::to_string(&response).unwrap();
+                line.push('\n');
+                write.write_all(line.as_bytes()).await.unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+
+        let diagnostics = fetch_quickstart_diagnostics(&socket, "model")
+            .await
+            .unwrap();
+        assert!(!diagnostics.has_content());
+        server.abort();
+    }
+
     // to both `drive` (zeroclaw wire shape) and `drive_goose_io`
     // (goose ACP wire shape):
     //
