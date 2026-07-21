@@ -3591,6 +3591,14 @@ fn update_loop_streaks(
 /// blocking findings, or `max_iters` is reached, or progress stalls. Every
 /// author turn and reviewer pass is cost-tracked in the ledger.
 ///
+/// Architectural policy: ZeroClaw's SOP engine is the model for any future
+/// repeatable multi-step orchestration primitive. Its native scoped tools,
+/// output schemas, routing, and failure policies (`Retry { max }` / `Goto
+/// { step }`) should be used instead of adding new options or phases to this
+/// command. `loop` itself remains unchanged for compatibility and its
+/// zoder-specific routing, cost accounting, reviewer-chain policy,
+/// check-subprocess safety, and diff-substance anti-gaming value.
+///
 /// `loop_timeout_secs` is the per-phase wall-clock watchdog budget (default
 /// [`DEFAULT_LOOP_TIMEOUT_SECS`], configurable via `--loop-timeout`): each
 /// author/check/review child is hard-capped at this many seconds. On expiry
