@@ -788,34 +788,28 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 /// string comparison (the `rescue` / `exec` commands test `== "timeout"`).
 ///
 /// Recognized values:
-///   * `completed`   — engine explicitly signalled `turn_complete` /
-///                     `stopReason: end_turn` (i.e. reached the terminal
-///                     marker), OR the engine closed the socket after
-///                     streaming text AND every in-flight tool received
-///                     its `tool_result` (clean partial). The streamed
-///                     `content` is the final text.
-///   * `timeout`     — wall-clock budget elapsed. The `content` and
-///                     `tool_calls` reflect whatever had streamed before
-///                     the deadline (partial work preserved).
+///   * `completed` — engine explicitly signalled `turn_complete` /
+///     `stopReason: end_turn` (i.e. reached the terminal marker), OR the
+///     engine closed the socket after streaming text AND every
+///     in-flight tool received its `tool_result` (clean partial). The
+///     streamed `content` is the final text.
+///   * `timeout` — wall-clock budget elapsed. The `content` and
+///     `tool_calls` reflect whatever had streamed before the deadline
+///     (partial work preserved).
 ///   * `interrupted` — engine closed the socket (EOF) before the
-///                     terminal marker AND at least one `tool_call` was
-///                     emitted without a matching `tool_result` (the
-///                     tool hung or was severed mid-execution). Also
-///                     reported when a `tool_call` was emitted with no
-///                     text and the engine vanished — distinct from
-///                     `completed` because the tool's output is
-///                     unobserved. `pending_tool_results` is tracked
-///                     per tool name so a single unresolved tool among
-///                     many is sufficient to flag the turn as
-///                     `interrupted` (no false-zero race on stray or
-///                     duplicate `tool_result` frames).
-///   * `failed`      — empty mid-turn disconnect (engine closed without
-///                     emitting any text OR tool calls) OR a JSON-RPC
-///                     error response on a critical RPC, surfaced as
-///                     `Err` by the driver. Reachable only when no
-///                     `tool_call` was streamed; any `tool_call` on a
-///                     closed-socket turn moves the outcome to
-///                     `interrupted` instead.
+///     terminal marker AND at least one `tool_call` was emitted without
+///     a matching `tool_result` (the tool hung or was severed
+///     mid-execution). Also reported when a `tool_call` was emitted
+///     with no text and the engine vanished — distinct from `completed`
+///     because the tool's output is unobserved. `pending_tool_results`
+///     is tracked per tool name so a single unresolved tool among many
+///     is sufficient to flag the turn as `interrupted` (no false-zero
+///     race on stray or duplicate `tool_result` frames).
+///   * `failed` — empty mid-turn disconnect (engine closed without
+///     emitting any text OR tool calls) OR a JSON-RPC error response on
+///     a critical RPC, surfaced as `Err` by the driver. Reachable only
+///     when no `tool_call` was streamed; any `tool_call` on a
+///     closed-socket turn moves the outcome to `interrupted` instead.
 ///
 /// State matrix (verified at the EOF branch of `drive`):
 ///
