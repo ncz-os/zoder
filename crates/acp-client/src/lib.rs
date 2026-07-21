@@ -1045,6 +1045,43 @@ pub async fn cancel_session(
     }
 }
 
+/// Call one JSON-RPC method on the local zeroclaw daemon and return its result.
+///
+/// This is the small request/response seam used by non-agentic integrations
+/// (for example the MCP server). Each call opens a fresh Unix-socket
+/// connection, performs the daemon's required `initialize` handshake, then
+/// waits for the response to `method`. Notifications and unrelated responses
+/// are handled by [`read_result`], just like the agentic driver handshake.
+pub async fn call_rpc(socket: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
+    let conn = connect_transport(&EngineTransport::UnixSocket(socket.to_path_buf())).await?;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
+
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-init",
+            "method": "initialize",
+            "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+        }),
+    )
+    .await?;
+    read_result(&mut reader, "rpc-init").await?;
+
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-call",
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await?;
+    read_result(&mut reader, "rpc-call").await
+}
+
 /// Create a fresh engine session bound to `cwd` and return its id (without
 /// prompting). Used by `transfer` to hand off a resumable thread.
 pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow::Result<String> {
