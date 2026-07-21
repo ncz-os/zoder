@@ -1,15 +1,16 @@
-//! zoder MCP server — exposes zoder's smart router as a single composable
-//! MCP tool (`zoder_route`).  Reads the same configuration, corpus and health
-//! store that the CLI does so the routing decision is identical.
+//! zoder MCP server — exposes zoder's smart router and SOP lifecycle as
+//! composable MCP tools. Reads the same configuration, corpus and health store
+//! that the CLI does so the routing decision is identical; SOP tools proxy the
+//! local zeroclaw daemon's JSON-RPC surface.
 //!
 //! # Protocol
 //!
 //! The server speaks the Model Context Protocol over stdio using JSON-RPC 2.0
-//! framing.  It implements three MCP methods:
+//! framing. It implements three MCP methods:
 //!
 //! * `initialize` — server info + capabilities
-//! * `tools/list` — one tool: `zoder_route`
-//! * `tools/call`  — actually runs the router and returns a real `Route`
+//! * `tools/list` — routing and SOP lifecycle tools
+//! * `tools/call`  — runs a route or forwards an SOP operation
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +20,28 @@ use zoder_core::config::Config;
 use zoder_core::corpus::Corpus;
 use zoder_core::health::HealthStore;
 use zoder_core::router::{Route, Router, Tier};
+
+const SOP_LIST: &str = "sop_list";
+const SOP_EXECUTE: &str = "sop_execute";
+const SOP_ADVANCE: &str = "sop_advance";
+const SOP_STATUS: &str = "sop_status";
+
+/// Arguments accepted by the MCP SOP wrappers. The fields are deliberately
+/// optional because each wrapper forwards only the fields understood by its
+/// zeroclaw RPC method.
+#[derive(Debug, Deserialize, Default)]
+pub struct SopToolArguments {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub decision: Option<Value>,
+    #[serde(default)]
+    pub sop_name: Option<String>,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JSON-RPC 2.0 wire types
@@ -136,7 +159,7 @@ pub struct Tool {
 #[derive(Debug, Deserialize)]
 pub struct ToolCallParams {
     pub name: String,
-    pub arguments: Option<ToolCallArguments>,
+    pub arguments: Option<Value>,
 }
 
 /// Arguments passed to a tool call.
@@ -173,13 +196,13 @@ pub struct ContentBlock {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolved configuration + corpus + health — the minimal context the router
-/// needs.  Built once per MCP-server process so subsequent tool calls are
-/// cheap (the router is created per-call, but the heavy I/O for config/corpus
-/// only happens once).
+/// needs. Built once per MCP-server process so subsequent tool calls are cheap;
+/// SOP calls use the daemon socket captured at startup.
 pub struct RoutingContext {
     cfg: Config,
     corpus: Corpus,
     health: HealthStore,
+    daemon_socket: std::path::PathBuf,
 }
 
 impl RoutingContext {
@@ -188,10 +211,12 @@ impl RoutingContext {
         let cfg = Config::load()?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
         let health = HealthStore::load(&cfg.health_path);
+        let daemon_socket = daemon_socket_path();
         Ok(Self {
             cfg,
             corpus,
             health,
+            daemon_socket,
         })
     }
 
@@ -205,6 +230,24 @@ impl RoutingContext {
         router.select(tier)
     }
 
+    /// Forward an SOP operation to the running zeroclaw daemon. The daemon
+    /// owns SOP state, so this server never constructs a second local engine.
+    pub fn sop_call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let socket = self.daemon_socket.clone();
+        let method = method.to_string();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| {
+                    runtime.block_on(zoder_core::engine_rpc::call_rpc(&socket, &method, params))
+                })
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("SOP RPC worker thread panicked"))?
+    }
+
     /// Compute the set of free model IDs that have a real (non-placeholder)
     /// provider configured — mirrors `backed_free_model_ids` in main.rs.
     fn backed_free_model_ids(&self) -> HashSet<String> {
@@ -214,6 +257,31 @@ impl RoutingContext {
             .map(|m| m.id.clone())
             .collect()
     }
+}
+
+fn daemon_socket_path() -> std::path::PathBuf {
+    if let Ok(socket) = std::env::var("ZEROCLAW_SOCKET") {
+        if !socket.trim().is_empty() {
+            return socket.into();
+        }
+    }
+    let home = std::env::var("ZEROCLAW_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(|dir| {
+            dir.strip_prefix("~/")
+                .map(|rest| {
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(dir))
+        })
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| std::path::PathBuf::from(home).join(".zoder"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".zoder"));
+    home.join("data").join("daemon.sock")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +305,18 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
             continue;
         }
 
+        let raw = serde_json::from_str::<Value>(&line).ok();
+        if raw
+            .as_ref()
+            .and_then(|raw| raw.get("method"))
+            .and_then(Value::as_str)
+            == Some("notifications/initialized")
+            && raw.as_ref().is_some_and(|raw| raw.get("id").is_none())
+        {
+            initialized = true;
+            continue;
+        }
+
         let msg = match serde_json::from_str::<RpcMessage>(&line) {
             Ok(m) => m,
             Err(e) => {
@@ -257,6 +337,13 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
                 method,
                 params,
             } => {
+                if method == "notifications/initialized" {
+                    // Some serde untagged-enum versions accept a notification
+                    // as the request variant when `id` is omitted. Treat the
+                    // method by name as the protocol notification either way.
+                    initialized = true;
+                    continue;
+                }
                 if jsonrpc != "2.0" {
                     RpcMessage::error_response(id.clone(), -32600, "invalid JSON-RPC version")
                 } else if !initialized
@@ -358,115 +445,230 @@ fn dispatch_request(
                     );
                 }
             };
+            let arguments = args.arguments.unwrap_or(Value::Object(Default::default()));
 
-            if args.name != "zoder_route" {
-                return RpcMessage::error_response(
-                    id.clone(),
-                    -32601,
-                    &format!("unknown tool: {}", args.name),
-                );
-            }
+            match args.name.as_str() {
+                "zoder_route" => {
+                    let arguments = match serde_json::from_value::<ToolCallArguments>(arguments) {
+                        Ok(arguments) => arguments,
+                        Err(_) => {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "invalid zoder_route arguments",
+                            );
+                        }
+                    };
 
-            let arguments = args.arguments.unwrap_or_else(ToolCallArguments::default);
-
-            // ── Input validation: task must be non-empty ──────────────────
-            if arguments.task.trim().is_empty() {
-                return RpcMessage::error_response(
-                    id.clone(),
-                    -32602,
-                    "task parameter is required and must be non-empty",
-                );
-            }
-
-            // Reject null bytes anywhere in the string (defense-in-depth
-            // against C-style string termination / injection vectors).
-            if arguments.task.contains('\0') {
-                return RpcMessage::error_response(
-                    id.clone(),
-                    -32602,
-                    "task parameter contains invalid characters",
-                );
-            }
-
-            // Max length check for task to prevent DoS via oversized payloads.
-            const MAX_TASK_LENGTH: usize = 10_000;
-            if arguments.task.len() > MAX_TASK_LENGTH {
-                return RpcMessage::error_response(
-                    id.clone(),
-                    -32602,
-                    "task parameter exceeds maximum length",
-                );
-            }
-
-            // Max length check for tier to prevent DoS.
-            const MAX_TIER_LENGTH: usize = 64;
-            if let Some(ref tier_str) = arguments.tier {
-                if tier_str.len() > MAX_TIER_LENGTH {
-                    return RpcMessage::error_response(
-                        id.clone(),
-                        -32602,
-                        "tier parameter exceeds maximum length",
-                    );
-                }
-            }
-
-            // Parse tier: only accept known values.  Reject anything
-            // outside the explicitly allowed set so that unexpected input
-            // cannot silently alter behaviour.
-            let tier = match arguments.tier.as_deref() {
-                None | Some("") | Some("auto") => Tier::Auto,
-                Some("fast") => Tier::Fast,
-                Some("strong") | Some("codex") => Tier::Strong,
-                Some("single-pass") | Some("singlepass") | Some("single") | Some("oneshot") => {
-                    Tier::SinglePass
-                }
-                Some("grind") | Some("loop") => Tier::Grind,
-                Some(unknown) => {
-                    return RpcMessage::error_response(
-                        id.clone(),
-                        -32602,
-                        &format!(
-                            "invalid tier: '{unknown}'. Valid tiers are: auto, fast, strong, \
-                             codex, single-pass, singlepass, single, oneshot, grind, loop"
-                        ),
-                    );
-                }
-            };
-
-            match ctx.route(&arguments.task, tier) {
-                Ok(route) => {
-                    // ── Validate routing decision is non-empty ─────────────
-                    if route.primary.is_empty() || route.reason.is_empty() {
+                    if arguments.task.trim().is_empty() {
                         return RpcMessage::error_response(
                             id.clone(),
-                            -32603,
-                            "routing decision is empty — no valid model could be selected",
+                            -32602,
+                            "task parameter is required and must be non-empty",
                         );
                     }
-
-                    let result = ToolCallResult {
-                        content: vec![
-                            ContentBlock {
-                                kind: "text".to_string(),
-                                text: route.reason.clone(),
-                            },
-                            ContentBlock {
-                                kind: "text".to_string(),
-                                text: format!(
-                                    "Primary: {}\nFallbacks: {}",
-                                    route.primary,
-                                    route.fallbacks.join(", ")
+                    if arguments.task.contains('\0') {
+                        return RpcMessage::error_response(
+                            id.clone(),
+                            -32602,
+                            "task parameter contains invalid characters",
+                        );
+                    }
+                    const MAX_TASK_LENGTH: usize = 10_000;
+                    if arguments.task.len() > MAX_TASK_LENGTH {
+                        return RpcMessage::error_response(
+                            id.clone(),
+                            -32602,
+                            "task parameter exceeds maximum length",
+                        );
+                    }
+                    const MAX_TIER_LENGTH: usize = 64;
+                    if let Some(ref tier_str) = arguments.tier {
+                        if tier_str.len() > MAX_TIER_LENGTH {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "tier parameter exceeds maximum length",
+                            );
+                        }
+                    }
+                    let tier = match arguments.tier.as_deref() {
+                        None | Some("") | Some("auto") => Tier::Auto,
+                        Some("fast") => Tier::Fast,
+                        Some("strong") | Some("codex") => Tier::Strong,
+                        Some("single-pass") | Some("singlepass") | Some("single")
+                        | Some("oneshot") => Tier::SinglePass,
+                        Some("grind") | Some("loop") => Tier::Grind,
+                        Some(unknown) => {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                &format!(
+                                    "invalid tier: '{unknown}'. Valid tiers are: auto, fast, strong, \
+                                     codex, single-pass, singlepass, single, oneshot, grind, loop"
                                 ),
-                            },
-                        ],
-                        is_error: None,
+                            );
+                        }
                     };
-                    RpcMessage::success_response(id.clone(), serde_json::to_value(result).unwrap())
+
+                    match ctx.route(&arguments.task, tier) {
+                        Ok(route) => {
+                            if route.primary.is_empty() || route.reason.is_empty() {
+                                return RpcMessage::error_response(
+                                    id.clone(),
+                                    -32603,
+                                    "routing decision is empty — no valid model could be selected",
+                                );
+                            }
+                            let result = ToolCallResult {
+                                content: vec![
+                                    ContentBlock {
+                                        kind: "text".to_string(),
+                                        text: route.reason.clone(),
+                                    },
+                                    ContentBlock {
+                                        kind: "text".to_string(),
+                                        text: format!(
+                                            "Primary: {}\nFallbacks: {}",
+                                            route.primary,
+                                            route.fallbacks.join(", ")
+                                        ),
+                                    },
+                                ],
+                                is_error: None,
+                            };
+                            RpcMessage::success_response(
+                                id.clone(),
+                                serde_json::to_value(result).unwrap(),
+                            )
+                        }
+                        Err(e) => RpcMessage::error_response(
+                            id.clone(),
+                            -32603,
+                            &format!("tool execution failed: {e}"),
+                        ),
+                    }
                 }
-                Err(e) => RpcMessage::error_response(
+                SOP_LIST | SOP_EXECUTE | SOP_ADVANCE | SOP_STATUS => {
+                    let (method, rpc_params) = match args.name.as_str() {
+                        SOP_LIST => ("sops/list", serde_json::json!({})),
+                        SOP_EXECUTE => {
+                            let arguments =
+                                match serde_json::from_value::<SopToolArguments>(arguments) {
+                                    Ok(arguments) => arguments,
+                                    Err(_) => {
+                                        return RpcMessage::error_response(
+                                            id.clone(),
+                                            -32602,
+                                            "invalid sop_execute arguments",
+                                        );
+                                    }
+                                };
+                            let Some(name) = arguments.name.filter(|name| !name.trim().is_empty())
+                            else {
+                                return RpcMessage::error_response(
+                                    id.clone(),
+                                    -32602,
+                                    "name parameter is required and must be non-empty",
+                                );
+                            };
+                            (
+                                "sops/run",
+                                serde_json::json!({
+                                    "name": name,
+                                    "payload": arguments.payload,
+                                }),
+                            )
+                        }
+                        SOP_ADVANCE => {
+                            let arguments =
+                                match serde_json::from_value::<SopToolArguments>(arguments) {
+                                    Ok(arguments) => arguments,
+                                    Err(_) => {
+                                        return RpcMessage::error_response(
+                                            id.clone(),
+                                            -32602,
+                                            "invalid sop_advance arguments",
+                                        );
+                                    }
+                                };
+                            let (Some(name), Some(run_id), Some(decision)) = (
+                                arguments.name.filter(|name| !name.trim().is_empty()),
+                                arguments.run_id.filter(|run_id| !run_id.trim().is_empty()),
+                                arguments.decision,
+                            ) else {
+                                return RpcMessage::error_response(
+                                    id.clone(),
+                                    -32602,
+                                    "sop_advance requires name, run_id, and decision",
+                                );
+                            };
+                            // zeroclaw's daemon exposes checkpoint advancement as
+                            // sops/decide; keep the MCP name aligned with the
+                            // first-party sop_advance lifecycle vocabulary.
+                            (
+                                "sops/decide",
+                                serde_json::json!({
+                                    "name": name,
+                                    "run_id": run_id,
+                                    "decision": decision,
+                                }),
+                            )
+                        }
+                        SOP_STATUS => {
+                            let arguments =
+                                match serde_json::from_value::<SopToolArguments>(arguments) {
+                                    Ok(arguments) => arguments,
+                                    Err(_) => {
+                                        return RpcMessage::error_response(
+                                            id.clone(),
+                                            -32602,
+                                            "invalid sop_status arguments",
+                                        );
+                                    }
+                                };
+                            if let (Some(name), Some(run_id)) = (
+                                arguments
+                                    .sop_name
+                                    .clone()
+                                    .filter(|name| !name.trim().is_empty()),
+                                arguments.run_id.filter(|run_id| !run_id.trim().is_empty()),
+                            ) {
+                                (
+                                    "sops/run-overlay",
+                                    serde_json::json!({"name": name, "run_id": run_id}),
+                                )
+                            } else {
+                                ("sops/runs", serde_json::json!({"sop": arguments.sop_name}))
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    match ctx.sop_call(method, rpc_params) {
+                        Ok(value) => RpcMessage::success_response(
+                            id.clone(),
+                            serde_json::to_value(ToolCallResult {
+                                content: vec![ContentBlock {
+                                    kind: "text".to_string(),
+                                    text: serde_json::to_string_pretty(&value)
+                                        .unwrap_or_else(|_| value.to_string()),
+                                }],
+                                is_error: None,
+                            })
+                            .unwrap(),
+                        ),
+                        Err(e) => RpcMessage::error_response(
+                            id.clone(),
+                            -32603,
+                            &format!("{} failed: {e}", args.name),
+                        ),
+                    }
+                }
+                unknown => RpcMessage::error_response(
                     id.clone(),
-                    -32603,
-                    &format!("tool execution failed: {e}"),
+                    -32601,
+                    &format!("unknown tool: {unknown}"),
                 ),
             }
         }
@@ -480,33 +682,68 @@ fn dispatch_request(
 // Tool definitions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the list of tools exposed by this server.  Currently a single tool:
-/// `zoder_route`.
+/// Build the list of tools exposed by this server.
 fn tools_list() -> Vec<Tool> {
-    vec![Tool {
-        name: "zoder_route".to_string(),
-        description: "Route a task to the best free model using zoder's smart router. \
-                      Returns the recommended model, fallback chain, and reasoning."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The task description to route (e.g. \"fix the login bug in auth.py\")."
+    vec![
+        Tool {
+            name: "zoder_route".to_string(),
+            description: "Route a task to the best free model using zoder's smart router. Returns the recommended model, fallback chain, and reasoning.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "The task description to route." },
+                    "tier": {
+                        "type": "string",
+                        "description": "Routing tier; defaults to auto.",
+                        "enum": ["fast", "strong", "codex", "single-pass", "singlepass", "single", "oneshot", "grind", "loop", "auto"],
+                        "default": "auto"
+                    }
                 },
-                "tier": {
-                    "type": "string",
-                    "description": "Routing tier: fast (latency-first), strong (capability-first), \
-                                   single-pass (one-shot codegen), grind (iterative fix loops), or auto \
-                                   (balanced default). Defaults to \"auto\".",
-                    "enum": ["fast", "strong", "codex", "single-pass", "singlepass", "single", "oneshot", "grind", "loop", "auto"],
-                    "default": "auto"
+                "required": ["task"]
+            }),
+        },
+        Tool {
+            name: SOP_LIST.to_string(),
+            description: "List SOP definitions through the zeroclaw daemon.".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+        },
+        Tool {
+            name: SOP_EXECUTE.to_string(),
+            description: "Manually trigger an SOP by name, optionally with a JSON payload.".to_string(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "name": {"type":"string"},
+                    "payload": {"type":"string","description":"Optional JSON string."}
+                },
+                "required":["name"]
+            }),
+        },
+        Tool {
+            name: SOP_ADVANCE.to_string(),
+            description: "Advance a paused SOP checkpoint through zeroclaw's sops/decide RPC.".to_string(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "name": {"type":"string"},
+                    "run_id": {"type":"string"},
+                    "decision": {"description":"Approval decision, e.g. \"approve\" or {\"deny\":{}}."}
+                },
+                "required":["name","run_id","decision"]
+            }),
+        },
+        Tool {
+            name: SOP_STATUS.to_string(),
+            description: "List SOP runs through the zeroclaw daemon.".to_string(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "sop_name": {"type":"string","description":"Optional SOP name filter."},
+                    "run_id": {"type":"string","description":"Optional specific run id; returns its overlay."}
                 }
-            },
-            "required": ["task"]
-        }),
-    }]
+            }),
+        },
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -561,14 +798,20 @@ mod tests {
         }
     }
 
-    /// Verify that `tools_list()` returns exactly one tool with the
-    /// expected shape.
+    /// Verify that `tools_list()` includes routing and the SOP lifecycle.
     #[test]
-    fn tools_list_returns_one_tool() {
+    fn tools_list_includes_route_and_sop_tools() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "zoder_route");
-        assert!(!tools[0].description.is_empty());
+        assert_eq!(tools.len(), 5);
+        for name in [
+            "zoder_route",
+            SOP_LIST,
+            SOP_EXECUTE,
+            SOP_ADVANCE,
+            SOP_STATUS,
+        ] {
+            assert!(tools.iter().any(|tool| tool.name == name), "missing {name}");
+        }
         assert!(tools[0].input_schema["required"]
             .as_array()
             .unwrap()
@@ -636,7 +879,7 @@ mod tests {
         let result = ToolsListResult { tools };
         let json = serde_json::to_string(&result).expect("serialize");
         let parsed: Value = serde_json::from_str(&json).expect("parse back");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 5);
         assert_eq!(parsed["tools"][0]["name"], "zoder_route");
     }
 
@@ -707,12 +950,28 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 2);
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 5);
         assert_eq!(response["result"]["tools"][0]["name"], "zoder_route");
     }
 
-    /// Verify that dispatching `tools/call` with a valid task calls the
-    /// real router and returns a structured result.
+    #[test]
+    fn sop_list_tool_forwards_rpc_method() {
+        let ctx = RoutingContext::load_with_fixture();
+        let tools = tools_list();
+        let params = serde_json::json!({"name": SOP_LIST, "arguments": {}});
+        let response = dispatch_request(
+            "tools/call",
+            &Some(params),
+            &Value::Number(22.into()),
+            Some(&ctx),
+            &tools,
+        );
+        // No daemon is expected in a unit test; the important contract here is
+        // that the MCP wrapper recognizes the real SOP tool name rather than
+        // returning `unknown tool`.
+        assert_ne!(response["error"]["message"], "unknown tool: sop_list");
+    }
+
     #[test]
     fn dispatch_tools_call_returns_routing_decision() {
         let ctx = RoutingContext::load_with_fixture();
@@ -1202,6 +1461,7 @@ mod test_helpers {
                 cfg,
                 corpus,
                 health,
+                daemon_socket: std::env::temp_dir().join("zoder-mcp-server-test.sock"),
             }
         }
     }
