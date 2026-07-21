@@ -10,6 +10,7 @@ mod agentic;
 mod exec_safety;
 mod goose;
 mod jobs;
+mod sop;
 mod utilization;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
@@ -802,6 +803,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// SOP (Standard Operating Procedure) graph monitor: read-only CLI
+    /// visibility into the local zeroclaw engine's SOP graph + per-run
+    /// overlay state. Subcommands: `graph <run-id>`. Talks to the engine
+    /// over the same Unix-socket JSON-RPC surface every other engine
+    /// command uses; never mutates the run.
+    Sop {
+        #[command(subcommand)]
+        action: sop::SopCmd,
+    },
 }
 
 /// Subcommands for `zoder jobs …`. Each subcommand reuses the same
@@ -1375,6 +1385,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(Cmd::Exec { prompt }) => cmd_exec(&cli, prompt.clone()).await,
         Some(Cmd::Tui { args }) => cmd_tui(args),
+        Some(Cmd::Sop { action }) => sop::run_sop(action.clone()).await,
         None => {
             let p = cli.prompt.clone();
             cmd_exec(&cli, p).await

@@ -34,6 +34,7 @@ pub mod report;
 pub mod router;
 pub mod scenarios;
 pub mod session;
+pub mod sop_graph;
 pub mod subscription_tiers;
 pub mod update;
 pub mod utilization;
@@ -95,6 +96,10 @@ pub use scenarios::{
     resolve_active, ProviderClass, Role as ScenarioRole, RoutableCandidate, RouteScenario,
 };
 pub use session::Session;
+pub use sop_graph::{
+    fetch_sop_graph, fetch_sop_graph_report, fetch_sop_overlay, render_sop_graph_human, SopGraph,
+    SopGraphReport, SopOverlay, SopOverlayStep, SopStep,
+};
 pub use subscription_tiers::{
     load_tier_catalog, resolve_plan_windows, Confidence, ProviderTiers, ResolveSource,
     ResolvedPlan, TierCatalog, TierEntry, TierWindow, WindowProvenance, TIERS_JSON_DEFAULT,
