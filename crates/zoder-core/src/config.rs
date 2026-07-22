@@ -3989,9 +3989,8 @@ auth = { type = "env", var = "GUARD_KEY" }
             // closure returns, and the `ok-original > 0` assertion
             // below will fire with a clear tally to point the next
             // reader at the helper regression that caused it.
-            match go_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(()) => {}
-                Err(_) => return,
+            if go_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                return;
             }
 
             let mut i: u64 = 0;
@@ -4016,7 +4015,7 @@ auth = { type = "env", var = "GUARD_KEY" }
                     }
                     let _ = std::fs::rename(&backup, &swap_target);
                 }
-                i = i.wrapping_add(1);
+                i += 1;
             }
         });
 
@@ -4156,6 +4155,5 @@ auth = { type = "env", var = "GUARD_KEY" }
         // permission-flipped file); we don't fail on `err-other`
         // alone; we just want to make sure it's not masking a deeper
         // issue.
-        let _ = err_other;
     }
 }
