@@ -791,6 +791,7 @@ async fn dispatch_reviewer_for_model(
     user: &str,
     max_tokens: u32,
 ) -> Result<Completion, ReviewerError> {
+    let started = std::time::Instant::now();
     let eng = match Engine::load() {
         Ok(eng) => eng,
         Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
@@ -979,6 +980,31 @@ async fn dispatch_reviewer_for_model(
         return Err(ReviewerError::fatal(format!(
             "policy check during reviewer turn: {e}"
         )));
+    }
+
+    // MR !1 finding (issue #13 port): reviewer/panel completions feed the
+    // breaker — SUCCESS path too, not only failure. Without this, a
+    // reviewer model that always succeeds would never update the
+    // health store and the breaker signal on it would never refresh;
+    // conversely, a model that succeeded once but later degraded
+    // would not have its recent latency reflected on the next routing
+    // decision. `reconcile_policy_checked_turn` already records the
+    // FAILURE path on a policy violation; here we record the SUCCESS
+    // path. Persist under a `mutate_locked`-equivalent atomic save so
+    // concurrent panel reviewers don't lose updates (mirrors the Y-8 /
+    // C4-MH1 fix for the failure path).
+    //
+    // A returned Err from `health.save()` is non-fatal: we already
+    // emitted the result upstream, and a stale breaker signal is
+    // recoverable on the next call. The previous MR !1 shape used a
+    // bare `eprintln!` warning here, which we preserve verbatim.
+    let elapsed_ms = started.elapsed().as_millis() as f64;
+    if let Err(e) = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+        h.record_success(model, elapsed_ms);
+    }) {
+        eprintln!(
+            "zoder: warning: failed to persist reviewer health store (success for {model}): {e}"
+        );
     }
 
     Ok(Completion {
@@ -8854,6 +8880,71 @@ mod reviewer_chain_dispatch_tests {
     // end reviewer tests).
     #[allow(dead_code)]
     fn _unused_import_anchor(_: &Provider, _: &PathBuf) {}
+
+    /// **MR !1 finding (issue #13 port): reviewer SUCCESS path must
+    /// record to the health store.** The pre-port code only recorded
+    /// failure on a fallback-worthy / policy-violation arm; a clean
+    /// reviewer call left the health store stale. After this slice
+    /// `dispatch_reviewer_for_model` calls `HealthStore::mutate_locked`
+    /// with `record_success(model, elapsed_ms)` on the success path so
+    /// the routing signal on the reviewer model refreshes after each
+    /// successful review. Without this regression guard a future
+    /// refactor that drops the success-record call (a one-line
+    /// change that compiles cleanly) would silently stale the breaker
+    /// on every reviewer model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_success_records_breaker_record() {
+        use crate::HealthStore;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        // Single working model: a clean chain must produce a real
+        // completion without any fallback-worthy errors, so we can
+        // verify the SUCCESS path of `dispatch_reviewer_for_model`.
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["working-model/glm-5.1"]);
+        write_config(&home, &server.uri(), "working-model/glm-5.1");
+
+        // Pre-condition: the health store is empty for this model.
+        let health_path = home.join("health.json");
+        let pre = HealthStore::load(&health_path);
+        assert!(
+            !pre.models.contains_key("working-model/glm-5.1"),
+            "pre-condition: health store must not have a record for the reviewer model before dispatch"
+        );
+
+        let cli = dummy_cli();
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let c = result.expect("a clean reviewer call must return Ok");
+        assert_eq!(c.model, "working-model/glm-5.1");
+        assert!(c.content.contains("working reviewer ok"));
+
+        // Post-condition: the SUCCESS path recorded the breaker.
+        let post = HealthStore::load(&health_path);
+        let entry = post
+            .models
+            .get("working-model/glm-5.1")
+            .expect("reviewer success MUST record a health entry for the winning model");
+        assert_eq!(
+            entry.calls, 1,
+            "reviewer success MUST increment calls on the breaker; got entry={entry:?}"
+        );
+        assert_eq!(
+            entry.failures, 0,
+            "reviewer success MUST NOT increment failures on the breaker; got entry={entry:?}"
+        );
+        assert_eq!(
+            entry.consecutive_failures, 0,
+            "reviewer success MUST NOT touch consecutive_failures on the breaker; got entry={entry:?}"
+        );
+        assert!(
+            entry.ewma_latency_ms.is_some(),
+            "reviewer success MUST record ewma_latency_ms (a non-zero latency was measured); got entry={entry:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
