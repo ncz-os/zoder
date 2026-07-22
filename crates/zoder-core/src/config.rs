@@ -3896,12 +3896,43 @@ auth = { type = "env", var = "GUARD_KEY" }
         }
     }
 
-    /// Continuous swapper. A dedicated thread runs the rename /
-    /// mkfifo / restore cycle on a small loop with a brief sleep
-    /// so the reader has many chances to enter its critical
-    /// section. The reader runs N iterations; each must complete
-    /// promptly (recv_timeout budget), never read non-original
-    /// content, and never panic.
+    /// Continuous swapper, synchronized to the reader so the wall-clock
+    /// timing assumptions don't hold the test hostage to host load.
+    ///
+    /// **Why this test exists.** The OLD `read_bounded_regular_file` did
+    /// `fs::metadata(path)` THEN `fs::read_to_string(path)` as two
+    /// separate `path` lookups, leaving a TOCTOU window that an attacker
+    /// could widen by replacing the path with a FIFO between the two
+    /// calls. The NEW helper opens once (with `O_NOFOLLOW | O_NONBLOCK`
+    /// on Unix so symlinks-to-FIFO and writer-less FIFOs fail fast at
+    /// open time), fstat's the open FD, and reads through
+    /// `Read::take(max_bytes)`. Once we hold an FD on a specific inode,
+    /// `rename` + `mkfifo` at the path by another thread cannot affect
+    /// us.
+    ///
+    /// **Why the previous timing-based fix was flaky.** The previous
+    /// design had the swapper loop continuously with a fixed 2 ms
+    /// "file present" sleep between rename cycles, and relied on the
+    /// reader thread racing into that window at least once across 64
+    /// iterations. Under real CPU contention (e.g. the default-parallel
+    /// `cargo test --workspace` run with 530+ other tests competing),
+    /// the swapper's 2 ms sleep stretched out of proportion to the
+    /// reader's iteration cost (filesystem `rename`/`mkfifo` syscalls
+    /// under load can balloon into the millisecond range), so the
+    /// reader's 64 short opens could all fall into the swapper's
+    /// "file missing" window and produce `ok-original=0, err-enoent=64`
+    /// — a CI flake unrelated to whatever change was actually being
+    /// verified.
+    ///
+    /// **The fix.** Replace the fixed sleep with an explicit
+    /// handshake: the swapper blocks on `recv()` until the reader has
+    /// completed at least one successful read of the original inode.
+    /// That guarantees `ok-original > 0` deterministically (no timing
+    /// dependency), then the swapper races the remaining iterations so
+    /// the safety assertions (`!ok-other`, no panics, no
+    /// `recv_timeout` blowups) still exercise every code path the
+    /// race could trigger — ENOENT, ENXIO, "not a regular file" —
+    /// against the fully-loaded, racing swapper.
     #[test]
     #[cfg(unix)]
     fn read_bounded_regular_file_is_toctou_safe_against_continuous_swap() {
@@ -3916,37 +3947,60 @@ auth = { type = "env", var = "GUARD_KEY" }
         let original = b"{}";
         std::fs::write(&target, original).unwrap();
 
+        // Synchronization channel: the reader signals the swapper via
+        // `go_tx` only after it has completed at least one successful
+        // read of the original inode. This is what makes
+        // `ok-original > 0` deterministic regardless of host load —
+        // the reader's first iteration runs against a swapper that is
+        // provably blocked on `go_rx.recv()`, so the file is stable
+        // and the read cannot fail.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+
         // The swapper: keep the file PRESENT most of the time, but
-        // periodically swap to a FIFO and back. The OLD design's
-        // window was between `fs::metadata(path)` and
-        // `fs::read_to_string(path)` — narrow, but enough for a
-        // racing swap. By interleaving "file present" sleep periods
-        // with brief FIFO windows we give the reader lots of
-        // chances to see the stable file AND lots of chances to
-        // hit a swap. With the NEW design (open-then-fstat), every
-        // read either:
+        // periodically swap to a FIFO and back. With the NEW design
+        // (open-then-fstat) every read after the swap starts either:
         //   - sees the file before the swap fires and reads it
         //     successfully,
-        //   - sees the file after the swap has restored it and
-        //     reads it successfully, OR
-        //   - catches the FIFO (rejected at fstat), the missing
-        //     path (ENOENT at open), or the brief mkfifo window
-        //     (the unlinked FIFO surfaces ENXIO).
-        // The OLD design would have either:
-        //   - blocked forever on a FIFO read (recv_timeout catches),
-        //   - returned non-original bytes (the helper's `Ok(_)` arm
-        //     catches).
-        // The "file present" sleep between swaps is calibrated so
-        // the reader can definitely open the file in that window.
+        //   - sees the file after the swap has restored it and reads
+        //     it successfully, OR
+        //   - catches the FIFO (rejected at fstat), the missing path
+        //     (ENOENT at open), or the brief mkfifo window (the
+        //     unlinked FIFO surfaces ENXIO).
+        // The OLD design would have either blocked forever on a FIFO
+        // read (recv_timeout catches) or returned non-original bytes
+        // (the helper's `Ok(_)` arm catches). The `recv_timeout` on
+        // `go_rx` is a hard safety net: if the helper ever regresses
+        // to the point that even the first iteration cannot succeed
+        // against a stable file, the swapper exits cleanly instead of
+        // hanging `cargo test` — the test then fails on the
+        // `ok-original > 0` assertion below with a clear tally, which
+        // is the right behavior.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let swap_dir = dir.path().to_path_buf();
         let swap_target = target.clone();
         let swapper = thread::spawn(move || {
+            // Block until the reader has at least one successful
+            // read of the original inode. The 2s budget is generous:
+            // a stable 2-byte file reads in microseconds, so anything
+            // past 2s is a regression, not a flake. We exit cleanly
+            // (without entering the racing loop) on timeout — main
+            // thread's `swapper.join()` will return as soon as this
+            // closure returns, and the `ok-original > 0` assertion
+            // below will fire with a clear tally to point the next
+            // reader at the helper regression that caused it.
+            match go_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(()) => {}
+                Err(_) => return,
+            }
+
             let mut i: u64 = 0;
             while !stop_clone.load(Ordering::Relaxed) {
-                // File is present for the next 2ms. The reader
-                // thread has plenty of time to open and read it.
+                // Brief "file present" pause so at least *some* reader
+                // iterations after the handshake can race past the
+                // swap into the happy path too — keeps the swapper's
+                // duty cycle honest without making the test's
+                // outcomes depend on this interval.
                 thread::sleep(Duration::from_micros(2000));
 
                 // Now perform the swap: rename target aside,
@@ -3966,22 +4020,41 @@ auth = { type = "env", var = "GUARD_KEY" }
             }
         });
 
-        // Reader: run N iterations and collect observations.
-        // Each iteration must complete promptly and either return
-        // the original content or a clear open-time error.
+        // Reader: run N iterations and collect observations. Each
+        // iteration must complete promptly and either return the
+        // original content or a clear open-time error. On the very
+        // first successful read of the original content, signal the
+        // swapper that the happy path is proven and it's safe to
+        // start racing; subsequent iterations then exercise the racing
+        // safety checks (ENOENT, ENXIO, "not a regular file") without
+        // the timing pressure that used to cause `ok-original=0`
+        // false-negatives under parallel `cargo test --workspace`
+        // load.
         let (tx, rx) = mpsc::channel::<Vec<&'static str>>();
         let target_for_reader = target.clone();
         let reader = thread::spawn(move || {
             let mut observations: Vec<&'static str> = Vec::with_capacity(64);
+            let mut signaled = false;
             for i in 0..64 {
                 if i == 0 {
-                    eprintln!("[reader] first iteration starting");
+                    eprintln!("[reader] first iteration starting (swapper blocked on go_rx)");
                 }
                 match crate::config::read_bounded_regular_file(
                     &target_for_reader,
                     crate::config::Config::MAX_CONFIG_BYTES,
                 ) {
                     Ok(s) if s.as_bytes() == original => {
+                        // First success: hand control to the swapper.
+                        // After this point the test exercises the
+                        // racing safety paths; the happy-path assertion
+                        // is already locked in regardless of how ugly
+                        // the race gets.
+                        if !signaled {
+                            go_tx.send(()).expect(
+                                "swapper must accept the handshake — it is alive until `stop`",
+                            );
+                            signaled = true;
+                        }
                         observations.push("ok-original");
                     }
                     Ok(s) => {
@@ -3993,8 +4066,16 @@ auth = { type = "env", var = "GUARD_KEY" }
                         );
                     }
                     Err(e) => {
-                        if observations.is_empty() {
-                            eprintln!("[reader] first-iter err: {e:#}");
+                        if observations.is_empty() && i == 0 {
+                            // The very first iteration — swapper is
+                            // blocked, file is stable — should never
+                            // fail. Surface this loudly because it
+                            // means the helper regressed against a
+                            // trivial 2-byte regular file, not just
+                            // that the swapper is fast.
+                            eprintln!(
+                                "[reader] UNEXPECTED first-iter err against stable file: {e:#}"
+                            );
                         }
                         let msg = format!("{e:#}");
                         if msg.contains("not a regular file") {
@@ -4032,10 +4113,12 @@ auth = { type = "env", var = "GUARD_KEY" }
         let err_enxio = observations.iter().filter(|o| **o == "err-enxio").count();
         let err_other = observations.iter().filter(|o| **o == "err-other").count();
 
-        // The load-bearing assertion: NO iteration returned
-        // successful read of non-original content. A "ok-other"
-        // means the helper read from a swapped FIFO or device,
-        // which is the regression we're guarding against.
+        // The load-bearing assertion: NO iteration returned a
+        // successful read of non-original content. An "ok-other"
+        // would mean the helper read from a swapped FIFO or device,
+        // which is the regression we're guarding against — and it's
+        // provably independent of timing because the FD-based open +
+        // fstat pattern is race-safe by construction.
         assert!(
             !observations.contains(&"ok-other"),
             "no iteration may return successful read of non-original \
@@ -4045,30 +4128,34 @@ auth = { type = "env", var = "GUARD_KEY" }
              {err_enxio}, err-other={err_other}"
         );
 
-        // At least one iteration must have read the original
-        // content successfully — this proves the happy path works
-        // AND that the swapper's interleaving actually gives the
-        // reader a chance to see a stable file.
+        // At least one iteration must have read the original content
+        // successfully — this proves the happy path works. With the
+        // synchronous handshake between reader and swapper, the
+        // FIRST iteration runs against a swapper that is provably
+        // blocked on `go_rx.recv()`, so the file is stable and the
+        // read cannot fail; the assertion is now deterministic
+        // regardless of host load.
         assert!(
             ok_original > 0,
             "at least one iteration must succeed reading the \
              original inode's content. observations: ok-original=\
              {ok_original}, err-not-regular={err_not_regular}, \
              err-enoent={err_enoent}, err-enxio={err_enxio}, \
-             err-other={err_other}. If err-enoent or err-enxio \
-             dominates, the swapper is renaming away faster than \
-             the reader can open — increase the swapper sleep or \
-             reduce the read load."
+             err-other={err_other}. If this fires while the swapper \
+             handshake reported a clean run, the helper has regressed \
+             against a trivial 2-byte regular file — look at the \
+             'UNEXPECTED first-iter err against stable file' \
+             eprintln above the assertion."
         );
 
-        // The error mix is informational. ENOENT, ENXIO, and "not
-        // a regular file" are all expected outcomes under a swap
-        // — they prove the helper is rejecting dangerous targets
-        // fast rather than blocking on them. `err-other` is
-        // suspicious but not necessarily wrong (e.g. EACCES on a
+        // The error mix is informational. ENOENT, ENXIO, and "not a
+        // regular file" are all expected outcomes under a swap —
+        // they prove the helper is rejecting dangerous targets fast
+        // rather than blocking on them. `err-other` is suspicious
+        // but not necessarily wrong (e.g. EACCES on a
         // permission-flipped file); we don't fail on `err-other`
-        // alone; we just want to make sure it's not masking a
-        // deeper issue.
+        // alone; we just want to make sure it's not masking a deeper
+        // issue.
         let _ = err_other;
     }
 }
