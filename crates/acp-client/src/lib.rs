@@ -69,6 +69,21 @@ use tokio::process::Child;
 /// deadline).
 pub(crate) const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Wall-clock budget for the per-RPC setup round-trips (`initialize`,
+/// `session/new`, `session/configure`) issued before `session/prompt`.
+///
+/// The agentic driver already enforces a turn-wide `opts.timeout` and the
+/// streaming loop after `session/prompt` is bounded by `deadline_at`.
+/// Without this per-RPC budget, a daemon that accepts the socket but
+/// never answers one specific `id` hangs the entire `agentic_turn` at
+/// the OS-level TCP read for as long as the kernel holds the FD open
+/// (often minutes — `AF_UNIX` reads do not honor any application-level
+/// timeout). 30s is generous (a healthy daemon answers `initialize`
+/// in milliseconds) but well below any operator-facing deadline so a
+/// hung daemon surfaces as `setup timed out`, not as a "ghost agent"
+/// left running while the caller waits.
+pub(crate) const SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Cumulative byte cap on the streamed `content` accumulator (and
 /// its mirrored on_event/Text sink) inside a single turn of
 /// `drive` / `drive_goose_io`. The per-frame
@@ -847,6 +862,173 @@ impl AgentRun {
     }
 }
 
+/// Wall-clock budget the `drive()` loop grants the engine to ACK a
+/// `session/cancel` after the author-phase deadline fires. The same
+/// `SETTLE_BUDGET` is used by the caller-side `cancel_session` helper
+/// for symmetry, and is intentionally small — long enough to receive
+/// the final `turn_complete` notification, short enough that a hung
+/// daemon cannot stall the loop indefinitely.
+pub(crate) const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Drain the engine socket after `drive()`'s outer deadline fires,
+/// parsing any final `turn_complete` / text that raced the deadline,
+/// recording late tool-result frames so the EOF / timeout
+/// classification stays consistent with the rest of the loop, and
+/// returning a settled `outcome` string.
+///
+/// Why this exists: the pre-fix `drive()` did `read_line(...)` once
+/// after sending `session/cancel` and then unconditionally broke with
+/// `outcome == "timeout"`. A turn that finished right at the budget
+/// got mislabeled (its final text / `turn_complete` arrived on the
+/// very next frame and was discarded), and a tool that returned
+/// between the cancel and the drain closed its
+/// `pending_tool_results` entry that the post-cancel drain
+/// deliberately throws away. This helper is a faithful replay of the
+/// streaming loop's notification-handling arms over a bounded settle
+/// window — same `pending_tool_results` accounting, same content /
+/// usage accumulation, same `turn_complete` semantics — so a turn
+/// that raced the deadline ends as `completed` and one whose engine
+/// ignored the cancel falls through to `timeout`.
+#[allow(clippy::too_many_arguments)]
+async fn drain_after_cancel<R, F>(
+    reader: &mut R,
+    show_reasoning: bool,
+    on_event: &mut F,
+    content: &mut String,
+    content_bytes: &mut u64,
+    input_tokens: &mut u64,
+    tool_calls: &mut u32,
+    pending_tool_results: &mut HashMap<String, u32>,
+    line: &mut String,
+) -> String
+where
+    R: tokio::io::AsyncBufReadExt + Unpin,
+    F: FnMut(AgentEvent) + ?Sized,
+{
+    let deadline = tokio::time::Instant::now() + SETTLE_BUDGET;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            // Settle budget elapsed with no `turn_complete`. Classify
+            // what we have using the same matrix the EOF branch in
+            // `drive()` uses, so a deadline-raced turn that emitted
+            // useful work before the budget ended as `completed` /
+            // `interrupted` consistently.
+            return if pending_tool_results.values().any(|n| *n > 0) {
+                "interrupted".to_string()
+            } else if content.is_empty() && *tool_calls == 0 {
+                "failed".to_string()
+            } else {
+                "timeout".to_string()
+            };
+        }
+        let got_line =
+            match tokio::time::timeout(remaining, read_frame_line_capped(reader, line)).await {
+                Ok(Ok(got)) => got,
+                // Read error after cancel: treat as the engine hung up.
+                // Fall through to the same classification as a zero-budget
+                // settle (above).
+                Ok(Err(_)) | Err(_) => {
+                    return if pending_tool_results.values().any(|n| *n > 0) {
+                        "interrupted".to_string()
+                    } else if content.is_empty() && *tool_calls == 0 {
+                        "failed".to_string()
+                    } else {
+                        "timeout".to_string()
+                    };
+                }
+            };
+        if !got_line {
+            // EOF during settle. Same classification as the settle-
+            // budget-elapsed arm above.
+            return if pending_tool_results.values().any(|n| *n > 0) {
+                "interrupted".to_string()
+            } else if content.is_empty() && *tool_calls == 0 {
+                "failed".to_string()
+            } else {
+                "timeout".to_string()
+            };
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        // Only `session/update` notifications carry the in-flight turn
+        // payload we care about here; anything else (e.g. an unrelated
+        // `session/cancel` ack, or another `initialize`) is dropped.
+        if method != "session/update" {
+            continue;
+        }
+        let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "agent_message_chunk" => {
+                if let Some(t) = params.get("text").and_then(Value::as_str) {
+                    let new_total = content_bytes.saturating_add(t.len() as u64);
+                    if new_total <= MAX_CUMULATIVE_CONTENT_BYTES {
+                        content.push_str(t);
+                        *content_bytes = new_total;
+                        on_event(AgentEvent::Text(t.to_string()));
+                    }
+                }
+            }
+            "agent_thought_chunk" if show_reasoning => {
+                if let Some(t) = params.get("text").and_then(Value::as_str) {
+                    on_event(AgentEvent::Thought(t.to_string()));
+                }
+            }
+            "tool_call" => {
+                *tool_calls += 1;
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                *pending_tool_results.entry(name.clone()).or_insert(0) += 1;
+                on_event(AgentEvent::ToolCall { name });
+            }
+            "tool_result" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                if let Some(count) = pending_tool_results.get_mut(&name) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                }
+                on_event(AgentEvent::ToolResult { name });
+            }
+            "context_usage" => {
+                if let Some(it) = params.get("input_tokens").and_then(Value::as_u64) {
+                    *input_tokens = (*input_tokens).max(it);
+                    on_event(AgentEvent::Usage { input_tokens: it });
+                }
+            }
+            "turn_complete" => {
+                // The engine confirmed the wind-down. Honor its final
+                // outcome (defaulting to "completed" if it omits one)
+                // and surface any final text via the same `content`
+                // semantics the streaming loop uses.
+                if let Some(c) = params.get("content").and_then(Value::as_str) {
+                    if !c.is_empty() && (c.len() as u64) <= MAX_CUMULATIVE_CONTENT_BYTES {
+                        *content = c.to_string();
+                    }
+                }
+                let oc = params
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed")
+                    .to_string();
+                return oc;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Poll-connect to the daemon socket until it accepts a connection or `budget`
 /// elapses. Useful right after spawning an ephemeral daemon.
 pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<()> {
@@ -865,6 +1047,64 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
                 ))
             }
         }
+    }
+}
+
+/// Initialize-handshake readiness probe.
+///
+/// A bare `UnixStream::connect` proves only "something accepted the
+/// connection at this instant" — a daemon that has bound the socket but
+/// never answers subsequent frames would still look "ready" to a poll
+/// that only checks the socket. This fn sends the ACP `initialize`
+/// notification and waits for the matching response within `budget`,
+/// so a hung daemon is exposed as a readiness failure (the caller can
+/// surface the daemon log / kill+reap the child instead of blocking
+/// the rest of the loop on a socket that will never produce frames).
+///
+/// Return value: `Ok(())` iff `initialize` was answered within `budget`,
+/// else `Err` carrying the original failure mode (connect / read /
+/// timeout). The transport is closed at the end either way (the reader
+/// + writer are local to this fn), so no leaked FDs.
+pub async fn probe_ready(socket: &Path, budget: Duration) -> anyhow::Result<()> {
+    let transport = EngineTransport::UnixSocket(socket.to_path_buf());
+    let conn = tokio::time::timeout(budget, connect_transport(&transport))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "connecting to daemon at {} timed out after {budget:?}",
+                socket.display()
+            )
+        })??;
+    let mut reader = BufReader::new(conn.reader);
+    let mut write_half = conn.writer;
+    write_frame(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": ACP_PROTOCOL_VERSION },
+        }),
+    )
+    .await?;
+    // Bound the read by `budget` (NOT `budget.saturating_sub(elapsed)`)
+    // — caller-supplied budgets are short (e.g. 2s during a startup
+    // poll, 5s on a fresh connect) and the connect-timeout already
+    // accounted for the connect leg. A single budget keeps the contract
+    // simple and the worst case well below the loop's overall wall
+    // clock. `read_result` itself is bounded by `MAX_FRAME_BYTES` via
+    // `read_frame_line_capped`, so a runaway daemon can't OOM us.
+    let remaining = budget;
+    match tokio::time::timeout(remaining, read_result(&mut reader, "init")).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow!(
+            "initialize handshake with daemon at {} failed: {e}",
+            socket.display()
+        )),
+        Err(_) => Err(anyhow!(
+            "initialize handshake with daemon at {} timed out after {budget:?}",
+            socket.display()
+        )),
     }
 }
 
@@ -1061,7 +1301,12 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         }),
     )
     .await?;
-    read_result(&mut reader, "init").await?;
+    // SETUP_RPC_TIMEOUT: bound the initialize round-trip so a daemon that
+    // accepts the socket but never answers can no longer hang the loop at
+    // the OS-level read. See `SETUP_RPC_TIMEOUT` for the budget rationale.
+    tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "init"))
+        .await
+        .map_err(|_| anyhow!("initialize timed out after {SETUP_RPC_TIMEOUT:?}"))??;
     write_frame(
         &mut write_half,
         &json!({
@@ -1076,7 +1321,9 @@ pub async fn new_session(socket: &Path, agent_alias: &str, cwd: &Path) -> anyhow
         }),
     )
     .await?;
-    let res = read_result(&mut reader, "new").await?;
+    let res = tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "new"))
+        .await
+        .map_err(|_| anyhow!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"))??;
     res.get("session_id")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
@@ -1166,7 +1413,12 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    read_result(&mut reader, "init").await?;
+    // SETUP_RPC_TIMEOUT: bound the initialize round-trip so a daemon
+    // that accepts the socket but never answers doesn't hang the
+    // entire turn on the OS-level read. See `SETUP_RPC_TIMEOUT`.
+    tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "init"))
+        .await
+        .map_err(|_| anyhow!("initialize timed out after {SETUP_RPC_TIMEOUT:?}"))??;
 
     // 2. session/new (acp = Code mode: pins cwd, excludes long-term memory tools).
     //
@@ -1202,7 +1454,13 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    let new_res = match read_result_inner(&mut reader, "new").await? {
+    let new_res = match tokio::time::timeout(
+        SETUP_RPC_TIMEOUT,
+        read_result_inner(&mut reader, "new"),
+    )
+    .await
+    .map_err(|_| anyhow!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"))?
+    {
         Ok(v) => v,
         Err(msg) => {
             // Engine rejected the resume. The previous behavior
@@ -1236,12 +1494,29 @@ async fn drive<F: FnMut(AgentEvent)>(
             .await?;
             // A retry-failure is fatal (any repeated error here means
             // the engine itself is misbehaving — not a stale id).
-            read_result(&mut reader, "new").await.map_err(|_| {
-                anyhow!(
-                    "engine error on session/new: {msg} (and the fresh-create retry also failed)"
-                )
-            })?
+            // Wrap the success value in `Ok` so the arm produces a
+            // `Result<Value, String>` matching the outer match (the
+            // outer arm type is `Result<Value, String>` because
+            // `read_result_inner` returns
+            // `anyhow::Result<Result<Value, String>>`).
+            tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "new"))
+                .await
+                .map_err(|_| anyhow!("session/new retry timed out after {SETUP_RPC_TIMEOUT:?}"))?
+                .map_err(|_| {
+                    anyhow!(
+                        "engine error on session/new: {msg} (and the fresh-create retry also failed)"
+                    )
+                })
+                .map(Ok)?
         }
+    };
+    // `new_res` is `Result<Value, String>` here (the outer `?` on the
+    // timeout unwraps the `anyhow::Result`, leaving the engine-error
+    // variant as the inner arm). Unwrap the success path; the error
+    // path is fatal (the retry arm already produced a clear message).
+    let new_res = match new_res {
+        Ok(v) => v,
+        Err(msg) => anyhow::bail!("session/new failed and no retry succeeded: {msg}"),
     };
     let session_id = new_res
         .get("session_id")
@@ -1262,7 +1537,11 @@ async fn drive<F: FnMut(AgentEvent)>(
         )
         .await?;
         // Best-effort: ignore configure failures (older daemons), keep going.
-        let _ = read_result(&mut reader, "cfg").await;
+        // SETUP_RPC_TIMEOUT still applies so a hung daemon on
+        // session/configure doesn't stall the rest of the drive.
+        let _ = tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "cfg"))
+            .await
+            .map_err(|_| anyhow!("session/configure timed out after {SETUP_RPC_TIMEOUT:?}"));
     }
 
     // 4. session/prompt — response is `{}`; real output streams as notifications.
@@ -1377,9 +1656,14 @@ async fn drive<F: FnMut(AgentEvent)>(
             match tokio::time::timeout_at(deadline, read_frame_line_capped(&mut reader, &mut line))
                 .await
             {
-                // Budget exhausted. CANCEL the turn server-side so the engine stops
-                // editing files (otherwise a ghost agent keeps running after we
-                // return + fail the job), then preserve whatever streamed so far.
+                // Budget exhausted. CANCEL the turn server-side AND DRAIN until the
+                // engine confirms it wound the turn down — otherwise a ghost
+                // agent keeps editing files after we return. The drain also
+                // parses any final `turn_complete`/text that races the deadline
+                // (a turn that finished right at the budget is a "completed"
+                // turn, not a "timeout" turn), and tracks tool-call
+                // completion so the EOF / timeout classification stays
+                // consistent with the rest of the loop.
                 Err(_) => {
                     let _ = write_frame(
                         &mut write_half,
@@ -1391,13 +1675,24 @@ async fn drive<F: FnMut(AgentEvent)>(
                         }),
                     )
                     .await;
-                    // Best-effort: give the engine a moment to ack/wind down the turn.
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        read_frame_line_capped(&mut reader, &mut line),
+                    // Bounded drain (SETTLE_BUDGET). Best-effort: a turn that
+                    // raced the deadline to completion here ends up as
+                    // `completed` (preserving the partial transcript + tool
+                    // tally); a daemon that ignores the cancel and keeps
+                    // streaming past the drain falls through to `timeout` with
+                    // whatever it had emitted before the budget.
+                    break drain_after_cancel(
+                        &mut reader,
+                        opts.show_reasoning,
+                        on_event,
+                        &mut content,
+                        &mut content_bytes,
+                        &mut input_tokens,
+                        &mut tool_calls,
+                        &mut pending_tool_results,
+                        &mut line,
                     )
                     .await;
-                    break "timeout".to_string();
                 }
                 Ok(r) => r.context("reading from engine")?,
             };
@@ -1473,15 +1768,59 @@ async fn drive<F: FnMut(AgentEvent)>(
             on_event(AgentEvent::Utilization { headers });
         }
 
-        // A JSON-RPC error response on our prompt id is fatal.
-        if frame.get("id").and_then(Value::as_str) == Some("prompt") {
+        // JSON-RPC *responses* (an `id`, no `method`). Previously ONLY a
+        // `prompt`-id error was treated as fatal and every other error
+        // response was silently dropped — so a failed `session/approve`
+        // left the engine blocked on approval and the turn stalled until
+        // the wall-clock budget. Handle every error response:
+        //
+        //   * `id == "prompt"` is the prompt the turn is actively
+        //     running; a fatal error here means the engine refused to
+        //     accept the prompt — bail with the engine's error message.
+        //   * `id` starting with `"approve-"` is a per-approval
+        //     decision we sent. A rejection here means the engine is
+        //     still waiting on approval (it will not advance) — stop
+        //     the turn now with a non-success outcome and preserve the
+        //     partial transcript rather than hanging until the
+        //     wall-clock budget. The engine is alive but cannot
+        //     progress without further interaction.
+        //   * Any other id (e.g. unexpected late `session/new` error)
+        //     is logged at warn and otherwise ignored — it is not
+        //     fatal because the engine can still stream the in-flight
+        //     turn. Previously a `FailedPrecondition` from a
+        //     no-longer-needed session/configure would have been
+        //     silently dropped; we keep that benign shape and just
+        //     make sure no OTHER error path silently stalls.
+        //
+        // Non-error responses (just an `id`, no `error`) are not
+        // notification frames, so they fall through to the
+        // `session/update` skip below (continue).
+        if frame.get("method").is_none() {
             if let Some(err) = frame.get("error") {
+                let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
                 let msg = err
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("error");
-                bail!("session/prompt failed: {msg}");
+                if id == "prompt" {
+                    bail!("session/prompt failed: {msg}");
+                }
+                if id.starts_with("approve-") {
+                    // The engine rejected our approval decision: it
+                    // is still waiting and the turn cannot progress.
+                    // Stop now with a non-success outcome and
+                    // preserve the partial transcript rather than
+                    // hanging until the wall-clock budget.
+                    eprintln!(
+                        "zoder: warning: approval rejected by engine (id={id}): {msg}; ending turn"
+                    );
+                    break "failed".to_string();
+                }
+                eprintln!(
+                    "zoder: warning: ignoring non-fatal engine error response (id={id}): {msg}"
+                );
             }
+            // Responses are never `session/update`; nothing else to do.
             continue;
         }
 
@@ -9478,6 +9817,269 @@ mod tests {
         assert_eq!(run.session_id, "z-twocall-1");
 
         let _ = server.await;
+    }
+}
+
+// =============================================================================
+// MR !1 reliability-fix regression tests (issue #13 port).
+//
+// The original MR !1 audit surfaced several ways the agentic loop could
+// silently mislabel a degraded run. This mod pins the wire-shape half of
+// the fixes against a mock engine speaking the exact same dialect the
+// existing `drive_against_mock` tests use, so a regression in the
+// error-response / timeout-drain handling cannot ship silently.
+// =============================================================================
+#[cfg(test)]
+mod mr1_reliability_regression {
+    //! Regressions for the MR !1 findings ported onto the
+    //! current `acp-client` structure (gitlab.com/ncz-os/zoder issue #13).
+    //!
+    //! Each test here corresponds to one of the documented
+    //! reliability fixes — the wire-shape half of the finding, not
+    //! the CLI seam (the CLI tests live in `zoder-cli/src/main.rs`
+    //! and `agentic.rs`). The mocks speak the zeroclaw-extensions
+    //! dialect that `drive()` consumes (`agent_alias`, `chat_mode`,
+    //! `session_id` snake_case in `session/update` params).
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    /// MR !1 finding: every JSON-RPC error response on a non-prompt
+    /// id (e.g. a rejected `session/approve`) must NOT silently stall
+    /// the turn until the wall-clock budget fires. Pre-fix the engine
+    /// rejection of an approval decision was dropped on the floor,
+    /// leaving the engine blocked on approval and the loop waiting
+    /// the full budget. The fix: an error response on `id` starting
+    /// with `"approve-"` ends the turn with `outcome = "failed"` and
+    /// preserves the partial transcript, instead of stalling.
+    #[tokio::test]
+    async fn drive_ends_turn_with_failed_on_approval_rejection() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("mr1-approve.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        // Build a zeroclaw-extensions daemon: replies to initialize /
+        // session/new / session/prompt in snake_case, then emits a
+        // JSON-RPC error response on `id="approve-1"` (the id we
+        // use for our approval-decision replies). The driver must
+        // end the turn here with `outcome="failed"`, NOT stall to
+        // the wall-clock budget.
+        let server = tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let (rh, mut wh) = tokio::io::split(stream);
+            let mut r = tokio::io::BufReader::new(rh);
+            async fn reply(
+                wh: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+                v: serde_json::Value,
+            ) {
+                let mut s = serde_json::to_string(&v).unwrap();
+                s.push('\n');
+                let _ = wh.write_all(s.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+            let mut line = String::new();
+            // initialize
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}),
+            )
+            .await;
+            // session/new (zeroclaw snake_case `session_id`)
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"new","result":{"session_id":"mr1-approve-1"}}),
+            )
+            .await;
+            // session/prompt
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"prompt","result":{}}),
+            )
+            .await;
+            // Now emit an error response on the approve id BEFORE
+            // any session/update / turn_complete. The driver must
+            // end the turn here with `outcome="failed"`.
+            reply(
+                &mut wh,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":"approve-1",
+                    "error":{"code":-32001,"message":"user denied approval"}
+                }),
+            )
+            .await;
+            // Hold the connection open briefly so the driver has
+            // time to react to the error response before close.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = wh.shutdown().await;
+        });
+        let mut opts = AgentOptions::new(
+            socket.clone(),
+            "mr1-test",
+            std::path::PathBuf::from("/tmp"),
+            "test prompt",
+        );
+        opts.timeout = std::time::Duration::from_secs(5);
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run_agent(&opts, |_| {})).await;
+        let _ = server.await;
+        let run = res
+            .expect("drive must end promptly on an approval rejection, not stall to the wall-clock budget")
+            .expect("drive returned Err on an approval rejection");
+        assert_eq!(
+            run.outcome, "failed",
+            "approval rejection must end turn with outcome='failed' (not stall); got: {:?}",
+            run.outcome
+        );
+        assert!(!run.succeeded());
+        drop(dir);
+    }
+
+    /// MR !1 finding: setup RPCs (`initialize`, `session/new`,
+    /// `session/configure`) must be deadline-bounded. A daemon that
+    /// accepts the socket but never answers `initialize` should
+    /// surface as a setup-timeout error within `SETUP_RPC_TIMEOUT`
+    /// (30s) — not block forever at the OS-level read.
+    ///
+    /// We can't wait 30s in a unit test, so we verify the timeout
+    /// wrapper's surface: read_result wrapped in a small budget
+    /// against a hung socket errors within the budget (not after
+    /// SETUP_RPC_TIMEOUT). The `SETUP_RPC_TIMEOUT` constant value
+    /// itself is also pinned.
+    #[tokio::test]
+    async fn setup_rpc_timeout_constant_is_30s() {
+        // Pin the constant. A regression that bumps it without
+        // updating the operator-facing loop-timeout docs is a
+        // reliability regression: a hung daemon would block
+        // agentic_turn's outer watchdog for `SETUP_RPC_TIMEOUT`
+        // instead of surfacing quickly.
+        assert_eq!(
+            SETUP_RPC_TIMEOUT,
+            std::time::Duration::from_secs(30),
+            "SETUP_RPC_TIMEOUT must remain 30s — see doc comment for the budget rationale"
+        );
+    }
+
+    /// MR !1 finding: `read_result` wrapped in `tokio::time::timeout`
+    /// must return within the budget on a hung socket, not block
+    /// forever at the OS-level read. This pins the wrapper's
+    /// behavior; the `SETUP_RPC_TIMEOUT` constant value is pinned by
+    /// `setup_rpc_timeout_constant_is_30s` above.
+    #[tokio::test]
+    async fn read_result_times_out_within_budget_on_hung_socket() {
+        // Build a "daemon" that accepts the connection but never
+        // writes anything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("hung.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Hold the connection open, write nothing.
+                let (_rh, _wh) = tokio::io::split(stream);
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        let conn = connect_transport(&EngineTransport::UnixSocket(socket.clone()))
+            .await
+            .expect("connect");
+        let reader = conn.reader;
+        let mut r = tokio::io::BufReader::new(reader);
+        drop(conn.writer);
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            read_result(&mut r, "init"),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "read_result on a hung socket MUST time out within the budget, not block"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "timeout fired too late ({elapsed:?}) — wrapper should respect the budget"
+        );
+        let _ = server.await;
+        drop(dir);
+    }
+
+    /// MR !1 finding: `probe_ready` runs an `initialize` HANDSHAKE,
+    /// not a bare `UnixStream::connect`. A socket that accepts but
+    /// never answers the initialize frame must NOT pass the readiness
+    /// check — that was the entire pre-fix defect: a daemon hung at
+    /// the protocol layer looked "ready" to the rest of the loop,
+    /// and every later `run_agent` blocked until its own wall-clock
+    /// budget fired.
+    #[tokio::test]
+    async fn probe_ready_fails_on_socket_that_never_responds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("probe-hung.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (_rh, _wh) = tokio::io::split(stream);
+                // Hold open but never respond.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        let start = std::time::Instant::now();
+        let res = probe_ready(&socket, std::time::Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "probe_ready on a hung daemon MUST fail within the budget, not pass"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "probe_ready took {elapsed:?} — should respect the explicit budget"
+        );
+        let _ = server.await;
+        drop(dir);
+    }
+
+    /// MR !1 finding: `probe_ready` SUCCEEDS against a daemon that
+    /// answers `initialize`. This is the non-breaking half: a
+    /// well-behaved engine on a freshly-bound socket MUST pass the
+    /// readiness check.
+    #[tokio::test]
+    async fn probe_ready_succeeds_against_responsive_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("probe-ok.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (rh, mut wh) = tokio::io::split(stream);
+                let mut r = tokio::io::BufReader::new(rh);
+                let mut line = String::new();
+                // Read the initialize frame, then reply.
+                let _ = r.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = wh.write_all(s.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+        });
+        probe_ready(&socket, std::time::Duration::from_secs(2))
+            .await
+            .expect("probe_ready must succeed against a responsive daemon");
+        let _ = server.await;
+        drop(dir);
     }
 }
 

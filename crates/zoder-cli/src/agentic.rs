@@ -2750,6 +2750,13 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
         );
     }
 
+    // A free-policy violation fails the rescue even on a completed turn:
+    // partial artifacts above are preserved, but we must not exit success
+    // after unverified paid spend without --allow-paid. MR !1 finding.
+    if let Some(v) = &t.policy_violation {
+        anyhow::bail!("rescue violated free policy (use --allow-paid to permit): {v}");
+    }
+
     if !ok {
         anyhow::bail!("rescue ended: {}", t.run.outcome);
     }
@@ -3811,6 +3818,21 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         .await
         {
             Ok(t) => {
+                // MR !1 finding: a free-policy violation must STOP the
+                // loop, not just be logged. Continuing would keep
+                // spending paid money turn after turn without
+                // --allow-paid. The partial artifacts are preserved
+                // (the engine already wrote them), but the loop exits
+                // nonzero with a clear "use --allow-paid" hint. We
+                // check this BEFORE recording the session id or
+                // incrementing `total_cost` — a violating turn does
+                // not extend the loop's bookkeeping as if it were a
+                // legitimate iteration.
+                if let Some(v) = &t.policy_violation {
+                    anyhow::bail!(
+                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
+                    );
+                }
                 session = Some(t.run.session_id.clone());
                 total_cost += t.cost_usd;
                 Some(t)
@@ -6038,6 +6060,7 @@ must reap the direct shell on the timeout branch)"
                 tokens_in: 0,
                 tokens_out: 0,
                 elapsed_ms: 0.0,
+                policy_violation: None,
             })
         };
         let res = author_phase_with_cancel(5, true, turn_fut, cancel_fut, settled_fut).await;
@@ -6472,6 +6495,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         };
         let turn_some: Option<crate::TurnResult> = Some(non_completed);
 
@@ -6534,6 +6558,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         });
         assert!(!turn_is_dead(&turn));
     }
@@ -6560,6 +6585,7 @@ not run to max_iters"
                 tokens_in: 0,
                 tokens_out: 0,
                 elapsed_ms: 0.0,
+                policy_violation: None,
             };
             assert!(
                 turn_is_dead(&Some(turn)),
@@ -6584,6 +6610,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         }
     }
 
@@ -7860,6 +7887,95 @@ mod loop_resolution_tests {
              verdict field was matched case-sensitively and this iteration \
              leaked through as RESOLVED."
         );
+    }
+}
+
+// =============================================================================
+// MR !1 reliability-fix regression tests (issue #13 port):
+// `TurnResult::policy_violation` + the loop/rescue `bail` contract.
+//
+// The agentic `policy_violation` field carries the free-gate failure
+// reason for a completed-but-violating turn. The loop and rescue
+// callers MUST surface it as a non-success exit (not just log it);
+// without this, a violating turn could complete AND exit success
+// without `--allow-paid`. The pre-fix behavior was exactly that: the
+// ledger/health recorded the violation, but `agentic_turn` still
+// returned `Ok(TurnResult)` and the CLI commands exited 0.
+// =============================================================================
+#[cfg(test)]
+mod mr1_policy_violation_tests {
+    fn turn_with_policy_violation(reason: &str) -> crate::TurnResult {
+        crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s".into(),
+                outcome: "completed".into(),
+                content: "partial output preserved for the operator".into(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+            policy_violation: Some(reason.to_string()),
+        }
+    }
+
+    /// A `TurnResult` with a `policy_violation` MUST NOT be treated as
+    /// succeeded — even though `run.outcome == "completed"` (the
+    /// engine finished the work, just on a paid / unverified model).
+    /// `AgentRun::succeeded` ignores the violation (it only tests
+    /// `outcome == "completed"`), so callers MUST check
+    /// `policy_violation` explicitly. This test pins the call-site
+    /// contract: every loop/rescue/exec bail-conditional reads BOTH
+    /// fields.
+    #[test]
+    fn completed_turn_with_policy_violation_is_not_a_success() {
+        let t = turn_with_policy_violation("paid without --allow-paid");
+        // AgentRun::succeeded is engine-only — the engine reported a
+        // clean turn — so it returns true here. The MR !1 finding is
+        // that callers must NOT rely on it alone.
+        assert!(t.run.succeeded());
+        assert!(t.policy_violation.is_some());
+        // The semantic test: a violating turn is NOT a successful
+        // run from the CLI's perspective. (The CLI implements this
+        // check in `cmd_exec_agentic` / `cmd_rescue` / `cmd_loop`.)
+        let cli_success = t.run.succeeded() && t.policy_violation.is_none();
+        assert!(
+            !cli_success,
+            "a completed turn with a policy_violation must NOT be a CLI success"
+        );
+    }
+
+    /// `TurnResult::policy_violation` defaults to `None` for non-
+    /// violating turns. This pins the `Option<String>` shape so a
+    /// future struct refactor cannot accidentally make the field
+    /// non-optional (which would force every test fixture to set a
+    /// value, hiding regressions in the violation-detection path).
+    #[test]
+    fn policy_violation_defaults_to_none_for_clean_turn() {
+        let t = crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s".into(),
+                outcome: "completed".into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+            policy_violation: None,
+        };
+        assert!(t.run.succeeded());
+        assert!(t.policy_violation.is_none());
     }
 }
 

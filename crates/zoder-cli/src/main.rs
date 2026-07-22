@@ -3753,9 +3753,36 @@ pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str 
 
 /// Ensure a zeroclaw agent daemon is reachable; spawn an ephemeral one (using
 /// the co-shipped `zeroclaw` binary) if the socket is absent. Returns the socket.
+///
+/// Reliability invariants (ported from MR !1, daemon-readiness finding):
+///
+/// * Readiness is the ACP `initialize` HANDSHAKE — not a bare
+///   `UnixStream::connect`. A daemon that has bound the socket but never
+///   answers subsequent frames must not look "ready" to the rest of the
+///   loop; otherwise every later `run_agent` would block until its own
+///   wall-clock budget fired.
+/// * Daemon stderr is captured to a log file so a startup failure (bad
+///   config, port/socket clash, missing provider key) is diagnosable —
+///   the previous behavior swallowed stderr as `Stdio::null()`, so a
+///   broken daemon looked identical to a hung one.
+/// * The spawned child is RETAINED and polled via `try_wait` so an early
+///   exit is detected within the readiness loop instead of after the
+///   full 20s deadline. On the deadline path the child is killed AND
+///   reaped (`child.wait()`) so we never leak a zombie.
+/// * The stale-socket unlink was REMOVED. A failed connect only proves
+///   "no listener right now"; another `zoder` / `zeroclaw` could bind
+///   the socket between our connect check and our unlink (TOCTOU), and
+///   we'd delete a live socket from under the new owner. The daemon
+///   owns its own stale-socket cleanup at bind time.
 async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     let socket = engine_socket_path();
-    if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+    // Short probe budget — the freshness check is meant to be a quick
+    // yes/no. A daemon that needs > 5s to respond to `initialize` is
+    // broken, not slow.
+    if zoder_core::probe_ready(&socket, std::time::Duration::from_secs(5))
+        .await
+        .is_ok()
+    {
         return Ok(socket);
     }
     let bin = locate_sibling("zeroclaw").ok_or_else(|| {
@@ -3769,18 +3796,91 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(zeroclaw_data_dir);
+    // Capture daemon stderr to a log instead of discarding it, so a startup
+    // failure (bad config, socket clash, missing provider key) is
+    // diagnosable rather than a silent "not ready" timeout.
+    let log_path = zeroclaw_data_dir().join("daemon.log");
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("daemon")
         .arg("--ephemeral")
         .arg("--config-dir")
         .arg(&config_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cmd.spawn()
+        .stdout(std::process::Stdio::null());
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        Err(_) => {
+            // No permission to write the log? Fall back to /dev/null —
+            // do NOT fail the spawn over a logging nicety.
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn zeroclaw daemon ({}): {e}", bin.display()))?;
-    zoder_core::wait_for_socket(&socket, std::time::Duration::from_secs(20)).await?;
-    Ok(socket)
+
+    // Poll readiness with the initialize handshake. Bail early if the
+    // child process exits during startup (otherwise we'd wait the full
+    // budget for a socket that will never appear). On timeout / exit,
+    // surface the daemon log tail for triage.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            // Kill is best-effort; the child already exited. Reap just
+            // in case the platform handed us a not-yet-reaped handle so
+            // we don't leak a zombie (the `try_wait` above already
+            // reaped it on most platforms, but `wait()` is idempotent).
+            let _ = child.wait();
+            anyhow::bail!(
+                "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
+                read_log_tail(&log_path)
+            );
+        }
+        // Short per-probe budget so a socket that accepts but never
+        // answers can't block this poll for the full setup timeout —
+        // the deadline and the child-exit check stay responsive.
+        if zoder_core::probe_ready(&socket, std::time::Duration::from_secs(2))
+            .await
+            .is_ok()
+        {
+            return Ok(socket);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Kill AND reap so we don't leave a zombie.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "zeroclaw daemon not ready within 20s; log tail:\n{}",
+                read_log_tail(&log_path)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Best-effort: return the last ~1.5KB of the daemon log for error context.
+/// Tails on a UTF-8 boundary (logs may contain multibyte chars).
+fn read_log_tail(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(1500);
+            // Walk backwards to a valid char boundary so we never slice
+            // inside a multibyte code point. Cheap because the tail is
+            // bounded at ~1.5KB.
+            let mut s = start;
+            while s < bytes.len() && !bytes[s].is_ascii() {
+                s += 1;
+            }
+            String::from_utf8_lossy(&bytes[s..]).trim().to_string()
+        }
+        Err(_) => "(no daemon log available)".to_string(),
+    }
 }
 
 struct AgenticCostScope {
@@ -4142,6 +4242,15 @@ pub(crate) struct TurnResult {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub elapsed_ms: f64,
+    /// `Some(reason)` when the run violated the free policy (billed, used a
+    /// paid engine model, or had unverifiable attribution) without
+    /// `--allow-paid`. The turn's partial output is still returned for
+    /// display, but callers MUST treat this as a failure (non-zero exit /
+    /// stop the loop) — recording it in the ledger/health is not enough; a
+    /// violating run must not exit success. (MR !1 finding: agentic
+    /// exec/rescue/loop must fail on a free-policy violation, not just
+    /// log it.)
+    pub policy_violation: Option<String>,
 }
 
 impl std::fmt::Debug for TurnResult {
@@ -4880,12 +4989,29 @@ pub(crate) async fn agentic_turn(
         reviewer: _,
         reason,
     } = resolve_chain(cli, &eng, &health)?;
-    let primary = chain
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no model resolved"))?;
+    if chain.is_empty() {
+        anyhow::bail!("no model resolved");
+    }
+    // Dedupe the chain (order-preserving). The fallback loop advances by
+    // skipping a candidate by value, so a duplicate id would otherwise be
+    // re-selected after its earlier appearance was skipped — making the
+    // skip/advance logic ambiguous. A unique chain makes that impossible.
+    let chain: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        chain
+            .into_iter()
+            .filter(|m| seen.insert(m.clone()))
+            .collect()
+    };
+    // `primary` is the first live link (the head of the dedup'd chain).
+    // Used by the pre-call free gate (must classify the head before any
+    // chain walk) and by the --explain / dry-run echo below.
+    let primary = chain[0].clone();
     if cli.explain {
         eprintln!("[route] {reason}");
+        if chain.len() > 1 {
+            eprintln!("[route] chain: {}", chain.join(" -> "));
+        }
     }
 
     // Backed-provider guard (agentic path): a routed/forced/pinned model with no
@@ -4966,7 +5092,14 @@ pub(crate) async fn agentic_turn(
     }
 
     let cwd = agentic_cwd(cli)?;
-    let alias = resolve_agent_alias(cli, &primary);
+    // The chain dispatch below resolves the per-candidate alias fresh; the
+    // head's alias is used here only for the cost-scope directory (which
+    // we open once before the loop). On a fallback to a different alias
+    // the cost scope path won't match the engine's records — we accept
+    // that minor accounting miss in exchange for keeping the scope open
+    // for the entire chain (the pre-scope path is not the failure mode
+    // this slice is closing).
+    let head_alias = resolve_agent_alias(cli, &primary);
 
     // SLICE 2 (execution-safety kernel CLI plumbing): resolve the
     // writable-root containment boundary from the operator's flags.
@@ -5059,14 +5192,18 @@ pub(crate) async fn agentic_turn(
 
     let opts = AgentOptions {
         socket: socket_path,
-        agent_alias: alias.clone(),
+        // Per-candidate aliases are re-resolved inside the chain loop
+        // below; this `head_alias` is the head-of-chain value used by
+        // the cost scope and the Goose path's single-shot dispatch.
+        // The chain loop overwrites it before each `run_agent_dispatch`.
+        agent_alias: head_alias.clone(),
         cwd: cwd.clone(),
-        prompt,
+        prompt: prompt.clone(),
         model_override,
         // The routed model id — the zeroclaw-free model name goose needs in
-        // `GOOSE_MODEL`. ALWAYS pass it when known (we always know: it's
-        // `chain[0]`); the goose driver prefers this over the zeroclaw
-        // agent alias (which goose doesn't understand).
+        // `GOOSE_MODEL`. ALWAYS pass it when known; the goose driver prefers
+        // this over the zeroclaw agent alias (which goose doesn't understand).
+        // The chain loop overwrites it before each `run_agent_dispatch`.
         model_id: Some(primary.clone()),
         session_id: engine_session_id,
         show_reasoning: cli.show_reasoning,
@@ -5139,8 +5276,14 @@ pub(crate) async fn agentic_turn(
     ledger_reservation
         .arm()
         .with_context(|| "verifying ledger reservation before agentic dispatch")?;
+    // The cost scope is opened ONCE before the chain walk and the cost
+    // reconciliation at the end queries the engine for whatever actually
+    // ran. The scope's alias is the head's; a fallback to a different
+    // alias is a known minor accounting miss (the engine's cost tracker
+    // is per-alias) — closing that miss is a follow-up that requires the
+    // engine to accept a scope key from the caller.
     let cost_scope = if engine_kind == EngineKind::Zeroclaw {
-        match AgenticCostScope::start(&opts.socket, &alias) {
+        match AgenticCostScope::start(&opts.socket, &head_alias) {
             Ok(scope) => Some(scope),
             Err(error) => {
                 eprintln!(
@@ -5170,47 +5313,203 @@ pub(crate) async fn agentic_turn(
         })
         .unwrap_or(None);
 
-    let run = run_agent_dispatch(engine_kind, &opts, |ev| {
-        // Write event to JSONL file if configured
-        if let Some(ref mut writer) = events_writer {
-            if let Some(json_line) = agent_event_to_jsonl(&ev) {
-                let _ = writeln!(writer, "{}", json_line);
-                let _ = writer.flush();
+    // -------------------------------------------------------------------
+    // CHAIN FALLBACK (MR !1 finding: agentic fallback chain).
+    //
+    // Walk the routed chain (primary + fallbacks) and dispatch on the
+    // first model that doesn't fail in the pre-side-effect setup window.
+    // Crucially: fallback only fires on a `run_agent_dispatch` Err —
+    // anything that returns `Ok(AgentRun)` is a post-prompt state
+    // (possibly `outcome == "timeout"` / `"interrupted"` / `"failed"`)
+    // where the engine may have already edited files or run tools.
+    // Re-running that on another model would re-do side effects and
+    // race the daemon's last writes, so we keep the partial `AgentRun`
+    // and surface its `outcome` to the caller. This lifts agentic
+    // reliability from the head's success rate toward the chain's,
+    // without ever duplicating side effects.
+    //
+    // Each candidate is gated independently — only the last live
+    // candidate failing the gate is fatal. Setup-time failures (Err
+    // from `run_agent_dispatch`) feed the breaker via
+    // `health.record_classified_failure` so a broken alias/model is
+    // not re-selected by future routing decisions.
+    //
+    // `used_primary` / `used_alias` are populated ONLY by the winning
+    // `Ok(run)` arm below — the loop unconditionally overwrites them.
+    // They start as `String::new()` so the type is well-formed even on
+    // a path that should be unreachable (the loop either returns
+    // `Ok(run)` with the variables populated, or returns `Err`).
+    // -------------------------------------------------------------------
+    // `unused_assignments` is allowed here: the loop below writes
+    // `used_primary` and `used_alias` exactly once via the winning
+    // `Ok(run)` arm, but the compiler can't prove that path is
+    // taken (it doesn't model loop semantics). The seed values are
+    // never read on any reachable control-flow path because the
+    // `Err` arm returns before either variable is observed.
+    #[allow(unused_assignments)]
+    let mut chain_opts = opts;
+    #[allow(unused_assignments)]
+    let mut used_primary = primary.clone();
+    #[allow(unused_assignments)]
+    let mut used_alias = head_alias.clone();
+    let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let run = loop {
+        // Find the next live candidate — the first chain entry whose
+        // id is not in `skipped`. `chain` was dedup'd at function
+        // entry so a duplicate model can never appear, and `skipped`
+        // is only ever appended to (never removed) so a stable
+        // position lookup is unambiguous.
+        let idx = chain
+            .iter()
+            .position(|m| !skipped.contains(m))
+            .unwrap_or(chain.len().saturating_sub(1));
+        let model = chain[idx].clone();
+        let last = chain[idx + 1..].iter().all(|m| skipped.contains(m));
+        let link_provider = routing.real_provider_for_model(&eng.cfg, &model).cloned();
+        let link_provider_paid = link_provider
+            .as_ref()
+            .map(|p| p.paid || p.billing == BillingMode::Metered)
+            .unwrap_or(provider_paid);
+        let link_provider_cost_neutral = link_provider
+            .as_ref()
+            .map(is_cost_neutral_provider)
+            .unwrap_or(provider_cost_neutral);
+        let link_entry = eng
+            .corpus
+            .get(&model)
+            .cloned()
+            .unwrap_or_else(|| ModelEntry {
+                id: model.clone(),
+                gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
+                ..Default::default()
+            });
+        // --require-free gate: skip a non-free link. The last live
+        // link failing the gate is fatal (we cannot fall through to
+        // anything that satisfies the operator's request).
+        if cli.require_free && !link_entry.free {
+            if last {
+                anyhow::bail!(
+                    "--require-free set but no chain model is a known free model (last tried {model})"
+                );
+            }
+            if !cli.quiet {
+                eprintln!("[zoder] skipping non-free chain link {model}");
+            }
+            skipped.insert(model);
+            continue;
+        }
+        // Per-link paid gate: a fallback can resolve to a DIFFERENT
+        // provider than the (already-confirmed) head, so re-run the
+        // policy gate for every link. The first link was gated +
+        // confirmed above. A fallback that needs paid confirmation is
+        // skipped fail-closed (never silently spend mid-chain);
+        // `--allow-paid` makes the gate return Allow so it runs.
+        if idx > 0 {
+            if let Decision::NeedConfirm(msg) =
+                gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
+            {
+                if !cli.quiet {
+                    eprintln!(
+                        "[zoder] skipping paid fallback {model} (pass --allow-paid to use it): {msg}"
+                    );
+                }
+                if last {
+                    anyhow::bail!("paid model use declined (no chain link is free)");
+                }
+                skipped.insert(model);
+                continue;
             }
         }
+        // Wire per-candidate alias + model_id into the shared opts.
+        let alias = resolve_agent_alias(cli, &model);
+        chain_opts.agent_alias = alias.clone();
+        chain_opts.model_id = Some(model.clone());
+        match run_agent_dispatch(engine_kind, &chain_opts, |ev| {
+            // Write event to JSONL file if configured
+            if let Some(ref mut writer) = events_writer {
+                if let Some(json_line) = agent_event_to_jsonl(&ev) {
+                    let _ = writeln!(writer, "{}", json_line);
+                    let _ = writer.flush();
+                }
+            }
 
-        if let AgentEvent::Utilization { headers } = &ev {
-            agentic::persist_agentic_utilization(&routed_provider, headers);
-        }
-        if let AgentEvent::Usage { input_tokens } = &ev {
-            // ACP usage updates are cumulative context totals. Retain the
-            // largest observed value and record it once after the turn so
-            // repeated updates cannot double-count the same real tokens.
-            agentic_usage.set(agentic_usage.get().max(*input_tokens));
-        }
-        if !stream_output {
-            return;
-        }
-        match ev {
-            AgentEvent::Text(t) => {
-                print!("{t}");
-                let _ = std::io::stdout().flush();
+            if let AgentEvent::Utilization { headers } = &ev {
+                agentic::persist_agentic_utilization(&routed_provider, headers);
             }
-            AgentEvent::Thought(t) => {
-                eprint!("{t}");
+            if let AgentEvent::Usage { input_tokens } = &ev {
+                // ACP usage updates are cumulative context totals. Retain the
+                // largest observed value and record it once after the turn so
+                // repeated updates cannot double-count the same real tokens.
+                agentic_usage.set(agentic_usage.get().max(*input_tokens));
             }
-            AgentEvent::ToolCall { name } => {
-                eprintln!("\n[tool] {name}");
+            if !stream_output {
+                return;
             }
-            AgentEvent::ToolResult { .. } => {}
-            AgentEvent::Approval { tool, approved } => {
-                eprintln!("[approve:{}] {tool}", if approved { "ok" } else { "deny" });
+            match ev {
+                AgentEvent::Text(t) => {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                }
+                AgentEvent::Thought(t) => {
+                    eprint!("{t}");
+                }
+                AgentEvent::ToolCall { name } => {
+                    eprintln!("\n[tool] {name}");
+                }
+                AgentEvent::ToolResult { .. } => {}
+                AgentEvent::Approval { tool, approved } => {
+                    eprintln!("[approve:{}] {tool}", if approved { "ok" } else { "deny" });
+                }
+                AgentEvent::Usage { .. } => {}
+                AgentEvent::Utilization { .. } => {}
             }
-            AgentEvent::Usage { .. } => {}
-            AgentEvent::Utilization { .. } => {}
+        })
+        .await
+        {
+            Ok(r) => {
+                // Lock in this candidate's identity for the cost /
+                // ledger / health reconciliation below. Anything that
+                // returned Ok(run) — including non-success outcomes
+                // like `timeout` / `interrupted` / `failed` — must not
+                // be retried on another model (side effects may have
+                // already happened).
+                used_primary = model;
+                used_alias = alias;
+                break r;
+            }
+            Err(e) => {
+                // PRE-side-effect failure: feed the breaker so a
+                // broken alias/model is not selected again, then fall
+                // back to the next chain model if one remains.
+                // `run_agent_dispatch` only returns Err during
+                // pre-streaming setup (initialize, session/new,
+                // session/configure, session/prompt, hung socket
+                // during the budget-guarded read); once a frame is
+                // emitted the driver returns `Ok(AgentRun)` even on a
+                // torn turn, so we never reach this Err on a turn
+                // that may have edited files.
+                let provider_id_for_setup = link_provider
+                    .as_ref()
+                    .map(|p| p.id.clone())
+                    .unwrap_or_else(|| routed_provider.id.clone());
+                health.record_classified_failure(
+                    &model,
+                    &format!("agentic setup/turn failed: {e}"),
+                    &provider_id_for_setup,
+                    Classification::Error,
+                );
+                if !cli.quiet {
+                    eprintln!("[zoder] {model} failed before any output: {e}");
+                }
+                if last {
+                    save_health(&health);
+                    return Err(e);
+                }
+                skipped.insert(model);
+                continue;
+            }
         }
-    })
-    .await?;
+    };
     agentic::persist_agentic_counter(&routed_provider, agentic_usage.get());
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
@@ -5224,15 +5523,24 @@ pub(crate) async fn agentic_turn(
     // Skip the post-verify paid-gate check (the corpus_paid test
     // also implicitly assumes the daemon reported the actual billed model,
     // which we don't have here).
+    //
+    // CHAIN FALLBACK: the alias passed to `agentic_cost` is the WINNING
+    // candidate's alias, not the head's. The cost-scope directory was
+    // opened with the head's alias above (see `AgenticCostScope::start`
+    // comment), so a fallback to a different alias is a known minor
+    // accounting miss — closing it requires the engine to accept a
+    // scope key from the caller.
     let (cost, tokens_in, tokens_out, model_used, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             match cost_scope.and_then(|scope| scope.finish().ok()) {
-                Some((from, to, false)) => agentic_cost(&socket2, from, to, &alias, &primary).await,
-                Some((_, _, true)) | None => (0.0, 0, 0, primary.clone(), false, 1),
+                Some((from, to, false)) => {
+                    agentic_cost(&socket2, from, to, &used_alias, &used_primary).await
+                }
+                Some((_, _, true)) | None => (0.0, 0, 0, used_primary.clone(), false, 1),
             }
         }
-        EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false, 1),
+        EngineKind::Goose => (0.0, run.input_tokens, 0, used_primary.clone(), false, 1),
     };
 
     // Post-verify: the engine (via the agent alias) may have run a different —
@@ -5255,7 +5563,7 @@ pub(crate) async fn agentic_turn(
             paid_without_opt_in(
                 cli.allow_paid,
                 provider_cost_neutral,
-                &format!("agentic run (alias {alias})"),
+                &format!("agentic run (alias {used_alias})"),
                 &model_used,
                 model_used_paid,
                 cost_known.then_some(cost),
@@ -5269,6 +5577,10 @@ pub(crate) async fn agentic_turn(
         (Some(paid), None) => Some(paid.clone()),
         (None, unknown) => unknown,
     };
+    // Capture `violation` before it is moved into the ledger Entry below;
+    // the `TurnResult` carries it for the caller's fail-on-violation
+    // contract (see `cmd_exec_agentic` / `cmd_rescue` / `cmd_loop`).
+    let policy_violation = violation.clone();
 
     let ledger_entry = Entry {
         ts_utc: chrono::Utc::now(),
@@ -5314,12 +5626,17 @@ pub(crate) async fn agentic_turn(
         .real_provider_for_model(&eng.cfg, &model_used)
         .map(|p| p.id.clone())
         .unwrap_or_else(|| routed_provider.id.clone());
-    if run.succeeded() {
+    if run.succeeded() && policy_violation.is_none() {
         health.record_success(&model_used, elapsed_ms);
     } else {
+        let reason = if let Some(v) = &policy_violation {
+            format!("policy violation: {v}")
+        } else {
+            format!("turn did not complete: {}", run.outcome)
+        };
         health.record_classified_failure(
             &model_used,
-            &format!("turn did not complete: {}", run.outcome),
+            &reason,
             &provider_id_for_record,
             Classification::Error,
         );
@@ -5329,12 +5646,13 @@ pub(crate) async fn agentic_turn(
     Ok(TurnResult {
         run,
         model: model_used,
-        alias,
+        alias: used_alias,
         cost_usd: cost,
         cost_unknown: !cost_known,
         tokens_in,
         tokens_out,
         elapsed_ms,
+        policy_violation,
     })
 }
 
@@ -5409,6 +5727,15 @@ pub(crate) async fn cmd_exec_agentic(
                 t.model, t.alias, t.run.tool_calls, cost_label, t.elapsed_ms, t.run.outcome
             );
         }
+    }
+
+    // A free-policy violation must FAIL the command even when the turn itself
+    // "completed": the partial output above is preserved, but exiting success
+    // after unverified paid spend (without --allow-paid) defeats the gate.
+    // MR !1 finding: a violating run that returned Ok(turn) was previously
+    // silently swallowed; this is the explicit enforcement.
+    if let Some(v) = &t.policy_violation {
+        anyhow::bail!("agentic turn violated free policy (use --allow-paid to permit): {v}");
     }
 
     if !t.run.succeeded() {
