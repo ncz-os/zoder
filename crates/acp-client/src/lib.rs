@@ -10081,6 +10081,175 @@ mod mr1_reliability_regression {
         let _ = server.await;
         drop(dir);
     }
+
+    /// MR !1 finding: a turn that finishes RIGHT AT the wall-clock budget
+    /// (the engine sends `turn_complete` immediately after the driver has
+    /// sent `session/cancel`) MUST be classified as `outcome = "completed"`
+    /// rather than `outcome = "timeout"`. Pre-fix the cancel path did a
+    /// single bounded read that threw away any `turn_complete` /
+    /// `agent_message_chunk` that raced the deadline, mislabeling
+    /// successful turns as timeouts.
+    ///
+    /// We exercise the integration end-to-end:
+    ///   1. The drive deadline fires (`opts.timeout` elapses while the
+    ///      engine is mid-stream).
+    ///   2. The driver sends `session/cancel`.
+    ///   3. The engine responds with `session/update {type:
+    ///      "turn_complete"}` within the post-cancel settle window
+    ///      (SETTLE_BUDGET).
+    ///   4. The driver classifies the turn as `completed` and preserves
+    ///      the streamed content accumulated before the cancel.
+    ///
+    /// Test runtime is bounded by the pre-cancel stream length + a
+    /// short post-cancel pause, NOT by the full SETTLE_BUDGET — the
+    /// turn_complete arrives during the drain and breaks out early.
+    #[tokio::test]
+    async fn drive_returns_completed_when_turn_complete_races_deadline() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("mr1-drain.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        // Daemon: ack initialize / session/new / session/prompt,
+        // stream a couple of `agent_message_chunk` notifications
+        // (so the drive deadline has content to preserve), then
+        // hold the connection open without sending `turn_complete`.
+        // After the driver-side deadline fires, the daemon watches
+        // for the `session/cancel` frame and replies with
+        // `session/update {type: "turn_complete"}` to drive the
+        // post-cancel drain to a clean completion.
+        let server = tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let (rh, mut wh) = tokio::io::split(stream);
+            let mut r = tokio::io::BufReader::new(rh);
+            async fn reply(
+                wh: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+                v: serde_json::Value,
+            ) {
+                let mut s = serde_json::to_string(&v).unwrap();
+                s.push('\n');
+                let _ = wh.write_all(s.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+            let mut line = String::new();
+            // initialize
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}),
+            )
+            .await;
+            // session/new
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"new","result":{"session_id":"mr1-drain-1"}}),
+            )
+            .await;
+            // session/prompt
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({"jsonrpc":"2.0","id":"prompt","result":{}}),
+            )
+            .await;
+            // Stream a couple of chunks so the deadline has real
+            // content to preserve. Then HOLD the connection open
+            // (don't send turn_complete yet) so the drive deadline
+            // fires on the client side.
+            for chunk in ["partial-a", "partial-b"] {
+                reply(
+                    &mut wh,
+                    serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "type":"agent_message_chunk",
+                            "text":chunk
+                        }
+                    }),
+                )
+                .await;
+                // Small delay so the client actually receives the
+                // chunk before we hold the connection.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // Now wait for the client's session/cancel frame. The
+            // client's deadline will fire while we're parked here,
+            // and it'll send session/cancel — which we read and
+            // reply to with turn_complete so the drain settles
+            // cleanly.
+            let _ = r.read_line(&mut line).await;
+            line.clear();
+            reply(
+                &mut wh,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "method":"session/update",
+                    "params":{"type":"turn_complete","outcome":"completed"}
+                }),
+            )
+            .await;
+            // Hold briefly so the drain loop exits cleanly.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = wh.shutdown().await;
+        });
+        let mut opts = AgentOptions::new(
+            socket.clone(),
+            "mr1-test",
+            std::path::PathBuf::from("/tmp"),
+            "test prompt",
+        );
+        // Force the drive deadline to fire on the client side
+        // (~250ms) while the daemon is between chunks. The
+        // post-cancel settle drain runs for up to SETTLE_BUDGET
+        // (5s in production); here the daemon sends turn_complete
+        // immediately after the cancel so we exit early.
+        opts.timeout = std::time::Duration::from_millis(250);
+        // Total wall budget: timeout + SETTLE_BUDGET headroom for the
+        // drain (the daemon answers quickly so the test returns
+        // well under this cap).
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(8), run_agent(&opts, |_| {})).await;
+        let _ = server.await;
+        let run = res
+            .expect("drive must end within timeout + drain window, not hang")
+            .expect("drive must NOT return Err on a clean drain settle");
+        // The critical MR !1 assertion: a turn whose `turn_complete`
+        // raced the deadline ends as `completed`, not `timeout`.
+        assert_eq!(
+            run.outcome, "completed",
+            "a turn_complete raced the deadline and was drained cleanly; \
+             outcome MUST be 'completed', not 'timeout'; got: {:?}",
+            run.outcome
+        );
+        assert!(
+            run.succeeded(),
+            "completed outcome must report succeeded() == true; run={:?}",
+            run
+        );
+        // Streamed content accumulated before the cancel MUST survive
+        // — the partial output is exactly what the drain is for.
+        assert!(
+            run.content.contains("partial-a") && run.content.contains("partial-b"),
+            "streamed chunks accumulated before the deadline MUST survive \
+             into the final AgentRun.content; got: {:?}",
+            run.content
+        );
+        // session_id from session/new ack MUST survive too.
+        assert_eq!(
+            run.session_id, "mr1-drain-1",
+            "session_id from session/new ack must survive a cancel-drain turn; got: {:?}",
+            run.session_id
+        );
+        drop(dir);
+    }
 }
 
 #[cfg(test)]
