@@ -4004,6 +4004,25 @@ fn agentic_scope_directory(engine_socket: &Path, alias: &str) -> PathBuf {
 /// `[from, to)` and the agent alias. The boolean is false when the engine
 /// could not supply an authoritative result; callers must mark that ledger row
 /// unknown rather than treating the numeric placeholder as verified $0.
+///
+/// **Tracker-flush lag (MR !1 finding, issue #13 port).** The zeroclaw
+/// cost engine flushes its in-memory request buffer asynchronously after
+/// a turn completes, so a `cost/query` issued immediately after a turn
+/// can legitimately return an empty `by_model` for a brief window (a
+/// few hundred ms in practice; longer under load). To ride this out
+/// without abandoning the free-gate's `known == true` fast path, the
+/// query is retried with backoff on the *transport-failure* arm — a
+/// daemon that answered once and then went away, or a write that
+/// EAGAIN'd on a momentarily-busy socket, is a TRANSIENT failure worth
+/// retrying. An empty-but-successful response (`Ok` with no rows) is
+/// NOT retried: a `by_model`-empty `CostSummary` is the engine's
+/// authoritative statement that the window holds no entries, and
+/// re-asking will keep returning the same authoritative emptiness
+/// (wasting a roundtrip while the ledger row waits). After
+/// `AGENTIC_COST_MAX_ATTEMPTS` transport failures, the boolean
+/// returned alongside the cost is `false` and the caller (the
+/// agentic-turn path) records a policy violation under the free guard
+/// — the same default-deny path a paid engine model already takes.
 async fn agentic_cost(
     socket: &std::path::Path,
     from: chrono::DateTime<chrono::Utc>,
@@ -4011,11 +4030,48 @@ async fn agentic_cost(
     alias: &str,
     fallback_model: &str,
 ) -> (f64, u64, u64, String, bool, u64) {
-    match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
-        Ok(sum) => classify_agentic_cost_summary(&sum, fallback_model),
-        Err(_) => (0.0, 0, 0, fallback_model.to_string(), false, 1),
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..AGENTIC_COST_MAX_ATTEMPTS {
+        match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
+            Ok(sum) => return classify_agentic_cost_summary(&sum, fallback_model),
+            Err(e) => {
+                last_err = Some(e);
+                // Don't sleep after the final attempt — the next call
+                // site (the reconciliation) is already preparing a
+                // policy-violation ledger row on the path where we
+                // return the unknown tuple, and an extra sleep here
+                // would only delay the operator-visible diagnostic.
+                if attempt + 1 < AGENTIC_COST_MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                }
+            }
+        }
     }
+    // Every attempt was a transport failure (connect / read / timeout /
+    // decode). Surface the last error in the trace so a maintainer
+    // running with `RUST_LOG=debug` can see the failure mode; the
+    // caller does NOT see it (the boolean carries the only signal it
+    // needs to mark the ledger row as `cost_unknown`).
+    if let Some(e) = &last_err {
+        tracing::debug!(
+            attempts = AGENTIC_COST_MAX_ATTEMPTS,
+            error = %e,
+            "agentic_cost exhausted retries; returning unknown"
+        );
+    }
+    (0.0, 0, 0, fallback_model.to_string(), false, 1)
 }
+
+/// Maximum number of `cost/query` attempts `agentic_cost` will make
+/// before giving up and returning the unknown tuple. 3 is the
+/// MR !1 port: 1 initial + 2 retries with exponential backoff
+/// (`backoff_delay` 0..2, base 500ms capped at 16s with ±20% jitter).
+/// The total wall-clock budget is bounded by `3 * QUERY_TIMEOUT + sum
+/// of backoffs` ≈ 15s + ~3s in the worst case — well within the
+/// agentic-turn outer watchdog and small enough that a real
+/// transport failure surfaces promptly rather than masking the error
+/// as `cost_unknown` for any longer.
+const AGENTIC_COST_MAX_ATTEMPTS: u32 = 3;
 
 fn classify_agentic_cost_summary(
     sum: &zoder_core::EngineCostSummary,
@@ -4227,6 +4283,197 @@ mod agentic_cost_tests {
 
         let second = AgenticCostScope::start(&ledger, "codex").unwrap();
         assert!(!second.finish().unwrap().2);
+    }
+
+    /// MR !1 finding (issue #13 port): `agentic_cost` must retry the
+    /// `cost/query` roundtrip a small number of times (3 total attempts
+    /// with exponential backoff) to ride out the zeroclaw cost
+    /// engine's in-memory tracker flush lag. A turn that completes and
+    /// immediately triggers `cost/query` can legitimately see an
+    /// empty `by_model` because the engine hasn't flushed yet — but a
+    /// TRANSPORT failure (connect / read EAGAIN / timeout) on the
+    /// first attempt is worth retrying before we mark the ledger row
+    /// `cost_unknown` and fail-closed the turn under the free guard.
+    ///
+    /// This test drives a fake cost-engine Unix-socket that
+    /// intentionally drops the first 2 connections, then on the 3rd
+    /// accepts and replies with a real `cost/query` response. The
+    /// call MUST return `known = true` (not the unknown tuple) — the
+    /// 3x retry budget was enough to ride out the brief unavailability
+    /// and the authoritative answer is the 3rd response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agentic_cost_retries_then_succeeds_on_third_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mr1-cost-flaky.sock");
+        let listener = Arc::new(UnixListener::bind(&socket).expect("bind cost socket"));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_server = attempts.clone();
+
+        // Fake cost engine: drop the first 2 connections without
+        // responding to the `initialize` frame, then on the 3rd
+        // attempt honor the full `initialize` + `cost/query` exchange
+        // and return a real `EngineCostSummary` payload with one
+        // model priced at $0.25.
+        //
+        // **Why we close the listener after the 3rd response.**
+        // `agentic_cost` will retry up to 3 times on a transport
+        // failure. The 3rd attempt here succeeds (real payload
+        // returned), so `agentic_cost` will return without making a
+        // 4th attempt. After the 3rd response we drop the listener
+        // and exit the accept loop, so the test can join cleanly
+        // (otherwise the spawned server would block forever on
+        // `accept()` waiting for a 4th connection that will never
+        // come).
+        let listener_for_server = listener.clone();
+        let server = tokio::spawn(async move {
+            for n in 0..3_usize {
+                let (stream, _) = match listener_for_server.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                attempts_for_server.store(n, Ordering::SeqCst);
+                if n < 2 {
+                    // Drop: close the socket without responding. The
+                    // client's `read_line` returns 0 (EOF) which
+                    // `fetch_engine_cost` maps to an Err.
+                    drop(stream);
+                    continue;
+                }
+                let (rh, mut wh) = tokio::io::split(stream);
+                let mut r = BufReader::new(rh);
+                let mut line = String::new();
+                // initialize
+                let _ = r.read_line(&mut line).await;
+                line.clear();
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": "nvz-init", "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = wh.write_all(s.as_bytes()).await;
+                let _ = wh.flush().await;
+                // cost/query
+                let _ = r.read_line(&mut line).await;
+                line.clear();
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "nvz-cost",
+                    "result": {
+                        "session_cost_usd": 0.25,
+                        "request_count": 2,
+                        "by_model": {
+                            "test-model": {
+                                "model": "test-model",
+                                "cost_usd": 0.25,
+                                "input_tokens": 10,
+                                "output_tokens": 5,
+                                "total_tokens": 15,
+                                "request_count": 2
+                            }
+                        }
+                    }
+                });
+                let mut s = serde_json::to_string(&body).unwrap();
+                s.push('\n');
+                let _ = wh.write_all(s.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+        });
+
+        let from = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let to = chrono::Utc::now();
+        // The agentic_cost call now has to make exactly 3 attempts:
+        // the 3rd one returns the real payload. The outer test
+        // guards with a wall-clock budget so a hang in
+        // agentic_cost's retry loop fails fast (the upper bound is
+        // 3 * 5s query timeout + ~1.5s backoffs = ~16.5s; 25s is a
+        // generous CI margin).
+        let call = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            agentic_cost(&socket, from, to, "codex", "fallback-model"),
+        );
+        let (cost, tin, tout, model, known, calls) = call.await.expect(
+            "agentic_cost must converge within the retry budget (3 attempts with backoff); \
+             25s wall clock budget is the upper bound",
+        );
+        // Stop accepting new connections; the server will exit its
+        // accept loop on its next iteration.
+        drop(listener);
+        let _ = server.await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the server must have observed at least n=0,1 (drops) and n=2 (response); \
+             last observed n must be 2 (i.e. 3 attempts total). got last n={}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert!(
+            known,
+            "the 3rd attempt must return a known cost (transport-failure retry contract); \
+             got tuple (cost={cost}, tin={tin}, tout={tout}, model={model:?}, known={known}, calls={calls})"
+        );
+        assert_eq!(cost, 0.25);
+        assert_eq!(model, "test-model");
+        assert_eq!(tin, 10);
+        assert_eq!(tout, 5);
+        assert_eq!(calls, 2);
+    }
+
+    /// MR !1 finding (issue #13 port): `agentic_cost` must NOT loop
+    /// forever chasing a permanently broken daemon. After
+    /// `AGENTIC_COST_MAX_ATTEMPTS` transport failures, the call returns
+    /// the unknown tuple (`known = false`) so the caller can mark the
+    /// ledger row `cost_unknown` and fail-closed the turn under the
+    /// free guard. Pre-fix the absence of a retry budget meant a
+    /// flaky daemon (or a tracker that hadn't flushed in time AND
+    /// then crashed) could pin the agentic-turn reconciliation in
+    /// repeated retries without ever surfacing the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agentic_cost_returns_unknown_after_exhausted_retries() {
+        use std::sync::Arc;
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mr1-cost-dead.sock");
+        let listener = Arc::new(UnixListener::bind(&socket).expect("bind cost socket"));
+        let listener_for_server = listener.clone();
+        // Server: accept and immediately close each of the 3 connections
+        // the client will make, then drop the listener so the test
+        // can join cleanly.
+        let server = tokio::spawn(async move {
+            for _ in 0..AGENTIC_COST_MAX_ATTEMPTS {
+                let Ok((stream, _)) = listener_for_server.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+        let from = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let to = chrono::Utc::now();
+        // 20s wall clock budget: 3 attempts * 5s `QUERY_TIMEOUT` + the
+        // 2 backoffs (~1.5s). The test MUST converge well within 20s;
+        // a hang here would be a regression of the retry-budget
+        // contract.
+        let call = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agentic_cost(&socket, from, to, "codex", "fallback-model"),
+        );
+        let (cost, tin, tout, _model, known, _calls) = call
+            .await
+            .expect("agentic_cost must converge within the retry budget (3 attempts with backoff)");
+        drop(listener);
+        let _ = server.await;
+        assert!(
+            !known,
+            "exhausted retries must return known=false; got known=true (cost={cost}, tin={tin}, tout={tout})"
+        );
+        assert_eq!(cost, 0.0);
+        assert_eq!((tin, tout), (0, 0));
     }
 }
 
