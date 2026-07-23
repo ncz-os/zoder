@@ -1,3 +1,11 @@
+# ⚠️ This is a mirror — the canonical repo lives on GitLab
+
+### 👉 https://gitlab.com/ncz-os/zoder
+
+**Source, releases, issues, merge requests, and CI all live on GitLab.** This GitHub copy is a read-only mirror and may lag. Please file issues and get releases there.
+
+---
+
 # zoder
 
 <p align="center"><img src="docs/img/zoder-logo.png" alt="zoder — pair code · dispatch · remember" width="380"></p>
