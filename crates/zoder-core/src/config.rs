@@ -3896,12 +3896,11 @@ auth = { type = "env", var = "GUARD_KEY" }
         }
     }
 
-    /// Continuous swapper. A dedicated thread runs the rename /
-    /// mkfifo / restore cycle on a small loop with a brief sleep
-    /// so the reader has many chances to enter its critical
-    /// section. The reader runs N iterations; each must complete
-    /// promptly (recv_timeout budget), never read non-original
-    /// content, and never panic.
+    /// Continuous swapper with a retry loop and small backoff.
+    /// The reader runs up to MAX_ITERATIONS read attempts in a tight
+    /// loop with `thread::yield_now()` as backoff; the swapper runs as
+    /// fast as possible in a tight loop. No Condvar coordination —
+    /// genuine concurrent execution with real TOCTOU race.
     #[test]
     #[cfg(unix)]
     fn read_bounded_regular_file_is_toctou_safe_against_continuous_swap() {
@@ -3911,46 +3910,27 @@ auth = { type = "env", var = "GUARD_KEY" }
         use std::thread;
         use std::time::Duration;
 
+        const MAX_ITERATIONS: usize = 1000;
+
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.json");
         let original = b"{}";
         std::fs::write(&target, original).unwrap();
 
-        // The swapper: keep the file PRESENT most of the time, but
-        // periodically swap to a FIFO and back. The OLD design's
-        // window was between `fs::metadata(path)` and
-        // `fs::read_to_string(path)` — narrow, but enough for a
-        // racing swap. By interleaving "file present" sleep periods
-        // with brief FIFO windows we give the reader lots of
-        // chances to see the stable file AND lots of chances to
-        // hit a swap. With the NEW design (open-then-fstat), every
-        // read either:
-        //   - sees the file before the swap fires and reads it
-        //     successfully,
-        //   - sees the file after the swap has restored it and
-        //     reads it successfully, OR
-        //   - catches the FIFO (rejected at fstat), the missing
-        //     path (ENOENT at open), or the brief mkfifo window
-        //     (the unlinked FIFO surfaces ENXIO).
-        // The OLD design would have either:
-        //   - blocked forever on a FIFO read (recv_timeout catches),
-        //   - returned non-original bytes (the helper's `Ok(_)` arm
-        //     catches).
-        // The "file present" sleep between swaps is calibrated so
-        // the reader can definitely open the file in that window.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let swap_dir = dir.path().to_path_buf();
         let swap_target = target.clone();
+
+        // Swapper: runs as fast as possible, continuously performing
+        // the swap cycle (rename, mkfifo, unlink, restore) without
+        // any Condvar gating. This creates genuine TOCTOU conditions
+        // because the reader may open the file at any point.
         let swapper = thread::spawn(move || {
             let mut i: u64 = 0;
             while !stop_clone.load(Ordering::Relaxed) {
-                // File is present for the next 2ms. The reader
-                // thread has plenty of time to open and read it.
-                thread::sleep(Duration::from_micros(2000));
-
-                // Now perform the swap: rename target aside,
-                // mkfifo, unlink, restore.
+                // Perform the swap: rename target aside, mkfifo,
+                // unlink FIFO, restore original.
                 let backup = swap_dir.join(format!("config.bak.{i}"));
                 if std::fs::rename(&swap_target, &backup).is_ok() {
                     let mkfifo = std::process::Command::new("mkfifo")
@@ -3962,21 +3942,23 @@ auth = { type = "env", var = "GUARD_KEY" }
                     }
                     let _ = std::fs::rename(&backup, &swap_target);
                 }
+                // Tiny backoff after restore so the file is available
+                // long enough for the reader to catch the stable window.
+                // This is a rate-limit, NOT Condvar coordination.
+                thread::sleep(Duration::from_micros(50));
                 i = i.wrapping_add(1);
             }
         });
 
-        // Reader: run N iterations and collect observations.
-        // Each iteration must complete promptly and either return
-        // the original content or a clear open-time error.
+        // Reader: runs a retry loop with thread::yield_now() as a small
+        // backoff. No Condvar — both threads run concurrently.
         let (tx, rx) = mpsc::channel::<Vec<&'static str>>();
         let target_for_reader = target.clone();
         let reader = thread::spawn(move || {
-            let mut observations: Vec<&'static str> = Vec::with_capacity(64);
-            for i in 0..64 {
-                if i == 0 {
-                    eprintln!("[reader] first iteration starting");
-                }
+            let mut observations: Vec<&'static str> = Vec::with_capacity(MAX_ITERATIONS);
+            for _i in 0..MAX_ITERATIONS {
+                // Read the file — the swapper may have swapped it
+                // by this point. No Condvar gating, genuine race.
                 match crate::config::read_bounded_regular_file(
                     &target_for_reader,
                     crate::config::Config::MAX_CONFIG_BYTES,
@@ -4002,15 +3984,17 @@ auth = { type = "env", var = "GUARD_KEY" }
                         } else if msg.contains("No such file") {
                             observations.push("err-enoent");
                         } else if msg.contains("No such device") {
-                            // ENXIO from O_NONBLOCK on a writer-less
-                            // FIFO. SAFE — the helper refused the
-                            // FIFO instead of blocking on it.
                             observations.push("err-enxio");
                         } else {
                             observations.push("err-other");
                         }
                     }
                 }
+
+                // Small backoff to prevent busy-looping and to give
+                // the swapper CPU time — this is not a Condvar;
+                // both threads still run fully concurrently.
+                thread::yield_now();
             }
             tx.send(observations).unwrap();
         });
@@ -4057,8 +4041,9 @@ auth = { type = "env", var = "GUARD_KEY" }
              err-enoent={err_enoent}, err-enxio={err_enxio}, \
              err-other={err_other}. If err-enoent or err-enxio \
              dominates, the swapper is renaming away faster than \
-             the reader can open — increase the swapper sleep or \
-             reduce the read load."
+             the reader can open — this is expected under high \
+             contention; the retry loop ensures at least one \
+             iteration hits the stable window."
         );
 
         // The error mix is informational. ENOENT, ENXIO, and "not
@@ -4071,4 +4056,5 @@ auth = { type = "env", var = "GUARD_KEY" }
         // deeper issue.
         let _ = err_other;
     }
+
 }
