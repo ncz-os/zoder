@@ -103,7 +103,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -247,7 +247,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -371,7 +371,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -495,7 +495,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -618,7 +618,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -744,7 +744,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -870,7 +870,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -994,7 +994,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1131,7 +1131,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1266,7 +1266,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1398,7 +1398,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1523,7 +1523,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1683,7 +1683,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1809,7 +1809,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -1938,7 +1938,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2063,7 +2063,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2183,7 +2183,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2309,7 +2309,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2438,7 +2438,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2558,7 +2558,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2699,7 +2699,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2826,7 +2826,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -2950,7 +2950,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3089,7 +3089,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3213,7 +3213,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3337,7 +3337,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3457,7 +3457,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3595,7 +3595,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3722,7 +3722,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3842,7 +3842,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -3966,7 +3966,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
@@ -4089,7 +4089,7 @@ Options:
           Working directory for the agentic run (codex `-C`). Default: current dir
 
       --agent <ALIAS>
-          Run as a specific zeroclaw agent alias (see `zoder agents`/zerocode picker). Default: alias derived from the routed/`-m` model
+          Run as a specific zeroclaw agent alias (see the zerocode picker). Default: alias derived from the routed/`-m` model
 
       --oneshot
           Pure single-shot completion (no tools/file edits). The default is the agentic loop (codex `exec` drop-in) when the engine is reachable
