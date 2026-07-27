@@ -46,11 +46,11 @@ Commands:
   run                 Headless agentic run (goose `run` equivalent): execute a task to completion without the UI. Honors `-C`, `--agent`, `-m`, `--approve`
   recipe              Saved prompt/agent templates (goose `recipe` equivalent)
   mcp                 List MCP extensions/servers configured in the engine (goose extensions)
+  sop                 Standard Operating Procedure (SOP) workflow: drive a structured runbook against the local zeroclaw engine's `sops/*` RPC surface. SOPs are the documented way to execute a multi-step procedure (init → advance → decide → complete) with a consistent, machine- addressable contract. This subcommand family is a thin wrapper: parse args, call the matching `sops/list`, `sops/run`, `sops/ runs`, `sops/decide`, or `sops/graph` method on the local zeroclaw engine, and print a clean result (table for list, plain status for run / status, confirmation for decide, step graph for graph)
   configure           Show/validate/edit configuration (goose `configure` equivalent)
   mcp-server          Run the local MCP server over stdio. This is the same server as the standalone `zoder-mcp-server` binary, including routing and SOP tools. Global routing/agent flags do not affect the server protocol
   completions         Generate shell completions (bash|zsh|fish|powershell|elvish)
   gate                Run the CI-parity gate against the current repo (or `--root DIR`). Detects ecosystems (Rust/Node/Python/Go), derives a plan from the repo's marker files + baseline OSS-hygiene defaults, runs it under the managed-tool bundle (cargo-deny, cargo-audit, osv-scanner, gitleaks, cyclonedx, govulncheck, pip-audit), and prints the honest-degradation GateReport. The default mode is `strict` (fail-closed); `--local-iterate` records skips instead of failing (use only for inner-loop speed; never to bypass the gate). Exits 0 only when the gate is Green. See `docs/CI-PARITY-GATE.md`
-  sop                 SOP (Standard Operating Procedure) graph monitor: read-only CLI visibility into the local zeroclaw engine's SOP graph + per-run overlay state. Subcommands: `graph <run-id>`. Talks to the engine over the same Unix-socket JSON-RPC surface every other engine command uses; never mutates the run
   help                Print this message or the help of the given subcommand(s)
 
 Arguments:
@@ -3647,13 +3647,17 @@ Options:
 
 zoder sop:
 
-SOP (Standard Operating Procedure) graph monitor: read-only CLI visibility into the local zeroclaw engine's SOP graph + per-run overlay state. Subcommands: `graph <run-id>`. Talks to the engine over the same Unix-socket JSON-RPC surface every other engine command uses; never mutates the run
+Standard Operating Procedure (SOP) workflow: drive a structured runbook against the local zeroclaw engine's `sops/*` RPC surface. SOPs are the documented way to execute a multi-step procedure (init → advance → decide → complete) with a consistent, machine- addressable contract. This subcommand family is a thin wrapper: parse args, call the matching `sops/list`, `sops/run`, `sops/ runs`, `sops/decide`, or `sops/graph` method on the local zeroclaw engine, and print a clean result (table for list, plain status for run / status, confirmation for decide, step graph for graph)
 
 Usage: zoder sop [OPTIONS] <COMMAND>
 
 Commands:
-  graph  Show the SOP step graph and current run overlay for a given run id
-  help   Print this message or the help of the given subcommand(s)
+  list    List the SOPs registered with the local zeroclaw engine
+  run     Start a new SOP run. `<name>` is the SOP identifier (as it appears in `sop list`); `--payload` carries the runbook inputs and accepts either an inline JSON object (`--payload '{"k":1}'`) or a path to a JSON file (`--payload ./payload.json`). The payload is forwarded as `params.payload` on `sops/run`; the engine returns a `run_id` that is printed to stdout
+  status  Show the current status of one or more SOP runs. Pass zero `<run-id>`s to read the full runs list; pass one or more to fetch each named run. The `--json` flag emits the raw engine response. Output is plain (one record per id, plus a one-line header) — not a table, because individual SOP runs vary in shape and a table would force a lossy projection
+  decide  Submit an operator decision for a SOP run that is paused awaiting input. `<decision>` is forwarded verbatim to the engine; the contract for valid decisions (approve/reject/skip + optional reason) is documented per-SOP in the engine
+  graph   Show the SOP step graph and current run overlay for a given run id
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -m, --model <MODEL>
