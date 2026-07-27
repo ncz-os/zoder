@@ -57,7 +57,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -187,7 +187,7 @@ Options:
           
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --scope <SCOPE>
           Possible values:
@@ -325,7 +325,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -449,7 +449,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -569,7 +569,7 @@ Usage: zoder config [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --validate
           Exit non-zero if the configuration is invalid
@@ -695,7 +695,7 @@ Options:
           Open the config file in $EDITOR
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -821,7 +821,7 @@ Options:
           Restrict to free/routable models (routable already implies free; this is an explicit, visible filter)
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --limit <LIMIT>
           Show at most N rows
@@ -948,7 +948,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1074,7 +1074,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
@@ -1205,7 +1205,7 @@ Usage: zoder gate [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --root <DIR>
           Repo root to gate (default: current working directory)
@@ -1340,7 +1340,7 @@ Usage: zoder health [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --probe
           Actively ping every free model and record the result
@@ -1477,7 +1477,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1604,7 +1604,7 @@ Options:
           Read the task/instructions from a file instead of args
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --max-iters <MAX_ITERS>
           Maximum author/review iterations before giving up
@@ -1763,7 +1763,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1886,7 +1886,7 @@ Options:
           
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --paid
           
@@ -2017,7 +2017,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2137,7 +2137,7 @@ Usage: zoder providers [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2263,7 +2263,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2392,7 +2392,7 @@ Options:
           [default: 14]
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2512,7 +2512,7 @@ Usage: zoder refresh [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2642,7 +2642,7 @@ Options:
           Custom trailing window in days (overrides the period argument)
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2780,7 +2780,7 @@ Options:
           Run detached as a tracked background job
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2904,7 +2904,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3027,7 +3027,7 @@ Options:
           Base ref for branch review (e.g. `main`); implies branch scope
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --scope <SCOPE>
           Review scope: auto | working-tree | branch
@@ -3167,7 +3167,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3291,7 +3291,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3411,7 +3411,7 @@ Usage: zoder sessions [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3537,7 +3537,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
@@ -3676,7 +3676,7 @@ Options:
           Include jobs from all working directories
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3796,7 +3796,7 @@ Usage: zoder transfer [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3920,7 +3920,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4043,7 +4043,7 @@ Options:
           Only report whether a newer release exists; do not install
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). Use `--agent <alias>` to choose the model directly
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
