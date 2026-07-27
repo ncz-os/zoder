@@ -544,6 +544,23 @@ the GitLab package registry: <https://gitlab.com/ncz-os/zoder/-/packages>
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `aarch64-apple-darwin` (Apple Silicon). Windows → use WSL.
 
+### Debian / Ubuntu (apt)
+
+Tagged releases publish `amd64` and `arm64` packages to the NCZ APT registry, so
+zoder upgrades with the rest of the system:
+
+```bash
+curl -fsSL https://packages.buildkite.com/ncz-os/ncz/gpgkey \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/ncz-os-ncz.gpg
+echo "deb [signed-by=/etc/apt/keyrings/ncz-os-ncz.gpg] https://packages.buildkite.com/ncz-os/ncz/any/ any main" \
+  | sudo tee /etc/apt/sources.list.d/ncz-os-ncz.list
+sudo apt-get update && sudo apt-get install zoder
+```
+
+The package carries the `zoder` CLI only; `zerocode` and `zeroclaw` come from
+`install.sh` or the container image. Packaging and publishing details are in
+[`packaging/deb/README.md`](packaging/deb/README.md).
+
 ### Container (Docker)
 
 The full stack (zoder + zerocode + zeroclaw + goose) ships as a multi-arch image
