@@ -240,7 +240,11 @@ struct Cli {
     prompt: Option<String>,
 
     // ---- routing / cost (zoder additions) ----
-    /// Force a specific model id (skips routing).
+    /// Pin a model id: skips routing and selects the matching agent.
+    /// On the zeroclaw engine the model that actually runs is the one the
+    /// selected agent's provider is configured with, so a pin that maps to an
+    /// unintended agent runs a different model (a warning is printed when that
+    /// happens). Use `--agent <alias>` to choose the model directly.
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
@@ -3696,6 +3700,34 @@ fn zeroclaw_model_override() -> Option<String> {
     None
 }
 
+/// Warn when an explicit `-m` pin is NOT the model the engine actually ran.
+///
+/// On the zeroclaw path `-m` does not select the model. `zeroclaw_model_override`
+/// is deliberately `None` (sending `session/configure { model }` strips tools),
+/// so the executed model is whatever the chosen AGENT's provider is configured
+/// with, and the agent is chosen by [`resolve_agent_alias`]'s substring table.
+/// When that table maps the pin somewhere unintended the two silently diverge:
+/// `-m MiniMax-M3` matches the `"minimax"` needle, selects the LOCAL `minimax`
+/// alias, and runs `minimax-m2.7` instead. Cost/routing are pre-gated on the
+/// pin while a different model does the work.
+///
+/// Returns `None` when no explicit pin was given (an auto-routed chain is
+/// *expected* to resolve elsewhere and must stay quiet), or when the two agree
+/// case-insensitively — engines echo their own casing (`MiniMax-M3` vs
+/// `minimax-m3`), and warning on that alone would be pure noise.
+fn pinned_model_divergence(pinned: Option<&str>, executed: &str) -> Option<String> {
+    let pinned = pinned?;
+    if pinned.eq_ignore_ascii_case(executed) {
+        return None;
+    }
+    Some(format!(
+        "[zoder] WARNING: -m {pinned} did not take effect — the engine ran {executed}. \
+         On the zeroclaw engine `-m` pins routing/cost and picks the AGENT; the model \
+         actually run is the one that agent's provider is configured with. \
+         Use `--agent <alias>` to choose the model directly."
+    ))
+}
+
 /// Map a model id to a renamed zeroclaw agent alias (the model-named aliases the
 /// TUI picker shows). Falls back to the strongest coding alias. `--agent` wins.
 fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
@@ -5234,6 +5266,17 @@ pub(crate) async fn agentic_turn(
         }
         EngineKind::Goose => (0.0, run.input_tokens, 0, primary.clone(), false, 1),
     };
+
+    // That divergence is invisible to the operator: the banner prints the
+    // engine-reported model, so a pin that silently went somewhere else looks
+    // like a normal run. Say so explicitly — a mis-mapped `-m` was twice
+    // misdiagnosed as a credential and then a model-resolution failure.
+    // Suppressed under --quiet; stderr keeps `--json` stdout parseable.
+    if !cli.quiet {
+        if let Some(warning) = pinned_model_divergence(cli.model.as_deref(), &model_used) {
+            eprintln!("{warning}");
+        }
+    }
 
     // Post-verify: the engine (via the agent alias) may have run a different —
     // possibly paid — model than the one pre-gated above (the daemon resolves
@@ -10655,6 +10698,50 @@ mod model_selection_tests {
     ///   by `resolve_chain` MUST lead with the per-agent pin, not with
     ///   `primary_model` — the engine receives the chain head, so a
     ///   mismatch here is the exact regression.
+    /// Reproduced on TYDEUS 2026-07-27: `zoder exec -m MiniMax-M3` printed
+    /// `[zoder] minimax-m2.7 via minimax ... [failed]`. `resolve_agent_alias`
+    /// lowercases the pin to `minimax-m3`, the FIRST substring needle
+    /// (`"minimax"`) matches, and the local swap-slot `minimax` alias wins —
+    /// so the engine ran that agent's configured `minimax-m2.7`.
+    #[test]
+    fn diverged_pin_warns_naming_both_models() {
+        let warning = pinned_model_divergence(Some("MiniMax-M3"), "minimax-m2.7")
+            .expect("a pin the engine did not honor must warn");
+        assert!(warning.contains("MiniMax-M3"), "names the pin: {warning}");
+        assert!(
+            warning.contains("minimax-m2.7"),
+            "names what ran: {warning}"
+        );
+        assert!(
+            warning.contains("--agent"),
+            "points at the flag that does work: {warning}"
+        );
+    }
+
+    /// Also reproduced live: `--agent minimax-m3-cloud -m qwen122b` completed
+    /// on MiniMax-M3, with `-m` having had no effect whatsoever.
+    #[test]
+    fn pin_ignored_because_agent_flag_won_still_warns() {
+        assert!(pinned_model_divergence(Some("qwen122b"), "MiniMax-M3").is_some());
+    }
+
+    /// Engines echo their own casing; warning on that alone would be noise on
+    /// every successful pinned run.
+    #[test]
+    fn pin_matching_case_insensitively_is_not_a_divergence() {
+        assert_eq!(
+            pinned_model_divergence(Some("MiniMax-M3"), "minimax-m3"),
+            None
+        );
+    }
+
+    /// No `-m` means auto-routing chose the model, which is expected to differ
+    /// from any particular id — this path must stay silent.
+    #[test]
+    fn auto_routed_run_without_a_pin_never_warns() {
+        assert_eq!(pinned_model_divergence(None, "minimax-m2.7"), None);
+    }
+
     #[test]
     fn primary_agent_model_overrides_primary_model_in_config() {
         let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
