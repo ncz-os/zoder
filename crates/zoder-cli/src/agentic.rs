@@ -791,6 +791,7 @@ async fn dispatch_reviewer_for_model(
     user: &str,
     max_tokens: u32,
 ) -> Result<Completion, ReviewerError> {
+    let started = std::time::Instant::now();
     let eng = match Engine::load() {
         Ok(eng) => eng,
         Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
@@ -979,6 +980,31 @@ async fn dispatch_reviewer_for_model(
         return Err(ReviewerError::fatal(format!(
             "policy check during reviewer turn: {e}"
         )));
+    }
+
+    // MR !1 finding (issue #13 port): reviewer/panel completions feed the
+    // breaker — SUCCESS path too, not only failure. Without this, a
+    // reviewer model that always succeeds would never update the
+    // health store and the breaker signal on it would never refresh;
+    // conversely, a model that succeeded once but later degraded
+    // would not have its recent latency reflected on the next routing
+    // decision. `reconcile_policy_checked_turn` already records the
+    // FAILURE path on a policy violation; here we record the SUCCESS
+    // path. Persist under a `mutate_locked`-equivalent atomic save so
+    // concurrent panel reviewers don't lose updates (mirrors the Y-8 /
+    // C4-MH1 fix for the failure path).
+    //
+    // A returned Err from `health.save()` is non-fatal: we already
+    // emitted the result upstream, and a stale breaker signal is
+    // recoverable on the next call. The previous MR !1 shape used a
+    // bare `eprintln!` warning here, which we preserve verbatim.
+    let elapsed_ms = started.elapsed().as_millis() as f64;
+    if let Err(e) = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+        h.record_success(model, elapsed_ms);
+    }) {
+        eprintln!(
+            "zoder: warning: failed to persist reviewer health store (success for {model}): {e}"
+        );
     }
 
     Ok(Completion {
@@ -2750,6 +2776,13 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
         );
     }
 
+    // A free-policy violation fails the rescue even on a completed turn:
+    // partial artifacts above are preserved, but we must not exit success
+    // after unverified paid spend without --allow-paid. MR !1 finding.
+    if let Some(v) = &t.policy_violation {
+        anyhow::bail!("rescue violated free policy (use --allow-paid to permit): {v}");
+    }
+
     if !ok {
         anyhow::bail!("rescue ended: {}", t.run.outcome);
     }
@@ -3811,6 +3844,21 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         .await
         {
             Ok(t) => {
+                // MR !1 finding: a free-policy violation must STOP the
+                // loop, not just be logged. Continuing would keep
+                // spending paid money turn after turn without
+                // --allow-paid. The partial artifacts are preserved
+                // (the engine already wrote them), but the loop exits
+                // nonzero with a clear "use --allow-paid" hint. We
+                // check this BEFORE recording the session id or
+                // incrementing `total_cost` — a violating turn does
+                // not extend the loop's bookkeeping as if it were a
+                // legitimate iteration.
+                if let Some(v) = &t.policy_violation {
+                    anyhow::bail!(
+                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
+                    );
+                }
                 session = Some(t.run.session_id.clone());
                 total_cost += t.cost_usd;
                 Some(t)
@@ -6038,6 +6086,7 @@ must reap the direct shell on the timeout branch)"
                 tokens_in: 0,
                 tokens_out: 0,
                 elapsed_ms: 0.0,
+                policy_violation: None,
             })
         };
         let res = author_phase_with_cancel(5, true, turn_fut, cancel_fut, settled_fut).await;
@@ -6472,6 +6521,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         };
         let turn_some: Option<crate::TurnResult> = Some(non_completed);
 
@@ -6534,6 +6584,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         });
         assert!(!turn_is_dead(&turn));
     }
@@ -6560,6 +6611,7 @@ not run to max_iters"
                 tokens_in: 0,
                 tokens_out: 0,
                 elapsed_ms: 0.0,
+                policy_violation: None,
             };
             assert!(
                 turn_is_dead(&Some(turn)),
@@ -6584,6 +6636,7 @@ not run to max_iters"
             tokens_in: 0,
             tokens_out: 0,
             elapsed_ms: 0.0,
+            policy_violation: None,
         }
     }
 
@@ -7863,6 +7916,95 @@ mod loop_resolution_tests {
     }
 }
 
+// =============================================================================
+// MR !1 reliability-fix regression tests (issue #13 port):
+// `TurnResult::policy_violation` + the loop/rescue `bail` contract.
+//
+// The agentic `policy_violation` field carries the free-gate failure
+// reason for a completed-but-violating turn. The loop and rescue
+// callers MUST surface it as a non-success exit (not just log it);
+// without this, a violating turn could complete AND exit success
+// without `--allow-paid`. The pre-fix behavior was exactly that: the
+// ledger/health recorded the violation, but `agentic_turn` still
+// returned `Ok(TurnResult)` and the CLI commands exited 0.
+// =============================================================================
+#[cfg(test)]
+mod mr1_policy_violation_tests {
+    fn turn_with_policy_violation(reason: &str) -> crate::TurnResult {
+        crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s".into(),
+                outcome: "completed".into(),
+                content: "partial output preserved for the operator".into(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+            policy_violation: Some(reason.to_string()),
+        }
+    }
+
+    /// A `TurnResult` with a `policy_violation` MUST NOT be treated as
+    /// succeeded — even though `run.outcome == "completed"` (the
+    /// engine finished the work, just on a paid / unverified model).
+    /// `AgentRun::succeeded` ignores the violation (it only tests
+    /// `outcome == "completed"`), so callers MUST check
+    /// `policy_violation` explicitly. This test pins the call-site
+    /// contract: every loop/rescue/exec bail-conditional reads BOTH
+    /// fields.
+    #[test]
+    fn completed_turn_with_policy_violation_is_not_a_success() {
+        let t = turn_with_policy_violation("paid without --allow-paid");
+        // AgentRun::succeeded is engine-only — the engine reported a
+        // clean turn — so it returns true here. The MR !1 finding is
+        // that callers must NOT rely on it alone.
+        assert!(t.run.succeeded());
+        assert!(t.policy_violation.is_some());
+        // The semantic test: a violating turn is NOT a successful
+        // run from the CLI's perspective. (The CLI implements this
+        // check in `cmd_exec_agentic` / `cmd_rescue` / `cmd_loop`.)
+        let cli_success = t.run.succeeded() && t.policy_violation.is_none();
+        assert!(
+            !cli_success,
+            "a completed turn with a policy_violation must NOT be a CLI success"
+        );
+    }
+
+    /// `TurnResult::policy_violation` defaults to `None` for non-
+    /// violating turns. This pins the `Option<String>` shape so a
+    /// future struct refactor cannot accidentally make the field
+    /// non-optional (which would force every test fixture to set a
+    /// value, hiding regressions in the violation-detection path).
+    #[test]
+    fn policy_violation_defaults_to_none_for_clean_turn() {
+        let t = crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s".into(),
+                outcome: "completed".into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+            },
+            model: "m".into(),
+            alias: "a".into(),
+            cost_usd: 0.0,
+            cost_unknown: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_ms: 0.0,
+            policy_violation: None,
+        };
+        assert!(t.run.succeeded());
+        assert!(t.policy_violation.is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `build_diff` / `cap_diff` review-diff soundness regressions.
 //
@@ -8738,6 +8880,71 @@ mod reviewer_chain_dispatch_tests {
     // end reviewer tests).
     #[allow(dead_code)]
     fn _unused_import_anchor(_: &Provider, _: &PathBuf) {}
+
+    /// **MR !1 finding (issue #13 port): reviewer SUCCESS path must
+    /// record to the health store.** The pre-port code only recorded
+    /// failure on a fallback-worthy / policy-violation arm; a clean
+    /// reviewer call left the health store stale. After this slice
+    /// `dispatch_reviewer_for_model` calls `HealthStore::mutate_locked`
+    /// with `record_success(model, elapsed_ms)` on the success path so
+    /// the routing signal on the reviewer model refreshes after each
+    /// successful review. Without this regression guard a future
+    /// refactor that drops the success-record call (a one-line
+    /// change that compiles cleanly) would silently stale the breaker
+    /// on every reviewer model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_success_records_breaker_record() {
+        use crate::HealthStore;
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        // Single working model: a clean chain must produce a real
+        // completion without any fallback-worthy errors, so we can
+        // verify the SUCCESS path of `dispatch_reviewer_for_model`.
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["working-model/glm-5.1"]);
+        write_config(&home, &server.uri(), "working-model/glm-5.1");
+
+        // Pre-condition: the health store is empty for this model.
+        let health_path = home.join("health.json");
+        let pre = HealthStore::load(&health_path);
+        assert!(
+            !pre.models.contains_key("working-model/glm-5.1"),
+            "pre-condition: health store must not have a record for the reviewer model before dispatch"
+        );
+
+        let cli = dummy_cli();
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let c = result.expect("a clean reviewer call must return Ok");
+        assert_eq!(c.model, "working-model/glm-5.1");
+        assert!(c.content.contains("working reviewer ok"));
+
+        // Post-condition: the SUCCESS path recorded the breaker.
+        let post = HealthStore::load(&health_path);
+        let entry = post
+            .models
+            .get("working-model/glm-5.1")
+            .expect("reviewer success MUST record a health entry for the winning model");
+        assert_eq!(
+            entry.calls, 1,
+            "reviewer success MUST increment calls on the breaker; got entry={entry:?}"
+        );
+        assert_eq!(
+            entry.failures, 0,
+            "reviewer success MUST NOT increment failures on the breaker; got entry={entry:?}"
+        );
+        assert_eq!(
+            entry.consecutive_failures, 0,
+            "reviewer success MUST NOT touch consecutive_failures on the breaker; got entry={entry:?}"
+        );
+        assert!(
+            entry.ewma_latency_ms.is_some(),
+            "reviewer success MUST record ewma_latency_ms (a non-zero latency was measured); got entry={entry:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
