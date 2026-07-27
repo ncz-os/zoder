@@ -2599,6 +2599,7 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
  "zoder-core",
+ "zoder-mcp-server",
 ]
 
 [[package]]
