@@ -19,13 +19,23 @@ ARCH=""
 VERSION=""
 OUTDIR="dist"
 
+usage() {
+  cat <<'USAGE'
+Usage: build-deb.sh --binary <path> --arch <amd64|arm64> --version <deb-version>
+                    [--outdir <dir>]
+
+Wraps an already-built zoder binary into a binary .deb. Requires dpkg-deb, so
+run it on a Debian/Ubuntu host. Prints the resulting package path on stdout.
+USAGE
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary)  BINARY="$2";  shift 2 ;;
     --arch)    ARCH="$2";    shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --outdir)  OUTDIR="$2";  shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "build-deb.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -82,7 +92,9 @@ if command -v strip >/dev/null 2>&1; then strip "$STAGE/usr/bin/zoder" || true; 
 
 install -m 0644 "$REPO_ROOT/LICENSE" "$STAGE/usr/share/doc/zoder/copyright"
 
-INSTALLED_SIZE="$(du -sk "$STAGE" | cut -f1)"
+# Installed-Size counts what lands on the target filesystem, so measure the
+# payload only — DEBIAN/ is package metadata and is never installed.
+INSTALLED_SIZE="$(du -sk "$STAGE/usr" | cut -f1)"
 
 cat > "$STAGE/DEBIAN/control" <<CONTROL
 Package: zoder
