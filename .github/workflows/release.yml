@@ -55,11 +55,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             # v0.2.1 -> 0.2.1
             DEB_VERSION="${GITHUB_REF_NAME#v}"
           else
+            CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+            # `sed | head` exits 0 on no match, so pipefail won't catch a miss;
+            # an empty version would produce a nonsense "~dev…" package.
+            [ -n "$CARGO_VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
             # Untagged dispatch build. `~` sorts BELOW the empty string in Debian
             # version comparison, so a dev build can never shadow the release of
             # the same version for `apt upgrade`.
