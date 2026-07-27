@@ -42,7 +42,7 @@ pub mod utilization;
 
 pub use acp_client::{
     cancel_session, fetch_quickstart_diagnostics, new_session, probe_ready, run_agent,
-    run_agent_dispatch, run_goose_agent, wait_for_socket, write_tool_matrix,
+    run_agent_dispatch, run_goose_agent, sop_rpc_call, wait_for_socket, write_tool_matrix,
     write_tool_matrix_human, AgentEvent, AgentOptions, AgentRun, ApprovalPolicy, EngineKind,
     GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
 };
