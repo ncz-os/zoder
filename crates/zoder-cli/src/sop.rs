@@ -16,55 +16,15 @@ use zoder_core::{
     SopOverlay, SopOverlayStep, SopStep,
 };
 
-/// Subcommands of `zoder sop …`. Today there is one — `graph <run-id>` —
-/// but the family is structured so a future `status` / `decide` /
-/// `cancel` set can extend it without breaking this command's parsing.
-#[derive(clap::Subcommand, Clone, Debug)]
-pub enum SopCmd {
-    /// Show the SOP step graph and current run overlay for a given run id.
-    ///
-    /// Calls `sops/graph` (canonical step graph) and, by default,
-    /// `sops/run-overlay` (which step is active, which are done / pending /
-    /// failed, routing hint) on the local zeroclaw engine. Print a clean
-    /// human-readable summary, or pass `--json` for the raw wire-shape
-    /// payload.
-    Graph {
-        /// The run id to query (e.g. `r-42`). Required.
-        run_id: String,
-        /// Emit the raw `SopGraphReport` as JSON instead of the human
-        /// renderer. Stable wire shape for scripts.
-        #[arg(long)]
-        json: bool,
-        /// Skip the `sops/run-overlay` round-trip — useful when the overlay
-        /// RPC is failing or when the operator only wants the canonical
-        /// graph. Default: include the overlay.
-        #[arg(long)]
-        no_overlay: bool,
-    },
-}
-
-/// Drive one `zoder sop …` invocation. The dispatch in `main.rs` picks the
-/// right variant; we keep the actual work in this module so `main.rs`
-/// stays small and so the CLI logic is unit-testable through this fn.
-///
-/// Returns `Ok(())` on a clean answer (the exit code is 0); returns `Err`
-/// on RPC / parse / arg failures so the binary's standard error handling
-/// path applies. The CLI binary exits non-zero on `Err`.
-pub async fn run_sop(cmd: SopCmd) -> anyhow::Result<()> {
-    match cmd {
-        SopCmd::Graph {
-            run_id,
-            json,
-            no_overlay,
-        } => cmd_sop_graph(&run_id, json, !no_overlay).await,
-    }
-}
-
 /// `zoder sop graph <run-id>` implementation. Resolves the engine socket
 /// the same way every other CLI command does (via
 /// [`crate::engine_socket_path`]) so the operator's `$ZEROCLAW_SOCKET`
 /// override is honored.
-async fn cmd_sop_graph(
+///
+/// The `sop` command family is declared as a single [`crate::SopCmd`] enum in
+/// `main.rs` (alongside `list` / `run` / `status` / `decide`); this module
+/// owns only the `graph` implementation, which `main.rs` dispatches into.
+pub(crate) async fn cmd_sop_graph(
     run_id: &str,
     json_output: bool,
     include_overlay: bool,
@@ -152,6 +112,7 @@ mod tests {
     //! CLI binary actually does on top of that: argument validation, the
     //! JSON payload shape, and the rendering decision.
     use super::*;
+    use crate::SopCmd;
     use clap::Parser;
 
     /// Mirror the `Cli` struct's `sop` field, just enough to exercise the
@@ -195,6 +156,7 @@ mod tests {
                 assert!(!json);
                 assert!(!no_overlay);
             }
+            other => panic!("expected SopCmd::Graph, got {other:?}"),
         }
     }
 
@@ -213,6 +175,7 @@ mod tests {
                 assert!(json);
                 assert!(no_overlay);
             }
+            other => panic!("expected SopCmd::Graph, got {other:?}"),
         }
     }
 
