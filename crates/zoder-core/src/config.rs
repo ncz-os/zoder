@@ -3905,7 +3905,7 @@ auth = { type = "env", var = "GUARD_KEY" }
     #[test]
     #[cfg(unix)]
     fn read_bounded_regular_file_is_toctou_safe_against_continuous_swap() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::mpsc;
         use std::sync::Arc;
         use std::thread;
@@ -3936,21 +3936,34 @@ auth = { type = "env", var = "GUARD_KEY" }
         //   - blocked forever on a FIFO read (recv_timeout catches),
         //   - returned non-original bytes (the helper's `Ok(_)` arm
         //     catches).
-        // The "file present" sleep between swaps is calibrated so
-        // the reader can definitely open the file in that window.
+        // KEY CHANGE: The synchronization mechanism is the
+        // `swap_count` atomic, NOT fixed sleeps. The reader spins on
+        // this counter inside its loop, making each iteration
+        // *observe* a swap boundary. The sleep at the end of the
+        // swapper loop (1 ms) is a brief cooldown to let the
+        // actual rename/mkfifo/unlink complete — the counter is
+        // read as the synchronization point, the sleep is just
+        // latency tolerance. This makes the test self-adjusting:
+        // under light load the counter changes rapidly and the
+        // reader races many iterations; under heavy load the
+        // counter changes slowly but the reader still races each
+        // iteration.
         let stop = Arc::new(AtomicBool::new(false));
+        let swap_count = Arc::new(AtomicU64::new(0));
         let stop_clone = stop.clone();
+        let swap_count_clone = swap_count.clone();
         let swap_dir = dir.path().to_path_buf();
         let swap_target = target.clone();
         let swapper = thread::spawn(move || {
             let mut i: u64 = 0;
             while !stop_clone.load(Ordering::Relaxed) {
-                // File is present for the next 2ms. The reader
-                // thread has plenty of time to open and read it.
-                thread::sleep(Duration::from_micros(2000));
+                // Increment the counter BEFORE swapping. The reader
+                // thread spins on this counter inside its loop, so
+                // each counter change represents a sync point where
+                // the reader observes that a swap just occurred.
+                swap_count_clone.store(i.wrapping_add(1), Ordering::Release);
 
-                // Now perform the swap: rename target aside,
-                // mkfifo, unlink, restore.
+                // Perform the swap: rename target aside, mkfifo, unlink, restore.
                 let backup = swap_dir.join(format!("config.bak.{i}"));
                 if std::fs::rename(&swap_target, &backup).is_ok() {
                     let mkfifo = std::process::Command::new("mkfifo")
@@ -3963,17 +3976,53 @@ auth = { type = "env", var = "GUARD_KEY" }
                     let _ = std::fs::rename(&backup, &swap_target);
                 }
                 i = i.wrapping_add(1);
+
+                // Brief cooldown — the counter is the sync point; this
+                // sleep is just a latency margin to let the swapper
+                // complete its swap work before the next iteration.
+                thread::sleep(Duration::from_millis(1));
             }
         });
 
         // Reader: run N iterations and collect observations.
-        // Each iteration must complete promptly and either return
-        // the original content or a clear open-time error.
+        // The synchronization mechanism is the `swap_count` atomic —
+        // the reader spins on it inside its loop, making each
+        // iteration *observe* a swap boundary. This is NOT a fixed
+        // sleep: the counter is read as the synchronization point.
+        // The 1 ms sleep at the end of the swapper loop is just a
+        // latency margin. Counter-driven sync is self-adjusting:
+        // under light load the counter changes rapidly and the reader
+        // races many iterations; under heavy load the counter changes
+        // slowly but the reader still races each iteration.
         let (tx, rx) = mpsc::channel::<Vec<&'static str>>();
         let target_for_reader = target.clone();
+        let swap_count_for_reader = swap_count.clone();
         let reader = thread::spawn(move || {
             let mut observations: Vec<&'static str> = Vec::with_capacity(64);
+            // Track which swap-counter value we've last seen so we can wait
+            // for it to change — every change marks a swap boundary.
+            let mut last_seen_count: u64 = swap_count_for_reader.load(Ordering::Acquire);
             for i in 0..64 {
+                // Counter-spinning as the synchronization mechanism.
+                // We spin here (yielding so we don't burn CPU) until the
+                // counter ticks to a new value, which means the swapper has
+                // issued a new swap boundary.  Because the counter is
+                // incremented *before* the actual swap work, each tick gives
+                // the reader a chance to open the file and race the ongoing
+                // swap — the file may still be the original, may have been
+                // renamed away, or may have been replaced with a FIFO.  This
+                // replaces the old fixed-sleep timing so the test adjusts
+                // itself to whatever parallel-execution load the test runner
+                // applies.
+                loop {
+                    let c = swap_count_for_reader.load(Ordering::Acquire);
+                    if c != last_seen_count {
+                        last_seen_count = c;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+
                 if i == 0 {
                     eprintln!("[reader] first iteration starting");
                 }
