@@ -36,7 +36,9 @@ Interface / functions:
   `-o/--output-last-message FILE`.
 - **Sessions**: `resume` / `fork`, `--ephemeral` (no session persistence).
 - **Hooks**: hook system with per-source trust (`--dangerously-bypass-hook-trust`).
-- Subcommands: `exec`, `review`, `apply`, `sandbox`, `mcp-server`.
+- Subcommands: `exec`, `review`, `apply`, `sandbox`.
+  `mcp-server` is a currently-open gap: zoder does not expose that subcommand
+  yet (it does expose `mcp` for listing/testing configured servers).
 
 ## Gap analysis (codex behavior → zoder today)
 
