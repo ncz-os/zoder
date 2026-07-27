@@ -11,6 +11,12 @@ rust-gate:
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
     CARGO_TERM_COLOR: "always"
+    # The small SaaS runner (1 vCPU / ~4 GB) cannot link the debug test
+    # binaries: ld dies with SIGBUS part-way through `zoder-core (lib test)`,
+    # which pulls in 257 object files. Dropping debuginfo from the test
+    # profile cuts the object size enough to link. This is a CI-only knob —
+    # backtraces stay symbolicated for local `cargo test`.
+    CARGO_PROFILE_TEST_DEBUG: "0"
   cache:
     key: "cargo-$CI_COMMIT_REF_SLUG"
     paths:
