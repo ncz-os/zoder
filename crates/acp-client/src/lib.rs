@@ -839,6 +839,36 @@ pub struct AgentRun {
     pub input_tokens: u64,
     /// Number of tool calls observed.
     pub tool_calls: u32,
+    /// The engine's own explanation for a non-completed turn, when it arrived
+    /// ONLY in the terminal `turn_complete` frame and was therefore never
+    /// streamed to the caller.
+    ///
+    /// zeroclaw reports a failed turn as `turn_complete { outcome: "failed",
+    /// content: "turn failed: <error>" }` and sends no text chunks, so the
+    /// diagnosis (HTTP status, model id, provider hint) exists only here.
+    /// Without this the CLI could report a character count but not the
+    /// reason — a 404 `model does not exist` was repeatedly misdiagnosed as a
+    /// credential or model-resolution bug because the text was never shown.
+    ///
+    /// `None` when the turn completed, or when content was streamed (the
+    /// caller has already seen it and re-printing would duplicate output).
+    pub failure_detail: Option<String>,
+}
+
+/// Decide whether a `turn_complete` frame's `content` is the engine's sole
+/// explanation of a failed turn, and therefore must be surfaced by the caller.
+///
+/// It qualifies only when the turn did NOT complete AND nothing was streamed
+/// beforehand (`streamed` still empty). Both conditions matter:
+///   * a completed turn's terminal content is ordinary model output;
+///   * if chunks were streamed, the caller has already printed them and
+///     re-printing the terminal copy would duplicate the whole turn.
+fn terminal_failure_detail(outcome: &str, streamed: &str, terminal: &str) -> Option<String> {
+    if outcome != "completed" && streamed.is_empty() && !terminal.is_empty() {
+        Some(terminal.to_string())
+    } else {
+        None
+    }
 }
 
 impl AgentRun {
@@ -1371,6 +1401,7 @@ async fn drive<F: FnMut(AgentEvent)>(
     // In every case the function returns `Ok(AgentRun{..})` — NEVER
     // `Err` — so partial work survives a severed connection.
     let mut pending_tool_results: HashMap<String, u32> = HashMap::new();
+    let mut failure_detail: Option<String> = None;
     let mut line = String::new();
     let outcome: String = loop {
         let got_line =
@@ -1661,6 +1692,10 @@ async fn drive<F: FnMut(AgentEvent)>(
                                 c.len()
                             );
                         }
+                        // Evaluated BEFORE the overwrite below: afterwards
+                        // "was anything streamed?" is unanswerable, because
+                        // `content` would hold the terminal text either way.
+                        failure_detail = terminal_failure_detail(&oc, &content, c);
                         content = c.to_string();
                         // The loop breaks immediately below; the
                         // streaming-loop's `content_bytes` counter
@@ -1688,6 +1723,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         content,
         input_tokens,
         tool_calls,
+        failure_detail,
     })
 }
 
@@ -3517,6 +3553,12 @@ where
         content,
         input_tokens,
         tool_calls,
+        // The goose driver ends a turn on the `session/prompt` response's
+        // `stopReason`, not on a zeroclaw-style `turn_complete { outcome,
+        // content }` frame, so the "diagnosis arrived only in the terminal
+        // frame" case this field exists for has not been observed here.
+        // Left None deliberately rather than guessed at.
+        failure_detail: None,
     })
 }
 
@@ -3692,6 +3734,68 @@ mod tests {
     // every call site.
     #![allow(clippy::cloned_ref_to_slice_refs)]
     use super::*;
+
+    /// The verbatim `turn_complete.content` zeroclaw 0.8.3 sends when every
+    /// provider attempt fails. Captured from a real run: an agent alias
+    /// pointing at a local OpenAI-compatible endpoint that was serving a
+    /// DIFFERENT model name, so the request 404'd on model lookup.
+    ///
+    /// zeroclaw builds this as `format!("turn failed: {e}")` and streams no
+    /// text chunks, so it is the ONLY description of the failure that ever
+    /// reaches the client.
+    const ZEROCLAW_FAILED_TURN_CONTENT: &str = concat!(
+        "turn failed: Agent turn failed: All model_providers/models failed. Attempts:\n",
+        "model_provider=custom model=minimax-m2.7 attempt 1/3: non_retryable; ",
+        "error=Custom API error (404 Not Found): ",
+        r#"{"error":{"message":"The model `minimax-m2.7` does not exist.","#,
+        r#""type":"NotFoundError","param":"model","code":404}}; "#,
+        "kind=model_not_found; phase=http_response; ",
+        "hint=check the configured model id for this provider",
+    );
+
+    #[test]
+    fn failed_turn_detail_is_kept_when_nothing_was_streamed() {
+        // The regression: this text was captured into `AgentRun.content` but
+        // the CLI printed only `content.len()`, so an operator saw
+        // "397 chars captured" and no reason. The 404, the offending model id
+        // and the provider hint were all present and all discarded, which is
+        // what made this look like a credential or model-resolution bug.
+        let detail = terminal_failure_detail("failed", "", ZEROCLAW_FAILED_TURN_CONTENT)
+            .expect("a failed turn with no streamed text must retain its detail");
+        assert_eq!(detail, ZEROCLAW_FAILED_TURN_CONTENT);
+        assert!(detail.contains("404"), "HTTP status must survive: {detail}");
+        assert!(
+            detail.contains("minimax-m2.7"),
+            "offending model id must survive: {detail}"
+        );
+        assert!(
+            detail.contains("hint=check the configured model id"),
+            "actionable hint must survive: {detail}"
+        );
+    }
+
+    #[test]
+    fn completed_turn_content_is_not_treated_as_a_failure_detail() {
+        // Ordinary model output must never be re-printed as a failure reason.
+        assert_eq!(terminal_failure_detail("completed", "", "OK"), None);
+    }
+
+    #[test]
+    fn streamed_turn_detail_is_dropped_to_avoid_duplicate_output() {
+        // The caller already printed the streamed text; echoing the terminal
+        // copy would duplicate the entire turn. This is the case a naive
+        // "just always print content on failure" fix would regress — most
+        // visibly on a timeout, where partial work IS streamed.
+        assert_eq!(
+            terminal_failure_detail("timeout", "partial work so far", "partial work so far"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_terminal_content_yields_no_detail() {
+        assert_eq!(terminal_failure_detail("failed", "", ""), None);
+    }
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
 

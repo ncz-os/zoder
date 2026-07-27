@@ -5415,6 +5415,15 @@ pub(crate) async fn cmd_exec_agentic(
         // Partial work is preserved: on-disk edits stay, and the streamed text
         // above is whatever the turn produced. Point the user at a clean resume.
         if !cli.quiet && !cli.json {
+            // When the engine explained the failure only in its terminal
+            // frame, nothing was streamed, so the block above printed
+            // NOTHING and the character count below is the sole output.
+            // Print the engine's reason first — it names the model, the HTTP
+            // status and the provider hint, which is what actually tells the
+            // operator whether this is config, credentials or the model.
+            if let Some(detail) = t.run.failure_detail.as_deref() {
+                eprintln!("[zoder] {}", detail.trim());
+            }
             let timed_out = t.run.outcome == "timeout";
             eprintln!(
                 "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
