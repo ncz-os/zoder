@@ -2,6 +2,11 @@ name: zoder release builds
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_apt:
+        description: "Publish the built .debs to the live ncz-os/ncz APT registry"
+        type: boolean
+        default: false
   push:
     tags: ["v*"]
 
@@ -16,10 +21,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64,   runner: macos-14,         target: aarch64-apple-darwin,        artifact: zoder-macos-arm64,   ext: "" }
-          - { name: macos-x86_64,  runner: macos-13,         target: x86_64-apple-darwin,         artifact: zoder-macos-x86_64,  ext: "" }
-          - { name: linux-x86_64,  runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,    artifact: zoder-linux-x86_64,  ext: "" }
-          - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu,   artifact: zoder-linux-arm64,   ext: "" }
+          - { name: macos-arm64,   runner: macos-14,         target: aarch64-apple-darwin,        artifact: zoder-macos-arm64,   ext: "", deb_arch: "" }
+          - { name: macos-x86_64,  runner: macos-13,         target: x86_64-apple-darwin,         artifact: zoder-macos-x86_64,  ext: "", deb_arch: "" }
+          - { name: linux-x86_64,  runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,    artifact: zoder-linux-x86_64,  ext: "", deb_arch: amd64 }
+          - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu,   artifact: zoder-linux-arm64,   ext: "", deb_arch: arm64 }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Rust
@@ -41,3 +46,72 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
+
+      # Debian package for the NCZ APT registry. Only the Linux targets get one;
+      # the binary is built natively on a runner of the same architecture, so no
+      # cross-compilation or foreign-arch dpkg setup is involved.
+      - name: Build .deb
+        if: matrix.deb_arch != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # v0.2.1 -> 0.2.1
+            DEB_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # Untagged dispatch build. `~` sorts BELOW the empty string in Debian
+            # version comparison, so a dev build can never shadow the release of
+            # the same version for `apt upgrade`.
+            DEB_VERSION="${CARGO_VERSION}~dev$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          fi
+          echo "deb version: $DEB_VERSION"
+          packaging/deb/build-deb.sh \
+            --binary "target/${{ matrix.target }}/release/zoder" \
+            --arch "${{ matrix.deb_arch }}" \
+            --version "$DEB_VERSION" \
+            --outdir deb
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.deb_arch != ''
+        with:
+          name: zoder-deb-${{ matrix.deb_arch }}
+          path: deb/*.deb
+          if-no-files-found: error
+
+  # Ship the Linux .debs to https://packages.buildkite.com/ncz-os/ncz.
+  #
+  # Publishing is deliberately narrow: a `v*` tag always publishes, and a manual
+  # run only publishes when explicitly asked for. That keeps the packaging path
+  # exercisable (artifacts are produced on every run) without any run being able
+  # to push to the live registry by accident.
+  publish-apt:
+    name: publish to ncz-os/ncz APT registry
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || inputs.publish_apt
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zoder-deb-*
+          path: deb
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          BUILDKITE_PACKAGES_TOKEN: ${{ secrets.BUILDKITE_PACKAGES_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l deb/
+          if [ -z "${BUILDKITE_PACKAGES_TOKEN:-}" ]; then
+            # Skip rather than fail: an unconfigured registry credential must not
+            # turn an otherwise-good release red. See packaging/deb/README.md.
+            echo "::warning::BUILDKITE_PACKAGES_TOKEN is not set — skipping APT publish."
+            echo "BUILDKITE_PACKAGES_TOKEN is not set; APT publish skipped." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          packaging/deb/publish-deb.sh deb/*.deb
+          echo "Published $(ls deb/*.deb | wc -l) package(s) to ncz-os/ncz." >> "$GITHUB_STEP_SUMMARY"
