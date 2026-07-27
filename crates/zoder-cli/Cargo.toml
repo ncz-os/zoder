@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 zoder-core = { path = "../zoder-core" }
+zoder-mcp-server = { path = "../zoder-mcp-server" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
