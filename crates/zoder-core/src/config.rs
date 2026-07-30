@@ -358,6 +358,20 @@ pub struct Provider {
     pub azure_api_version: Option<String>,
 }
 
+/// A model-entry contributed by a vendor overlay's `[providers.models.*]`
+/// block. These map a provider alias (e.g. `custom.reviewer`) to a model id
+/// (e.g. `"reviewer"`) and serve as the bridge for `--agent` → model
+/// resolution in the oneshot path when the agent specifies `model_provider`
+/// but has no explicit `.model` pin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// The model id that this provider alias resolves to (e.g. `"reviewer"`).
+    pub model: Option<String>,
+    /// Provider base URL for this model entry (optional, for informational).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
 fn default_kind() -> String {
     "openai-chat".into()
 }
@@ -465,6 +479,13 @@ pub struct Config {
     /// consulted AFTER `-m` / `--reviewer` and BEFORE `primary_model`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AliasedAgentConfig>,
+    /// Model entries contributed by `[providers.models.*]` blocks in overlay
+    /// TOMLs. Maps a provider alias (e.g. `custom.reviewer`) to a model id
+    /// (e.g. `"reviewer"`). Used by the oneshot router to resolve an agent's
+    /// `model_provider` to an actual model id when no explicit `.model` pin
+    /// is set on the agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelEntry>,
     /// Pre-call spend caps. A paid call whose *estimated* cost would breach a
     /// cap is gated behind the same confirmation as a paid model. Empty by
     /// default (no caps). See [`crate::budget::Budget`].
@@ -580,6 +601,14 @@ pub struct AliasedAgentConfig {
     /// model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_model: Option<String>,
+    /// Provider id used by the zeroclaw engine for this agent. When set
+    /// and `model` is `None`, the oneshot router follows this chain to
+    /// resolve the model id — looking up `[providers.models.<provider_id>].model`
+    /// from the agent-descriptor config surface. Without `model` set, the
+    /// agent has no pin for the zoder oneshot router and `resolve_chain`
+    /// will error out when `--agent` is specified under `--oneshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
 }
 
 fn default_strict_free() -> bool {
@@ -1219,6 +1248,7 @@ impl Config {
             primary_model: None,
             reviewer_model: None,
             agents: BTreeMap::new(),
+            models: BTreeMap::new(),
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
@@ -1396,6 +1426,24 @@ impl Config {
         self.agents
             .get(alias)
             .and_then(|a| a.reviewer_model.clone())
+    }
+
+    /// Resolve the PRIMARY model id for `--agent <alias>` through the
+    /// `model_provider` chain. When the agent has a `model_provider` set
+    /// (e.g. `custom.reviewer`) but no explicit `.model` pin, this method
+    /// looks up the model id from `Config::models` keyed by the provider
+    /// alias. Returns `None` when the agent has no `model_provider` set or
+    /// when the provider alias is not found in the models registry.
+    ///
+    /// This enables `--agent <alias> --oneshot` to resolve correctly even
+    /// when the agent's model is defined via `model_provider` rather than
+    /// an explicit `.model` pin — mirroring the zeroclaw engine's path
+    /// where `model_provider` is the authoritative model selector.
+    pub fn resolve_model_for_agent(&self, alias: Option<&str>) -> Option<String> {
+        let alias = alias?;
+        let agent = self.agents.get(alias)?;
+        let mp = agent.model_provider.as_deref()?;
+        self.models.get(mp).and_then(|m| m.model.clone())
     }
 
     /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
@@ -3297,6 +3345,7 @@ auth = { type = "env", var = "ACME_KEY" }
             AliasedAgentConfig {
                 model: None,
                 reviewer_model: Some("z-ai/glm-5.1,nvidia/llama-3.3-nemotron".into()),
+                model_provider: None,
             },
         );
         cfg.agents = agents;
