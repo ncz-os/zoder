@@ -4774,7 +4774,7 @@ fn cancel_background_process_group(_meta: &JobMeta) -> anyhow::Result<CancelSign
     Ok(CancelSignalOutcome::Signalled)
 }
 
-pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> anyhow::Result<()> {
     if let Some(want) = &job {
         let m = resolve_job(Some(want), false).ok_or_else(|| anyhow!("no such job: {want}"))?;
         if cli.json {
@@ -4790,13 +4790,13 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> an
         return Ok(());
     }
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let jobs: Vec<JobMeta> = all_jobs()
-        .into_iter()
-        .filter(|j| all || cwd.as_deref().map(|c| c == j.cwd).unwrap_or(true))
-        .collect();
+    // Always show ALL jobs — `status` without an id is the health check.
+    // The `--all` flag remains for backward compatibility but no longer
+    // narrows results.  See zoder#19: the old cwd filter hid jobs whose
+    // cwd didn't match the current working directory, making the bare
+    // `zoder status` health check report "no background jobs" even when
+    // background jobs were actively running (just not in the current repo).
+    let jobs = all_jobs();
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
