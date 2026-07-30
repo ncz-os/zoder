@@ -1242,13 +1242,12 @@ impl Config {
     /// API side anyway, so we skip it in favor of a working alternative.
     /// The window rolls forward over time and the subscription becomes
     /// available again automatically; no operator intervention is required
-    /// for recovery.
-    ///
-    /// This is the route the dual-billing vendor overlay relies on: a single
-    /// vendor modeled as SEPARATE provider entries (one subscription, one
-    /// metered — different auth and endpoint, both claiming the same model
-    /// prefixes). The subscription wins while its window has headroom; the
-    /// metered entry picks up the slack when the subscription is exhausted.
+    /// Simple prefix-matching lookup: returns the first provider whose
+    /// `serves` list explicitly claims `model_id`. Returns `None` when no
+    /// provider serves the model — the caller must decide what to do
+    /// (error, route via the default, etc.). This is the "real provider"
+    /// lookup; it does NOT fall through to `default_provider` for unmatched
+    /// models.
     ///
     /// Window-exhaustion detection needs the local ledger and the tier
     /// catalog. Pass them in via [`best_provider_for_model`]; this
@@ -1266,13 +1265,14 @@ impl Config {
         )
     }
 
-    /// Full quota-aware ranking for routing. Identical to
-    /// [`provider_for_model`] but the subscription-vs-metered decision is
-    /// driven by the ledger (`entries`) and the tier `catalog` so that a
-    /// subscription whose rolling window is at/over cap is treated like a
-    /// metered provider (i.e. demoted below live subscriptions). Pass the
-    /// same `entries` / `catalog` pair the report uses so routing and the
-    /// utilization report never disagree about whether a window is full.
+    /// Full quota-aware ranking for routing. Returns a provider that explicitly
+    /// claims the model via one of its `serves` prefix entries. Returns `None`
+    /// when no provider serves the model — callers must handle this instead of
+    /// silently falling through to the default provider.
+    ///
+    /// This is a "real provider" lookup: the default provider is NOT returned as
+    /// a fallback for unmatched models. A model must be explicitly claimed by at
+    /// least one provider's `serves` list to be routed.
     pub fn best_provider_for_model(
         &self,
         model_id: &str,
@@ -1281,15 +1281,12 @@ impl Config {
     ) -> Option<&Provider> {
         let candidates = self.ranked_providers_for_model(model_id, entries, catalog);
         if candidates.is_empty() {
-            // No provider claims the prefix -> fall through to
-            // `default_provider`. This is the historical single-endpoint
-            // behavior: the CLI expects a non-None answer for `-m
-            // <unprefixed>`, and the report always shows the default as
-            // the "unrouted" route. We deliberately do NOT re-rank
-            // `default_provider` against its real billing tier here —
-            // there is no competition (the list is empty by construction),
-            // so any tier assignment would be cosmetic. Just return it.
-            return self.provider(&self.default_provider);
+            // No provider claims this model's prefix via its `serves` list.
+            // Do NOT fall through to `default_provider` — that would silently
+            // route the model to a provider that never declared it, causing
+            // cryptic 404s or silent misrouting when a different provider
+            // happens to share the same model id.
+            return None;
         }
         candidates.into_iter().next().map(|c| c.provider)
     }
@@ -1624,6 +1621,39 @@ impl Config {
         ] {
             if cap.is_some_and(|v| !v.is_finite() || v < 0.0) {
                 errs.push(format!("budget.{name} must be finite and non-negative"));
+            }
+        }
+
+        // Validate that model references are served by at least one provider.
+        // An unservable model would silently fall through to the default provider
+        // and call the wrong endpoint — the bug fixed by #17.
+        if let Some(ref model) = self.primary_model {
+            if !self.model_has_real_provider(model) {
+                errs.push(format!(
+                    "[profile].primary_model {:?} is not served by any provider; add a \
+                     [[providers]] entry with `serves` matching it",
+                    model
+                ));
+            }
+        }
+        if let Some(ref model) = self.reviewer_model {
+            if !self.model_has_real_provider(model) {
+                errs.push(format!(
+                    "[profile].reviewer_model {:?} is not served by any provider; add a \
+                     [[providers]] entry with `serves` matching it",
+                    model
+                ));
+            }
+        }
+        for (alias, agent) in &self.agents {
+            if let Some(ref model) = agent.model {
+                if !self.model_has_real_provider(model) {
+                    errs.push(format!(
+                        "[agents.{}].model {:?} is not served by any provider; add a \
+                         [[providers]] entry with `serves` matching it",
+                        alias, model
+                    ));
+                }
             }
         }
 
@@ -2045,7 +2075,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     #[test]
-    fn provider_for_model_routes_by_serves_prefix_else_default() {
+    fn provider_for_model_routes_by_serves_prefix_else_none() {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
             id: "minimax".into(),
@@ -2088,10 +2118,10 @@ mod tests {
                 .id,
             "nvidia-eih"
         );
-        // No prefix claims it -> falls back to default_provider.
-        assert_eq!(
-            cfg.provider_for_model("azure/gpt-4o").unwrap().id,
-            cfg.default_provider
+        // No prefix claims it -> returns None (not default_provider).
+        assert!(
+            cfg.provider_for_model("azure/gpt-4o").is_none(),
+            "unmatched model must return None, not fall through to default_provider"
         );
     }
 
@@ -2910,6 +2940,64 @@ auth = { type = "env", var = "ACME_KEY" }
         cfg.default_provider = "openai-codex".into();
         let errs = cfg.validate();
         assert!(errs.is_empty(), "{}", errs.join("\n"));
+    }
+
+    #[test]
+    fn validate_rejects_unservable_primary_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        // Set primary_model to a model that no provider serves.
+        cfg.primary_model = Some("unknown-model".into());
+        let errs = cfg.validate();
+        assert!(
+            !errs.is_empty(),
+            "unservable primary_model must be rejected, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("primary_model"),
+            "error must reference primary_model, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("not served by any provider"),
+            "error must say 'not served by any provider', got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unservable_per_agent_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        cfg.agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("unknown-model".into()),
+                reviewer_model: None,
+            },
+        );
+        let errs = cfg.validate();
+        assert!(
+            !errs.is_empty(),
+            "unservable per-agent model must be rejected, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("[agents.codex]"),
+            "error must reference the agent, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_served_primary_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        cfg.primary_model = Some("gpt-4".into());
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "served primary_model must not be rejected, got: {errs:?}"
+        );
     }
 
     // ---------- KNEMON per-account identity (adversarial-review finding #3) ----------
