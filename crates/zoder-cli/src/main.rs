@@ -5290,11 +5290,12 @@ pub(crate) async fn agentic_turn(
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
+    // Lifted out of the closure below: the unknown-cost check needs it too.
+    let provider_cost_neutral = routing
+        .real_provider_for_model(&eng.cfg, &model_used)
+        .is_some_and(is_cost_neutral_provider);
     let paid_failure = (engine_kind == EngineKind::Zeroclaw)
         .then(|| {
-            let provider_cost_neutral = routing
-                .real_provider_for_model(&eng.cfg, &model_used)
-                .is_some_and(is_cost_neutral_provider);
             paid_without_opt_in(
                 cli.allow_paid,
                 provider_cost_neutral,
@@ -5305,7 +5306,20 @@ pub(crate) async fn agentic_turn(
             )
         })
         .flatten();
-    let unknown_cost_violation = (!cost_known)
+    // "I could not read the cost" is not the same claim as "this cost money".
+    // Previously this fired on `!cost_known` alone, so it could not be suppressed
+    // by `--allow-paid` (which only gates `paid_failure`) and ignored whether the
+    // operator had declared the provider cost-neutral. The effect was that every
+    // provider which does not emit cost telemetry -- most local servers, and
+    // subscription APIs like MiniMax -- failed EVERY agentic turn, including with
+    // `--allow-paid` explicitly passed.
+    //
+    // A provider configured `billing = "free"` should not need runtime telemetry
+    // to prove it is free, and `--allow-paid` is already an explicit opt-in to
+    // unknown spend. The fact is still recorded on the ledger entry below
+    // (`cost_unknown: !cost_known`), so the audit trail is unchanged -- only the
+    // decision to reject the turn is.
+    let unknown_cost_violation = (!cost_known && !cli.allow_paid && !provider_cost_neutral)
         .then(|| format!("cost unknown: {engine_kind:?} returned no authoritative cost telemetry"));
     let violation = match (&paid_failure, unknown_cost_violation) {
         (Some(paid), Some(unknown)) => Some(format!("{paid}; {unknown}")),
