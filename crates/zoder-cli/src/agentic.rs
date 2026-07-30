@@ -1441,6 +1441,54 @@ struct CappedGitOutput {
     limit_reached: bool,
 }
 
+/// `run_git` with extra environment variables.
+///
+/// Exists so the patch journal can snapshot the working tree through a
+/// THROWAWAY `GIT_INDEX_FILE`. Using the real index would stage the user's
+/// files as a side effect of taking a measurement, which is exactly the kind
+/// of surprise a review tool must not cause.
+/// Unique path for a throwaway git index.
+///
+/// The first version keyed on `process::id()` + the cwd's LENGTH, which is not
+/// unique: two concurrent journals in different directories of the same path
+/// length shared one index file and corrupted each other's snapshot. It showed
+/// up as a test that passed alone and failed under parallel execution -- the
+/// same signature as a race in production, where several agents run at once by
+/// design.
+fn unique_index_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "zoder-{tag}-{}-{}-{}.index",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -1644,6 +1692,11 @@ pub(crate) struct PatchJournal {
     /// iterations are included in the baseline and not misattributed
     /// to the agent in `agent_diff`.
     baseline: Option<Baseline>,
+    /// Tree object capturing the working state (tracked AND untracked) when the
+    /// iteration began. Preferred over `baseline.head_sha` for diffing: HEAD
+    /// misses pre-existing untracked files and wrongly includes the user's
+    /// uncommitted edits. `None` only when the snapshot could not be taken.
+    baseline_tree: Option<String>,
     /// Per-turn patch records. Index 0 = first turn, etc.
     turns: Vec<TurnPatch>,
 }
@@ -1675,7 +1728,43 @@ impl PatchJournal {
     /// start of each loop iteration so that user edits made between
     /// iterations are included in the baseline and not misattributed
     /// to the agent in `agent_diff`.
+    /// Snapshot the working tree into a real git tree object, using a THROWAWAY
+    /// index so the user's staged changes are untouched.
+    ///
+    /// `git diff <HEAD>` was the wrong baseline in both directions:
+    ///   * a human's uncommitted edit to a tracked file was already in the diff
+    ///     at baseline, so it got attributed to the agent -- the exact
+    ///     misattribution the patch journal exists to prevent;
+    ///   * a pre-existing UNTRACKED file was excluded by path, so when the agent
+    ///     edited one, its work vanished from review entirely.
+    ///
+    /// A tree captures tracked and untracked content together, so the later
+    /// diff is exactly "what changed since the agent started" -- no more, and
+    /// crucially no less. Where the two error directions conflict, this errs
+    /// toward showing the reviewer too much: an extra hunk is a nuisance, a
+    /// missing one is an unreviewed change.
+    fn snapshot_tree(cwd: &Path) -> Option<String> {
+        let idx = unique_index_path("baseline");
+        let _ = std::fs::remove_file(&idx);
+        let idx_s = idx.to_string_lossy().to_string();
+        // `add -A` honours .gitignore, so build artefacts stay out.
+        run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
+        let tree = run_git_env(cwd, &["write-tree"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
+        let _ = std::fs::remove_file(&idx);
+        let tree = tree.trim().to_string();
+        if tree.is_empty() {
+            None
+        } else {
+            Some(tree)
+        }
+    }
+
     pub(crate) fn record_baseline(&mut self, cwd: &Path) {
+        // Preferred baseline: a tree of the working state. Falls back to HEAD
+        // only when the snapshot fails (no git, unwritable tmp), which is the
+        // old behaviour and no worse than it was.
+        self.baseline_tree = Self::snapshot_tree(cwd);
+
         let head_sha = rev_parse_head(cwd).unwrap_or_else(|| {
             // Repo with no commits yet — baseline is the "fresh" state.
             String::new()
@@ -1754,9 +1843,30 @@ impl PatchJournal {
         if let Some(baseline) = &self.baseline {
             let mut result = String::new();
 
-            // 1. Tracked-file modifications: diff against baseline HEAD.
-            //    `git diff <baseline_sha>` shows changes to tracked files.
-            if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
+            // 1. Everything that changed since the snapshot.
+            //
+            // Diffing the CURRENT working state against the baseline TREE
+            // covers tracked edits and pre-existing untracked files in one
+            // pass, and excludes changes the human had already made when the
+            // agent started. Falls back to the old HEAD diff only when no tree
+            // was captured.
+            if let Some(tree) = &self.baseline_tree {
+                let idx = unique_index_path("now");
+                let _ = std::fs::remove_file(&idx);
+                let idx_s = idx.to_string_lossy().to_string();
+                if run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).is_ok() {
+                    if let Ok(output) = run_git_env(
+                        cwd,
+                        &["diff", "--cached", tree],
+                        &[("GIT_INDEX_FILE", &idx_s)],
+                    ) {
+                        if !output.trim().is_empty() {
+                            result.push_str(&output);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&idx);
+            } else if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
                 if !output.trim().is_empty() {
                     result.push_str(&output);
                 }
@@ -9838,6 +9948,60 @@ mod patch_journal_tests {
     }
 
     #[test]
+    #[test]
+    fn agent_diff_excludes_a_humans_uncommitted_edit() {
+        // The baseline was `git diff <HEAD>`, so an edit the human had already
+        // made -- but not committed -- was in the diff from the start and got
+        // attributed to the agent. That is the misattribution the patch journal
+        // exists to prevent.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("human.txt"), "human edit before the agent ran\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        assert!(
+            !j.agent_diff(&repo)
+                .contains("human edit before the agent ran"),
+            "a pre-existing uncommitted edit must not be attributed to the agent"
+        );
+    }
+
+    #[test]
+    fn agent_diff_includes_edits_to_a_preexisting_untracked_file() {
+        // Baseline untracked files were excluded BY PATH, so when the agent
+        // edited one that already existed, its work disappeared from review
+        // entirely -- the dangerous direction for a review gate.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("scratch.txt"), "original scratch\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        std::fs::write(repo.join("scratch.txt"), "AGENT CHANGED THIS\n").unwrap();
+        assert!(
+            j.agent_diff(&repo).contains("AGENT CHANGED THIS"),
+            "an agent edit to a pre-existing untracked file must reach review"
+        );
+    }
+
+    #[test]
+    fn record_baseline_does_not_stage_the_users_files() {
+        // The snapshot uses a throwaway GIT_INDEX_FILE. Taking a measurement
+        // must not stage the user's work as a side effect.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("unstaged.txt"), "should stay unstaged\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        let staged = run_git(&repo, &["diff", "--cached", "--name-only"]).unwrap_or_default();
+        assert!(
+            !staged.contains("unstaged.txt"),
+            "baseline capture must not touch the real index, got: {staged:?}"
+        );
+    }
+
     fn agent_diff_is_empty_with_no_turns() {
         let (_dir, repo) = init_temp_repo();
         let mut journal = PatchJournal::new();
