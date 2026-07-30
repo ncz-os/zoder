@@ -229,10 +229,10 @@ fn render_table(rows: &[JobListRow]) -> String {
     out
 }
 
-/// Build `JobListRow`s from raw `JobMeta`s, applying the `cwd` filter when
-/// `!all` and a current `cwd` can be resolved. Age is computed against
-/// `now` so tests can pin it deterministically. `started_iso` uses RFC 3339
-/// so it's greppable but compact.
+/// Build `JobListRow`s from raw `JobMeta`s. The cwd filter was removed
+/// (zoder#19) — `jobs list` now always shows ALL jobs for discoverability.
+/// Age is computed against `now` so tests can pin it deterministically.
+/// `started_iso` uses RFC 3339 so it's greppable but compact.
 fn build_rows(jobs: &[JobMeta], now: DateTime<Utc>) -> Vec<JobListRow> {
     jobs.iter()
         .map(|m| {
@@ -250,25 +250,19 @@ fn build_rows(jobs: &[JobMeta], now: DateTime<Utc>) -> Vec<JobListRow> {
         .collect()
 }
 
-pub(crate) fn cmd_jobs_list(cli: &crate::Cli, all: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_jobs_list(_cli: &crate::Cli, _all: bool) -> anyhow::Result<()> {
     let dir = resolved_jobs_dir();
     let now = Utc::now();
+    // Always show ALL jobs — `jobs list` is the discoverability tool.
+    // The `--all` flag remains for backward compatibility but no longer
+    // narrows results.  See zoder#19: the old cwd filter hid jobs whose
+    // cwd didn't match the current working directory, making background
+    // work invisible when the operator was in a different directory.
     let all_jobs = collect_jobs(&dir);
 
-    // Match `cmd_status`: when `all` is false and we can resolve a cwd,
-    // restrict to jobs whose cwd matches — operators usually only care
-    // about their current repo's loop results.
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let filtered: Vec<JobMeta> = all_jobs
-        .into_iter()
-        .filter(|j| all || cwd.as_deref().map(|c| c == j.cwd).unwrap_or(true))
-        .collect();
+    let rows = build_rows(&all_jobs, now);
 
-    let rows = build_rows(&filtered, now);
-
-    if cli.json {
+    if _cli.json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
