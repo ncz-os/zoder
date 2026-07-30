@@ -944,7 +944,12 @@ async fn dispatch_reviewer_for_model(
         (None, None) => None,
     };
     let mut violation = policy_failure.clone();
-    if unknown_cost {
+    // Only add cost-unknown as a violation when the call is genuinely
+    // at-risk: not allow-paid, and not served from a cost-neutral
+    // provider. Under concurrent fan-out telemetry races are transient,
+    // and conflating "unknown" with "paid" kills agents that are safe
+    // to run on free providers.
+    if unknown_cost && !cli.allow_paid && !provider_cost_neutral {
         let msg = format!("cost unknown: no valid telemetry or catalog price for {model}");
         violation = Some(match violation {
             Some(existing) => format!("{existing}; {msg}"),
