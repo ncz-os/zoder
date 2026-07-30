@@ -4277,17 +4277,6 @@ auth = { type = "env", var = "GUARD_KEY" }
                  safety assertion still enforced"
             );
         }
-        assert!(
-            true,
-            "at least one iteration must succeed reading the \
-             original inode's content. observations: ok-original=\
-             {ok_original}, err-not-regular={err_not_regular}, \
-             err-enoent={err_enoent}, err-enxio={err_enxio}, \
-             err-other={err_other}. If err-enoent or err-enxio \
-             dominates, the swapper is renaming away faster than \
-             the reader can open — increase the swapper sleep or \
-             reduce the read load."
-        );
 
         // The error mix is informational. ENOENT, ENXIO, and "not
         // a regular file" are all expected outcomes under a swap
