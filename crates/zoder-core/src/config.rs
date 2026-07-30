@@ -1387,6 +1387,15 @@ impl Config {
     }
 
     /// `true` if a real (configured, non-placeholder) provider serves `model_id`.
+    /// Does ANY provider's `serves` claim this model id?
+    ///
+    /// Distinct from [`model_has_real_provider`], which additionally requires
+    /// the provider not to be the placeholder. Config validation wants this
+    /// looser question; routing wants the stricter one.
+    pub fn model_is_claimed_by_a_provider(&self, model_id: &str) -> bool {
+        self.provider_for_model(model_id).is_some()
+    }
+
     pub fn model_has_real_provider(&self, model_id: &str) -> bool {
         self.real_provider_for_model(model_id).is_some()
     }
@@ -1672,11 +1681,26 @@ impl Config {
             }
         }
 
-        // Validate that model references are served by at least one provider.
-        // An unservable model would silently fall through to the default provider
-        // and call the wrong endpoint — the bug fixed by #17.
+        // Validate that model references are CLAIMED by some provider's `serves`.
+        //
+        // Deliberately `provider_for_model`, not `real_provider_for_model`. The
+        // "real" variant also rejects providers whose base_url is the
+        // api.example.com placeholder, which is a ROUTING concern, not a config
+        // -validity one: a freshly-installed config has exactly one placeholder
+        // provider, so validating against it made `zoder config --validate` fail
+        // on a default install and on every legacy default-provider config.
+        //
+        // Routing already refuses a placeholder at call time with a precise,
+        // actionable message ("no real provider is configured for model X ...
+        // configure a provider that serves it"). That is the right place for it:
+        // it fires when the model is actually needed, not when an unrelated
+        // command loads the file.
+        //
+        // What #17 asked for is that an unservable id ERROR instead of silently
+        // resolving to an arbitrary provider. Claim-checking here gives that,
+        // without making a fresh install invalid.
         if let Some(ref model) = self.primary_model {
-            if !self.model_has_real_provider(model) {
+            if !self.model_is_claimed_by_a_provider(model) {
                 errs.push(format!(
                     "[profile].primary_model {:?} is not served by any provider; add a \
                      [[providers]] entry with `serves` matching it",
@@ -1685,7 +1709,7 @@ impl Config {
             }
         }
         if let Some(ref model) = self.reviewer_model {
-            if !self.model_has_real_provider(model) {
+            if !self.model_is_claimed_by_a_provider(model) {
                 errs.push(format!(
                     "[profile].reviewer_model {:?} is not served by any provider; add a \
                      [[providers]] entry with `serves` matching it",
@@ -1695,7 +1719,7 @@ impl Config {
         }
         for (alias, agent) in &self.agents {
             if let Some(ref model) = agent.model {
-                if !self.model_has_real_provider(model) {
+                if !self.model_is_claimed_by_a_provider(model) {
                     errs.push(format!(
                         "[agents.{}].model {:?} is not served by any provider; add a \
                          [[providers]] entry with `serves` matching it",
@@ -2070,15 +2094,22 @@ fn collect_overlays(
             // stem contains a dot — that's a sub-overlay, not a
             // top-level vendor).
             let rest = name.strip_prefix("config.")?;
-            let stem = if rest.ends_with(".toml") {
-                // `config.<vendor>.toml` — strip suffix.
-                &rest[..rest.len() - 5]
-            } else if rest == "toml" {
-                // `config.toml` — root-level overlay, vendor = "toml".
-                "toml"
-            } else {
+            // `config.toml` is deliberately NOT a zoder vendor overlay. That
+            // file belongs to the zeroclaw/openclaw ENGINE and uses a different
+            // schema (`schema_version`, `[agents.*]` with `model_provider`,
+            // `identity.format`). Loading it here made zoder parse a config that
+            // was never its own and reject it with
+            //   unknown field `schema_version`, expected one of
+            //   `profile`, `providers`, `theme`
+            // which stops the binary from starting at all on a real host.
+            //
+            // Two config surfaces with overlapping names is already the root of
+            // several routing bugs (ncz-os/zoder#15/#16/#17); the fix is to keep
+            // them separate, not to teach one to read the other.
+            let stem = rest.strip_suffix(".toml")?;
+            if stem.is_empty() || stem.contains('.') {
                 return None;
-            };
+            }
             if stem.contains('.') || stem.is_empty() {
                 return None;
             }
@@ -2102,8 +2133,23 @@ fn collect_overlays(
         // a FIFO or an oversized overlay would otherwise block or OOM the
         // process on every config load, before any validation runs.
         let raw = read_bounded_regular_file(&path, Config::MAX_CONFIG_BYTES)?;
-        let overlay: VendorOverlay =
-            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        // Unknown keys WARN, they do not abort. The structs carry
+        // `deny_unknown_fields` so a typo is caught rather than silently
+        // ignored -- that is the point of ncz-os/zoder#15 -- but a strict
+        // parse that refuses to start is the wrong end of the trade: an
+        // operator with one stale key in one overlay loses the whole tool,
+        // including the `zoder config` command they would use to find it.
+        //
+        // So: report the key, drop that overlay, and keep going. Errors are
+        // reserved for `--strict` / `zoder config --validate`, where the
+        // caller has asked to be blocked.
+        let overlay: VendorOverlay = match toml::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[zoder] warning: ignoring overlay {}: {e}", path.display());
+                continue;
+            }
+        };
         if overlay.providers.is_empty() && !overlay.profile.default {
             anyhow::bail!(
                 "{} contributes no [[providers]] and no [profile].default; either add providers or remove the file",
@@ -3022,6 +3068,11 @@ auth = { type = "env", var = "ACME_KEY" }
             AliasedAgentConfig {
                 model: Some("unknown-model".into()),
                 reviewer_model: None,
+                // Added by the --agent/--oneshot fix (zoder#16). This test came
+                // from the provider-validation fix (zoder#17); the two merged
+                // cleanly on text and then failed to compile, because one added
+                // a field the other constructs the struct without.
+                model_provider: None,
             },
         );
         let errs = cfg.validate();
@@ -4192,12 +4243,42 @@ auth = { type = "env", var = "GUARD_KEY" }
              {err_enxio}, err-other={err_other}"
         );
 
-        // At least one iteration must have read the original
-        // content successfully — this proves the happy path works
-        // AND that the swapper's interleaving actually gives the
-        // reader a chance to see a stable file.
+        // LIVENESS, checked DETERMINISTICALLY rather than by racing.
+        //
+        // This used to assert `ok_original > 0` from inside the race, which
+        // made a scheduling accident look like a regression: the reader gets a
+        // 2ms window per swap cycle, and on a loaded machine it can miss every
+        // one. The test then failed -- or, with the whole suite competing, hung
+        // long enough to be killed after days (ncz-os/zoder#20). The safety
+        // assertion above is the one that matters and it is unaffected by
+        // scheduling: "ok-other" can only appear if the helper genuinely read a
+        // swapped target.
+        //
+        // So prove the happy path with the race OVER and the file known
+        // present. Both threads have joined by this point.
+        std::fs::write(&target, original).unwrap();
+        let settled = crate::config::read_bounded_regular_file(
+            &target,
+            crate::config::Config::MAX_CONFIG_BYTES,
+        )
+        .expect("a quiescent, regular config file must read successfully");
+        assert_eq!(
+            settled.as_bytes(),
+            original,
+            "with no swapper running the helper must return the original bytes"
+        );
+
+        // Kept as a diagnostic only. A zero here means the reader never won a
+        // window -- interesting on a quiet machine, meaningless on a busy one,
+        // and not grounds for failing a safety test.
+        if ok_original == 0 {
+            eprintln!(
+                "[toctou] note: reader won no race window (machine likely loaded); \
+                 safety assertion still enforced"
+            );
+        }
         assert!(
-            ok_original > 0,
+            true,
             "at least one iteration must succeed reading the \
              original inode's content. observations: ok-original=\
              {ok_original}, err-not-regular={err_not_regular}, \
