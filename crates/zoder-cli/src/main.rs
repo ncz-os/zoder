@@ -244,7 +244,9 @@ struct Cli {
     /// On the zeroclaw engine the model that actually runs is the one the
     /// selected agent's provider is configured with, so a pin that maps to an
     /// unintended agent runs a different model (a warning is printed when that
-    /// happens). Use `--agent <alias>` to choose the model directly.
+    /// happens). `-m` supersedes `--agent` configuration — when both are
+    /// specified, `-m` wins for the primary author lane. Use `--agent <alias>`
+    /// to choose the model directly (agent config pin or model_provider chain).
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
@@ -2804,21 +2806,60 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     let rc = RoutingContext::load(&eng.cfg)?;
     let (scn_primary, scn_reviewer, scn_reason) = scenario_chain_for_roles(eng, &rc, health, cli)?;
 
+    // Resolve the pin for the "strong pin" path. Priority:
+    //   1. explicit `-m <model>` (per-invocation) — wins over everything
+    //   2. `[agents.<alias>].model` (per-agent pin)
+    //
+    // NOTE: `[agents.<alias>].model_provider` is ONLY for the zeroclaw
+    // engine (agentic loop). It must NOT resolve under `--oneshot` — the
+    // oneshot router is a direct model selector, not a provider chain
+    // resolver. When `--agent <alias>` is specified under `--oneshot`
+    // without an explicit `-m`, the agent MUST have a direct `.model`
+    // pin, or else we error out so the operator cannot silently get a
+    // different model than what `--agent` declared.
+    //
+    // When `--agent` is set but no model resolves, we error out
+    // before the precedence block so that `--agent` cannot silently fall
+    // through to scenario routing.
+    let cli_model = cli.model.clone();
+    let direct_agent_pin = cli_model.is_none()
+        .then(|| eng.cfg.agent_model(cli.agent.as_deref()))
+        .flatten();
+
+    // Guard: `--agent` without a direct model pin or explicit `-m` must
+    // error out immediately rather than silently delegating to the scenario
+    // layer. The guard checks `cli_model` (explicit `-m`) and
+    // `direct_agent_pin` (`[agents.<alias>].model`). The `model_provider`
+    // chain is zeroclaw-engine-only and does NOT apply under `--oneshot`.
+    // If ANY of these resolves, the guard yields — `-m` is the strongest
+    // pin and supersedes all `--agent` configuration.
+    //
+    // Post-guard, the precedence block below is guaranteed that `pin`
+    // resolves to `Some`.
+    if let Some(alias) = &cli.agent {
+        // Check the raw agent config, independent of `-m`. Only error when
+        // the operator has neither an explicit model pin nor an agent config
+        // with a direct `.model` pin — if `-m` is set the operator is
+        // choosing explicitly, so the guard yields to the explicit pin.
+        let direct = eng.cfg.agent_model(Some(alias.as_str()));
+        if direct.is_none() && cli_model.is_none() {
+            anyhow::bail!(
+                "agent alias '{}' has no model configured for the oneshot router",
+                alias
+            );
+        }
+    }
+
     // Precedence step (1): an operator-chosen pin collapses the chain to
     // [pin] and skips the scenario/router layer for the author lane.
     // We still return the scenario-routed reviewer chain so the
     // reviewer's per-role preference lane (sub-first in balanced,
     // free-only in economy, etc.) is honored independently.
-    if cli.model.is_some() || eng.cfg.agent_model(cli.agent.as_deref()).is_some() {
-        let pin = match (
-            cli.model.as_ref(),
-            eng.cfg.agent_model(cli.agent.as_deref()),
-        ) {
-            (Some(m), _) => m.clone(),
-            (None, Some(m)) => m,
-            (None, None) => unreachable!("guard above guarantees Some"),
-        };
-        let src = if cli.model.is_some() {
+    //
+    // Only enter this block when at least one pin resolved. When no pin is
+    // set (no `-m`, no `--agent`), fall through to scenario routing below.
+    if let Some(pin) = cli_model.clone().or(direct_agent_pin.clone()) {
+        let src = if cli_model.is_some() {
             "explicit -m"
         } else {
             "per-agent [agents.<alias>].model override"
@@ -10828,6 +10869,182 @@ mod model_selection_tests {
         );
     }
 
+    /// PRIMARY precedence (regression guard): `-m` with an agent that has NO
+    /// config entry must NOT be rejected by the guard. The guard checks
+    /// `direct.is_none() && mp.is_none()` to bail, but when `-m` is set the
+    /// operator is choosing explicitly — the guard yields to the explicit pin
+    /// (`cli_model.is_some()` short-circuits the error). Regression test:
+    /// `--agent reviewer` (no `[agents.reviewer]` entry) + `-m qwen36`
+    /// previously errored out; must succeed and use the `-m` value.
+    #[test]
+    fn agent_without_config_entry_succeeds_when_m_is_set() {
+        // Config with a `[agents.reviewer]` entry that has NO model — the agent
+        // exists but has never been given a model pin. This is the case the
+        // guard was incorrectly rejecting.
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "reviewer".into(),
+            AliasedAgentConfig {
+                // No model set — the agent entry exists but has no model.
+                model: None,
+                reviewer_model: None,
+                model_provider: None,
+            },
+        );
+        cfg.agents = agents;
+
+        // `--agent reviewer` with `-m qwen36`: no `[agents.reviewer].model`
+        // and no `model_provider`, but `-m` is set so the guard must NOT fire.
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--agent",
+            "reviewer",
+            "-m",
+            "qwen36",
+        ])
+        .unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let health = HealthStore::default();
+
+        // The guard must NOT bail — resolve_chain should succeed.
+        let ResolvedRoutes {
+            primary: chain,
+            reviewer: _,
+            reason: _,
+        } = resolve_chain(&cli, &eng, &health)
+            .expect("resolve_chain must NOT error when -m is set with --agent but no config");
+        assert_eq!(
+            chain.first().map(|s| s.as_str()),
+            Some("qwen36"),
+            "resolve_chain must use -m value when -m is set; got chain={chain:?}"
+        );
+    }
+
+    /// GUARD regression: `--agent` with an alias that has NO config entry
+    /// AND no `-m` must STILL error. This is the guard's core purpose —
+    /// prevent `--agent` from silently falling through to scenario routing
+    /// when nothing resolves. The new `cli_model.is_none()` condition
+    /// does NOT weaken this: when `-m` is absent, the guard fires as before.
+    #[test]
+    fn agent_without_config_entry_errors_without_m() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "reviewer".into(),
+            AliasedAgentConfig {
+                model: None,
+                reviewer_model: None,
+                model_provider: None,
+            },
+        );
+        cfg.agents = agents;
+
+        // `--agent reviewer` with NO `-m`: the alias has no config entry,
+        // so the guard MUST fire.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"])
+            .unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let health = HealthStore::default();
+
+        match resolve_chain(&cli, &eng, &health) {
+            Ok(_) => panic!("guard must error when --agent has no config AND no -m"),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("reviewer"),
+                    "error must name the alias: {err}"
+                );
+                assert!(
+                    err.to_string().contains("no model configured"),
+                    "error must say 'no model configured': {err}"
+                );
+            }
+        }
+    }
+
+    /// ONESHOT model_provider regression (fix for issue #15):
+    ///   An agent with only `model_provider` (no `.model`) must error out
+    ///   under `--oneshot`. The `model_provider` chain is zeroclaw-engine-
+    ///   only — the oneshot router is a direct model selector, not a
+    ///   provider-chain resolver. Previously the `model_provider` chain
+    ///   was used in the oneshot precedence block, causing `--agent` to
+    ///   silently resolve to a different model than the agent declared.
+    #[test]
+    fn model_provider_chain_must_not_resolve_under_oneshot() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        // The agent has model_provider but NO direct .model pin.
+        agents.insert(
+            "reviewer".into(),
+            AliasedAgentConfig {
+                model: None,
+                reviewer_model: None,
+                model_provider: Some("minimax".into()),
+            },
+        );
+        cfg.agents = agents;
+
+        // `--agent reviewer` with NO `-m`: must error because the agent
+        // has only model_provider (zeroclaw-only), not a direct .model pin.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"])
+            .unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let health = HealthStore::default();
+
+        match resolve_chain(&cli, &eng, &health) {
+            Ok(_) => panic!(
+                "guard must error when --agent has only model_provider (no .model) AND no -m"
+            ),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("reviewer"),
+                    "error must name the alias: {err}"
+                );
+                assert!(
+                    err.to_string().contains("no model configured"),
+                    "error must say 'no model configured': {err}"
+                );
+            }
+        }
+    }
+
+    /// ONESHOT with agent that has BOTH .model AND model_provider: the .model
+    /// pin MUST be used (not model_provider). `model_provider` is zeroclaw-
+    /// only and must not affect the oneshot route.
+    #[test]
+    fn direct_model_pin_takes_precedence_over_model_provider_in_oneshot() {
+        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "author".into(),
+            AliasedAgentConfig {
+                model: Some("deepseek-ai/deepseek-r1".into()),
+                reviewer_model: None,
+                model_provider: Some("nvidia-eih".into()),
+            },
+        );
+        cfg.agents = agents;
+
+        // `--agent author` with a direct .model pin: must use that pin.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author"])
+            .unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let health = HealthStore::default();
+
+        let ResolvedRoutes {
+            primary: chain,
+            reviewer: _,
+            reason: _,
+        } = resolve_chain(&cli, &eng, &health).unwrap();
+        // The chain head must be the .model pin, NOT the model_provider chain.
+        assert_eq!(
+            chain.first().map(|s| s.as_str()),
+            Some("deepseek-ai/deepseek-r1"),
+            "direct .model pin must be used, not model_provider; got chain={chain:?}"
+        );
+    }
+
     /// PRIMARY precedence (regression test):
     ///   `primary_model` is the FALLBACK default — when no `-m` and no
     ///   `[agents.<alias>].model` is set, it wins. This pins the
@@ -10864,6 +11081,7 @@ mod model_selection_tests {
             AliasedAgentConfig {
                 model: Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".into()),
                 reviewer_model: Some("moonshotai/kimi-k2.6".into()),
+                model_provider: None,
             },
         );
         cfg.agents = agents;
@@ -10930,6 +11148,7 @@ mod model_selection_tests {
             AliasedAgentConfig {
                 model: Some("deepseek-ai/deepseek-r1".into()),
                 reviewer_model: Some("moonshotai/kimi-k2.6".into()),
+                model_provider: None,
             },
         );
         cfg.agents = agents;
