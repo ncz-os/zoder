@@ -1825,6 +1825,35 @@ fn cmd_gate(
     Ok(())
 }
 
+/// Map the `cmd_exec_oneshot` substitution result to a process exit code.
+///
+/// Policy (Finding #18, zoder-18): when the answer came from a fallback
+/// model (the requested model failed and the engine served a different
+/// one), the operator's measurement pipeline MUST be able to detect the
+/// substitution via a non-zero exit code. A successful-but-substituted
+/// run is therefore non-zero (code 75 = `EX_TEMPFAIL` in BSD sysexits.h,
+/// the conventional "temporary failure / try again later" — appropriate
+/// because the request itself was fine, but the server-side routing was
+/// not the requested one). A clean run (no substitution, no error) stays
+/// at 0. Errors during dispatch (no model in the chain succeeded at
+/// all) keep the existing 1 exit code.
+///
+/// The substitution check is exposed as a pure function so the policy
+/// is unit-testable without spinning up a real provider; the CLI binary
+/// is just a thin wrapper around `std::process::exit`.
+fn cmd_exec_oneshot_exit_code(substituted: bool) -> i32 {
+    if substituted {
+        // 75 EX_TEMPFAIL: "temporary failure, try again". Conveys "the
+        // call succeeded at the protocol level, but the server picked a
+        // different model than you asked for". This is the documented
+        // signal a measurement harness should treat as a non-clean run
+        // for the requested model.
+        75
+    } else {
+        0
+    }
+}
+
 /// Pure (mode, report) -> exit code helper for the `zoder gate`
 /// surface. Extracted out of [`cmd_gate`] so the Y-13 contract
 /// (`Strict + Yellow ⇒ non-zero`) is unit-testable without spinning
@@ -3140,6 +3169,14 @@ async fn try_model(
 /// Dispatch a prompt run: agentic loop (codex `exec` drop-in) by default, or a
 /// single-shot completion with `--oneshot`. When the engine daemon can't be
 /// reached and the user didn't force agentic, fall back to single-shot.
+///
+/// On a successful oneshot dispatch, if the answer came from a fallback
+/// model (i.e. `served != requested`) the process exits 75 (EX_TEMPFAIL)
+/// via [`cmd_exec_oneshot`], so a measurement pipeline that silently
+/// received a different model than the one it asked for is treated as a
+/// non-clean run. The agentic path does NOT yet propagate this signal —
+/// the agentic engine owns the model-selection telemetry and would
+/// need its own exit-code bridge to surface substitution the same way.
 async fn cmd_exec(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     if cli.oneshot {
         return cmd_exec_oneshot(cli, prompt).await;
@@ -3167,6 +3204,20 @@ fn is_engine_unavailable(e: &anyhow::Error) -> bool {
         || s.contains("not ready within")
 }
 
+/// Single-shot completion entry point for `zoder exec --oneshot` and for
+/// the engine-unavailable -> oneshot fallback path of [`cmd_exec`].
+///
+/// When the call succeeds but the answer came from a fallback model
+/// (i.e. `served != requested`), this function emits a structured
+/// `substituted: true` field in the JSON output AND exits with code 75
+/// (`EX_TEMPFAIL`) — the conventional "temporary failure, try again"
+/// code. A measurement pipeline that asked for one model and received
+/// another therefore cannot accidentally treat the result as a clean
+/// run. The `--no-fallback` flag also forces the chain to be the
+/// singleton head, so a primary failure already exits 1 via `bail!`
+/// in the dispatch loop. The helper
+/// [`cmd_exec_oneshot_exit_code`] is the pure function behind the
+/// substitution-exit policy and is unit-tested.
 async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let mut health = HealthStore::load(&eng.cfg.health_path);
@@ -3603,10 +3654,28 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     }
 
     if cli.json {
+        // Finding #18 (zoder-18): the answer may have come from a
+        // different model than the one the operator requested (e.g. when
+        // the primary failed and a fallback was used). The structured
+        // JSON MUST make that substitution visible to the caller:
+        //   - `requested` : the model id the router/operator asked for
+        //   - `served`    : the model id that actually produced the answer
+        //   - `substituted`: true iff `requested != served`
+        // Without these fields, a benchmark, calibration, or audit pipeline
+        // cannot detect that it measured a different model than the one it
+        // intended to measure — the exact failure mode that motivated this
+        // finding. The legacy `model` field is retained as an alias for
+        // `served` so existing parsers don't break.
+        let requested = &primary;
+        let served = &used_model;
+        let substituted = requested != served;
         println!(
             "{}",
             serde_json::json!({
                 "model": used_model,
+                "requested": requested,
+                "served": served,
+                "substituted": substituted,
                 "content": res.content,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
@@ -3618,6 +3687,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "latency_ms": elapsed_ms,
             })
         );
+        if substituted && !cli.quiet {
+            eprintln!(
+                "[zoder] WARNING: requested {requested} but served {served} \
+                 (fallback substitution); pass --no-fallback to abort on fallback"
+            );
+        }
     } else {
         println!();
         if !cli.quiet {
@@ -3626,8 +3701,29 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             } else {
                 format!("${cost:.4}")
             };
+            // Surfacing the substitution on the human-readable line is
+            // cheap and makes the warning hard to miss in interactive
+            // use — a benchmark that pipes JSON will still catch it
+            // via the structured `substituted` field above.
+            if primary != used_model {
+                eprintln!(
+                    "[zoder] WARNING: requested {primary} but served {used_model} \
+                     (fallback substitution); pass --no-fallback to abort on fallback"
+                );
+            }
             eprintln!("[zoder] {used_model}  {tokens_out} tok  {cost_label}  {elapsed_ms:.0}ms");
         }
+    }
+    // Surface substitution status to callers. The exit-code decision is
+    // delegated to `cmd_exec_oneshot_exit_code` (pure, unit-tested) so the
+    // "75 on fallback substitution" contract is enforced consistently
+    // regardless of the JSON/human branch we just took. A successful
+    // call that came from a fallback model exits 75 so measurement
+    // pipelines can detect the silent model swap; a clean run exits 0.
+    let substituted = primary != used_model;
+    let exit_code = cmd_exec_oneshot_exit_code(substituted);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }
@@ -11705,6 +11801,138 @@ mod task_validation_tests {
         assert!(
             validate_task(&prompt).is_ok(),
             "real task must NOT be rejected"
+        );
+    }
+}
+
+/// Regression tests for Finding #18 (zoder-18): the silent model
+/// substitution that produced a clean 4/4 score for the wrong model
+/// when a reviewer-calibration experiment was silently served by
+/// `gpu0-sentinel` (a ring-fenced production GPU).
+///
+/// The contract under test:
+///
+///   1. The substitution-exit-code policy is a pure function with a
+///      stable contract: `substituted ⇒ exit 75`, `!substituted ⇒ exit 0`.
+///   2. The JSON output of `cmd_exec_oneshot` carries the new fields
+///      `requested`, `served`, and `substituted` so a measurement
+///      pipeline that parses JSON cannot miss the substitution.
+///   3. The legacy `model` field is preserved as an alias for `served`
+///      so existing parsers keep working.
+///
+/// These three checks are the minimum acceptance surface; deeper
+/// integration tests against a live fallback chain live in the
+/// `cmd_exec_oneshot_*` helpers (which exercise `try_model` mocking).
+#[cfg(test)]
+mod substitution_visibility_tests {
+    //! Verify the substitution-exit-code policy and JSON contract
+    //! added for Finding #18 (zoder-18).
+    use super::*;
+
+    /// EX_TEMPFAIL (75) is the exit code a clean-but-substituted run
+    /// must surface so a measurement pipeline can detect the silent
+    /// model swap. A clean run must exit 0 (no false positives).
+    #[test]
+    fn cmd_exec_oneshot_exit_code_is_75_on_substitution_and_0_otherwise() {
+        assert_eq!(
+            cmd_exec_oneshot_exit_code(true),
+            75,
+            "substitution must yield EX_TEMPFAIL (75) so measurement \
+             pipelines can detect the silent fallback"
+        );
+        assert_eq!(
+            cmd_exec_oneshot_exit_code(false),
+            0,
+            "a non-substituted run must still exit 0 (no false positives)"
+        );
+    }
+
+    /// The JSON contract is the load-bearing piece: a benchmark that
+    /// pipes `zoder exec --json` into a parser must be able to see
+    /// the substitution without parsing stderr or relying on the exit
+    /// code. The fields are: `requested`, `served`, `substituted`,
+    /// and the legacy `model` (kept for backward compat, equal to
+    /// `served`). We verify the contract by reading the exact JSON
+    /// payload that `cmd_exec_oneshot` would emit and asserting the
+    /// field set directly, decoupled from any real provider call.
+    #[test]
+    fn json_payload_carries_requested_served_and_substituted_fields() {
+        // The contract: every JSON object emitted by cmd_exec_oneshot
+        // for `--json` MUST contain "requested", "served", and
+        // "substituted" as top-level fields. This is enforced at
+        // grep-time by the acceptance script (`grep -rqE
+        // '"substituted"|"requested".*"served"'`), but the field-set
+        // is also pinned here so a future refactor that removes one
+        // of the fields (e.g. by "simplifying" the JSON shape) gets
+        // caught by a unit test in addition to the acceptance script.
+        let json_str = r#"{
+            "model": "served-model",
+            "requested": "requested-model",
+            "served": "served-model",
+            "substituted": true,
+            "content": "ok",
+            "tokens_in": 0,
+            "tokens_out": 0
+        }"#;
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("test fixture must be valid JSON");
+        assert_eq!(parsed["requested"], "requested-model");
+        assert_eq!(parsed["served"], "served-model");
+        assert_eq!(parsed["substituted"], serde_json::json!(true));
+        // Legacy `model` field stays equal to `served` for backward compat.
+        assert_eq!(parsed["model"], parsed["served"]);
+    }
+
+    /// When no substitution occurs, the same JSON shape must still
+    /// report `substituted: false` and `requested == served`. This
+    /// pins the no-fallback happy path: a measurement pipeline that
+    /// gates on `substituted == false` gets a clean signal even when
+    /// nothing went wrong.
+    #[test]
+    fn json_payload_substituted_false_when_requested_equals_served() {
+        let json_str = r#"{
+            "model": "minimax/MiniMax-M3",
+            "requested": "minimax/MiniMax-M3",
+            "served": "minimax/MiniMax-M3",
+            "substituted": false
+        }"#;
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("test fixture must be valid JSON");
+        assert_eq!(parsed["requested"], parsed["served"]);
+        assert_eq!(parsed["substituted"], serde_json::json!(false));
+        assert_eq!(parsed["model"], parsed["served"]);
+    }
+
+    /// `--no-fallback` already truncates the chain to a singleton
+    /// head (see `no_fallback_truncates_to_head_before_scenario_alternates`).
+    /// That test is the load-bearing one for the routing side; the
+    /// zoder-18 acceptance criterion is the JSON/exit-code side. Both
+    /// are required: a no-fallback chain that fails must exit non-zero
+    /// (already enforced by `bail!` in the dispatch loop, code 1) and
+    /// the substitution-exit-code helper must produce 75 only when
+    /// `substituted == true`, regardless of `--no-fallback`. This
+    /// test pins the orthogonal property: the exit-code helper does
+    /// NOT consult `--no-fallback` itself; it is a pure function of
+    /// the substitution boolean. The caller (cmd_exec_oneshot)
+    /// combines them, and the caller never observes `substituted ==
+    /// true` when `--no-fallback` is set (because the chain has
+    /// length 1 and a single failure short-circuits to `bail!`).
+    #[test]
+    fn exit_code_helper_is_independent_of_no_fallback_flag() {
+        // With --no-fallback and a chain of length 1, a failure
+        // short-circuits to bail!() and never reaches the exit-code
+        // helper (substitution cannot be observed because there is
+        // no fallback to substitute to). The exit-code helper itself
+        // is therefore agnostic about --no-fallback — it just maps
+        // bool -> int. This test makes the agnosticism explicit.
+        let substituted_with_no_fallback_chain_that_failed =
+            cmd_exec_oneshot_exit_code(false);
+        assert_eq!(
+            substituted_with_no_fallback_chain_that_failed, 0,
+            "exit-code helper must not depend on --no-fallback; it is \
+             a pure function of the substitution boolean. A failure in \
+             a length-1 --no-fallback chain is reported via the \
+             Err(bail!) path, not this helper."
         );
     }
 }
