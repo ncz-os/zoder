@@ -1984,14 +1984,24 @@ fn collect_overlays(
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            // Filename must be exactly `config.<vendor>.toml`. Reject
-            // `config.toml` (no vendor stem), `config.foo.toml.bak`
-            // (wrong suffix), and `config.foo.bar.toml` (vendor stem
-            // contains a dot — that's a sub-overlay, not a top-level
-            // vendor).
+            // Top-level vendor overlay: `config.<vendor>.toml`.
+            // Also accept exactly `config.toml` (the root-level
+            // overlay — engine-specific config, distinct from the
+            // JSON `config.json`).  Reject `config.foo.toml.bak`
+            // (wrong suffix), and `config.foo.bar.toml` (vendor
+            // stem contains a dot — that's a sub-overlay, not a
+            // top-level vendor).
             let rest = name.strip_prefix("config.")?;
-            let stem = rest.strip_suffix(".toml")?;
-            if stem.is_empty() || stem.contains('.') {
+            let stem = if rest.ends_with(".toml") {
+                // `config.<vendor>.toml` — strip suffix.
+                &rest[..rest.len() - 5]
+            } else if rest == "toml" {
+                // `config.toml` — root-level overlay, vendor = "toml".
+                "toml"
+            } else {
+                return None;
+            };
+            if stem.contains('.') || stem.is_empty() {
                 return None;
             }
             if let Some(want) = only_vendor {
