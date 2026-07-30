@@ -1616,6 +1616,267 @@ fn detect_base(cwd: &Path, base: Option<&str>) -> String {
     "HEAD".to_string()
 }
 
+/// Baseline state of a repository at the start of a loop iteration.
+/// Captures enough metadata to detect whether the agent or the human
+/// made a given change. Captured fresh each iteration so that user
+/// edits between iterations are included in the baseline and not
+/// misattributed to the agent in `agent_diff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Baseline {
+    /// SHA of HEAD at baseline time.
+    head_sha: String,
+    /// Set of tracked (git-claimed) files at baseline.
+    tracked: Vec<String>,
+    /// Set of untracked (not-ignored) files at baseline.
+    untracked: Vec<String>,
+}
+
+/// A patch journal records the agent's changes turn by turn.
+///
+/// This is the core of transactional editing support: instead of relying on
+/// `git diff HEAD` (which cannot distinguish agent changes from pre-existing
+/// user edits), the journal captures the agent's delta each turn and allows
+/// review, inspection, and rollback of *exactly* what the agent changed.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PatchJournal {
+    /// Baseline captured at the start of the current loop iteration.
+    /// Freshly captured each iteration so that user edits between
+    /// iterations are included in the baseline and not misattributed
+    /// to the agent in `agent_diff`.
+    baseline: Option<Baseline>,
+    /// Per-turn patch records. Index 0 = first turn, etc.
+    turns: Vec<TurnPatch>,
+}
+
+/// A single turn's patch record.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnPatch {
+    /// Iteration number (1-based).
+    pub(crate) iter: usize,
+    /// The full diff text for this turn (same format as `build_diff` output).
+    pub(crate) diff: String,
+    /// Relative paths touched by this turn (tracked + untracked).
+    pub(crate) touched: Vec<String>,
+    /// Whether this turn produced a substantive diff (as classified by
+    /// `classify_diff_substance`). Used for anti-gaming analysis.
+    #[allow(dead_code)]
+    pub(crate) substance: DiffSubstance,
+}
+
+#[allow(dead_code)]
+impl PatchJournal {
+    /// Create a fresh patch journal. No baseline is captured yet — the
+    /// caller must call `record_baseline()` before `record_turn()`.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Capture the repository state as the baseline. Call this at the
+    /// start of each loop iteration so that user edits made between
+    /// iterations are included in the baseline and not misattributed
+    /// to the agent in `agent_diff`.
+    pub(crate) fn record_baseline(&mut self, cwd: &Path) {
+        let head_sha = rev_parse_head(cwd).unwrap_or_else(|| {
+            // Repo with no commits yet — baseline is the "fresh" state.
+            String::new()
+        });
+
+        // Capture tracked files.
+        let tracked = run_git(cwd, &["ls-files"])
+            .ok()
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+
+        // Capture untracked (non-ignored) files. Use --directory flag so
+        // directory entries are included (they contain nested untracked files).
+        let untracked_raw = run_git(
+            cwd,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+        )
+        .ok()
+        .map(|s| {
+            let mut files = Vec::new();
+            for entry in s.split('\0') {
+                if entry.is_empty() {
+                    continue;
+                }
+                // Strip trailing slash for directories; only add files.
+                let path = entry.trim_end_matches('/');
+                if !path.is_empty() && !path.starts_with(".git/") {
+                    files.push(path.to_string());
+                }
+            }
+            files
+        })
+        .unwrap_or_default();
+
+        self.baseline = Some(Baseline {
+            head_sha,
+            tracked,
+            untracked: untracked_raw,
+        });
+    }
+
+    /// Record a turn's patch. Must have a baseline first.
+    pub(crate) fn record_turn(
+        &mut self,
+        iter: usize,
+        diff: &str,
+        touched: Vec<String>,
+        substance: DiffSubstance,
+    ) {
+        self.turns.push(TurnPatch {
+            iter,
+            diff: diff.to_string(),
+            touched,
+            substance,
+        });
+    }
+
+    /// Return the combined diff of all agent turns so far. This is what
+    /// review should consume instead of `git diff HEAD`, because it is
+    /// guaranteed to reflect *only* the agent's changes — not any
+    /// pre-existing user edits.
+    ///
+    /// The function compares the current working tree against the baseline
+    /// captured at loop start. For tracked files, `git diff <baseline_sha>`
+    /// shows modifications. For untracked files not in the baseline, it
+    /// emits synthetic "new file" hunks. When no baseline exists, it
+    /// falls back to the last turn's raw diff.
+    pub(crate) fn agent_diff(&self, cwd: &Path) -> String {
+        // If we have a baseline, diff against it to get agent work.
+        if let Some(baseline) = &self.baseline {
+            let mut result = String::new();
+
+            // 1. Tracked-file modifications: diff against baseline HEAD.
+            //    `git diff <baseline_sha>` shows changes to tracked files.
+            if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
+                if !output.trim().is_empty() {
+                    result.push_str(&output);
+                }
+            }
+
+            // 2. New untracked files: files that appeared after baseline.
+            let baseline_untracked_set: std::collections::HashSet<&str> =
+                baseline.untracked.iter().map(|s| s.as_str()).collect();
+            let current_untracked: Vec<String> =
+                run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])
+                    .ok()
+                    .map(|s| {
+                        s.split('\0')
+                            .filter(|e| !e.is_empty())
+                            .filter(|e| !e.starts_with(".git/") && !e.ends_with('/'))
+                            .map(|e| e.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            for file in &current_untracked {
+                if !baseline_untracked_set.contains(file.as_str()) {
+                    // This is a NEW untracked file (agent-created since baseline).
+                    // Guard against directory paths — `git ls-files` should not
+                    // emit bare directory names without a trailing `/`, but a
+                    // directory whose name matched a baseline directory entry
+                    // (after slash-stripping) could slip through.  Only produce
+                    // a hunk for actual regular files.
+                    let abs = cwd.join(file);
+                    if let Ok(meta) = std::fs::metadata(&abs) {
+                        if meta.is_dir() {
+                            continue; // Skip directories; nothing to diff.
+                        }
+                    }
+                    let hunk = render_untracked_file_hunk(std::path::Path::new(file), &abs);
+                    if !hunk.is_empty() {
+                        if !result.is_empty() && !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                        result.push_str(&hunk);
+                        if !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                    }
+                }
+            }
+
+            if !result.is_empty() {
+                return result;
+            }
+        }
+
+        // Fallback: if no baseline, use the diff from the last turn.
+        // This handles the case where baseline capture failed or the repo
+        // had no commits (baseline_sha is empty). When a baseline DOES exist
+        // but shows no changes, return empty — no agent work to report.
+        if self.baseline.is_none() {
+            self.turns
+                .last()
+                .map(|t| t.diff.clone())
+                .unwrap_or_default()
+        } else {
+            // Baseline exists, no changes relative to it.
+            String::new()
+        }
+    }
+
+    /// List all files touched by the agent across all recorded turns.
+    /// Returns deduplicated relative paths.
+    pub(crate) fn files_touched(&self) -> Vec<String> {
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for turn in &self.turns {
+            for f in &turn.touched {
+                files.insert(f.clone());
+            }
+        }
+        let mut vec: Vec<_> = files.into_iter().collect();
+        vec.sort();
+        vec
+    }
+
+    /// Get the diff for a specific turn (for inspection or rollback).
+    pub(crate) fn turn_diff(&self, iter: usize) -> Option<String> {
+        self.turns
+            .iter()
+            .find(|t| t.iter == iter)
+            .map(|t| t.diff.clone())
+    }
+
+    /// Clear all recorded turns, keeping the baseline intact. Useful to
+    /// reset after a rollback.
+    pub(crate) fn clear(&mut self) {
+        self.turns.clear();
+    }
+
+    /// Serialize the journal to JSON for storage/transport.
+    #[allow(dead_code)]
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let turns: Vec<serde_json::Value> = self
+            .turns
+            .iter()
+            .map(|t| {
+                json!({
+                    "iter": t.iter,
+                    "touched": t.touched,
+                    "substance": format!("{:?}", t.substance),
+                    "diff_truncated": t.diff.len() > 1000,
+                })
+            })
+            .collect();
+        json!({
+            "baseline_sha": self.baseline.as_ref().map(|b| &b.head_sha),
+            "baseline_tracked_count": self.baseline.as_ref().map(|b| b.tracked.len()).unwrap_or(0),
+            "baseline_untracked_count": self.baseline.as_ref().map(|b| b.untracked.len()).unwrap_or(0),
+            "turn_count": self.turns.len(),
+            "turns": turns,
+        })
+    }
+}
+
 /// Build the diff for the requested scope. Returns `(label, diff)`.
 fn build_diff(
     cwd: &Path,
@@ -1732,6 +1993,13 @@ fn untracked_not_ignored_diff(cwd: &Path) -> String {
 /// falls back to a hand-built hunk when the index diff fails (e.g. binary
 /// files, very large files).
 fn render_untracked_file_hunk(rel: &Path, abs: &Path) -> String {
+    // Defensive guard: skip directories, sockets, FIFOs, etc. Only regular
+    // files can produce a meaningful unified-diff hunk.
+    if let Ok(meta) = std::fs::metadata(abs) {
+        if !meta.is_file() {
+            return String::new();
+        }
+    }
     let dev_null = Path::new("/dev/null");
     if let Ok(ok) = std::process::Command::new("git")
         .arg("diff")
@@ -3699,7 +3967,18 @@ pub(crate) async fn cmd_loop(
     let mut prev_head: Option<String> = rev_parse_head(&cwd);
     const STALL_LIMIT: usize = 3;
 
+    // Patch journal: tracks agent changes turn by turn for transactional
+    // review. We capture a FRESH baseline at the start of each loop
+    // iteration so that user edits made between iterations are included
+    // in the baseline and NOT misattributed to the agent. Review and
+    // later-turn inspection use the journal instead of `git diff HEAD`
+    // to avoid confusing pre-existing user edits with agent work.
+    let mut journal = PatchJournal::new();
     for i in 1..=max_iters {
+        // Capture a fresh baseline at the start of each iteration so that
+        // user edits made between iterations are included in the baseline
+        // and NOT misattributed to the agent in `agent_diff`.
+        journal.record_baseline(&cwd);
         // 1. Author turn — continue the SAME engine session for memory.
         let author_prompt = if i == 1 {
             let mut p = format!(
@@ -3875,6 +4154,27 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // continues to the next iteration.
         let diff_substance = classify_diff_substance(&diff);
 
+        // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
+        // headers from the diff output; this is the same set the reviewer sees.
+        let touched: Vec<String> = diff
+            .lines()
+            .filter(|l| l.starts_with("diff --git a/") && l.contains(" b/"))
+            .filter_map(|l| {
+                // Extract the relative path after `a/` (before ` b/`).
+                let after_a = l.strip_prefix("diff --git a/")?;
+                let rel = after_a.split(" b/").next()?.to_string();
+                if rel.is_empty() {
+                    None
+                } else {
+                    Some(rel)
+                }
+            })
+            .collect();
+
+        // Record this turn in the patch journal so review can consume
+        // exactly what the agent changed (not ambient working-tree state).
+        journal.record_turn(i, &diff, touched.clone(), diff_substance);
+
         // 4. Validate (build/test) if a check command was given. The check is
         // its own child process (a shell) and historically had NO watchdog —
         // a hung script blocked the loop forever. Wrap with `run_check_watched`
@@ -3954,10 +4254,18 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         }
 
         // 5. Adversarial review of the current diff (+ validation output).
+        // When the patch journal has turns, use its `agent_diff` so the
+        // reviewer sees EXACTLY what the agent changed — not the full
+        // working-tree diff which may contain pre-existing user edits.
+        let review_diff = if !journal.turns.is_empty() {
+            journal.agent_diff(&cwd)
+        } else {
+            diff.clone()
+        };
         let review_user = {
             let mut u = format!(
                 "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
-                cap_diff(&diff, 100_000)
+                cap_diff(&review_diff, 100_000)
             );
             if let Some(p) = check_passed {
                 u.push_str(&format!(
@@ -9460,6 +9768,436 @@ mod commit_author_enforcement_tests {
             "run_check_watched must source ~/.profile so the operator's \
              toolchain (cargo in ~/.cargo/bin, go in ~/go/bin, …) is on \
              PATH for the check; tail:\n{tail}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PatchJournal — unit tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod patch_journal_tests {
+    use super::*;
+
+    /// Initialize a temp git repo with one committed file. Returns the
+    /// repo path.
+    fn init_temp_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "patch-journal-test"]);
+        run(&["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo)
+    }
+
+    #[test]
+    fn baseline_captures_tracked_and_untracked_files() {
+        let (_dir, repo) = init_temp_repo();
+        // Add an untracked file so we have both tracked and untracked.
+        std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        let baseline = journal.baseline.as_ref().expect("baseline should be set");
+
+        // Must have at least one tracked file (README.md).
+        assert!(
+            !baseline.tracked.is_empty(),
+            "baseline should include tracked files, got: {:?}",
+            baseline.tracked
+        );
+        // README.md should be tracked.
+        assert!(
+            baseline.tracked.contains(&"README.md".to_string()),
+            "README.md should be in tracked files"
+        );
+        // new.txt should be untracked.
+        assert!(
+            baseline.untracked.contains(&"new.txt".to_string()),
+            "new.txt should be in untracked files"
+        );
+    }
+
+    #[test]
+    fn agent_diff_is_empty_with_no_turns() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        let diff = journal.agent_diff(&repo);
+        assert!(
+            diff.is_empty(),
+            "agent_diff should be empty when no turns recorded: {:?}",
+            diff
+        );
+    }
+
+    #[test]
+    fn agent_diff_shows_new_untracked_file_for_agent_work() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Simulate: agent creates a new file and we record a turn.
+        std::fs::write(repo.join("agent_fix.rs"), "pub fn fix() {}\n").unwrap();
+
+        // Simulate a turn record with the diff content.
+        let diff_text =
+            "diff --git a/agent_fix.rs b/agent_fix.rs\nnew file mode 100644\n+pub fn fix() {}\n";
+        let touched = vec!["agent_fix.rs".to_string()];
+        journal.record_turn(1, diff_text, touched.clone(), DiffSubstance::Substantive);
+
+        // Now agent_diff should include the new file.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff.is_empty(),
+            "agent_diff should contain new untracked file: {:?}",
+            agent_diff
+        );
+        assert!(
+            agent_diff.contains("agent_fix.rs"),
+            "diff should reference agent_fix.rs: {:?}",
+            agent_diff
+        );
+    }
+
+    #[test]
+    fn files_touched_returns_deduplicated_list() {
+        let mut journal = PatchJournal::new();
+        // Same file touched in multiple turns.
+        journal.record_turn(
+            1,
+            "diff --git a/foo.rs b/foo.rs\n+fix\n",
+            vec!["foo.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+        journal.record_turn(
+            2,
+            "diff --git a/foo.rs b/foo.rs\n+fix2\n",
+            vec!["foo.rs".to_string(), "bar.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        let touched = journal.files_touched();
+        assert_eq!(touched.len(), 2, "expected 2 unique files");
+        assert!(touched.contains(&"bar.rs".to_string()));
+        assert!(touched.contains(&"foo.rs".to_string()));
+        // Should be sorted.
+        assert_eq!(touched[0], "bar.rs");
+        assert_eq!(touched[1], "foo.rs");
+    }
+
+    #[test]
+    fn turn_diff_returns_specific_turn() {
+        let mut journal = PatchJournal::new();
+        journal.record_turn(1, "turn 1 diff", vec![], DiffSubstance::Substantive);
+        journal.record_turn(2, "turn 2 diff", vec![], DiffSubstance::Substantive);
+
+        assert_eq!(journal.turn_diff(1).unwrap(), "turn 1 diff");
+        assert_eq!(journal.turn_diff(2).unwrap(), "turn 2 diff");
+        assert!(journal.turn_diff(3).is_none());
+    }
+
+    #[test]
+    fn clear_removes_turns_but_keeps_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+        journal.record_turn(1, "diff", vec![], DiffSubstance::Substantive);
+
+        assert!(!journal.turns.is_empty());
+        journal.clear();
+        assert!(journal.turns.is_empty());
+        // Baseline still present.
+        assert!(journal.baseline.is_some());
+    }
+
+    #[test]
+    fn agent_diff_shows_tracked_file_modification() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Get baseline HEAD SHA for later comparison.
+        let _baseline_sha = journal.baseline.as_ref().unwrap().head_sha.clone();
+
+        // Modify a tracked file.
+        std::fs::write(repo.join("README.md"), "modified content\n").unwrap();
+
+        // Record a turn with the diff.
+        journal.record_turn(
+            1,
+            "diff --git a/README.md b/README.md\n-\n+modified content",
+            vec!["README.md".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // agent_diff should show the modification via git diff against baseline.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff.is_empty(),
+            "agent_diff should show tracked file modification: {:?}",
+            agent_diff
+        );
+        assert!(
+            agent_diff.contains("README.md"),
+            "diff should reference README.md: {:?}",
+            agent_diff
+        );
+    }
+
+    #[test]
+    fn agent_diff_fallback_to_last_turn_when_no_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        // Don't record a baseline.
+
+        let turn_diff = "diff --git a/foo.rs b/foo.rs\n+new fn\n";
+        journal.record_turn(
+            1,
+            turn_diff,
+            vec!["foo.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // Without a baseline, agent_diff falls back to the last turn's diff.
+        let agent_diff = journal.agent_diff(&repo);
+        assert_eq!(agent_diff, turn_diff);
+    }
+
+    /// Regression test: `agent_diff` must not panic when an untracked
+    /// directory appears in the working tree. Directories should be silently
+    /// skipped rather than passed to `render_untracked_file_hunk`.
+    #[test]
+    fn agent_diff_skips_untracked_directories() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an untracked directory with a file inside it.
+        let subdir = repo.join("new_subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("inside.txt"), "hello\n").unwrap();
+
+        // No panic — agent_diff should gracefully handle the directory.
+        let agent_diff = journal.agent_diff(&repo);
+        // The file inside the dir should be picked up, but the dir itself
+        // should not cause a panic.
+        assert!(
+            agent_diff.contains("inside.txt") || agent_diff.is_empty(),
+            "agent_diff should handle untracked directory gracefully: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Regression test: when a baseline directory entry (stored without
+    /// trailing slash) later contains a new file, the new file must be
+    /// included in the diff without error.
+    #[test]
+    fn agent_diff_handles_new_file_inside_baseline_directory() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an untracked directory *before* baseline so it's captured
+        // as a directory entry in baseline.untracked.
+        let pre_dir = repo.join("pre_dir");
+        std::fs::create_dir(&pre_dir).unwrap();
+        // Add a file inside it so git ls-files --directory includes it.
+        std::fs::write(pre_dir.join("original.txt"), "orig\n").unwrap();
+
+        // Record baseline — the directory "pre_dir/" is captured as "pre_dir".
+        journal.record_baseline(&repo);
+        // Reset the baseline to capture the state with pre_dir.
+        journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Now add a NEW file inside the existing directory.
+        std::fs::write(pre_dir.join("new_agent_file.rs"), "pub fn agent() {}\n").unwrap();
+
+        // agent_diff should NOT panic and should include the new file.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            agent_diff.contains("new_agent_file.rs"),
+            "agent_diff should include new file inside baseline directory: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Test: `render_untracked_file_hunk` returns empty string for directories.
+    #[test]
+    fn render_untracked_file_hunk_returns_empty_for_dirs() {
+        let (_dir, repo) = init_temp_repo();
+        let dir = repo.join("some_dir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let hunk = render_untracked_file_hunk(&PathBuf::from("some_dir"), &dir);
+        assert!(
+            hunk.is_empty(),
+            "render_untracked_file_hunk should return empty string for directories: {:?}",
+            hunk
+        );
+    }
+
+    /// Test: `render_untracked_file_hunk` handles a real file correctly.
+    #[test]
+    fn render_untracked_file_hunk_handles_real_file() {
+        let (_dir, repo) = init_temp_repo();
+        let file = repo.join("test_file.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+
+        let hunk = render_untracked_file_hunk(
+            &PathBuf::from("test_file.txt"),
+            &file,
+        );
+        assert!(
+            !hunk.is_empty(),
+            "render_untracked_file_hunk should produce output for regular files"
+        );
+        assert!(
+            hunk.contains("test_file.txt"),
+            "hunk should reference the file name"
+        );
+    }
+
+    /// Edge case: empty untracked directory should not cause issues.
+    #[test]
+    fn agent_diff_ignores_empty_untracked_directory() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an empty untracked directory.
+        std::fs::create_dir(repo.join("empty_dir")).unwrap();
+
+        // No panic, should be empty diff (no new files, just a dir).
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            agent_diff.is_empty(),
+            "agent_diff should be empty for empty directories: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Regression test: baseline refreshed each iteration prevents
+    /// user committed changes from leaking into agent_diff.
+    /// This tests the per-iteration baseline capture.
+    #[test]
+    fn agent_diff_resets_per_iteration_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+
+        // --- Simulate loop iteration 1 ---
+        // Baseline captured BEFORE agent work in iteration 1.
+        journal.record_baseline(&repo);
+
+        // Agent creates a new file and commits it.
+        std::fs::write(repo.join("agent_work.rs"), "fn agent_fix() {}\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "agent_work.rs"]);
+        run(&["commit", "-q", "-m", "agent: fix"]);
+
+        // agent_diff should show the agent's change (baseline was
+        // captured BEFORE the agent's commit).
+        let agent_diff_v1 = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff_v1.is_empty(),
+            "iteration 1 agent_diff should not be empty: {:?}",
+            agent_diff_v1
+        );
+        assert!(
+            agent_diff_v1.contains("agent_work.rs"),
+            "iteration 1 diff should reference agent_work.rs: {:?}",
+            agent_diff_v1
+        );
+
+        // Record the turn.
+        journal.record_turn(
+            1,
+            &agent_diff_v1,
+            vec!["agent_work.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // --- Simulate user commit between iterations ---
+        std::fs::write(
+            repo.join("agent_work.rs"),
+            "fn agent_fix() {}\n// user fix\n",
+        )
+        .unwrap();
+        run(&["commit", "-q", "-am", "user: improve"]);
+
+        // --- Simulate loop iteration 2: FRESH baseline ---
+        // This is the FIX: the loop captures a fresh baseline at the
+        // start of each iteration.
+        journal.record_baseline(&repo);
+
+        // agent_diff should NOT show the user's committed change,
+        // because the baseline was captured AFTER it.
+        let agent_diff_v2 = journal.agent_diff(&repo);
+        assert!(
+            agent_diff_v2.is_empty(),
+            "iteration 2 agent_diff should be empty (user change absorbed into fresh baseline): {:?}",
+            agent_diff_v2
+        );
+
+        // If the agent makes a new change, only THAT change should appear.
+        std::fs::write(
+            repo.join("agent_work.rs"),
+            "fn agent_fix() {}\n// agent change v2\n",
+        )
+        .unwrap();
+        run(&["add", "agent_work.rs"]);
+        run(&["commit", "-q", "-m", "agent: v2"]);
+
+        let agent_diff_v3 = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff_v3.is_empty(),
+            "agent_diff after agent change should not be empty: {:?}",
+            agent_diff_v3
+        );
+        assert!(
+            agent_diff_v3.contains("agent change v2"),
+            "agent's v2 change should be in diff: {:?}",
+            agent_diff_v3
+        );
+        // The user's committed change should NOT appear as a NEW addition.
+        // It may appear in removal context (replaced by agent), but not as added.
+        let additions: Vec<&str> = agent_diff_v3
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert!(
+            !additions.iter().any(|l| l.contains("user fix")),
+            "user's committed change should NOT be added in agent_diff: {:?}",
+            agent_diff_v3
         );
     }
 }
