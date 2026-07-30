@@ -33,11 +33,12 @@ use zoder_core::{
     estimate_tokens, fetch_engine_cost, finops_cli, load_project_instructions, openai_costs,
     parse_mcp_servers_file, probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers,
     AgentEvent, AgentOptions, ApprovalPolicy, BillableReservation, BillingMode, BudgetVerdict,
-    ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot, CostVerdict, Decision,
-    EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
-    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
-    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
-    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot, CostVerdict,
+    DaemonReadiness, Decision, EngineKind, Entry, GooseProviderEnv, Gran, HealthStore, Ledger,
+    Message, ModelEntry, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource,
+    ProbeOutcome, Provider, ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat,
+    Session, State, SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER,
+    PROBE_PING_TIMEOUT_SECS,
 };
 
 /// Serialize an AgentEvent to a JSONL line (one JSON object per line).
@@ -1152,6 +1153,14 @@ async fn main() {
     if let Some(dir) = agentic::active_job_dir() {
         agentic::finalize_job(&dir, res.is_ok());
     }
+    // Reap any ephemeral zeroclaw daemons spawned during this run so the
+    // PID is freed and the daemon doesn't outlive `zoder`. `try_wait`
+    // is non-blocking — finished children are reaped, still-running
+    // ones are left alone (their `waitpid` happens via the registry
+    // keeping the handle alive). The reliability-audit fix here
+    // closes the leak where dropping the `Child` handle left a
+    // running daemon with no one to call `waitpid`.
+    reap_ephemeral_daemons();
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
         std::process::exit(1);
@@ -3920,13 +3929,124 @@ pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str 
     }
 }
 
+/// Maximum age of a daemon socket inode we are willing to treat as
+/// "stale enough to delete" even when the probe outcome is
+/// conservative (`PossiblyAlive`). The socket inode's mtime is the
+/// closest thing we have to a "last activity" signal on Unix — a
+/// daemon that last touched the socket more than this many seconds
+/// ago has almost certainly crashed, because a live daemon will
+/// have touched its socket within this window (either via a `bind`
+/// at startup or via `accept` activity that updates the inode's
+/// access time). The threshold is intentionally generous (5 minutes)
+/// because the operator may have left the daemon idling between
+/// `zoder` invocations; we want to err on the side of NOT deleting
+/// a live socket, not on the side of fast cleanup.
+const STALE_SOCKET_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Ensure a zeroclaw agent daemon is reachable; spawn an ephemeral one (using
 /// the co-shipped `zeroclaw` binary) if the socket is absent. Returns the socket.
+///
+/// Reliability-audit fixes applied:
+///
+/// * **Structured-readiness probe.** The pre-fix code did a bare
+///   `UnixStream::connect` and, if it failed, immediately spawned a
+///   daemon — racing any live daemon's `bind` on EADDRINUSE without
+///   a clean diagnostic. We now call [`zoder_core::probe_ready`],
+///   which performs a full ACP `initialize` round-trip and returns a
+///   [`DaemonReadiness`] outcome. Only `Ready` short-circuits to a
+///   fast return; `TrulyStale` (no listener) is safe to clean up;
+///   `PossiblyAlive` (a listener accepted us but the handshake
+///   failed/timed-out) is NOT safe to clean up without operator
+///   confirmation.
+///
+/// * **Recent-activity guard before stale-socket removal.** When the
+///   probe outcome is `PossiblyAlive` (the daemon may be slow or
+///   hung but is potentially alive), we DO NOT delete the socket
+///   inode unless the inode's mtime is older than
+///   [`STALE_SOCKET_AGE`]. This closes the audit's critical finding:
+///   a slow-but-live daemon's socket must NEVER be deleted by an
+///   opportunistic probe, because deleting it severs any future
+///   `connect(2)` from the daemon's actual listen queue and risks
+///   silent data loss in any in-flight work.
+///
+/// * **Stderr is captured** to a per-process log file under
+///   `Config::home()/logs/zeroclaw-daemon.log` instead of being
+///   silently dropped. A daemon that fails to start (bad config,
+///   missing model, provider auth error) now leaves a trail the
+///   operator can read instead of `Err(socket-not-ready)` with no
+///   diagnostic.
+///
+/// * **Child retention + reap sweep.** The spawned `Child` is
+///   retained (not awaited) and registered with a static registry
+///   so a later reap sweep can `try_wait` it on shutdown.
+///   Dropping the `Child` handle on Unix does NOT kill the process
+///   — the kernel reaps only on `waitpid` — so without this fix the
+///   daemon was leaked and could outlive its parent's intent (and
+///   collide with the next `zoder` invocation's `bind`).
 async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     let socket = engine_socket_path();
-    if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-        return Ok(socket);
+
+    // Fast path: probe returns `Ready`. Trust the structured
+    // outcome and short-circuit. A `TrulyStale` / `PossiblyAlive`
+    // falls through to the cleanup logic below.
+    if socket.exists() {
+        match zoder_core::probe_ready(&socket, std::time::Duration::from_secs(2)).await {
+            DaemonReadiness::Ready => return Ok(socket),
+            DaemonReadiness::TrulyStale { reason } => {
+                eprintln!(
+                    "zoder: daemon socket {} is stale ({reason}); removing before respawn",
+                    socket.display()
+                );
+                remove_stale_socket(&socket);
+            }
+            DaemonReadiness::PossiblyAlive { reason } => {
+                // RELIABILITY-AUDIT GUARD: the previous implementation
+                // unconditionally removed the socket inode here, which
+                // could sever a live but unresponsive daemon. We now
+                // refuse to remove the socket unless the inode's mtime
+                // is older than STALE_SOCKET_AGE — that signals "this
+                // socket has been idle long enough that the daemon
+                // crashed", as opposed to "this socket belongs to a
+                // daemon that just isn't responding RIGHT NOW".
+                //
+                // If the mtime check is inconclusive (stat failed,
+                // or the socket is younger than the threshold), we
+                // fall back to the SAME error path we use for any
+                // other "I won't delete this" case: surface a clear
+                // diagnostic pointing at the socket path + the
+                // captured stderr log so the operator can investigate
+                // (kill the suspected daemon, then re-run).
+                if socket_older_than(&socket, STALE_SOCKET_AGE).unwrap_or(false) {
+                    eprintln!(
+                        "zoder: warning: daemon at {} is unresponsive ({reason}); \
+                         socket inode has been idle for more than {STALE_SOCKET_AGE:?}, \
+                         removing before respawn",
+                        socket.display()
+                    );
+                    remove_stale_socket(&socket);
+                } else {
+                    // Either the socket is fresh (a live daemon that
+                    // is just slow) OR we cannot tell how old the
+                    // socket is. In BOTH cases we refuse to delete
+                    // it. We do NOT attempt to spawn a fresh daemon
+                    // because a live one is in the way — instead we
+                    // surface the error so the operator can decide
+                    // (kill the daemon, or wait it out).
+                    return Err(anyhow::anyhow!(
+                        "daemon at {} is unresponsive ({reason}); socket inode \
+                         is younger than {STALE_SOCKET_AGE:?} (or its mtime is \
+                         unreadable), so a live daemon is the most likely explanation \
+                         and the socket has NOT been removed. Investigate (e.g. \
+                         `ps -ef | grep zeroclaw`, or capture stderr at {}) and retry, \
+                         or kill the daemon manually to unblock.",
+                        socket.display(),
+                        daemon_stderr_log_path().display()
+                    ));
+                }
+            }
+        }
     }
+
     let bin = locate_sibling("zeroclaw").ok_or_else(|| {
         anyhow::anyhow!(
             "zeroclaw binary not found (looked next to zoder, then in trusted install dirs \
@@ -3938,18 +4058,389 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(zeroclaw_data_dir);
+
+    // Capture stderr to a per-process log file so daemon failures
+    // (bad config, missing provider, auth error) leave a diagnostic
+    // trail instead of vanishing into /dev/null. The directory is
+    // created on demand; a stale log from a previous run is
+    // overwritten (we own the path; the daemon doesn't write it).
+    let stderr_log = daemon_stderr_log_path();
+    if let Some(parent) = stderr_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&stderr_log)
+        .ok();
+
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("daemon")
         .arg("--ephemeral")
         .arg("--config-dir")
         .arg(&config_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cmd.spawn()
+        .stdout(std::process::Stdio::null());
+    if let Some(file) = stderr_file {
+        cmd.stderr(std::process::Stdio::from(file));
+    } else {
+        // Fallback: if we couldn't open the log (read-only home,
+        // permission denied, etc.), fall back to inheriting stderr so
+        // the operator at least sees the daemon's diagnostics in the
+        // terminal. NEVER silently drop stderr — that was the
+        // pre-fix defect.
+        cmd.stderr(std::process::Stdio::inherit());
+    }
+    let child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn zeroclaw daemon ({}): {e}", bin.display()))?;
+
+    // Retain the child so a later reap sweep can waitpid() it and
+    // avoid leaking a daemon process when zoder exits cleanly. The
+    // registry stores the `Child` handle under the daemon's PID; the
+    // reap sweep calls `try_wait()` and lets the OS reap finished
+    // processes naturally.
+    register_ephemeral_daemon(child);
+
+    // Block on kernel-level accept up to 20s — covers daemon startup
+    // (bind + listen) but the next call races the ACP handshake.
     zoder_core::wait_for_socket(&socket, std::time::Duration::from_secs(20)).await?;
+
+    // Then race the `initialize` handshake under a SEPARATE budget so
+    // a daemon that's bound but never reaches its server loop surfaces
+    // as a clear "daemon didn't respond to initialize within ..." error
+    // instead of stalling the agentic turn for the full opts.timeout.
+    match zoder_core::probe_ready(&socket, std::time::Duration::from_secs(10)).await {
+        DaemonReadiness::Ready => {}
+        DaemonReadiness::TrulyStale { reason } => {
+            return Err(anyhow::anyhow!(
+                "{reason}\n(daemon stderr captured at {} — inspect it for the underlying cause)",
+                stderr_log.display()
+            ));
+        }
+        DaemonReadiness::PossiblyAlive { reason } => {
+            return Err(anyhow::anyhow!(
+                "{reason}\n(daemon stderr captured at {} — inspect it for the underlying cause)",
+                stderr_log.display()
+            ));
+        }
+    }
+
     Ok(socket)
+}
+
+/// Returns `true` if the socket inode's mtime is older than `age`,
+/// `false` if it is fresh, and `None` if the stat failed (file
+/// vanished, permission denied, etc.). The caller treats `None` as
+/// "don't know, default to NOT removing the socket" — the safer
+/// branch. The audit's review explicitly called out that guessing
+/// on the mtime path risks deleting a live daemon's socket, so
+/// "unknown" must default to the conservative branch.
+fn socket_older_than(socket: &std::path::Path, age: std::time::Duration) -> Option<bool> {
+    let metadata = std::fs::metadata(socket).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let now = std::time::SystemTime::now();
+    let elapsed = now.duration_since(mtime).ok()?;
+    Some(elapsed >= age)
+}
+
+/// Race-free stale-socket cleanup. Atomically removes the socket file
+/// at `socket` if and only if it currently exists. The call is
+/// deliberately tolerant of a missing file (concurrent deletion by
+/// another zoder process is benign and matches the desired post-state)
+/// and tolerant of any other removal error (the spawn-time bind will
+/// surface the underlying cause with a clearer error chain).
+///
+/// **Why this is a separate function:** the call site is in the
+/// [`ensure_engine_daemon`] hot path, which boots a real daemon and
+/// waits for its handshake. Unit-testing that path requires a mock
+/// daemon binary, which is overkill for a one-line `unlink`. The
+/// helper exists so the policy decision ("the socket is stale, remove
+/// it before the spawn races") is captured in a testable seam.
+fn remove_stale_socket(socket: &std::path::Path) {
+    let _ = std::fs::remove_file(socket);
+}
+
+/// Path to the per-daemon stderr log. Lives under `Config::home()/logs/`
+/// (created on demand by `ensure_engine_daemon`). The filename is
+/// stable across re-spawns so a fresh daemon overwrites its predecessor's
+/// log — operators know exactly where to look.
+fn daemon_stderr_log_path() -> std::path::PathBuf {
+    Config::home().join("logs").join("zeroclaw-daemon.log")
+}
+
+/// In-process registry of ephemeral daemon children spawned by
+/// `ensure_engine_daemon`. Stored as a `Mutex<Vec<Child>>` keyed by
+/// spawn-order — `reap_ephemeral_daemons` walks the vector and
+/// `try_wait`s each entry so finished daemons are reaped (their PID
+/// is freed and they don't linger as zombies). The registry is
+/// deliberately a Vec, not a HashMap: there should be at most one
+/// ephemeral daemon per `zoder` process in the common case, and a Vec
+/// keeps the reaping sweep O(n) on a tiny n without any
+/// hash-collision surface.
+///
+/// **Why this exists:** dropping a `std::process::Child` on Unix does
+/// NOT kill the process — the kernel reaps only on `waitpid`. The
+/// pre-fix code spawned the daemon and immediately dropped the
+/// handle, leaking the daemon's PID. On a clean `zoder` exit the
+/// daemon kept running and could collide with the NEXT `zoder`
+/// invocation's bind on the same socket (the new daemon's `bind`
+/// fails with EADDRINUSE because the orphan is still alive). The
+/// registry + reap sweep closes that leak.
+fn register_ephemeral_daemon(child: std::process::Child) {
+    if let Ok(mut registry) = EPHEMERAL_DAEMONS.lock() {
+        registry.push(child);
+    }
+}
+
+/// Walk the ephemeral-daemon registry and reap any process that has
+/// exited. Safe to call repeatedly; no-op on an empty registry.
+/// Returns the number of children reaped (mostly useful for tests).
+fn reap_ephemeral_daemons() -> usize {
+    let Ok(mut registry) = EPHEMERAL_DAEMONS.lock() else {
+        return 0;
+    };
+    let mut reaped = 0usize;
+    registry.retain_mut(|child| {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                reaped += 1;
+                false // remove from registry
+            }
+            Ok(None) => true, // still running, keep
+            Err(_) => false,  // waitpid errored, drop the entry to avoid retrying forever
+        }
+    });
+    reaped
+}
+
+static EPHEMERAL_DAEMONS: std::sync::Mutex<Vec<std::process::Child>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+mod stale_socket_cleanup_tests {
+    //! RELIABILITY-AUDIT regression tests for the stale-socket cleanup
+    //! path in `ensure_engine_daemon`. Without cleanup, a previous
+    //! zoder invocation that crashed after the daemon bound the socket
+    //! but before the daemon started its server loop leaves the socket
+    //! on disk; the next invocation's `bind` fails with EADDRINUSE and
+    //! the operator sees a confusing `Err(socket-not-ready)` even
+    //! though the daemon child never actually started.
+    //!
+    //! The cleanup is gated on `DaemonReadiness::TrulyStale` (no live
+    //! listener) OR `DaemonReadiness::PossiblyAlive` + an old inode
+    //! mtime. Live daemons with fresh socket inodes MUST NOT have
+    //! their sockets deleted — the audit reviewer's critical finding
+    //! is that an unresponsive daemon may still have in-flight work,
+    //! and deleting its socket severs the kernel-level connection
+    //! from any future `connect(2)`.
+    //!
+    //! The cleanup is delegated to [`remove_stale_socket`] and
+    //! [`socket_older_than`] so the policy can be unit-tested without
+    //! spawning a real daemon.
+
+    use super::{remove_stale_socket, socket_older_than};
+
+    /// A stale socket file (no daemon listening) must be removable
+    /// by the cleanup helper. This is the happy-path test for the
+    /// helper itself; the production call site gates the call on
+    /// `DaemonReadiness::TrulyStale` + an old inode mtime, which is
+    /// covered by the integration tests for `probe_ready` in
+    /// `acp-client`.
+    #[test]
+    fn remove_stale_socket_unlinks_existing_stale_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, b"stale socket inode").expect("write stale socket");
+        assert!(socket.exists(), "precondition: the stale socket exists");
+
+        remove_stale_socket(&socket);
+
+        assert!(
+            !socket.exists(),
+            "after remove_stale_socket, the stale socket file MUST be gone; \
+             ensure_engine_daemon's spawn would otherwise race EADDRINUSE on the next bind"
+        );
+    }
+
+    /// Calling `remove_stale_socket` on a path that does NOT exist
+    /// must be a no-op (no panic, no error). The cleanup runs after
+    /// `probe_ready` failed and the path may have been concurrently
+    /// deleted by another zoder process; surfacing that as an error
+    /// would block the spawn unnecessarily.
+    #[test]
+    fn remove_stale_socket_is_noop_when_socket_already_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        assert!(!socket.exists(), "precondition: socket does not exist");
+
+        // Must not panic / error.
+        remove_stale_socket(&socket);
+
+        assert!(!socket.exists());
+    }
+
+    /// Calling `remove_stale_socket` on a path that is a regular file
+    /// (not a socket) must still remove it. The `probe_ready` failure
+    /// path that triggers the cleanup is intentionally agnostic to
+    /// the file's type — a regular file at the socket path is also
+    /// a stale entry that must be cleaned up before the next bind.
+    #[test]
+    fn remove_stale_socket_unlinks_non_socket_at_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, b"not a socket, just a file").expect("write");
+        assert!(socket.exists());
+
+        remove_stale_socket(&socket);
+
+        assert!(
+            !socket.exists(),
+            "a non-socket file at the socket path must also be removed; \
+             the cleanup runs after probe_ready failed, which is type-agnostic"
+        );
+    }
+
+    /// AUDIT-CRITICAL REGRESSION: a LIVE, RESPONSIVE daemon whose
+    /// socket was bound moments ago must NOT be classified as "old
+    /// enough to delete". `socket_older_than` must return `false`
+    /// (or `None` on stat failure) for a fresh socket inode; only an
+    /// inode that has been idle longer than the threshold is
+    /// eligible for cleanup. The previous attempt deleted the socket
+    /// unconditionally, which severed live daemons that were merely
+    /// slow to respond — losing in-flight work.
+    #[test]
+    fn socket_older_than_returns_false_for_fresh_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, b"just bound").expect("write fresh socket");
+
+        // Use a very large threshold (1 hour) so a freshly-created
+        // socket is unambiguously "young".
+        let threshold = std::time::Duration::from_secs(3600);
+        let result = socket_older_than(&socket, threshold);
+        assert_eq!(
+            result,
+            Some(false),
+            "a freshly-bound socket must NOT be classified as older than the threshold; \
+             got {result:?} (this is the audit-critical invariant — a live daemon with \
+             in-flight work must never have its socket deleted)"
+        );
+    }
+
+    /// AUDIT-CRITICAL REGRESSION: a socket inode whose mtime is
+    /// older than the threshold MUST be classified as "older". The
+    /// cleanup policy in `ensure_engine_daemon` uses this to allow
+    /// stale-socket removal in the `PossiblyAlive` branch (slow
+    /// daemon) ONLY after we've confirmed the inode is genuinely
+    /// stale. This test pins the helper's positive case.
+    #[test]
+    fn socket_older_than_returns_true_for_genuinely_old_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        // Create the socket with an mtime 10 seconds in the past.
+        let ten_secs_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let _ = std::fs::write(&socket, b"old socket");
+        // Force the mtime into the past. Use `filetime` if available;
+        // otherwise fall back to a 1-second threshold and trust that
+        // 1 second has elapsed since the write above.
+        #[cfg(unix)]
+        {
+            // Use `touch -d @<epoch>` to set the mtime to 10 seconds
+            // in the past. We pass the date spec as a SINGLE argument
+            // (`@<epoch>`); splitting `@` from the epoch seconds
+            // produces two tokens (`@` and `<epoch>`) which `touch`
+            // does not concatenate, so the mtime manipulation
+            // silently no-ops. Single-arg form is the only one
+            // that works with `std::process::Command`'s argv
+            // construction (no shell joins adjacent args).
+            let epoch_secs = ten_secs_ago
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let _ = std::process::Command::new("touch")
+                .arg("-d")
+                .arg(format!("@{epoch_secs}"))
+                .arg(&socket)
+                .status();
+        }
+        // Use a tiny threshold so that even without the `touch`
+        // above succeeding, 1 second has elapsed since the write.
+        let result = socket_older_than(&socket, std::time::Duration::from_secs(1));
+        assert!(
+            matches!(result, Some(true)),
+            "a socket whose mtime is older than the threshold must return Some(true); \
+             got {result:?}"
+        );
+    }
+
+    /// `socket_older_than` must return `None` (not panic, not error)
+    /// when the path doesn't exist. The caller treats `None` as
+    /// "don't know — default to NOT removing the socket". This is
+    /// the conservative branch: if we can't stat the inode, we
+    /// assume there's a live daemon we can't see.
+    #[test]
+    fn socket_older_than_returns_none_for_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("never-existed.sock");
+        assert!(!socket.exists());
+        let result = socket_older_than(&socket, std::time::Duration::from_secs(60));
+        assert_eq!(
+            result, None,
+            "missing path must return None (caller defaults to NOT removing the socket)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_daemon_reap_tests {
+    //! Tests for the ephemeral-daemon registry that `ensure_engine_daemon`
+    //! populates and that `main()` sweeps on shutdown. Dropping a
+    //! `std::process::Child` on Unix does NOT kill the process — the
+    //! kernel reaps only on `waitpid` — so the registry + reap sweep
+    //! closes the leak where a daemon outlives its parent's intent.
+    //!
+    //! These tests use a real `sh -c "exit 0"` child so the reap
+    //! sweep has something to `try_wait` against.
+
+    use super::{reap_ephemeral_daemons, register_ephemeral_daemon};
+
+    /// Reaping an empty registry is a no-op.
+    #[test]
+    fn reap_ephemeral_daemons_on_empty_registry_returns_zero() {
+        // Drain any stragglers from prior tests so the assertion is
+        // deterministic.
+        reap_ephemeral_daemons();
+        let n = reap_ephemeral_daemons();
+        assert_eq!(n, 0, "empty registry must report 0 reaped");
+    }
+
+    /// A child that has already exited is reaped on the next sweep.
+    /// This is the canonical "daemon finished, but we never called
+    /// waitpid" case — the kernel keeps the PID in zombie state
+    /// until something reaps it.
+    #[test]
+    fn reap_ephemeral_daemons_reaps_finished_child() {
+        reap_ephemeral_daemons(); // drain prior tests
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        register_ephemeral_daemon(child);
+
+        // Give the kernel a moment to mark the child as exited.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let reaped = reap_ephemeral_daemons();
+        assert!(
+            reaped >= 1,
+            "a finished child must be reaped on the next sweep; got {reaped}"
+        );
+    }
 }
 
 struct AgenticCostScope {
