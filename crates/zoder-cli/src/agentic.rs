@@ -10065,10 +10065,7 @@ mod patch_journal_tests {
         let file = repo.join("test_file.txt");
         std::fs::write(&file, "hello world\n").unwrap();
 
-        let hunk = render_untracked_file_hunk(
-            &PathBuf::from("test_file.txt"),
-            &file,
-        );
+        let hunk = render_untracked_file_hunk(&PathBuf::from("test_file.txt"), &file);
         assert!(
             !hunk.is_empty(),
             "render_untracked_file_hunk should produce output for regular files"
@@ -10119,7 +10116,12 @@ mod patch_journal_tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["add", "agent_work.rs"]);
         run(&["commit", "-q", "-m", "agent: fix"]);

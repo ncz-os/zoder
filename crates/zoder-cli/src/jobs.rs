@@ -250,15 +250,37 @@ fn build_rows(jobs: &[JobMeta], now: DateTime<Utc>) -> Vec<JobListRow> {
         .collect()
 }
 
-pub(crate) fn cmd_jobs_list(_cli: &crate::Cli, _all: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_jobs_list(_cli: &crate::Cli, all: bool) -> anyhow::Result<()> {
     let dir = resolved_jobs_dir();
     let now = Utc::now();
-    // Always show ALL jobs — `jobs list` is the discoverability tool.
-    // The `--all` flag remains for backward compatibility but no longer
-    // narrows results.  See zoder#19: the old cwd filter hid jobs whose
-    // cwd didn't match the current working directory, making background
-    // work invisible when the operator was in a different directory.
-    let all_jobs = collect_jobs(&dir);
+    // zoder#19: the cwd filter hid RUNNING jobs whose cwd differed from the
+    // caller's, so a fan-out could not discover its own work. The first fix
+    // dropped the filter entirely, which also made `--all` a no-op and threw
+    // away the reason it existed: keeping historical jobs from other
+    // directories out of a routine listing.
+    //
+    // Keep both. Running jobs are ALWAYS shown regardless of cwd -- an active
+    // job is never something you want hidden -- while finished jobs stay
+    // scoped to the current directory unless `--all` is passed.
+    let here = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let all_jobs: Vec<_> = collect_jobs(&dir)
+        .into_iter()
+        .filter(|j| {
+            // A job whose meta still says `running` is never hidden, whatever
+            // directory the operator happens to be in. That was the actual bug.
+            if all || j.status == "running" {
+                return true;
+            }
+            match (&here, j.cwd.as_str()) {
+                // A job with no recorded cwd cannot be filtered out safely.
+                (_, "") => true,
+                (Some(h), c) => c == h,
+                (None, _) => true,
+            }
+        })
+        .collect();
 
     let rows = build_rows(&all_jobs, now);
 

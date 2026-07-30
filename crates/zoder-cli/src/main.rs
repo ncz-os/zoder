@@ -1850,8 +1850,14 @@ fn cmd_gate(
 /// The substitution check is exposed as a pure function so the policy
 /// is unit-testable without spinning up a real provider; the CLI binary
 /// is just a thin wrapper around `std::process::exit`.
-fn cmd_exec_oneshot_exit_code(substituted: bool) -> i32 {
-    if substituted {
+fn cmd_exec_oneshot_exit_code(substituted: bool, no_fallback: bool) -> i32 {
+    // Substitution is REPORTED always, but only FATAL when the caller asked for
+    // it. Exiting non-zero after printing a perfectly good answer breaks every
+    // scripted and interactive caller for whom fallback is the desired
+    // behaviour -- `set -e` turns a working run into an aborted one. The issue
+    // asked for substitution to be "visible and refusable": visible is the
+    // structured field plus the warning, refusable is `--no-fallback`.
+    if substituted && no_fallback {
         // 75 EX_TEMPFAIL: "temporary failure, try again". Conveys "the
         // call succeeded at the protocol level, but the server picked a
         // different model than you asked for". This is the documented
@@ -2860,7 +2866,8 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // before the precedence block so that `--agent` cannot silently fall
     // through to scenario routing.
     let cli_model = cli.model.clone();
-    let direct_agent_pin = cli_model.is_none()
+    let direct_agent_pin = cli_model
+        .is_none()
         .then(|| eng.cfg.agent_model(cli.agent.as_deref()))
         .flatten();
 
@@ -3730,7 +3737,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // call that came from a fallback model exits 75 so measurement
     // pipelines can detect the silent model swap; a clean run exits 0.
     let substituted = primary != used_model;
-    let exit_code = cmd_exec_oneshot_exit_code(substituted);
+    let exit_code = cmd_exec_oneshot_exit_code(substituted, cli.no_fallback);
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -4016,33 +4023,37 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
                 // diagnostic pointing at the socket path + the
                 // captured stderr log so the operator can investigate
                 // (kill the suspected daemon, then re-run).
-                if socket_older_than(&socket, STALE_SOCKET_AGE).unwrap_or(false) {
-                    eprintln!(
-                        "zoder: warning: daemon at {} is unresponsive ({reason}); \
-                         socket inode has been idle for more than {STALE_SOCKET_AGE:?}, \
-                         removing before respawn",
-                        socket.display()
-                    );
-                    remove_stale_socket(&socket);
-                } else {
-                    // Either the socket is fresh (a live daemon that
-                    // is just slow) OR we cannot tell how old the
-                    // socket is. In BOTH cases we refuse to delete
-                    // it. We do NOT attempt to spawn a fresh daemon
-                    // because a live one is in the way — instead we
-                    // surface the error so the operator can decide
-                    // (kill the daemon, or wait it out).
-                    return Err(anyhow::anyhow!(
-                        "daemon at {} is unresponsive ({reason}); socket inode \
-                         is younger than {STALE_SOCKET_AGE:?} (or its mtime is \
-                         unreadable), so a live daemon is the most likely explanation \
-                         and the socket has NOT been removed. Investigate (e.g. \
-                         `ps -ef | grep zeroclaw`, or capture stderr at {}) and retry, \
-                         or kill the daemon manually to unblock.",
-                        socket.display(),
-                        daemon_stderr_log_path().display()
-                    ));
-                }
+                // NEVER remove the socket on a PossiblyAlive probe.
+                //
+                // The previous guard removed it when the inode mtime was older
+                // than STALE_SOCKET_AGE, on the stated premise that mtime shows
+                // "this socket has been idle". It does not: a Unix socket's
+                // mtime is set when it is BOUND and does not advance with
+                // traffic. A perfectly healthy daemon that has been up for an
+                // hour therefore looks "idle for more than 5 minutes" and has
+                // its socket unlinked out from under it -- which is the exact
+                // failure the reliability audit raised, reintroduced with a
+                // delay rather than removed.
+                //
+                // `probe_ready` already draws the only distinction that is
+                // sound: TrulyStale means nothing is listening (the connect was
+                // refused), and that arm above removes the socket. PossiblyAlive
+                // means something IS there and did not answer in time. There is
+                // no safe way to turn that into "delete it" without asking the
+                // operator, so we surface it and stop.
+                eprintln!(
+                    "zoder: daemon at {} did not become ready ({reason}), but something \n\
+                     is still bound to that socket. Refusing to remove it -- deleting a \n\
+                     live daemon's socket is worse than failing here.\n\
+                     If you are sure it is dead: fuser {} (or lsof) to find the pid, \n\
+                     kill it, then re-run.",
+                    socket.display(),
+                    socket.display()
+                );
+                anyhow::bail!(
+                    "engine daemon at {} is unresponsive and its socket is still bound",
+                    socket.display()
+                );
             }
         }
     }
@@ -11496,15 +11507,8 @@ mod model_selection_tests {
 
         // `--agent reviewer` with `-m qwen36`: no `[agents.reviewer].model`
         // and no `model_provider`, but `-m` is set so the guard must NOT fire.
-        let cli = Cli::try_parse_from([
-            "zoder",
-            "exec",
-            "--agent",
-            "reviewer",
-            "-m",
-            "qwen36",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer", "-m", "qwen36"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
@@ -11543,8 +11547,7 @@ mod model_selection_tests {
 
         // `--agent reviewer` with NO `-m`: the alias has no config entry,
         // so the guard MUST fire.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
@@ -11587,8 +11590,7 @@ mod model_selection_tests {
 
         // `--agent reviewer` with NO `-m`: must error because the agent
         // has only model_provider (zeroclaw-only), not a direct .model pin.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
@@ -11627,8 +11629,7 @@ mod model_selection_tests {
         cfg.agents = agents;
 
         // `--agent author` with a direct .model pin: must use that pin.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
@@ -12337,15 +12338,27 @@ mod substitution_visibility_tests {
     /// must surface so a measurement pipeline can detect the silent
     /// model swap. A clean run must exit 0 (no false positives).
     #[test]
-    fn cmd_exec_oneshot_exit_code_is_75_on_substitution_and_0_otherwise() {
+    fn cmd_exec_oneshot_exit_code_is_75_only_when_fallback_was_refused() {
         assert_eq!(
-            cmd_exec_oneshot_exit_code(true),
+            cmd_exec_oneshot_exit_code(true, true),
             75,
-            "substitution must yield EX_TEMPFAIL (75) so measurement \
-             pipelines can detect the silent fallback"
+            "substitution under --no-fallback must yield EX_TEMPFAIL (75) so a \
+             measurement pipeline can detect that it did not get the model it asked for"
         );
         assert_eq!(
-            cmd_exec_oneshot_exit_code(false),
+            cmd_exec_oneshot_exit_code(true, false),
+            0,
+            "substitution WITHOUT --no-fallback must still exit 0: the answer is \
+             valid and fallback was permitted. Exiting non-zero here aborts every \
+             `set -e` caller for whom fallback is the desired behaviour."
+        );
+        assert_eq!(
+            cmd_exec_oneshot_exit_code(false, true),
+            0,
+            "no substitution means a clean run, even under --no-fallback"
+        );
+        assert_eq!(
+            cmd_exec_oneshot_exit_code(false, false),
             0,
             "a non-substituted run must still exit 0 (no false positives)"
         );
@@ -12423,20 +12436,18 @@ mod substitution_visibility_tests {
     /// length 1 and a single failure short-circuits to `bail!`).
     #[test]
     fn exit_code_helper_is_independent_of_no_fallback_flag() {
-        // With --no-fallback and a chain of length 1, a failure
-        // short-circuits to bail!() and never reaches the exit-code
-        // helper (substitution cannot be observed because there is
-        // no fallback to substitute to). The exit-code helper itself
-        // is therefore agnostic about --no-fallback — it just maps
-        // bool -> int. This test makes the agnosticism explicit.
-        let substituted_with_no_fallback_chain_that_failed =
-            cmd_exec_oneshot_exit_code(false);
+        // The exit-code helper is deliberately NOT agnostic about
+        // --no-fallback any more. It used to return 75 on any substitution,
+        // which meant a successful run that fell back to a working model
+        // exited non-zero and aborted every `set -e` caller for whom fallback
+        // was the desired behaviour. Substitution is now always REPORTED (the
+        // warning and the structured field) but only FATAL when the operator
+        // refused fallback.
+        let substituted_but_fallback_allowed = cmd_exec_oneshot_exit_code(true, false);
         assert_eq!(
-            substituted_with_no_fallback_chain_that_failed, 0,
-            "exit-code helper must not depend on --no-fallback; it is \
-             a pure function of the substitution boolean. A failure in \
-             a length-1 --no-fallback chain is reported via the \
-             Err(bail!) path, not this helper."
+            substituted_but_fallback_allowed, 0,
+            "substitution with fallback permitted is a successful run: the answer \
+             is valid and the operator did not ask to be blocked"
         );
     }
 }
