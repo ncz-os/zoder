@@ -3938,18 +3938,6 @@ pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str 
 
 /// Maximum age of a daemon socket inode we are willing to treat as
 /// "stale enough to delete" even when the probe outcome is
-/// conservative (`PossiblyAlive`). The socket inode's mtime is the
-/// closest thing we have to a "last activity" signal on Unix — a
-/// daemon that last touched the socket more than this many seconds
-/// ago has almost certainly crashed, because a live daemon will
-/// have touched its socket within this window (either via a `bind`
-/// at startup or via `accept` activity that updates the inode's
-/// access time). The threshold is intentionally generous (5 minutes)
-/// because the operator may have left the daemon idling between
-/// `zoder` invocations; we want to err on the side of NOT deleting
-/// a live socket, not on the side of fast cleanup.
-const STALE_SOCKET_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
 /// Ensure a zeroclaw agent daemon is reachable; spawn an ephemeral one (using
 /// the co-shipped `zeroclaw` binary) if the socket is absent. Returns the socket.
 ///
@@ -4141,21 +4129,6 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
     Ok(socket)
 }
 
-/// Returns `true` if the socket inode's mtime is older than `age`,
-/// `false` if it is fresh, and `None` if the stat failed (file
-/// vanished, permission denied, etc.). The caller treats `None` as
-/// "don't know, default to NOT removing the socket" — the safer
-/// branch. The audit's review explicitly called out that guessing
-/// on the mtime path risks deleting a live daemon's socket, so
-/// "unknown" must default to the conservative branch.
-fn socket_older_than(socket: &std::path::Path, age: std::time::Duration) -> Option<bool> {
-    let metadata = std::fs::metadata(socket).ok()?;
-    let mtime = metadata.modified().ok()?;
-    let now = std::time::SystemTime::now();
-    let elapsed = now.duration_since(mtime).ok()?;
-    Some(elapsed >= age)
-}
-
 /// Race-free stale-socket cleanup. Atomically removes the socket file
 /// at `socket` if and only if it currently exists. The call is
 /// deliberately tolerant of a missing file (concurrent deletion by
@@ -4248,10 +4221,9 @@ mod stale_socket_cleanup_tests {
     //! from any future `connect(2)`.
     //!
     //! The cleanup is delegated to [`remove_stale_socket`] and
-    //! [`socket_older_than`] so the policy can be unit-tested without
-    //! spawning a real daemon.
+    //! so the policy can be unit-tested without spawning a real daemon.
 
-    use super::{remove_stale_socket, socket_older_than};
+    use super::remove_stale_socket;
 
     /// A stale socket file (no daemon listening) must be removable
     /// by the cleanup helper. This is the happy-path test for the
@@ -4310,96 +4282,6 @@ mod stale_socket_cleanup_tests {
             !socket.exists(),
             "a non-socket file at the socket path must also be removed; \
              the cleanup runs after probe_ready failed, which is type-agnostic"
-        );
-    }
-
-    /// AUDIT-CRITICAL REGRESSION: a LIVE, RESPONSIVE daemon whose
-    /// socket was bound moments ago must NOT be classified as "old
-    /// enough to delete". `socket_older_than` must return `false`
-    /// (or `None` on stat failure) for a fresh socket inode; only an
-    /// inode that has been idle longer than the threshold is
-    /// eligible for cleanup. The previous attempt deleted the socket
-    /// unconditionally, which severed live daemons that were merely
-    /// slow to respond — losing in-flight work.
-    #[test]
-    fn socket_older_than_returns_false_for_fresh_socket() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("daemon.sock");
-        std::fs::write(&socket, b"just bound").expect("write fresh socket");
-
-        // Use a very large threshold (1 hour) so a freshly-created
-        // socket is unambiguously "young".
-        let threshold = std::time::Duration::from_secs(3600);
-        let result = socket_older_than(&socket, threshold);
-        assert_eq!(
-            result,
-            Some(false),
-            "a freshly-bound socket must NOT be classified as older than the threshold; \
-             got {result:?} (this is the audit-critical invariant — a live daemon with \
-             in-flight work must never have its socket deleted)"
-        );
-    }
-
-    /// AUDIT-CRITICAL REGRESSION: a socket inode whose mtime is
-    /// older than the threshold MUST be classified as "older". The
-    /// cleanup policy in `ensure_engine_daemon` uses this to allow
-    /// stale-socket removal in the `PossiblyAlive` branch (slow
-    /// daemon) ONLY after we've confirmed the inode is genuinely
-    /// stale. This test pins the helper's positive case.
-    #[test]
-    fn socket_older_than_returns_true_for_genuinely_old_socket() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("daemon.sock");
-        // Create the socket with an mtime 10 seconds in the past.
-        let ten_secs_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
-        let _ = std::fs::write(&socket, b"old socket");
-        // Force the mtime into the past. Use `filetime` if available;
-        // otherwise fall back to a 1-second threshold and trust that
-        // 1 second has elapsed since the write above.
-        #[cfg(unix)]
-        {
-            // Use `touch -d @<epoch>` to set the mtime to 10 seconds
-            // in the past. We pass the date spec as a SINGLE argument
-            // (`@<epoch>`); splitting `@` from the epoch seconds
-            // produces two tokens (`@` and `<epoch>`) which `touch`
-            // does not concatenate, so the mtime manipulation
-            // silently no-ops. Single-arg form is the only one
-            // that works with `std::process::Command`'s argv
-            // construction (no shell joins adjacent args).
-            let epoch_secs = ten_secs_ago
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let _ = std::process::Command::new("touch")
-                .arg("-d")
-                .arg(format!("@{epoch_secs}"))
-                .arg(&socket)
-                .status();
-        }
-        // Use a tiny threshold so that even without the `touch`
-        // above succeeding, 1 second has elapsed since the write.
-        let result = socket_older_than(&socket, std::time::Duration::from_secs(1));
-        assert!(
-            matches!(result, Some(true)),
-            "a socket whose mtime is older than the threshold must return Some(true); \
-             got {result:?}"
-        );
-    }
-
-    /// `socket_older_than` must return `None` (not panic, not error)
-    /// when the path doesn't exist. The caller treats `None` as
-    /// "don't know — default to NOT removing the socket". This is
-    /// the conservative branch: if we can't stat the inode, we
-    /// assume there's a live daemon we can't see.
-    #[test]
-    fn socket_older_than_returns_none_for_missing_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("never-existed.sock");
-        assert!(!socket.exists());
-        let result = socket_older_than(&socket, std::time::Duration::from_secs(60));
-        assert_eq!(
-            result, None,
-            "missing path must return None (caller defaults to NOT removing the socket)"
         );
     }
 }
@@ -5950,13 +5832,10 @@ pub(crate) async fn agentic_turn(
     // runtime telemetry to prove it is free — under concurrent fan-out
     // telemetry races are transient, and conflating "unknown" with "paid"
     // kills agents that are safe to run.
-    let cost_neutral = (engine_kind == EngineKind::Zeroclaw)
-        .then(|| {
-            routing
-                .real_provider_for_model(&eng.cfg, &model_used)
-                .is_some_and(is_cost_neutral_provider)
-        })
-        .unwrap_or(false);
+    let cost_neutral = engine_kind == EngineKind::Zeroclaw
+        && routing
+            .real_provider_for_model(&eng.cfg, &model_used)
+            .is_some_and(is_cost_neutral_provider);
     let unknown_cost_violation = (!cost_known && !cli.allow_paid && !cost_neutral)
         .then(|| format!("cost unknown: {engine_kind:?} returned no authoritative cost telemetry"));
     let violation = match (&paid_failure, unknown_cost_violation) {
@@ -12310,24 +12189,24 @@ mod task_validation_tests {
     }
 }
 
-/// Regression tests for Finding #18 (zoder-18): the silent model
-/// substitution that produced a clean 4/4 score for the wrong model
-/// when a reviewer-calibration experiment was silently served by
-/// `gpu0-sentinel` (a ring-fenced production GPU).
-///
-/// The contract under test:
-///
-///   1. The substitution-exit-code policy is a pure function with a
-///      stable contract: `substituted ⇒ exit 75`, `!substituted ⇒ exit 0`.
-///   2. The JSON output of `cmd_exec_oneshot` carries the new fields
-///      `requested`, `served`, and `substituted` so a measurement
-///      pipeline that parses JSON cannot miss the substitution.
-///   3. The legacy `model` field is preserved as an alias for `served`
-///      so existing parsers keep working.
-///
-/// These three checks are the minimum acceptance surface; deeper
-/// integration tests against a live fallback chain live in the
-/// `cmd_exec_oneshot_*` helpers (which exercise `try_model` mocking).
+// Regression tests for Finding #18 (zoder-18): the silent model
+// substitution that produced a clean 4/4 score for the wrong model
+// when a reviewer-calibration experiment was silently served by
+// `gpu0-sentinel` (a ring-fenced production GPU).
+//
+// The contract under test:
+//
+//   1. The substitution-exit-code policy is a pure function with a
+//      stable contract: `substituted ⇒ exit 75`, `!substituted ⇒ exit 0`.
+//   2. The JSON output of `cmd_exec_oneshot` carries the new fields
+//      `requested`, `served`, and `substituted` so a measurement
+//      pipeline that parses JSON cannot miss the substitution.
+//   3. The legacy `model` field is preserved as an alias for `served`
+//      so existing parsers keep working.
+//
+// These three checks are the minimum acceptance surface; deeper
+// integration tests against a live fallback chain live in the
+// `cmd_exec_oneshot_*` helpers (which exercise `try_model` mocking).
 #[cfg(test)]
 mod substitution_visibility_tests {
     //! Verify the substitution-exit-code policy and JSON contract

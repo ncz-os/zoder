@@ -9948,7 +9948,6 @@ mod patch_journal_tests {
     }
 
     #[test]
-    #[test]
     fn agent_diff_excludes_a_humans_uncommitted_edit() {
         // The baseline was `git diff <HEAD>`, so an edit the human had already
         // made -- but not committed -- was in the diff from the start and got
@@ -10002,6 +10001,7 @@ mod patch_journal_tests {
         );
     }
 
+    #[test]
     fn agent_diff_is_empty_with_no_turns() {
         let (_dir, repo) = init_temp_repo();
         let mut journal = PatchJournal::new();
