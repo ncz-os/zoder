@@ -5305,7 +5305,20 @@ pub(crate) async fn agentic_turn(
             )
         })
         .flatten();
-    let unknown_cost_violation = (!cost_known)
+    // Only treat missing cost telemetry as a violation when the call is
+    // genuinely at-risk: not allow-paid, and not served from a cost-neutral
+    // provider. A provider declared billing = "free" should not require
+    // runtime telemetry to prove it is free — under concurrent fan-out
+    // telemetry races are transient, and conflating "unknown" with "paid"
+    // kills agents that are safe to run.
+    let cost_neutral = (engine_kind == EngineKind::Zeroclaw)
+        .then(|| {
+            routing
+                .real_provider_for_model(&eng.cfg, &model_used)
+                .is_some_and(is_cost_neutral_provider)
+        })
+        .unwrap_or(false);
+    let unknown_cost_violation = (!cost_known && !cli.allow_paid && !cost_neutral)
         .then(|| format!("cost unknown: {engine_kind:?} returned no authoritative cost telemetry"));
     let violation = match (&paid_failure, unknown_cost_violation) {
         (Some(paid), Some(unknown)) => Some(format!("{paid}; {unknown}")),
