@@ -1290,10 +1290,39 @@ async fn drive<F: FnMut(AgentEvent)>(
                     .await;
                     break "timeout".to_string();
                 }
-                Ok(r) => r.context("reading from engine")?,
+                Ok(r) => match r {
+                    Ok(got_line) => got_line,
+                    Err(e) => {
+                        // Distinguish between different types of read errors:
+                        // - InvalidData from frame cap: this is a sign of a misbehaving
+                        //   engine, so we return an error (original Z-17 behavior).
+                        // - Other errors (connection errors, etc.): treat as partial
+                        //   turn - preserve whatever was streamed so far.
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            return Err(e.into());
+                        }
+                        return Ok(AgentRun {
+                            session_id: session_id.clone(),
+                            outcome: "partial".to_string(),
+                            content,
+                            input_tokens,
+                            tool_calls,
+                        });
+                    }
+                },
             };
         if !got_line {
-            bail!("engine closed the connection before turn completed");
+            // Engine closed the connection mid-turn. Return partial work
+            // instead of losing everything. This preserves streamed text +
+            // session id so the caller can resume or at least see what was
+            // accomplished before the disconnect.
+            return Ok(AgentRun {
+                session_id: session_id.clone(),
+                outcome: "partial".to_string(),
+                content,
+                input_tokens,
+                tool_calls,
+            });
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -2915,16 +2944,39 @@ where
                 }
                 break "timeout".to_string();
             }
-            Ok(r) => r.context("reading from goose ACP engine")?,
+            Ok(r) => match r {
+                Ok(got_line) => got_line,
+                Err(e) => {
+                    // Distinguish between different types of read errors:
+                    // - InvalidData from frame cap: this is a sign of a misbehaving
+                    //   engine, so we return an error (original Z-17 behavior).
+                    // - Other errors (connection errors, etc.): treat as partial
+                    //   turn - preserve whatever was streamed so far.
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        return Err(e.into());
+                    }
+                    return Ok(AgentRun {
+                        session_id: session_id.clone(),
+                        outcome: "partial".to_string(),
+                        content,
+                        input_tokens,
+                        tool_calls,
+                    });
+                }
+            },
         };
         if !got_line {
-            // Engine closed its end. If we never got an explicit stopReason,
-            // assume the turn completed.
-            break if content.is_empty() && tool_calls == 0 {
-                "failed".to_string()
-            } else {
-                "completed".to_string()
-            };
+            // Engine closed the connection mid-turn. Return partial work
+            // instead of losing everything. This preserves streamed text +
+            // session id so the caller can resume or at least see what was
+            // accomplished before the disconnect.
+            return Ok(AgentRun {
+                session_id: session_id.clone(),
+                outcome: "partial".to_string(),
+                content,
+                input_tokens,
+                tool_calls,
+            });
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -4889,6 +4941,15 @@ mod tests {
     /// `session/request_permission` request is read-after-write so the
     /// client's reply lands in `received` for the test to assert on.
     async fn run_mock(server: MockGoose, engine_io: tokio::io::DuplexStream) {
+        run_mock_with_behavior(server, engine_io, MockBehavior::Normal).await
+    }
+
+    /// The mock server task with configurable behavior.
+    async fn run_mock_with_behavior(
+        server: MockGoose,
+        engine_io: tokio::io::DuplexStream,
+        behavior: MockBehavior,
+    ) {
         use tokio::io::AsyncWriteExt as _;
         let (r, mut w) = tokio::io::split(engine_io);
         let mut r = tokio::io::BufReader::new(r);
@@ -4952,22 +5013,28 @@ mod tests {
             }
         }
 
-        // 4. read session/prompt
+        // 4. For Normal behavior: read session/prompt and send response.
+        //    For MidTurnDisconnect: read session/prompt but DON'T send
+        //    the response, then close the stream to simulate a disconnect.
         read_one(&mut r, &server.received).await;
 
-        // 5. final prompt response with terminal stopReason.
-        write_one(
-            &mut w,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "prompt",
-                "result": { "stopReason": "end_turn" }
-            }),
-        )
-        .await;
+        if matches!(behavior, MockBehavior::Normal) {
+            // 5. final prompt response with terminal stopReason.
+            write_one(
+                &mut w,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "prompt",
+                    "result": { "stopReason": "end_turn" }
+                }),
+            )
+            .await;
 
-        // Give the client a moment to read the response.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Give the client a moment to read the response.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // For MidTurnDisconnect: close the stream without sending prompt response
+        // to simulate a mid-turn disconnect.
     }
 
     /// Run the goose driver against a mock engine speaking the real
@@ -4978,13 +5045,33 @@ mod tests {
         show_reasoning: bool,
         approval: ApprovalPolicy,
     ) -> (Vec<serde_json::Value>, AgentRun, Vec<AgentEvent>) {
+        drive_against_mock_with_behavior(outbound, show_reasoning, approval, MockBehavior::Normal)
+            .await
+    }
+
+    /// Behavior variants for the mock engine.
+    enum MockBehavior {
+        /// Normal behavior: complete the turn with stopReason.
+        Normal,
+        /// Mid-turn disconnect: close the connection after outbound frames
+        /// without sending the prompt response.
+        MidTurnDisconnect,
+    }
+
+    /// Run the goose driver against a mock with configurable behavior.
+    async fn drive_against_mock_with_behavior(
+        outbound: Vec<String>,
+        show_reasoning: bool,
+        approval: ApprovalPolicy,
+        behavior: MockBehavior,
+    ) -> (Vec<serde_json::Value>, AgentRun, Vec<AgentEvent>) {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = MockGoose {
             received: received.clone(),
             outbound,
         };
         let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
-        let server_handle = tokio::spawn(run_mock(server, engine_io));
+        let server_handle = tokio::spawn(run_mock_with_behavior(server, engine_io, behavior));
         let (mut r, mut w) = tokio::io::split(client_io);
         let mut r = tokio::io::BufReader::new(&mut r);
         let mut opts = goose_opts(Some("gpt-4o-mini"));
@@ -8208,6 +8295,64 @@ mod tests {
             .expect("read_result_inner errored")
             .expect("engine returned an error response");
         assert_eq!(res["protocolVersion"], 1);
+    }
+
+    /// Z-25: mid-turn disconnect must return partial AgentRun instead of Err.
+    ///
+    /// When the engine closes the connection during a turn, the driver should
+    /// preserve all accumulated content, session_id, and metadata instead of
+    /// losing everything by returning Err. This allows the caller to resume
+    /// the turn or at least see what was accomplished.
+    ///
+    /// This test verifies that content is correctly accumulated and returned
+    /// even when the turn doesn't complete normally (the mock closes the
+    /// connection without sending the prompt response, simulating a mid-turn
+    /// disconnect).
+    #[tokio::test]
+    async fn mid_turn_disconnect_returns_partial_run() {
+        // Use the existing mock infrastructure but have the mock close
+        // the connection after sending some content but before turn_complete.
+        let outbound = vec![
+            // Some content chunks
+            update(
+                "test-session-123",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Hello" }
+                }),
+            ),
+            update(
+                "test-session-123",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": " World" }
+                }),
+            ),
+            // NOTE: No turn_complete - the mock will close the connection
+        ];
+        let (frames, run, _events) = drive_against_mock_with_behavior(
+            outbound,
+            false,
+            ApprovalPolicy::Allowlist,
+            MockBehavior::MidTurnDisconnect,
+        )
+        .await;
+
+        // The fix: partial content must be preserved
+        assert_eq!(run.session_id, "goose-test-session-1");
+        // The outcome should be "partial" to indicate incomplete turn
+        assert_eq!(run.outcome, "partial");
+        // The key assertion is that content was preserved
+        assert_eq!(run.content, "Hello World");
+        assert!(
+            !run.content.is_empty(),
+            "partial content should be preserved"
+        );
+        // Verify we received the frames we sent
+        assert!(
+            frames.len() >= 3,
+            "should have received init/new/prompt frames"
+        );
     }
 }
 
