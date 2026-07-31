@@ -5229,9 +5229,33 @@ fn pinned_model_divergence(pinned: Option<&str>, executed: &str) -> Option<Strin
 
 /// Map a model id to a renamed zeroclaw agent alias (the model-named aliases the
 /// TUI picker shows). Falls back to the strongest coding alias. `--agent` wins.
-fn resolve_agent_alias(cli: &Cli, model: &str) -> String {
+fn resolve_agent_alias(
+    cli: &Cli,
+    known_agents: &std::collections::HashSet<String>,
+    model: &str,
+) -> String {
     if let Some(a) = &cli.agent {
         return a.clone();
+    }
+    // A REAL ENGINE AGENT WINS OVER THE HARDCODED TABLE BELOW.
+    //
+    // That table lists cloud model ids. An engine agent name (`coder`,
+    // `reviewer`, `qwen36-gguf`, ...) matches none of them and fell through to
+    // the `minimax` default, so `-m coder` silently ran minimax-m2.7 against
+    // :8002 and 404'd -- the engine ran a different model than the one named on
+    // the command line. `pinned_model_divergence` was left *warning* about that
+    // instead of fixing it.
+    //
+    // The agent set comes from the zeroclaw daemon (`agents_status`), not from
+    // `Config::agents`: on this stack the agents are defined in the ENGINE
+    // config and `zoder_core::config::Config::agents` is empty, so checking it
+    // silently matched nothing. The daemon is the only thing that actually
+    // knows which aliases exist.
+    if known_agents.contains(model) {
+        return model.to_string();
+    }
+    if let Some(k) = known_agents.iter().find(|k| k.eq_ignore_ascii_case(model)) {
+        return k.clone();
     }
     let m = model.to_ascii_lowercase();
     // (substring in model id) -> alias
@@ -6878,7 +6902,20 @@ pub(crate) async fn agentic_turn(
     // that minor accounting miss in exchange for keeping the scope open
     // for the entire chain (the pre-scope path is not the failure mode
     // this slice is closing).
-    let head_alias = resolve_agent_alias(cli, &primary);
+    // Resolved the same way as the executing alias below. This runs before the
+    // daemon socket is created, so ask an ALREADY-RUNNING daemon without
+    // spawning one; if none is up the set is empty and this degrades to the old
+    // table-only behaviour. Passing an empty set unconditionally would scope the
+    // cost directory under a different alias than the one actually executed --
+    // the same silent divergence this resolution order exists to remove.
+    let head_alias = {
+        let known: std::collections::HashSet<String> =
+            zoder_core::agents_status(&engine_socket_path())
+                .await
+                .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
+                .unwrap_or_default();
+        resolve_agent_alias(cli, &known, &primary)
+    };
 
     // SLICE 2 (execution-safety kernel CLI plumbing): resolve the
     // writable-root containment boundary from the operator's flags.
@@ -6926,6 +6963,18 @@ pub(crate) async fn agentic_turn(
     let socket = match engine_kind {
         EngineKind::Zeroclaw => Some(ensure_engine_daemon().await?),
         EngineKind::Goose => None,
+    };
+
+    // Ask the daemon which agent aliases exist, once, so `-m <alias>` can
+    // resolve to a real agent instead of falling through to the default. A
+    // failure here is non-fatal: an empty set just restores the old
+    // substring-table behaviour rather than breaking the run.
+    let known_agents: std::collections::HashSet<String> = match socket.as_ref() {
+        Some(sock) => zoder_core::agents_status(sock)
+            .await
+            .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
+            .unwrap_or_default(),
+        None => std::collections::HashSet::new(),
     };
 
     // Zeroclaw selects a complete coding-agent definition at `session/new`:
@@ -7200,7 +7249,7 @@ pub(crate) async fn agentic_turn(
             }
         }
         // Wire per-candidate alias + model_id into the shared opts.
-        let alias = resolve_agent_alias(cli, &model);
+        let alias = resolve_agent_alias(cli, &known_agents, &model);
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
         match run_agent_dispatch(engine_kind, &chain_opts, |ev| {
@@ -7475,7 +7524,16 @@ pub(crate) async fn cmd_exec_agentic(
             reason: _,
         } = resolve_chain(cli, &eng, &health)?;
         let primary = chain.first().cloned().unwrap_or_default();
-        let alias = resolve_agent_alias(cli, &primary);
+        // --dry-run must not SPAWN a daemon, but if one is already up we ask it
+        // which aliases exist so the printed alias matches what a real run would
+        // pick. Reporting a different alias than execution would choose is the
+        // same class of divergence this resolution order exists to remove.
+        let known_agents: std::collections::HashSet<String> =
+            zoder_core::agents_status(&engine_socket_path())
+                .await
+                .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
+                .unwrap_or_default();
+        let alias = resolve_agent_alias(cli, &known_agents, &primary);
         let cwd = agentic_cwd(cli)?;
         println!(
             "[dry-run] agentic: alias={alias} model={primary} cwd={}",
@@ -13084,6 +13142,48 @@ mod model_selection_tests {
         );
     }
 
+    /// REGRESSION: `-m <engine-agent-alias>` must select that agent.
+    ///
+    /// `resolve_agent_alias` matched the model id against a hardcoded table of
+    /// CLOUD model ids and, on no match, returned the `minimax` default. A local
+    /// engine alias such as `coder` matched nothing, so `zoder exec -m coder`
+    /// silently ran `minimax-m2.7` and 404'd -- the engine ran a model the
+    /// operator never named. `pinned_model_divergence` only *warned* about it.
+    ///
+    /// Fails on the old behaviour: with `coder` present in the engine's agent
+    /// set, the pre-fix resolver still answered `minimax`.
+    #[test]
+    fn dash_m_selects_a_real_engine_agent_over_the_builtin_table() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "-m", "coder", "task"]).unwrap();
+        let known: std::collections::HashSet<String> = ["coder", "reviewer", "minimax"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            resolve_agent_alias(&cli, &known, "coder"),
+            "coder",
+            "a model id naming a real engine agent must select that agent, not the default"
+        );
+
+        // Case-insensitive, since aliases are operator-typed.
+        assert_eq!(resolve_agent_alias(&cli, &known, "CODER"), "coder");
+
+        // Unknown ids still fall through to the substring table / default, so
+        // cloud model ids keep working.
+        assert_eq!(
+            resolve_agent_alias(&cli, &known, "some-unknown-cloud-model"),
+            "minimax"
+        );
+
+        // `--agent` still outranks everything.
+        let pinned = Cli::try_parse_from([
+            "zoder", "exec", "-m", "coder", "--agent", "reviewer", "task",
+        ])
+        .unwrap();
+        assert_eq!(resolve_agent_alias(&pinned, &known, "coder"), "reviewer");
+    }
+
     /// A forced loop author must still enter Zeroclaw through a complete coding
     /// agent. The alias selected from the forced model supplies the provider,
     /// runtime/tool profile and workspace at `session/new`; a subsequent bare
@@ -13104,7 +13204,7 @@ mod model_selection_tests {
         } = resolve_chain(&cli, &eng, &health).unwrap();
         let head = chain.first().expect("chain must have a head");
         assert_eq!(
-            resolve_agent_alias(&cli, head),
+            resolve_agent_alias(&cli, &std::collections::HashSet::new(), head),
             "minimax",
             "the forced model must select its configured coding-agent alias"
         );
