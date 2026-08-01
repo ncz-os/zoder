@@ -5309,16 +5309,21 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
         ));
     }
     let dir = base.join(&m.id);
-    if cancel_background_process_group(&m)? == CancelSignalOutcome::AlreadyFinished {
-        println!("job already finished: {}", m.id);
-        return Ok(());
-    }
+    let outcome = cancel_background_process_group(&m)?;
     if let Some(mut meta) = read_meta(&dir) {
+        // A worker can die before its finalizer runs (for example, after an
+        // external SIGKILL). Reconcile that stale `running` record here so a
+        // harness does not wait forever on a PID the kernel has already lost.
         meta.status = "cancelled".into();
         meta.finished = Some(Utc::now());
         let _ = write_meta(&dir, &meta);
     }
-    println!("cancelled {}", m.id);
+    match outcome {
+        CancelSignalOutcome::AlreadyFinished => {
+            println!("reconciled already-finished job {}", m.id);
+        }
+        CancelSignalOutcome::Signalled => println!("cancelled {}", m.id),
+    }
     Ok(())
 }
 
@@ -5333,6 +5338,7 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::path::PathBuf;
 
     // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
@@ -5862,6 +5868,30 @@ mod tests {
             outcome,
             CancelSignalOutcome::AlreadyFinished,
             "dead recorded pid must be treated as already finished without signalling"
+        );
+    }
+
+    #[test]
+    fn cmd_cancel_reconciles_a_dead_worker_to_cancelled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::EnvGuard::new(home_dir.path());
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait true");
+
+        let id = "dead-worker";
+        let dir = jobs_dir().join(id);
+        write_meta(&dir, &meta_for_test_id_pid(id, pid)).expect("write dead job metadata");
+        let cli = crate::Cli::try_parse_from(["zoder", "status"]).expect("parse cli");
+        cmd_cancel(&cli, Some(id.to_string())).expect("reconcile dead job");
+
+        let meta = read_meta(&dir).expect("read reconciled metadata");
+        assert_eq!(meta.status, "cancelled");
+        assert!(
+            meta.finished.is_some(),
+            "reconciled job must have a finish time"
         );
     }
 
