@@ -5033,11 +5033,22 @@ fn configure_background_worker_command(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    // Detach the worker into its own process group so cancel can SIGTERM /
-    // SIGKILL the WHOLE subtree. `process_group(0)` maps to setpgid(pid, 0)
-    // on Unix, so the child leads a fresh group with pgid == pid.
+    // Detach the worker into a new SESSION, not merely a new process group.
+    // A job that shares its submitter's controlling session can receive the
+    // terminal's SIGHUP when the submitter exits. That leaves a dead PID with
+    // a permanently `running` job record, so a harness polling `zoder status`
+    // waits until its own timeout. `setsid()` also makes the child its own
+    // process-group leader, preserving group-based cancellation.
     #[cfg(unix)]
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
 }
 
 /// Re-exec the current invocation as a detached worker writing to a new job dir.
@@ -5754,7 +5765,8 @@ mod tests {
     }
 
     #[test]
-    fn configure_background_worker_command_sets_own_process_group() {
+    fn configure_background_worker_command_starts_own_session_and_process_group() {
+        let parent_sid = unsafe { libc::getsid(0) };
         let dir = tempfile::tempdir().expect("tempdir");
         let out = std::fs::File::create(dir.path().join("output.txt")).expect("output file");
         let err = out.try_clone().expect("clone output");
@@ -5763,6 +5775,7 @@ mod tests {
         configure_background_worker_command(&mut command, &args, dir.path(), out, err);
         let mut child = command.spawn().expect("spawn sleep");
         let pid = child.id();
+        let sid = unsafe { libc::getsid(pid as libc::pid_t) };
         let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
 
         unsafe {
@@ -5777,6 +5790,14 @@ mod tests {
         assert_eq!(
             pgid, pid as libc::pid_t,
             "background worker must lead its own process group so pgid == pid"
+        );
+        assert_eq!(
+            sid, pid as libc::pid_t,
+            "background worker must lead its own session"
+        );
+        assert_ne!(
+            sid, parent_sid,
+            "background worker must not share the submitter session"
         );
     }
 
