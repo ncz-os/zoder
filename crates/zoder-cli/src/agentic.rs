@@ -467,6 +467,45 @@ impl ReviewerError {
     }
 }
 
+fn provider_error_mentions_model_unavailable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "model_not_found",
+        "model-not-found",
+        "model not found",
+        "model does not exist",
+        "model doesn't exist",
+        "deployment_not_found",
+        "deployment not found",
+        "invalid_api_key",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn provider_error_is_model_unavailable(
+    e: &zoder_core::ProviderError,
+    server_failures: u32,
+) -> bool {
+    if e.emitted {
+        return false;
+    }
+    match e.status {
+        Some(401 | 403 | 404) => true,
+        Some(500..=599) => server_failures > 1,
+        Some(400..=499) => provider_error_mentions_model_unavailable(&e.message),
+        _ => match e.kind {
+            zoder_core::ErrKind::Http => provider_error_mentions_model_unavailable(&e.message),
+            zoder_core::ErrKind::Server => server_failures > 1,
+            _ => false,
+        },
+    }
+}
+
 /// Run one non-streamed completion on `model_override` (else the resolved
 /// reviewer model), record it in the ledger, and return the text + cost.
 ///
@@ -854,12 +893,38 @@ async fn dispatch_reviewer_for_model(
         )));
     }
 
-    // Reserve and lock accounting before the reviewer request. Panel calls may
-    // run concurrently, so this also serializes their authoritative snapshots.
     let ledger_path = eng.cfg.ledger_path.clone();
-    let mut ledger_reservation =
-        match tokio::task::spawn_blocking(move || Ledger::new(&ledger_path).reserve_billable())
-            .await
+    let messages = vec![Message::new("system", system), Message::new("user", user)];
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages,
+        max_tokens,
+        temperature: Some(0.1),
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: cli.reasoning.clone(),
+    };
+    let provider = match OpenAiProvider::new_with_request_timeout_s(
+        provider_cfg,
+        Some(crate::provider_request_timeout_s(cli, &eng.cfg)),
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
+    };
+
+    let mut attempt = 0u32;
+    let mut server_failures = 0u32;
+    let (res, ledger_reservation) = loop {
+        // Reserve and lock accounting before each reviewer attempt. Panel
+        // calls may run concurrently, so this also serializes their
+        // authoritative snapshots. A failed attempt may have reached the
+        // provider, so dropping an armed reservation intentionally retains
+        // its unknown-cost row before the retry proceeds.
+        let reservation_path = ledger_path.clone();
+        let mut ledger_reservation = match tokio::task::spawn_blocking(move || {
+            Ledger::new(&reservation_path).reserve_billable()
+        })
+        .await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -874,42 +939,48 @@ async fn dispatch_reviewer_for_model(
             }
         };
 
-    let messages = vec![Message::new("system", system), Message::new("user", user)];
-    let req = ChatRequest {
-        model: model.to_string(),
-        messages,
-        max_tokens,
-        temperature: Some(0.1),
-        stream: false,
-        show_reasoning: false,
-        reasoning_effort: cli.reasoning.clone(),
-    };
-    let provider = match OpenAiProvider::new(provider_cfg) {
-        Ok(p) => p,
-        Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
-    };
-    if let Err(e) = ledger_reservation.arm() {
-        return Err(ReviewerError::fatal(format!(
-            "verifying ledger reservation before reviewer dispatch: {e}"
-        )));
-    }
-    let res = match provider.stream_chat(&req, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Provider / network / decode error — fallback-worthy when
-            // nothing has been emitted yet (the model cannot have shown
-            // partial output because `complete_once` does not stream).
-            // `emitted == true` (an extreme edge case where the
-            // provider reported bytes we haven't surfaced yet) is
-            // treated as fatal so the chain does not duplicate visible
-            // output. The original `complete_once` propagated the
-            // message verbatim via `anyhow!("{}", e.message)`; we
-            // preserve that for the call site's `review failed: 0/N
-            // reviewers completed` rendering.
-            if e.emitted {
+        if let Err(e) = ledger_reservation.arm() {
+            return Err(ReviewerError::fatal(format!(
+                "verifying ledger reservation before reviewer dispatch: {e}"
+            )));
+        }
+
+        match provider.stream_chat(&req, None).await {
+            Ok(r) => break (r, ledger_reservation),
+            Err(e) => {
+                drop(ledger_reservation);
+                if e.kind == zoder_core::ErrKind::Server {
+                    server_failures = server_failures.saturating_add(1);
+                }
+                if e.emitted {
+                    return Err(ReviewerError::Fatal { message: e.message });
+                }
+                if e.retryable() && attempt < cli.retries {
+                    let delay = zoder_core::backoff_delay(attempt, e.retry_after);
+                    if !cli.quiet {
+                        eprintln!(
+                            "[zoder] reviewer {model}: {} (retry {}/{} in {:.1}s)",
+                            e.message,
+                            attempt + 1,
+                            cli.retries,
+                            delay.as_secs_f64()
+                        );
+                    }
+                    tracing::debug!(
+                        model = %model,
+                        attempt,
+                        ?delay,
+                        "retrying transient reviewer failure on same model"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                if provider_error_is_model_unavailable(&e, server_failures) {
+                    return Err(ReviewerError::fallback_worthy_from(e));
+                }
                 return Err(ReviewerError::Fatal { message: e.message });
             }
-            return Err(ReviewerError::fallback_worthy_from(e));
         }
     };
 
@@ -2654,6 +2725,100 @@ const REVIEW_SYSTEM: &str = "You are a meticulous senior software engineer perfo
 Identify bugs, anti-patterns, missing tests, security issues, and documentation gaps. \
 Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
 {\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
+
+/// Directed angles for multi-pass review.
+///
+/// One undirected read converges on the most visibly suspicious hunk and leaves
+/// the rest of the diff unexamined -- QwenLM/qwen-code names this explicitly in
+/// its bundled `/review` skill, and it is what we measured: on seven
+/// independently-verified defects a single pass scored HIT=2, VAGUE=2, MISS=3.
+/// The misses were not subtle-but-visible; they were in hunks the reviewer never
+/// engaged with. Rotating the angle forces coverage the model will not choose on
+/// its own.
+///
+/// qwen-code spends ~14 specialised agents on this. These are the same idea at
+/// one call per angle, which is affordable inside a fix loop.
+/// Review a diff once per angle and merge the results.
+///
+/// Returns the WORST verdict across passes and the union of findings, deduped
+/// on (lowercased title, location). A defect found by one angle is a defect;
+/// requiring agreement would reintroduce exactly the single-pass blindness this
+/// exists to remove.
+///
+/// Cost is one reviewer call per angle. Guarded by `ZODER_REVIEW_ANGLES=1`
+/// because it multiplies review latency by the angle count, and the fix loop
+/// pays that on every iteration.
+async fn review_multi_angle(
+    cli: &crate::Cli,
+    reviewer: Option<&str>,
+    reviewer_chain: &[String],
+    base_system: &str,
+    review_user: &str,
+    max_tokens: u32,
+) -> anyhow::Result<ReviewOutput> {
+    let mut merged: Vec<Finding> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut worst = "approve".to_string();
+    let mut summaries: Vec<String> = Vec::new();
+
+    for (name, focus) in REVIEW_ANGLES {
+        let system = format!(
+            "{base_system}\n\nTHIS PASS HAS ONE ANGLE: {name}. {focus} \
+Report only what this angle surfaces; another pass covers the rest. \
+Silence is better than noise -- if you are unsure something is a problem, do not report it."
+        );
+        let c = match complete_once(
+            cli,
+            reviewer,
+            reviewer_chain,
+            &system,
+            review_user,
+            max_tokens,
+        )
+        .await
+        {
+            Ok(c) => c,
+            // One angle failing must not void the review: the others still ran.
+            Err(e) => {
+                if !cli.quiet {
+                    eprintln!("[zoder] review angle '{name}' failed: {e}");
+                }
+                continue;
+            }
+        };
+        let out = parse_review(&c.content);
+        if verdict_rank(&out.verdict) > verdict_rank(&worst) {
+            worst = out.verdict.clone();
+        }
+        if !out.summary.trim().is_empty() {
+            summaries.push(format!("[{name}] {}", out.summary.trim()));
+        }
+        for f in out.findings {
+            let key = (
+                f.title.trim().to_lowercase(),
+                f.location.clone().unwrap_or_default(),
+            );
+            if seen.insert(key) {
+                merged.push(f);
+            }
+        }
+    }
+
+    Ok(ReviewOutput {
+        verdict: worst,
+        summary: summaries.join(" "),
+        findings: merged,
+        next_steps: Vec::new(),
+    })
+}
+
+const REVIEW_ANGLES: &[(&str, &str)] = &[
+    ("correctness", "Does the change do what it claims for every input it now accepts?"),
+    ("consumers", "Name each caller of the changed code and what it now receives differently -- exit codes, return shapes, files owned by another component."),
+    ("assumptions", "List what the change assumes a file, socket, exit code or flag actually does, and say whether each is true."),
+    ("dead-paths", "Is anything accepted and then never read -- a flag, a field, a config key?"),
+    ("coverage", "What behaviour changed with no test that would fail if it regressed?"),
+];
 
 const ADVERSARIAL_SYSTEM: &str = "You are a demanding, skeptical staff engineer and security auditor performing an ADVERSARIAL review. \
 Aggressively pressure-test the logic: assume the author missed edge cases, race conditions, error handling, injection/abuse vectors, and incorrect assumptions. Be specific and uncompromising. \
@@ -8710,6 +8875,10 @@ mod reviewer_chain_dispatch_tests {
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zoder_core::config::Provider;
@@ -8906,6 +9075,33 @@ mod reviewer_chain_dispatch_tests {
             .await;
     }
 
+    fn openai_review_completion(summary: &str) -> String {
+        let review = serde_json::json!({
+            "verdict": "approve",
+            "summary": summary,
+            "findings": [],
+            "next_steps": [],
+        })
+        .to_string();
+        serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": review,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 10,
+                "total_tokens": 15,
+            }
+        })
+        .to_string()
+    }
+
     /// Build a minimal `Cli` suitable for a single `complete_once` call.
     /// Defaults that affect the dispatch are explicit here; everything
     /// else is left at `clap`'s default. Quiet is on so test stdout
@@ -8913,6 +9109,156 @@ mod reviewer_chain_dispatch_tests {
     /// `eprintln` not stdout.
     fn dummy_cli() -> Cli {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_retries_timeout_on_same_model_before_trying_tail() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        let broken_hits = Arc::new(AtomicUsize::new(0));
+        let broken_hits_for_responder = Arc::clone(&broken_hits);
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let attempt = broken_hits_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_string(openai_review_completion("head was too slow"))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(openai_review_completion("head retry ok"))
+                }
+            })
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--request-timeout", "1", "--retries", "1"])
+                .expect("clap parse");
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect("same reviewer model should be retried before fallback");
+        assert_eq!(
+            c.model, "broken-model/coder-6.7b",
+            "the head should win after a same-model retry"
+        );
+        assert!(
+            c.content.contains("head retry ok"),
+            "retry response should be surfaced; got: {}",
+            c.content
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            2,
+            "head must be tried twice: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            0,
+            "tail must not be tried after the head succeeds on retry: paths={paths:?}"
+        );
+        assert_eq!(broken_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_single_503_without_retries_does_not_fallback_to_tail() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("queue full"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).expect("clap parse");
+        let err = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect_err("a single 503 is transient, not model-unavailable fallback");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("503") || msg.to_lowercase().contains("queue full"),
+            "the transient 503 must be surfaced for retry/tuning, not hidden: {msg}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            1,
+            "head should be tried once when retries are disabled: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            0,
+            "tail should not be tried for a single transient 503: paths={paths:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_persistent_5xx_falls_through_after_same_model_retries() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("backend unavailable"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "1"]).expect("clap parse");
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect("persistent 5xx should fall through after retrying the same model");
+        assert_eq!(
+            c.model, "working-model/glm-5.1",
+            "persistent 5xx should move to the next reviewer after same-model retries"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            2,
+            "head must be retried before fallback: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            1,
+            "tail should answer only after the persistent 5xx: paths={paths:?}"
+        );
     }
 
     /// **REGRESSION: 2026-07-07 reviewer-pipeline fix.** A chain of

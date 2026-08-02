@@ -178,6 +178,17 @@ pub(crate) fn paid_without_opt_in(
     ))
 }
 
+fn effective_request_timeout_s(cli: &Cli, cfg: &Config, env_timeout_s: Option<u64>) -> u64 {
+    cli.request_timeout
+        .or(cfg.request_timeout_s)
+        .or(env_timeout_s)
+        .unwrap_or(zoder_core::DEFAULT_REQUEST_TIMEOUT_S)
+}
+
+pub(crate) fn provider_request_timeout_s(cli: &Cli, cfg: &Config) -> u64 {
+    effective_request_timeout_s(cli, cfg, zoder_core::request_timeout_s_from_env())
+}
+
 /// Durably account for a completed dispatch before enforcing its post-call
 /// policy result. A violation is also persisted as a routing-health failure and
 /// is always returned as `Err`, ensuring every command exits nonzero instead of
@@ -298,6 +309,16 @@ struct Cli {
     /// Relax the fail-closed free guard when a backend reports no telemetry.
     #[arg(long, global = true)]
     lenient_telemetry: bool,
+    /// Provider request timeout in seconds. Includes upstream queue time before
+    /// generation starts. Precedence: CLI > config request_timeout_s >
+    /// ZODER_TIMEOUT_S > 120.
+    #[arg(
+        long = "request-timeout",
+        global = true,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    request_timeout: Option<u64>,
 
     // ---- agentic loop (codex-style; drives the zeroclaw engine) ----
     /// Working directory for the agentic run (codex `-C`). Default: current dir.
@@ -3493,7 +3514,13 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 .cfg
                 .provider(&pid)
                 .ok_or_else(|| anyhow::anyhow!("provider {pid} not configured"))?;
-            provider_clients.insert(pid.clone(), OpenAiProvider::new(pcfg)?);
+            provider_clients.insert(
+                pid.clone(),
+                OpenAiProvider::new_with_request_timeout_s(
+                    pcfg,
+                    Some(provider_request_timeout_s(cli, &eng.cfg)),
+                )?,
+            );
         }
         let provider = &provider_clients[&pid];
         let req = ChatRequest {
@@ -4905,6 +4932,72 @@ mod cli_tier_reasoning_parse_tests {
     fn reasoning_unset_is_none() {
         let cli = Cli::try_parse_from(["zoder", "hi"]).expect("no --reasoning must parse");
         assert!(cli.reasoning.is_none(), "unset --reasoning stays None");
+    }
+
+    #[test]
+    fn request_timeout_flag_is_global_and_optional() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--request-timeout", "17"])
+            .expect("--request-timeout must parse on subcommands");
+        assert_eq!(
+            cli.request_timeout,
+            Some(17),
+            "the CLI must surface the provider request timeout"
+        );
+
+        let unset = Cli::try_parse_from(["zoder", "exec"]).expect("plain exec parses");
+        assert!(
+            unset.request_timeout.is_none(),
+            "unset CLI timeout must remain None so config/env/default precedence can apply"
+        );
+    }
+
+    #[test]
+    fn request_timeout_config_key_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [{
+                    "id": "acme",
+                    "base_url": "https://gw.acme.example/v1",
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"}
+                }],
+                "corpus_path": "/tmp/zoder-timeout/corpus.json",
+                "ledger_path": "/tmp/zoder-timeout/ledger.jsonl",
+                "health_path": "/tmp/zoder-timeout/health.json",
+                "default_provider": "acme",
+                "request_timeout_s": 33
+            }"#,
+        )
+        .unwrap();
+        let cfg =
+            Config::load_unvalidated_from(dir.path()).expect("request_timeout_s config loads");
+        assert_eq!(
+            cfg.request_timeout_s,
+            Some(33),
+            "request_timeout_s must be available from config"
+        );
+    }
+
+    #[test]
+    fn request_timeout_precedence_is_cli_config_env_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.request_timeout_s = Some(33);
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--request-timeout", "44"]).unwrap();
+        assert_eq!(effective_request_timeout_s(&cli, &cfg, Some(55)), 44);
+
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        assert_eq!(effective_request_timeout_s(&cli, &cfg, Some(55)), 33);
+
+        cfg.request_timeout_s = None;
+        assert_eq!(effective_request_timeout_s(&cli, &cfg, Some(55)), 55);
+        assert_eq!(
+            effective_request_timeout_s(&cli, &cfg, None),
+            zoder_core::DEFAULT_REQUEST_TIMEOUT_S
+        );
     }
 }
 
@@ -7400,7 +7493,10 @@ async fn run_probe_default(
                 zoder_core::config::PLACEHOLDER_PROVIDER_HOST
             )
         })?;
-    let provider = OpenAiProvider::new(provider_cfg)?;
+    let provider = OpenAiProvider::new_with_request_timeout_s(
+        provider_cfg,
+        Some(provider_request_timeout_s(cli, &eng.cfg)),
+    )?;
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
@@ -7569,7 +7665,10 @@ async fn run_probe_all(
         {
             continue;
         }
-        let provider = match OpenAiProvider::new(p) {
+        let provider = match OpenAiProvider::new_with_request_timeout_s(
+            p,
+            Some(provider_request_timeout_s(cli, &eng.cfg)),
+        ) {
             Ok(pr) => pr,
             Err(e) => {
                 if !quiet {
@@ -8027,7 +8126,10 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
                 zoder_core::config::PLACEHOLDER_PROVIDER_HOST
             )
         })?;
-    let provider = OpenAiProvider::new(provider_cfg)?;
+    let provider = OpenAiProvider::new_with_request_timeout_s(
+        provider_cfg,
+        Some(provider_request_timeout_s(cli, &eng.cfg)),
+    )?;
     let served = provider.list_models().await.map_err(|e| {
         anyhow::anyhow!(
             "could not list models from {}: {}",
@@ -8053,7 +8155,10 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         let ids = if p.id == default_id {
             served.clone()
         } else {
-            match OpenAiProvider::new(p) {
+            match OpenAiProvider::new_with_request_timeout_s(
+                p,
+                Some(provider_request_timeout_s(cli, &eng.cfg)),
+            ) {
                 Ok(client) => match client.list_models().await {
                     Ok(ids) => ids,
                     Err(e) => {
