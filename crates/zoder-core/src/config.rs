@@ -430,6 +430,12 @@ pub struct Config {
     /// treated as a policy violation. `--lenient-telemetry` relaxes this.
     #[serde(default = "default_strict_free")]
     pub strict_free: bool,
+    /// Overall provider request timeout in seconds. The timer includes time
+    /// spent queued inside an upstream gateway before the model starts
+    /// generating. CLI precedence: `--request-timeout` > this key >
+    /// `ZODER_TIMEOUT_S` > provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -1243,6 +1249,7 @@ impl Config {
             health_path: home.join("health.json"),
             free_api_hosts: default_free_hosts(),
             strict_free: default_strict_free(),
+            request_timeout_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,
@@ -1672,6 +1679,9 @@ impl Config {
                 "strict_free is on but free_api_hosts is empty (every call would violate)".into(),
             );
         }
+        if self.request_timeout_s.is_some_and(|secs| secs == 0) {
+            errs.push("request_timeout_s must be greater than zero".into());
+        }
         for (name, cap) in [
             ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
             ("monthly_cap_usd", self.budget.monthly_cap_usd),
@@ -1823,6 +1833,10 @@ pub struct VendorProfile {
     /// reviewer without owning the author default.
     #[serde(default)]
     pub reviewer_model: Option<String>,
+    /// Overall provider request timeout in seconds for this profile. Same
+    /// default-claimer/last-defined merge semantics as reviewer_model.
+    #[serde(default)]
+    pub request_timeout_s: Option<u64>,
 }
 
 /// Read a regular file with a bounded byte cap, mirroring the guard used by
@@ -1976,6 +1990,11 @@ fn apply_overlays_filtered(
     // without touching the author default.
     let mut default_reviewer: Option<String> = None;
     let mut fallback_reviewer: Option<String> = None;
+    // Request timeout follows the same profile merge shape as the pinned
+    // model defaults: the default-claiming overlay wins, else the
+    // alphabetically-last overlay that defines it.
+    let mut default_request_timeout_s: Option<u64> = None;
+    let mut fallback_request_timeout_s: Option<u64> = None;
 
     for (vendor, overlay) in overlays {
         for p in &overlay.providers {
@@ -2003,6 +2022,9 @@ fn apply_overlays_filtered(
         if overlay.profile.reviewer_model.is_some() {
             fallback_reviewer = overlay.profile.reviewer_model.clone();
         }
+        if overlay.profile.request_timeout_s.is_some() {
+            fallback_request_timeout_s = overlay.profile.request_timeout_s;
+        }
         if overlay.profile.default {
             defaults_count += 1;
             if overlay.theme.is_some() {
@@ -2013,6 +2035,9 @@ fn apply_overlays_filtered(
             }
             if overlay.profile.reviewer_model.is_some() {
                 default_reviewer = overlay.profile.reviewer_model.clone();
+            }
+            if overlay.profile.request_timeout_s.is_some() {
+                default_request_timeout_s = overlay.profile.request_timeout_s;
             }
             let new_default = overlay
                 .profile
@@ -2056,6 +2081,9 @@ fn apply_overlays_filtered(
     // author default.
     if let Some(reviewer) = default_reviewer.or(fallback_reviewer) {
         cfg.reviewer_model = Some(reviewer);
+    }
+    if let Some(request_timeout_s) = default_request_timeout_s.or(fallback_request_timeout_s) {
+        cfg.request_timeout_s = Some(request_timeout_s);
     }
     Ok(())
 }

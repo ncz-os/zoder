@@ -57,7 +57,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -98,6 +98,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -187,7 +190,7 @@ Options:
           
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --scope <SCOPE>
           Possible values:
@@ -242,6 +245,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -325,7 +331,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -366,6 +372,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -449,7 +458,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -490,6 +499,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -569,7 +581,7 @@ Usage: zoder config [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --validate
           Exit non-zero if the configuration is invalid
@@ -613,6 +625,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -695,7 +710,7 @@ Options:
           Open the config file in $EDITOR
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -739,6 +754,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -821,7 +839,7 @@ Options:
           Restrict to free/routable models (routable already implies free; this is an explicit, visible filter)
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --limit <LIMIT>
           Show at most N rows
@@ -865,6 +883,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -948,7 +969,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -989,6 +1010,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1074,7 +1098,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
@@ -1126,6 +1150,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1205,7 +1232,7 @@ Usage: zoder gate [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --root <DIR>
           Repo root to gate (default: current working directory)
@@ -1261,6 +1288,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1340,7 +1370,7 @@ Usage: zoder health [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --probe
           Actively ping every free model and record the result
@@ -1393,6 +1423,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1477,7 +1510,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1518,6 +1551,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1604,7 +1640,7 @@ Options:
           Read the task/instructions from a file instead of args
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --max-iters <MAX_ITERS>
           Maximum author/review iterations before giving up
@@ -1678,6 +1714,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1763,7 +1802,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1804,6 +1843,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -1886,7 +1928,7 @@ Options:
           
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --paid
           
@@ -1933,6 +1975,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2017,7 +2062,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2058,6 +2103,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2137,7 +2185,7 @@ Usage: zoder providers [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2178,6 +2226,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2263,7 +2314,7 @@ Commands:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2304,6 +2355,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2392,7 +2446,7 @@ Options:
           [default: 14]
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2433,6 +2487,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2512,7 +2569,7 @@ Usage: zoder refresh [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2553,6 +2610,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2642,7 +2702,7 @@ Options:
           Custom trailing window in days (overrides the period argument)
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2694,6 +2754,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2780,7 +2843,7 @@ Options:
           Run detached as a tracked background job
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2821,6 +2884,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -2904,7 +2970,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2945,6 +3011,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3027,7 +3096,7 @@ Options:
           Base ref for branch review (e.g. `main`); implies branch scope
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --scope <SCOPE>
           Review scope: auto | working-tree | branch
@@ -3084,6 +3153,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3167,7 +3239,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3208,6 +3280,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3291,7 +3366,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3332,6 +3407,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3411,7 +3489,7 @@ Usage: zoder sessions [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3452,6 +3530,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3537,7 +3618,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
@@ -3590,6 +3671,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3676,7 +3760,7 @@ Options:
           Include jobs from all working directories
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3717,6 +3801,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3796,7 +3883,7 @@ Usage: zoder transfer [OPTIONS]
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3837,6 +3924,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -3920,7 +4010,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3961,6 +4051,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
@@ -4043,7 +4136,7 @@ Options:
           Only report whether a newer release exists; do not install
 
   -m, --model <MODEL>
-          Force a specific model id (skips routing)
+          Pin a model id: skips routing and selects the matching agent. On the zeroclaw engine the model that actually runs is the one the selected agent's provider is configured with, so a pin that maps to an unintended agent runs a different model (a warning is printed when that happens). `-m` supersedes `--agent` configuration — when both are specified, `-m` wins for the primary author lane. Use `--agent <alias>` to choose the model directly (agent config pin or model_provider chain)
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4084,6 +4177,9 @@ Options:
 
       --lenient-telemetry
           Relax the fail-closed free guard when a backend reports no telemetry
+
+      --request-timeout <SECS>
+          Provider request timeout in seconds. Includes upstream queue time before generation starts. Precedence: CLI > config request_timeout_s > ZODER_TIMEOUT_S > 120
 
   -C, --cd <DIR>
           Working directory for the agentic run (codex `-C`). Default: current dir
