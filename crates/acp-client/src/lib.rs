@@ -11303,8 +11303,11 @@ mod mr1_reliability_regression {
         let res = probe_ready(&socket, std::time::Duration::from_millis(200)).await;
         let elapsed = start.elapsed();
         assert!(
-            res.is_err(),
-            "probe_ready on a hung daemon MUST fail within the budget, not pass"
+            matches!(res, DaemonReadiness::PossiblyAlive { .. }),
+            "probe_ready on a hung daemon MUST report PossiblyAlive within the \
+             budget - never Ready, and never TrulyStale: the socket is still \
+             accepting, so treating it as stale would unlink a live daemon's \
+             socket. got {res:?}"
         );
         assert!(
             elapsed < std::time::Duration::from_millis(500),
@@ -11328,11 +11331,22 @@ mod mr1_reliability_regression {
                 let (rh, mut wh) = tokio::io::split(stream);
                 let mut r = tokio::io::BufReader::new(rh);
                 let mut line = String::new();
-                // Read the initialize frame, then reply.
+                // Read the initialize frame, then reply. Echo the
+                // request's OWN id back, exactly as a real daemon would:
+                // hard-coding an id here silently desynchronises the fixture
+                // the moment probe_ready changes its request id, and the
+                // client then waits for a correlation that never arrives
+                // until the mock drops the connection. That is precisely how
+                // this fixture came to answer "init" to a "probe-init"
+                // request while still calling itself a responsive daemon.
                 let _ = r.read_line(&mut line).await;
+                let req_id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or_else(|| serde_json::json!("probe-init"));
                 let mut s = serde_json::to_string(&serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": "init",
+                    "id": req_id,
                     "result": { "protocolVersion": 1 }
                 }))
                 .unwrap();
@@ -11341,9 +11355,11 @@ mod mr1_reliability_regression {
                 let _ = wh.flush().await;
             }
         });
-        probe_ready(&socket, std::time::Duration::from_secs(2))
-            .await
-            .expect("probe_ready must succeed against a responsive daemon");
+        assert_eq!(
+            probe_ready(&socket, std::time::Duration::from_secs(2)).await,
+            DaemonReadiness::Ready,
+            "probe_ready must report Ready against a responsive daemon"
+        );
         let _ = server.await;
         drop(dir);
     }
