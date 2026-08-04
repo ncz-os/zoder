@@ -28,7 +28,12 @@ env:
   CARGO_INCREMENTAL: "0"
   PROJECT_ID: "83731897"                 # gitlab.com/ncz-os/zoder
   ENGINE_REPO: "gitlab.com/ncz-os/zeroclaw.git"
-  ENGINE_BRANCH: "zoder-integration"
+  # master, not zoder-integration: that patch-stack branch froze on
+  # 2026-07-20 and fell 72 commits behind the fork and 163 behind upstream,
+  # so the nightly faithfully shipped a six-week-old engine to every host
+  # while reporting success every morning. master is now synced to upstream
+  # zeroclaw-labs and is the branch the fleet should track.
+  ENGINE_BRANCH: "master"
   RELEASE_TAG: "nightly"
 
 jobs:
