@@ -12186,14 +12186,26 @@ mod goose_acp_real_turn {
     async fn probe_ready_classifies_socket_with_no_listener_as_truly_stale() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("no-listener.sock");
-        // Create a regular file at the path — `connect(2)` on a
-        // path that exists but isn't a socket returns
-        // `ConnectionRefused` (ECONNREFUSED) on Linux. This is the
-        // closest we can get to "socket inode exists but no live
-        // listener" without spawning a fake daemon, and it's the
-        // shape `probe_ready` sees in production when the daemon
-        // crashed after `bind(2)` and before `listen(2)`.
-        std::fs::write(&socket, b"stale socket inode").expect("write stale socket");
+        // Bind a REAL unix socket and immediately drop the listener.
+        // Closing a bound unix socket leaves its inode on disk with
+        // nothing accepting on it, so `connect(2)` returns
+        // ECONNREFUSED — on both Linux and macOS. That is exactly the
+        // production shape this test claims to cover: the daemon
+        // crashed after `bind(2)`, before serving.
+        //
+        // The previous fixture wrote a REGULAR file here. `connect(2)`
+        // on a non-socket happens to return ECONNREFUSED on Linux but
+        // ENOTSOCK on macOS, which Rust surfaces as the unmapped
+        // `Uncategorized` — so `probe_ready` correctly declined to call
+        // it TrulyStale and the test failed on every Mac. It only ever
+        // exercised a Linux quirk, never the real shape.
+        {
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+        }
+        assert!(
+            socket.exists(),
+            "stale socket inode must persist after the listener is dropped"
+        );
         let out = probe_ready(&socket, Duration::from_secs(1)).await;
         match out {
             DaemonReadiness::TrulyStale { .. } => {}
