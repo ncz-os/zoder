@@ -358,6 +358,20 @@ pub struct Provider {
     pub azure_api_version: Option<String>,
 }
 
+/// A model-entry contributed by a vendor overlay's `[providers.models.*]`
+/// block. These map a provider alias (e.g. `custom.reviewer`) to a model id
+/// (e.g. `"reviewer"`) and serve as the bridge for `--agent` → model
+/// resolution in the oneshot path when the agent specifies `model_provider`
+/// but has no explicit `.model` pin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// The model id that this provider alias resolves to (e.g. `"reviewer"`).
+    pub model: Option<String>,
+    /// Provider base URL for this model entry (optional, for informational).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
 fn default_kind() -> String {
     "openai-chat".into()
 }
@@ -416,6 +430,12 @@ pub struct Config {
     /// treated as a policy violation. `--lenient-telemetry` relaxes this.
     #[serde(default = "default_strict_free")]
     pub strict_free: bool,
+    /// Overall provider request timeout in seconds. The timer includes time
+    /// spent queued inside an upstream gateway before the model starts
+    /// generating. CLI precedence: `--request-timeout` > this key >
+    /// `ZODER_TIMEOUT_S` > provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -465,6 +485,13 @@ pub struct Config {
     /// consulted AFTER `-m` / `--reviewer` and BEFORE `primary_model`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AliasedAgentConfig>,
+    /// Model entries contributed by `[providers.models.*]` blocks in overlay
+    /// TOMLs. Maps a provider alias (e.g. `custom.reviewer`) to a model id
+    /// (e.g. `"reviewer"`). Used by the oneshot router to resolve an agent's
+    /// `model_provider` to an actual model id when no explicit `.model` pin
+    /// is set on the agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelEntry>,
     /// Pre-call spend caps. A paid call whose *estimated* cost would breach a
     /// cap is gated behind the same confirmation as a paid model. Empty by
     /// default (no caps). See [`crate::budget::Budget`].
@@ -580,6 +607,14 @@ pub struct AliasedAgentConfig {
     /// model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_model: Option<String>,
+    /// Provider id used by the zeroclaw engine for this agent. When set
+    /// and `model` is `None`, the oneshot router follows this chain to
+    /// resolve the model id — looking up `[providers.models.<provider_id>].model`
+    /// from the agent-descriptor config surface. Without `model` set, the
+    /// agent has no pin for the zoder oneshot router and `resolve_chain`
+    /// will error out when `--agent` is specified under `--oneshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
 }
 
 fn default_strict_free() -> bool {
@@ -1214,11 +1249,13 @@ impl Config {
             health_path: home.join("health.json"),
             free_api_hosts: default_free_hosts(),
             strict_free: default_strict_free(),
+            request_timeout_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,
             reviewer_model: None,
             agents: BTreeMap::new(),
+            models: BTreeMap::new(),
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
@@ -1242,13 +1279,12 @@ impl Config {
     /// API side anyway, so we skip it in favor of a working alternative.
     /// The window rolls forward over time and the subscription becomes
     /// available again automatically; no operator intervention is required
-    /// for recovery.
-    ///
-    /// This is the route the dual-billing vendor overlay relies on: a single
-    /// vendor modeled as SEPARATE provider entries (one subscription, one
-    /// metered — different auth and endpoint, both claiming the same model
-    /// prefixes). The subscription wins while its window has headroom; the
-    /// metered entry picks up the slack when the subscription is exhausted.
+    /// Simple prefix-matching lookup: returns the first provider whose
+    /// `serves` list explicitly claims `model_id`. Returns `None` when no
+    /// provider serves the model — the caller must decide what to do
+    /// (error, route via the default, etc.). This is the "real provider"
+    /// lookup; it does NOT fall through to `default_provider` for unmatched
+    /// models.
     ///
     /// Window-exhaustion detection needs the local ledger and the tier
     /// catalog. Pass them in via [`best_provider_for_model`]; this
@@ -1266,13 +1302,14 @@ impl Config {
         )
     }
 
-    /// Full quota-aware ranking for routing. Identical to
-    /// [`provider_for_model`] but the subscription-vs-metered decision is
-    /// driven by the ledger (`entries`) and the tier `catalog` so that a
-    /// subscription whose rolling window is at/over cap is treated like a
-    /// metered provider (i.e. demoted below live subscriptions). Pass the
-    /// same `entries` / `catalog` pair the report uses so routing and the
-    /// utilization report never disagree about whether a window is full.
+    /// Full quota-aware ranking for routing. Returns a provider that explicitly
+    /// claims the model via one of its `serves` prefix entries. Returns `None`
+    /// when no provider serves the model — callers must handle this instead of
+    /// silently falling through to the default provider.
+    ///
+    /// This is a "real provider" lookup: the default provider is NOT returned as
+    /// a fallback for unmatched models. A model must be explicitly claimed by at
+    /// least one provider's `serves` list to be routed.
     pub fn best_provider_for_model(
         &self,
         model_id: &str,
@@ -1281,15 +1318,12 @@ impl Config {
     ) -> Option<&Provider> {
         let candidates = self.ranked_providers_for_model(model_id, entries, catalog);
         if candidates.is_empty() {
-            // No provider claims the prefix -> fall through to
-            // `default_provider`. This is the historical single-endpoint
-            // behavior: the CLI expects a non-None answer for `-m
-            // <unprefixed>`, and the report always shows the default as
-            // the "unrouted" route. We deliberately do NOT re-rank
-            // `default_provider` against its real billing tier here —
-            // there is no competition (the list is empty by construction),
-            // so any tier assignment would be cosmetic. Just return it.
-            return self.provider(&self.default_provider);
+            // No provider claims this model's prefix via its `serves` list.
+            // Do NOT fall through to `default_provider` — that would silently
+            // route the model to a provider that never declared it, causing
+            // cryptic 404s or silent misrouting when a different provider
+            // happens to share the same model id.
+            return None;
         }
         candidates.into_iter().next().map(|c| c.provider)
     }
@@ -1360,6 +1394,15 @@ impl Config {
     }
 
     /// `true` if a real (configured, non-placeholder) provider serves `model_id`.
+    /// Does ANY provider's `serves` claim this model id?
+    ///
+    /// Distinct from [`model_has_real_provider`], which additionally requires
+    /// the provider not to be the placeholder. Config validation wants this
+    /// looser question; routing wants the stricter one.
+    pub fn model_is_claimed_by_a_provider(&self, model_id: &str) -> bool {
+        self.provider_for_model(model_id).is_some()
+    }
+
     pub fn model_has_real_provider(&self, model_id: &str) -> bool {
         self.real_provider_for_model(model_id).is_some()
     }
@@ -1396,6 +1439,24 @@ impl Config {
         self.agents
             .get(alias)
             .and_then(|a| a.reviewer_model.clone())
+    }
+
+    /// Resolve the PRIMARY model id for `--agent <alias>` through the
+    /// `model_provider` chain. When the agent has a `model_provider` set
+    /// (e.g. `custom.reviewer`) but no explicit `.model` pin, this method
+    /// looks up the model id from `Config::models` keyed by the provider
+    /// alias. Returns `None` when the agent has no `model_provider` set or
+    /// when the provider alias is not found in the models registry.
+    ///
+    /// This enables `--agent <alias> --oneshot` to resolve correctly even
+    /// when the agent's model is defined via `model_provider` rather than
+    /// an explicit `.model` pin — mirroring the zeroclaw engine's path
+    /// where `model_provider` is the authoritative model selector.
+    pub fn resolve_model_for_agent(&self, alias: Option<&str>) -> Option<String> {
+        let alias = alias?;
+        let agent = self.agents.get(alias)?;
+        let mp = agent.model_provider.as_deref()?;
+        self.models.get(mp).and_then(|m| m.model.clone())
     }
 
     /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
@@ -1618,12 +1679,63 @@ impl Config {
                 "strict_free is on but free_api_hosts is empty (every call would violate)".into(),
             );
         }
+        if self.request_timeout_s.is_some_and(|secs| secs == 0) {
+            errs.push("request_timeout_s must be greater than zero".into());
+        }
         for (name, cap) in [
             ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
             ("monthly_cap_usd", self.budget.monthly_cap_usd),
         ] {
             if cap.is_some_and(|v| !v.is_finite() || v < 0.0) {
                 errs.push(format!("budget.{name} must be finite and non-negative"));
+            }
+        }
+
+        // Validate that model references are CLAIMED by some provider's `serves`.
+        //
+        // Deliberately `provider_for_model`, not `real_provider_for_model`. The
+        // "real" variant also rejects providers whose base_url is the
+        // api.example.com placeholder, which is a ROUTING concern, not a config
+        // -validity one: a freshly-installed config has exactly one placeholder
+        // provider, so validating against it made `zoder config --validate` fail
+        // on a default install and on every legacy default-provider config.
+        //
+        // Routing already refuses a placeholder at call time with a precise,
+        // actionable message ("no real provider is configured for model X ...
+        // configure a provider that serves it"). That is the right place for it:
+        // it fires when the model is actually needed, not when an unrelated
+        // command loads the file.
+        //
+        // What #17 asked for is that an unservable id ERROR instead of silently
+        // resolving to an arbitrary provider. Claim-checking here gives that,
+        // without making a fresh install invalid.
+        if let Some(ref model) = self.primary_model {
+            if !self.model_is_claimed_by_a_provider(model) {
+                errs.push(format!(
+                    "[profile].primary_model {:?} is not served by any provider; add a \
+                     [[providers]] entry with `serves` matching it",
+                    model
+                ));
+            }
+        }
+        if let Some(ref model) = self.reviewer_model {
+            if !self.model_is_claimed_by_a_provider(model) {
+                errs.push(format!(
+                    "[profile].reviewer_model {:?} is not served by any provider; add a \
+                     [[providers]] entry with `serves` matching it",
+                    model
+                ));
+            }
+        }
+        for (alias, agent) in &self.agents {
+            if let Some(ref model) = agent.model {
+                if !self.model_is_claimed_by_a_provider(model) {
+                    errs.push(format!(
+                        "[agents.{}].model {:?} is not served by any provider; add a \
+                         [[providers]] entry with `serves` matching it",
+                        alias, model
+                    ));
+                }
             }
         }
 
@@ -1721,6 +1833,10 @@ pub struct VendorProfile {
     /// reviewer without owning the author default.
     #[serde(default)]
     pub reviewer_model: Option<String>,
+    /// Overall provider request timeout in seconds for this profile. Same
+    /// default-claimer/last-defined merge semantics as reviewer_model.
+    #[serde(default)]
+    pub request_timeout_s: Option<u64>,
 }
 
 /// Read a regular file with a bounded byte cap, mirroring the guard used by
@@ -1874,6 +1990,11 @@ fn apply_overlays_filtered(
     // without touching the author default.
     let mut default_reviewer: Option<String> = None;
     let mut fallback_reviewer: Option<String> = None;
+    // Request timeout follows the same profile merge shape as the pinned
+    // model defaults: the default-claiming overlay wins, else the
+    // alphabetically-last overlay that defines it.
+    let mut default_request_timeout_s: Option<u64> = None;
+    let mut fallback_request_timeout_s: Option<u64> = None;
 
     for (vendor, overlay) in overlays {
         for p in &overlay.providers {
@@ -1901,6 +2022,9 @@ fn apply_overlays_filtered(
         if overlay.profile.reviewer_model.is_some() {
             fallback_reviewer = overlay.profile.reviewer_model.clone();
         }
+        if overlay.profile.request_timeout_s.is_some() {
+            fallback_request_timeout_s = overlay.profile.request_timeout_s;
+        }
         if overlay.profile.default {
             defaults_count += 1;
             if overlay.theme.is_some() {
@@ -1911,6 +2035,9 @@ fn apply_overlays_filtered(
             }
             if overlay.profile.reviewer_model.is_some() {
                 default_reviewer = overlay.profile.reviewer_model.clone();
+            }
+            if overlay.profile.request_timeout_s.is_some() {
+                default_request_timeout_s = overlay.profile.request_timeout_s;
             }
             let new_default = overlay
                 .profile
@@ -1955,6 +2082,9 @@ fn apply_overlays_filtered(
     if let Some(reviewer) = default_reviewer.or(fallback_reviewer) {
         cfg.reviewer_model = Some(reviewer);
     }
+    if let Some(request_timeout_s) = default_request_timeout_s.or(fallback_request_timeout_s) {
+        cfg.request_timeout_s = Some(request_timeout_s);
+    }
     Ok(())
 }
 
@@ -1984,14 +2114,31 @@ fn collect_overlays(
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            // Filename must be exactly `config.<vendor>.toml`. Reject
-            // `config.toml` (no vendor stem), `config.foo.toml.bak`
-            // (wrong suffix), and `config.foo.bar.toml` (vendor stem
-            // contains a dot — that's a sub-overlay, not a top-level
-            // vendor).
+            // Top-level vendor overlay: `config.<vendor>.toml`.
+            // Also accept exactly `config.toml` (the root-level
+            // overlay — engine-specific config, distinct from the
+            // JSON `config.json`).  Reject `config.foo.toml.bak`
+            // (wrong suffix), and `config.foo.bar.toml` (vendor
+            // stem contains a dot — that's a sub-overlay, not a
+            // top-level vendor).
             let rest = name.strip_prefix("config.")?;
+            // `config.toml` is deliberately NOT a zoder vendor overlay. That
+            // file belongs to the zeroclaw/openclaw ENGINE and uses a different
+            // schema (`schema_version`, `[agents.*]` with `model_provider`,
+            // `identity.format`). Loading it here made zoder parse a config that
+            // was never its own and reject it with
+            //   unknown field `schema_version`, expected one of
+            //   `profile`, `providers`, `theme`
+            // which stops the binary from starting at all on a real host.
+            //
+            // Two config surfaces with overlapping names is already the root of
+            // several routing bugs (ncz-os/zoder#15/#16/#17); the fix is to keep
+            // them separate, not to teach one to read the other.
             let stem = rest.strip_suffix(".toml")?;
             if stem.is_empty() || stem.contains('.') {
+                return None;
+            }
+            if stem.contains('.') || stem.is_empty() {
                 return None;
             }
             if let Some(want) = only_vendor {
@@ -2014,8 +2161,23 @@ fn collect_overlays(
         // a FIFO or an oversized overlay would otherwise block or OOM the
         // process on every config load, before any validation runs.
         let raw = read_bounded_regular_file(&path, Config::MAX_CONFIG_BYTES)?;
-        let overlay: VendorOverlay =
-            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        // Unknown keys WARN, they do not abort. The structs carry
+        // `deny_unknown_fields` so a typo is caught rather than silently
+        // ignored -- that is the point of ncz-os/zoder#15 -- but a strict
+        // parse that refuses to start is the wrong end of the trade: an
+        // operator with one stale key in one overlay loses the whole tool,
+        // including the `zoder config` command they would use to find it.
+        //
+        // So: report the key, drop that overlay, and keep going. Errors are
+        // reserved for `--strict` / `zoder config --validate`, where the
+        // caller has asked to be blocked.
+        let overlay: VendorOverlay = match toml::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[zoder] warning: ignoring overlay {}: {e}", path.display());
+                continue;
+            }
+        };
         if overlay.providers.is_empty() && !overlay.profile.default {
             anyhow::bail!(
                 "{} contributes no [[providers]] and no [profile].default; either add providers or remove the file",
@@ -2035,7 +2197,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     #[test]
-    fn provider_for_model_routes_by_serves_prefix_else_default() {
+    fn provider_for_model_routes_by_serves_prefix_else_none() {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
             id: "minimax".into(),
@@ -2078,10 +2240,10 @@ mod tests {
                 .id,
             "nvidia-eih"
         );
-        // No prefix claims it -> falls back to default_provider.
-        assert_eq!(
-            cfg.provider_for_model("azure/gpt-4o").unwrap().id,
-            cfg.default_provider
+        // No prefix claims it -> returns None (not default_provider).
+        assert!(
+            cfg.provider_for_model("azure/gpt-4o").is_none(),
+            "unmatched model must return None, not fall through to default_provider"
         );
     }
 
@@ -2902,6 +3064,69 @@ auth = { type = "env", var = "ACME_KEY" }
         assert!(errs.is_empty(), "{}", errs.join("\n"));
     }
 
+    #[test]
+    fn validate_rejects_unservable_primary_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        // Set primary_model to a model that no provider serves.
+        cfg.primary_model = Some("unknown-model".into());
+        let errs = cfg.validate();
+        assert!(
+            !errs.is_empty(),
+            "unservable primary_model must be rejected, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("primary_model"),
+            "error must reference primary_model, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("not served by any provider"),
+            "error must say 'not served by any provider', got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unservable_per_agent_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        cfg.agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("unknown-model".into()),
+                reviewer_model: None,
+                // Added by the --agent/--oneshot fix (zoder#16). This test came
+                // from the provider-validation fix (zoder#17); the two merged
+                // cleanly on text and then failed to compile, because one added
+                // a field the other constructs the struct without.
+                model_provider: None,
+            },
+        );
+        let errs = cfg.validate();
+        assert!(
+            !errs.is_empty(),
+            "unservable per-agent model must be rejected, got: {errs:?}"
+        );
+        assert!(
+            errs.join("\n").contains("[agents.codex]"),
+            "error must reference the agent, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_served_primary_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers[0].serves = vec!["gpt-".into()];
+        cfg.primary_model = Some("gpt-4".into());
+        let errs = cfg.validate();
+        assert!(
+            errs.is_empty(),
+            "served primary_model must not be rejected, got: {errs:?}"
+        );
+    }
+
     // ---------- KNEMON per-account identity (adversarial-review finding #3) ----------
     //
     // KNEMON claims per-account portfolio intelligence, but the config-facing
@@ -3297,6 +3522,7 @@ auth = { type = "env", var = "ACME_KEY" }
             AliasedAgentConfig {
                 model: None,
                 reviewer_model: Some("z-ai/glm-5.1,nvidia/llama-3.3-nemotron".into()),
+                model_provider: None,
             },
         );
         cfg.agents = agents;
@@ -4127,31 +4353,46 @@ auth = { type = "env", var = "GUARD_KEY" }
              {err_enxio}, err-other={err_other}"
         );
 
-        // At least one iteration must have read the original content
-        // successfully — this proves the happy path works. With the
-        // synchronous handshake between reader and swapper, the
-        // FIRST iteration runs against a swapper that is provably
-        // blocked on `go_rx.recv()`, so the file is stable and the
-        // read cannot fail; the assertion is now deterministic
-        // regardless of host load.
-        assert!(
-            ok_original > 0,
-            "at least one iteration must succeed reading the \
-             original inode's content. observations: ok-original=\
-             {ok_original}, err-not-regular={err_not_regular}, \
-             err-enoent={err_enoent}, err-enxio={err_enxio}, \
-             err-other={err_other}. If this fires while the swapper \
-             handshake reported a clean run, the helper has regressed \
-             against a trivial 2-byte regular file — look at the \
-             'UNEXPECTED first-iter err against stable file' \
-             eprintln above the assertion."
+        // LIVENESS, checked DETERMINISTICALLY rather than by racing.
+        //
+        // This used to assert `ok_original > 0` from inside the race, which
+        // made a scheduling accident look like a regression: the reader gets a
+        // 2ms window per swap cycle, and on a loaded machine it can miss every
+        // one. The test then failed -- or, with the whole suite competing, hung
+        // long enough to be killed after days (ncz-os/zoder#20). The safety
+        // assertion above is the one that matters and it is unaffected by
+        // scheduling: "ok-other" can only appear if the helper genuinely read a
+        // swapped target.
+        //
+        // So prove the happy path with the race OVER and the file known
+        // present. Both threads have joined by this point.
+        std::fs::write(&target, original).unwrap();
+        let settled = crate::config::read_bounded_regular_file(
+            &target,
+            crate::config::Config::MAX_CONFIG_BYTES,
+        )
+        .expect("a quiescent, regular config file must read successfully");
+        assert_eq!(
+            settled.as_bytes(),
+            original,
+            "with no swapper running the helper must return the original bytes"
         );
 
-        // The error mix is informational. ENOENT, ENXIO, and "not a
-        // regular file" are all expected outcomes under a swap —
-        // they prove the helper is rejecting dangerous targets fast
-        // rather than blocking on them. `err-other` is suspicious
-        // but not necessarily wrong (e.g. EACCES on a
+        // Kept as a diagnostic only. A zero here means the reader never won a
+        // window -- interesting on a quiet machine, meaningless on a busy one,
+        // and not grounds for failing a safety test.
+        if ok_original == 0 {
+            eprintln!(
+                "[toctou] note: reader won no race window (machine likely loaded); \
+                 safety assertion still enforced"
+            );
+        }
+
+        // The error mix is informational. ENOENT, ENXIO, and "not
+        // a regular file" are all expected outcomes under a swap
+        // — they prove the helper is rejecting dangerous targets
+        // fast rather than blocking on them. `err-other` is
+        // suspicious but not necessarily wrong (e.g. EACCES on a
         // permission-flipped file); we don't fail on `err-other`
         // alone; we just want to make sure it's not masking a deeper
         // issue.
