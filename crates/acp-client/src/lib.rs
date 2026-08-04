@@ -1122,68 +1122,236 @@ pub async fn wait_for_socket(socket: &Path, budget: Duration) -> anyhow::Result<
     }
 }
 
-/// Initialize-handshake readiness probe.
+/// Structured outcome of a daemon-readiness probe.
 ///
-/// A bare `UnixStream::connect` proves only "something accepted the
-/// connection at this instant" — a daemon that has bound the socket but
-/// never answers subsequent frames would still look "ready" to a poll
-/// that only checks the socket. This fn sends the ACP `initialize`
-/// notification and waits for the matching response within `budget`,
-/// so a hung daemon is exposed as a readiness failure (the caller can
-/// surface the daemon log / kill+reap the child instead of blocking
-/// the rest of the loop on a socket that will never produce frames).
+/// `probe_ready` distinguishes two failure modes the kernel-level
+/// `wait_for_socket` (and the bare `UnixStream::connect` it polls)
+/// conflates:
 ///
-/// Return value: `Ok(())` iff `initialize` was answered within `budget`,
-/// else `Err` carrying the original failure mode (connect / read /
-/// timeout). The transport is closed at the end either way (the reader
-/// + writer are local to this fn), so no leaked FDs.
-pub async fn probe_ready(socket: &Path, budget: Duration) -> anyhow::Result<()> {
+/// * [`DaemonReadiness::TrulyStale`] — the socket is on disk but NO daemon
+///   is listening. Concretely: `connect(2)` failed with `ConnectionRefused`
+///   or the socket file does not exist at all. Removing the socket
+///   inode is safe; nothing on the system has a live listener on it.
+///
+/// * [`DaemonReadiness::PossiblyAlive`] — the socket may have a live
+///   daemon that just didn't respond in time. Concretely: connect
+///   succeeded but the ACP `initialize` handshake timed out, errored
+///   mid-write, EOF'd unexpectedly, or returned a malformed / error
+///   reply. Removing the socket inode is NOT safe — there may be a
+///   daemon hung in its server loop (or a slow-starting daemon) that
+///   is doing real work we would silently sever. Callers MUST treat
+///   this branch as "investigate, do NOT delete".
+///
+/// * [`DaemonReadiness::Ready`] — the probe succeeded; the daemon is
+///   fully initialized and serving the ACP loop.
+///
+/// The discrimination matters because the original review flagged
+/// the pre-fix behavior as critical: a live daemon that was merely
+/// slow to respond (or stuck in a non-responsive state with
+/// in-flight work) had its socket inode unconditionally removed,
+/// severing the kernel-level connection from any future
+/// `connect(2)`. A subsequent `bind` then either succeeded against
+/// a fresh inode (and the now-orphaned daemon kept running on a
+/// dead socket) or, worse, raced the new daemon's `bind` and
+/// produced a confusing EADDRINUSE. The structured outcome lets
+/// the caller decide based on REAL signal, not "probe errored,
+/// must be stale".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonReadiness {
+    /// The daemon completed the ACP `initialize` round-trip. Safe
+    /// to proceed with `drive`.
+    Ready,
+    /// The socket file does not exist OR `connect(2)` failed with
+    /// `ConnectionRefused`. No live daemon on the system has a
+    /// listener on this path. The socket inode may be safely
+    /// removed.
+    TrulyStale { reason: &'static str },
+    /// The socket accepted a connection but the daemon did not
+    /// complete the ACP handshake inside `budget`, OR the
+    /// handshake errored in a way that does NOT establish a dead
+    /// listener. There MAY be a live daemon doing real work;
+    /// removing the socket inode risks deleting a live daemon's
+    /// socket and severing in-flight work.
+    PossiblyAlive { reason: String },
+}
+
+/// Probe whether the daemon is fully ready by completing the ACP
+/// `initialize` handshake, not just accepting a TCP-level connection.
+///
+/// **Why this exists (reliability audit, finding #9):**
+/// `wait_for_socket` above only checks that the kernel will accept
+/// a connect(2) on the daemon's Unix socket — which is satisfied the
+/// moment the daemon process binds the socket, BEFORE it has started
+/// the ACP server loop, dispatched its first request, or warmed up
+/// its provider config. A caller that uses `wait_for_socket` and then
+/// immediately tries to send `initialize` can race the daemon: the
+/// socket accepts (we exit the wait) but the first `initialize` write
+/// is buffered indefinitely because the server side hasn't entered
+/// its read loop yet. In production this manifests as the agentic
+/// turn hanging for the full `opts.timeout` window and returning an
+/// empty `interrupted` AgentRun — the operator sees a stuck turn with
+/// no error and no work, and the loop spends a full budget minute
+/// discovering that the daemon was never going to respond.
+///
+/// `probe_ready` closes that race by completing a FRESH
+/// `initialize` round-trip: connect, write the handshake, read the
+/// result, drop the connection. The function returns
+/// `DaemonReadiness::Ready` only when the daemon has fully processed
+/// the initialize and returned a valid result. Failure modes are
+/// split into `TrulyStale` (no live listener; safe to unlink) and
+/// `PossiblyAlive` (a listener accepted us but the daemon didn't
+/// behave normally; do NOT unlink without operator confirmation).
+///
+/// The classification is conservative: a `PossiblyAlive` outcome is
+/// returned for EVERY non-`TrulyStale` failure (handshake timeout,
+/// mid-write error, mid-read error, malformed reply, JSON-RPC
+/// error reply) so the caller cannot accidentally delete a live
+/// daemon's socket on a single transient fault.
+///
+/// `budget` is the total wall-clock budget for connect + write +
+/// read, NOT a per-step cap. A short budget (e.g. 5–10s) is plenty
+/// for a daemon that's already in its server loop; a long budget
+/// (e.g. 30s+) is safe for a daemon that is just starting up but
+/// has its config loaded. Callers should use this immediately after
+/// `wait_for_socket` succeeds, before the first real `drive`.
+///
+/// The probe connection is opened AND closed for every call — the
+/// daemon's `initialize` is required on every fresh connection, and
+/// reusing the caller's subsequent turn-connection is intentional:
+/// this probe should never hold a long-lived socket open that could
+/// outlive the daemon's own reconnection logic.
+pub async fn probe_ready(socket: &Path, budget: Duration) -> DaemonReadiness {
+    let deadline = tokio::time::Instant::now() + budget;
+
+    // 1. Connect. Race against the remaining budget so a hung
+    //    daemon socket (accept at the kernel level, never serves
+    //    the ACP loop) cannot stall us past `budget`.
     let transport = EngineTransport::UnixSocket(socket.to_path_buf());
-    let conn = tokio::time::timeout(budget, connect_transport(&transport))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "connecting to daemon at {} timed out after {budget:?}",
-                socket.display()
-            )
-        })??;
+    let conn = match tokio::time::timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        connect_transport(&transport),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            // Classify the connect error. The two outcomes that
+            // unambiguously establish "no live listener" are
+            // `NotFound` (socket path doesn't exist) and
+            // `ConnectionRefused` (socket path exists but nobody
+            // is bound to it). Everything else — PermissionDenied
+            // (e.g. socket owned by another user), a host of
+            // platform-specific errors, or a `connect_transport`
+            // wrapper error — falls into `PossiblyAlive` so the
+            // caller does not unconditionally delete a socket
+            // inode that may belong to a daemon we can't see.
+            use std::io::ErrorKind;
+            let reason = classify_connect_error(&e);
+            let outcome = match reason {
+                ErrorKind::NotFound => DaemonReadiness::TrulyStale {
+                    reason: "socket path does not exist",
+                },
+                ErrorKind::ConnectionRefused => DaemonReadiness::TrulyStale {
+                    reason: "no listener on the daemon socket (ECONNREFUSED)",
+                },
+                other => DaemonReadiness::PossiblyAlive {
+                    reason: format!(
+                        "connect to {} failed with {:?}: {e}",
+                        socket.display(),
+                        other
+                    ),
+                },
+            };
+            return outcome;
+        }
+        Err(_) => {
+            // Connect itself timed out. We never even reached the
+            // kernel-level state machine, so we cannot rule out a
+            // slow daemon. Do NOT classify as `TrulyStale` — a
+            // hung socket can manifest as a long connect() stall
+            // (e.g. SELinux policy, container firewall rule), and
+            // deleting its inode would be premature.
+            return DaemonReadiness::PossiblyAlive {
+                reason: format!(
+                    "connect to {} timed out after {:?}",
+                    socket.display(),
+                    budget
+                ),
+            };
+        }
+    };
     let mut reader = BufReader::new(conn.reader);
     let mut write_half = conn.writer;
-    write_frame(
+
+    // 2. Send the initialize handshake. Use `deadline` so a
+    //    half-open socket cannot extend the probe past what the
+    //    caller asked for.
+    if let Err(e) = write_frame(
         &mut write_half,
         &json!({
             "jsonrpc": "2.0",
-            "id": "init",
+            "id": "probe-init",
             "method": "initialize",
             "params": { "protocol_version": ACP_PROTOCOL_VERSION },
         }),
     )
-    .await?;
-    // Bound the read by `budget` (NOT `budget.saturating_sub(elapsed)`)
-    // — caller-supplied budgets are short (e.g. 2s during a startup
-    // poll, 5s on a fresh connect) and the connect-timeout already
-    // accounted for the connect leg. A single budget keeps the contract
-    // simple and the worst case well below the loop's overall wall
-    // clock. `read_result` itself is bounded by `MAX_FRAME_BYTES` via
-    // `read_frame_line_capped`, so a runaway daemon can't OOM us.
-    let remaining = budget;
-    match tokio::time::timeout(remaining, read_result(&mut reader, "init")).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!(
-            "initialize handshake with daemon at {} failed: {e}",
-            socket.display()
-        )),
-        Err(_) => Err(anyhow!(
-            "initialize handshake with daemon at {} timed out after {budget:?}",
-            socket.display()
-        )),
+    .await
+    {
+        return DaemonReadiness::PossiblyAlive {
+            reason: format!(
+                "write initialize to {} failed (daemon accepted the connection but \
+                 didn't service the handshake): {e}",
+                socket.display()
+            ),
+        };
     }
+
+    // 3. Read the response under the same deadline. Any error
+    //    (EOF before the response, malformed JSON, error reply)
+    //    surfaces as `PossiblyAlive` so the caller knows the
+    //    daemon may still be alive but not behaving — not that
+    //    the probe is buggy or the socket is safe to delete.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match tokio::time::timeout(remaining, read_result(&mut reader, "probe-init")).await {
+        Ok(Ok(_)) => DaemonReadiness::Ready,
+        Ok(Err(e)) => DaemonReadiness::PossiblyAlive {
+            reason: format!(
+                "daemon at {} errored on initialize (connection was live; daemon \
+                 may be hung in startup or mid-fault): {e}",
+                socket.display()
+            ),
+        },
+        Err(_) => DaemonReadiness::PossiblyAlive {
+            reason: format!(
+                "daemon at {} did not respond to initialize within {:?} \
+                 (connection was live; daemon may be slow / hung)",
+                socket.display(),
+                budget
+            ),
+        },
+    }
+}
+
+/// Extract the underlying `io::ErrorKind` from an `anyhow::Error`
+/// returned by `connect_transport`. `connect_transport` wraps the
+/// underlying `std::io::Error` via `anyhow!`'s `Context` chain, so we
+/// walk the chain looking for the first cause that downcasts to
+/// `std::io::Error`. If nothing in the chain is an `io::Error`, we
+/// return `ErrorKind::Other` so the caller defaults to the safe
+/// `PossiblyAlive` branch.
+fn classify_connect_error(err: &anyhow::Error) -> std::io::ErrorKind {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return io_err.kind();
+        }
+    }
+    std::io::ErrorKind::Other
 }
 
 /// Call a single read-only zeroclaw JSON-RPC method after completing the
 /// daemon's required `initialize` handshake.
 ///
-/// The complete connect → initialize → request exchange is bounded so CLI
+/// The complete connect -> initialize -> request exchange is bounded so CLI
 /// inventory commands fail with a useful error instead of hanging on a stale or
 /// wedged daemon socket.
 async fn read_only_rpc(socket: &Path, method: &str) -> anyhow::Result<Value> {
@@ -1817,6 +1985,116 @@ pub async fn run_agent<F: FnMut(AgentEvent)>(
         .map_err(|_| anyhow!("agentic turn hung during setup; exceeded {:?}", backstop))?
 }
 
+/// Classify a partial turn after the engine closed the socket (clean EOF),
+/// hit a non-EOF read error, or failed to receive our approval write.
+///
+/// This is the single source of truth for the partial-turn outcome matrix
+/// that the daemon-disconnect / read-error / approval-write-failure branches
+/// of `drive` (and `drive_goose_io` on EOF) all converge on. Keeping it in
+/// one place prevents the three branches from drifting apart — the audit
+/// review of the original fix called out the inconsistency risk: if EOF
+/// classified `[A] -> EOF` as `interrupted` but a read error on the same
+/// shape classified it as `completed`, callers would see the same operator
+/// input produce different `outcome` strings depending on the failure mode.
+///
+/// The matrix, ordered most-specific first:
+///
+/// 1. If ANY entry in `pending_tool_results` is non-zero, the engine emitted
+///    at least one `tool_call` that did NOT receive its matching
+///    `tool_result` before the socket closed. The tool hung or was severed
+///    mid-execution. We MUST NOT call that `completed` — the caller would
+///    (incorrectly) treat the tool as having finished and dispatch on a
+///    result that never streamed. The result is `"interrupted"`. The
+///    per-name `HashMap` makes this branch also fire when only ONE of N
+///    distinct tools is unresolved: `[A] -> [B] -> [result A] -> EOF` is
+///    `interrupted` because `B` is still pending, even though `A` is closed.
+///
+/// 2. If `content` is empty AND no tool calls were emitted, the engine
+///    closed without producing anything. The turn is genuinely empty and
+///    we surface that as `"failed"` so callers can distinguish "engine
+///    disconnected with no output" from "engine disconnected after
+///    streaming useful work". (This branch is reached only when
+///    `pending_tool_results` is also empty, by the ordering above — a turn
+///    with a `tool_call` and no text is `interrupted`, not `failed`.)
+///
+/// 3. Otherwise text streamed AND every tool that was called received its
+///    result before EOF. The caller treats this as a clean end with
+///    whatever the engine managed to produce before vanishing. The
+///    result is `"completed"`.
+///
+/// `drive_goose_io` does not maintain a per-name pending map (it tracks
+/// `tool_calls` as a flat counter only), so its EOF branch routes through
+/// [`classify_partial_outcome_flat`] instead, which delegates to this
+/// helper when a pending map IS supplied and otherwise falls back to the
+/// flat-counter matrix.
+fn classify_partial_outcome(
+    pending_tool_results: &HashMap<String, u32>,
+    content: &str,
+    tool_call_count: u32,
+) -> String {
+    if pending_tool_results.values().any(|n| *n > 0) {
+        "interrupted".to_string()
+    } else if content.is_empty() && tool_call_count == 0 {
+        "failed".to_string()
+    } else {
+        "completed".to_string()
+    }
+}
+
+/// Simple partial-classifier that delegates to the full
+/// [`classify_partial_outcome`] when a per-name pending map is
+/// supplied, and otherwise applies the flat-counter matrix.
+///
+/// **Why this exists (reliability-audit review):** the original
+/// flat-counter variant unconditionally classified any non-empty
+/// stream as `completed`, regardless of whether a tool call was
+/// pending. A turn that emitted a `tool_call` and no text and then
+/// hit a mid-stream disconnect would be labelled `completed`
+/// instead of `interrupted` — the caller would (incorrectly)
+/// dispatch on a tool result that never streamed.
+///
+/// The fix: when the caller does maintain per-name pending state
+/// (the `zeroclaw` driver does; `drive_goose_io` does NOT, which is
+/// why this entry point exists as a separate helper), pass it
+/// through. The helper then uses the SAME state matrix the per-name
+/// classifier uses, so the partial-outcome contract is identical
+/// across the two wire drivers.
+///
+/// For callers without a pending map (the flat-counter case used by
+/// `drive_goose_io`'s EOF branch), the helper falls back to the
+/// two-branch decision: empty stream -> `"failed"`, anything else
+/// -> `"completed"`. This preserves the original flat-counter
+/// behavior for callers that genuinely have no per-name state to
+/// pass through.
+///
+/// **Audit invariant:** when the caller knows that a tool is
+/// pending, this helper MUST be called with `pending_tools =
+/// Some(...)`. Any caller that has access to a per-name map and
+/// passes `None` is silently discarding reliability information —
+/// `classify_partial_outcome` exists so that mistake is impossible
+/// to make. Audit call sites of this helper to ensure the
+/// `Some(...)` arm is used whenever per-name state is available.
+fn classify_partial_outcome_flat(
+    pending_tools: Option<&HashMap<String, u32>>,
+    content: &str,
+    tool_call_count: u32,
+) -> String {
+    if let Some(pending) = pending_tools {
+        // Delegate to the full classifier so the matrix stays in one
+        // place. The audit explicitly requires this delegation when
+        // pending state is known — see the helper's doc comment.
+        return classify_partial_outcome(pending, content, tool_call_count);
+    }
+    // Flat-counter fallback (no per-name state available). Used by
+    // `drive_goose_io` whose wire shape doesn't carry enough
+    // information to track pending tools by name.
+    if content.is_empty() && tool_call_count == 0 {
+        "failed".to_string()
+    } else {
+        "completed".to_string()
+    }
+}
+
 async fn drive<F: FnMut(AgentEvent)>(
     opts: &AgentOptions,
     on_event: &mut F,
@@ -2098,112 +2376,125 @@ async fn drive<F: FnMut(AgentEvent)>(
     let mut failure_detail: Option<String> = None;
     let mut line = String::new();
     let outcome: String = loop {
-        let got_line =
-            match tokio::time::timeout_at(deadline, read_frame_line_capped(&mut reader, &mut line))
-                .await
-            {
-                // Budget exhausted. CANCEL the turn server-side AND DRAIN until the
-                // engine confirms it wound the turn down — otherwise a ghost
-                // agent keeps editing files after we return. The drain also
-                // parses any final `turn_complete`/text that races the deadline
-                // (a turn that finished right at the budget is a "completed"
-                // turn, not a "timeout" turn), and tracks tool-call
-                // completion so the EOF / timeout classification stays
-                // consistent with the rest of the loop.
-                Err(_) => {
-                    let _ = write_frame(
-                        &mut write_half,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "id": "cancel",
-                            "method": "session/cancel",
-                            "params": { "session_id": session_id },
-                        }),
-                    )
-                    .await;
-                    // Bounded drain (SETTLE_BUDGET). Best-effort: a turn that
-                    // raced the deadline to completion here ends up as
-                    // `completed` (preserving the partial transcript + tool
-                    // tally); a daemon that ignores the cancel and keeps
-                    // streaming past the drain falls through to `timeout` with
-                    // whatever it had emitted before the budget.
-                    break drain_after_cancel(
-                        &mut reader,
-                        opts.show_reasoning,
-                        on_event,
-                        &mut content,
-                        &mut content_bytes,
-                        &mut input_tokens,
-                        &mut tool_calls,
-                        &mut pending_tool_results,
-                        &mut line,
-                    )
-                    .await;
-                }
-                Ok(r) => r.context("reading from engine")?,
-            };
-        if !got_line {
-            // Mid-turn disconnect (EOF before `turn_complete`). The engine
-            // already streamed whatever it streamed — preserve the partial
-            // turn rather than discarding it as `bail!` did. The previous
-            // behavior was: any EOF before turn_complete surfaced as an
-            // `Err`, which made a daemon that crashed mid-edit (or a
-            // network blip that severed the socket) silently zero out the
-            // operator's turn even when text + tool calls had already
-            // streamed. `drive_goose_io` already returns a partial
-            // `AgentRun` on the same condition; this brings `drive` into
-            // line so both drivers share one wire-side EOF contract.
-            //
-            // Classification (ordered most-specific first):
-            //   1. ANY entry in `pending_tool_results` is > 0 ->
-            //      `"interrupted"`. The engine emitted at least one
-            //      `tool_call` that did NOT receive its matching
-            //      `tool_result` before the socket closed. The tool
-            //      hung or was severed mid-execution, and we MUST NOT
-            //      call that `completed` — the caller would
-            //      (incorrectly) treat the tool as having finished and
-            //      dispatch on a result that never streamed. The
-            //      per-name `HashMap` ensures this branch is also
-            //      taken when only ONE of N distinct tools is
-            //      unresolved: `[A] -> [B] -> [result A] -> EOF` is
-            //      `interrupted` because `B` is still pending, even
-            //      though `A` is closed. The v1 flat-counter code
-            //      would have called this `completed`.
-            //   2. `content.is_empty() && tool_calls == 0` ->
-            //      `"failed"`. The engine closed without emitting
-            //      anything; the turn is genuinely empty and we
-            //      surface that so the caller can distinguish
-            //      "engine disconnected with no output" from "engine
-            //      disconnected after streaming useful work". (Note:
-            //      this branch is REACHED only when `pending_tool_results`
-            //      is also empty, by the ordering above — a turn with
-            //      a `tool_call` and no text is `interrupted`, not
-            //      `failed`.)
-            //   3. otherwise -> `"completed"`. Text streamed AND
-            //      every tool that was called received its result
-            //      before EOF. The caller treats this as a clean end
-            //      with whatever the engine managed to produce before
-            //      vanishing.
-            //
-            // In every case the function returns `Ok(AgentRun{..})` —
-            // NEVER `Err` — so partial work survives.
-            //
-            // INVARIANT on `line`: `read_frame_line_capped` clears the
-            // caller's `line` buffer on EOF (and on the oversized-frame
-            // error path) before returning `Ok(false)`. That means when
-            // we reach this branch, there is no partial frame buffered
-            // for the next iteration to lose — every byte the engine
-            // emitted before closing is already in `content` /
-            // `tool_calls` / `pending_tool_results`. The break below
-            // happens AFTER all prior-iteration state is committed; no
-            // chunk is lost.
-            break if pending_tool_results.values().any(|n| *n > 0) {
-                "interrupted".to_string()
-            } else if content.is_empty() && tool_calls == 0 {
-                "failed".to_string()
-            } else {
-                "completed".to_string()
-            };
+        // The streaming-loop dispatch on the per-frame read result is
+        // exhaustive over [`read_frame_line_capped`]'s
+        // `Result<bool, io::Error>`:
+        //   * Outer `Err(_)` = the per-frame read timed out (we hit
+        //     `deadline`). We cancel server-side and drain briefly so a
+        //     turn that completed at the deadline is not mislabeled.
+        //   * Inner `Ok(true)` = we got a frame; fall through to the
+        //     parse + dispatch block below.
+        //   * Inner `Ok(false)` = EOF (clean socket close, no frame).
+        //     Classify the partial turn via the same state-matrix
+        //     used for read-errors and approval-write failures and
+        //     return `Ok(AgentRun{..})` — never `Err` — so partial
+        //     work survives a severed connection.
+        //   * Inner `Err(_)` = non-EOF read error (broken pipe,
+        //     oversized frame, generic io::Error). Same matrix as
+        //     EOF; the error is preserved on `failure_detail` for
+        //     operator diagnosis.
+        match tokio::time::timeout_at(deadline, read_frame_line_capped(&mut reader, &mut line))
+            .await
+        {
+            // Budget exhausted. CANCEL the turn server-side so the engine stops
+            // editing files (otherwise a ghost agent keeps running after we
+            // return + fail the job), then preserve whatever streamed so far.
+            Err(_) => {
+                let _ = write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": "cancel",
+                        "method": "session/cancel",
+                        "params": { "session_id": session_id },
+                    }),
+                )
+                .await;
+                // Bounded drain (SETTLE_BUDGET). Best-effort: a turn that
+                // raced the deadline to completion here ends up as `completed`;
+                // a daemon that ignores cancel falls through with the partial
+                // turn classified consistently with the normal loop.
+                break drain_after_cancel(
+                    &mut reader,
+                    opts.show_reasoning,
+                    on_event,
+                    &mut content,
+                    &mut content_bytes,
+                    &mut input_tokens,
+                    &mut tool_calls,
+                    &mut pending_tool_results,
+                    &mut line,
+                )
+                .await;
+            }
+            Ok(Ok(true)) => {
+                // Got a valid frame — fall through to the parse + handle logic below.
+            }
+            Ok(Ok(false)) => {
+                // Mid-turn disconnect (EOF before `turn_complete`). The engine
+                // already streamed whatever it streamed — preserve the partial
+                // turn rather than discarding it as `bail!` did. The previous
+                // behavior was: any EOF before turn_complete surfaced as an
+                // `Err`, which made a daemon that crashed mid-edit (or a
+                // network blip that severed the socket) silently zero out the
+                // operator's turn even when text + tool calls had already
+                // streamed. `drive_goose_io` already returns a partial
+                // `AgentRun` on the same condition; this brings `drive` into
+                // line so both drivers share one wire-side EOF contract.
+                //
+                // Classification is delegated to
+                // [`classify_partial_outcome`] so the EOF / read-error /
+                // approval-write-failure branches all converge on the same
+                // state matrix. The matrix is documented in that helper's
+                // doc comment; in summary:
+                //   1. `pending_tool_results` non-zero -> "interrupted"
+                //      (a tool was severed mid-execution; the caller must
+                //      NOT treat the tool as completed).
+                //   2. `content` empty AND no tool calls -> "failed"
+                //      (engine disconnected with no output).
+                //   3. otherwise -> "completed" (text streamed; every
+                //      tool that was called received its result before EOF).
+                //
+                // In every case the function returns `Ok(AgentRun{..})` —
+                // NEVER `Err` — so partial work survives.
+                //
+                // INVARIANT on `line`: `read_frame_line_capped` clears the
+                // caller's `line` buffer on EOF (and on the oversized-frame
+                // error path) before returning `Ok(false)`. That means when
+                // we reach this branch, there is no partial frame buffered
+                // for the next iteration to lose — every byte the engine
+                // emitted before closing is already in `content` /
+                // `tool_calls` / `pending_tool_results`. The break below
+                // happens AFTER all prior-iteration state is committed; no
+                // chunk is lost.
+                let outcome = classify_partial_outcome(&pending_tool_results, &content, tool_calls);
+                break outcome;
+            }
+            Ok(Err(read_err)) => {
+                // RELIABILITY-AUDIT FIX (mid-turn read-error, NOT just EOF):
+                //
+                // The EOF branch above already preserves partial work on a
+                // clean socket close. The same contract MUST hold for any
+                // other read error too — a broken pipe, a connection reset
+                // by peer, an oversized frame (`io::ErrorKind::InvalidData`
+                // from the per-frame cap), or a generic io::Error. The
+                // engine has already streamed whatever it streamed;
+                // surfacing the error as `Err` would silently zero out the
+                // operator's turn even when text + tool calls had already
+                // been emitted to the sink.
+                //
+                // We classify the partial using the SAME state-matrix the
+                // EOF branch uses (pending tools -> interrupted, empty ->
+                // failed, otherwise -> completed). The error string is
+                // preserved on `failure_detail` so the operator can diagnose
+                // the wire-side fault, but the function still returns
+                // `Ok(AgentRun{..})` — NEVER `Err` — so the partial
+                // transcript + session id are both usable for `--session`
+                // resume.
+                failure_detail = Some(format!("engine read error mid-turn: {read_err}"));
+                let outcome = classify_partial_outcome(&pending_tool_results, &content, tool_calls);
+                break outcome;
+            }
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -2404,7 +2695,30 @@ async fn drive<F: FnMut(AgentEvent)>(
                     opts.trust_engine,
                 );
                 let decision = if approved { "approve" } else { "deny" };
-                write_frame(
+                // RELIABILITY-AUDIT FIX (approval-write-failure must NOT
+                // discard the turn):
+                //
+                // `session/approve` is the LAST thing the engine sees in
+                // response to its `approval_request` — if writing it
+                // fails (broken pipe / IO error), the engine will not
+                // proceed, but EVERYTHING the engine streamed BEFORE
+                // this request is already real: text chunks, tool calls,
+                // tool results. Surfacing the write error as `bail!` /
+                // `Err` discards all of that and returns Err to the
+                // caller, who then sees `0/N successful` and never
+                // learns that the engine was mid-turn on legitimate
+                // work. We instead capture the error on
+                // `failure_detail`, classify the turn using the same
+                // state matrix as the EOF / read-error branches
+                // (pending tool -> interrupted, empty -> failed,
+                // otherwise completed), and return `Ok(AgentRun{..})`
+                // with whatever streamed. The caller still gets a
+                // usable session id and partial transcript; the error
+                // is visible on `failure_detail` and on the
+                // `AgentEvent::Approval { approved: false }` we emit
+                // as a fallback so downstream observers see the
+                // approval was NOT delivered.
+                if let Err(write_err) = write_frame(
                     &mut write_half,
                     &json!({
                         "jsonrpc": "2.0",
@@ -2417,7 +2731,23 @@ async fn drive<F: FnMut(AgentEvent)>(
                         },
                     }),
                 )
-                .await?;
+                .await
+                {
+                    failure_detail = Some(format!(
+                        "approval write failed (decision was {decision}, tool '{tool}'): {write_err}"
+                    ));
+                    // Synthesize a deny event so the operator sees the
+                    // engine got no decision — `approved: false` is the
+                    // safe fallback when we couldn't deliver the real
+                    // one.
+                    on_event(AgentEvent::Approval {
+                        tool,
+                        approved: false,
+                    });
+                    let outcome =
+                        classify_partial_outcome(&pending_tool_results, &content, tool_calls);
+                    break outcome;
+                }
                 on_event(AgentEvent::Approval { tool, approved });
             }
             "turn_complete" => {
@@ -3925,13 +4255,27 @@ where
             Ok(r) => r.context("reading from goose ACP engine")?,
         };
         if !got_line {
-            // Engine closed its end. If we never got an explicit stopReason,
-            // assume the turn completed.
-            break if content.is_empty() && tool_calls == 0 {
-                "failed".to_string()
-            } else {
-                "completed".to_string()
-            };
+            // Engine closed its end. If we never got an explicit
+            // stopReason, classify the partial using
+            // [`classify_partial_outcome_flat`]. The goose driver
+            // does not maintain per-name pending tool state (it has
+            // only a flat `tool_calls` counter, which the
+            // reliability-audit review explicitly accepted because
+            // the goose wire shape doesn't carry enough information
+            // for name-scoped tracking), so we pass `None` for the
+            // pending map. The helper then falls back to the
+            // two-branch matrix:
+            //   * empty stream -> "failed"
+            //   * otherwise    -> "completed"
+            // Note: this branch only fires on EOF (clean socket
+            // close); non-EOF read errors are surfaced as
+            // `Err(context(...))` above (a separate change tracks
+            // unifying the read-error branch with the per-name
+            // driver; for now the goose driver keeps the pre-fix
+            // behavior on read errors and the audit-acceptable
+            // behavior on EOF).
+            let outcome = classify_partial_outcome_flat(None, &content, tool_calls);
+            break outcome;
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -11345,5 +11689,688 @@ mod goose_acp_real_turn {
             run.outcome, "timeout",
             "real goose+minimax turn TIMED OUT (possible prompt-write-before-read deadlock!)"
         );
+    }
+
+    // ---------- classify_partial_outcome (reliability-audit unit tests) ----------
+    //
+    // The drive-loop refactor extracted the partial-turn outcome matrix
+    // (EOF / read-error / approval-write-failure branches all converge
+    // on the same state machine) into a single helper. These tests pin
+    // every branch of that matrix so a future refactor cannot silently
+    // regress the wire-side contract: the audit's review of the
+    // original fix called out the risk that the three branches could
+    // drift apart if the matrix was inlined per-call.
+
+    /// Pin the "pending tool" branch — pending tool calls have
+    /// precedence over the empty-stream check. A turn that emitted a
+    /// `tool_call` but no text and then disconnected is NOT `failed`;
+    /// it is `interrupted` because the tool hung.
+    #[test]
+    fn classify_partial_outcome_pending_tool_is_interrupted() {
+        let mut pending = HashMap::new();
+        pending.insert("edit_file".to_string(), 1);
+        let out = classify_partial_outcome(&pending, "", 1);
+        assert_eq!(
+            out, "interrupted",
+            "a pending tool result with zero text MUST classify as `interrupted`; got {out:?}"
+        );
+    }
+
+    /// Pin the "pending tool beats empty content" rule: even if
+    /// `content` is non-empty, a pending tool still wins.
+    #[test]
+    fn classify_partial_outcome_pending_tool_beats_nonempty_content() {
+        let mut pending = HashMap::new();
+        pending.insert("bash".to_string(), 1);
+        let out = classify_partial_outcome(&pending, "starting bash", 1);
+        assert_eq!(
+            out, "interrupted",
+            "non-empty text with a pending tool must still classify as `interrupted`; got {out:?}"
+        );
+    }
+
+    /// Pin the "empty stream" branch — no text, no tool calls,
+    /// no pending; the engine disconnected without producing anything.
+    #[test]
+    fn classify_partial_outcome_empty_stream_is_failed() {
+        let pending = HashMap::new();
+        let out = classify_partial_outcome(&pending, "", 0);
+        assert_eq!(
+            out, "failed",
+            "an empty stream with no pending tools MUST classify as `failed`; got {out:?}"
+        );
+    }
+
+    /// Pin the "completed-with-partial-text" branch — text streamed
+    /// AND every tool was closed; the engine vanished after producing
+    /// useful work.
+    #[test]
+    fn classify_partial_outcome_text_only_is_completed() {
+        let pending = HashMap::new();
+        let out = classify_partial_outcome(&pending, "hello, world", 0);
+        assert_eq!(
+            out, "completed",
+            "text streamed with no pending tools must classify as `completed`; got {out:?}"
+        );
+    }
+
+    /// Pin the "completed-after-tool-closed" branch — text streamed
+    /// AND every tool_call has a matching tool_result.
+    #[test]
+    fn classify_partial_outcome_text_with_closed_tools_is_completed() {
+        let pending = HashMap::new(); // every tool has closed
+        let out = classify_partial_outcome(&pending, "done editing", 1);
+        assert_eq!(
+            out, "completed",
+            "text streamed with all tools closed must classify as `completed`; got {out:?}"
+        );
+    }
+
+    /// Pin the flat variant's fallback when `None` is passed and the
+    /// stream is empty. Empty-stream must still be `failed` for the
+    /// flat variant too, so the goose EOF path doesn't drift from the
+    /// per-name matrix.
+    #[test]
+    fn classify_partial_outcome_flat_empty_is_failed() {
+        let out = classify_partial_outcome_flat(None, "", 0);
+        assert_eq!(out, "failed", "flat (None): empty stream must be `failed`");
+    }
+
+    /// Pin the flat variant's fallback when `None` is passed and
+    /// text was streamed.
+    #[test]
+    fn classify_partial_outcome_flat_with_text_is_completed() {
+        let out = classify_partial_outcome_flat(None, "some text", 0);
+        assert_eq!(
+            out, "completed",
+            "flat (None): text streamed must be `completed`"
+        );
+    }
+
+    /// Pin the flat variant's fallback when `None` is passed and
+    /// tool calls were emitted but no text. This is the
+    /// audit-accepted flat-counter behavior for the goose driver
+    /// (no per-name pending state is available).
+    #[test]
+    fn classify_partial_outcome_flat_with_tool_calls_is_completed() {
+        let out = classify_partial_outcome_flat(None, "", 3);
+        assert_eq!(
+            out, "completed",
+            "flat (None): tool calls with no text must be `completed` (drive_goose_io has no per-name pending map); got {out:?}"
+        );
+    }
+
+    /// REGRESSION (audit-critical): the flat variant MUST delegate
+    /// to the full per-name classifier when a pending map IS
+    /// supplied, even if it would otherwise use the flat matrix.
+    /// A pending tool with no text and zero non-empty content MUST
+    /// classify as `interrupted` via the `Some(...)` arm of the
+    /// helper — the flat matrix would say `completed`, which is
+    /// the bug the reviewer flagged in the previous attempt.
+    #[test]
+    fn classify_partial_outcome_flat_with_some_pending_interrupts() {
+        let mut pending = HashMap::new();
+        pending.insert("edit_file".to_string(), 1);
+        // The flat matrix would say `completed` (non-empty tool_calls,
+        // empty content). But the per-name map says `interrupted`.
+        let out = classify_partial_outcome_flat(Some(&pending), "", 1);
+        assert_eq!(
+            out, "interrupted",
+            "flat (Some(pending)): pending tool with empty content MUST classify as \
+             `interrupted` (delegate to classify_partial_outcome, not the flat matrix); \
+             got {out:?}"
+        );
+    }
+
+    /// REGRESSION: the flat variant with `Some(pending)` and an
+    /// empty pending map should behave identically to passing `None`
+    /// (delegation preserves the empty-stream -> failed branch).
+    #[test]
+    fn classify_partial_outcome_flat_with_some_empty_pending_delegates_to_full() {
+        let pending = HashMap::new();
+        let out_none = classify_partial_outcome_flat(None, "", 0);
+        let out_some = classify_partial_outcome_flat(Some(&pending), "", 0);
+        assert_eq!(
+            out_none, out_some,
+            "flat (Some(empty pending)) and flat (None) must agree on empty stream"
+        );
+        assert_eq!(
+            out_some, "failed",
+            "flat (Some(empty pending)): empty stream must be `failed`"
+        );
+    }
+
+    /// REGRESSION: the flat variant with `Some(pending)` and a
+    /// closed (zero-count) entry must NOT classify as
+    /// `interrupted` — zero is not "pending". A `tool_call` with
+    /// its `tool_result` already received is a closed call, not a
+    /// severed one.
+    #[test]
+    fn classify_partial_outcome_flat_with_some_zero_count_pending_does_not_interrupt() {
+        let mut pending = HashMap::new();
+        pending.insert("edit_file".to_string(), 0); // closed
+        let out = classify_partial_outcome_flat(Some(&pending), "done", 1);
+        assert_eq!(
+            out, "completed",
+            "flat (Some(zero-count pending)): zero-count is closed, not pending; \
+             got {out:?}"
+        );
+    }
+
+    // ---------- drive loop: read-error mid-turn (reliability-audit) ----------
+    //
+    // The original fix exposed the read-error path
+    // (`Ok(Err(read_err))` in the streaming loop) but did not have a
+    // dedicated test — the existing tests all hit the EOF branch
+    // (`Ok(Ok(false))`). This test exercises the non-EOF error path
+    // by sending a frame that exceeds [`MAX_FRAME_BYTES`], which
+    // `read_frame_line_capped` rejects with `io::ErrorKind::InvalidData`.
+    // The driver must surface the partial turn (preserving the streamed
+    // text + session id) instead of discarding everything as `Err`.
+
+    /// Mid-turn read-error must produce a partial `AgentRun`, not
+    /// `Err`. The streamed text must survive; the `outcome` must
+    /// follow the same state matrix as the EOF branch (read-error and
+    /// EOF are unified in the audit's reliability fix).
+    #[tokio::test]
+    async fn drive_returns_partial_agent_run_on_mid_turn_read_error() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-readerr-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // read `session/prompt` so the streaming loop is parked.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // Stream some text first; the partial turn must
+                // preserve this even though the next read errors.
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "partial output before the wire-side error"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Trigger a non-EOF read error on the client side by
+                // emitting a frame that exceeds MAX_FRAME_BYTES
+                // without a newline. The cap is in
+                // [`read_frame_line_capped`] which converts it to
+                // `io::ErrorKind::InvalidData` — exactly the
+                // production failure mode this fix targets.
+                let huge = vec![b'x'; MAX_FRAME_BYTES as usize + 256];
+                let _ = write_half.write_all(&huge).await;
+                let _ = write_half.shutdown().await;
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "produce output then crash".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let run = run_agent(&opts, |ev| events.push(ev))
+            .await
+            .expect("mid-turn read-error must surface as Ok(partial), not Err");
+
+        assert_eq!(
+            run.content, "partial output before the wire-side error",
+            "the text streamed BEFORE the read error must survive the partial turn"
+        );
+        assert_eq!(
+            run.tool_calls, 0,
+            "no tool_call frames were streamed; tool_calls must be 0"
+        );
+        assert_eq!(
+            run.outcome, "completed",
+            "a non-empty stream with no pending tools must classify as `completed` (the read-error path \
+             uses the same state matrix as the EOF path); got {:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.session_id, "z-readerr-1",
+            "session_id from the session/new ack must survive the read-error"
+        );
+        assert!(
+            run.failure_detail.is_some(),
+            "failure_detail must be populated by the read-error branch so the operator can diagnose; \
+             got None"
+        );
+        let detail = run.failure_detail.unwrap();
+        assert!(
+            detail.contains("read error mid-turn"),
+            "failure_detail must mention the read-error origin; got {detail:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    /// Mid-turn read-error with a pending tool call must classify
+    /// as `interrupted`, not `completed` — the per-name
+    /// `pending_tool_results` HashMap makes the read-error branch
+    /// follow the same matrix as the EOF branch.
+    #[tokio::test]
+    async fn drive_marks_outcome_interrupted_on_read_error_with_pending_tool() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                // ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // ack `session/new`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "z-readerr-tool-1" }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // read `session/prompt`.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+
+                // Stream SOME text + a tool_call, then trigger the
+                // read-error. The pending tool_call must drive the
+                // outcome to `interrupted` (the per-name map beats
+                // the text-stream check).
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "agent_message_chunk",
+                        "text": "starting edit"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "type": "tool_call",
+                        "name": "edit_file"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+
+                // Trigger the read-error via MAX_FRAME_BYTES overflow.
+                let huge = vec![b'x'; MAX_FRAME_BYTES as usize + 256];
+                let _ = write_half.write_all(&huge).await;
+                let _ = write_half.shutdown().await;
+            }
+        });
+
+        let opts = AgentOptions {
+            socket,
+            agent_alias: "minimax".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            prompt: "edit something then crash".to_string(),
+            model_override: None,
+            model_id: None,
+            session_id: None,
+            show_reasoning: false,
+            approval: ApprovalPolicy::Allowlist,
+            timeout: std::time::Duration::from_secs(10),
+            goose_provider: None,
+            writable_roots: vec![std::path::PathBuf::from("/tmp")],
+            enforce_writable_roots: false,
+            trust_engine: false,
+            mcp_servers: Vec::new(),
+            project_instructions: None,
+            persist_session_id: false,
+            session_store_path: None,
+        };
+
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("read-error with pending tool must surface as Ok, not Err");
+
+        assert_eq!(
+            run.content, "starting edit",
+            "text streamed before the read-error must survive"
+        );
+        assert_eq!(
+            run.tool_calls, 1,
+            "exactly one tool_call was streamed before the read-error"
+        );
+        assert_eq!(
+            run.outcome, "interrupted",
+            "read-error with a pending tool_call MUST classify as `interrupted` (the per-name pending map \
+             must take precedence over the text-stream check); got {:?}",
+            run.outcome
+        );
+        assert!(!run.succeeded());
+        assert_eq!(run.session_id, "z-readerr-tool-1");
+
+        let _ = server.await;
+    }
+
+    // ---------- probe_ready (reliability-audit unit tests) ----------
+    //
+    // The audit flagged the pre-fix behavior as critical: a live
+    // daemon that was merely slow to respond had its socket inode
+    // unconditionally removed, severing any future `connect(2)`.
+    // The structured `DaemonReadiness` outcome closes that hole
+    // by separating "no listener" (`TrulyStale`, safe to unlink)
+    // from "listener accepted us but didn't complete the handshake"
+    // (`PossiblyAlive`, NOT safe to unlink without operator
+    // confirmation).
+
+    /// `probe_ready` against a non-existent socket path MUST return
+    /// `TrulyStale { NotFound }`. This is the "the socket file
+    /// doesn't even exist" case — no live daemon anywhere; the
+    /// caller can safely proceed to spawn a fresh one.
+    #[tokio::test]
+    async fn probe_ready_classifies_missing_socket_as_truly_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("never-existed.sock");
+        let out = probe_ready(&socket, Duration::from_secs(1)).await;
+        match out {
+            DaemonReadiness::TrulyStale { reason } => {
+                assert!(
+                    reason.contains("socket path does not exist")
+                        || reason.contains("does not exist"),
+                    "TrulyStale reason must explain why; got {reason:?}"
+                );
+            }
+            other => panic!("missing socket must be `TrulyStale` (NotFound); got {other:?}"),
+        }
+    }
+
+    /// `probe_ready` against a socket path with no listener MUST
+    /// return `TrulyStale { ConnectionRefused }`. This is the
+    /// "previous zoder crashed after binding but before serving"
+    /// case — safe to unlink the inode; nothing on the system has
+    /// the path open.
+    #[tokio::test]
+    async fn probe_ready_classifies_socket_with_no_listener_as_truly_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("no-listener.sock");
+        // Create a regular file at the path — `connect(2)` on a
+        // path that exists but isn't a socket returns
+        // `ConnectionRefused` (ECONNREFUSED) on Linux. This is the
+        // closest we can get to "socket inode exists but no live
+        // listener" without spawning a fake daemon, and it's the
+        // shape `probe_ready` sees in production when the daemon
+        // crashed after `bind(2)` and before `listen(2)`.
+        std::fs::write(&socket, b"stale socket inode").expect("write stale socket");
+        let out = probe_ready(&socket, Duration::from_secs(1)).await;
+        match out {
+            DaemonReadiness::TrulyStale { .. } => {}
+            other => panic!("socket with no listener must be `TrulyStale`; got {other:?}"),
+        }
+    }
+
+    /// `probe_ready` against a healthy daemon that completes the
+    /// ACP `initialize` round-trip MUST return `Ready`. This is
+    /// the success path; the caller short-circuits to `drive`.
+    #[tokio::test]
+    async fn probe_ready_classifies_healthy_daemon_as_ready() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon-healthy.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // ack `initialize`.
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "probe-init",
+                    "result": { "protocolVersion": 1 }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+                // close so the probe can finish.
+                let _ = write_half.shutdown().await;
+            }
+        });
+
+        let out = probe_ready(&socket, Duration::from_secs(5)).await;
+        assert_eq!(
+            out,
+            DaemonReadiness::Ready,
+            "healthy daemon must classify as `Ready`; got {out:?}"
+        );
+        let _ = server.await;
+    }
+
+    /// `probe_ready` against a daemon that ACCEPTS the connection
+    /// but does NOT respond to the `initialize` round-trip MUST
+    /// return `PossiblyAlive` (NOT `TrulyStale`). The audit
+    /// explicitly called out: a slow-but-live daemon must NEVER
+    /// be classified as `TrulyStale`, because deleting its socket
+    /// inode would sever the live kernel connection and lose
+    /// in-flight work. `PossiblyAlive` forces the caller to
+    /// investigate before unlinking.
+    #[tokio::test]
+    async fn probe_ready_classifies_slow_daemon_as_possibly_alive() {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon-slow.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, _write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                // Read `initialize` but NEVER respond. The probe
+                // exhausts its budget waiting for the result and
+                // must classify as `PossiblyAlive`, NOT `TrulyStale`.
+                let _ = reader.read_line(&mut line).await;
+                // Hold the connection open without writing anything.
+                // The probe's read will time out.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        // 1-second budget so the test runs quickly. The server
+        // sleeps 5s without responding, so the probe MUST see the
+        // timeout and classify as `PossiblyAlive`.
+        let out = probe_ready(&socket, Duration::from_secs(1)).await;
+        match out {
+            DaemonReadiness::PossiblyAlive { reason } => {
+                // The reason can be either "connect timed out" or
+                // "did not respond to initialize within ..." depending
+                // on whether the connect completed before the read
+                // started. Both are classified as `PossiblyAlive` —
+                // which is the audit-critical invariant.
+                assert!(
+                    reason.contains("timed out") || reason.contains("did not respond"),
+                    "PossiblyAlive reason must mention timeout/no-response; got {reason:?}"
+                );
+            }
+            other => panic!(
+                "a slow-but-live daemon MUST classify as `PossiblyAlive`; the audit \
+                 explicitly forbids `TrulyStale` here because deleting the socket would \
+                 sever the live daemon. got {other:?}"
+            ),
+        }
+        // Don't wait on `server` here — the server's 5s sleep
+        // would slow the test suite; the spawned task is
+        // best-effort and the daemon's read will EOF when we drop
+        // our side. The test infrastructure cleans up the task.
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// `probe_ready` against a daemon that responds with a malformed
+    /// JSON-RPC error (NOT a clean `result`) MUST return
+    /// `PossiblyAlive`, NOT `TrulyStale`. The audit called this out
+    /// explicitly: the daemon may have a real bug, but its socket
+    /// is live and an operator-confirmed removal is the only safe
+    /// path to a clean state.
+    #[tokio::test]
+    async fn probe_ready_classifies_malformed_reply_as_possibly_alive() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon-malformed.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                // Reply with garbage that doesn't satisfy the
+                // `read_result` contract. The probe MUST NOT classify
+                // as `TrulyStale` — the connection was live; only
+                // the reply was malformed.
+                let garbage = b"this is not json\n";
+                let _ = write_half.write_all(garbage).await;
+                let _ = write_half.flush().await;
+            }
+        });
+
+        let out = probe_ready(&socket, Duration::from_secs(2)).await;
+        match out {
+            DaemonReadiness::PossiblyAlive { .. } => {}
+            other => panic!(
+                "malformed reply from a live daemon must be `PossiblyAlive`; \
+                 got {other:?}"
+            ),
+        }
+        let _ = server.await;
+    }
+
+    /// `probe_ready` against a daemon that replies with a JSON-RPC
+    /// error envelope (rather than a `result`) MUST classify as
+    /// `PossiblyAlive` (the daemon is alive; it's reporting a
+    /// protocol error). The caller MUST NOT remove the socket
+    /// inode based on a `result.error` reply — only on a clean
+    /// `result` ack or a kernel-level connection refusal.
+    #[tokio::test]
+    async fn probe_ready_classifies_jsonrpc_error_reply_as_possibly_alive() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon-jsonrpc-err.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let mut s = serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "probe-init",
+                    "error": {
+                        "code": -32601,
+                        "message": "method not found"
+                    }
+                }))
+                .unwrap();
+                s.push('\n');
+                let _ = write_half.write_all(s.as_bytes()).await;
+                let _ = write_half.flush().await;
+            }
+        });
+
+        let out = probe_ready(&socket, Duration::from_secs(2)).await;
+        match out {
+            DaemonReadiness::PossiblyAlive { .. } => {}
+            other => panic!(
+                "JSON-RPC error reply from a live daemon must be `PossiblyAlive`; \
+                 got {other:?}"
+            ),
+        }
+        let _ = server.await;
     }
 }

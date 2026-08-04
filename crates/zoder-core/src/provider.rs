@@ -30,8 +30,12 @@ const ANTHROPIC_MESSAGES_SUFFIX: &str = "messages";
 /// suffix it was hard-coded to before this slice landed.
 const RESPONSES_SUFFIX: &str = "responses";
 
-/// Default overall request budget (seconds). Override: ZODER_TIMEOUT_S.
-const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
+/// Default overall request budget (seconds). This timer starts before the
+/// HTTP request is sent, so gateways such as LiteLLM/vLLM spend it while the
+/// request waits in the server queue as well as while the model generates.
+/// Override precedence at CLI call sites is `--request-timeout`, then
+/// `request_timeout_s` config, then `ZODER_TIMEOUT_S`, then this default.
+pub const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
 /// Default stream inactivity budget (seconds). A model that stops emitting for
 /// this long is treated as stalled. Override: ZODER_IDLE_S.
 const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
@@ -49,6 +53,12 @@ fn env_secs(var: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+pub fn request_timeout_s_from_env() -> Option<u64> {
+    std::env::var("ZODER_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Classified failure mode of a single provider call.
@@ -850,6 +860,16 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(p: &Provider) -> anyhow::Result<Self> {
+        Self::new_with_request_timeout_s(p, None)
+    }
+
+    pub fn new_with_request_timeout_s(
+        p: &Provider,
+        request_timeout_s: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        if request_timeout_s.is_some_and(|secs| secs == 0) {
+            anyhow::bail!("request_timeout_s must be greater than zero");
+        }
         let plan_label = p
             .subscription
             .as_ref()
@@ -906,10 +926,11 @@ impl OpenAiProvider {
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .build()?,
-            request_timeout: Duration::from_secs(env_secs(
-                "ZODER_TIMEOUT_S",
-                DEFAULT_REQUEST_TIMEOUT_S,
-            )),
+            request_timeout: Duration::from_secs(
+                request_timeout_s
+                    .or_else(request_timeout_s_from_env)
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_S),
+            ),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
             azure_api_version,
         })

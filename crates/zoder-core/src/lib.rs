@@ -44,8 +44,8 @@ pub use acp_client::{
     agents_status, cancel_session, fetch_quickstart_diagnostics, list_agents, new_session,
     probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call, wait_for_socket,
     write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent, AgentOptions, AgentRun,
-    AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy, EngineKind,
-    GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
+    AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy, DaemonReadiness,
+    EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
 };
 /// Settle budget the loop grants the daemon to ACK a `session/cancel` after
 /// the author-phase watchdog fires (see `cancel_session`). Canonical value
@@ -88,8 +88,8 @@ pub use project_instructions::{
     PROJECT_INSTRUCTIONS_HEADER, PROJECT_INSTRUCTIONS_SEPARATOR, TRUNCATION_MARKER,
 };
 pub use provider::{
-    backoff_delay, CallTelemetry, ChatRequest, ChatResult, ErrKind, Message, OpenAiProvider,
-    ProviderError,
+    backoff_delay, request_timeout_s_from_env, CallTelemetry, ChatRequest, ChatResult, ErrKind,
+    Message, OpenAiProvider, ProviderError, DEFAULT_REQUEST_TIMEOUT_S,
 };
 pub use quota::{
     amortized_per_call, plan_usage, plan_usage_for_catalog_provider, window_usage, WindowUsage,

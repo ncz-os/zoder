@@ -229,10 +229,10 @@ fn render_table(rows: &[JobListRow]) -> String {
     out
 }
 
-/// Build `JobListRow`s from raw `JobMeta`s, applying the `cwd` filter when
-/// `!all` and a current `cwd` can be resolved. Age is computed against
-/// `now` so tests can pin it deterministically. `started_iso` uses RFC 3339
-/// so it's greppable but compact.
+/// Build `JobListRow`s from raw `JobMeta`s. The cwd filter was removed
+/// (zoder#19) — `jobs list` now always shows ALL jobs for discoverability.
+/// Age is computed against `now` so tests can pin it deterministically.
+/// `started_iso` uses RFC 3339 so it's greppable but compact.
 fn build_rows(jobs: &[JobMeta], now: DateTime<Utc>) -> Vec<JobListRow> {
     jobs.iter()
         .map(|m| {
@@ -250,25 +250,41 @@ fn build_rows(jobs: &[JobMeta], now: DateTime<Utc>) -> Vec<JobListRow> {
         .collect()
 }
 
-pub(crate) fn cmd_jobs_list(cli: &crate::Cli, all: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_jobs_list(_cli: &crate::Cli, all: bool) -> anyhow::Result<()> {
     let dir = resolved_jobs_dir();
     let now = Utc::now();
-    let all_jobs = collect_jobs(&dir);
-
-    // Match `cmd_status`: when `all` is false and we can resolve a cwd,
-    // restrict to jobs whose cwd matches — operators usually only care
-    // about their current repo's loop results.
-    let cwd = std::env::current_dir()
+    // zoder#19: the cwd filter hid RUNNING jobs whose cwd differed from the
+    // caller's, so a fan-out could not discover its own work. The first fix
+    // dropped the filter entirely, which also made `--all` a no-op and threw
+    // away the reason it existed: keeping historical jobs from other
+    // directories out of a routine listing.
+    //
+    // Keep both. Running jobs are ALWAYS shown regardless of cwd -- an active
+    // job is never something you want hidden -- while finished jobs stay
+    // scoped to the current directory unless `--all` is passed.
+    let here = std::env::current_dir()
         .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let filtered: Vec<JobMeta> = all_jobs
+        .map(|p| p.to_string_lossy().into_owned());
+    let all_jobs: Vec<_> = collect_jobs(&dir)
         .into_iter()
-        .filter(|j| all || cwd.as_deref().map(|c| c == j.cwd).unwrap_or(true))
+        .filter(|j| {
+            // A job whose meta still says `running` is never hidden, whatever
+            // directory the operator happens to be in. That was the actual bug.
+            if all || j.status == "running" {
+                return true;
+            }
+            match (&here, j.cwd.as_str()) {
+                // A job with no recorded cwd cannot be filtered out safely.
+                (_, "") => true,
+                (Some(h), c) => c == h,
+                (None, _) => true,
+            }
+        })
         .collect();
 
-    let rows = build_rows(&filtered, now);
+    let rows = build_rows(&all_jobs, now);
 
-    if cli.json {
+    if _cli.json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
