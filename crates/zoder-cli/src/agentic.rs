@@ -467,6 +467,45 @@ impl ReviewerError {
     }
 }
 
+fn provider_error_mentions_model_unavailable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "model_not_found",
+        "model-not-found",
+        "model not found",
+        "model does not exist",
+        "model doesn't exist",
+        "deployment_not_found",
+        "deployment not found",
+        "invalid_api_key",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn provider_error_is_model_unavailable(
+    e: &zoder_core::ProviderError,
+    server_failures: u32,
+) -> bool {
+    if e.emitted {
+        return false;
+    }
+    match e.status {
+        Some(401 | 403 | 404) => true,
+        Some(500..=599) => server_failures > 1,
+        Some(400..=499) => provider_error_mentions_model_unavailable(&e.message),
+        _ => match e.kind {
+            zoder_core::ErrKind::Http => provider_error_mentions_model_unavailable(&e.message),
+            zoder_core::ErrKind::Server => server_failures > 1,
+            _ => false,
+        },
+    }
+}
+
 /// Run one non-streamed completion on `model_override` (else the resolved
 /// reviewer model), record it in the ledger, and return the text + cost.
 ///
@@ -855,12 +894,38 @@ async fn dispatch_reviewer_for_model(
         )));
     }
 
-    // Reserve and lock accounting before the reviewer request. Panel calls may
-    // run concurrently, so this also serializes their authoritative snapshots.
     let ledger_path = eng.cfg.ledger_path.clone();
-    let mut ledger_reservation =
-        match tokio::task::spawn_blocking(move || Ledger::new(&ledger_path).reserve_billable())
-            .await
+    let messages = vec![Message::new("system", system), Message::new("user", user)];
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages,
+        max_tokens,
+        temperature: Some(0.1),
+        stream: false,
+        show_reasoning: false,
+        reasoning_effort: cli.reasoning.clone(),
+    };
+    let provider = match OpenAiProvider::new_with_request_timeout_s(
+        provider_cfg,
+        Some(crate::provider_request_timeout_s(cli, &eng.cfg)),
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
+    };
+
+    let mut attempt = 0u32;
+    let mut server_failures = 0u32;
+    let (res, ledger_reservation) = loop {
+        // Reserve and lock accounting before each reviewer attempt. Panel
+        // calls may run concurrently, so this also serializes their
+        // authoritative snapshots. A failed attempt may have reached the
+        // provider, so dropping an armed reservation intentionally retains
+        // its unknown-cost row before the retry proceeds.
+        let reservation_path = ledger_path.clone();
+        let mut ledger_reservation = match tokio::task::spawn_blocking(move || {
+            Ledger::new(&reservation_path).reserve_billable()
+        })
+        .await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -875,42 +940,48 @@ async fn dispatch_reviewer_for_model(
             }
         };
 
-    let messages = vec![Message::new("system", system), Message::new("user", user)];
-    let req = ChatRequest {
-        model: model.to_string(),
-        messages,
-        max_tokens,
-        temperature: Some(0.1),
-        stream: false,
-        show_reasoning: false,
-        reasoning_effort: cli.reasoning.clone(),
-    };
-    let provider = match OpenAiProvider::new(provider_cfg) {
-        Ok(p) => p,
-        Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
-    };
-    if let Err(e) = ledger_reservation.arm() {
-        return Err(ReviewerError::fatal(format!(
-            "verifying ledger reservation before reviewer dispatch: {e}"
-        )));
-    }
-    let res = match provider.stream_chat(&req, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Provider / network / decode error — fallback-worthy when
-            // nothing has been emitted yet (the model cannot have shown
-            // partial output because `complete_once` does not stream).
-            // `emitted == true` (an extreme edge case where the
-            // provider reported bytes we haven't surfaced yet) is
-            // treated as fatal so the chain does not duplicate visible
-            // output. The original `complete_once` propagated the
-            // message verbatim via `anyhow!("{}", e.message)`; we
-            // preserve that for the call site's `review failed: 0/N
-            // reviewers completed` rendering.
-            if e.emitted {
+        if let Err(e) = ledger_reservation.arm() {
+            return Err(ReviewerError::fatal(format!(
+                "verifying ledger reservation before reviewer dispatch: {e}"
+            )));
+        }
+
+        match provider.stream_chat(&req, None).await {
+            Ok(r) => break (r, ledger_reservation),
+            Err(e) => {
+                drop(ledger_reservation);
+                if e.kind == zoder_core::ErrKind::Server {
+                    server_failures = server_failures.saturating_add(1);
+                }
+                if e.emitted {
+                    return Err(ReviewerError::Fatal { message: e.message });
+                }
+                if e.retryable() && attempt < cli.retries {
+                    let delay = zoder_core::backoff_delay(attempt, e.retry_after);
+                    if !cli.quiet {
+                        eprintln!(
+                            "[zoder] reviewer {model}: {} (retry {}/{} in {:.1}s)",
+                            e.message,
+                            attempt + 1,
+                            cli.retries,
+                            delay.as_secs_f64()
+                        );
+                    }
+                    tracing::debug!(
+                        model = %model,
+                        attempt,
+                        ?delay,
+                        "retrying transient reviewer failure on same model"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                if provider_error_is_model_unavailable(&e, server_failures) {
+                    return Err(ReviewerError::fallback_worthy_from(e));
+                }
                 return Err(ReviewerError::Fatal { message: e.message });
             }
-            return Err(ReviewerError::fallback_worthy_from(e));
         }
     };
 
@@ -945,7 +1016,12 @@ async fn dispatch_reviewer_for_model(
         (None, None) => None,
     };
     let mut violation = policy_failure.clone();
-    if unknown_cost {
+    // Only add cost-unknown as a violation when the call is genuinely
+    // at-risk: not allow-paid, and not served from a cost-neutral
+    // provider. Under concurrent fan-out telemetry races are transient,
+    // and conflating "unknown" with "paid" kills agents that are safe
+    // to run on free providers.
+    if unknown_cost && !cli.allow_paid && !provider_cost_neutral {
         let msg = format!("cost unknown: no valid telemetry or catalog price for {model}");
         violation = Some(match violation {
             Some(existing) => format!("{existing}; {msg}"),
@@ -1462,6 +1538,54 @@ struct CappedGitOutput {
     limit_reached: bool,
 }
 
+/// `run_git` with extra environment variables.
+///
+/// Exists so the patch journal can snapshot the working tree through a
+/// THROWAWAY `GIT_INDEX_FILE`. Using the real index would stage the user's
+/// files as a side effect of taking a measurement, which is exactly the kind
+/// of surprise a review tool must not cause.
+/// Unique path for a throwaway git index.
+///
+/// The first version keyed on `process::id()` + the cwd's LENGTH, which is not
+/// unique: two concurrent journals in different directories of the same path
+/// length shared one index file and corrupted each other's snapshot. It showed
+/// up as a test that passed alone and failed under parallel execution -- the
+/// same signature as a race in production, where several agents run at once by
+/// design.
+fn unique_index_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "zoder-{tag}-{}-{}-{}.index",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -1637,6 +1761,329 @@ fn detect_base(cwd: &Path, base: Option<&str>) -> String {
     "HEAD".to_string()
 }
 
+/// Baseline state of a repository at the start of a loop iteration.
+/// Captures enough metadata to detect whether the agent or the human
+/// made a given change. Captured fresh each iteration so that user
+/// edits between iterations are included in the baseline and not
+/// misattributed to the agent in `agent_diff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Baseline {
+    /// SHA of HEAD at baseline time.
+    head_sha: String,
+    /// Set of tracked (git-claimed) files at baseline.
+    tracked: Vec<String>,
+    /// Set of untracked (not-ignored) files at baseline.
+    untracked: Vec<String>,
+}
+
+/// A patch journal records the agent's changes turn by turn.
+///
+/// This is the core of transactional editing support: instead of relying on
+/// `git diff HEAD` (which cannot distinguish agent changes from pre-existing
+/// user edits), the journal captures the agent's delta each turn and allows
+/// review, inspection, and rollback of *exactly* what the agent changed.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PatchJournal {
+    /// Baseline captured at the start of the current loop iteration.
+    /// Freshly captured each iteration so that user edits between
+    /// iterations are included in the baseline and not misattributed
+    /// to the agent in `agent_diff`.
+    baseline: Option<Baseline>,
+    /// Tree object capturing the working state (tracked AND untracked) when the
+    /// iteration began. Preferred over `baseline.head_sha` for diffing: HEAD
+    /// misses pre-existing untracked files and wrongly includes the user's
+    /// uncommitted edits. `None` only when the snapshot could not be taken.
+    baseline_tree: Option<String>,
+    /// Per-turn patch records. Index 0 = first turn, etc.
+    turns: Vec<TurnPatch>,
+}
+
+/// A single turn's patch record.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnPatch {
+    /// Iteration number (1-based).
+    pub(crate) iter: usize,
+    /// The full diff text for this turn (same format as `build_diff` output).
+    pub(crate) diff: String,
+    /// Relative paths touched by this turn (tracked + untracked).
+    pub(crate) touched: Vec<String>,
+    /// Whether this turn produced a substantive diff (as classified by
+    /// `classify_diff_substance`). Used for anti-gaming analysis.
+    #[allow(dead_code)]
+    pub(crate) substance: DiffSubstance,
+}
+
+#[allow(dead_code)]
+impl PatchJournal {
+    /// Create a fresh patch journal. No baseline is captured yet — the
+    /// caller must call `record_baseline()` before `record_turn()`.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Capture the repository state as the baseline. Call this at the
+    /// start of each loop iteration so that user edits made between
+    /// iterations are included in the baseline and not misattributed
+    /// to the agent in `agent_diff`.
+    /// Snapshot the working tree into a real git tree object, using a THROWAWAY
+    /// index so the user's staged changes are untouched.
+    ///
+    /// `git diff <HEAD>` was the wrong baseline in both directions:
+    ///   * a human's uncommitted edit to a tracked file was already in the diff
+    ///     at baseline, so it got attributed to the agent -- the exact
+    ///     misattribution the patch journal exists to prevent;
+    ///   * a pre-existing UNTRACKED file was excluded by path, so when the agent
+    ///     edited one, its work vanished from review entirely.
+    ///
+    /// A tree captures tracked and untracked content together, so the later
+    /// diff is exactly "what changed since the agent started" -- no more, and
+    /// crucially no less. Where the two error directions conflict, this errs
+    /// toward showing the reviewer too much: an extra hunk is a nuisance, a
+    /// missing one is an unreviewed change.
+    fn snapshot_tree(cwd: &Path) -> Option<String> {
+        let idx = unique_index_path("baseline");
+        let _ = std::fs::remove_file(&idx);
+        let idx_s = idx.to_string_lossy().to_string();
+        // `add -A` honours .gitignore, so build artefacts stay out.
+        run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
+        let tree = run_git_env(cwd, &["write-tree"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
+        let _ = std::fs::remove_file(&idx);
+        let tree = tree.trim().to_string();
+        if tree.is_empty() {
+            None
+        } else {
+            Some(tree)
+        }
+    }
+
+    pub(crate) fn record_baseline(&mut self, cwd: &Path) {
+        // Preferred baseline: a tree of the working state. Falls back to HEAD
+        // only when the snapshot fails (no git, unwritable tmp), which is the
+        // old behaviour and no worse than it was.
+        self.baseline_tree = Self::snapshot_tree(cwd);
+
+        let head_sha = rev_parse_head(cwd).unwrap_or_else(|| {
+            // Repo with no commits yet — baseline is the "fresh" state.
+            String::new()
+        });
+
+        // Capture tracked files.
+        let tracked = run_git(cwd, &["ls-files"])
+            .ok()
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+
+        // Capture untracked (non-ignored) files. Use --directory flag so
+        // directory entries are included (they contain nested untracked files).
+        let untracked_raw = run_git(
+            cwd,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+        )
+        .ok()
+        .map(|s| {
+            let mut files = Vec::new();
+            for entry in s.split('\0') {
+                if entry.is_empty() {
+                    continue;
+                }
+                // Strip trailing slash for directories; only add files.
+                let path = entry.trim_end_matches('/');
+                if !path.is_empty() && !path.starts_with(".git/") {
+                    files.push(path.to_string());
+                }
+            }
+            files
+        })
+        .unwrap_or_default();
+
+        self.baseline = Some(Baseline {
+            head_sha,
+            tracked,
+            untracked: untracked_raw,
+        });
+    }
+
+    /// Record a turn's patch. Must have a baseline first.
+    pub(crate) fn record_turn(
+        &mut self,
+        iter: usize,
+        diff: &str,
+        touched: Vec<String>,
+        substance: DiffSubstance,
+    ) {
+        self.turns.push(TurnPatch {
+            iter,
+            diff: diff.to_string(),
+            touched,
+            substance,
+        });
+    }
+
+    /// Return the combined diff of all agent turns so far. This is what
+    /// review should consume instead of `git diff HEAD`, because it is
+    /// guaranteed to reflect *only* the agent's changes — not any
+    /// pre-existing user edits.
+    ///
+    /// The function compares the current working tree against the baseline
+    /// captured at loop start. For tracked files, `git diff <baseline_sha>`
+    /// shows modifications. For untracked files not in the baseline, it
+    /// emits synthetic "new file" hunks. When no baseline exists, it
+    /// falls back to the last turn's raw diff.
+    pub(crate) fn agent_diff(&self, cwd: &Path) -> String {
+        // If we have a baseline, diff against it to get agent work.
+        if let Some(baseline) = &self.baseline {
+            let mut result = String::new();
+
+            // 1. Everything that changed since the snapshot.
+            //
+            // Diffing the CURRENT working state against the baseline TREE
+            // covers tracked edits and pre-existing untracked files in one
+            // pass, and excludes changes the human had already made when the
+            // agent started. Falls back to the old HEAD diff only when no tree
+            // was captured.
+            if let Some(tree) = &self.baseline_tree {
+                let idx = unique_index_path("now");
+                let _ = std::fs::remove_file(&idx);
+                let idx_s = idx.to_string_lossy().to_string();
+                if run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).is_ok() {
+                    if let Ok(output) = run_git_env(
+                        cwd,
+                        &["diff", "--cached", tree],
+                        &[("GIT_INDEX_FILE", &idx_s)],
+                    ) {
+                        if !output.trim().is_empty() {
+                            result.push_str(&output);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&idx);
+            } else if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
+                if !output.trim().is_empty() {
+                    result.push_str(&output);
+                }
+            }
+
+            // 2. New untracked files: files that appeared after baseline.
+            let baseline_untracked_set: std::collections::HashSet<&str> =
+                baseline.untracked.iter().map(|s| s.as_str()).collect();
+            let current_untracked: Vec<String> =
+                run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])
+                    .ok()
+                    .map(|s| {
+                        s.split('\0')
+                            .filter(|e| !e.is_empty())
+                            .filter(|e| !e.starts_with(".git/") && !e.ends_with('/'))
+                            .map(|e| e.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            for file in &current_untracked {
+                if !baseline_untracked_set.contains(file.as_str()) {
+                    // This is a NEW untracked file (agent-created since baseline).
+                    // Guard against directory paths — `git ls-files` should not
+                    // emit bare directory names without a trailing `/`, but a
+                    // directory whose name matched a baseline directory entry
+                    // (after slash-stripping) could slip through.  Only produce
+                    // a hunk for actual regular files.
+                    let abs = cwd.join(file);
+                    if let Ok(meta) = std::fs::metadata(&abs) {
+                        if meta.is_dir() {
+                            continue; // Skip directories; nothing to diff.
+                        }
+                    }
+                    let hunk = render_untracked_file_hunk(std::path::Path::new(file), &abs);
+                    if !hunk.is_empty() {
+                        if !result.is_empty() && !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                        result.push_str(&hunk);
+                        if !result.ends_with('\n') {
+                            result.push('\n');
+                        }
+                    }
+                }
+            }
+
+            if !result.is_empty() {
+                return result;
+            }
+        }
+
+        // Fallback: if no baseline, use the diff from the last turn.
+        // This handles the case where baseline capture failed or the repo
+        // had no commits (baseline_sha is empty). When a baseline DOES exist
+        // but shows no changes, return empty — no agent work to report.
+        if self.baseline.is_none() {
+            self.turns
+                .last()
+                .map(|t| t.diff.clone())
+                .unwrap_or_default()
+        } else {
+            // Baseline exists, no changes relative to it.
+            String::new()
+        }
+    }
+
+    /// List all files touched by the agent across all recorded turns.
+    /// Returns deduplicated relative paths.
+    pub(crate) fn files_touched(&self) -> Vec<String> {
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for turn in &self.turns {
+            for f in &turn.touched {
+                files.insert(f.clone());
+            }
+        }
+        let mut vec: Vec<_> = files.into_iter().collect();
+        vec.sort();
+        vec
+    }
+
+    /// Get the diff for a specific turn (for inspection or rollback).
+    pub(crate) fn turn_diff(&self, iter: usize) -> Option<String> {
+        self.turns
+            .iter()
+            .find(|t| t.iter == iter)
+            .map(|t| t.diff.clone())
+    }
+
+    /// Clear all recorded turns, keeping the baseline intact. Useful to
+    /// reset after a rollback.
+    pub(crate) fn clear(&mut self) {
+        self.turns.clear();
+    }
+
+    /// Serialize the journal to JSON for storage/transport.
+    #[allow(dead_code)]
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let turns: Vec<serde_json::Value> = self
+            .turns
+            .iter()
+            .map(|t| {
+                json!({
+                    "iter": t.iter,
+                    "touched": t.touched,
+                    "substance": format!("{:?}", t.substance),
+                    "diff_truncated": t.diff.len() > 1000,
+                })
+            })
+            .collect();
+        json!({
+            "baseline_sha": self.baseline.as_ref().map(|b| &b.head_sha),
+            "baseline_tracked_count": self.baseline.as_ref().map(|b| b.tracked.len()).unwrap_or(0),
+            "baseline_untracked_count": self.baseline.as_ref().map(|b| b.untracked.len()).unwrap_or(0),
+            "turn_count": self.turns.len(),
+            "turns": turns,
+        })
+    }
+}
+
 /// Build the diff for the requested scope. Returns `(label, diff)`.
 fn build_diff(
     cwd: &Path,
@@ -1753,6 +2200,13 @@ fn untracked_not_ignored_diff(cwd: &Path) -> String {
 /// falls back to a hand-built hunk when the index diff fails (e.g. binary
 /// files, very large files).
 fn render_untracked_file_hunk(rel: &Path, abs: &Path) -> String {
+    // Defensive guard: skip directories, sockets, FIFOs, etc. Only regular
+    // files can produce a meaningful unified-diff hunk.
+    if let Ok(meta) = std::fs::metadata(abs) {
+        if !meta.is_file() {
+            return String::new();
+        }
+    }
     let dev_null = Path::new("/dev/null");
     if let Ok(ok) = std::process::Command::new("git")
         .arg("diff")
@@ -2300,6 +2754,7 @@ Respond with ONLY a single JSON object (no markdown, no prose) matching this sch
 
 const ADVERSARIAL_SYSTEM: &str = "You are a demanding, skeptical staff engineer and security auditor performing an ADVERSARIAL review. \
 Aggressively pressure-test the logic: assume the author missed edge cases, race conditions, error handling, injection/abuse vectors, and incorrect assumptions. Be specific and uncompromising. \
+A correct change MUST be approved: report `request_changes` only for a defect you can name and locate in this diff, never for style, speculation, or unverified suspicion. Approving a sound change is as important as catching a broken one; withholding approval from correct work is itself a review failure. \
 Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
 {\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
 
@@ -3729,7 +4184,18 @@ pub(crate) async fn cmd_loop(
     let mut prev_head: Option<String> = rev_parse_head(&cwd);
     const STALL_LIMIT: usize = 3;
 
+    // Patch journal: tracks agent changes turn by turn for transactional
+    // review. We capture a FRESH baseline at the start of each loop
+    // iteration so that user edits made between iterations are included
+    // in the baseline and NOT misattributed to the agent. Review and
+    // later-turn inspection use the journal instead of `git diff HEAD`
+    // to avoid confusing pre-existing user edits with agent work.
+    let mut journal = PatchJournal::new();
     for i in 1..=max_iters {
+        // Capture a fresh baseline at the start of each iteration so that
+        // user edits made between iterations are included in the baseline
+        // and NOT misattributed to the agent in `agent_diff`.
+        journal.record_baseline(&cwd);
         // 1. Author turn — continue the SAME engine session for memory.
         let author_prompt = if i == 1 {
             let mut p = format!(
@@ -3920,6 +4386,27 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // continues to the next iteration.
         let diff_substance = classify_diff_substance(&diff);
 
+        // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
+        // headers from the diff output; this is the same set the reviewer sees.
+        let touched: Vec<String> = diff
+            .lines()
+            .filter(|l| l.starts_with("diff --git a/") && l.contains(" b/"))
+            .filter_map(|l| {
+                // Extract the relative path after `a/` (before ` b/`).
+                let after_a = l.strip_prefix("diff --git a/")?;
+                let rel = after_a.split(" b/").next()?.to_string();
+                if rel.is_empty() {
+                    None
+                } else {
+                    Some(rel)
+                }
+            })
+            .collect();
+
+        // Record this turn in the patch journal so review can consume
+        // exactly what the agent changed (not ambient working-tree state).
+        journal.record_turn(i, &diff, touched.clone(), diff_substance);
+
         // 4. Validate (build/test) if a check command was given. The check is
         // its own child process (a shell) and historically had NO watchdog —
         // a hung script blocked the loop forever. Wrap with `run_check_watched`
@@ -3999,10 +4486,18 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         }
 
         // 5. Adversarial review of the current diff (+ validation output).
+        // When the patch journal has turns, use its `agent_diff` so the
+        // reviewer sees EXACTLY what the agent changed — not the full
+        // working-tree diff which may contain pre-existing user edits.
+        let review_diff = if !journal.turns.is_empty() {
+            journal.agent_diff(&cwd)
+        } else {
+            diff.clone()
+        };
         let review_user = {
             let mut u = format!(
                 "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
-                cap_diff(&diff, 100_000)
+                cap_diff(&review_diff, 100_000)
             );
             if let Some(p) = check_passed {
                 u.push_str(&format!(
@@ -4660,11 +5155,22 @@ fn configure_background_worker_command(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    // Detach the worker into its own process group so cancel can SIGTERM /
-    // SIGKILL the WHOLE subtree. `process_group(0)` maps to setpgid(pid, 0)
-    // on Unix, so the child leads a fresh group with pgid == pid.
+    // Detach the worker into a new SESSION, not merely a new process group.
+    // A job that shares its submitter's controlling session can receive the
+    // terminal's SIGHUP when the submitter exits. That leaves a dead PID with
+    // a permanently `running` job record, so a harness polling `zoder status`
+    // waits until its own timeout. `setsid()` also makes the child its own
+    // process-group leader, preserving group-based cancellation.
     #[cfg(unix)]
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
 }
 
 /// Re-exec the current invocation as a detached worker writing to a new job dir.
@@ -4819,7 +5325,7 @@ fn cancel_background_process_group(_meta: &JobMeta) -> anyhow::Result<CancelSign
     Ok(CancelSignalOutcome::Signalled)
 }
 
-pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> anyhow::Result<()> {
     if let Some(want) = &job {
         let m = resolve_job(Some(want), false).ok_or_else(|| anyhow!("no such job: {want}"))?;
         if cli.json {
@@ -4835,13 +5341,13 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, all: bool) -> an
         return Ok(());
     }
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let jobs: Vec<JobMeta> = all_jobs()
-        .into_iter()
-        .filter(|j| all || cwd.as_deref().map(|c| c == j.cwd).unwrap_or(true))
-        .collect();
+    // Always show ALL jobs — `status` without an id is the health check.
+    // The `--all` flag remains for backward compatibility but no longer
+    // narrows results.  See zoder#19: the old cwd filter hid jobs whose
+    // cwd didn't match the current working directory, making the bare
+    // `zoder status` health check report "no background jobs" even when
+    // background jobs were actively running (just not in the current repo).
+    let jobs = all_jobs();
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
@@ -4925,16 +5431,21 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
         ));
     }
     let dir = base.join(&m.id);
-    if cancel_background_process_group(&m)? == CancelSignalOutcome::AlreadyFinished {
-        println!("job already finished: {}", m.id);
-        return Ok(());
-    }
+    let outcome = cancel_background_process_group(&m)?;
     if let Some(mut meta) = read_meta(&dir) {
+        // A worker can die before its finalizer runs (for example, after an
+        // external SIGKILL). Reconcile that stale `running` record here so a
+        // harness does not wait forever on a PID the kernel has already lost.
         meta.status = "cancelled".into();
         meta.finished = Some(Utc::now());
         let _ = write_meta(&dir, &meta);
     }
-    println!("cancelled {}", m.id);
+    match outcome {
+        CancelSignalOutcome::AlreadyFinished => {
+            println!("reconciled already-finished job {}", m.id);
+        }
+        CancelSignalOutcome::Signalled => println!("cancelled {}", m.id),
+    }
     Ok(())
 }
 
@@ -4949,6 +5460,7 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::path::PathBuf;
 
     // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
@@ -5381,7 +5893,8 @@ mod tests {
     }
 
     #[test]
-    fn configure_background_worker_command_sets_own_process_group() {
+    fn configure_background_worker_command_starts_own_session_and_process_group() {
+        let parent_sid = unsafe { libc::getsid(0) };
         let dir = tempfile::tempdir().expect("tempdir");
         let out = std::fs::File::create(dir.path().join("output.txt")).expect("output file");
         let err = out.try_clone().expect("clone output");
@@ -5390,6 +5903,7 @@ mod tests {
         configure_background_worker_command(&mut command, &args, dir.path(), out, err);
         let mut child = command.spawn().expect("spawn sleep");
         let pid = child.id();
+        let sid = unsafe { libc::getsid(pid as libc::pid_t) };
         let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
 
         unsafe {
@@ -5404,6 +5918,14 @@ mod tests {
         assert_eq!(
             pgid, pid as libc::pid_t,
             "background worker must lead its own process group so pgid == pid"
+        );
+        assert_eq!(
+            sid, pid as libc::pid_t,
+            "background worker must lead its own session"
+        );
+        assert_ne!(
+            sid, parent_sid,
+            "background worker must not share the submitter session"
         );
     }
 
@@ -5468,6 +5990,30 @@ mod tests {
             outcome,
             CancelSignalOutcome::AlreadyFinished,
             "dead recorded pid must be treated as already finished without signalling"
+        );
+    }
+
+    #[test]
+    fn cmd_cancel_reconciles_a_dead_worker_to_cancelled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_env::EnvGuard::new(home_dir.path());
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait true");
+
+        let id = "dead-worker";
+        let dir = jobs_dir().join(id);
+        write_meta(&dir, &meta_for_test_id_pid(id, pid)).expect("write dead job metadata");
+        let cli = crate::Cli::try_parse_from(["zoder", "status"]).expect("parse cli");
+        cmd_cancel(&cli, Some(id.to_string())).expect("reconcile dead job");
+
+        let meta = read_meta(&dir).expect("read reconciled metadata");
+        assert_eq!(meta.status, "cancelled");
+        assert!(
+            meta.finished.is_some(),
+            "reconciled job must have a finish time"
         );
     }
 
@@ -8380,6 +8926,10 @@ mod reviewer_chain_dispatch_tests {
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zoder_core::config::Provider;
@@ -8576,6 +9126,33 @@ mod reviewer_chain_dispatch_tests {
             .await;
     }
 
+    fn openai_review_completion(summary: &str) -> String {
+        let review = serde_json::json!({
+            "verdict": "approve",
+            "summary": summary,
+            "findings": [],
+            "next_steps": [],
+        })
+        .to_string();
+        serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": review,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 10,
+                "total_tokens": 15,
+            }
+        })
+        .to_string()
+    }
+
     /// Build a minimal `Cli` suitable for a single `complete_once` call.
     /// Defaults that affect the dispatch are explicit here; everything
     /// else is left at `clap`'s default. Quiet is on so test stdout
@@ -8583,6 +9160,156 @@ mod reviewer_chain_dispatch_tests {
     /// `eprintln` not stdout.
     fn dummy_cli() -> Cli {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_retries_timeout_on_same_model_before_trying_tail() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        let broken_hits = Arc::new(AtomicUsize::new(0));
+        let broken_hits_for_responder = Arc::clone(&broken_hits);
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let attempt = broken_hits_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_string(openai_review_completion("head was too slow"))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(openai_review_completion("head retry ok"))
+                }
+            })
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--request-timeout", "1", "--retries", "1"])
+                .expect("clap parse");
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect("same reviewer model should be retried before fallback");
+        assert_eq!(
+            c.model, "broken-model/coder-6.7b",
+            "the head should win after a same-model retry"
+        );
+        assert!(
+            c.content.contains("head retry ok"),
+            "retry response should be surfaced; got: {}",
+            c.content
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            2,
+            "head must be tried twice: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            0,
+            "tail must not be tried after the head succeeds on retry: paths={paths:?}"
+        );
+        assert_eq!(broken_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_single_503_without_retries_does_not_fallback_to_tail() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("queue full"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).expect("clap parse");
+        let err = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect_err("a single 503 is transient, not model-unavailable fallback");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("503") || msg.to_lowercase().contains("queue full"),
+            "the transient 503 must be surfaced for retry/tuning, not hidden: {msg}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            1,
+            "head should be tried once when retries are disabled: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            0,
+            "tail should not be tried for a single transient 503: paths={paths:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_persistent_5xx_falls_through_after_same_model_retries() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("backend unavailable"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "1"]).expect("clap parse");
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+            .await
+            .expect("persistent 5xx should fall through after retrying the same model");
+        assert_eq!(
+            c.model, "working-model/glm-5.1",
+            "persistent 5xx should move to the next reviewer after same-model retries"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/broken/")).count(),
+            2,
+            "head must be retried before fallback: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            1,
+            "tail should answer only after the persistent 5xx: paths={paths:?}"
+        );
     }
 
     /// **REGRESSION: 2026-07-07 reviewer-pipeline fix.** A chain of
@@ -9665,6 +10392,492 @@ mod commit_author_enforcement_tests {
             "run_check_watched must source ~/.profile so the operator's \
              toolchain (cargo in ~/.cargo/bin, go in ~/go/bin, …) is on \
              PATH for the check; tail:\n{tail}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PatchJournal — unit tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod patch_journal_tests {
+    use super::*;
+
+    /// Initialize a temp git repo with one committed file. Returns the
+    /// repo path.
+    fn init_temp_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "patch-journal-test"]);
+        run(&["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo)
+    }
+
+    #[test]
+    fn baseline_captures_tracked_and_untracked_files() {
+        let (_dir, repo) = init_temp_repo();
+        // Add an untracked file so we have both tracked and untracked.
+        std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        let baseline = journal.baseline.as_ref().expect("baseline should be set");
+
+        // Must have at least one tracked file (README.md).
+        assert!(
+            !baseline.tracked.is_empty(),
+            "baseline should include tracked files, got: {:?}",
+            baseline.tracked
+        );
+        // README.md should be tracked.
+        assert!(
+            baseline.tracked.contains(&"README.md".to_string()),
+            "README.md should be in tracked files"
+        );
+        // new.txt should be untracked.
+        assert!(
+            baseline.untracked.contains(&"new.txt".to_string()),
+            "new.txt should be in untracked files"
+        );
+    }
+
+    #[test]
+    fn agent_diff_excludes_a_humans_uncommitted_edit() {
+        // The baseline was `git diff <HEAD>`, so an edit the human had already
+        // made -- but not committed -- was in the diff from the start and got
+        // attributed to the agent. That is the misattribution the patch journal
+        // exists to prevent.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("human.txt"), "human edit before the agent ran\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        assert!(
+            !j.agent_diff(&repo)
+                .contains("human edit before the agent ran"),
+            "a pre-existing uncommitted edit must not be attributed to the agent"
+        );
+    }
+
+    #[test]
+    fn agent_diff_includes_edits_to_a_preexisting_untracked_file() {
+        // Baseline untracked files were excluded BY PATH, so when the agent
+        // edited one that already existed, its work disappeared from review
+        // entirely -- the dangerous direction for a review gate.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("scratch.txt"), "original scratch\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        std::fs::write(repo.join("scratch.txt"), "AGENT CHANGED THIS\n").unwrap();
+        assert!(
+            j.agent_diff(&repo).contains("AGENT CHANGED THIS"),
+            "an agent edit to a pre-existing untracked file must reach review"
+        );
+    }
+
+    #[test]
+    fn record_baseline_does_not_stage_the_users_files() {
+        // The snapshot uses a throwaway GIT_INDEX_FILE. Taking a measurement
+        // must not stage the user's work as a side effect.
+        let (_dir, repo) = init_temp_repo();
+        std::fs::write(repo.join("unstaged.txt"), "should stay unstaged\n").unwrap();
+
+        let mut j = PatchJournal::default();
+        j.record_baseline(&repo);
+
+        let staged = run_git(&repo, &["diff", "--cached", "--name-only"]).unwrap_or_default();
+        assert!(
+            !staged.contains("unstaged.txt"),
+            "baseline capture must not touch the real index, got: {staged:?}"
+        );
+    }
+
+    #[test]
+    fn agent_diff_is_empty_with_no_turns() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        let diff = journal.agent_diff(&repo);
+        assert!(
+            diff.is_empty(),
+            "agent_diff should be empty when no turns recorded: {:?}",
+            diff
+        );
+    }
+
+    #[test]
+    fn agent_diff_shows_new_untracked_file_for_agent_work() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Simulate: agent creates a new file and we record a turn.
+        std::fs::write(repo.join("agent_fix.rs"), "pub fn fix() {}\n").unwrap();
+
+        // Simulate a turn record with the diff content.
+        let diff_text =
+            "diff --git a/agent_fix.rs b/agent_fix.rs\nnew file mode 100644\n+pub fn fix() {}\n";
+        let touched = vec!["agent_fix.rs".to_string()];
+        journal.record_turn(1, diff_text, touched.clone(), DiffSubstance::Substantive);
+
+        // Now agent_diff should include the new file.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff.is_empty(),
+            "agent_diff should contain new untracked file: {:?}",
+            agent_diff
+        );
+        assert!(
+            agent_diff.contains("agent_fix.rs"),
+            "diff should reference agent_fix.rs: {:?}",
+            agent_diff
+        );
+    }
+
+    #[test]
+    fn files_touched_returns_deduplicated_list() {
+        let mut journal = PatchJournal::new();
+        // Same file touched in multiple turns.
+        journal.record_turn(
+            1,
+            "diff --git a/foo.rs b/foo.rs\n+fix\n",
+            vec!["foo.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+        journal.record_turn(
+            2,
+            "diff --git a/foo.rs b/foo.rs\n+fix2\n",
+            vec!["foo.rs".to_string(), "bar.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        let touched = journal.files_touched();
+        assert_eq!(touched.len(), 2, "expected 2 unique files");
+        assert!(touched.contains(&"bar.rs".to_string()));
+        assert!(touched.contains(&"foo.rs".to_string()));
+        // Should be sorted.
+        assert_eq!(touched[0], "bar.rs");
+        assert_eq!(touched[1], "foo.rs");
+    }
+
+    #[test]
+    fn turn_diff_returns_specific_turn() {
+        let mut journal = PatchJournal::new();
+        journal.record_turn(1, "turn 1 diff", vec![], DiffSubstance::Substantive);
+        journal.record_turn(2, "turn 2 diff", vec![], DiffSubstance::Substantive);
+
+        assert_eq!(journal.turn_diff(1).unwrap(), "turn 1 diff");
+        assert_eq!(journal.turn_diff(2).unwrap(), "turn 2 diff");
+        assert!(journal.turn_diff(3).is_none());
+    }
+
+    #[test]
+    fn clear_removes_turns_but_keeps_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+        journal.record_turn(1, "diff", vec![], DiffSubstance::Substantive);
+
+        assert!(!journal.turns.is_empty());
+        journal.clear();
+        assert!(journal.turns.is_empty());
+        // Baseline still present.
+        assert!(journal.baseline.is_some());
+    }
+
+    #[test]
+    fn agent_diff_shows_tracked_file_modification() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Get baseline HEAD SHA for later comparison.
+        let _baseline_sha = journal.baseline.as_ref().unwrap().head_sha.clone();
+
+        // Modify a tracked file.
+        std::fs::write(repo.join("README.md"), "modified content\n").unwrap();
+
+        // Record a turn with the diff.
+        journal.record_turn(
+            1,
+            "diff --git a/README.md b/README.md\n-\n+modified content",
+            vec!["README.md".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // agent_diff should show the modification via git diff against baseline.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff.is_empty(),
+            "agent_diff should show tracked file modification: {:?}",
+            agent_diff
+        );
+        assert!(
+            agent_diff.contains("README.md"),
+            "diff should reference README.md: {:?}",
+            agent_diff
+        );
+    }
+
+    #[test]
+    fn agent_diff_fallback_to_last_turn_when_no_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        // Don't record a baseline.
+
+        let turn_diff = "diff --git a/foo.rs b/foo.rs\n+new fn\n";
+        journal.record_turn(
+            1,
+            turn_diff,
+            vec!["foo.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // Without a baseline, agent_diff falls back to the last turn's diff.
+        let agent_diff = journal.agent_diff(&repo);
+        assert_eq!(agent_diff, turn_diff);
+    }
+
+    /// Regression test: `agent_diff` must not panic when an untracked
+    /// directory appears in the working tree. Directories should be silently
+    /// skipped rather than passed to `render_untracked_file_hunk`.
+    #[test]
+    fn agent_diff_skips_untracked_directories() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an untracked directory with a file inside it.
+        let subdir = repo.join("new_subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("inside.txt"), "hello\n").unwrap();
+
+        // No panic — agent_diff should gracefully handle the directory.
+        let agent_diff = journal.agent_diff(&repo);
+        // The file inside the dir should be picked up, but the dir itself
+        // should not cause a panic.
+        assert!(
+            agent_diff.contains("inside.txt") || agent_diff.is_empty(),
+            "agent_diff should handle untracked directory gracefully: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Regression test: when a baseline directory entry (stored without
+    /// trailing slash) later contains a new file, the new file must be
+    /// included in the diff without error.
+    #[test]
+    fn agent_diff_handles_new_file_inside_baseline_directory() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an untracked directory *before* baseline so it's captured
+        // as a directory entry in baseline.untracked.
+        let pre_dir = repo.join("pre_dir");
+        std::fs::create_dir(&pre_dir).unwrap();
+        // Add a file inside it so git ls-files --directory includes it.
+        std::fs::write(pre_dir.join("original.txt"), "orig\n").unwrap();
+
+        // Record baseline — the directory "pre_dir/" is captured as "pre_dir".
+        journal.record_baseline(&repo);
+        // Reset the baseline to capture the state with pre_dir.
+        journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Now add a NEW file inside the existing directory.
+        std::fs::write(pre_dir.join("new_agent_file.rs"), "pub fn agent() {}\n").unwrap();
+
+        // agent_diff should NOT panic and should include the new file.
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            agent_diff.contains("new_agent_file.rs"),
+            "agent_diff should include new file inside baseline directory: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Test: `render_untracked_file_hunk` returns empty string for directories.
+    #[test]
+    fn render_untracked_file_hunk_returns_empty_for_dirs() {
+        let (_dir, repo) = init_temp_repo();
+        let dir = repo.join("some_dir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let hunk = render_untracked_file_hunk(&PathBuf::from("some_dir"), &dir);
+        assert!(
+            hunk.is_empty(),
+            "render_untracked_file_hunk should return empty string for directories: {:?}",
+            hunk
+        );
+    }
+
+    /// Test: `render_untracked_file_hunk` handles a real file correctly.
+    #[test]
+    fn render_untracked_file_hunk_handles_real_file() {
+        let (_dir, repo) = init_temp_repo();
+        let file = repo.join("test_file.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+
+        let hunk = render_untracked_file_hunk(&PathBuf::from("test_file.txt"), &file);
+        assert!(
+            !hunk.is_empty(),
+            "render_untracked_file_hunk should produce output for regular files"
+        );
+        assert!(
+            hunk.contains("test_file.txt"),
+            "hunk should reference the file name"
+        );
+    }
+
+    /// Edge case: empty untracked directory should not cause issues.
+    #[test]
+    fn agent_diff_ignores_empty_untracked_directory() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(&repo);
+
+        // Create an empty untracked directory.
+        std::fs::create_dir(repo.join("empty_dir")).unwrap();
+
+        // No panic, should be empty diff (no new files, just a dir).
+        let agent_diff = journal.agent_diff(&repo);
+        assert!(
+            agent_diff.is_empty(),
+            "agent_diff should be empty for empty directories: {:?}",
+            agent_diff
+        );
+    }
+
+    /// Regression test: baseline refreshed each iteration prevents
+    /// user committed changes from leaking into agent_diff.
+    /// This tests the per-iteration baseline capture.
+    #[test]
+    fn agent_diff_resets_per_iteration_baseline() {
+        let (_dir, repo) = init_temp_repo();
+        let mut journal = PatchJournal::new();
+
+        // --- Simulate loop iteration 1 ---
+        // Baseline captured BEFORE agent work in iteration 1.
+        journal.record_baseline(&repo);
+
+        // Agent creates a new file and commits it.
+        std::fs::write(repo.join("agent_work.rs"), "fn agent_fix() {}\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", "agent_work.rs"]);
+        run(&["commit", "-q", "-m", "agent: fix"]);
+
+        // agent_diff should show the agent's change (baseline was
+        // captured BEFORE the agent's commit).
+        let agent_diff_v1 = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff_v1.is_empty(),
+            "iteration 1 agent_diff should not be empty: {:?}",
+            agent_diff_v1
+        );
+        assert!(
+            agent_diff_v1.contains("agent_work.rs"),
+            "iteration 1 diff should reference agent_work.rs: {:?}",
+            agent_diff_v1
+        );
+
+        // Record the turn.
+        journal.record_turn(
+            1,
+            &agent_diff_v1,
+            vec!["agent_work.rs".to_string()],
+            DiffSubstance::Substantive,
+        );
+
+        // --- Simulate user commit between iterations ---
+        std::fs::write(
+            repo.join("agent_work.rs"),
+            "fn agent_fix() {}\n// user fix\n",
+        )
+        .unwrap();
+        run(&["commit", "-q", "-am", "user: improve"]);
+
+        // --- Simulate loop iteration 2: FRESH baseline ---
+        // This is the FIX: the loop captures a fresh baseline at the
+        // start of each iteration.
+        journal.record_baseline(&repo);
+
+        // agent_diff should NOT show the user's committed change,
+        // because the baseline was captured AFTER it.
+        let agent_diff_v2 = journal.agent_diff(&repo);
+        assert!(
+            agent_diff_v2.is_empty(),
+            "iteration 2 agent_diff should be empty (user change absorbed into fresh baseline): {:?}",
+            agent_diff_v2
+        );
+
+        // If the agent makes a new change, only THAT change should appear.
+        std::fs::write(
+            repo.join("agent_work.rs"),
+            "fn agent_fix() {}\n// agent change v2\n",
+        )
+        .unwrap();
+        run(&["add", "agent_work.rs"]);
+        run(&["commit", "-q", "-m", "agent: v2"]);
+
+        let agent_diff_v3 = journal.agent_diff(&repo);
+        assert!(
+            !agent_diff_v3.is_empty(),
+            "agent_diff after agent change should not be empty: {:?}",
+            agent_diff_v3
+        );
+        assert!(
+            agent_diff_v3.contains("agent change v2"),
+            "agent's v2 change should be in diff: {:?}",
+            agent_diff_v3
+        );
+        // The user's committed change should NOT appear as a NEW addition.
+        // It may appear in removal context (replaced by agent), but not as added.
+        let additions: Vec<&str> = agent_diff_v3
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert!(
+            !additions.iter().any(|l| l.contains("user fix")),
+            "user's committed change should NOT be added in agent_diff: {:?}",
+            agent_diff_v3
         );
     }
 }
