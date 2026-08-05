@@ -5459,13 +5459,53 @@ fn resolve_agent_alias(
     ];
     for (needle, alias) in MAP {
         if m.contains(needle) {
-            return (*alias).to_string();
+            // THE TABLE IS A PREFERENCE, NOT A FACT.
+            //
+            // Its right-hand column is written for a per-MODEL agent layout
+            // (`deepseek-v4-pro`, `kimi-k2.6`, `gpt-oss-120b`). A config that
+            // names agents per PROVIDER instead -- `[agents.deepseek]`,
+            // `[agents.groq]` -- has none of those, and handing the engine an
+            // alias it does not have fails `session/new` with
+            // `agents.<alias> is not configured`. That is not a degraded run:
+            // it is EVERY invocation dead, including `-m`, which leaves
+            // `--agent` as the only way to use zoder at all.
+            //
+            // So reconcile the preference against what the daemon reported.
+            return reconcile_alias(known_agents, alias);
         }
     }
     // Default coding agent. Was `deepseek-v4-pro`, which dangled / flapped and
     // made zoder non-invokable mid-loop (field reports 2026-06-30). `minimax`
     // is the configured default author on the cutover hosts and is stable.
-    "minimax".to_string()
+    reconcile_alias(known_agents, "minimax")
+}
+
+/// Resolve a wanted alias against the aliases the engine actually reported.
+///
+/// Exact match, then case-insensitive, then the longest configured alias the
+/// wanted one starts with -- `deepseek-v4-pro` resolves to `deepseek`, which is
+/// how a per-provider config names the same agent.
+///
+/// Anything less principled is left alone on purpose. Substituting an unrelated
+/// agent would run a model the caller never asked for and report success, which
+/// is the failure this function's own history is a record of; a loud
+/// `is not configured` from the engine is the better outcome. An empty set means
+/// the daemon reported nothing, so the caller keeps the historic behaviour
+/// rather than having one invented for it.
+fn reconcile_alias(known: &std::collections::HashSet<String>, want: &str) -> String {
+    if known.is_empty() || known.contains(want) {
+        return want.to_string();
+    }
+    if let Some(k) = known.iter().find(|k| k.eq_ignore_ascii_case(want)) {
+        return k.clone();
+    }
+    let w = want.to_ascii_lowercase();
+    known
+        .iter()
+        .filter(|k| w.starts_with(&k.to_ascii_lowercase()))
+        .max_by_key(|k| k.len())
+        .cloned()
+        .unwrap_or_else(|| want.to_string())
 }
 
 /// Default ADVERSARIAL REVIEWER when none is given: a strong, empirically-validated
@@ -13879,6 +13919,68 @@ mod model_selection_tests {
         ])
         .unwrap();
         assert_eq!(resolve_agent_alias(&pinned, &known, "coder"), "reviewer");
+    }
+
+    /// REGRESSION: the builtin table must never hand the engine an alias it
+    /// does not have.
+    ///
+    /// The table's right-hand column is written for a per-MODEL agent layout.
+    /// Against a config that names agents per PROVIDER it produced
+    /// `deepseek-v4-pro` where only `deepseek` exists, and `session/new` failed
+    /// with `agents.deepseek-v4-pro is not configured` on EVERY invocation --
+    /// `-m` included -- leaving `--agent` as the only usable entry point.
+    ///
+    /// Fails on the old behaviour, which returned the table value verbatim.
+    #[test]
+    fn table_alias_is_reconciled_against_the_engines_real_agents() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "task"]).unwrap();
+        // A per-provider config: the shape the table was NOT written for.
+        let known: std::collections::HashSet<String> = [
+            "minimax",
+            "groq",
+            "deepseek",
+            "siliconflow",
+            "claude",
+            "codex",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            resolve_agent_alias(&cli, &known, "deepseek-v4-pro"),
+            "deepseek",
+            "a per-model table alias must resolve to the per-provider agent that exists"
+        );
+
+        // The default is reconciled too, not just table hits.
+        assert_eq!(
+            resolve_agent_alias(&cli, &known, "some-unknown-cloud-model"),
+            "minimax"
+        );
+    }
+
+    /// The reconciliation must stay conservative: a principled relation only.
+    #[test]
+    fn alias_reconciliation_never_invents_an_unrelated_agent() {
+        // No configured alias is a prefix of the wanted one, so the wanted alias
+        // is returned unchanged and the engine reports it plainly. Silently
+        // running some other agent would be the bug this file already documents:
+        // the engine running a model the caller never named, and reporting success.
+        let known: std::collections::HashSet<String> =
+            ["groq", "claude"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(reconcile_alias(&known, "kimi-k2.6"), "kimi-k2.6");
+
+        // An empty set means the daemon reported nothing; keep historic behaviour.
+        assert_eq!(
+            reconcile_alias(&std::collections::HashSet::new(), "kimi-k2.6"),
+            "kimi-k2.6"
+        );
+
+        // Longest principled prefix wins when several could match.
+        let nested: std::collections::HashSet<String> =
+            ["deep", "deepseek"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(reconcile_alias(&nested, "deepseek-v4-pro"), "deepseek");
     }
 
     /// A forced loop author must still enter Zeroclaw through a complete coding
