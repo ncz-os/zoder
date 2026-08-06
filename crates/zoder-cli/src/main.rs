@@ -697,6 +697,18 @@ enum Cmd {
         #[command(subcommand)]
         action: JobsCmd,
     },
+    /// Work-performance history by model, from the local loop records.
+    ///
+    /// `report` answers what a model COST. This answers what it GOT DONE:
+    /// per author model, how often a run resolved, how much it wrote, and how
+    /// often it exhausted its iteration budget; per reviewer model, how its
+    /// verdicts line up with the objective `--check`, which is the only signal
+    /// in the loop that is not a model opinion.
+    Perf {
+        /// Emit the structured form instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Autonomous fix loop: author -> validate (build/test) -> adversarial
     /// review -> fix, repeating until the check passes and the reviewer raises
     /// no blocking findings (or `--max-iters`). The author keeps one engine
@@ -1486,6 +1498,7 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Status { job, all }) => agentic::cmd_status(&cli, job.clone(), *all),
         Some(Cmd::Result { job }) => agentic::cmd_result(&cli, job.clone()),
         Some(Cmd::Cancel { job }) => agentic::cmd_cancel(&cli, job.clone()),
+        Some(Cmd::Perf { json }) => jobs::cmd_perf(&cli, *json || cli.json),
         Some(Cmd::Jobs { action }) => match action {
             JobsCmd::List { all } => jobs::cmd_jobs_list(&cli, *all),
             JobsCmd::Prune {
