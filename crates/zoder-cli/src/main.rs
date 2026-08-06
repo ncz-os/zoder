@@ -8,6 +8,7 @@ use anyhow::Context;
 use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
+mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
@@ -708,6 +709,23 @@ enum Cmd {
         /// Emit the structured form instead of the table.
         #[arg(long)]
         json: bool,
+    },
+    /// Run a behavioural eval suite: the same cases across two or more
+    /// configurations, each in its own clone and its own process, indexed so a
+    /// result can be attributed to the arm that produced it.
+    Eval {
+        /// TOML suite file ([[case]] and [[arm]] entries).
+        #[arg(value_name = "SUITE")]
+        suite: std::path::PathBuf,
+        /// Only run cases whose name contains this substring.
+        #[arg(long, value_name = "SUBSTR")]
+        filter: Option<String>,
+        /// Artifact directory (default: <zoder home>/evals/<timestamp>).
+        #[arg(long, value_name = "DIR")]
+        out: Option<std::path::PathBuf>,
+        /// Resolve and list the runs without executing them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Autonomous fix loop: author -> validate (build/test) -> adversarial
     /// review -> fix, repeating until the check passes and the reviewer raises
@@ -1499,6 +1517,20 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Result { job }) => agentic::cmd_result(&cli, job.clone()),
         Some(Cmd::Cancel { job }) => agentic::cmd_cancel(&cli, job.clone()),
         Some(Cmd::Perf { json }) => jobs::cmd_perf(&cli, *json || cli.json),
+        Some(Cmd::Eval {
+            suite,
+            filter,
+            out,
+            dry_run,
+        }) => evals::cmd_eval(
+            &cli,
+            evals::EvalArgs {
+                suite: suite.clone(),
+                filter: filter.clone(),
+                out: out.clone(),
+                dry_run: *dry_run,
+            },
+        ),
         Some(Cmd::Jobs { action }) => match action {
             JobsCmd::List { all } => jobs::cmd_jobs_list(&cli, *all),
             JobsCmd::Prune {
