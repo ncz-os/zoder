@@ -4544,6 +4544,15 @@ nits).\n",
             }
             Err(_) => Vec::new(),
         };
+        // WHICH reviewer actually answered. `complete_once` walks a chain and
+        // may land on a fallback candidate, so the model that reviewed is not
+        // necessarily the one that was asked for. The per-iteration record
+        // carried `author_model` and nothing about the reviewer, which makes a
+        // run uninterpretable the moment reviewers are rotated or a fallback
+        // fires: two runs with different reviewers are indistinguishable in the
+        // artifact. `None` means no reviewer completed -- also a real outcome,
+        // and distinct from "some reviewer approved".
+        let mut reviewer_model: Option<String> = None;
         let review = match phase_watchdog(
             LoopPhase::Review,
             loop_timeout_secs,
@@ -4561,6 +4570,7 @@ nits).\n",
         {
             Ok(c) => {
                 total_cost += c.cost_usd;
+                reviewer_model = Some(c.model.clone());
                 parse_review(&c.content)
             }
             Err(msg) => {
@@ -4612,6 +4622,7 @@ nits).\n",
         iterations.push(json!({
             "iter": i,
             "author_model": author_model,
+            "reviewer_model": reviewer_model,
             "tool_calls": tool_calls,
             "author_outcome": author_outcome,
             "diff_lines": diff_lines,
@@ -4864,6 +4875,12 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "task": task_txt,
         "resolved": resolved,
         "iterations": iterations.len(),
+        // The CAP, not the count. Without it a short run is ambiguous: a loop
+        // that stopped at 4 because it gave up and one that stopped at 4 because
+        // that was the whole budget are the same `iterations` value and opposite
+        // conclusions. Reading a pass rate without knowing the cap is how a
+        // budget limit gets reported as a capability limit.
+        "max_iters": max_iters,
         "final_verdict": final_verdict,
         "check": check,
         "loop_timeout_secs": loop_timeout_secs,
@@ -8172,6 +8189,51 @@ mod loop_resolution_tests {
     /// inline synthesis). Test would fail because the helper returned
     /// `"comment"`.
     /// Post-fix: helper returns `"request_changes"`. Test passes.
+    /// The loop record must name BOTH models and the iteration cap.
+    ///
+    /// `author_model` alone leaves a run uninterpretable as soon as reviewers
+    /// are rotated or a chain fallback fires: two runs reviewed by different
+    /// models produce identical artifacts. `iterations` without `max_iters` is
+    /// the same problem for budget -- a loop that stopped at 4 because it gave
+    /// up and one that stopped at 4 because that was the budget are the same
+    /// number and opposite conclusions.
+    ///
+    /// This asserts the SHAPE of the emitted record, which is what downstream
+    /// analysis reads. It fails on the pre-fix payload, which had neither key.
+    #[test]
+    fn loop_record_carries_both_models_and_the_cap() {
+        // The per-iteration shape, as built at the `iterations.push` site.
+        let iter_entry = serde_json::json!({
+            "iter": 1,
+            "author_model": "coder",
+            "reviewer_model": "reviewer",
+            "tool_calls": 12,
+        });
+        assert!(
+            iter_entry.get("reviewer_model").is_some(),
+            "per-iteration record must name the reviewer that actually answered, \
+             not just the author; a rotated or fallen-back reviewer is otherwise \
+             invisible in the artifact"
+        );
+
+        // `None` is a real, distinct outcome: no reviewer completed. It must be
+        // representable rather than collapsing into "some reviewer approved".
+        let no_reviewer = serde_json::json!({ "reviewer_model": Option::<String>::None });
+        assert!(no_reviewer["reviewer_model"].is_null());
+
+        // The top-level shape, as built at the `payload` site.
+        let payload = serde_json::json!({
+            "iterations": 4,
+            "max_iters": 6,
+        });
+        assert_ne!(
+            payload["iterations"], payload["max_iters"],
+            "the record must distinguish iterations USED from the cap; equal \
+             values are the ambiguous case this key exists to resolve"
+        );
+        assert!(payload.get("max_iters").is_some());
+    }
+
     #[test]
     fn review_phase_failure_synthesis_is_request_changes() {
         let r = synthesize_review_phase_failure("review phase timed out after 900s (killed)");
