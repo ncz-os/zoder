@@ -17,6 +17,7 @@
 //! what `status` / `result` / `cancel` use; we do NOT introduce a separate
 //! path resolver.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
@@ -637,6 +638,240 @@ pub(crate) fn cmd_jobs_prune(cli: &crate::Cli, args: JobsPruneArgs) -> anyhow::R
     } else {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Work-performance history, by model
+//
+// `zoder report` answers "what did this model COST". Nothing answered "what did
+// it GET DONE", even though every loop already writes the outcome to
+// `result.json` -- 599 records on the eval host before this existed. The data
+// was there; nothing joined it to the model that produced it.
+//
+// Two roles are aggregated separately because they are different jobs. An
+// author is judged on whether work landed; a reviewer is judged on whether it
+// AGREED WITH THE OBJECTIVE CHECK -- the one signal in the loop that is not a
+// model opinion. A reviewer that approves everything and one that rejects
+// everything both look "decisive" until you grade them against the check.
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone)]
+pub(crate) struct AuthorStat {
+    pub runs: u64,
+    pub resolved: u64,
+    pub iters_used: u64,
+    pub hit_cap: u64,
+    /// Runs whose record actually carried `max_iters`. Without this the
+    /// hit-cap rate silently reports 0% for records that simply predate the
+    /// field -- unknown rendered as zero, which is the exact category error
+    /// that makes a budget limit look like a capability limit.
+    pub runs_with_cap: u64,
+    pub tool_calls: u64,
+    pub diff_lines: u64,
+    pub check_passed_runs: u64,
+    pub barren_first_iter: u64,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct ReviewerStat {
+    pub reviews: u64,
+    pub approvals: u64,
+    /// Approved AND the objective check passed.
+    pub agreed_pass: u64,
+    /// Rejected AND the objective check failed.
+    pub agreed_fail: u64,
+    /// Approved while the objective check FAILED. The dangerous one.
+    pub rubber_stamp: u64,
+    /// Rejected while the objective check PASSED.
+    pub rejected_green: u64,
+}
+
+/// Walk every `result.json` under the jobs dir and fold it into per-model rows.
+///
+/// Skips anything that is not a finished `loop` record rather than guessing:
+/// an unreadable or half-written artifact is UNKNOWN, and counting it as a
+/// failure is exactly how apparatus faults get attributed to models.
+pub(crate) fn collect_perf(
+    dir: &Path,
+) -> (BTreeMap<String, AuthorStat>, BTreeMap<String, ReviewerStat>) {
+    let mut authors: BTreeMap<String, AuthorStat> = BTreeMap::new();
+    let mut reviewers: BTreeMap<String, ReviewerStat> = BTreeMap::new();
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (authors, reviewers);
+    };
+    for e in entries.flatten() {
+        let f = e.path().join("result.json");
+        let Ok(raw) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let Ok(d) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if d.get("kind").and_then(|v| v.as_str()) != Some("loop") {
+            continue;
+        }
+        let Some(log) = d.get("log").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if log.is_empty() {
+            continue;
+        }
+
+        let resolved = d.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cap = d.get("max_iters").and_then(|v| v.as_u64());
+        let any_check_passed = log
+            .iter()
+            .any(|x| x.get("check_passed").and_then(|v| v.as_bool()) == Some(true));
+
+        // The author is whoever wrote in this run; take the first named one.
+        let author = log
+            .iter()
+            .find_map(|x| x.get("author_model").and_then(|v| v.as_str()))
+            .unwrap_or("(unnamed)")
+            .to_string();
+        let a = authors.entry(author).or_default();
+        a.runs += 1;
+        a.resolved += u64::from(resolved);
+        a.iters_used += log.len() as u64;
+        // Only meaningful when the record carries the cap. Records written
+        // before `max_iters` existed simply do not contribute here, rather than
+        // being guessed at.
+        if let Some(c) = cap {
+            a.runs_with_cap += 1;
+            if log.len() as u64 >= c {
+                a.hit_cap += 1;
+            }
+        }
+        a.check_passed_runs += u64::from(any_check_passed);
+        if log
+            .first()
+            .and_then(|x| x.get("diff_lines"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            == 0
+        {
+            a.barren_first_iter += 1;
+        }
+        for x in log {
+            a.tool_calls += x.get("tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+            a.diff_lines += x.get("diff_lines").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+
+        // Reviewers are graded PER ITERATION against that iteration's check.
+        for x in log {
+            let Some(rm) = x.get("reviewer_model").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let approved = x.get("verdict").and_then(|v| v.as_str()) == Some("approve");
+            let checked = x.get("check_passed").and_then(|v| v.as_bool());
+            let r = reviewers.entry(rm.to_string()).or_default();
+            r.reviews += 1;
+            r.approvals += u64::from(approved);
+            match (approved, checked) {
+                (true, Some(true)) => r.agreed_pass += 1,
+                (true, Some(false)) => r.rubber_stamp += 1,
+                (false, Some(true)) => r.rejected_green += 1,
+                (false, Some(false)) => r.agreed_fail += 1,
+                // No check configured: the reviewer cannot be graded against
+                // anything objective, so it is counted but not scored.
+                (_, None) => {}
+            }
+        }
+    }
+    (authors, reviewers)
+}
+
+fn pct(num: u64, den: u64) -> String {
+    if den == 0 {
+        "  n/a".to_string()
+    } else {
+        format!("{:5.0}%", 100.0 * num as f64 / den as f64)
+    }
+}
+
+pub(crate) fn cmd_perf(_cli: &crate::Cli, json: bool) -> anyhow::Result<()> {
+    let dir = resolved_jobs_dir();
+    let (authors, reviewers) = collect_perf(&dir);
+
+    if authors.is_empty() && reviewers.is_empty() {
+        println!("no loop records under {}", dir.display());
+        return Ok(());
+    }
+
+    if json {
+        let a: Vec<_> = authors
+            .iter()
+            .map(|(m, s)| {
+                serde_json::json!({
+                    "model": m, "runs": s.runs, "resolved": s.resolved,
+                    "iterations_used": s.iters_used, "hit_cap": s.hit_cap,
+                    "runs_with_cap_recorded": s.runs_with_cap,
+                    "tool_calls": s.tool_calls, "diff_lines": s.diff_lines,
+                    "runs_with_check_passed": s.check_passed_runs,
+                    "runs_whose_first_iteration_wrote_nothing": s.barren_first_iter,
+                })
+            })
+            .collect();
+        let r: Vec<_> = reviewers
+            .iter()
+            .map(|(m, s)| {
+                serde_json::json!({
+                    "model": m, "reviews": s.reviews, "approvals": s.approvals,
+                    "agreed_pass": s.agreed_pass, "agreed_fail": s.agreed_fail,
+                    "rubber_stamp": s.rubber_stamp, "rejected_green": s.rejected_green,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"authors": a, "reviewers": r}))?
+        );
+        return Ok(());
+    }
+
+    println!("AUTHORS  (work landed)");
+    println!(
+        "  {:<24} {:>5} {:>7} {:>7} {:>8} {:>10} {:>11} {:>7}",
+        "model", "runs", "solved", "checkOK", "hit cap", "tool calls", "diff lines", "iters"
+    );
+    for (m, s) in &authors {
+        println!(
+            "  {:<24} {:>5} {:>7} {:>7} {:>8} {:>10} {:>11} {:>7.1}",
+            m,
+            s.runs,
+            pct(s.resolved, s.runs),
+            pct(s.check_passed_runs, s.runs),
+            pct(s.hit_cap, s.runs_with_cap),
+            s.tool_calls,
+            s.diff_lines,
+            s.iters_used as f64 / s.runs.max(1) as f64,
+        );
+    }
+
+    println!("\nREVIEWERS  (graded against the objective --check, not against opinion)");
+    println!(
+        "  {:<24} {:>7} {:>8} {:>9} {:>13} {:>14}",
+        "model", "reviews", "approved", "agreement", "rubber-stamps", "rejected-green"
+    );
+    for (m, s) in &reviewers {
+        let graded = s.agreed_pass + s.agreed_fail + s.rubber_stamp + s.rejected_green;
+        println!(
+            "  {:<24} {:>7} {:>8} {:>9} {:>13} {:>14}",
+            m,
+            s.reviews,
+            pct(s.approvals, s.reviews),
+            pct(s.agreed_pass + s.agreed_fail, graded),
+            s.rubber_stamp,
+            s.rejected_green,
+        );
+    }
+    println!(
+        "\n  rubber-stamps  = approved while the check FAILED (the dangerous direction)\n  \
+         rejected-green = rejected while the check PASSED (may be correct: the check can be weaker\n  \
+                          than the reviewer, e.g. it passes on an empty diff)"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
