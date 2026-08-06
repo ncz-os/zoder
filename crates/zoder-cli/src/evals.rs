@@ -86,6 +86,10 @@ pub(crate) struct Arm {
 
 #[derive(Debug, Serialize)]
 struct RunRow {
+    /// Which repetition this row is. A single run of a case is an anecdote;
+    /// the index has to say which of N a row belongs to or repeats cannot be
+    /// distinguished from separate suites after the fact.
+    rep: usize,
     case: String,
     arm: String,
     author: String,
@@ -109,6 +113,8 @@ struct RunRow {
 
 pub(crate) struct EvalArgs {
     pub suite: PathBuf,
+    /// How many times to run every case x arm cell.
+    pub repeat: usize,
     pub filter: Option<String>,
     pub out: Option<PathBuf>,
     pub dry_run: bool,
@@ -201,11 +207,12 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", index.display()))?;
 
     let exe = std::env::current_exe().context("locating the zoder binary to re-invoke")?;
-    let total = cases.len() * arms.len();
+    let total = cases.len() * arms.len() * args.repeat.max(1);
     eprintln!(
-        "[eval] {} case(s) x {} arm(s) = {total} run(s); artifacts -> {}",
+        "[eval] {} case(s) x {} arm(s) x {} rep(s) = {total} run(s); artifacts -> {}",
         cases.len(),
         arms.len(),
+        args.repeat.max(1),
         out.display()
     );
 
@@ -220,119 +227,123 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
         }
     };
 
-    for case in &cases {
-        for arm in &arms {
-            let cap = arm.max_iters.or(suite.defaults.max_iters).unwrap_or(3);
-            let check = case.check.clone().or_else(|| suite.defaults.check.clone());
-            let wd = out.join(format!("{}__{}", case.name, arm.name));
+    let repeat = args.repeat.max(1);
+    for rep in 1..=repeat {
+        for case in &cases {
+            for arm in &arms {
+                let cap = arm.max_iters.or(suite.defaults.max_iters).unwrap_or(3);
+                let check = case.check.clone().or_else(|| suite.defaults.check.clone());
+                let wd = out.join(format!("{}__{}__r{rep}", case.name, arm.name));
 
-            let mut row = RunRow {
-                case: case.name.clone(),
-                arm: arm.name.clone(),
-                author: arm.author.clone(),
-                reviewer: arm.reviewer.clone(),
-                base: case.base.clone(),
-                max_iters: cap,
-                ran: false,
-                skipped_reason: None,
-                resolved: None,
-                iterations: None,
-                final_verdict: None,
-                diff_lines: None,
-                tool_calls: None,
-                duration_ms: None,
-                workdir: wd.display().to_string(),
-                artifact: None,
-            };
+                let mut row = RunRow {
+                    rep,
+                    case: case.name.clone(),
+                    arm: arm.name.clone(),
+                    author: arm.author.clone(),
+                    reviewer: arm.reviewer.clone(),
+                    base: case.base.clone(),
+                    max_iters: cap,
+                    ran: false,
+                    skipped_reason: None,
+                    resolved: None,
+                    iterations: None,
+                    final_verdict: None,
+                    diff_lines: None,
+                    tool_calls: None,
+                    duration_ms: None,
+                    workdir: wd.display().to_string(),
+                    artifact: None,
+                };
 
-            if args.dry_run {
-                row.skipped_reason = Some("dry-run".into());
-                eprintln!("[eval] would run {} / {}", case.name, arm.name);
-                record(&mut index_file, &row);
-                rows.push(row);
-                continue;
-            }
-
-            if let Err(e) = clone_case(&case.repo, &case.base, &wd) {
-                // Setup failure is an APPARATUS problem. It is recorded with its
-                // reason and excluded from rates -- calling it a model failure is
-                // the exact mistake this runner exists to stop making.
-                row.skipped_reason = Some(format!("setup: {e}"));
-                eprintln!("[eval] SKIP {} / {}: {e}", case.name, arm.name);
-                record(&mut index_file, &row);
-                rows.push(row);
-                continue;
-            }
-
-            let mut cmd = Command::new(&exe);
-            cmd.arg("loop")
-                .arg("--json")
-                .arg("-C")
-                .arg(&wd)
-                .args(["--agent", &arm.author, "-m", &arm.author])
-                .args(["--reviewer", &arm.reviewer])
-                .arg("--allow-paid")
-                .args(["--max-iters", &cap.to_string()])
-                .args(["-i", &case.task]);
-            if let Some(c) = &check {
-                cmd.args(["--check", c]);
-            }
-            if let Some(t) = suite.defaults.agent_timeout_secs {
-                cmd.args(["--agent-timeout", &t.to_string()]);
-            }
-            if let Some(t) = suite.defaults.loop_timeout_secs {
-                cmd.args(["--loop-timeout", &t.to_string()]);
-            }
-            if let Some(t) = suite.defaults.max_tokens {
-                cmd.args(["--max-tokens", &t.to_string()]);
-            }
-
-            eprintln!("[eval] run {} / {} (cap {cap})", case.name, arm.name);
-            let output = match cmd.output() {
-                Ok(o) => o,
-                Err(e) => {
-                    row.skipped_reason = Some(format!("spawn: {e}"));
+                if args.dry_run {
+                    row.skipped_reason = Some("dry-run".into());
+                    eprintln!("[eval] would run {} / {}", case.name, arm.name);
                     record(&mut index_file, &row);
                     rows.push(row);
                     continue;
                 }
-            };
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let artifact = wd.join("result.json");
-            let _ = std::fs::write(&artifact, stdout.as_bytes());
-            row.artifact = Some(artifact.display().to_string());
 
-            match extract_payload(&stdout) {
-                None => {
-                    // Unreadable output is UNKNOWN, not zero.
-                    row.skipped_reason = Some("no readable loop payload in stdout".into());
+                if let Err(e) = clone_case(&case.repo, &case.base, &wd) {
+                    // Setup failure is an APPARATUS problem. It is recorded with its
+                    // reason and excluded from rates -- calling it a model failure is
+                    // the exact mistake this runner exists to stop making.
+                    row.skipped_reason = Some(format!("setup: {e}"));
+                    eprintln!("[eval] SKIP {} / {}: {e}", case.name, arm.name);
+                    record(&mut index_file, &row);
+                    rows.push(row);
+                    continue;
                 }
-                Some(d) => {
-                    row.ran = true;
-                    row.resolved = d.get("resolved").and_then(|v| v.as_bool());
-                    row.iterations = d.get("iterations").and_then(|v| v.as_u64());
-                    row.final_verdict = d
-                        .get("final_verdict")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    row.duration_ms = d.get("duration_ms").and_then(|v| v.as_u64());
-                    if let Some(log) = d.get("log").and_then(|v| v.as_array()) {
-                        row.diff_lines = Some(
-                            log.iter()
-                                .filter_map(|x| x.get("diff_lines").and_then(|v| v.as_u64()))
-                                .max()
-                                .unwrap_or(0),
-                        );
-                        row.tool_calls = Some(
-                            log.iter()
-                                .filter_map(|x| x.get("tool_calls").and_then(|v| v.as_u64()))
-                                .sum(),
-                        );
+
+                let mut cmd = Command::new(&exe);
+                cmd.arg("loop")
+                    .arg("--json")
+                    .arg("-C")
+                    .arg(&wd)
+                    .args(["--agent", &arm.author, "-m", &arm.author])
+                    .args(["--reviewer", &arm.reviewer])
+                    .arg("--allow-paid")
+                    .args(["--max-iters", &cap.to_string()])
+                    .args(["-i", &case.task]);
+                if let Some(c) = &check {
+                    cmd.args(["--check", c]);
+                }
+                if let Some(t) = suite.defaults.agent_timeout_secs {
+                    cmd.args(["--agent-timeout", &t.to_string()]);
+                }
+                if let Some(t) = suite.defaults.loop_timeout_secs {
+                    cmd.args(["--loop-timeout", &t.to_string()]);
+                }
+                if let Some(t) = suite.defaults.max_tokens {
+                    cmd.args(["--max-tokens", &t.to_string()]);
+                }
+
+                eprintln!("[eval] run {} / {} (cap {cap})", case.name, arm.name);
+                let output = match cmd.output() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        row.skipped_reason = Some(format!("spawn: {e}"));
+                        record(&mut index_file, &row);
+                        rows.push(row);
+                        continue;
+                    }
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let artifact = wd.join("result.json");
+                let _ = std::fs::write(&artifact, stdout.as_bytes());
+                row.artifact = Some(artifact.display().to_string());
+
+                match extract_payload(&stdout) {
+                    None => {
+                        // Unreadable output is UNKNOWN, not zero.
+                        row.skipped_reason = Some("no readable loop payload in stdout".into());
+                    }
+                    Some(d) => {
+                        row.ran = true;
+                        row.resolved = d.get("resolved").and_then(|v| v.as_bool());
+                        row.iterations = d.get("iterations").and_then(|v| v.as_u64());
+                        row.final_verdict = d
+                            .get("final_verdict")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        row.duration_ms = d.get("duration_ms").and_then(|v| v.as_u64());
+                        if let Some(log) = d.get("log").and_then(|v| v.as_array()) {
+                            row.diff_lines = Some(
+                                log.iter()
+                                    .filter_map(|x| x.get("diff_lines").and_then(|v| v.as_u64()))
+                                    .max()
+                                    .unwrap_or(0),
+                            );
+                            row.tool_calls = Some(
+                                log.iter()
+                                    .filter_map(|x| x.get("tool_calls").and_then(|v| v.as_u64()))
+                                    .sum(),
+                            );
+                        }
                     }
                 }
+                record(&mut index_file, &row);
+                rows.push(row);
             }
-            record(&mut index_file, &row);
-            rows.push(row);
         }
     }
 

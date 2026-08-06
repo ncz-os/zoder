@@ -723,6 +723,10 @@ enum Cmd {
         /// Artifact directory (default: <zoder home>/evals/<timestamp>).
         #[arg(long, value_name = "DIR")]
         out: Option<std::path::PathBuf>,
+        /// Run every case x arm cell this many times. One run of a cell is an
+        /// anecdote; repeats are what make a rate mean anything.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        repeat: usize,
         /// Resolve and list the runs without executing them.
         #[arg(long)]
         dry_run: bool,
@@ -1521,6 +1525,7 @@ async fn run() -> anyhow::Result<()> {
             suite,
             filter,
             out,
+            repeat,
             dry_run,
         }) => evals::cmd_eval(
             &cli,
@@ -1528,6 +1533,7 @@ async fn run() -> anyhow::Result<()> {
                 suite: suite.clone(),
                 filter: filter.clone(),
                 out: out.clone(),
+                repeat: *repeat,
                 dry_run: *dry_run,
             },
         ),
