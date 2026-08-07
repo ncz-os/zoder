@@ -4604,6 +4604,25 @@ nits).\n",
 
         let author_model = turn.as_ref().map(|t| t.model.clone());
         let tool_calls = turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0);
+        // WHY the author turn failed, not just THAT it did.
+        //
+        // `author_outcome` records "failed" and nothing else, so a serving
+        // fault and a model that chose to do nothing produce identical records:
+        // outcome=failed, substance=Empty, diff_lines=0. On 2026-08-07 an
+        // endpoint returning HTTP errors for some agentic requests was scored
+        // as an author that wrote nothing, across three of four cases, and was
+        // only caught by reading container logs.
+        //
+        // `failure_detail` is the engine's own explanation (HTTP status, model
+        // id, provider hint). It already exists precisely because a 404 was
+        // repeatedly misdiagnosed as a credential bug when the text was never
+        // surfaced -- it just never reached this record. `author_err` covers the
+        // other path, where the turn never returned at all.
+        let author_error = turn
+            .as_ref()
+            .and_then(|t| t.run.failure_detail.clone())
+            .or_else(|| author_err.clone());
+
         let author_outcome = match (&turn, &author_err) {
             (Some(t), _) => t.run.outcome.clone(),
             (None, Some(e)) => format!("interrupted: {e}"),
@@ -4622,6 +4641,7 @@ nits).\n",
         iterations.push(json!({
             "iter": i,
             "author_model": author_model,
+            "author_error": author_error,
             "reviewer_model": reviewer_model,
             "tool_calls": tool_calls,
             "author_outcome": author_outcome,
@@ -8232,6 +8252,38 @@ mod loop_resolution_tests {
              values are the ambiguous case this key exists to resolve"
         );
         assert!(payload.get("max_iters").is_some());
+    }
+
+    /// A failed author turn must record WHY, not just that it failed.
+    ///
+    /// Without a reason, a serving fault and a model that chose to do nothing
+    /// are the same record -- outcome=failed, substance=Empty, diff_lines=0 --
+    /// and the fault gets scored as the model. That happened on 2026-08-07 and
+    /// was only caught by reading container logs.
+    #[test]
+    fn failed_author_turn_records_a_reason() {
+        let with_detail = serde_json::json!({
+            "author_outcome": "failed",
+            "author_error": "turn failed: HTTP 400 from http://127.0.0.1:8002/v1",
+            "diff_lines": 0,
+        });
+        let no_detail = serde_json::json!({
+            "author_outcome": "failed",
+            "author_error": Option::<String>::None,
+            "diff_lines": 0,
+        });
+        assert!(
+            with_detail
+                .get("author_error")
+                .is_some_and(|v| !v.is_null()),
+            "a failed turn with an engine explanation must carry it into the record"
+        );
+        // `null` is meaningful and must stay representable: the turn failed and
+        // the engine offered no explanation. Collapsing that to an empty string
+        // would make "no reason given" look like "reason was blank".
+        assert!(no_detail["author_error"].is_null());
+        // The two are distinguishable, which is the entire point.
+        assert_ne!(with_detail["author_error"], no_detail["author_error"]);
     }
 
     #[test]
