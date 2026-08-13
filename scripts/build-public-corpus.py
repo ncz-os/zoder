@@ -124,7 +124,7 @@ def overlay_openrouter(econ):
     for m in data:
         mid = m.get("id")
         pricing = m.get("pricing") or {}
-        if not mid or mid in econ:
+        if not mid:
             continue
         if pricing.get("prompt") is None or pricing.get("completion") is None:
             continue
@@ -133,12 +133,24 @@ def overlay_openrouter(econ):
             out = float(pricing["completion"]) * PER_TOK_TO_MTOK
         except (TypeError, ValueError):
             continue
+        openrouter_free_alias = (
+            mid.lower().endswith(":free") and inp == 0.0 and out == 0.0
+        )
+        if mid in econ:
+            # Preserve LiteLLM as the pricing source, but record that OpenRouter
+            # itself currently serves this exact :free alias at zero cost. The
+            # corpus builder uses this marker to distinguish a real hosted free
+            # route from a commercial-vendor placeholder with missing pricing.
+            if openrouter_free_alias:
+                econ[mid]["_openrouter_free_alias"] = True
+            continue
         econ[mid] = {
             "input_usd_per_mtok": inp,
             "output_usd_per_mtok": out,
             "source": "openrouter",
             "_explicit_zero": inp == 0.0 and out == 0.0,
             "_priced": True,
+            "_openrouter_free_alias": openrouter_free_alias,
         }
         added += 1
     print(f"  openrouter: +{added} models", file=sys.stderr)
@@ -212,10 +224,17 @@ def build_corpus(econ, generated, bench=None, known_good=None):
         # Strip internal helper keys before publishing the economics block so it
         # deserializes cleanly into zoder-core Economics.
         econ_pub = {k: v for k, v in e.items() if not k.startswith("_")}
-        # A closed-weight commercial vendor (Anthropic/OpenAI/Gemini) has no $0
-        # public API; a zero price in the feed is a placeholder, not a free tier,
-        # so it must never be auto-routed as "free". Open-weight gpt-oss is exempt.
-        commercial_zero = explicit_zero and _is_commercial_paid_only(mid)
+        # A closed-weight commercial vendor (Anthropic/OpenAI/Gemini) normally
+        # has no $0 public API, so an isolated zero-price row remains blocked.
+        # The narrow exception is an exact :free alias independently observed
+        # in OpenRouter's live feed with both prices at zero. Open-weight gpt-oss
+        # remains exempt from the commercial-vendor heuristic.
+        verified_openrouter_free_alias = e.get("_openrouter_free_alias", False)
+        commercial_zero = (
+            explicit_zero
+            and _is_commercial_paid_only(mid)
+            and not verified_openrouter_free_alias
+        )
         free = explicit_zero and not commercial_zero
         route_candidate = free  # free chat models route out-of-box; refresh narrows to served
         if commercial_zero:
