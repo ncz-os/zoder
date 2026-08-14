@@ -5072,14 +5072,27 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             );
         }
         let provider = &provider_clients[&pid];
+        // Per-model sampling from `[providers.models.*]`. Matched on the model
+        // id rather than the alias key so it works whichever alias resolved
+        // here. Absent config keeps the previous behaviour exactly.
+        let model_cfg = eng
+            .cfg
+            .models
+            .values()
+            .find(|m| m.model.as_deref() == Some(model_id.as_str()));
         let req = ChatRequest {
             model: model_id.clone(),
             messages: messages.clone(),
             max_tokens: cli.max_tokens,
-            temperature: Some(0.2),
+            // 0.2 stays the default. Models that publish their own
+            // recommendation (NVIDIA specifies 1.0 / 0.95 for Nemotron 3.5)
+            // can now state it in config instead of being silently overridden.
+            temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
             reasoning_effort: cli.reasoning.clone(),
+            top_p: model_cfg.and_then(|m| m.top_p),
+            chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
         };
         // Per-model timer: health latency must reflect THIS model's call, not
         // the chain-wide elapsed time (which would fold in prior models' time
@@ -9656,6 +9669,10 @@ async fn run_probe_default(
             stream: false,
             show_reasoning: false,
             reasoning_effort: None,
+            // A liveness ping stays sampling- and template-neutral so it
+            // measures the endpoint, not a model's configuration.
+            top_p: None,
+            chat_template_kwargs: None,
         };
         let mut reservation = Ledger::new(&eng.cfg.ledger_path)
             .reserve_billable()

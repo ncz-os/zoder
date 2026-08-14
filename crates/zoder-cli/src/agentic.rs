@@ -896,14 +896,26 @@ async fn dispatch_reviewer_for_model(
 
     let ledger_path = eng.cfg.ledger_path.clone();
     let messages = vec![Message::new("system", system), Message::new("user", user)];
+    // Per-model sampling from `[providers.models.*]`, matched on model id.
+    // Without this a model's own documented settings cannot reach the wire --
+    // and for some backends that is not a tuning nicety: Nemotron 3.5 returns
+    // empty content for coding work unless `force_nonempty_content` is passed
+    // as a chat-template kwarg.
+    let model_cfg = eng
+        .cfg
+        .models
+        .values()
+        .find(|m| m.model.as_deref() == Some(model));
     let req = ChatRequest {
         model: model.to_string(),
         messages,
         max_tokens,
-        temperature: Some(0.1),
+        temperature: model_cfg.and_then(|m| m.temperature).or(Some(0.1)),
         stream: false,
         show_reasoning: false,
         reasoning_effort: cli.reasoning.clone(),
+        top_p: model_cfg.and_then(|m| m.top_p),
+        chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
     };
     let provider = match OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
@@ -8273,7 +8285,9 @@ mod loop_resolution_tests {
             "diff_lines": 0,
         });
         assert!(
-            with_detail.get("author_error").is_some_and(|v| !v.is_null()),
+            with_detail
+                .get("author_error")
+                .is_some_and(|v| !v.is_null()),
             "a failed turn with an engine explanation must carry it into the record"
         );
         // `null` is meaningful and must stay representable: the turn failed and
