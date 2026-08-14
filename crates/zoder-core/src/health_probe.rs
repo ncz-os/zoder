@@ -92,6 +92,8 @@ pub fn probe_request(model_id: &str) -> ChatRequest {
         // must answer the same way for every backend, so it carries no model
         // specific sampling or chat-template kwargs.
         top_p: None,
+        top_k: None,
+        presence_penalty: None,
         chat_template_kwargs: None,
     }
 }

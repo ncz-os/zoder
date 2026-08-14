@@ -5092,6 +5092,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             show_reasoning: cli.show_reasoning,
             reasoning_effort: cli.reasoning.clone(),
             top_p: model_cfg.and_then(|m| m.top_p),
+            top_k: model_cfg.and_then(|m| m.top_k),
+            presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
             chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
         };
         // Per-model timer: health latency must reflect THIS model's call, not
@@ -9672,6 +9674,8 @@ async fn run_probe_default(
             // A liveness ping stays sampling- and template-neutral so it
             // measures the endpoint, not a model's configuration.
             top_p: None,
+            top_k: None,
+            presence_penalty: None,
             chat_template_kwargs: None,
         };
         let mut reservation = Ledger::new(&eng.cfg.ledger_path)

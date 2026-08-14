@@ -915,6 +915,8 @@ async fn dispatch_reviewer_for_model(
         show_reasoning: false,
         reasoning_effort: cli.reasoning.clone(),
         top_p: model_cfg.and_then(|m| m.top_p),
+        top_k: model_cfg.and_then(|m| m.top_k),
+        presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
         chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
     };
     let provider = match OpenAiProvider::new_with_request_timeout_s(

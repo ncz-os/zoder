@@ -230,6 +230,14 @@ pub struct ChatRequest {
     /// Nucleus-sampling cutoff. `None` omits `top_p` entirely, matching the
     /// `temperature` contract above: absent means "model default", not 1.0.
     pub top_p: Option<f32>,
+    /// Top-k cutoff. `None` omits the field.
+    pub top_k: Option<u32>,
+    /// Presence penalty. `None` omits the field.
+    ///
+    /// Qwen3.8 publishes materially different presets per mode -- presence
+    /// penalty 0.0 when thinking, 1.5 when not -- so one hardcoded value
+    /// cannot serve both.
+    pub presence_penalty: Option<f32>,
     /// Verbatim `chat_template_kwargs` for backends whose chat template gates
     /// behaviour on them (vLLM forwards this to the Jinja template). `None`
     /// omits the field.
@@ -1119,6 +1127,12 @@ impl OpenAiProvider {
         }
         if let Some(top_p) = req.top_p {
             body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = req.top_k {
+            body["top_k"] = serde_json::json!(top_k);
+        }
+        if let Some(pp) = req.presence_penalty {
+            body["presence_penalty"] = serde_json::json!(pp);
         }
         // Forwarded verbatim: vLLM hands these to the chat template, and some
         // templates gate whether the model emits usable content at all.
@@ -3202,6 +3216,8 @@ mod tests {
             show_reasoning: false,
             reasoning_effort: Some("medium".into()),
             top_p: None,
+            top_k: None,
+            presence_penalty: None,
             chat_template_kwargs: None,
         };
         let body = p.body(&req);
@@ -3411,6 +3427,8 @@ mod tests {
             show_reasoning: false,
             reasoning_effort: Some("medium".into()),
             top_p: None,
+            top_k: None,
+            presence_penalty: None,
             chat_template_kwargs: None,
         }
     }
@@ -3606,6 +3624,8 @@ mod tests {
             show_reasoning: false,
             reasoning_effort: None,
             top_p: None,
+            top_k: None,
+            presence_penalty: None,
             chat_template_kwargs: None,
         }
     }
@@ -3965,8 +3985,26 @@ mod tests {
             show_reasoning: false,
             reasoning_effort: None,
             top_p,
+            top_k: None,
+            presence_penalty: None,
             chat_template_kwargs: kwargs,
         }
+    }
+
+    /// Every sampling knob a model card can specify must reach the wire.
+    /// Qwen3.8 publishes top_k 20 and a presence_penalty that differs by mode
+    /// (0.0 thinking / 1.5 not), so dropping either silently serves the model
+    /// settings its own documentation says not to use.
+    #[test]
+    fn chat_body_carries_top_k_and_presence_penalty() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.top_k = Some(20);
+        req.presence_penalty = Some(1.5);
+        let body = p.body(&req);
+        assert_eq!(body["top_k"], serde_json::json!(20));
+        let pp = body["presence_penalty"].as_f64().expect("presence_penalty on the wire");
+        assert!((pp - 1.5).abs() < 1e-6, "presence_penalty should be ~1.5, got {pp}");
     }
 
     /// `top_p` and `chat_template_kwargs` must reach the wire.
