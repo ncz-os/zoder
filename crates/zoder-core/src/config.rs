@@ -382,6 +382,16 @@ pub struct ModelEntry {
     /// Nucleus-sampling cutoff for this model. `None` omits the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Top-k cutoff. `None` omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Presence penalty. `None` omits the field.
+    ///
+    /// Not a nicety for every model: Qwen3.8 publishes materially different
+    /// presets for its two modes -- presence_penalty 0.0 when thinking, 1.5
+    /// when not -- so a single hardcoded value cannot serve both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
     /// Free-form `chat_template_kwargs` forwarded verbatim on every request to
     /// this model.
     ///
