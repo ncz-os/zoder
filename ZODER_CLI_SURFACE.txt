@@ -41,6 +41,8 @@ Commands:
   result              Show the stored final output for a finished background job
   cancel              Cancel an active background job
   jobs                Manage the background-job directories under the zoder state dir: list what's there, or prune the finished ones to reclaim space. Subcommands: `list`, `prune`
+  perf                Work-performance history by model, from the local loop records
+  eval                Run a behavioural eval suite: the same cases across two or more configurations, each in its own clone and its own process, indexed so a result can be attributed to the arm that produced it
   loop                Autonomous fix loop: author -> validate (build/test) -> adversarial review -> fix, repeating until the check passes and the reviewer raises no blocking findings (or `--max-iters`). The author keeps one engine session for continuity; every turn is cost-tracked. "Grind until green", the codex/claude-code workflow on open-source models
   transfer            Print a resumable engine session id for the current working dir (codex `/transfer` equivalent) so a follow-up can `--session <id>`
   session             Start an interactive agentic session (goose `session` equivalent): launches the zerocode terminal UI wired to the engine
