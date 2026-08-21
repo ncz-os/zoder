@@ -30,6 +30,10 @@ fn req(model: &str, stream: bool) -> ChatRequest {
         stream,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     }
 }
 
@@ -788,6 +792,10 @@ fn anthropic_req(model: &str, stream: bool) -> ChatRequest {
         stream,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     }
 }
 
@@ -975,6 +983,10 @@ async fn openai_chat_path_remains_byte_identical_after_anthropic_fork() {
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -1428,6 +1440,10 @@ fn responses_req(model: &str, stream: bool) -> ChatRequest {
         stream,
         show_reasoning: false,
         reasoning_effort: Some("low".into()),
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     }
 }
 
@@ -1555,6 +1571,10 @@ async fn openai_chat_path_remains_byte_identical_after_responses_fork() {
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -1844,6 +1864,10 @@ fn azure_req(model: &str, stream: bool) -> ChatRequest {
         stream,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     }
 }
 
@@ -2020,6 +2044,10 @@ async fn openai_chat_path_remains_byte_identical_after_azure_fork() {
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -2319,6 +2347,10 @@ async fn drive_live_arm(
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     };
     let err = p_local.stream_chat(&req, None).await.unwrap_err();
     let cls = classify_err(&err);
