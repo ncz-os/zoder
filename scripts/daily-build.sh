@@ -79,9 +79,20 @@ mkdir -p dist
 build_linux_in_docker() {
   local platform="$1"
   log "linux build via $RUST_IMAGE ($platform)"
+  # --user: without it the container writes dist/ as root, and the NEXT run's
+  # cleanup dies with "rm: cannot remove ... Permission denied" -- which aborts
+  # the leg and silently publishes nothing. Observed on TYDEUS 2026-08-03.
+  #
+  # ZEROCLAW_REF=master, not zoder-integration. The macOS leg runs package.sh
+  # natively and therefore inherits build.sh's default of upstream
+  # zeroclaw-labs/zeroclaw master, while the Linux legs pinned a side branch --
+  # so the same nightly shipped zeroclaw built from two different sources
+  # depending on platform. Operator directive 2026-08-04: the nightly builds
+  # master from upstream. Set ZEROCLAW_REF in the environment to pin deliberately.
   docker run --rm --platform "$platform" \
+    --user "$(id -u):$(id -g)" \
     -e "ZEROCLAW_REPO=$ZC_URL" \
-    -e ZEROCLAW_REF=zoder-integration \
+    -e "ZEROCLAW_REF=${ZEROCLAW_REF:-master}" \
     -e GIT_TERMINAL_PROMPT=0 \
     -v "$PWD":/src -w /src \
     "$RUST_IMAGE" bash -c '
