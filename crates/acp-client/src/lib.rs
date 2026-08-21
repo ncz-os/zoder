@@ -10087,6 +10087,44 @@ mod tests {
         assert_eq!(res["protocolVersion"], 1);
     }
 
+    #[tokio::test]
+    async fn goose_mid_turn_disconnect_preserves_streamed_content() {
+        let outbound = vec![
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Hello" }
+                }),
+            ),
+            update(
+                "goose-test-session-1",
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": " World" }
+                }),
+            ),
+        ];
+        let (frames, run, events) = drive_against_mock_with_behavior(
+            outbound,
+            false,
+            ApprovalPolicy::Allowlist,
+            MockBehavior::MidTurnDisconnect,
+        )
+        .await;
+
+        assert_eq!(run.session_id, "goose-test-session-1");
+        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.content, "Hello World");
+        assert!(
+            frames.len() >= 3,
+            "mock should have received initialize, session/new, and session/prompt"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Text(text) if text == "Hello")));
+    }
+
     // -----------------------------------------------------------------
     // RELIABILITY-AUDIT FIX — mid-turn disconnect returns partial AgentRun.
     //
