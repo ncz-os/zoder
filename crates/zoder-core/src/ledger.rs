@@ -696,6 +696,21 @@ impl Ledger {
         self.entries_strict_from_file(&mut file)
     }
 
+    /// Read entries without acquiring the lock. Used for dry-run routing
+    /// where the ledger is read but no usage is recorded — the lock file
+    /// need not be created or opened for writing.
+    pub fn entries_readonly(&self) -> anyhow::Result<Vec<Entry>> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("opening ledger at {}", self.path.display())))
+            }
+        };
+        self.entries_strict_from_file(&mut file)
+    }
+
     fn entries_strict_from_file(&self, file: &mut File) -> anyhow::Result<Vec<Entry>> {
         let mut malformed_lines = Vec::new();
         let entries = read_entries(file, &self.path, |line_no, _| {
