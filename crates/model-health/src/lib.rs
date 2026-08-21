@@ -490,7 +490,7 @@ impl HealthStore {
             .unwrap_or(false)
     }
 
-/// `true` when the model's most recent classification marks it "skip for
+    /// `true` when the model's most recent classification marks it "skip for
     /// now" (Unauthorized/Unprovisioned/Capacity). Mirrors `breaker_open`:
     /// these classifications are breaker-neutral (W1), so the breaker stays
     /// closed forever for a 401/404 model — routing must consult this too or
