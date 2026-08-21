@@ -4388,46 +4388,31 @@ auth = { type = "env", var = "GUARD_KEY" }
              {err_enxio}, err-other={err_other}"
         );
 
-        // LIVENESS, checked DETERMINISTICALLY rather than by racing.
-        //
-        // This used to assert `ok_original > 0` from inside the race, which
-        // made a scheduling accident look like a regression: the reader gets a
-        // 2ms window per swap cycle, and on a loaded machine it can miss every
-        // one. The test then failed -- or, with the whole suite competing, hung
-        // long enough to be killed after days (ncz-os/zoder#20). The safety
-        // assertion above is the one that matters and it is unaffected by
-        // scheduling: "ok-other" can only appear if the helper genuinely read a
-        // swapped target.
-        //
-        // So prove the happy path with the race OVER and the file known
-        // present. Both threads have joined by this point.
-        std::fs::write(&target, original).unwrap();
-        let settled = crate::config::read_bounded_regular_file(
-            &target,
-            crate::config::Config::MAX_CONFIG_BYTES,
-        )
-        .expect("a quiescent, regular config file must read successfully");
-        assert_eq!(
-            settled.as_bytes(),
-            original,
-            "with no swapper running the helper must return the original bytes"
+        // At least one iteration must have read the original content
+        // successfully — this proves the happy path works. With the
+        // synchronous handshake between reader and swapper, the
+        // FIRST iteration runs against a swapper that is provably
+        // blocked on `go_rx.recv()`, so the file is stable and the
+        // read cannot fail; the assertion is now deterministic
+        // regardless of host load.
+        assert!(
+            ok_original > 0,
+            "at least one iteration must succeed reading the \
+             original inode's content. observations: ok-original=\
+             {ok_original}, err-not-regular={err_not_regular}, \
+             err-enoent={err_enoent}, err-enxio={err_enxio}, \
+             err-other={err_other}. If this fires while the swapper \
+             handshake reported a clean run, the helper has regressed \
+             against a trivial 2-byte regular file — look at the \
+             'UNEXPECTED first-iter err against stable file' \
+             eprintln above the assertion."
         );
 
-        // Kept as a diagnostic only. A zero here means the reader never won a
-        // window -- interesting on a quiet machine, meaningless on a busy one,
-        // and not grounds for failing a safety test.
-        if ok_original == 0 {
-            eprintln!(
-                "[toctou] note: reader won no race window (machine likely loaded); \
-                 safety assertion still enforced"
-            );
-        }
-
-        // The error mix is informational. ENOENT, ENXIO, and "not
-        // a regular file" are all expected outcomes under a swap
-        // — they prove the helper is rejecting dangerous targets
-        // fast rather than blocking on them. `err-other` is
-        // suspicious but not necessarily wrong (e.g. EACCES on a
+        // The error mix is informational. ENOENT, ENXIO, and "not a
+        // regular file" are all expected outcomes under a swap —
+        // they prove the helper is rejecting dangerous targets fast
+        // rather than blocking on them. `err-other` is suspicious
+        // but not necessarily wrong (e.g. EACCES on a
         // permission-flipped file); we don't fail on `err-other`
         // alone; we just want to make sure it's not masking a deeper
         // issue.
