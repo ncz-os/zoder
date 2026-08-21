@@ -233,6 +233,21 @@ pub struct ChatRequest {
     /// `none` to ask the model to skip thinking). `None` leaves it unset so the
     /// model uses its own default.
     pub reasoning_effort: Option<String>,
+    /// Nucleus-sampling cutoff. `None` omits `top_p` entirely, matching the
+    /// `temperature` contract above: absent means "model default", not 1.0.
+    pub top_p: Option<f32>,
+    /// Top-k cutoff. `None` omits the field.
+    pub top_k: Option<u32>,
+    /// Presence penalty. `None` omits the field.
+    ///
+    /// Qwen3.8 publishes materially different presets per mode -- presence
+    /// penalty 0.0 when thinking, 1.5 when not -- so one hardcoded value
+    /// cannot serve both.
+    pub presence_penalty: Option<f32>,
+    /// Verbatim `chat_template_kwargs` for backends whose chat template gates
+    /// behaviour on them (vLLM forwards this to the Jinja template). `None`
+    /// omits the field.
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 /// Telemetry parsed from LiteLLM response headers (authoritative, no guessing).
@@ -1115,6 +1130,20 @@ impl OpenAiProvider {
         });
         if let Some(temp) = req.temperature {
             body["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = req.top_k {
+            body["top_k"] = serde_json::json!(top_k);
+        }
+        if let Some(pp) = req.presence_penalty {
+            body["presence_penalty"] = serde_json::json!(pp);
+        }
+        // Forwarded verbatim: vLLM hands these to the chat template, and some
+        // templates gate whether the model emits usable content at all.
+        if let Some(kwargs) = &req.chat_template_kwargs {
+            body["chat_template_kwargs"] = kwargs.clone();
         }
         // Ask the backend to emit a final usage chunk so we can record real
         // prompt/completion token counts instead of guessing.
@@ -3245,6 +3274,10 @@ mod tests {
             stream: true,
             show_reasoning: false,
             reasoning_effort: Some("medium".into()),
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: None,
         };
         let body = p.body(&req);
         // The chat-completions shape MUST carry `messages`,
@@ -3452,6 +3485,10 @@ mod tests {
             stream: true,
             show_reasoning: false,
             reasoning_effort: Some("medium".into()),
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -3645,6 +3682,10 @@ mod tests {
             stream: false,
             show_reasoning: false,
             reasoning_effort: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -3991,5 +4032,80 @@ mod tests {
         assert_eq!(t.primary.as_ref().unwrap().used_percent, Some(60.0));
 
         std::env::remove_var("ZODER_HOME");
+    }
+
+    fn sampling_req(top_p: Option<f32>, kwargs: Option<serde_json::Value>) -> ChatRequest {
+        ChatRequest {
+            model: "coder".into(),
+            messages: vec![Message::new("user", "hi")],
+            max_tokens: 32,
+            temperature: Some(1.0),
+            stream: false,
+            show_reasoning: false,
+            reasoning_effort: None,
+            top_p,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: kwargs,
+        }
+    }
+
+    /// Every sampling knob a model card can specify must reach the wire.
+    /// Qwen3.8 publishes top_k 20 and a presence_penalty that differs by mode
+    /// (0.0 thinking / 1.5 not), so dropping either silently serves the model
+    /// settings its own documentation says not to use.
+    #[test]
+    fn chat_body_carries_top_k_and_presence_penalty() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.top_k = Some(20);
+        req.presence_penalty = Some(1.5);
+        let body = p.body(&req);
+        assert_eq!(body["top_k"], serde_json::json!(20));
+        let pp = body["presence_penalty"].as_f64().expect("presence_penalty on the wire");
+        assert!((pp - 1.5).abs() < 1e-6, "presence_penalty should be ~1.5, got {pp}");
+    }
+
+    /// `top_p` and `chat_template_kwargs` must reach the wire.
+    ///
+    /// Not cosmetic: Nemotron 3.5 Lightning returns EMPTY content for
+    /// coding-agent work unless `force_nonempty_content` is passed as a
+    /// chat-template kwarg (measured: 0 content characters at temperature 0
+    /// and 1.0, with and without `enable_thinking`; 4936 characters once the
+    /// flag is sent). A silently-dropped kwarg leaves the model looking
+    /// healthy while producing nothing usable.
+    #[test]
+    fn chat_body_carries_top_p_and_template_kwargs() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let req = sampling_req(
+            Some(0.95),
+            Some(serde_json::json!({ "force_nonempty_content": true })),
+        );
+        let body = p.body(&req);
+        // Compared with a tolerance: 0.95 is not exactly representable in f32,
+        // so it serialises as 0.949999988079071. Asserting equality against the
+        // literal would fail on a value that is in fact correct on the wire.
+        let sent = body["top_p"].as_f64().expect("top_p must be on the wire");
+        assert!(
+            (sent - 0.95).abs() < 1e-6,
+            "top_p should reach the wire as ~0.95, got {sent}"
+        );
+        assert_eq!(
+            body["chat_template_kwargs"]["force_nonempty_content"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// Unset means ABSENT, not null -- the same contract `temperature` keeps,
+    /// so a backend still applies its own defaults.
+    #[test]
+    fn chat_body_omits_sampling_fields_when_unset() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let body = p.body(&sampling_req(None, None));
+        assert!(body.get("top_p").is_none(), "top_p must be absent, not null");
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "chat_template_kwargs must be absent, not null"
+        );
     }
 }
