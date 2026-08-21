@@ -76,6 +76,8 @@ pub enum ErrKind {
     Http,
     /// Malformed/undecodable response.
     Decode,
+    /// Stream ended before terminal marker (truncation). Retryable if nothing emitted.
+    Truncation,
 }
 
 impl Default for ErrKind {
@@ -136,7 +138,11 @@ impl ProviderError {
         !self.emitted
             && matches!(
                 self.kind,
-                ErrKind::Timeout | ErrKind::RateLimit | ErrKind::Server | ErrKind::Network
+                ErrKind::Timeout
+                    | ErrKind::RateLimit
+                    | ErrKind::Server
+                    | ErrKind::Network
+                    | ErrKind::Truncation
             )
     }
 }
@@ -1844,7 +1850,7 @@ impl OpenAiProvider {
             // error message gives operators and engineers the most precise signal
             // for triage (see gitlab.com/ncz-os/zoder MR !1 finding 1).
             return Err(fail(
-                ErrKind::Decode,
+                ErrKind::Truncation,
                 "stream ended before terminal [DONE] marker - likely a premature disconnect"
                     .to_string(),
                 emitted,
@@ -2194,7 +2200,7 @@ impl OpenAiProvider {
         }
         if !done {
             return Err(fail(
-                ErrKind::Decode,
+                ErrKind::Truncation,
                 "anthropic stream ended before terminal message_stop marker - likely a premature disconnect"
                     .to_string(),
                 emitted,
@@ -2524,7 +2530,7 @@ impl OpenAiProvider {
         }
         if !done {
             return Err(fail(
-                ErrKind::Decode,
+                ErrKind::Truncation,
                 "responses stream ended before terminal response.completed marker - likely a premature disconnect"
                     .to_string(),
                 emitted,
@@ -2792,6 +2798,59 @@ mod tests {
     use crate::config::{
         Auth, BillingMode, Observability, QuotaUnit, QuotaWindow, ResetKind, SubscriptionPlan,
     };
+
+    // -----------------------------------------------------------------------
+    // Y-15: Truncation error kind — streaming EOF before terminal marker.
+    //
+    // The reliability audit (MR !1 finding 1) identified that streaming EOF
+    // before [DONE]/finish_reason should be classified as a Truncation error,
+    // not a Decode error. A truncation is a transient network/server issue
+    // that should be retryable (if nothing was emitted), unlike a decode
+    // error which indicates malformed data.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncation_error_is_retryable_when_nothing_emitted() {
+        let err = ProviderError {
+            message: "stream ended before terminal marker".into(),
+            kind: ErrKind::Truncation,
+            status: None,
+            retry_after: None,
+            emitted: false,
+            anthropic_error_body: None,
+        };
+        assert!(
+            err.retryable(),
+            "Truncation error with nothing emitted must be retryable"
+        );
+    }
+
+    #[test]
+    fn truncation_error_is_not_retryable_when_emitted() {
+        let err = ProviderError {
+            message: "stream ended after emitting content".into(),
+            kind: ErrKind::Truncation,
+            status: None,
+            retry_after: None,
+            emitted: true,
+            anthropic_error_body: None,
+        };
+        assert!(
+            !err.retryable(),
+            "Truncation error with emitted content must NOT be retryable"
+        );
+    }
+
+    #[test]
+    fn truncation_classifies_as_error_for_breaker() {
+        use crate::health_probe::classify_err_kind;
+        use crate::Classification;
+        assert_eq!(
+            classify_err_kind(ErrKind::Truncation),
+            Classification::Error,
+            "Truncation should classify as Error for circuit breaker"
+        );
+    }
 
     #[test]
     fn endpoint_url_never_doubles_v1() {
