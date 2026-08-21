@@ -1233,6 +1233,24 @@ impl RoutingContext {
         Ok(Self { entries, catalog })
     }
 
+    /// Load the ledger without acquiring the lock file. Used for dry-run
+    /// routing where the ledger is read but no usage is recorded — the lock
+    /// file need not be created or opened for writing.
+    fn load_readonly(cfg: &Config) -> anyhow::Result<Self> {
+        let entries = Ledger::new(&cfg.ledger_path)
+            .entries_readonly()
+            .with_context(|| {
+                format!(
+                    "loading quota-routing ledger from {}",
+                    cfg.ledger_path.display()
+                )
+            })?;
+        let catalog = load_tier_catalog(Some(
+            &zoder_core::subscription_tiers::default_catalog_path(&Config::home()),
+        ));
+        Ok(Self { entries, catalog })
+    }
+
     /// Quota-aware variant of [`Config::real_provider_for_model`]. The CLI
     /// router calls this in preference to the no-ledger form so a
     /// subscription provider whose rolling window is at/over cap
@@ -3317,7 +3335,15 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // reviewer chain is unconditional — even an explicit `-m` keeps the
     // reviewer's per-role preference lane, because balanced routing
     // (sub-first reviewer) is independent of the author's choice.
-    let rc = RoutingContext::load(&eng.cfg)?;
+    //
+    // Dry-run does not record usage, so it reads the ledger without acquiring
+    // the lock file — this allows `--dry-run` to work in sandboxes where
+    // `~/.zoder` is readable but not writable.
+    let rc = if cli.dry_run {
+        RoutingContext::load_readonly(&eng.cfg)?
+    } else {
+        RoutingContext::load(&eng.cfg)?
+    };
     let (scn_primary, scn_reviewer, scn_reason) = scenario_chain_for_roles(eng, &rc, health, cli)?;
 
     // Resolve the pin for the "strong pin" path. Priority:
@@ -4832,7 +4858,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // metered sibling) claim the same prefix, it picks the cost-neutral one
     // while the subscription's rolling window has headroom and transparently
     // falls through to the metered path when the window is exhausted.
-    let routing = RoutingContext::load(&eng.cfg)?;
+    //
+    // Dry-run does not record usage, so it reads the ledger without acquiring
+    // the lock file — this allows `--dry-run` to work in sandboxes where
+    // `~/.zoder` is readable but not writable.
+    let routing = if cli.dry_run {
+        RoutingContext::load_readonly(&eng.cfg)?
+    } else {
+        RoutingContext::load(&eng.cfg)?
+    };
     let provider_cfg = match routing.real_provider_for_model(&eng.cfg, &primary) {
         Some(provider) => provider,
         None => {
@@ -14910,5 +14944,79 @@ mod events_file_tests {
         assert!(events_path.exists());
         let content = std::fs::read_to_string(&events_path).unwrap();
         assert!(content.contains("\"test\": true"));
+    }
+
+    /// Regression test: `RoutingContext::load_readonly` must not open the
+    /// ledger lock file for writing.  A dry-run routing preview should work
+    /// when `~/.zoder` is readable but not writable.
+    #[test]
+    fn load_readonly_does_not_require_writable_ledger_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let lock_path = ledger_path.with_extension("jsonl.lock");
+
+        // Write a valid (empty) ledger file so entries_readonly succeeds.
+        std::fs::write(&ledger_path, "").unwrap();
+
+        // Make the directory read+execute but NOT writable.  This simulates
+        // a sandboxed `~/.zoder` that can be read but not written to.
+        // (0o555 = r-x for owner/group/other — no write bit.)
+        let mut perms = std::fs::metadata(dir.path())
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let cfg = Config::default_provider(dir.path());
+
+        // `load_readonly` must succeed even when the directory is not writable.
+        let result = RoutingContext::load_readonly(&cfg);
+        assert!(result.is_ok(), "load_readonly must not require write access");
+
+        // Verify the lock file was NOT created.
+        assert!(
+            !lock_path.exists(),
+            "entries_readonly must not create the lock file"
+        );
+    }
+
+    /// Regression test: `RoutingContext::load` (strict) must still fail when
+    /// the directory is not writable — we must not silently suppress write
+    /// failures for the normal (non-dry-run) path.
+    #[test]
+    fn load_strict_fails_on_unwritable_ledger_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+
+        // Write a valid (empty) ledger file.
+        std::fs::write(&ledger_path, "").unwrap();
+
+        // Make the directory read+execute but NOT writable.
+        let mut perms = std::fs::metadata(dir.path())
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let cfg = Config::default_provider(dir.path());
+
+        // `load` (strict) must fail because it needs to create/open the
+        // lock file for writing.
+        let result = RoutingContext::load(&cfg);
+        assert!(
+            result.is_err(),
+            "load (strict) must fail when the directory is not writable"
+        );
+        let err_str = format!("{:?}", result.err().unwrap());
+        eprintln!("load error: {}", err_str);
+        assert!(
+            err_str.contains("opening ledger lock"),
+            "error must mention the ledger lock, got: {}",
+            err_str
+        );
     }
 }
