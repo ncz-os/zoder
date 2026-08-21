@@ -31,7 +31,7 @@ echo "Generating detailed subcommand help..."
 {
     echo "=== MAIN COMMANDS ==="
     $ZODER_BIN --help | sed -n '/^Commands:/,/^Options:/p' | head -n -1
-    
+
     echo -e "\n=== GLOBAL OPTIONS ==="
     $ZODER_BIN --help | sed -n '/^Options:/,/^Commands:/p' | head -n -1
 } > /tmp/zoder-cli-surface-temp.txt
