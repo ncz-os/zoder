@@ -139,11 +139,15 @@ pub fn classify_err_kind(kind: crate::provider::ErrKind) -> Classification {
     use crate::provider::ErrKind;
     match kind {
         // The breaker's signal: timeouts / decode / network / generic
-        // server. These should NOT cause consult to skip a model — the
-        // breaker already handles repeated failures. Recorded as `Error`.
-        ErrKind::Timeout | ErrKind::Network | ErrKind::Decode | ErrKind::Server | ErrKind::Http => {
-            Classification::Error
-        }
+        // server / truncation. These should NOT cause consult to skip a
+        // model — the breaker already handles repeated failures. Recorded
+        // as `Error`.
+        ErrKind::Timeout
+        | ErrKind::Network
+        | ErrKind::Decode
+        | ErrKind::Server
+        | ErrKind::Http
+        | ErrKind::Truncation => Classification::Error,
         // No-status RateLimit: treat as Capacity so consult skips it until
         // the next probe.
         ErrKind::RateLimit => Classification::Capacity,

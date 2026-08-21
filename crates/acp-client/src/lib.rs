@@ -4252,7 +4252,27 @@ where
                 }
                 break "timeout".to_string();
             }
-            Ok(r) => r.context("reading from goose ACP engine")?,
+            Ok(r) => match r {
+                Ok(got_line) => got_line,
+                Err(e) => {
+                    // Distinguish between different types of read errors:
+                    // - InvalidData from frame cap: this is a sign of a misbehaving
+                    //   engine, so we return an error (original Z-17 behavior).
+                    // - Other errors (connection errors, etc.): treat as partial
+                    //   turn - preserve whatever was streamed so far.
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        return Err(e.into());
+                    }
+                    return Ok(AgentRun {
+                        session_id: session_id.clone(),
+                        outcome: "partial".to_string(),
+                        content,
+                        input_tokens,
+                        tool_calls,
+                        failure_detail: None,
+                    });
+                }
+            },
         };
         if !got_line {
             // Engine closed its end. If we never got an explicit
@@ -6534,6 +6554,15 @@ mod tests {
     /// `session/request_permission` request is read-after-write so the
     /// client's reply lands in `received` for the test to assert on.
     async fn run_mock(server: MockGoose, engine_io: tokio::io::DuplexStream) {
+        run_mock_with_behavior(server, engine_io, MockBehavior::Normal).await
+    }
+
+    /// The mock server task with configurable behavior.
+    async fn run_mock_with_behavior(
+        server: MockGoose,
+        engine_io: tokio::io::DuplexStream,
+        behavior: MockBehavior,
+    ) {
         use tokio::io::AsyncWriteExt as _;
         let (r, mut w) = tokio::io::split(engine_io);
         let mut r = tokio::io::BufReader::new(r);
@@ -6597,22 +6626,28 @@ mod tests {
             }
         }
 
-        // 4. read session/prompt
+        // 4. For Normal behavior: read session/prompt and send response.
+        //    For MidTurnDisconnect: read session/prompt but DON'T send
+        //    the response, then close the stream to simulate a disconnect.
         read_one(&mut r, &server.received).await;
 
-        // 5. final prompt response with terminal stopReason.
-        write_one(
-            &mut w,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "prompt",
-                "result": { "stopReason": "end_turn" }
-            }),
-        )
-        .await;
+        if matches!(behavior, MockBehavior::Normal) {
+            // 5. final prompt response with terminal stopReason.
+            write_one(
+                &mut w,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "prompt",
+                    "result": { "stopReason": "end_turn" }
+                }),
+            )
+            .await;
 
-        // Give the client a moment to read the response.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Give the client a moment to read the response.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // For MidTurnDisconnect: close the stream without sending prompt response
+        // to simulate a mid-turn disconnect.
     }
 
     /// Run the goose driver against a mock engine speaking the real
@@ -6623,13 +6658,33 @@ mod tests {
         show_reasoning: bool,
         approval: ApprovalPolicy,
     ) -> (Vec<serde_json::Value>, AgentRun, Vec<AgentEvent>) {
+        drive_against_mock_with_behavior(outbound, show_reasoning, approval, MockBehavior::Normal)
+            .await
+    }
+
+    /// Behavior variants for the mock engine.
+    enum MockBehavior {
+        /// Normal behavior: complete the turn with stopReason.
+        Normal,
+        /// Mid-turn disconnect: close the connection after outbound frames
+        /// without sending the prompt response.
+        MidTurnDisconnect,
+    }
+
+    /// Run the goose driver against a mock with configurable behavior.
+    async fn drive_against_mock_with_behavior(
+        outbound: Vec<String>,
+        show_reasoning: bool,
+        approval: ApprovalPolicy,
+        behavior: MockBehavior,
+    ) -> (Vec<serde_json::Value>, AgentRun, Vec<AgentEvent>) {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = MockGoose {
             received: received.clone(),
             outbound,
         };
         let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
-        let server_handle = tokio::spawn(run_mock(server, engine_io));
+        let server_handle = tokio::spawn(run_mock_with_behavior(server, engine_io, behavior));
         let (mut r, mut w) = tokio::io::split(client_io);
         let mut r = tokio::io::BufReader::new(&mut r);
         let mut opts = goose_opts(Some("gpt-4o-mini"));
