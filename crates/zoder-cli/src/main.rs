@@ -14967,9 +14967,7 @@ mod events_file_tests {
         // Make the directory read+execute but NOT writable.  This simulates
         // a sandboxed `~/.zoder` that can be read but not written to.
         // (0o555 = r-x for owner/group/other — no write bit.)
-        let mut perms = std::fs::metadata(dir.path())
-            .unwrap()
-            .permissions();
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o555);
         std::fs::set_permissions(dir.path(), perms).unwrap();
 
@@ -14977,7 +14975,10 @@ mod events_file_tests {
 
         // `load_readonly` must succeed even when the directory is not writable.
         let result = RoutingContext::load_readonly(&cfg);
-        assert!(result.is_ok(), "load_readonly must not require write access");
+        assert!(
+            result.is_ok(),
+            "load_readonly must not require write access"
+        );
 
         // Verify the lock file was NOT created.
         assert!(
@@ -15000,9 +15001,7 @@ mod events_file_tests {
         std::fs::write(&ledger_path, "").unwrap();
 
         // Make the directory read+execute but NOT writable.
-        let mut perms = std::fs::metadata(dir.path())
-            .unwrap()
-            .permissions();
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o555);
         std::fs::set_permissions(dir.path(), perms).unwrap();
 

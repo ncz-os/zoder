@@ -4062,8 +4062,13 @@ mod tests {
         req.presence_penalty = Some(1.5);
         let body = p.body(&req);
         assert_eq!(body["top_k"], serde_json::json!(20));
-        let pp = body["presence_penalty"].as_f64().expect("presence_penalty on the wire");
-        assert!((pp - 1.5).abs() < 1e-6, "presence_penalty should be ~1.5, got {pp}");
+        let pp = body["presence_penalty"]
+            .as_f64()
+            .expect("presence_penalty on the wire");
+        assert!(
+            (pp - 1.5).abs() < 1e-6,
+            "presence_penalty should be ~1.5, got {pp}"
+        );
     }
 
     /// `top_p` and `chat_template_kwargs` must reach the wire.
@@ -4102,7 +4107,10 @@ mod tests {
     fn chat_body_omits_sampling_fields_when_unset() {
         let p = azure_provider_fixture("openai-chat", Auth::None, None);
         let body = p.body(&sampling_req(None, None));
-        assert!(body.get("top_p").is_none(), "top_p must be absent, not null");
+        assert!(
+            body.get("top_p").is_none(),
+            "top_p must be absent, not null"
+        );
         assert!(
             body.get("chat_template_kwargs").is_none(),
             "chat_template_kwargs must be absent, not null"
