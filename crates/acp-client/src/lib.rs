@@ -2856,6 +2856,51 @@ fn acp_kind_category(kind: &str) -> Option<ToolKindCategory> {
     })
 }
 
+/// Semantic classification of a tool call, derived from the ACP v1
+/// `toolCall.kind` when present (the MACHINE tool category) and never
+/// from the human-rendered `toolCall.title`.
+///
+/// ACP v1 defines a small, fixed set of semantic kinds. We collapse them
+/// into the three security-relevant buckets this file already reasons about:
+///   * `Read`  — read/search/fetch: eligible for the Allowlist auto-approve.
+///   * `Write` — edit/delete/move: routed through writable-root containment.
+///   * `Exec`  — execute: an exec-class tool; NOT write-class, decided by the
+///     name-based policy (exec-arg inspection is a later slice).
+///
+/// Anything we do not recognize (e.g. `think`, `other`, or a novel kind) is
+/// `Other`, which means "fall back to the name/title heuristic" — we do NOT
+/// guess, and we never let an unknown kind widen the allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolKindCategory {
+    Read,
+    Write,
+    Exec,
+    Other,
+}
+
+/// Map an ACP v1 `toolCall.kind` string to a [`ToolKindCategory`]. Returns
+/// `None` for an empty/absent kind so the caller can fall back to the
+/// existing name-based heuristic (this is what keeps zeroclaw — which sends a
+/// canonical `tool_name` and no ACP kind — on its current code path).
+///
+/// The match is case-insensitive and covers the ACP v1 semantic kinds
+/// (`read`, `search`, `fetch`, `edit`, `delete`, `move`, `execute`) plus a
+/// couple of tolerant aliases (`write` as an edit synonym, `exec` for
+/// `execute`). Anything else maps to `Other` (fall back to the heuristic),
+/// NEVER to `Read` — an unrecognized kind must never widen auto-approval.
+fn acp_kind_category(kind: &str) -> Option<ToolKindCategory> {
+    let k = kind.trim().to_ascii_lowercase();
+    if k.is_empty() {
+        return None;
+    }
+    Some(match k.as_str() {
+        "read" | "search" | "fetch" => ToolKindCategory::Read,
+        "edit" | "delete" | "move" | "write" => ToolKindCategory::Write,
+        "execute" | "exec" => ToolKindCategory::Exec,
+        _ => ToolKindCategory::Other,
+    })
+}
+
 fn decide_approval(policy: ApprovalPolicy, tool: &str) -> bool {
     match policy {
         ApprovalPolicy::All => true,
