@@ -370,6 +370,41 @@ pub struct ModelEntry {
     /// Provider base URL for this model entry (optional, for informational).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Sampling temperature to send for this model. `None` leaves the field
+    /// off the wire so the model uses its own default.
+    ///
+    /// Models publish sampling recommendations that differ from ours -- NVIDIA
+    /// documents temperature 1.0 / top_p 0.95 for Nemotron 3.5, for instance --
+    /// and before this existed there was no way to honour them: the wire field
+    /// was plumbed but nothing could populate it from config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling cutoff for this model. `None` omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Top-k cutoff. `None` omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Presence penalty. `None` omits the field.
+    ///
+    /// Not a nicety for every model: Qwen3.8 publishes materially different
+    /// presets for its two modes -- presence_penalty 0.0 when thinking, 1.5
+    /// when not -- so a single hardcoded value cannot serve both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Free-form `chat_template_kwargs` forwarded verbatim on every request to
+    /// this model.
+    ///
+    /// Some chat templates gate real behaviour on a kwarg rather than a
+    /// sampling parameter. Nemotron 3.5 Lightning returns EMPTY content for
+    /// coding-agent workloads unless `force_nonempty_content` is set: measured
+    /// here at 0 content characters across temperature 0 and 1.0, with and
+    /// without `enable_thinking`, and 4936 characters the moment the flag is
+    /// passed. A model that cannot be configured this way is unusable as an
+    /// agent regardless of its weights, so this is deliberately free-form
+    /// rather than an allow-list of the kwargs we happen to know about today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 fn default_kind() -> String {

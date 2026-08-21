@@ -88,6 +88,13 @@ pub fn probe_request(model_id: &str) -> ChatRequest {
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
+        // A liveness ping is deliberately unsampled and template-neutral: it
+        // must answer the same way for every backend, so it carries no model
+        // specific sampling or chat-template kwargs.
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        chat_template_kwargs: None,
     }
 }
 
