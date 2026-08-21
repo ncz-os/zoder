@@ -7,4 +7,3 @@
 # It serves as both:
 # 1. The canonical reference for CLI documentation
 # 2. A CI gate to detect when CLI drift occurs
-
