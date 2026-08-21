@@ -5137,22 +5137,6 @@ const JOB_META_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | li
 /// parse. Sorted newest-started-first, matching `all_jobs()`. Used by both
 /// the in-process dispatcher and the `jobs list`/`jobs prune` subcommands
 /// (the latter passes an explicit `dir` so tests can point at a tempdir).
-pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
-    let mut jobs: Vec<JobMeta> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if let Some(m) = read_meta(&e.path()) {
-                jobs.push(m);
-            }
-        }
-    }
-    jobs.sort_by_key(|b| std::cmp::Reverse(b.started));
-    jobs
-}
-
-/// Read every `<id>/meta.json` under `dir`, skipping entries that fail to
-/// parse. Sorted newest-started-first, matching `all_jobs()`. Used by both
-/// the in-process dispatcher and the `jobs list`/`jobs prune` subcommands
 /// (the latter passes an explicit `dir` so tests can point at a tempdir).
 pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
     let mut jobs: Vec<JobMeta> = Vec::new();
