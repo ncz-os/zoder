@@ -5150,6 +5150,23 @@ pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
     jobs
 }
 
+/// Read every `<id>/meta.json` under `dir`, skipping entries that fail to
+/// parse. Sorted newest-started-first, matching `all_jobs()`. Used by both
+/// the in-process dispatcher and the `jobs list`/`jobs prune` subcommands
+/// (the latter passes an explicit `dir` so tests can point at a tempdir).
+pub(crate) fn read_dir_jobs(dir: &Path) -> Vec<JobMeta> {
+    let mut jobs: Vec<JobMeta> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Some(m) = read_meta(&e.path()) {
+                jobs.push(m);
+            }
+        }
+    }
+    jobs.sort_by(|a, b| b.started.cmp(&a.started));
+    jobs
+}
+
 fn write_meta(dir: &Path, meta: &JobMeta) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(test)]
