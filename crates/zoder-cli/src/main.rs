@@ -4765,7 +4765,50 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         .ok_or_else(|| anyhow::anyhow!("no model resolved"))?
         .clone();
 
-    if cli.explain || cli.dry_run {
+    // L1: --dry-run short-circuits before acquiring the ledger lock.
+    // RoutingContext::load opens ledger.jsonl.lock for create/read/write,
+    // which blocks when ~/.zoder is read-only. A dry run performs no model
+    // call and records no usage, so it must not need the lock.
+    if cli.dry_run {
+        // For dry runs we use the simpler, no-ledger provider resolution.
+        // This is sufficient for a routing preview — the quota-aware
+        // variant (RoutingContext::real_provider_for_model) is only needed
+        // when actually dispatching, where the ledger lock is required.
+        let provider_cfg = match eng.cfg.real_provider_for_model(&primary) {
+            Some(provider) => provider,
+            None => {
+                let local_hint = format!(
+                    "no real provider is configured for model '{primary}' — routing would fall through to the {host} placeholder and fail. Configure a provider that serves it (e.g. in ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
+                    host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+                );
+                let diagnostic =
+                    enrich_no_provider_diagnostic(&engine_socket_path(), &primary, local_hint).await;
+                anyhow::bail!(diagnostic);
+            }
+        };
+        let entry = eng.corpus.get(&primary);
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "chain": chain,
+                    "model": primary,
+                    "provider": provider_cfg.id,
+                    "free": entry.map(|e| e.free).unwrap_or(false),
+                })
+            );
+        } else {
+            println!(
+                "[dry-run] would call {primary} via {} (chain: {})",
+                provider_cfg.id,
+                chain.join(" -> ")
+            );
+        }
+        return Ok(());
+    }
+
+    if cli.explain {
         eprintln!("[route] {reason}");
         if chain.len() > 1 {
             eprintln!("[route] chain: {}", chain.join(" -> "));
@@ -4794,30 +4837,6 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             anyhow::bail!(diagnostic);
         }
     };
-
-    // L2: --dry-run short-circuits before reading stdin and any paid confirm.
-    if cli.dry_run {
-        let entry = eng.corpus.get(&primary);
-        if cli.json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "dry_run": true,
-                    "chain": chain,
-                    "model": primary,
-                    "provider": provider_cfg.id,
-                    "free": entry.map(|e| e.free).unwrap_or(false),
-                })
-            );
-        } else {
-            println!(
-                "[dry-run] would call {primary} via {} (chain: {})",
-                provider_cfg.id,
-                chain.join(" -> ")
-            );
-        }
-        return Ok(());
-    }
 
     // Strict free guard: config default, relaxable via --lenient-telemetry, but
     // always enforced when the user explicitly asked for --require-free.
