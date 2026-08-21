@@ -490,13 +490,12 @@ impl HealthStore {
             .unwrap_or(false)
     }
 
-    /// `true` when the model's most recent classification marks it skipped:
-    /// fresh `Capacity` outcomes are skipped only until their TTL elapses,
-    /// while `Unauthorized` and `Unprovisioned` remain permanent skips. Mirrors
-    /// `breaker_open`: these classifications are breaker-neutral (W1), so the
-    /// breaker stays closed forever for a 401/404 model — routing must consult
-    /// this too or it will keep selecting a guaranteed-failed model. Unknown
-    /// model => false (nothing recorded means nothing to skip).
+/// `true` when the model's most recent classification marks it "skip for
+    /// now" (Unauthorized/Unprovisioned/Capacity). Mirrors `breaker_open`:
+    /// these classifications are breaker-neutral (W1), so the breaker stays
+    /// closed forever for a 401/404 model — routing must consult this too or
+    /// it will keep selecting a guaranteed-failed model. Unknown model =>
+    /// false (nothing recorded means nothing to skip).
     pub fn is_skipped_by_classification(&self, model: &str) -> bool {
         self.models
             .get(model)
