@@ -114,9 +114,9 @@ jobs:
 
           # Build the engine pair natively. Prefer --locked (fork lock kept in
           # sync); fall back to unlocked on drift so the nightly still ships.
-          if ! ( cd .zc-src && cargo build --release --locked -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" ); then
+          if ! ( cd .zc-src && cargo build --release --locked -p zeroclaw -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" ); then
             echo "::warning::--locked engine build failed (fork Cargo.lock drift?); rebuilding unlocked"
-            ( cd .zc-src && cargo build --release -p zeroclawlabs -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" )
+            ( cd .zc-src && cargo build --release -p zeroclaw -p zerocode --bin zeroclaw --bin zerocode --target "$TRIPLE" )
           fi
 
           ZBIN="target/${TRIPLE}/release/zoder"
