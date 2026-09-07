@@ -1817,7 +1817,7 @@ fn quickstart_validation_params(state: Option<&Value>, model: &str) -> Value {
                 "mode": "fresh",
                 "value": {
                     "provider_type": provider_type,
-                    "alias": "zoder-diagnostic",
+                    "alias": "zoder_diagnostic",
                     "model": model,
                     "fields": {}
                 }
@@ -1828,7 +1828,7 @@ fn quickstart_validation_params(state: Option<&Value>, model: &str) -> Value {
             "channels": [],
             "peer_groups": [],
             "agent": {
-                "name": "zoder-diagnostic",
+                "name": "zoder_diagnostic",
                 "system_prompt": "",
                 "personality_file": null,
                 "personality_files": []
