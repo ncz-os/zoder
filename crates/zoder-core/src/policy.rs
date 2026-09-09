@@ -280,6 +280,7 @@ mod tests {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(crate::config::Provider {
             id: "minimax".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: crate::config::Auth::None,

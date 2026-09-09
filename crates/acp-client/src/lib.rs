@@ -9,6 +9,7 @@
 //! Lifecycle (mirrors zeroclaw `crates/zeroclaw-runtime/src/rpc/dispatch.rs`):
 //!   connect -> `initialize` -> `session/new {agent_alias,cwd,chat_mode:"acp"}`
 //!   -> (optional) `session/configure {overrides:{model}}`
+//!   -> (optional) final `config/get` consistency check
 //!   -> `session/prompt {session_id,prompt}` (returns `{}` immediately)
 //!   -> consume `session/update` notifications until `turn_complete`
 //!   -> approvals answered with `session/approve`.
@@ -70,7 +71,8 @@ use tokio::process::Child;
 pub(crate) const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Wall-clock budget for the per-RPC setup round-trips (`initialize`,
-/// `session/new`, `session/configure`) issued before `session/prompt`.
+/// `session/new`, `session/configure`, final `config/get`) issued before
+/// `session/prompt`.
 ///
 /// The agentic driver already enforces a turn-wide `opts.timeout` and the
 /// streaming loop after `session/prompt` is bounded by `deadline_at`.
@@ -613,6 +615,13 @@ pub struct AgentOptions {
     /// like `minimax` / `deepseek-v4-pro` and goose has no idea what they
     /// mean).
     pub model_id: Option<String>,
+    /// Masked `config/get` value whose model routes were classified and gated
+    /// by the caller. When present on a Zeroclaw run, the driver re-fetches
+    /// `config/get` after `session/new` and immediately before
+    /// `session/prompt`; any failure or difference withholds the prompt.
+    /// This is client-only state and is never added to a daemon RPC. Goose
+    /// ignores it.
+    pub zeroclaw_config_snapshot: Option<Value>,
     /// Resume an existing session id (None = new session).
     pub session_id: Option<String>,
     /// Stream `agent_thought_chunk` (reasoning) too.
@@ -742,6 +751,7 @@ impl AgentOptions {
             prompt: prompt.into(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -1401,6 +1411,14 @@ pub async fn list_agents(socket: &Path) -> anyhow::Result<AgentsListResult> {
 pub async fn agents_status(socket: &Path) -> anyhow::Result<AgentsStatusResult> {
     let result = read_only_rpc(socket, "agents/status").await?;
     serde_json::from_value(result).context("decoding agents/status result")
+}
+
+/// Fetch the running zeroclaw daemon's masked configuration using
+/// `config/get`. Model-pin verification uses this live view rather than only
+/// reading `config.toml`: a daemon can legitimately still be serving an older
+/// configuration until it is reloaded or restarted.
+pub async fn fetch_engine_config(socket: &Path) -> anyhow::Result<Value> {
+    read_only_rpc(socket, "config/get").await
 }
 
 /// Cancel an in-flight turn on the daemon for `session_id` and wait up to
@@ -2095,6 +2113,33 @@ fn classify_partial_outcome_flat(
     }
 }
 
+/// Build the Zeroclaw `session/new` parameters in one place so the
+/// fresh-create retry uses exactly the same existing RPC shape as the first
+/// request.
+fn zeroclaw_session_new_params(
+    opts: &AgentOptions,
+    session_id: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    params.insert("agent_alias".into(), json!(opts.agent_alias));
+    params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
+    params.insert("chat_mode".into(), json!("acp"));
+    if let Some(session_id) = session_id {
+        params.insert("session_id".into(), json!(session_id));
+    }
+    params
+}
+
+fn verify_zeroclaw_config_snapshot(expected: &Value, actual: &Value) -> anyhow::Result<()> {
+    if actual != expected {
+        bail!(
+            "the running Zeroclaw configuration changed after model/agent routing was gated; \
+             refusing to send session/prompt"
+        );
+    }
+    Ok(())
+}
+
 async fn drive<F: FnMut(AgentEvent)>(
     opts: &AgentOptions,
     on_event: &mut F,
@@ -2160,13 +2205,7 @@ async fn drive<F: FnMut(AgentEvent)>(
     // path leaves it untouched. A non-error failure (timeout,
     // dropped connection) is surfaced unchanged so the caller can
     // decide.
-    let mut new_params = serde_json::Map::new();
-    new_params.insert("agent_alias".into(), json!(opts.agent_alias));
-    new_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
-    new_params.insert("chat_mode".into(), json!("acp"));
-    if let Some(sid) = &effective_session_id {
-        new_params.insert("session_id".into(), json!(sid));
-    }
+    let new_params = zeroclaw_session_new_params(opts, effective_session_id.as_deref());
     write_frame(
         &mut write_half,
         &json!({
@@ -2201,10 +2240,7 @@ async fn drive<F: FnMut(AgentEvent)>(
             // failure path leaves it untouched.
             //
             // Retry without session_id.
-            let mut retry_params = serde_json::Map::new();
-            retry_params.insert("agent_alias".into(), json!(opts.agent_alias));
-            retry_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
-            retry_params.insert("chat_mode".into(), json!("acp"));
+            let retry_params = zeroclaw_session_new_params(opts, None);
             write_frame(
                 &mut write_half,
                 &json!({
@@ -2246,7 +2282,6 @@ async fn drive<F: FnMut(AgentEvent)>(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("session/new returned no session_id"))?
         .to_string();
-
     // 3. optional model override (rpc-only).
     if let Some(model) = &opts.model_override {
         write_frame(
@@ -2279,13 +2314,58 @@ async fn drive<F: FnMut(AgentEvent)>(
     // AGENTS.md / CLAUDE.md at the repo root (regression pinned
     // by `prompt_none_is_byte_identical_to_task`).
     let final_prompt = compose_session_prompt(opts);
+
+    if let Some(expected_config) = opts.zeroclaw_config_snapshot.as_ref() {
+        write_frame(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "pre-prompt-config",
+                "method": "config/get",
+                "params": {},
+            }),
+        )
+        .await
+        .context("sending final Zeroclaw config/get before session/prompt")?;
+        let actual_config = tokio::time::timeout(
+            SETUP_RPC_TIMEOUT,
+            read_result(&mut reader, "pre-prompt-config"),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "final Zeroclaw config/get timed out after {SETUP_RPC_TIMEOUT:?}; refusing to \
+                 send session/prompt"
+            )
+        })?
+        .context("final Zeroclaw config/get failed; refusing to send session/prompt")?;
+
+        // This is the narrowest identity check possible using Zeroclaw's
+        // existing RPCs: it runs on the session connection immediately before
+        // releasing the prompt. One residual ABA race is not observable through
+        // that surface because `session/new` has already snapshotted the daemon
+        // config and built the session. Config can be A at zoder's preflight, B
+        // while the session is built, then A again for this final `config/get`.
+        // That A -> B -> A sequence passes this comparison even though the
+        // session remains bound to B. The existing `session/new` result exposes
+        // only session id, agent alias, message count, and workspace directory;
+        // it does not expose the bound model/provider/fallback closure or a
+        // config generation. The existing RPC surface therefore cannot close
+        // this race. Fail closed on every observable difference here and
+        // otherwise send the prompt immediately.
+        verify_zeroclaw_config_snapshot(expected_config, &actual_config)?;
+    }
+
+    let mut prompt_params = serde_json::Map::new();
+    prompt_params.insert("session_id".into(), json!(session_id));
+    prompt_params.insert("prompt".into(), json!(final_prompt));
     write_frame(
         &mut write_half,
         &json!({
             "jsonrpc": "2.0",
             "id": "prompt",
             "method": "session/prompt",
-            "params": { "session_id": session_id, "prompt": final_prompt },
+            "params": Value::Object(prompt_params),
         }),
     )
     .await?;
@@ -4914,6 +4994,364 @@ mod tests {
     fn empty_terminal_content_yields_no_detail() {
         assert_eq!(terminal_failure_detail("failed", "", ""), None);
     }
+
+    #[test]
+    fn config_snapshot_comparison_rejects_every_observable_change() {
+        let expected = json!({
+            "agents": { "author": { "model": "safe-model" } },
+            "providers": { "models": {} }
+        });
+        assert!(verify_zeroclaw_config_snapshot(&expected, &expected).is_ok());
+
+        let changed = json!({
+            "agents": { "author": { "model": "paid-model-after-reload" } },
+            "providers": { "models": {} }
+        });
+        let error = verify_zeroclaw_config_snapshot(&expected, &changed)
+            .expect_err("a changed live config must fail closed before prompt dispatch");
+        assert!(error
+            .to_string()
+            .contains("refusing to send session/prompt"));
+    }
+
+    /// Exercise the real Unix-socket driver with an early, already-gated
+    /// `config/get` snapshot, then make the fake daemon report a different
+    /// value at the final pre-prompt re-fetch. The later daemon state must win:
+    /// the driver closes the connection without ever releasing the prompt.
+    #[tokio::test]
+    async fn config_change_between_preflight_and_prompt_sends_no_session_prompt() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("pre-prompt-config-change.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let gated_config = json!({
+            "agents": { "author": { "model": "safe-model" } }
+        });
+        let changed_config = json!({
+            "agents": { "author": { "model": "paid-model-after-reload" } }
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut frames = Vec::new();
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str::<Value>(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str::<Value>(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "existing-rpc-session" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str::<Value>(line.trim()).unwrap());
+            assert_eq!(frames[2]["method"], "config/get");
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "pre-prompt-config",
+                    "result": changed_config,
+                }),
+            )
+            .await
+            .unwrap();
+
+            // A changed final snapshot makes `drive` return and drop its
+            // socket. Read until EOF so an accidental prompt is captured.
+            loop {
+                line.clear();
+                let read =
+                    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line)).await;
+                match read {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(_)) => frames.push(serde_json::from_str::<Value>(line.trim()).unwrap()),
+                    Ok(Err(error)) => panic!("reading fake daemon socket failed: {error}"),
+                }
+            }
+            frames
+        });
+
+        let mut opts = AgentOptions::new(
+            &socket,
+            "author",
+            std::path::PathBuf::from("/tmp"),
+            "must never reach a model",
+        );
+        opts.zeroclaw_config_snapshot = Some(gated_config);
+        opts.timeout = Duration::from_secs(5);
+        let error = run_agent(&opts, |_| {})
+            .await
+            .expect_err("a changed pre-prompt config must fail before prompt dispatch");
+        let frames = server.await.unwrap();
+
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(frames[1]["method"], "session/new");
+        assert_eq!(
+            frames[1]["params"],
+            json!({
+                "agent_alias": "author",
+                "cwd": "/tmp",
+                "chat_mode": "acp"
+            }),
+            "session/new must retain the current Zeroclaw RPC shape"
+        );
+        assert_eq!(frames[2]["method"], "config/get");
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame["method"] != "session/prompt"),
+            "session/prompt must be withheld after the final snapshot changed: {frames:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("configuration changed"), "{message}");
+        assert!(
+            message.contains("refusing to send session/prompt"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_final_config_uses_only_existing_rpc_fields_and_releases_prompt() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("matching-pre-prompt-config.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected_config = json!({
+            "agents": { "author": { "model": "safe-model" } }
+        });
+        let server_config = expected_config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "existing-rpc-session" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let config_get: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(config_get["method"], "config/get");
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "pre-prompt-config",
+                    "result": server_config,
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let prompt: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(prompt["method"], "session/prompt");
+            assert_eq!(
+                prompt["params"],
+                json!({
+                    "session_id": "existing-rpc-session",
+                    "prompt": "safe prompt"
+                }),
+                "session/prompt must retain the current Zeroclaw RPC shape"
+            );
+            write_frame(
+                &mut write_half,
+                &json!({ "jsonrpc": "2.0", "id": "prompt", "result": {} }),
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "turn_complete", "outcome": "completed" },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut opts = AgentOptions::new(&socket, "author", "/tmp", "safe prompt");
+        opts.zeroclaw_config_snapshot = Some(expected_config);
+        opts.timeout = Duration::from_secs(5);
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("an unchanged final config should release the prompt");
+        assert_eq!(run.outcome, "completed");
+        server.await.unwrap();
+    }
+
+    /// Pin the limitation of the current Zeroclaw RPC surface: the daemon can
+    /// bind a session while config B is active and return to config A before
+    /// the only available post-creation `config/get`. `session/new` reports no
+    /// bound model/provider or config generation, so A -> B -> A is identical
+    /// on the wire to an unchanged A -> A sequence and the prompt is released.
+    ///
+    /// This is intentionally a risk-characterization test, not a claim that
+    /// the ABA case is safe. If Zeroclaw later exposes session-scoped identity,
+    /// this test should be replaced by one that rejects the mismatched binding.
+    #[tokio::test]
+    async fn aba_config_change_is_unobservable_and_releases_prompt() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("aba-pre-prompt-config.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let config_a = json!({
+            "agents": { "author": { "model": "safe-model-a" } }
+        });
+        let final_config_a = config_a.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let session_new: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(session_new["method"], "session/new");
+
+            // Model the daemon's private, session-scoped state while global
+            // config B is active. None of this identity is representable in
+            // today's SessionNewResult, so the client receives only the four
+            // fields emitted by the existing daemon implementation.
+            let bound_model_during_session_new = "paid-model-b";
+            let session_new_result = json!({
+                "session_id": "aba-session",
+                "agent_alias": "author",
+                "message_count": 0,
+                "workspace_dir": "/tmp",
+            });
+            assert!(session_new_result.get("model").is_none());
+            assert!(session_new_result.get("model_provider").is_none());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": session_new_result,
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let config_get: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(config_get["method"], "config/get");
+            // Global config has returned from B to A, masking the model that
+            // was captured in the already-created session.
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "pre-prompt-config",
+                    "result": final_config_a,
+                }),
+            )
+            .await
+            .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let prompt: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(prompt["method"], "session/prompt");
+            write_frame(
+                &mut write_half,
+                &json!({ "jsonrpc": "2.0", "id": "prompt", "result": {} }),
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "turn_complete", "outcome": "completed" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            (bound_model_during_session_new, prompt)
+        });
+
+        let mut opts = AgentOptions::new(&socket, "author", "/tmp", "ABA-visible prompt");
+        opts.zeroclaw_config_snapshot = Some(config_a);
+        opts.timeout = Duration::from_secs(5);
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("A -> B -> A cannot be distinguished using the existing RPC fields");
+        let (bound_model, prompt) = server.await.unwrap();
+
+        assert_eq!(bound_model, "paid-model-b");
+        assert_eq!(run.outcome, "completed");
+        assert_eq!(prompt["params"]["session_id"], "aba-session");
+        assert_eq!(prompt["params"]["prompt"], "ABA-visible prompt");
+    }
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
 
@@ -6008,6 +6446,7 @@ mod tests {
             prompt: "hello".to_string(),
             model_override: model_override.map(|s| s.to_string()),
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -10224,6 +10663,7 @@ mod tests {
             prompt: "say something then disconnect".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -10349,6 +10789,7 @@ mod tests {
             prompt: "say something".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -10502,6 +10943,7 @@ mod tests {
             prompt: "edit something then crash".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -10790,6 +11232,7 @@ mod tests {
             prompt: "do work, then misbehave".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -10987,6 +11430,7 @@ mod tests {
             prompt: "do work, then duplicate a frame".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -11143,6 +11587,7 @@ mod tests {
             prompt: "edit twice, then crash on the second".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -11749,6 +12194,7 @@ mod goose_acp_real_turn {
             prompt: "Reply with exactly the word: pong. Do not call any tools.".to_string(),
             model_override: None,
             model_id: Some("MiniMax-M3".to_string()),
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::None,
@@ -12058,6 +12504,7 @@ mod goose_acp_real_turn {
             prompt: "produce output then crash".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
@@ -12200,6 +12647,7 @@ mod goose_acp_real_turn {
             prompt: "edit something then crash".to_string(),
             model_override: None,
             model_id: None,
+            zeroclaw_config_snapshot: None,
             session_id: None,
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,

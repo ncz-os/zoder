@@ -3026,6 +3026,7 @@ mod tests {
     ) -> OpenAiProvider {
         let cfg = Provider {
             id: "azure-test".into(),
+            engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
             kind: kind.into(),
             auth,
@@ -3742,6 +3743,7 @@ mod tests {
     fn fixture_subscription_provider(account_id: Option<&str>) -> Provider {
         Provider {
             id: "minimax".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,

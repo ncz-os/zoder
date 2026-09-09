@@ -103,6 +103,32 @@ Then add a row to the feature inventory above. Keep the delta a **single commit*
   build cache) — handy for CI and local iteration.
 - Heavy zeroclaw builds run **off the dev Mac** (e.g. ULTRA) per fleet policy.
 
+## Accepted limits of the existing RPC surface
+
+zoder remains a downstream consumer of Zeroclaw's existing `config/get`,
+`session/new`, and `session/prompt` methods. Its last pre-prompt
+`config/get` comparison rejects every observable route change, but two
+conditions cannot be attested by those responses:
+
+- An A → B → A configuration change can bind `session/new` under B and return
+  to A before the final `config/get`. The session result does not report the
+  bound model/provider or a configuration generation. The
+  `aba_config_change_is_unobservable_and_releases_prompt` test intentionally
+  characterizes this accepted race.
+- `config/get` replaces all configured API keys and secret headers with the
+  same mask, and `session/new` reports no auth subject, credential fingerprint,
+  or billed account id. Its non-secret `auth_mode` and
+  `requires_openai_auth` fields identify only an authentication mechanism or
+  store, not the authenticated subject. Exact provider reference, kind, and
+  endpoint checks therefore cannot distinguish two accounts whose credentials
+  occupy the same profile. The
+  `masked_credentials_cannot_attest_a_different_billing_account` test
+  intentionally characterizes this accepted limitation.
+
+Neither limitation is treated as a requirement for a new Zeroclaw RPC. If the
+existing daemon protocol later exposes session-scoped or non-secret credential
+identity, zoder can bind it without changing this downstream-only policy.
+
 ## Vendoring goose (the second engine)
 
 goose is vendored **differently** from zeroclaw: there is **no source delta at

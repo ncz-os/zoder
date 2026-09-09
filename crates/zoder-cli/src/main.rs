@@ -38,11 +38,11 @@ use zoder_core::{
     probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers, AgentEvent, AgentOptions,
     AgentStatusEntry, AgentsStatusResult, ApprovalPolicy, BillableReservation, BillingMode,
     BudgetVerdict, ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot,
-    CostVerdict, DaemonReadiness, Decision, EngineKind, EnrichmentOutcome, Entry, GooseProviderEnv,
-    Gran, HealthStore, Ledger, Message, ModelEntry, OpenAiProvider, Period, PolicyGate,
-    PricingCatalog, PricingSource, ProbeOutcome, Provider, ProviderError, RoutableCandidate,
-    Router, ScenarioRole, ScopeStat, Session, State, SubscriptionPlan, Theme, Tier,
-    PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    CostVerdict, DaemonReadiness, Decision, EngineKind, EngineModelRegistry, EngineProviderRoute,
+    EnrichmentOutcome, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
+    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
+    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
+    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 use zoder_mcp_server::{run_server, RoutingContext as McpRoutingContext};
 
@@ -257,13 +257,12 @@ struct Cli {
     prompt: Option<String>,
 
     // ---- routing / cost (zoder additions) ----
-    /// Pin a model id: skips routing and selects the matching agent.
-    /// On the zeroclaw engine the model that actually runs is the one the
-    /// selected agent's provider is configured with, so a pin that maps to an
-    /// unintended agent runs a different model (a warning is printed when that
-    /// happens). `-m` supersedes `--agent` configuration — when both are
-    /// specified, `-m` wins for the primary author lane. Use `--agent <alias>`
-    /// to choose the model directly (agent config pin or model_provider chain).
+    /// Pin a model id: skips routing and selects the engine agent configured
+    /// for that exact model. If zeroclaw has no matching agent route, execution
+    /// fails before the turn instead of substituting another model. `-m`
+    /// supersedes `--agent` configuration when both are specified. Use
+    /// `--agent <alias>` to select through the agent's direct model or
+    /// model_provider route.
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
@@ -1143,13 +1142,26 @@ fn read_prompt(arg: Option<String>) -> anyhow::Result<String> {
 struct Engine {
     cfg: Config,
     corpus: Corpus,
+    engine_models: EngineModelRegistry,
 }
 
 impl Engine {
     fn load() -> anyhow::Result<Self> {
-        let cfg = Config::load()?;
+        let mut cfg = Config::load()?;
+        let engine_models = EngineModelRegistry::load_from(&engine_config_path())?;
+        cfg.bind_engine_provider_refs(&engine_models)
+            .with_context(|| {
+                format!(
+                    "validating zoder/Zeroclaw provider mappings while loading {}",
+                    engine_config_path().display()
+                )
+            })?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
-        Ok(Self { cfg, corpus })
+        Ok(Self {
+            cfg,
+            corpus,
+            engine_models,
+        })
     }
 
     /// Build an `Engine` from explicit in-memory parts — used by unit tests
@@ -1158,7 +1170,24 @@ impl Engine {
     /// callers always use [`Engine::load`].
     #[cfg(test)]
     fn from_parts(cfg: Config, corpus: Corpus) -> Self {
-        Self { cfg, corpus }
+        Self {
+            cfg,
+            corpus,
+            engine_models: EngineModelRegistry::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_parts_with_engine_models(
+        cfg: Config,
+        corpus: Corpus,
+        engine_models: EngineModelRegistry,
+    ) -> Self {
+        Self {
+            cfg,
+            corpus,
+            engine_models,
+        }
     }
 }
 
@@ -3253,6 +3282,18 @@ fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
     }
 }
 
+/// Resolve one selected agent alias to its model across the two configuration
+/// surfaces. A zoder-side direct pin remains the highest-priority override;
+/// otherwise consult the authoritative zeroclaw `config.toml` projection, then
+/// the legacy zoder-side `model_provider` registry.
+fn configured_model_for_agent(eng: &Engine, alias: Option<&str>) -> Option<String> {
+    let alias = alias?;
+    eng.cfg
+        .agent_model(Some(alias))
+        .or_else(|| eng.engine_models.model_for_agent(alias).map(str::to_owned))
+        .or_else(|| eng.cfg.resolve_model_for_agent(Some(alias)))
+}
+
 /// Resolve the effective PRIMARY model id for the CLI invocation, applying
 /// the precedence order so a per-agent pin or `-m` override ALWAYS wins
 /// over the global `primary_model`. The router then uses this resolved id
@@ -3264,7 +3305,7 @@ fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
 /// `[agents.X].model`:
 ///
 ///   1. explicit `-m <model>` (per-invocation) wins,
-///   2. `[agents.<alias>].model` for the resolved alias (per-agent pin),
+///   2. the selected agent's direct `model` or `model_provider` route,
 ///   3. `Config::primary_model` (the fallback DEFAULT — never overrides
 ///      a per-invocation or per-agent pin),
 ///   4. capability/health-ranked auto routing (no pin anywhere).
@@ -3276,7 +3317,7 @@ pub(crate) fn resolve_effective_primary(cli: &Cli, eng: &Engine) -> Option<Strin
     if let Some(m) = &cli.model {
         return Some(m.clone());
     }
-    if let Some(m) = eng.cfg.agent_model(cli.agent.as_deref()) {
+    if let Some(m) = configured_model_for_agent(eng, cli.agent.as_deref()) {
         return Some(m);
     }
     eng.cfg.primary_model.clone()
@@ -3299,7 +3340,8 @@ pub(crate) struct ResolvedRoutes {
 /// Resolve the routing chain for a single CLI invocation. Honors the
 /// precedence:
 ///
-///   1. **Strong pin** — `-m <model>` or `[agents.<alias>].model`.
+///   1. **Strong pin** — `-m <model>` or the selected agent's configured
+///      model (directly or through `model_provider`).
 ///      This is the only path that returns a SINGLETON chain (`[pin]`):
 ///      the operator has explicitly chosen THIS model for THIS
 ///      invocation/alias, and the contract callers rely on
@@ -3348,44 +3390,32 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
 
     // Resolve the pin for the "strong pin" path. Priority:
     //   1. explicit `-m <model>` (per-invocation) — wins over everything
-    //   2. `[agents.<alias>].model` (per-agent pin)
-    //
-    // NOTE: `[agents.<alias>].model_provider` is ONLY for the zeroclaw
-    // engine (agentic loop). It must NOT resolve under `--oneshot` — the
-    // oneshot router is a direct model selector, not a provider chain
-    // resolver. When `--agent <alias>` is specified under `--oneshot`
-    // without an explicit `-m`, the agent MUST have a direct `.model`
-    // pin, or else we error out so the operator cannot silently get a
-    // different model than what `--agent` declared.
+    //   2. the selected agent's direct `.model` pin
+    //   3. the selected agent's `model_provider` -> provider-model route
     //
     // When `--agent` is set but no model resolves, we error out
     // before the precedence block so that `--agent` cannot silently fall
     // through to scenario routing.
     let cli_model = cli.model.clone();
-    let direct_agent_pin = cli_model
+    let agent_pin = cli_model
         .is_none()
-        .then(|| eng.cfg.agent_model(cli.agent.as_deref()))
+        .then(|| configured_model_for_agent(eng, cli.agent.as_deref()))
         .flatten();
 
-    // Guard: `--agent` without a direct model pin or explicit `-m` must
+    // Guard: `--agent` without any resolvable model or explicit `-m` must
     // error out immediately rather than silently delegating to the scenario
-    // layer. The guard checks `cli_model` (explicit `-m`) and
-    // `direct_agent_pin` (`[agents.<alias>].model`). The `model_provider`
-    // chain is zeroclaw-engine-only and does NOT apply under `--oneshot`.
-    // If ANY of these resolves, the guard yields — `-m` is the strongest
-    // pin and supersedes all `--agent` configuration.
+    // layer. `model_provider` is an authoritative model selector in the
+    // zeroclaw config and therefore resolves to the same direct model id the
+    // oneshot provider call needs.
     //
     // Post-guard, the precedence block below is guaranteed that `pin`
     // resolves to `Some`.
     if let Some(alias) = &cli.agent {
-        // Check the raw agent config, independent of `-m`. Only error when
-        // the operator has neither an explicit model pin nor an agent config
-        // with a direct `.model` pin — if `-m` is set the operator is
-        // choosing explicitly, so the guard yields to the explicit pin.
-        let direct = eng.cfg.agent_model(Some(alias.as_str()));
-        if direct.is_none() && cli_model.is_none() {
+        let configured = configured_model_for_agent(eng, Some(alias.as_str()));
+        if configured.is_none() && cli_model.is_none() {
             anyhow::bail!(
-                "agent alias '{}' has no model configured for the oneshot router",
+                "agent alias '{}' has no model configured for the oneshot router \
+                 (neither direct model nor model_provider resolved)",
                 alias
             );
         }
@@ -3399,11 +3429,11 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     //
     // Only enter this block when at least one pin resolved. When no pin is
     // set (no `-m`, no `--agent`), fall through to scenario routing below.
-    if let Some(pin) = cli_model.clone().or(direct_agent_pin.clone()) {
+    if let Some(pin) = cli_model.clone().or(agent_pin.clone()) {
         let src = if cli_model.is_some() {
             "explicit -m"
         } else {
-            "per-agent [agents.<alias>].model override"
+            "per-agent model/model_provider route"
         };
         let reason = format!("pinned {pin} ({src}); fallbacks suppressed by operator pin");
         // Even with a singleton author chain, `--require-free` filters
@@ -4804,15 +4834,34 @@ async fn cmd_exec(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     }
 }
 
-/// Heuristic: did the failure come from not being able to reach/start the
-/// engine (vs. a real agent error we should surface)?
+/// Typed failure emitted only when zoder cannot reach or start the agentic
+/// engine. Route, registry, identity, and turn errors deliberately use other
+/// error types so their wording can never trigger a oneshot downgrade.
+#[derive(Debug)]
+struct EngineUnavailableError {
+    message: String,
+}
+
+impl EngineUnavailableError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EngineUnavailableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EngineUnavailableError {}
+
+/// Did the failure carry the explicit engine-unavailable marker?
 fn is_engine_unavailable(e: &anyhow::Error) -> bool {
-    let s = e.to_string().to_ascii_lowercase();
-    s.contains("connecting to engine")
-        || s.contains("socket")
-        || s.contains("daemon")
-        || s.contains("zeroclaw binary not found")
-        || s.contains("not ready within")
+    e.chain()
+        .any(|cause| cause.downcast_ref::<EngineUnavailableError>().is_some())
 }
 
 /// Single-shot completion entry point for `zoder exec --oneshot` and for
@@ -5478,63 +5527,407 @@ fn zeroclaw_model_override() -> Option<String> {
     None
 }
 
-/// Warn when an explicit `-m` pin is NOT the model the engine actually ran.
-///
-/// On the zeroclaw path `-m` does not select the model. `zeroclaw_model_override`
-/// is deliberately `None` (sending `session/configure { model }` strips tools),
-/// so the executed model is whatever the chosen AGENT's provider is configured
-/// with, and the agent is chosen by [`resolve_agent_alias`]'s substring table.
-/// When that table maps the pin somewhere unintended the two silently diverge:
-/// `-m MiniMax-M3` matches the `"minimax"` needle, selects the LOCAL `minimax`
-/// alias, and runs `minimax-m2.7` instead. Cost/routing are pre-gated on the
-/// pin while a different model does the work.
-///
-/// Returns `None` when no explicit pin was given (an auto-routed chain is
-/// *expected* to resolve elsewhere and must stay quiet), or when the two agree
-/// case-insensitively — engines echo their own casing (`MiniMax-M3` vs
-/// `minimax-m3`), and warning on that alone would be pure noise.
-fn pinned_model_divergence(pinned: Option<&str>, executed: &str) -> Option<String> {
+/// Verify the engine honored an explicit `-m` pin. The resolver performs this
+/// check before dispatch using the engine config; this postcondition catches a
+/// stale daemon or a config change racing the turn. `-m` is an exact model-ID
+/// pin; an agent alias is selected separately with `--agent`.
+fn pinned_model_mismatch(
+    pinned: Option<&str>,
+    selected_alias: &str,
+    executed: Option<&str>,
+) -> Option<String> {
     let pinned = pinned?;
-    if pinned.eq_ignore_ascii_case(executed) {
+    let Some(executed) = executed else {
+        return Some(format!(
+            "explicit -m {pinned:?} resolved to zeroclaw agent {selected_alias:?}, but the \
+             daemon did not provide an authoritative model identity; refusing to run or \
+             report the turn as successful (restart the daemon and check {})",
+            engine_config_path().display()
+        ));
+    };
+    if pinned == executed {
         return None;
     }
     Some(format!(
-        "[zoder] WARNING: -m {pinned} did not take effect — the engine ran {executed}. \
-         On the zeroclaw engine `-m` pins routing/cost and picks the AGENT; the model \
-         actually run is the one that agent's provider is configured with. \
-         Use `--agent <alias>` to choose the model directly."
+        "explicit -m {pinned:?} resolved to zeroclaw agent {selected_alias:?}, but the \
+         engine reported model {executed:?}; refusing to report the turn as successful \
+         (restart the daemon and check {})",
+        engine_config_path().display()
     ))
 }
 
-/// Map a model id to a renamed zeroclaw agent alias (the model-named aliases the
-/// TUI picker shows). Falls back to the strongest coding alias. `--agent` wins.
+/// Require the daemon's provider profile to map to the exact zoder provider
+/// whose billing policy was gated.
+///
+/// The zoder provider's dedicated `engine_provider_ref` is resolved and
+/// cross-validated against the on-disk Zeroclaw registry while configuration
+/// is loaded. The live daemon must report that exact reference; matching only
+/// its profile-name suffix would collapse (for example)
+/// `custom.subscription` and `other.subscription` across potentially
+/// different credentials/accounts. The registry projection preserves the
+/// canonical implementation selected by `kind`, then resolves omitted or
+/// ignored URI fields through that factory's rules, family defaults, typed
+/// endpoint selectors, and computed endpoint fields before this comparison.
+/// An unresolved implicit identity is a registry error, never a wildcard.
+///
+/// Accepted account-attestation limitation: the existing `config/get` RPC
+/// replaces every configured API key and secret header with the same mask,
+/// while the existing `session/new` result reports no auth subject, key
+/// fingerprint, or account id. Fields such as `auth_mode` and
+/// `requires_openai_auth` identify only the authentication mechanism/store,
+/// not the authenticated or billed subject. Exact reference/kind/endpoint
+/// checking can detect a switch to another profile, but cannot detect
+/// credential rotation to a different billed account within the same profile.
+/// The regression test
+/// `masked_credentials_cannot_attest_a_different_billing_account` pins that
+/// protocol limitation; closing it would require information Zeroclaw does not
+/// expose today.
+fn verify_live_zeroclaw_provider(
+    selected_alias: &str,
+    live_provider: Option<&EngineProviderRoute>,
+    gated_provider: &Provider,
+) -> anyhow::Result<()> {
+    let Some(live_provider) = live_provider else {
+        anyhow::bail!(
+            "Zeroclaw agent {selected_alias:?} has no model_provider identity in the running \
+             daemon, so it cannot be mapped to gated zoder provider {:?}; refusing to dispatch",
+            gated_provider.id
+        );
+    };
+
+    let expected_ref = gated_provider
+        .engine_provider_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_ref| !provider_ref.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "zoder provider {:?} has no resolved engine_provider_ref; set it explicitly \
+                 when its Zeroclaw profile cannot be derived unambiguously at config-load time",
+                gated_provider.id
+            )
+        })?;
+
+    let mut mismatches = Vec::new();
+    if live_provider.provider_ref != expected_ref {
+        mismatches.push(format!(
+            "provider reference {:?} does not exactly match approved engine_provider_ref \
+             {expected_ref:?}",
+            live_provider.provider_ref
+        ));
+    }
+
+    let (expected_type, expected_alias) = expected_ref
+        .split_once('.')
+        .unwrap_or((expected_ref, expected_ref));
+    if live_provider.provider_type != expected_type {
+        mismatches.push(format!(
+            "daemon provider type {:?} differs from approved provider type {expected_type:?}",
+            live_provider.provider_type
+        ));
+    }
+    if live_provider.provider_alias != expected_alias {
+        mismatches.push(format!(
+            "daemon provider alias {:?} differs from approved provider alias {expected_alias:?}",
+            live_provider.provider_alias
+        ));
+    }
+
+    let gated_kind = gated_provider.kind.trim();
+    if !gated_provider.engine_kind_is_compatible(&live_provider.effective_kind) {
+        mismatches.push(format!(
+            "daemon effective provider kind {:?} differs from gated provider kind \
+             {gated_kind:?}",
+            live_provider.effective_kind
+        ));
+    }
+
+    if !gated_provider
+        .engine_endpoint_is_compatible(&live_provider.effective_uri, &live_provider.implementation)
+    {
+        mismatches.push(format!(
+            "daemon effective endpoint {:?} differs from gated endpoint {:?}",
+            live_provider.effective_uri,
+            gated_provider.base_url.trim()
+        ));
+    }
+    let gated_endpoint = gated_provider.base_url.trim();
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    let account_id = gated_provider
+        .subscription
+        .as_ref()
+        .map(|plan| plan.effective_account_id())
+        .unwrap_or_else(|| "<none>".to_owned());
+    anyhow::bail!(
+        "Zeroclaw agent {selected_alias:?} routes through daemon provider {:?} \
+         (type={:?}, implementation={:?}, effective_kind={:?}, effective_endpoint={:?}), which does not match the \
+         approved zoder \
+         billing identity (provider={:?}, engine_provider_ref={expected_ref:?}, \
+         kind={gated_kind:?}, billing={:?}, \
+         account_id={account_id:?}, endpoint={gated_endpoint:?}): {}; refusing to dispatch",
+        live_provider.provider_ref,
+        live_provider.provider_type,
+        live_provider.implementation,
+        live_provider.effective_kind,
+        live_provider.effective_uri,
+        gated_provider.id,
+        gated_provider.billing,
+        mismatches.join("; ")
+    )
+}
+
+/// Verify a zoder-side Zeroclaw selection against the running daemon's route
+/// registry before `session/new` can dispatch a prompt.
+///
+/// The on-disk registry is useful for early routing, but it is not
+/// authoritative once a daemon is running. For `-m`, repeat model-to-agent
+/// selection against the live registry so duplicate routes and
+/// `[acp].default_agent` are interpreted by the daemon's state, then require
+/// that result to agree with the alias selected from disk. For `--agent`
+/// without `-m`, require the live alias route to name the same model zoder
+/// classified and budget-gated. Automatic routing is subject to the same
+/// requirement: an unavailable registry, a different live default, or a live
+/// model disagreement is a hard pre-dispatch failure.
+///
+/// Provider-local and provider-to-provider fallbacks are also part of model
+/// identity. Zoder's own chain gates each candidate before a separate
+/// dispatch, so a daemon-internal fallback is never pre-gated and must be
+/// rejected here. Model equality is not sufficient: the live provider profile
+/// and endpoint must also map to the exact zoder provider whose billing policy
+/// was gated. The ACP driver repeats the complete live `config/get` snapshot
+/// comparison immediately before `session/prompt`; this helper remains useful
+/// for an earlier, more actionable error.
+fn verify_live_zeroclaw_route(
+    cli: &Cli,
+    selected_alias: &str,
+    routed_model: &str,
+    gated_provider: &Provider,
+    live_registry: Option<&EngineModelRegistry>,
+) -> anyhow::Result<Option<String>> {
+    let Some(live_registry) = live_registry else {
+        anyhow::bail!(
+            "cannot verify Zeroclaw model/agent selection against the running daemon; \
+             refusing to dispatch"
+        );
+    };
+
+    let live_candidates = live_registry
+        .model_candidates_for_agent(selected_alias)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Zeroclaw agent {selected_alias:?} has no authoritative model route in the \
+                 running daemon; refusing to dispatch"
+            )
+        })?;
+    let live_model = live_candidates.first().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Zeroclaw agent {selected_alias:?} has an empty model route in the running daemon; \
+             refusing to dispatch"
+        )
+    })?;
+
+    if let Some(model_pin) = cli.model.as_deref() {
+        // `-m` names an exact model id. Resolve it again using the live
+        // registry, including its live default-agent tie-breaker.
+        match live_registry.agent_for_model_with_preference(model_pin, cli.agent.as_deref())? {
+            Some(live_alias) if !live_alias.eq_ignore_ascii_case(selected_alias) => {
+                anyhow::bail!(
+                    "explicit -m {model_pin:?} selected Zeroclaw agent {selected_alias:?} from \
+                     disk config, but the running daemon selects {live_alias:?}; refusing to \
+                     dispatch (restart the daemon or pass --agent <alias>)"
+                )
+            }
+            Some(_) => {}
+            None => {
+                anyhow::bail!(
+                    "explicit -m {model_pin:?} selected Zeroclaw agent {selected_alias:?} from \
+                     disk config, but the running daemon has no agent route for that model; \
+                     refusing to dispatch"
+                )
+            }
+        }
+
+        if let Some(mismatch) =
+            pinned_model_mismatch(Some(model_pin), selected_alias, Some(&live_model))
+        {
+            anyhow::bail!(mismatch);
+        }
+    } else if let Some(agent_pin) = cli.agent.as_deref() {
+        if !agent_pin.eq_ignore_ascii_case(selected_alias) {
+            anyhow::bail!(
+                "explicit --agent {agent_pin:?} resolved to Zeroclaw agent \
+                 {selected_alias:?}; refusing to dispatch"
+            );
+        }
+        if live_model != routed_model {
+            anyhow::bail!(
+                "explicit --agent {agent_pin:?} was classified and budget-gated as model \
+                 {routed_model:?}, but the running Zeroclaw daemon routes that alias to \
+                 {live_model:?}; refusing to dispatch"
+            );
+        }
+    } else {
+        let live_alias = live_registry
+            .agent_for_model_with_preference(routed_model, None)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "automatically routed model {routed_model:?} has no agent route in the \
+                     running Zeroclaw daemon; refusing to dispatch"
+                )
+            })?;
+        if !live_alias.eq_ignore_ascii_case(selected_alias) {
+            anyhow::bail!(
+                "automatic routing selected Zeroclaw agent {selected_alias:?}, but the running \
+                 daemon selects {live_alias:?} for model {routed_model:?}; refusing to dispatch"
+            );
+        }
+        if live_model != routed_model {
+            anyhow::bail!(
+                "automatic routing classified and budget-gated model {routed_model:?}, but the \
+                 running Zeroclaw daemon routes agent {selected_alias:?} to {live_model:?}; \
+                 refusing to dispatch"
+            );
+        }
+    }
+
+    if live_candidates.len() > 1 {
+        anyhow::bail!(
+            "Zeroclaw agent {selected_alias:?} can fall back from pre-gated model \
+             {live_model:?} to un-gated daemon model(s) {}; refusing to dispatch (remove the \
+             provider fallback or route each fallback through zoder's gated chain)",
+            live_candidates[1..]
+                .iter()
+                .map(|model| format!("{model:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let live_provider = live_registry.provider_route_for_agent(selected_alias)?;
+    verify_live_zeroclaw_provider(selected_alias, live_provider.as_ref(), gated_provider)?;
+
+    Ok(Some(live_model))
+}
+
+/// Reconcile the daemon's live route with any model named by authoritative,
+/// non-overlapping cost telemetry. Ledger attribution may fall back to the
+/// routed model, but explicit-pin verification never does: a missing live
+/// identity or either source naming a different model is a hard mismatch.
+fn reconcile_agentic_model_identity(
+    pinned: Option<&str>,
+    selected_alias: &str,
+    routed_model: &str,
+    daemon_model: Option<&str>,
+    cost_model: Option<&str>,
+) -> (String, Option<String>) {
+    let model_used = cost_model
+        .or(daemon_model)
+        .unwrap_or(routed_model)
+        .to_owned();
+    let mismatch = pinned_model_mismatch(pinned, selected_alias, daemon_model).or_else(|| {
+        cost_model.and_then(|model| pinned_model_mismatch(pinned, selected_alias, Some(model)))
+    });
+    (model_used, mismatch)
+}
+
+fn configured_agent_for_model(
+    eng: &Engine,
+    model: &str,
+    preferred_agent: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(alias) = eng
+        .engine_models
+        .agent_for_model_with_preference(model, preferred_agent)?
+    {
+        return Ok(Some(alias.to_owned()));
+    }
+    // Once the authoritative engine config supplied routes, do not let a
+    // stale zoder-side agent pin claim a different model for one of those
+    // aliases. That would recreate the same pre-gate/actual-run divergence.
+    if !eng.engine_models.is_empty() {
+        return Ok(None);
+    }
+
+    let matches: Vec<&str> = eng
+        .cfg
+        .agents
+        .keys()
+        .filter(|alias| {
+            configured_model_for_agent(eng, Some(alias.as_str())).as_deref() == Some(model)
+        })
+        .map(String::as_str)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some((*only).to_owned())),
+        _ => {
+            if let Some(alias) = preferred_agent.and_then(|preferred| {
+                matches
+                    .iter()
+                    .copied()
+                    .find(|alias| alias.eq_ignore_ascii_case(preferred))
+            }) {
+                return Ok(Some(alias.to_owned()));
+            }
+            anyhow::bail!(
+                "model {model:?} is configured on multiple zoder agents ({}); pass \
+                 --agent <alias> to select one",
+                matches.join(", ")
+            )
+        }
+    }
+}
+
+/// Map a model id to the zeroclaw agent configured to run that exact model.
+///
+/// An explicit `-m` is fail-closed: if neither the engine config nor the live
+/// daemon inventory can prove a matching agent, return an error before
+/// `session/new` rather than falling through to an unrelated default. Automatic
+/// routing retains the legacy alias table as a compatibility fallback.
 fn resolve_agent_alias(
     cli: &Cli,
+    eng: &Engine,
     known_agents: &std::collections::HashSet<String>,
     model: &str,
-) -> String {
-    if let Some(a) = &cli.agent {
-        return a.clone();
+) -> anyhow::Result<String> {
+    if cli.model.is_none() {
+        if let Some(a) = &cli.agent {
+            return Ok(a.clone());
+        }
     }
-    // A REAL ENGINE AGENT WINS OVER THE HARDCODED TABLE BELOW.
-    //
-    // That table lists cloud model ids. An engine agent name (`coder`,
-    // `reviewer`, `qwen36-gguf`, ...) matches none of them and fell through to
-    // the `minimax` default, so `-m coder` silently ran minimax-m2.7 against
-    // :8002 and 404'd -- the engine ran a different model than the one named on
-    // the command line. `pinned_model_divergence` was left *warning* about that
-    // instead of fixing it.
-    //
-    // The agent set comes from the zeroclaw daemon (`agents_status`), not from
-    // `Config::agents`: on this stack the agents are defined in the ENGINE
-    // config and `zoder_core::config::Config::agents` is empty, so checking it
-    // silently matched nothing. The daemon is the only thing that actually
-    // knows which aliases exist.
-    if known_agents.contains(model) {
-        return model.to_string();
+
+    if let Some(alias) = configured_agent_for_model(eng, model, cli.agent.as_deref())? {
+        if known_agents.is_empty() {
+            return Ok(alias);
+        }
+        if let Some(live_alias) = known_agents
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(&alias))
+        {
+            return Ok(live_alias.clone());
+        }
+        if cli.model.is_some() {
+            anyhow::bail!(
+                "model {model:?} is configured on engine agent {alias:?}, but the running \
+                 zeroclaw daemon does not report that agent; restart the daemon after \
+                 checking {}",
+                engine_config_path().display()
+            );
+        }
+        return Ok(reconcile_alias(known_agents, &alias));
     }
-    if let Some(k) = known_agents.iter().find(|k| k.eq_ignore_ascii_case(model)) {
-        return k.clone();
+
+    if cli.model.is_some() {
+        anyhow::bail!(
+            "model {model:?} is not configured on any zeroclaw agent; add an \
+             [agents.<alias>] model/model_provider route in {} or select an existing \
+             agent with --agent <alias>",
+            engine_config_path().display()
+        );
     }
     let m = model.to_ascii_lowercase();
     // (substring in model id) -> alias
@@ -5571,13 +5964,13 @@ fn resolve_agent_alias(
             // `--agent` as the only way to use zoder at all.
             //
             // So reconcile the preference against what the daemon reported.
-            return reconcile_alias(known_agents, alias);
+            return Ok(reconcile_alias(known_agents, alias));
         }
     }
     // Default coding agent. Was `deepseek-v4-pro`, which dangled / flapped and
     // made zoder non-invokable mid-loop (field reports 2026-06-30). `minimax`
     // is the configured default author on the cutover hosts and is stable.
-    reconcile_alias(known_agents, "minimax")
+    Ok(reconcile_alias(known_agents, "minimax"))
 }
 
 /// Resolve a wanted alias against the aliases the engine actually reported.
@@ -5662,7 +6055,7 @@ pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str 
 ///   — the kernel reaps only on `waitpid` — so without this fix the
 ///   daemon was leaked and could outlive its parent's intent (and
 ///   collide with the next `zoder` invocation's `bind`).
-async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
+async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableError> {
     let socket = engine_socket_path();
 
     // Fast path: probe returns `Ready`. Trust the structured
@@ -5706,19 +6099,19 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
                     socket.display(),
                     socket.display()
                 );
-                anyhow::bail!(
+                return Err(EngineUnavailableError::new(format!(
                     "engine daemon at {} is unresponsive and its socket is still bound",
                     socket.display()
-                );
+                )));
             }
         }
     }
 
     let bin = locate_sibling("zeroclaw").ok_or_else(|| {
-        anyhow::anyhow!(
+        EngineUnavailableError::new(
             "zeroclaw binary not found (looked next to zoder, then in trusted install dirs \
              ~/.local/bin and ~/.cargo/bin, then on PATH); \
-             cannot start the agentic engine"
+             cannot start the agentic engine",
         )
     })?;
     let config_dir = zeroclaw_data_dir()
@@ -5759,9 +6152,12 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         // pre-fix defect.
         cmd.stderr(std::process::Stdio::inherit());
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn zeroclaw daemon ({}): {e}", bin.display()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        EngineUnavailableError::new(format!(
+            "failed to spawn zeroclaw daemon ({}): {e}",
+            bin.display()
+        ))
+    })?;
 
     // Poll readiness with the initialize handshake. Bail early if the child
     // exits during startup; on timeout, kill and reap it before returning.
@@ -5770,19 +6166,19 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = child.wait();
-                anyhow::bail!(
+                return Err(EngineUnavailableError::new(format!(
                     "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
                     read_log_tail(&stderr_log)
-                );
+                )));
             }
             Ok(None) => {}
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                anyhow::bail!(
+                return Err(EngineUnavailableError::new(format!(
                     "failed to poll zeroclaw daemon during startup: {e}; log tail:\n{}",
                     read_log_tail(&stderr_log)
-                );
+                )));
             }
         }
 
@@ -5799,10 +6195,10 @@ async fn ensure_engine_daemon() -> anyhow::Result<std::path::PathBuf> {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!(
+            return Err(EngineUnavailableError::new(format!(
                 "zeroclaw daemon not ready within 20s ({last_probe}); log tail:\n{}",
                 read_log_tail(&stderr_log)
-            );
+            )));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -6169,17 +6565,29 @@ fn agentic_scope_directory(engine_socket: &Path, alias: &str) -> PathBuf {
 /// returned alongside the cost is `false` and the caller (the
 /// agentic-turn path) records a policy violation under the free guard
 /// — the same default-deny path a paid engine model already takes.
+type AgenticCostReport = (f64, u64, u64, Option<String>, bool, u64);
+
+#[derive(Debug, Clone, Copy)]
+enum AgenticCostGap {
+    QueryFailed,
+    ScopeOverlapped,
+    ScopeUnavailable,
+}
+
+fn unavailable_agentic_cost(_gap: AgenticCostGap) -> AgenticCostReport {
+    (0.0, 0, 0, None, false, 1)
+}
+
 async fn agentic_cost(
     socket: &std::path::Path,
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
     alias: &str,
-    fallback_model: &str,
-) -> (f64, u64, u64, String, bool, u64) {
+) -> AgenticCostReport {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..AGENTIC_COST_MAX_ATTEMPTS {
         match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
-            Ok(sum) => return classify_agentic_cost_summary(&sum, fallback_model),
+            Ok(sum) => return classify_agentic_cost_summary(&sum),
             Err(e) => {
                 last_err = Some(e);
                 // Don't sleep after the final attempt — the next call
@@ -6205,7 +6613,7 @@ async fn agentic_cost(
             "agentic_cost exhausted retries; returning unknown"
         );
     }
-    (0.0, 0, 0, fallback_model.to_string(), false, 1)
+    unavailable_agentic_cost(AgenticCostGap::QueryFailed)
 }
 
 /// Maximum number of `cost/query` attempts `agentic_cost` will make
@@ -6219,10 +6627,7 @@ async fn agentic_cost(
 /// as `cost_unknown` for any longer.
 const AGENTIC_COST_MAX_ATTEMPTS: u32 = 3;
 
-fn classify_agentic_cost_summary(
-    sum: &zoder_core::EngineCostSummary,
-    fallback_model: &str,
-) -> (f64, u64, u64, String, bool, u64) {
+fn classify_agentic_cost_summary(sum: &zoder_core::EngineCostSummary) -> AgenticCostReport {
     let cost = sum.window_cost_usd();
     // Pick the dominant model in the window for attribution.
     let model = sum
@@ -6230,8 +6635,7 @@ fn classify_agentic_cost_summary(
         .values()
         .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens))
         .map(|m| m.model.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| fallback_model.to_string());
+        .filter(|s| !s.is_empty());
     let tin = sum
         .by_model
         .values()
@@ -6379,12 +6783,68 @@ mod agentic_cost_tests {
     #[test]
     fn empty_successful_cost_query_is_unknown_not_known_zero() {
         let summary = zoder_core::EngineCostSummary::default();
-        let (cost, tin, tout, model, known, calls) =
-            classify_agentic_cost_summary(&summary, "fallback-model");
+        let (cost, tin, tout, model, known, calls) = classify_agentic_cost_summary(&summary);
         assert_eq!((cost, tin, tout), (0.0, 0, 0));
-        assert_eq!(model, "fallback-model");
+        assert_eq!(
+            model, None,
+            "empty telemetry must not invent model identity"
+        );
         assert!(!known);
         assert_eq!(calls, 1);
+    }
+
+    /// Agentic regression for adversarial-review finding 1. The running
+    /// daemon's authoritative `config/get` route is stale. Empty, failed, and
+    /// overlapped cost telemetry must not substitute the requested model and
+    /// thereby hide that mismatch.
+    #[test]
+    fn stale_daemon_is_rejected_across_unavailable_agentic_cost_telemetry() {
+        let live_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "author": { "model": "stale-model" }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.author" }
+            }
+        }))
+        .unwrap();
+        let daemon_model = live_registry.model_for_agent("author");
+        assert_eq!(daemon_model, Some("stale-model"));
+
+        let empty = classify_agentic_cost_summary(&zoder_core::EngineCostSummary::default());
+        let failed = unavailable_agentic_cost(AgenticCostGap::QueryFailed);
+        let overlapped = unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped);
+        for (state, report) in [
+            ("empty", empty),
+            ("failed", failed),
+            ("overlapped", overlapped),
+        ] {
+            assert_eq!(
+                report.3, None,
+                "{state} cost telemetry must carry no model identity"
+            );
+            let (model_used, mismatch) = reconcile_agentic_model_identity(
+                Some("requested-model"),
+                "author",
+                "requested-model",
+                daemon_model,
+                report.3.as_deref(),
+            );
+            assert_eq!(model_used, "stale-model", "state={state}");
+            let mismatch = mismatch.expect("stale daemon must be rejected");
+            assert!(
+                mismatch.contains("requested-model"),
+                "state={state}: {mismatch}"
+            );
+            assert!(
+                mismatch.contains("stale-model"),
+                "state={state}: {mismatch}"
+            );
+        }
     }
 
     #[test]
@@ -6404,7 +6864,7 @@ mod agentic_cost_tests {
                 cost_usd: 0.25,
             },
         );
-        let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary, "fallback");
+        let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary);
         assert!(known);
         assert_eq!(calls, 3);
     }
@@ -6541,7 +7001,7 @@ mod agentic_cost_tests {
         // generous CI margin).
         let call = tokio::time::timeout(
             std::time::Duration::from_secs(25),
-            agentic_cost(&socket, from, to, "codex", "fallback-model"),
+            agentic_cost(&socket, from, to, "codex"),
         );
         let (cost, tin, tout, model, known, calls) = call.await.expect(
             "agentic_cost must converge within the retry budget (3 attempts with backoff); \
@@ -6565,7 +7025,7 @@ mod agentic_cost_tests {
              got tuple (cost={cost}, tin={tin}, tout={tout}, model={model:?}, known={known}, calls={calls})"
         );
         assert_eq!(cost, 0.25);
-        assert_eq!(model, "test-model");
+        assert_eq!(model.as_deref(), Some("test-model"));
         assert_eq!(tin, 10);
         assert_eq!(tout, 5);
         assert_eq!(calls, 2);
@@ -6607,7 +7067,7 @@ mod agentic_cost_tests {
         // contract.
         let call = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            agentic_cost(&socket, from, to, "codex", "fallback-model"),
+            agentic_cost(&socket, from, to, "codex"),
         );
         let (cost, tin, tout, _model, known, _calls) = call
             .await
@@ -7565,13 +8025,15 @@ pub(crate) async fn agentic_turn(
     // table-only behaviour. Passing an empty set unconditionally would scope the
     // cost directory under a different alias than the one actually executed --
     // the same silent divergence this resolution order exists to remove.
-    let head_alias = {
+    let head_alias = if matches!(engine_kind, EngineKind::Goose) {
+        primary.clone()
+    } else {
         let known: std::collections::HashSet<String> =
             zoder_core::agents_status(&engine_socket_path())
                 .await
                 .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
                 .unwrap_or_default();
-        resolve_agent_alias(cli, &known, &primary)
+        resolve_agent_alias(cli, &eng, &known, &primary)?
     };
 
     // SLICE 2 (execution-safety kernel CLI plumbing): resolve the
@@ -7622,16 +8084,55 @@ pub(crate) async fn agentic_turn(
         EngineKind::Goose => None,
     };
 
-    // Ask the daemon which agent aliases exist, once, so `-m <alias>` can
-    // resolve to a real agent instead of falling through to the default. A
-    // failure here is non-fatal: an empty set just restores the old
-    // substring-table behaviour rather than breaking the run.
+    // Ask the daemon which agent aliases exist once for alias reconciliation.
+    // Explicit `-m` still resolves only through exact configured model routes;
+    // this inventory never turns an alias into a model id.
     let known_agents: std::collections::HashSet<String> = match socket.as_ref() {
         Some(sock) => zoder_core::agents_status(sock)
             .await
             .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
             .unwrap_or_default(),
         None => std::collections::HashSet::new(),
+    };
+
+    // The file-backed registry above is only the desired configuration. A
+    // running daemon may still have an older config in memory, so every
+    // selection must be checked against the daemon's own `config/get` view
+    // before any prompt (and therefore before any side effect) is dispatched.
+    // Automatic routing is equally fail-closed: disk and live defaults can
+    // differ, and dispatching the disk-selected alias under that disagreement
+    // can change tool/workspace policy even when no explicit selector exists.
+    // This is an early diagnostic. The same masked value is carried into the
+    // ACP driver, which re-fetches `config/get` immediately before releasing
+    // `session/prompt` and rejects every observable change.
+    let live_engine_config = match socket.as_ref() {
+        Some(sock) => match zoder_core::fetch_engine_config(sock).await {
+            Ok(value) => Some(value),
+            Err(error) => {
+                anyhow::bail!(
+                    "cannot verify model/agent selection against the running zeroclaw daemon: \
+                     {error}"
+                )
+            }
+        },
+        None => None,
+    };
+    let live_engine_models = live_engine_config
+        .as_ref()
+        .map(EngineModelRegistry::from_json)
+        .transpose()
+        .context("parsing live zeroclaw config/get model routes")?;
+
+    let head_daemon_model = if matches!(engine_kind, EngineKind::Zeroclaw) {
+        verify_live_zeroclaw_route(
+            cli,
+            &head_alias,
+            &primary,
+            &routed_provider,
+            live_engine_models.as_ref(),
+        )?
+    } else {
+        None
     };
 
     // Zeroclaw selects a complete coding-agent definition at `session/new`:
@@ -7690,6 +8191,10 @@ pub(crate) async fn agentic_turn(
         // this over the zeroclaw agent alias (which goose doesn't understand).
         // The chain loop overwrites it before each `run_agent_dispatch`.
         model_id: Some(primary.clone()),
+        // Populated per Zeroclaw candidate with the exact masked `config/get`
+        // value whose routes passed the live preflight. The ACP client checks
+        // it again immediately before releasing the prompt.
+        zeroclaw_config_snapshot: None,
         session_id: engine_session_id,
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
@@ -7837,6 +8342,8 @@ pub(crate) async fn agentic_turn(
     let mut used_primary = primary.clone();
     #[allow(unused_assignments)]
     let mut used_alias = head_alias.clone();
+    #[allow(unused_assignments)]
+    let mut used_daemon_model = head_daemon_model;
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let run = loop {
         // Find the next live candidate — the first chain entry whose
@@ -7906,9 +8413,35 @@ pub(crate) async fn agentic_turn(
             }
         }
         // Wire per-candidate alias + model_id into the shared opts.
-        let alias = resolve_agent_alias(cli, &known_agents, &model);
+        let alias = if matches!(engine_kind, EngineKind::Goose) {
+            model.clone()
+        } else {
+            resolve_agent_alias(cli, &eng, &known_agents, &model)?
+        };
+        let daemon_model = if matches!(engine_kind, EngineKind::Zeroclaw) {
+            let gated_link_provider = link_provider.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot map Zeroclaw model {model:?} to a gated zoder provider; refusing to \
+                     dispatch"
+                )
+            })?;
+            verify_live_zeroclaw_route(
+                cli,
+                &alias,
+                &model,
+                gated_link_provider,
+                live_engine_models.as_ref(),
+            )?
+        } else {
+            None
+        };
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
+        chain_opts.zeroclaw_config_snapshot = if matches!(engine_kind, EngineKind::Zeroclaw) {
+            live_engine_config.clone()
+        } else {
+            None
+        };
         match run_agent_dispatch(engine_kind, &chain_opts, |ev| {
             // Write event to JSONL file if configured
             if let Some(ref mut writer) = events_writer {
@@ -7960,6 +8493,7 @@ pub(crate) async fn agentic_turn(
                 // already happened).
                 used_primary = model;
                 used_alias = alias;
+                used_daemon_model = daemon_model;
                 break r;
             }
             Err(e) => {
@@ -8015,29 +8549,35 @@ pub(crate) async fn agentic_turn(
     // comment), so a fallback to a different alias is a known minor
     // accounting miss — closing it requires the engine to accept a
     // scope key from the caller.
-    let (cost, tokens_in, tokens_out, model_used, cost_known, request_count) = match engine_kind {
+    let (cost, tokens_in, tokens_out, cost_model, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             match cost_scope.and_then(|scope| scope.finish().ok()) {
-                Some((from, to, false)) => {
-                    agentic_cost(&socket2, from, to, &used_alias, &used_primary).await
-                }
-                Some((_, _, true)) | None => (0.0, 0, 0, used_primary.clone(), false, 1),
+                Some((from, to, false)) => agentic_cost(&socket2, from, to, &used_alias).await,
+                Some((_, _, true)) => unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
+                None => unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
             }
         }
-        EngineKind::Goose => (0.0, run.input_tokens, 0, used_primary.clone(), false, 1),
+        EngineKind::Goose => (0.0, run.input_tokens, 0, None, false, 1),
     };
 
-    // That divergence is invisible to the operator: the banner prints the
-    // engine-reported model, so a pin that silently went somewhere else looks
-    // like a normal run. Say so explicitly — a mis-mapped `-m` was twice
-    // misdiagnosed as a credential and then a model-resolution failure.
-    // Suppressed under --quiet; stderr keeps `--json` stdout parseable.
-    if !cli.quiet {
-        if let Some(warning) = pinned_model_divergence(cli.model.as_deref(), &model_used) {
-            eprintln!("{warning}");
-        }
-    }
+    // Defense in depth: pre-dispatch resolution already proves `-m` maps to
+    // this agent against the daemon's live config. A racing config reload or
+    // authoritative cost row can still expose a different model after the
+    // turn. Empty, failed, or overlapped cost telemetry contributes no model
+    // identity; it can never substitute the requested model and hide a stale
+    // daemon.
+    let (model_used, model_mismatch) = if engine_kind == EngineKind::Zeroclaw {
+        reconcile_agentic_model_identity(
+            cli.model.as_deref(),
+            &used_alias,
+            &used_primary,
+            used_daemon_model.as_deref(),
+            cost_model.as_deref(),
+        )
+    } else {
+        (used_primary.clone(), None)
+    };
 
     // Post-verify: the engine (via the agent alias) may have run a different —
     // possibly paid — model than the one pre-gated above (the daemon resolves
@@ -8082,15 +8622,16 @@ pub(crate) async fn agentic_turn(
     // decision to reject the turn is.
     let unknown_cost_violation = (!cost_known && !cli.allow_paid && !provider_cost_neutral)
         .then(|| format!("cost unknown: {engine_kind:?} returned no authoritative cost telemetry"));
-    let violation = match (&paid_failure, unknown_cost_violation) {
+    let policy_violation = match (&paid_failure, unknown_cost_violation) {
         (Some(paid), Some(unknown)) => Some(format!("{paid}; {unknown}")),
         (Some(paid), None) => Some(paid.clone()),
         (None, unknown) => unknown,
     };
-    // Capture `violation` before it is moved into the ledger Entry below;
-    // the `TurnResult` carries it for the caller's fail-on-violation
-    // contract (see `cmd_exec_agentic` / `cmd_rescue` / `cmd_loop`).
-    let policy_violation = violation.clone();
+    let violation = match (&policy_violation, &model_mismatch) {
+        (Some(policy), Some(mismatch)) => Some(format!("{policy}; {mismatch}")),
+        (Some(policy), None) => Some(policy.clone()),
+        (None, mismatch) => mismatch.clone(),
+    };
 
     let ledger_entry = Entry {
         ts_utc: chrono::Utc::now(),
@@ -8136,10 +8677,12 @@ pub(crate) async fn agentic_turn(
         .real_provider_for_model(&eng.cfg, &model_used)
         .map(|p| p.id.clone())
         .unwrap_or_else(|| routed_provider.id.clone());
-    if run.succeeded() && policy_violation.is_none() {
+    if run.succeeded() && policy_violation.is_none() && model_mismatch.is_none() {
         health.record_success(&model_used, elapsed_ms);
     } else {
-        let reason = if let Some(v) = &policy_violation {
+        let reason = if let Some(v) = &model_mismatch {
+            format!("model selection violation: {v}")
+        } else if let Some(v) = &policy_violation {
             format!("policy violation: {v}")
         } else {
             format!("turn did not complete: {}", run.outcome)
@@ -8152,6 +8695,10 @@ pub(crate) async fn agentic_turn(
         );
     }
     save_health(&health);
+
+    if let Some(mismatch) = model_mismatch {
+        anyhow::bail!(mismatch);
+    }
 
     Ok(TurnResult {
         run,
@@ -8172,6 +8719,10 @@ pub(crate) async fn cmd_exec_agentic(
     output_last_message: Option<String>,
     events_file: Option<String>,
 ) -> anyhow::Result<()> {
+    // Parse the engine before either dry-run or live routing. Goose consumes a
+    // model id directly and must not be subjected to zeroclaw's agent lookup.
+    let engine_kind = resolve_engine_kind(cli)?;
+
     if cli.dry_run {
         let eng = Engine::load()?;
         let health = HealthStore::load(&eng.cfg.health_path);
@@ -8186,11 +8737,19 @@ pub(crate) async fn cmd_exec_agentic(
         // pick. Reporting a different alias than execution would choose is the
         // same class of divergence this resolution order exists to remove.
         let known_agents: std::collections::HashSet<String> =
-            zoder_core::agents_status(&engine_socket_path())
-                .await
-                .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
-                .unwrap_or_default();
-        let alias = resolve_agent_alias(cli, &known_agents, &primary);
+            if matches!(engine_kind, EngineKind::Goose) {
+                std::collections::HashSet::new()
+            } else {
+                zoder_core::agents_status(&engine_socket_path())
+                    .await
+                    .map(|st| st.agents.into_iter().map(|a| a.alias).collect())
+                    .unwrap_or_default()
+            };
+        let alias = if matches!(engine_kind, EngineKind::Goose) {
+            primary.clone()
+        } else {
+            resolve_agent_alias(cli, &eng, &known_agents, &primary)?
+        };
         let cwd = agentic_cwd(cli)?;
         println!(
             "[dry-run] agentic: alias={alias} model={primary} cwd={}",
@@ -8204,8 +8763,6 @@ pub(crate) async fn cmd_exec_agentic(
     // request must NOT spawn the zeroclaw daemon — the daemon-unavailable ->
     // oneshot fallback would otherwise mask the goose path and produce a
     // confusing socket/transport failure instead of the real diagnostic.
-    let engine_kind = resolve_engine_kind(cli)?;
-
     let prompt = read_prompt(prompt)?;
     validate_task(&prompt)?;
 
@@ -10466,6 +11023,17 @@ fn zeroclaw_data_dir() -> std::path::PathBuf {
         .join("data")
 }
 
+/// Authoritative zeroclaw runtime configuration used to map agent aliases to
+/// models. Keep this path derived from the same data-dir resolver used when
+/// spawning the daemon so routing cannot inspect one config and execute
+/// another.
+fn engine_config_path() -> std::path::PathBuf {
+    zeroclaw_data_dir()
+        .parent()
+        .expect("zeroclaw data dir always has a config-dir parent")
+        .join("config.toml")
+}
+
 /// Human-actionable message when the cost engine is unreachable. Distinguishes a
 /// stale socket (file present, nobody listening) from a daemon that was never
 /// started, and prints the exact command to bring it up for *this* config dir.
@@ -11897,6 +12465,7 @@ mod probe_skip_class_tests {
     fn mk_provider(id: &str, serves: &[&str]) -> Provider {
         Provider {
             id: id.into(),
+            engine_provider_ref: None,
             base_url: "https://gw.example/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
@@ -12206,6 +12775,7 @@ mod scenario_routing_tests {
     fn classify_provider_matches_task_spec() {
         let p = Provider {
             id: "nvidia-eih".into(),
+            engine_provider_ref: None,
             base_url: "https://integrate.api.nvidia.com/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
@@ -12218,6 +12788,7 @@ mod scenario_routing_tests {
         assert_eq!(classify_provider(&p, "nvidia/llama"), ProviderClass::Free);
         let p = Provider {
             id: "nvcf".into(),
+            engine_provider_ref: None,
             base_url: "https://nvcf.example/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
@@ -12230,6 +12801,7 @@ mod scenario_routing_tests {
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Free);
         let p = Provider {
             id: "minimax-flat".into(),
+            engine_provider_ref: None,
             base_url: "https://minimax.example/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
@@ -13332,6 +13904,7 @@ mod subscription_utilization_render_tests {
         });
         cfg.providers.push(zoder_core::Provider {
             id: "openai-team".into(),
+            engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             kind: "openai-responses".into(),
             auth: zoder_core::Auth::None,
@@ -13438,6 +14011,7 @@ mod model_selection_tests {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-model-sel-test"));
         cfg.providers.push(Provider {
             id: "minimax".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: ProviderAuth::None,
@@ -13449,6 +14023,7 @@ mod model_selection_tests {
         });
         cfg.providers.push(Provider {
             id: "nvidia-eih".into(),
+            engine_provider_ref: None,
             base_url: "https://integrate.api.nvidia.com/v1".into(),
             kind: "openai-chat".into(),
             auth: ProviderAuth::None,
@@ -13467,6 +14042,21 @@ mod model_selection_tests {
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
         cfg
+    }
+
+    fn fixture_gated_provider(id: &str, base_url: &str, billing: BillingMode) -> Provider {
+        Provider {
+            id: id.to_owned(),
+            engine_provider_ref: Some(id.to_owned()),
+            base_url: base_url.to_owned(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: billing == BillingMode::Metered,
+            billing,
+            subscription: None,
+            serves: vec!["shared-model".into(), "safe-model".into()],
+            azure_api_version: None,
+        }
     }
 
     /// Build a `Config` with a populated `[agents]` block. `primary_model`
@@ -13549,55 +14139,73 @@ mod model_selection_tests {
         assert_eq!(cfg.agent_model(None), None);
     }
 
-    /// PRIMARY precedence (regression test):
-    ///   `[agents.codex].model` MUST win over `primary_model` when `-m` is
-    ///   unset. Without this, `primary_model` globally overrides every
-    ///   agent's own model (the 2026-07-04 bug). The full chain produced
-    ///   by `resolve_chain` MUST lead with the per-agent pin, not with
-    ///   `primary_model` — the engine receives the chain head, so a
-    ///   mismatch here is the exact regression.
+    /// Runtime postcondition regression for explicit model pins.
     /// Reproduced on TYDEUS 2026-07-27: `zoder exec -m MiniMax-M3` printed
     /// `[zoder] minimax-m2.7 via minimax ... [failed]`. `resolve_agent_alias`
     /// lowercases the pin to `minimax-m3`, the FIRST substring needle
     /// (`"minimax"`) matches, and the local swap-slot `minimax` alias wins —
     /// so the engine ran that agent's configured `minimax-m2.7`.
     #[test]
-    fn diverged_pin_warns_naming_both_models() {
-        let warning = pinned_model_divergence(Some("MiniMax-M3"), "minimax-m2.7")
-            .expect("a pin the engine did not honor must warn");
-        assert!(warning.contains("MiniMax-M3"), "names the pin: {warning}");
+    fn diverged_pin_fails_postcondition_naming_both_models() {
+        let mismatch = pinned_model_mismatch(Some("MiniMax-M3"), "minimax", Some("minimax-m2.7"))
+            .expect("a pin the engine did not honor must fail its postcondition");
+        assert!(mismatch.contains("MiniMax-M3"), "names the pin: {mismatch}");
         assert!(
-            warning.contains("minimax-m2.7"),
-            "names what ran: {warning}"
-        );
-        assert!(
-            warning.contains("--agent"),
-            "points at the flag that does work: {warning}"
+            mismatch.contains("minimax-m2.7"),
+            "names what ran: {mismatch}"
         );
     }
 
-    /// Also reproduced live: `--agent minimax-m3-cloud -m qwen122b` completed
-    /// on MiniMax-M3, with `-m` having had no effect whatsoever.
+    /// Defense in depth for a stale daemon/config race: even after preflight,
+    /// a mismatched engine report must not pass the postcondition.
     #[test]
-    fn pin_ignored_because_agent_flag_won_still_warns() {
-        assert!(pinned_model_divergence(Some("qwen122b"), "MiniMax-M3").is_some());
+    fn stale_daemon_model_mismatch_is_rejected() {
+        assert!(pinned_model_mismatch(Some("qwen122b"), "qwen", Some("MiniMax-M3")).is_some());
     }
 
-    /// Engines echo their own casing; warning on that alone would be noise on
-    /// every successful pinned run.
     #[test]
-    fn pin_matching_case_insensitively_is_not_a_divergence() {
-        assert_eq!(
-            pinned_model_divergence(Some("MiniMax-M3"), "minimax-m3"),
-            None
+    fn explicit_pin_without_authoritative_identity_is_rejected() {
+        let mismatch = pinned_model_mismatch(Some("qwen122b"), "qwen", None)
+            .expect("an unverifiable explicit pin must fail closed");
+        assert!(mismatch.contains("did not provide an authoritative model identity"));
+    }
+
+    /// Model ids are exact pins. Different casing is a different identifier
+    /// and must not silently pass the postcondition.
+    #[test]
+    fn pin_matching_only_case_insensitively_is_rejected() {
+        assert!(pinned_model_mismatch(Some("MiniMax-M3"), "minimax", Some("minimax-m3")).is_some());
+    }
+
+    /// Agent aliases belong to `--agent`, not the exact model-id `-m` surface.
+    #[test]
+    fn engine_agent_alias_does_not_satisfy_model_postcondition() {
+        assert!(pinned_model_mismatch(Some("coder"), "coder", Some("qwen36-gguf")).is_some());
+    }
+
+    #[test]
+    fn only_typed_unavailable_errors_can_downgrade_to_oneshot() {
+        let unavailable: anyhow::Error =
+            EngineUnavailableError::new("zeroclaw daemon is unavailable").into();
+        assert!(is_engine_unavailable(&unavailable));
+
+        let identity = anyhow::anyhow!(
+            "running daemon model registry changed; refusing to send session/prompt"
+        );
+        assert!(
+            !is_engine_unavailable(&identity),
+            "identity errors mentioning daemon must never trigger oneshot fallback"
         );
     }
 
     /// No `-m` means auto-routing chose the model, which is expected to differ
-    /// from any particular id — this path must stay silent.
+    /// from any particular id — this path has no model postcondition.
     #[test]
-    fn auto_routed_run_without_a_pin_never_warns() {
-        assert_eq!(pinned_model_divergence(None, "minimax-m2.7"), None);
+    fn auto_routed_run_without_a_pin_never_mismatches() {
+        assert_eq!(
+            pinned_model_mismatch(None, "minimax", Some("minimax-m2.7")),
+            None
+        );
     }
 
     #[test]
@@ -13753,7 +14361,8 @@ mod model_selection_tests {
 
         // `--agent reviewer` with NO `-m`: the alias has no config entry,
         // so the guard MUST fire.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer", "--oneshot"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
         let health = HealthStore::default();
 
@@ -13772,71 +14381,55 @@ mod model_selection_tests {
         }
     }
 
-    /// ONESHOT model_provider regression (fix for issue #15):
-    ///   An agent with only `model_provider` (no `.model`) must error out
-    ///   under `--oneshot`. The `model_provider` chain is zeroclaw-engine-
-    ///   only — the oneshot router is a direct model selector, not a
-    ///   provider-chain resolver. Previously the `model_provider` chain
-    ///   was used in the oneshot precedence block, causing `--agent` to
-    ///   silently resolve to a different model than the agent declared.
+    /// ONESHOT model_provider regression: an agent whose model is configured
+    /// through `model_provider` must resolve to the model in
+    /// `[providers.models.*]`. This is the normal zeroclaw config shape and
+    /// must work without duplicating a direct `.model` pin on the agent.
     #[test]
-    fn model_provider_chain_must_not_resolve_under_oneshot() {
-        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
-        let mut agents = BTreeMap::new();
-        // The agent has model_provider but NO direct .model pin.
-        agents.insert(
-            "reviewer".into(),
-            AliasedAgentConfig {
-                model: None,
-                reviewer_model: None,
-                model_provider: Some("minimax".into()),
-            },
-        );
-        cfg.agents = agents;
+    fn model_provider_chain_resolves_under_oneshot() {
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.minimax]
+model = "minimax/MiniMax-M3"
 
-        // `--agent reviewer` with NO `-m`: must error because the agent
-        // has only model_provider (zeroclaw-only), not a direct .model pin.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer"]).unwrap();
-        let eng = Engine::from_parts(cfg, fixture_corpus());
+[agents.reviewer]
+model_provider = "custom.minimax"
+"#,
+        )
+        .unwrap();
+
+        // `--agent reviewer` with NO `-m`: resolve through model_provider.
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--agent", "reviewer", "--oneshot"]).unwrap();
+        let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
         let health = HealthStore::default();
 
-        match resolve_chain(&cli, &eng, &health) {
-            Ok(_) => panic!(
-                "guard must error when --agent has only model_provider (no .model) AND no -m"
-            ),
-            Err(err) => {
-                assert!(
-                    err.to_string().contains("reviewer"),
-                    "error must name the alias: {err}"
-                );
-                assert!(
-                    err.to_string().contains("no model configured"),
-                    "error must say 'no model configured': {err}"
-                );
-            }
-        }
+        let routes = resolve_chain(&cli, &eng, &health)
+            .expect("model_provider must resolve for an explicitly selected oneshot agent");
+        assert_eq!(routes.primary, vec!["minimax/MiniMax-M3"]);
     }
 
     /// ONESHOT with agent that has BOTH .model AND model_provider: the .model
-    /// pin MUST be used (not model_provider). `model_provider` is zeroclaw-
-    /// only and must not affect the oneshot route.
+    /// pin MUST be used before the model_provider indirection.
     #[test]
     fn direct_model_pin_takes_precedence_over_model_provider_in_oneshot() {
-        let mut cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "author".into(),
-            AliasedAgentConfig {
-                model: Some("deepseek-ai/deepseek-r1".into()),
-                reviewer_model: None,
-                model_provider: Some("nvidia-eih".into()),
-            },
-        );
-        cfg.agents = agents;
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "minimax/MiniMax-M3"
+
+[agents.author]
+model = "deepseek-ai/deepseek-r1"
+model_provider = "custom.other"
+"#,
+        )
+        .unwrap();
 
         // `--agent author` with a direct .model pin: must use that pin.
-        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author"]).unwrap();
-        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "--oneshot"]).unwrap();
+        let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
         let health = HealthStore::default();
 
         let ResolvedRoutes {
@@ -13989,46 +14582,1216 @@ mod model_selection_tests {
         );
     }
 
-    /// REGRESSION: `-m <engine-agent-alias>` must select that agent.
-    ///
-    /// `resolve_agent_alias` matched the model id against a hardcoded table of
-    /// CLOUD model ids and, on no match, returned the `minimax` default. A local
-    /// engine alias such as `coder` matched nothing, so `zoder exec -m coder`
-    /// silently ran `minimax-m2.7` and 404'd -- the engine ran a model the
-    /// operator never named. `pinned_model_divergence` only *warned* about it.
-    ///
-    /// Fails on the old behaviour: with `coder` present in the engine's agent
-    /// set, the pre-fix resolver still answered `minimax`.
+    /// `-m` is an exact model id, so a live agent alias without a model route
+    /// must be rejected instead of being treated as model selection.
     #[test]
-    fn dash_m_selects_a_real_engine_agent_over_the_builtin_table() {
+    fn dash_m_rejects_a_bare_engine_agent_alias() {
         let cli = Cli::try_parse_from(["zoder", "exec", "-m", "coder", "task"]).unwrap();
+        let eng = Engine::from_parts(fixture_cfg(None, None), fixture_corpus());
         let known: std::collections::HashSet<String> = ["coder", "reviewer", "minimax"]
             .iter()
             .map(|s| s.to_string())
             .collect();
 
-        assert_eq!(
-            resolve_agent_alias(&cli, &known, "coder"),
-            "coder",
-            "a model id naming a real engine agent must select that agent, not the default"
+        assert!(
+            resolve_agent_alias(&cli, &eng, &known, "coder").is_err(),
+            "a bare agent alias must be selected with --agent, not -m"
         );
+        assert!(resolve_agent_alias(&cli, &eng, &known, "CODER").is_err());
+        assert!(resolve_agent_alias(&cli, &eng, &known, "some-unknown-cloud-model").is_err());
+    }
 
-        // Case-insensitive, since aliases are operator-typed.
-        assert_eq!(resolve_agent_alias(&cli, &known, "CODER"), "coder");
+    /// REGRESSION: `-m <model-id>` must choose the engine agent configured for
+    /// that exact model, rather than falling through to the unrelated default
+    /// agent and merely warning after the turn has already run.
+    #[test]
+    fn dash_m_model_id_does_not_fall_through_to_unrelated_default_agent() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "-m", "gpt-5.5", "task"]).unwrap();
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.codex]
+model = "gpt-5.5"
 
-        // Unknown ids still fall through to the substring table / default, so
-        // cloud model ids keep working.
-        assert_eq!(
-            resolve_agent_alias(&cli, &known, "some-unknown-cloud-model"),
-            "minimax"
+[agents.codex]
+model_provider = "custom.codex"
+"#,
+        )
+        .unwrap();
+        let eng = Engine::from_parts_with_engine_models(
+            fixture_cfg(None, None),
+            fixture_corpus(),
+            engine_models,
         );
+        let known: std::collections::HashSet<String> =
+            ["codex", "minimax"].iter().map(|s| s.to_string()).collect();
 
-        // `--agent` still outranks everything.
-        let pinned = Cli::try_parse_from([
-            "zoder", "exec", "-m", "coder", "--agent", "reviewer", "task",
+        assert_eq!(
+            resolve_agent_alias(&cli, &eng, &known, "gpt-5.5").unwrap(),
+            "codex",
+            "an explicit model id must select its configured engine agent"
+        );
+    }
+
+    #[test]
+    fn dash_m_rejects_ambiguous_engine_agents_without_explicit_agent() {
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.shared]
+model = "shared-model"
+
+[agents.author]
+model_provider = "custom.shared"
+
+[agents.reviewer]
+model_provider = "custom.shared"
+"#,
+        )
+        .unwrap();
+        let eng = Engine::from_parts_with_engine_models(
+            fixture_cfg(None, None),
+            fixture_corpus(),
+            engine_models,
+        );
+        let known = ["author", "reviewer"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let ambiguous =
+            Cli::try_parse_from(["zoder", "exec", "-m", "shared-model", "task"]).unwrap();
+        let err = resolve_agent_alias(&ambiguous, &eng, &known, "shared-model")
+            .expect_err("duplicate routes must not silently select author by lexical order");
+        assert!(err.to_string().contains("multiple engine agents"));
+
+        let selected = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "-m",
+            "shared-model",
+            "--agent",
+            "reviewer",
+            "task",
         ])
         .unwrap();
-        assert_eq!(resolve_agent_alias(&pinned, &known, "coder"), "reviewer");
+        assert_eq!(
+            resolve_agent_alias(&selected, &eng, &known, "shared-model").unwrap(),
+            "reviewer"
+        );
+    }
+
+    /// The daemon is the authority once it is running. This deliberately uses
+    /// separate disk and live registries: disk has one unambiguous route, while
+    /// the fake daemon reports two. A live ambiguity must fail, and a live
+    /// default that picks the other agent must be rejected as disagreement
+    /// rather than dispatching the disk-selected agent.
+    #[test]
+    fn fake_daemon_rejects_unique_disk_route_when_live_route_is_ambiguous_or_redefaulted() {
+        let disk_registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.shared]
+model = "shared-model"
+
+[agents.author]
+model_provider = "custom.shared"
+"#,
+        )
+        .unwrap();
+        let eng = Engine::from_parts_with_engine_models(
+            fixture_cfg(None, None),
+            fixture_corpus(),
+            disk_registry,
+        );
+        let known = ["author", "reviewer"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let cli = Cli::try_parse_from(["zoder", "exec", "-m", "shared-model", "task"]).unwrap();
+        let disk_alias = resolve_agent_alias(&cli, &eng, &known, "shared-model").unwrap();
+        assert_eq!(disk_alias, "author", "disk route is intentionally unique");
+
+        let fake_daemon_config = |default_agent: Option<&str>| {
+            let mut value = serde_json::json!({
+                "providers": {
+                    "models": {
+                        "custom": {
+                            "shared": { "model": "shared-model" }
+                        }
+                    }
+                },
+                "agents": {
+                    "author": { "model_provider": "custom.shared" },
+                    "reviewer": { "model_provider": "custom.shared" }
+                }
+            });
+            if let Some(default_agent) = default_agent {
+                value["acp"] = serde_json::json!({ "default_agent": default_agent });
+            }
+            EngineModelRegistry::from_json(&value).unwrap()
+        };
+
+        let ambiguous = fake_daemon_config(None);
+        let gated_provider = fixture_gated_provider(
+            "custom.shared",
+            "https://subscription.example/v1",
+            BillingMode::Free,
+        );
+        let err = verify_live_zeroclaw_route(
+            &cli,
+            &disk_alias,
+            "shared-model",
+            &gated_provider,
+            Some(&ambiguous),
+        )
+        .expect_err("live duplicate routes without a default must fail closed");
+        assert!(err.to_string().contains("multiple engine agents"), "{err}");
+
+        let redefaulted = fake_daemon_config(Some("reviewer"));
+        let err = verify_live_zeroclaw_route(
+            &cli,
+            &disk_alias,
+            "shared-model",
+            &gated_provider,
+            Some(&redefaulted),
+        )
+        .expect_err("a live default selecting another agent must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("author"), "{message}");
+        assert!(message.contains("reviewer"), "{message}");
+        assert!(message.contains("running daemon selects"), "{message}");
+    }
+
+    /// `--agent` without `-m` used to pre-gate the stale zoder-side model and
+    /// never compare it with the same alias in the running daemon. Cost
+    /// telemetry cannot repair a pre-dispatch policy decision, so unavailable
+    /// telemetry must still leave this route rejected before dispatch.
+    #[test]
+    fn explicit_agent_conflicting_with_live_model_never_reaches_dispatch() {
+        let mut cfg = fixture_cfg(None, None);
+        cfg.agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("minimax/MiniMax-M3".into()),
+                ..Default::default()
+            },
+        );
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "codex", "task"]).unwrap();
+        let routed_model = resolve_effective_primary(&cli, &eng).unwrap();
+        assert_eq!(
+            routed_model, "minimax/MiniMax-M3",
+            "fixture must reproduce the stale zoder-side pre-gate model"
+        );
+
+        let live_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "agents": {
+                "codex": { "model": "gpt-5.5" }
+            }
+        }))
+        .unwrap();
+        let unavailable_cost = unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable);
+        assert_eq!(
+            unavailable_cost.3, None,
+            "unavailable cost telemetry must not invent a model identity"
+        );
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let gated_provider = fixture_gated_provider(
+            "custom.codex",
+            "https://subscription.example/v1",
+            BillingMode::Free,
+        );
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "codex",
+            &routed_model,
+            &gated_provider,
+            Some(&live_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+
+        let message = preflight
+            .expect_err("conflicting zoder/live --agent models must fail before dispatch")
+            .to_string();
+        assert!(message.contains("minimax/MiniMax-M3"), "{message}");
+        assert!(message.contains("gpt-5.5"), "{message}");
+        assert!(
+            !dispatch_called.get(),
+            "run_agent_dispatch must remain unreachable after failed live preflight"
+        );
+    }
+
+    #[test]
+    fn automatic_route_requires_live_registry_and_agrees_with_live_selection() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "task"]).unwrap();
+
+        let gated_provider = fixture_gated_provider(
+            "custom.author",
+            "https://subscription.example/v1",
+            BillingMode::Free,
+        );
+        let unavailable =
+            verify_live_zeroclaw_route(&cli, "author", "safe-model", &gated_provider, None)
+                .expect_err("automatic routing must fail closed when config/get is unavailable");
+        assert!(
+            unavailable.to_string().contains("cannot verify Zeroclaw"),
+            "{unavailable}"
+        );
+
+        let live_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "agents": {
+                "author": { "model": "different-model" },
+                "reviewer": { "model": "safe-model" }
+            }
+        }))
+        .unwrap();
+        let disagreement = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "safe-model",
+            &gated_provider,
+            Some(&live_registry),
+        )
+        .expect_err("automatic disk selection must be reconciled through the live registry");
+        let message = disagreement.to_string();
+        assert!(message.contains("author"), "{message}");
+        assert!(message.contains("reviewer"), "{message}");
+        assert!(message.contains("running daemon selects"), "{message}");
+    }
+
+    #[test]
+    fn live_provider_fallback_closure_is_rejected_before_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let live_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "primary": {
+                            "model": "safe-model",
+                            "fallback_models": ["same-provider-paid"],
+                            "fallback": ["custom.remote"]
+                        },
+                        "remote": { "model": "other-provider-paid" }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.primary" }
+            }
+        }))
+        .unwrap();
+
+        let gated_provider = fixture_gated_provider(
+            "custom.primary",
+            "https://subscription.example/v1",
+            BillingMode::Free,
+        );
+        let error = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "safe-model",
+            &gated_provider,
+            Some(&live_registry),
+        )
+        .expect_err("daemon-internal fallback models have not passed zoder's policy gates");
+        let message = error.to_string();
+        assert!(message.contains("same-provider-paid"), "{message}");
+        assert!(message.contains("other-provider-paid"), "{message}");
+        assert!(message.contains("un-gated"), "{message}");
+    }
+
+    /// Fleet-compatibility regression: zoder providers historically use a
+    /// short id and omit kind, while Zeroclaw uses a qualified provider
+    /// profile. The load seam must derive that unique mapping once and retain
+    /// the default zoder kind; live preflight must then allow dispatch.
+    #[test]
+    fn short_provider_id_and_implicit_kind_bind_and_dispatch() {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "minimax",
+            "base_url": "https://api.minimax.io/v1",
+            "auth": { "type": "none" },
+            "billing": "subscription",
+            "serves": ["MiniMax-"]
+        }))
+        .unwrap();
+        assert_eq!(provider.id, "minimax");
+        assert_eq!(provider.kind, "openai-chat");
+        assert_eq!(provider.engine_provider_ref, None);
+
+        let live_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": {
+                            "uri": "https://api.minimax.io/v1",
+                            "model": "MiniMax-M3"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "minimax": { "model_provider": "custom.minimax" }
+            }
+        }))
+        .unwrap();
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers = vec![provider];
+        cfg.default_provider = "minimax".into();
+        cfg.bind_engine_provider_refs(&live_registry)
+            .expect("a unique legacy short id must bind at config-load time");
+        let gated_provider = &cfg.providers[0];
+        assert_eq!(
+            gated_provider.engine_provider_ref.as_deref(),
+            Some("custom.minimax")
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "minimax", "task"]).unwrap();
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "minimax",
+            "MiniMax-M3",
+            gated_provider,
+            Some(&live_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        preflight.expect("the fleet-shaped route must pass live preflight");
+        assert!(
+            dispatch_called.get(),
+            "the compatible short-id/implicit-kind route must reach dispatch"
+        );
+    }
+
+    #[test]
+    fn uri_less_minimax_cn_is_not_equivalent_to_intl_billing_route() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "minimax",
+            "https://api.minimax.io/v1",
+            BillingMode::Subscription,
+        );
+        gated_provider.engine_provider_ref = Some("minimax.primary".into());
+
+        let cn_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "minimax": {
+                        "primary": {
+                            "endpoint": "cn",
+                            "model": "MiniMax-M3"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "minimax.primary" }
+            }
+        }))
+        .unwrap();
+        let route = cn_registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.effective_kind, "openai-chat");
+        assert_eq!(route.effective_uri, "https://api.minimaxi.com/v1");
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "MiniMax-M3",
+            &gated_provider,
+            Some(&cn_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("the URI-less CN selector must not inherit zoder's Intl endpoint")
+            .to_string();
+        assert!(message.contains("https://api.minimaxi.com/v1"), "{message}");
+        assert!(message.contains("https://api.minimax.io/v1"), "{message}");
+        assert!(!dispatch_called.get());
+
+        let intl_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "minimax": {
+                        "primary": { "model": "MiniMax-M3" }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "minimax.primary" }
+            }
+        }))
+        .unwrap();
+        assert!(
+            verify_live_zeroclaw_route(
+                &cli,
+                "author",
+                "MiniMax-M3",
+                &gated_provider,
+                Some(&intl_registry),
+            )
+            .is_ok(),
+            "MiniMax's omitted endpoint selector has an authoritative Intl default"
+        );
+    }
+
+    #[test]
+    fn uri_less_anthropic_default_mismatch_withholds_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "anthropic",
+            "https://anthropic-proxy.example/v1",
+            BillingMode::Subscription,
+        );
+        gated_provider.kind = "anthropic".into();
+        gated_provider.engine_provider_ref = Some("anthropic.primary".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "anthropic": {
+                        "primary": { "model": "claude-sonnet" }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "anthropic.primary" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.effective_kind, "anthropic");
+        assert_eq!(route.effective_uri, "https://api.anthropic.com");
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "claude-sonnet",
+            &gated_provider,
+            Some(&registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("Anthropic's implicit canonical endpoint must be compared")
+            .to_string();
+        assert!(message.contains("https://api.anthropic.com"), "{message}");
+        assert!(
+            message.contains("https://anthropic-proxy.example/v1"),
+            "{message}"
+        );
+        assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn computed_azure_endpoint_mismatch_withholds_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "azure",
+            "https://approved.openai.azure.com/openai/deployments/approved-deployment",
+            BillingMode::Metered,
+        );
+        gated_provider.kind = "azure-openai".into();
+        gated_provider.engine_provider_ref = Some("azure.primary".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "azure": {
+                        "primary": {
+                            "resource": "other-resource",
+                            "deployment": "other-deployment",
+                            "model": "gpt-4o"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "azure.primary" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.effective_kind, "azure-openai");
+        assert_eq!(
+            route.effective_uri,
+            "https://other-resource.openai.azure.com/openai/deployments/other-deployment"
+        );
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight =
+            verify_live_zeroclaw_route(&cli, "author", "gpt-4o", &gated_provider, Some(&registry));
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("Azure resource/deployment must define the checked endpoint")
+            .to_string();
+        assert!(message.contains("other-resource"), "{message}");
+        assert!(message.contains("approved"), "{message}");
+        assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn no_uri_openai_codex_accepts_chatgpt_subscription_endpoint() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let codex_uri = "https://chatgpt.com/backend-api/codex/responses";
+        let mut gated_provider = fixture_gated_provider(
+            "codex",
+            "https://chatgpt.com/backend-api/codex",
+            BillingMode::Subscription,
+        );
+        gated_provider.kind = "openai-responses".into();
+        gated_provider.engine_provider_ref = Some("openai.codex".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "openai": {
+                        "codex": {
+                            "requires_openai_auth": true,
+                            "model": "gpt-5.3-codex"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "openai.codex" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.implementation, "openai-codex");
+        assert_eq!(route.effective_kind, "openai-responses");
+        assert_eq!(route.effective_uri, codex_uri);
+
+        verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "gpt-5.3-codex",
+            &gated_provider,
+            Some(&registry),
+        )
+        .expect("the no-URI Codex route must attest against the ChatGPT endpoint");
+    }
+
+    #[test]
+    fn no_uri_openai_codex_rejects_openai_api_endpoint() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "codex",
+            "https://api.openai.com/v1",
+            BillingMode::Subscription,
+        );
+        gated_provider.kind = "openai-responses".into();
+        gated_provider.engine_provider_ref = Some("openai.codex".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "openai": {
+                        "codex": {
+                            "requires_openai_auth": true,
+                            "model": "gpt-5.3-codex"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "openai.codex" }
+            }
+        }))
+        .unwrap();
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "gpt-5.3-codex",
+            &gated_provider,
+            Some(&registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("a ChatGPT Codex session must not attest as api.openai.com")
+            .to_string();
+        assert!(message.contains("chatgpt.com"), "{message}");
+        assert!(message.contains("api.openai.com"), "{message}");
+        assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn native_groq_ignores_explicit_uri_and_withholds_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let proxy_uri = "https://subscription-proxy.example/v1";
+        let mut gated_provider =
+            fixture_gated_provider("groq", proxy_uri, BillingMode::Subscription);
+        gated_provider.engine_provider_ref = Some("groq.primary".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "groq": {
+                        "primary": {
+                            "uri": proxy_uri,
+                            "model": "openai/gpt-oss-20b"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "groq.primary" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.implementation, "groq");
+        assert_eq!(route.effective_kind, "openai-chat");
+        assert_eq!(route.effective_uri, "https://api.groq.com/openai/v1");
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "openai/gpt-oss-20b",
+            &gated_provider,
+            Some(&registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("Groq's native factory must not attest against an ignored proxy URI")
+            .to_string();
+        assert!(
+            message.contains("https://api.groq.com/openai/v1"),
+            "{message}"
+        );
+        assert!(message.contains(proxy_uri), "{message}");
+        assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn custom_profile_selecting_native_openrouter_withholds_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let proxy_uri = "https://free-proxy.example/v1";
+        let mut gated_provider = fixture_gated_provider("proxy", proxy_uri, BillingMode::Free);
+        gated_provider.engine_provider_ref = Some("custom.proxy".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "proxy": {
+                            "kind": "openrouter",
+                            "uri": proxy_uri,
+                            "model": "vendor/shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.proxy" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.implementation, "openrouter");
+        assert_eq!(route.effective_kind, "openai-chat");
+        assert_eq!(route.effective_uri, "https://openrouter.ai/api/v1");
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "vendor/shared-model",
+            &gated_provider,
+            Some(&registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+        let message = preflight
+            .expect_err("kind=openrouter must use the native factory's fixed endpoint")
+            .to_string();
+        assert!(
+            message.contains("https://openrouter.ai/api/v1"),
+            "{message}"
+        );
+        assert!(message.contains(proxy_uri), "{message}");
+        assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn openrouter_profile_with_compatible_implementation_honors_uri() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let proxy_uri = "https://subscription-proxy.example/v1";
+        let mut gated_provider =
+            fixture_gated_provider("proxy", proxy_uri, BillingMode::Subscription);
+        gated_provider.engine_provider_ref = Some("openrouter.proxy".into());
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "openrouter": {
+                        "proxy": {
+                            "kind": "openai-compatible",
+                            "uri": proxy_uri,
+                            "model": "vendor/shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "openrouter.proxy" }
+            }
+        }))
+        .unwrap();
+        let route = registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.implementation, "openai-compatible");
+        assert_eq!(route.effective_kind, "openai-chat");
+        assert_eq!(route.effective_uri, proxy_uri);
+
+        verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "vendor/shared-model",
+            &gated_provider,
+            Some(&registry),
+        )
+        .expect("a URI-consuming implementation must preserve the configured proxy endpoint");
+    }
+
+    /// A model id is not a billing identity. The subscription and metered
+    /// profiles below deliberately serve the same model, but use different
+    /// provider aliases and endpoints. Gating the subscription route must not
+    /// authorize dispatch through the daemon's metered route.
+    #[test]
+    fn identical_model_on_different_billing_provider_is_rejected_before_dispatch() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut subscription_provider = fixture_gated_provider(
+            "subscription",
+            "https://subscription.example/v1",
+            BillingMode::Subscription,
+        );
+        subscription_provider.engine_provider_ref = Some("custom.subscription".into());
+        let mut metered_provider = fixture_gated_provider(
+            "metered",
+            "https://metered.example/v1",
+            BillingMode::Metered,
+        );
+        metered_provider.engine_provider_ref = Some("custom.metered".into());
+        assert!(is_cost_neutral_provider(&subscription_provider));
+        assert!(!is_cost_neutral_provider(&metered_provider));
+
+        let subscription_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "uri": "https://subscription.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.subscription" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            verify_live_zeroclaw_route(
+                &cli,
+                "author",
+                "shared-model",
+                &subscription_provider,
+                Some(&subscription_registry),
+            )
+            .unwrap(),
+            Some("shared-model".to_owned()),
+            "the explicitly mapped subscription provider is the control case"
+        );
+
+        let direct_model_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "agents": {
+                "author": { "model": "shared-model" }
+            }
+        }))
+        .unwrap();
+        let missing_provider = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &subscription_provider,
+            Some(&direct_model_registry),
+        )
+        .expect_err("model equality without a provider identity must fail closed")
+        .to_string();
+        assert!(missing_provider.contains("no model_provider identity"));
+
+        let missing_endpoint_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.subscription" }
+            }
+        }))
+        .unwrap();
+        let missing_endpoint = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &subscription_provider,
+            Some(&missing_endpoint_registry),
+        )
+        .expect_err("provider identity without an endpoint must fail closed")
+        .to_string();
+        assert!(missing_endpoint.contains("no explicit endpoint"));
+
+        let missing_kind_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "uri": "https://subscription.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.subscription" }
+            }
+        }))
+        .unwrap();
+        assert!(
+            verify_live_zeroclaw_route(
+                &cli,
+                "author",
+                "shared-model",
+                &subscription_provider,
+                Some(&missing_kind_registry),
+            )
+            .is_ok(),
+            "an omitted engine kind must retain the provider family's supported default"
+        );
+
+        let metered_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "metered": {
+                            "kind": "openai-chat",
+                            "uri": "https://metered.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.metered" }
+            }
+        }))
+        .unwrap();
+        assert!(
+            verify_live_zeroclaw_route(
+                &cli,
+                "author",
+                "shared-model",
+                &metered_provider,
+                Some(&metered_registry),
+            )
+            .is_ok(),
+            "fixture must describe a complete, internally consistent metered route"
+        );
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &subscription_provider,
+            Some(&metered_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+
+        let message = preflight
+            .expect_err("the same model through an unapproved metered provider must fail closed")
+            .to_string();
+        assert!(message.contains("custom.metered"), "{message}");
+        assert!(message.contains("subscription"), "{message}");
+        assert!(message.contains("https://metered.example/v1"), "{message}");
+        assert!(
+            message.contains("https://subscription.example/v1"),
+            "{message}"
+        );
+        assert!(message.contains("billing=Subscription"), "{message}");
+        assert!(
+            !dispatch_called.get(),
+            "run_agent_dispatch must remain unreachable after provider identity mismatch"
+        );
+    }
+
+    /// Provider profile suffixes are not account identities. These two routes
+    /// intentionally keep model, endpoint, suffix, and implementation kind
+    /// identical; only the fully-qualified provider reference changes. The
+    /// daemon route must therefore be rejected before dispatch.
+    #[test]
+    fn identical_route_with_different_fully_qualified_provider_is_rejected() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "subscription",
+            "https://shared.example/v1",
+            BillingMode::Subscription,
+        );
+        gated_provider.engine_provider_ref = Some("custom.subscription".into());
+        let exact_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "uri": "https://shared.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.subscription" }
+            }
+        }))
+        .unwrap();
+        assert!(
+            verify_live_zeroclaw_route(
+                &cli,
+                "author",
+                "shared-model",
+                &gated_provider,
+                Some(&exact_registry),
+            )
+            .is_ok(),
+            "the exact fully-qualified provider is the control case"
+        );
+
+        let wrong_kind_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "kind": "anthropic",
+                            "uri": "https://shared.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.subscription" }
+            }
+        }))
+        .unwrap();
+        let wrong_kind = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &gated_provider,
+            Some(&wrong_kind_registry),
+        )
+        .expect_err("an implementation-kind mismatch must fail closed")
+        .to_string();
+        assert!(wrong_kind.contains("anthropic"), "{wrong_kind}");
+        assert!(wrong_kind.contains("openai-chat"), "{wrong_kind}");
+
+        let other_account_registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "other": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "uri": "https://shared.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "other.subscription" }
+            }
+        }))
+        .unwrap();
+        let live_route = other_account_registry
+            .provider_route_for_agent("author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_route.provider_alias, "subscription");
+        assert_eq!(live_route.effective_kind, "openai-chat");
+        assert_eq!(live_route.effective_uri, "https://shared.example/v1");
+
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &gated_provider,
+            Some(&other_account_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+
+        let message = preflight
+            .expect_err("a different fully-qualified provider must fail closed")
+            .to_string();
+        assert!(message.contains("other.subscription"), "{message}");
+        assert!(message.contains("custom.subscription"), "{message}");
+        assert!(message.contains("does not exactly match"), "{message}");
+        assert!(
+            !dispatch_called.get(),
+            "run_agent_dispatch must remain unreachable after account identity mismatch"
+        );
+    }
+
+    /// Risk characterization for the existing Zeroclaw protocol. Distinct
+    /// underlying credentials for the same provider profile are serialized by
+    /// config/get to the same masked value, and session/new reports no auth
+    /// subject or key fingerprint. Zoder therefore cannot observe an account
+    /// change that preserves provider ref, kind, endpoint, and model.
+    #[test]
+    fn masked_credentials_cannot_attest_a_different_billing_account() {
+        let approved_secret = "secret-for-approved-account";
+        let executed_secret = "secret-for-other-account";
+        assert_ne!(approved_secret, executed_secret);
+
+        let masked_config_for = |_unobservable_secret: &str| {
+            serde_json::json!({
+                "providers": {
+                    "models": {
+                        "custom": {
+                            "subscription": {
+                                "api_key": "***MASKED***",
+                                "kind": "openai-chat",
+                                "uri": "https://shared.example/v1",
+                                "model": "shared-model"
+                            }
+                        }
+                    }
+                },
+                "agents": {
+                    "author": { "model_provider": "custom.subscription" }
+                }
+            })
+        };
+        let approved_masked_config = masked_config_for(approved_secret);
+        let executed_masked_config = masked_config_for(executed_secret);
+        assert_eq!(
+            approved_masked_config, executed_masked_config,
+            "config/get replaces distinct credentials with one sentinel"
+        );
+        let session_new_result = serde_json::json!({
+            "session_id": "existing-protocol-session",
+            "agent_alias": "author",
+            "message_count": 0,
+            "workspace_dir": "/tmp"
+        });
+        assert!(session_new_result.get("account_id").is_none());
+        assert!(session_new_result.get("auth_subject").is_none());
+        assert!(session_new_result.get("credential_fingerprint").is_none());
+
+        let live_registry = EngineModelRegistry::from_json(&executed_masked_config).unwrap();
+        let mut gated_provider = fixture_gated_provider(
+            "subscription",
+            "https://shared.example/v1",
+            BillingMode::Subscription,
+        );
+        gated_provider.engine_provider_ref = Some("custom.subscription".into());
+        gated_provider.subscription = Some(SubscriptionPlan {
+            account_id: Some("approved-account".into()),
+            ..Default::default()
+        });
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "author", "task"]).unwrap();
+        let dispatch_called = std::cell::Cell::new(false);
+        let preflight = verify_live_zeroclaw_route(
+            &cli,
+            "author",
+            "shared-model",
+            &gated_provider,
+            Some(&live_registry),
+        );
+        if preflight.is_ok() {
+            dispatch_called.set(true);
+        }
+
+        preflight.expect(
+            "today's RPC payload cannot distinguish credentials within one provider profile",
+        );
+        assert!(
+            dispatch_called.get(),
+            "this intentionally pins the accepted account-attestation gap"
+        );
+    }
+
+    #[test]
+    fn dash_m_does_not_trust_stale_zoder_agent_pin_over_engine_config() {
+        let mut cfg = fixture_cfg(None, None);
+        cfg.agents.insert(
+            "codex".into(),
+            AliasedAgentConfig {
+                model: Some("stale-model".into()),
+                ..Default::default()
+            },
+        );
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.codex]
+model = "gpt-5.5"
+
+[agents.codex]
+model_provider = "custom.codex"
+"#,
+        )
+        .unwrap();
+        let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
+        let known = ["codex"].into_iter().map(str::to_owned).collect();
+        let cli = Cli::try_parse_from(["zoder", "exec", "-m", "stale-model", "task"]).unwrap();
+
+        assert!(
+            resolve_agent_alias(&cli, &eng, &known, "stale-model").is_err(),
+            "a zoder-side pin must not override the model the engine agent actually runs"
+        );
     }
 
     /// REGRESSION: the builtin table must never hand the engine an alias it
@@ -14044,6 +15807,7 @@ mod model_selection_tests {
     #[test]
     fn table_alias_is_reconciled_against_the_engines_real_agents() {
         let cli = Cli::try_parse_from(["zoder", "exec", "task"]).unwrap();
+        let eng = Engine::from_parts(fixture_cfg(None, None), fixture_corpus());
         // A per-provider config: the shape the table was NOT written for.
         let known: std::collections::HashSet<String> = [
             "minimax",
@@ -14058,14 +15822,14 @@ mod model_selection_tests {
         .collect();
 
         assert_eq!(
-            resolve_agent_alias(&cli, &known, "deepseek-v4-pro"),
+            resolve_agent_alias(&cli, &eng, &known, "deepseek-v4-pro").unwrap(),
             "deepseek",
             "a per-model table alias must resolve to the per-provider agent that exists"
         );
 
         // The default is reconciled too, not just table hits.
         assert_eq!(
-            resolve_agent_alias(&cli, &known, "some-unknown-cloud-model"),
+            resolve_agent_alias(&cli, &eng, &known, "some-unknown-cloud-model").unwrap(),
             "minimax"
         );
     }
@@ -14101,9 +15865,19 @@ mod model_selection_tests {
     #[test]
     fn forced_loop_author_keeps_model_agent_tool_wiring() {
         let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.minimax]
+model = "minimax/MiniMax-M3"
+
+[agents.minimax]
+model_provider = "custom.minimax"
+"#,
+        )
+        .unwrap();
         let cli =
             Cli::try_parse_from(["zoder", "loop", "-m", "minimax/MiniMax-M3", "task"]).unwrap();
-        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
         let health = HealthStore::default();
 
         let ResolvedRoutes {
@@ -14113,7 +15887,7 @@ mod model_selection_tests {
         } = resolve_chain(&cli, &eng, &health).unwrap();
         let head = chain.first().expect("chain must have a head");
         assert_eq!(
-            resolve_agent_alias(&cli, &std::collections::HashSet::new(), head),
+            resolve_agent_alias(&cli, &eng, &std::collections::HashSet::new(), head).unwrap(),
             "minimax",
             "the forced model must select its configured coding-agent alias"
         );
@@ -14235,6 +16009,7 @@ mod model_selection_tests {
         // filter runs.
         cfg.providers.push(Provider {
             id: "free-host".into(),
+            engine_provider_ref: None,
             base_url: "https://free.example/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
@@ -14457,6 +16232,7 @@ mod model_selection_tests {
         cfg.providers = vec![
             Provider {
                 id: "openai-sub".into(),
+                engine_provider_ref: None,
                 base_url: "https://chatgpt.com/backend-api/codex".into(),
                 kind: "openai-responses".into(),
                 auth: zoder_core::Auth::None,
@@ -14468,6 +16244,7 @@ mod model_selection_tests {
             },
             Provider {
                 id: "openai-metered".into(),
+                engine_provider_ref: None,
                 base_url: "https://api.openai.com/v1".into(),
                 kind: "openai-responses".into(),
                 auth: zoder_core::Auth::None,
