@@ -1435,6 +1435,7 @@ mod test_helpers {
             // set.
             cfg.providers.push(Provider {
                 id: "test-alpha".into(),
+                engine_provider_ref: None,
                 base_url: "https://alpha.example/v1".into(),
                 kind: "openai-chat".into(),
                 auth: zoder_core::Auth::None,
@@ -1446,6 +1447,7 @@ mod test_helpers {
             });
             cfg.providers.push(Provider {
                 id: "test-beta".into(),
+                engine_provider_ref: None,
                 base_url: "https://beta.example/v1".into(),
                 kind: "openai-chat".into(),
                 auth: zoder_core::Auth::None,

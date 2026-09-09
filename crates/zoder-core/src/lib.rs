@@ -41,11 +41,11 @@ pub mod update;
 pub mod utilization;
 
 pub use acp_client::{
-    agents_status, cancel_session, fetch_quickstart_diagnostics, list_agents, new_session,
-    probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call, wait_for_socket,
-    write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent, AgentOptions, AgentRun,
-    AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy, DaemonReadiness,
-    EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
+    agents_status, cancel_session, fetch_engine_config, fetch_quickstart_diagnostics, list_agents,
+    new_session, probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call,
+    wait_for_socket, write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent,
+    AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy,
+    DaemonReadiness, EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
 };
 /// Settle budget the loop grants the daemon to ACK a `session/cancel` after
 /// the author-phase watchdog fires (see `cancel_session`). Canonical value
@@ -59,9 +59,9 @@ pub use catalog_models::{
     EnrichmentOutcome,
 };
 pub use config::{
-    AliasedAgentConfig, Auth, BillingMode, Config, ExecSafetyConfig, ExecSandbox,
-    LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions, Provider, QuotaUnit, QuotaWindow,
-    SeatbeltProfileOptions, SubscriptionPlan, Theme,
+    AliasedAgentConfig, Auth, BillingMode, Config, EngineModelRegistry, EngineProviderRoute,
+    ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions,
+    Provider, QuotaUnit, QuotaWindow, SeatbeltProfileOptions, SubscriptionPlan, Theme,
 };
 pub use corpus::{Corpus, ModelEntry, RefreshReport};
 pub use engine_cost::{
