@@ -9,6 +9,7 @@ use zoder_core::{
 fn provider(base_url: &str) -> OpenAiProvider {
     let cfg = Provider {
         id: "test".into(),
+        engine_provider_ref: None,
         base_url: base_url.to_string(),
         kind: "openai-chat".into(),
         auth: Auth::None,
@@ -764,6 +765,7 @@ fn backoff_honors_retry_after_floor() {
 fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
     let cfg = Provider {
         id: "anthropic".into(),
+        engine_provider_ref: None,
         base_url: base_url.to_string(),
         kind: "anthropic".into(),
         auth,
@@ -1413,6 +1415,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message
 fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
     let cfg = Provider {
         id: "responses".into(),
+        engine_provider_ref: None,
         base_url: base_url.to_string(),
         kind: "openai-responses".into(),
         auth,
@@ -1839,6 +1842,7 @@ static AZURE_INTEG_API_VERSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 fn azure_provider(base_url: &str, auth: Auth, azure_api_version: Option<&str>) -> OpenAiProvider {
     let cfg = Provider {
         id: "azure".into(),
+        engine_provider_ref: None,
         base_url: base_url.to_string(),
         kind: "azure-openai".into(),
         auth,
@@ -2324,6 +2328,7 @@ async fn drive_live_arm(
     // live arm behavior).
     let cfg = Provider {
         id: "test".into(),
+        engine_provider_ref: None,
         base_url: server.uri(),
         kind: "openai-chat".into(),
         auth: Auth::None,

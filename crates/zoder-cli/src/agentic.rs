@@ -237,6 +237,7 @@ mod agentic_utilization_tests {
     fn test_provider() -> zoder_core::config::Provider {
         zoder_core::config::Provider {
             id: "openai".into(),
+            engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             kind: "openai-responses".into(),
             auth: Auth::None,
@@ -256,6 +257,7 @@ mod agentic_utilization_tests {
     fn minimax_counter_provider() -> zoder_core::config::Provider {
         zoder_core::config::Provider {
             id: "minimax".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,

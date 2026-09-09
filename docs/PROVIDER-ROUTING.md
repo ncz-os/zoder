@@ -18,6 +18,9 @@ purely additive and never changes behavior for existing single-provider setups.
 # A flat-rate subscription model on its own endpoint.
 [[providers]]
 id = "minimax"
+# Optional for the common unique mapping custom.minimax -> minimax.
+# Set it when more than one Zeroclaw profile has the alias "minimax":
+# engine_provider_ref = "custom.minimax"
 base_url = "https://api.minimax.io/v1"
 kind = "openai-chat"
 auth = { type = "env", var = "MINIMAX_API_KEY" }
@@ -36,6 +39,30 @@ paid = false
 billing = "free"
 serves = ["deepseek-ai/", "meta/llama-", "mistralai/", "qwen/"]
 ```
+
+`engine_provider_ref` is the exact Zeroclaw `providers.models` profile used
+for agentic execution. It is separate from zoder's provider `id`, so existing
+short ids remain valid. During configuration load zoder auto-derives an absent
+mapping from an exact reference or a unique alias match, using explicit
+endpoint/kind metadata to disambiguate. If multiple profiles remain possible,
+loading fails with a clear request to set `engine_provider_ref`; dispatch
+never chooses one arbitrarily.
+
+The mapping compares Zeroclaw's **effective** transport and endpoint, not only
+the literal `kind` and `uri` fields. Zoder preserves the canonical
+implementation selected by `kind`, then resolves omitted or ignored values
+through that factory's rules and the typed provider family (including regional
+selectors such as MiniMax `endpoint = "cn"` and computed fields such as Azure
+`resource` plus `deployment`). Native Groq and OpenRouter, for example, ignore
+a configured URI and always use their fixed endpoints; a different
+implementation selected from an OpenRouter-family profile can still consume
+its explicit URI. An OpenAI profile with `requires_openai_auth = true` is
+projected as the distinct `openai-codex` implementation and, without an
+explicit URI, resolves to the ChatGPT subscription Codex Responses endpoint
+rather than `api.openai.com`; zoder's configured Codex base is normalized with
+the same `/responses` suffix before comparison. A family whose effective
+identity cannot be resolved is rejected instead of treating omission as a
+wildcard.
 
 With the above, a single `zoder exec` fallback chain can run `MiniMax-M3` on
 `api.minimax.io` and then `meta/llama-3.3-70b-instruct` on the open-weight host

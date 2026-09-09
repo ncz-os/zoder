@@ -303,6 +303,7 @@ mod tests {
     fn provider(id: &str, base_url: &str) -> Provider {
         Provider {
             id: id.into(),
+            engine_provider_ref: None,
             base_url: base_url.into(),
             kind: "openai-chat".into(),
             auth: Auth::None,

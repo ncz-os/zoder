@@ -310,6 +310,17 @@ impl SubscriptionPlan {
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     pub id: String,
+    /// Exact Zeroclaw `model_provider` profile reference represented by this
+    /// zoder billing provider (for example `custom.minimax`). This is distinct
+    /// from [`Self::id`], which remains an arbitrary zoder-local routing name
+    /// and may be the short form used by existing configurations.
+    ///
+    /// When omitted, the exec configuration loader derives the reference from
+    /// the engine registry only when the mapping is unambiguous. Operators
+    /// must set it explicitly when two engine provider profiles share the same
+    /// short alias and compatible endpoint/kind metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_provider_ref: Option<String>,
     pub base_url: String,
     #[serde(default = "default_kind")]
     pub kind: String, // openai-chat | openai-responses | azure-openai | anthropic | custom
@@ -356,6 +367,47 @@ pub struct Provider {
     /// header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_api_version: Option<String>,
+}
+
+impl Provider {
+    /// Whether Zeroclaw's resolved implementation kind is compatible with
+    /// zoder's provider transport. Callers must resolve implicit family
+    /// defaults before invoking this method; absence is not evidence of
+    /// equivalence.
+    pub fn engine_kind_is_compatible(&self, engine_kind: &str) -> bool {
+        let engine_kind = engine_kind.trim();
+        let zoder_kind = self.kind.trim();
+        engine_kind == zoder_kind
+            || matches!(
+                (engine_kind, zoder_kind),
+                ("openai-compatible", "openai-chat") | ("openai", "openai-chat")
+            )
+    }
+
+    /// Whether Zeroclaw's resolved effective endpoint agrees with zoder's
+    /// gated provider endpoint. Callers must resolve family defaults and typed
+    /// endpoint selectors first.
+    pub fn engine_endpoint_is_compatible(
+        &self,
+        engine_uri: &str,
+        engine_implementation: &str,
+    ) -> bool {
+        let engine_uri = engine_uri.trim_end_matches('/');
+        let base_url = self.base_url.trim().trim_end_matches('/');
+        if engine_implementation == "openai-codex" {
+            // Zoder stores provider base URLs, while Zeroclaw reports the
+            // Codex implementation's complete Responses endpoint. Match the
+            // daemon's builder: preserve a complete `/responses` endpoint or
+            // append that suffix to the configured base.
+            let gated_uri = if base_url.ends_with("/responses") {
+                base_url.to_owned()
+            } else {
+                format!("{base_url}/responses")
+            };
+            return engine_uri == gated_uri;
+        }
+        engine_uri == base_url
+    }
 }
 
 /// A model-entry contributed by a vendor overlay's `[providers.models.*]`
@@ -405,6 +457,1108 @@ pub struct ModelEntry {
     /// rather than an allow-list of the kwargs we happen to know about today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// Read-only projection of the zeroclaw engine's `config.toml` model routing.
+///
+/// zoder's provider/cost configuration and zeroclaw's runtime configuration
+/// are intentionally different schemas, but `exec` must still understand the
+/// engine's two-hop agent route:
+///
+/// `agents.<alias>.model_provider` -> `providers.models.<provider>.model`.
+///
+/// Parsing the complete engine file as [`Config`] is incorrect (and used to
+/// fail on unrelated keys such as `schema_version`, identity, memory, and
+/// workspace settings). This type extracts only agent/model routing plus the
+/// provider reference, implementation kind, endpoint, and fallback closure
+/// needed to verify model and billing identity; it ignores the rest of the
+/// engine schema.
+#[derive(Debug, Clone, Default)]
+pub struct EngineModelRegistry {
+    agents: BTreeMap<String, EngineAgentModel>,
+    models: BTreeMap<String, EngineProviderModel>,
+    default_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EngineAgentModel {
+    model: Option<String>,
+    model_provider: Option<String>,
+}
+
+/// Routing-relevant projection of one
+/// `[providers.models.<family>.<alias>]` profile. A provider profile is not a
+/// single model: after its primary fails, Zeroclaw can try same-provider model
+/// fallbacks and then recursively visit other provider profiles. Keeping the
+/// complete closure here is therefore part of model-identity verification,
+/// not merely a reliability detail.
+#[derive(Debug, Clone, Default)]
+struct EngineProviderModel {
+    model: String,
+    kind: Option<String>,
+    uri: Option<String>,
+    wire_api: Option<String>,
+    endpoint: Option<String>,
+    resource: Option<String>,
+    deployment: Option<String>,
+    requires_openai_auth: bool,
+    fallback_models: Vec<String>,
+    fallback: Vec<String>,
+}
+
+/// Provider identity attached to an engine agent's `model_provider` route.
+///
+/// Model equality alone cannot establish billing identity: two provider
+/// profiles can serve the same model through different endpoints or accounts.
+/// The live `config/get` projection therefore retains the complete
+/// non-secret identity Zeroclaw exposes so callers can map it explicitly to
+/// the provider whose billing policy they approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineProviderRoute {
+    /// Exact Zeroclaw provider reference, such as `custom.minimax` or a
+    /// supported non-dotted built-in reference such as `openai`.
+    pub provider_ref: String,
+    /// Provider family (the part before the first dot). For a non-dotted
+    /// built-in reference this is the complete reference.
+    pub provider_type: String,
+    /// Provider profile alias (the part after the first dot). For a non-dotted
+    /// built-in reference this is also the complete reference.
+    pub provider_alias: String,
+    /// Canonical provider implementation selected by Zeroclaw after applying
+    /// the profile's `kind` override and auth-backed specializations. This is
+    /// more specific than the wire transport: native and generic
+    /// implementations can speak the same protocol while applying different
+    /// endpoint rules.
+    pub implementation: String,
+    /// Effective transport after resolving the provider family, `kind`,
+    /// `wire_api`, and auth-backed OpenAI variants.
+    pub effective_kind: String,
+    /// Effective endpoint after applying explicit URI precedence, typed
+    /// endpoint selectors, or computed family fields.
+    pub effective_uri: String,
+}
+
+impl EngineModelRegistry {
+    /// Parse the routing projection from a zeroclaw engine TOML document.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let doc: toml::Value = toml::from_str(raw).context("parsing engine config TOML")?;
+        let root = doc
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("engine config root must be a TOML table"))?;
+
+        let mut registry = Self {
+            default_agent: root
+                .get("acp")
+                .and_then(toml::Value::as_table)
+                .and_then(|acp| acp.get("default_agent"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+            ..Self::default()
+        };
+        if let Some(agents) = root.get("agents").and_then(toml::Value::as_table) {
+            for (alias, value) in agents {
+                let Some(agent) = value.as_table() else {
+                    continue;
+                };
+                let route = EngineAgentModel {
+                    model: agent
+                        .get("model")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    model_provider: agent
+                        .get("model_provider")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                };
+                if route.model.is_some() || route.model_provider.is_some() {
+                    registry.agents.insert(alias.clone(), route);
+                }
+            }
+        }
+
+        if let Some(models) = root
+            .get("providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get("models"))
+            .and_then(toml::Value::as_table)
+        {
+            collect_engine_models(models, "", &mut registry.models)?;
+        }
+
+        Ok(registry)
+    }
+
+    /// Parse the same routing projection from the running daemon's masked
+    /// `config/get` JSON response. This is deliberately separate from
+    /// [`Self::from_toml`]: an on-disk file can be newer than a long-running
+    /// daemon, while an explicit model pin must be checked against the config
+    /// the daemon is actually serving.
+    pub fn from_json(value: &serde_json::Value) -> anyhow::Result<Self> {
+        let root = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("engine config JSON root must be an object"))?;
+        let mut registry = Self {
+            default_agent: root
+                .get("acp")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|acp| acp.get("default_agent"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+            ..Self::default()
+        };
+
+        if let Some(agents) = root.get("agents").and_then(serde_json::Value::as_object) {
+            for (alias, value) in agents {
+                let Some(agent) = value.as_object() else {
+                    continue;
+                };
+                let route = EngineAgentModel {
+                    model: agent
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    model_provider: agent
+                        .get("model_provider")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                };
+                if route.model.is_some() || route.model_provider.is_some() {
+                    registry.agents.insert(alias.clone(), route);
+                }
+            }
+        }
+
+        if let Some(models) = root
+            .get("providers")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|providers| providers.get("models"))
+            .and_then(serde_json::Value::as_object)
+        {
+            collect_engine_models_json(models, "", &mut registry.models)?;
+        }
+
+        Ok(registry)
+    }
+
+    /// Load a zeroclaw engine config. A missing file means there are no known
+    /// engine routes; malformed or unsafe files fail closed because guessing a
+    /// route can run a different model than the operator selected.
+    pub fn load_from(path: &Path) -> anyhow::Result<Self> {
+        if !path
+            .try_exists()
+            .with_context(|| format!("checking engine config at {}", path.display()))?
+        {
+            return Ok(Self::default());
+        }
+        let raw = read_bounded_regular_file(path, Config::MAX_CONFIG_BYTES)
+            .with_context(|| format!("reading engine model routes from {}", path.display()))?;
+        Self::from_toml(&raw)
+            .with_context(|| format!("loading engine model routes from {}", path.display()))
+    }
+
+    /// Whether the engine config contributed any agent model routes.
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+    }
+
+    /// Resolve an agent alias to the model the engine is configured to run.
+    /// A direct `model` wins; otherwise follow `model_provider` into the
+    /// flattened `[providers.models.*]` registry.
+    pub fn model_for_agent(&self, alias: &str) -> Option<&str> {
+        let route = self.agents.get(alias).or_else(|| {
+            self.agents
+                .iter()
+                .find(|(configured, _)| configured.eq_ignore_ascii_case(alias))
+                .map(|(_, route)| route)
+        })?;
+        route.model.as_deref().or_else(|| {
+            route
+                .model_provider
+                .as_deref()
+                .and_then(|provider| self.models.get(provider))
+                .map(|provider| provider.model.as_str())
+        })
+    }
+
+    /// Return the complete ordered model-attempt closure for an agent.
+    ///
+    /// The first entry is the primary model. Remaining entries are every
+    /// `fallback_models` item on that provider followed by the primary and
+    /// same-provider fallbacks of each recursively referenced `fallback`
+    /// provider. A direct `[agents.<alias>].model` remains the primary when
+    /// present, but the selected `model_provider` profile's `fallback_models`
+    /// and downstream provider fallbacks still belong to the attempt closure;
+    /// only that profile's superseded primary is omitted.
+    ///
+    /// Dangling provider references and cycles fail closed. Zeroclaw may prune
+    /// those edges at runtime, but route verification must never silently
+    /// discard a configured attempt that could otherwise escape policy gates.
+    pub fn model_candidates_for_agent(&self, alias: &str) -> anyhow::Result<Option<Vec<String>>> {
+        let Some(route) = self.agents.get(alias).or_else(|| {
+            self.agents
+                .iter()
+                .find(|(configured, _)| configured.eq_ignore_ascii_case(alias))
+                .map(|(_, route)| route)
+        }) else {
+            return Ok(None);
+        };
+
+        let mut candidates = Vec::new();
+        if let Some(model) = route.model.as_deref() {
+            candidates.push(model.to_owned());
+            if let Some(provider) = route.model_provider.as_deref() {
+                let mut path = Vec::new();
+                self.collect_provider_model_candidates(
+                    provider,
+                    false,
+                    &mut path,
+                    &mut candidates,
+                )?;
+            }
+            return Ok(Some(candidates));
+        }
+        let Some(provider) = route.model_provider.as_deref() else {
+            return Ok(None);
+        };
+
+        let mut path = Vec::new();
+        self.collect_provider_model_candidates(provider, true, &mut path, &mut candidates)?;
+        Ok(Some(candidates))
+    }
+
+    /// Return the non-secret provider identity for an agent's engine route.
+    ///
+    /// A direct agent `model` without `model_provider` has no provider identity
+    /// and returns `None`. A dangling or malformed provider reference is a hard
+    /// error so billing verification cannot silently fall back to model-only
+    /// matching.
+    pub fn provider_route_for_agent(
+        &self,
+        alias: &str,
+    ) -> anyhow::Result<Option<EngineProviderRoute>> {
+        let Some(route) = self.agents.get(alias).or_else(|| {
+            self.agents
+                .iter()
+                .find(|(configured, _)| configured.eq_ignore_ascii_case(alias))
+                .map(|(_, route)| route)
+        }) else {
+            return Ok(None);
+        };
+        let Some(provider_ref) = route.model_provider.as_deref() else {
+            return Ok(None);
+        };
+        if provider_ref.trim().is_empty() {
+            anyhow::bail!("engine model provider reference for agent {alias:?} is empty");
+        }
+        let Some((configured_ref, provider)) =
+            self.models.get_key_value(provider_ref).or_else(|| {
+                self.models
+                    .iter()
+                    .find(|(configured, _)| configured.eq_ignore_ascii_case(provider_ref))
+            })
+        else {
+            anyhow::bail!(
+                "engine model provider {provider_ref:?} for agent {alias:?} is not configured"
+            );
+        };
+
+        Ok(Some(Self::project_provider_route(
+            configured_ref,
+            provider,
+        )?))
+    }
+
+    fn provider_route_for_ref(
+        &self,
+        provider_ref: &str,
+    ) -> anyhow::Result<Option<EngineProviderRoute>> {
+        let Some((configured_ref, provider)) = self.models.get_key_value(provider_ref) else {
+            return Ok(None);
+        };
+        Ok(Some(Self::project_provider_route(
+            configured_ref,
+            provider,
+        )?))
+    }
+
+    /// Resolve only profiles whose short alias could map to the zoder
+    /// provider being loaded. Unrelated engine profiles may use native
+    /// transports zoder never dispatches and must not break an otherwise
+    /// valid oneshot/Goose configuration merely by existing.
+    fn provider_routes_for_alias(&self, alias: &str) -> anyhow::Result<Vec<EngineProviderRoute>> {
+        self.models
+            .iter()
+            .filter(|(provider_ref, _)| {
+                provider_ref
+                    .split_once('.')
+                    .map_or(provider_ref.as_str(), |(_, profile)| profile)
+                    == alias
+            })
+            .map(|(provider_ref, provider)| Self::project_provider_route(provider_ref, provider))
+            .collect()
+    }
+
+    fn project_provider_route(
+        provider_ref: &str,
+        provider: &EngineProviderModel,
+    ) -> anyhow::Result<EngineProviderRoute> {
+        let (provider_type, provider_alias) = provider_ref
+            .split_once('.')
+            .unwrap_or((provider_ref, provider_ref));
+        let implementation = resolve_engine_provider_implementation(provider_type, provider);
+        let effective_kind = resolve_engine_provider_kind(provider_ref, provider, &implementation)?;
+        let effective_uri = resolve_engine_provider_uri(
+            provider_ref,
+            provider_type,
+            provider,
+            &implementation,
+            &effective_kind,
+        )?;
+        Ok(EngineProviderRoute {
+            provider_ref: provider_ref.to_owned(),
+            provider_type: provider_type.to_owned(),
+            provider_alias: provider_alias.to_owned(),
+            implementation,
+            effective_kind,
+            effective_uri,
+        })
+    }
+
+    fn collect_provider_model_candidates(
+        &self,
+        provider_alias: &str,
+        include_primary: bool,
+        path: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(cycle_start) = path
+            .iter()
+            .position(|seen| seen.eq_ignore_ascii_case(provider_alias))
+        {
+            let mut cycle = path[cycle_start..].to_vec();
+            cycle.push(provider_alias.to_owned());
+            anyhow::bail!(
+                "provider fallback cycle in engine model routes: {}",
+                cycle.join(" -> ")
+            );
+        }
+        let Some((configured_alias, provider)) =
+            self.models.get_key_value(provider_alias).or_else(|| {
+                self.models
+                    .iter()
+                    .find(|(configured, _)| configured.eq_ignore_ascii_case(provider_alias))
+            })
+        else {
+            anyhow::bail!(
+                "engine model provider {provider_alias:?} is referenced by a route or fallback, \
+                 but is not configured"
+            );
+        };
+
+        path.push(configured_alias.clone());
+        if include_primary {
+            out.push(provider.model.clone());
+        }
+        out.extend(provider.fallback_models.iter().cloned());
+        for fallback_provider in &provider.fallback {
+            self.collect_provider_model_candidates(fallback_provider, true, path, out)?;
+        }
+        path.pop();
+        Ok(())
+    }
+
+    /// Resolve a model id to a configured engine agent without silently
+    /// selecting the lexicographically-first alias when routes are duplicated.
+    /// `[acp].default_agent` is the engine's semantic tie-breaker when it is one
+    /// of the matching agents; otherwise the caller must select an agent.
+    pub fn agent_for_model(&self, model: &str) -> anyhow::Result<Option<&str>> {
+        self.agent_for_model_with_preference(model, None)
+    }
+
+    /// Resolve an exact model id while allowing an explicit `--agent` to break
+    /// an otherwise ambiguous mapping. Model identifiers are not aliases and
+    /// are never matched case-insensitively.
+    pub fn agent_for_model_with_preference(
+        &self,
+        model: &str,
+        preferred_agent: Option<&str>,
+    ) -> anyhow::Result<Option<&str>> {
+        let matches: Vec<&str> = self
+            .agents
+            .keys()
+            .filter(|alias| self.model_for_agent(alias) == Some(model))
+            .map(String::as_str)
+            .collect();
+        self.select_matching_agent(model, preferred_agent, &matches)
+    }
+
+    fn select_matching_agent<'a>(
+        &'a self,
+        model: &str,
+        preferred_agent: Option<&str>,
+        matches: &[&'a str],
+    ) -> anyhow::Result<Option<&'a str>> {
+        match matches {
+            [] => Ok(None),
+            [only] => Ok(Some(*only)),
+            _ => {
+                if let Some(alias) = preferred_agent.and_then(|preferred| {
+                    matches
+                        .iter()
+                        .copied()
+                        .find(|alias| alias.eq_ignore_ascii_case(preferred))
+                }) {
+                    return Ok(Some(alias));
+                }
+                if preferred_agent.is_none() {
+                    if let Some(alias) = self.default_agent.as_deref().and_then(|default| {
+                        matches
+                            .iter()
+                            .copied()
+                            .find(|alias| alias.eq_ignore_ascii_case(default))
+                    }) {
+                        return Ok(Some(alias));
+                    }
+                }
+                anyhow::bail!(
+                    "model {model:?} is configured on multiple engine agents ({}); pass \
+                     --agent <alias> to select one{}",
+                    matches.join(", "),
+                    if self.default_agent.is_some() {
+                        " (the configured [acp].default_agent is not one of them)"
+                    } else {
+                        " or configure [acp].default_agent"
+                    }
+                )
+            }
+        }
+    }
+}
+
+/// Resolve the canonical factory key Zeroclaw selects for a provider profile.
+/// `kind` overrides the profile family before the daemon decides whether the
+/// supplied URI is meaningful, so endpoint attestation must retain this
+/// identity instead of reducing it immediately to a wire protocol.
+fn resolve_engine_provider_implementation(
+    provider_type: &str,
+    provider: &EngineProviderModel,
+) -> String {
+    let selected = provider
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider_type);
+    let implementation = canonicalize_engine_provider_implementation(selected);
+    if implementation == "openai" && provider.requires_openai_auth {
+        // OpenAI's typed factory replaces itself with the subscription-backed
+        // Codex Responses implementation before it considers the ordinary
+        // OpenAI chat/responses paths.
+        "openai-codex".to_owned()
+    } else {
+        implementation.to_owned()
+    }
+}
+
+/// Mirror the aliases Zeroclaw canonicalizes before factory dispatch. Keep the
+/// canonical implementation in the route even when several implementations
+/// share one effective transport.
+fn canonicalize_engine_provider_implementation(implementation: &str) -> &str {
+    match implementation {
+        "azure_openai" | "azure-openai" => "azure",
+        "openai_compatible" => "openai-compatible",
+        "openai_responses" => "openai-responses",
+        "openai_codex" | "codex" => "openai-codex",
+        "anthropic-custom" | "claude-code" => "anthropic",
+        "grok" => "xai",
+        "google" | "google-gemini" => "gemini",
+        "together-ai" => "together",
+        "fireworks-ai" => "fireworks",
+        "vercel-ai" => "vercel",
+        "cloudflare-ai" => "cloudflare",
+        "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        "aws-bedrock" => "bedrock",
+        "lm-studio" => "lmstudio",
+        "lite-llm" => "litellm",
+        "hf" => "huggingface",
+        "01ai" | "lingyiwanwu" => "yi",
+        "tencent" => "hunyuan",
+        "baidu" => "qianfan",
+        "github-copilot" => "copilot",
+        "ovhcloud" => "ovh",
+        "opencode-zen" | "opencode-go" => "opencode",
+        "llama.cpp" => "llamacpp",
+        "deep-myst" => "deepmyst",
+        "silicon-flow" => "siliconflow",
+        "deep-infra" => "deepinfra",
+        "ai21-labs" => "ai21",
+        "friendliai" => "friendli",
+        "lepton-ai" => "lepton",
+        "lambda-ai" => "lambda_ai",
+        "github-models" => "github_models",
+        "step" | "stepfun-intl" | "step-intl" => "stepfun",
+        "gemini-cli" => "gemini_cli",
+        "volcengine" | "ark" | "doubao-cn" => "doubao",
+        "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
+        | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
+        "qwen-cn"
+        | "qwen-intl"
+        | "qwen-us"
+        | "qwen-international"
+        | "qwen-code"
+        | "qwen-oauth"
+        | "qwen_oauth"
+        | "dashscope"
+        | "dashscope-cn"
+        | "dashscope-intl"
+        | "dashscope-us"
+        | "dashscope-international"
+        | "bailian"
+        | "aliyun-bailian"
+        | "aliyun" => "qwen",
+        "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => "glm",
+        "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => "zai",
+        "minimax-intl"
+        | "minimax-io"
+        | "minimax-global"
+        | "minimax-portal"
+        | "minimax-portal-global"
+        | "minimax-cn"
+        | "minimaxi"
+        | "minimax-portal-cn"
+        | "minimax-oauth"
+        | "minimax-oauth-global"
+        | "minimax-oauth-cn" => "minimax",
+        _ => implementation,
+    }
+}
+
+/// Resolve the transport Zeroclaw actually constructs for a provider profile.
+fn resolve_engine_provider_kind(
+    provider_ref: &str,
+    provider: &EngineProviderModel,
+    implementation: &str,
+) -> anyhow::Result<String> {
+    let wire_api = provider
+        .wire_api
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(wire_api) = wire_api {
+        anyhow::ensure!(
+            matches!(wire_api, "responses" | "chat_completions"),
+            "engine provider {provider_ref:?} has unsupported wire_api {wire_api:?}; refusing to \
+             infer its effective transport"
+        );
+    }
+
+    let kind = match implementation {
+        "anthropic" => "anthropic",
+        "azure" => "azure-openai",
+        "openai-responses" | "openai-codex" => "openai-responses",
+        "openai" => {
+            if provider.requires_openai_auth || wire_api == Some("responses") {
+                "openai-responses"
+            } else {
+                "openai-chat"
+            }
+        }
+        "custom" => {
+            if wire_api == Some("responses") {
+                "openai-responses"
+            } else {
+                "openai-chat"
+            }
+        }
+        "openai-compatible" | "openai_compatible" | "openai-chat" | "openai_chat" => "openai-chat",
+        family if openai_compatible_engine_family(family) => {
+            // Of Zeroclaw's typed compatibility families, only OpenCode
+            // currently consumes its profile's `wire_api` override. The rest
+            // instantiate the chat-completions provider even if the shared
+            // base happens to contain that otherwise-unused field.
+            if family == "opencode" && wire_api == Some("responses") {
+                "openai-responses"
+            } else {
+                "openai-chat"
+            }
+        }
+        _ => anyhow::bail!(
+            "engine provider {provider_ref:?} omits an authoritative transport mapping for \
+             Zeroclaw implementation {implementation:?}; set an explicit supported kind or do \
+             not route this provider through zoder"
+        ),
+    };
+    Ok(kind.to_owned())
+}
+
+/// Resolve the endpoint Zeroclaw actually binds after applying the selected
+/// implementation's URI-consumption rule and typed family defaults. Explicit
+/// `uri` wins only for factories that consume it; Azure is deliberately
+/// computed from `resource`/`deployment`, matching the current daemon factory.
+/// No missing or unknown default is treated as equal.
+fn resolve_engine_provider_uri(
+    provider_ref: &str,
+    provider_type: &str,
+    provider: &EngineProviderModel,
+    implementation: &str,
+    effective_kind: &str,
+) -> anyhow::Result<String> {
+    if effective_kind == "azure-openai" {
+        anyhow::ensure!(
+            provider_type == "azure",
+            "engine provider {provider_ref:?} selects Azure through a different typed family; \
+             its effective resource/deployment endpoint cannot be resolved authoritatively"
+        );
+        let resource =
+            required_engine_provider_field(provider_ref, "resource", &provider.resource)?;
+        let deployment =
+            required_engine_provider_field(provider_ref, "deployment", &provider.deployment)?;
+        return Ok(format!(
+            "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
+        ));
+    }
+
+    // These native factories ignore `api_url` even when the selected profile
+    // contains `uri`. Key this rule off the canonical implementation selected
+    // by `kind`, not the profile family: `custom.proxy kind = "openrouter"`
+    // still runs OpenRouter, while `openrouter.proxy kind =
+    // "openai-compatible"` really does consume the explicit URI.
+    if let Some(uri) = ignored_uri_engine_provider_endpoint(implementation) {
+        return Ok(uri.to_owned());
+    }
+
+    if let Some(uri) = provider
+        .uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(uri.to_owned());
+    }
+
+    if implementation == "openai-codex" {
+        // OpenAiCodexModelProvider uses this ChatGPT subscription endpoint
+        // when provider_api_url is absent. It is not the OpenAI API-family
+        // default and must remain a distinct billing/trust boundary.
+        return Ok("https://chatgpt.com/backend-api/codex/responses".to_owned());
+    }
+
+    if provider_type == "custom" {
+        anyhow::bail!(
+            "engine provider {provider_ref:?} has no explicit endpoint; custom profiles require \
+             uri so their effective billing endpoint can be verified"
+        );
+    }
+
+    if let Some(uri) = resolved_typed_engine_endpoint(provider_ref, provider_type, provider)? {
+        return Ok(uri.to_owned());
+    }
+    if let Some(uri) = fixed_engine_provider_endpoint(provider_type) {
+        return Ok(uri.to_owned());
+    }
+
+    anyhow::bail!(
+        "engine provider {provider_ref:?} has no explicit uri and zoder cannot resolve an \
+         authoritative effective endpoint for Zeroclaw family {provider_type:?}; refusing to \
+         equate an omitted endpoint with the gated provider"
+    )
+}
+
+fn ignored_uri_engine_provider_endpoint(implementation: &str) -> Option<&'static str> {
+    match implementation {
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        _ => None,
+    }
+}
+
+fn required_engine_provider_field<'a>(
+    provider_ref: &str,
+    field: &str,
+    value: &'a Option<String>,
+) -> anyhow::Result<&'a str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine provider {provider_ref:?} requires non-empty typed field {field:?} to \
+                 resolve its effective endpoint"
+            )
+        })
+}
+
+fn resolved_typed_engine_endpoint(
+    provider_ref: &str,
+    provider_type: &str,
+    provider: &EngineProviderModel,
+) -> anyhow::Result<Option<&'static str>> {
+    let endpoint = provider
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let resolved = match provider_type {
+        "minimax" => match endpoint.unwrap_or("intl") {
+            "cn" => "https://api.minimaxi.com/v1",
+            "intl" => "https://api.minimax.io/v1",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "moonshot" => match endpoint.unwrap_or("intl") {
+            "cn" => "https://api.moonshot.cn/v1",
+            "intl" => "https://api.moonshot.ai/v1",
+            "code" => "https://api.kimi.com/coding/v1",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "qwen" => match endpoint.unwrap_or("intl") {
+            "cn" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "intl" => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "us" => "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+            "code" => {
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+            }
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "glm" => match endpoint.unwrap_or("global") {
+            "cn" => "https://open.bigmodel.cn/api/paas/v4",
+            "global" => "https://api.z.ai/api/paas/v4",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "zai" => match endpoint.unwrap_or("global") {
+            "cn" => "https://open.bigmodel.cn/api/coding/paas/v4",
+            "global" => "https://api.z.ai/api/coding/paas/v4",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "stepfun" => match endpoint.unwrap_or("intl") {
+            "cn" => "https://api.stepfun.com/v1",
+            "intl" => "https://api.stepfun.ai/v1",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        "kilo" => match endpoint.unwrap_or("gateway") {
+            "gateway" => "https://api.kilo.ai/api/gateway",
+            value => return unknown_engine_endpoint(provider_ref, value),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(resolved))
+}
+
+fn unknown_engine_endpoint<T>(provider_ref: &str, endpoint: &str) -> anyhow::Result<T> {
+    anyhow::bail!(
+        "engine provider {provider_ref:?} has unknown typed endpoint selector {endpoint:?}; \
+         refusing to guess its effective endpoint"
+    )
+}
+
+/// Families whose current Zeroclaw implementation uses the OpenAI-compatible
+/// chat transport when `kind` is omitted. This mirrors the downstream daemon
+/// factory; unlisted native/subprocess families fail closed above.
+fn openai_compatible_engine_family(family: &str) -> bool {
+    matches!(
+        family,
+        "ai21"
+            | "aihubmix"
+            | "anyscale"
+            | "arcee"
+            | "astrai"
+            | "atomic_chat"
+            | "avian"
+            | "baichuan"
+            | "baseten"
+            | "cerebras"
+            | "cloudflare"
+            | "cohere"
+            | "deepinfra"
+            | "deepmyst"
+            | "deepseek"
+            | "doubao"
+            | "featherless"
+            | "fireworks"
+            | "friendli"
+            | "github_models"
+            | "glm"
+            | "groq"
+            | "huggingface"
+            | "hunyuan"
+            | "hyperbolic"
+            | "inception"
+            | "kilo"
+            | "lambda_ai"
+            | "lepton"
+            | "litellm"
+            | "llamacpp"
+            | "lmstudio"
+            | "manifest"
+            | "minimax"
+            | "mistral"
+            | "moonshot"
+            | "morph"
+            | "nearai"
+            | "nebius"
+            | "novita"
+            | "nscale"
+            | "nvidia"
+            | "opencode"
+            | "openrouter"
+            | "osaurus"
+            | "perplexity"
+            | "qianfan"
+            | "qwen"
+            | "reka"
+            | "sambanova"
+            | "sglang"
+            | "siliconflow"
+            | "stepfun"
+            | "synthetic"
+            | "together"
+            | "upstage"
+            | "venice"
+            | "vercel"
+            | "vllm"
+            | "xai"
+            | "yi"
+            | "zai"
+    )
+}
+
+/// Fixed defaults consumed by Zeroclaw's current OpenAI-compatible factories.
+/// Multi-region and computed families are resolved separately above.
+fn fixed_engine_provider_endpoint(family: &str) -> Option<&'static str> {
+    Some(match family {
+        "openai" => "https://api.openai.com/v1",
+        "anthropic" => "https://api.anthropic.com",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "groq" => "https://api.groq.com/openai/v1",
+        "vercel" => "https://ai-gateway.vercel.sh/v1",
+        "cloudflare" => "https://gateway.ai.cloudflare.com/v1",
+        "synthetic" => "https://api.synthetic.new/openai/v1",
+        "opencode" => "https://opencode.ai/zen/v1",
+        "doubao" => "https://ark.cn-beijing.volces.com/api/v3",
+        "mistral" => "https://api.mistral.ai/v1",
+        "deepseek" => "https://api.deepseek.com",
+        "together" => "https://api.together.xyz",
+        "fireworks" => "https://api.fireworks.ai/inference/v1",
+        "novita" => "https://api.novita.ai/openai",
+        "perplexity" => "https://api.perplexity.ai",
+        "cohere" => "https://api.cohere.com/compatibility",
+        "sglang" => "http://localhost:30000/v1",
+        "vllm" => "http://localhost:8000/v1",
+        "astrai" => "https://as-trai.com/v1",
+        "siliconflow" => "https://api.siliconflow.com/v1",
+        "aihubmix" => "https://aihubmix.com/v1",
+        "litellm" => "http://localhost:4000/v1",
+        "cerebras" => "https://api.cerebras.ai/v1",
+        "sambanova" => "https://api.sambanova.ai/v1",
+        "hyperbolic" => "https://api.hyperbolic.xyz/v1",
+        "deepinfra" => "https://api.deepinfra.com/v1/openai",
+        "huggingface" => "https://router.huggingface.co/v1",
+        "ai21" => "https://api.ai21.com/studio/v1",
+        "reka" => "https://api.reka.ai/v1",
+        "baseten" => "https://inference.baseten.co/v1",
+        "nscale" => "https://inference.api.nscale.com/v1",
+        "anyscale" => "https://api.endpoints.anyscale.com/v1",
+        "nebius" => "https://api.tokenfactory.nebius.com/v1",
+        "friendli" => "https://api.friendli.ai/serverless/v1",
+        "lepton" => "https://llama3-1-405b.lepton.run/api/v1",
+        "manifest" => "https://app.manifest.build/v1",
+        "morph" => "https://api.morphllm.com/v1",
+        "github_models" => "https://models.github.ai/inference",
+        "upstage" => "https://api.upstage.ai/v1",
+        "featherless" => "https://api.featherless.ai/v1",
+        "arcee" => "https://api.arcee.ai/api/v1",
+        "lambda_ai" => "https://api.lambda.ai/v1",
+        "inception" => "https://api.inceptionlabs.ai/v1",
+        "baichuan" => "https://api.baichuan-ai.com/v1",
+        "yi" => "https://api.lingyiwanwu.com/v1",
+        "hunyuan" => "https://api.hunyuan.cloud.tencent.com/v1",
+        "avian" => "https://api.avian.io/v1",
+        "deepmyst" => "https://api.deepmyst.com/v1",
+        "venice" => "https://api.venice.ai",
+        "nearai" => "https://cloud-api.near.ai/v1",
+        "nvidia" => "https://integrate.api.nvidia.com/v1",
+        "atomic_chat" => "http://127.0.0.1:1337/v1",
+        "xai" => "https://api.x.ai/v1",
+        "lmstudio" => "http://localhost:1234/v1",
+        "llamacpp" => "http://localhost:8080/v1",
+        "osaurus" => "http://localhost:1337/v1",
+        "qianfan" => "https://qianfan.baidubce.com/v2",
+        _ => return None,
+    })
+}
+
+fn collect_engine_models(
+    table: &toml::Table,
+    prefix: &str,
+    out: &mut BTreeMap<String, EngineProviderModel>,
+) -> anyhow::Result<()> {
+    for (name, value) in table {
+        let Some(child) = value.as_table() else {
+            continue;
+        };
+        let alias = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if let Some(model) = child.get("model").and_then(toml::Value::as_str) {
+            out.insert(
+                alias.clone(),
+                EngineProviderModel {
+                    model: model.to_owned(),
+                    kind: child
+                        .get("kind")
+                        .or_else(|| child.get("type"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    uri: child
+                        .get("uri")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    wire_api: child
+                        .get("wire_api")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    endpoint: child
+                        .get("endpoint")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    resource: child
+                        .get("resource")
+                        .or_else(|| child.get("azure_openai_resource"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    deployment: child
+                        .get("deployment")
+                        .or_else(|| child.get("azure_openai_deployment"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    requires_openai_auth: child
+                        .get("requires_openai_auth")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false),
+                    fallback_models: toml_string_array(child, "fallback_models", &alias)?,
+                    fallback: toml_string_array(child, "fallback", &alias)?,
+                },
+            );
+        }
+        collect_engine_models(child, &alias, out)?;
+    }
+    Ok(())
+}
+
+fn collect_engine_models_json(
+    object: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    out: &mut BTreeMap<String, EngineProviderModel>,
+) -> anyhow::Result<()> {
+    for (name, value) in object {
+        let Some(child) = value.as_object() else {
+            continue;
+        };
+        let alias = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if let Some(model) = child.get("model").and_then(serde_json::Value::as_str) {
+            out.insert(
+                alias.clone(),
+                EngineProviderModel {
+                    model: model.to_owned(),
+                    kind: child
+                        .get("kind")
+                        .or_else(|| child.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    uri: child
+                        .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    wire_api: child
+                        .get("wire_api")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    endpoint: child
+                        .get("endpoint")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    resource: child
+                        .get("resource")
+                        .or_else(|| child.get("azure_openai_resource"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    deployment: child
+                        .get("deployment")
+                        .or_else(|| child.get("azure_openai_deployment"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    requires_openai_auth: child
+                        .get("requires_openai_auth")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    fallback_models: json_string_array(child, "fallback_models", &alias)?,
+                    fallback: json_string_array(child, "fallback", &alias)?,
+                },
+            );
+        }
+        collect_engine_models_json(child, &alias, out)?;
+    }
+    Ok(())
+}
+
+fn toml_string_array(
+    table: &toml::Table,
+    field: &str,
+    provider_alias: &str,
+) -> anyhow::Result<Vec<String>> {
+    let Some(value) = table.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field {field:?} must be an array of strings"
+        )
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "engine provider {provider_alias:?} field {field:?} must contain only strings"
+                )
+            })
+        })
+        .collect()
+}
+
+fn json_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    provider_alias: &str,
+) -> anyhow::Result<Vec<String>> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field {field:?} must be an array of strings"
+        )
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "engine provider {provider_alias:?} field {field:?} must contain only strings"
+                )
+            })
+        })
+        .collect()
 }
 
 fn default_kind() -> String {
@@ -1209,6 +2363,135 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Resolve and validate zoder-to-Zeroclaw provider-profile mappings once
+    /// while the two configuration files are loaded.
+    ///
+    /// Existing zoder configurations commonly use a short provider id such as
+    /// `minimax`, while Zeroclaw names the same profile `custom.minimax`. When
+    /// [`Provider::engine_provider_ref`] is absent, an exact reference match
+    /// wins; otherwise a single matching profile alias is adopted. If multiple
+    /// profiles share that alias, an explicit endpoint and compatible kind may
+    /// disambiguate them. A remaining ambiguity is a load-time error requiring
+    /// `engine_provider_ref`, never a per-turn guess.
+    ///
+    /// Providers with no name-related engine profile are left unmapped because
+    /// they may be valid oneshot/Goose-only routes. A Zeroclaw dispatch through
+    /// such a provider still fails closed and asks for an explicit mapping.
+    pub fn bind_engine_provider_refs(
+        &mut self,
+        registry: &EngineModelRegistry,
+    ) -> anyhow::Result<()> {
+        if registry.models.is_empty() {
+            return Ok(());
+        }
+
+        let mut claimed = BTreeMap::<String, String>::new();
+        for provider in &mut self.providers {
+            if provider.base_url.contains(PLACEHOLDER_PROVIDER_HOST) {
+                continue;
+            }
+            let explicit_ref = provider.engine_provider_ref.as_deref();
+            let selected = if let Some(provider_ref) = explicit_ref {
+                Some(
+                    registry
+                        .provider_route_for_ref(provider_ref)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                        "zoder provider {:?} maps engine_provider_ref {:?}, but that profile is \
+                         absent from the loaded Zeroclaw configuration",
+                        provider.id,
+                        provider_ref
+                    )
+                        })?,
+                )
+            } else if let Some(exact) = registry.provider_route_for_ref(&provider.id)? {
+                Some(exact)
+            } else {
+                let named = registry.provider_routes_for_alias(&provider.id)?;
+                match named.as_slice() {
+                    [] => None,
+                    [only] => Some(only.clone()),
+                    _ => {
+                        let compatible = named
+                            .iter()
+                            .filter(|route| {
+                                provider.engine_kind_is_compatible(&route.effective_kind)
+                                    && provider.engine_endpoint_is_compatible(
+                                        &route.effective_uri,
+                                        &route.implementation,
+                                    )
+                            })
+                            .collect::<Vec<_>>();
+                        match compatible.as_slice() {
+                            [only] => Some((*only).clone()),
+                            [] => {
+                                anyhow::bail!(
+                                    "zoder provider {:?} matches multiple Zeroclaw profiles by \
+                                     alias ({}) but none matches its endpoint/kind; set \
+                                     engine_provider_ref explicitly",
+                                    provider.id,
+                                    named
+                                        .iter()
+                                        .map(|route| route.provider_ref.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "zoder provider {:?} ambiguously matches multiple Zeroclaw \
+                                     profiles ({}); set engine_provider_ref explicitly",
+                                    provider.id,
+                                    compatible
+                                        .iter()
+                                        .map(|route| route.provider_ref.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            }
+                        }
+                    }
+                }
+            };
+
+            let Some(route) = selected else {
+                continue;
+            };
+            if !provider.engine_kind_is_compatible(&route.effective_kind) {
+                anyhow::bail!(
+                    "zoder provider {:?} (kind {:?}) maps Zeroclaw profile {:?}, but its \
+                     effective transport {:?} is incompatible",
+                    provider.id,
+                    provider.kind,
+                    route.provider_ref,
+                    route.effective_kind
+                );
+            }
+            if !provider.engine_endpoint_is_compatible(&route.effective_uri, &route.implementation)
+            {
+                anyhow::bail!(
+                    "zoder provider {:?} (endpoint {:?}) maps Zeroclaw profile {:?}, but its \
+                     effective endpoint {:?} differs",
+                    provider.id,
+                    provider.base_url,
+                    route.provider_ref,
+                    route.effective_uri
+                );
+            }
+            if let Some(previous) = claimed.insert(route.provider_ref.clone(), provider.id.clone())
+            {
+                anyhow::bail!(
+                    "zoder providers {previous:?} and {:?} both map Zeroclaw profile {:?}; each \
+                     engine billing boundary must map to exactly one zoder provider",
+                    provider.id,
+                    route.provider_ref
+                );
+            }
+            provider.engine_provider_ref = Some(route.provider_ref);
+        }
+        Ok(())
+    }
+
     /// Like `load()`, but never reads `config.json` — starts from the default
     /// free-tier config and applies only the named vendor TOML. Used by
     /// `--vendor <name>` when the user wants a vendor-only view from a clean
@@ -1267,6 +2550,7 @@ impl Config {
         Config {
             providers: vec![Provider {
                 id: "default".into(),
+                engine_provider_ref: None,
                 base_url: format!("https://{PLACEHOLDER_PROVIDER_HOST}/v1"),
                 kind: "openai-chat".into(),
                 auth: Auth::Env {
@@ -1570,11 +2854,28 @@ impl Config {
             errs.push("no providers configured".into());
         }
         let mut seen = std::collections::HashSet::new();
+        let mut seen_engine_provider_refs = BTreeMap::<&str, &str>::new();
         for p in &self.providers {
             if p.id.trim().is_empty() {
                 errs.push("a provider has an empty id".into());
             } else if !seen.insert(p.id.clone()) {
                 errs.push(format!("duplicate provider id: {}", p.id));
+            }
+            if let Some(provider_ref) = p.engine_provider_ref.as_deref() {
+                if provider_ref.trim().is_empty() {
+                    errs.push(format!(
+                        "provider {}: engine_provider_ref must not be empty",
+                        p.id
+                    ));
+                } else if let Some(previous) =
+                    seen_engine_provider_refs.insert(provider_ref, p.id.as_str())
+                {
+                    errs.push(format!(
+                        "providers {previous} and {} both declare engine_provider_ref \
+                         {provider_ref:?}",
+                        p.id
+                    ));
+                }
             }
             if let Err(e) = url::Url::parse(&p.base_url) {
                 errs.push(format!(
@@ -2232,10 +3533,359 @@ mod tests {
     use chrono::{Duration, Utc};
 
     #[test]
+    fn engine_model_registry_resolves_real_agent_provider_shape() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+schema_version = 1
+
+[providers.models.custom.reviewer]
+type = "openai-compatible"
+model = "nvidia/nvidia/nemotron-3-super-v3"
+uri = "https://example.invalid/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+
+[agents.reviewer.identity]
+name = "ignored by the routing projection"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry.model_for_agent("reviewer"),
+            Some("nvidia/nvidia/nemotron-3-super-v3")
+        );
+        assert_eq!(
+            registry
+                .agent_for_model("nvidia/nvidia/nemotron-3-super-v3")
+                .unwrap(),
+            Some("reviewer")
+        );
+        assert_eq!(
+            registry
+                .agent_for_model("NVIDIA/NVIDIA/NEMOTRON-3-SUPER-V3")
+                .unwrap(),
+            None,
+            "model ids must match exactly rather than case-insensitively"
+        );
+        assert_eq!(
+            registry.provider_route_for_agent("reviewer").unwrap(),
+            Some(EngineProviderRoute {
+                provider_ref: "custom.reviewer".into(),
+                provider_type: "custom".into(),
+                provider_alias: "reviewer".into(),
+                implementation: "openai-compatible".into(),
+                effective_kind: "openai-chat".into(),
+                effective_uri: "https://example.invalid/v1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn engine_model_registry_prefers_direct_agent_model() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.old]
+model = "old-model"
+fallback_models = ["provider-backup"]
+
+[agents.codex]
+model_provider = "custom.old"
+model = "gpt-5.5"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(registry.model_for_agent("codex"), Some("gpt-5.5"));
+        assert_eq!(registry.agent_for_model("gpt-5.5").unwrap(), Some("codex"));
+        assert_eq!(registry.agent_for_model("old-model").unwrap(), None);
+        assert_eq!(
+            registry
+                .model_candidates_for_agent("codex")
+                .unwrap()
+                .unwrap(),
+            vec!["gpt-5.5", "provider-backup"],
+            "the direct model replaces only the provider primary, not its fallback closure"
+        );
+    }
+
+    #[test]
+    fn engine_model_registry_rejects_ambiguous_model_agents() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.shared]
+model = "shared-model"
+
+[agents.author]
+model_provider = "custom.shared"
+
+[agents.reviewer]
+model_provider = "custom.shared"
+"#,
+        )
+        .unwrap();
+
+        let err = registry
+            .agent_for_model("shared-model")
+            .expect_err("duplicate routes must not select the first BTreeMap key");
+        let message = err.to_string();
+        assert!(message.contains("author"), "{message}");
+        assert!(message.contains("reviewer"), "{message}");
+        assert!(message.contains("--agent"), "{message}");
+        assert_eq!(
+            registry
+                .agent_for_model_with_preference("shared-model", Some("reviewer"))
+                .unwrap(),
+            Some("reviewer")
+        );
+    }
+
+    #[test]
+    fn engine_model_registry_default_agent_resolves_ambiguous_model() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[acp]
+default_agent = "author"
+
+[agents.author]
+model = "shared-model"
+
+[agents.reviewer]
+model = "shared-model"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry.agent_for_model("shared-model").unwrap(),
+            Some("author")
+        );
+    }
+
+    #[test]
+    fn engine_model_registry_parses_live_config_json() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "acp": { "default_agent": "author" },
+            "providers": {
+                "models": {
+                    "custom": {
+                        "author": {
+                            "kind": "openai-compatible",
+                            "uri": "https://live.example/v1",
+                            "model": "live-model"
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.author" }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(registry.model_for_agent("author"), Some("live-model"));
+        assert_eq!(
+            registry.agent_for_model("live-model").unwrap(),
+            Some("author")
+        );
+        assert_eq!(
+            registry.provider_route_for_agent("author").unwrap(),
+            Some(EngineProviderRoute {
+                provider_ref: "custom.author".into(),
+                provider_type: "custom".into(),
+                provider_alias: "author".into(),
+                implementation: "openai-compatible".into(),
+                effective_kind: "openai-chat".into(),
+                effective_uri: "https://live.example/v1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn engine_provider_binding_supports_non_dotted_builtin_reference() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.minimax]
+model = "MiniMax-M3"
+
+[agents.author]
+model_provider = "minimax"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.provider_route_for_agent("author").unwrap(),
+            Some(EngineProviderRoute {
+                provider_ref: "minimax".into(),
+                provider_type: "minimax".into(),
+                provider_alias: "minimax".into(),
+                implementation: "minimax".into(),
+                effective_kind: "openai-chat".into(),
+                effective_uri: "https://api.minimax.io/v1".into(),
+            })
+        );
+
+        let mut cfg = Config::default_provider(Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = "https://api.minimax.io/v1".into();
+        cfg.bind_engine_provider_refs(&registry).unwrap();
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            Some("minimax")
+        );
+    }
+
+    #[test]
+    fn ambiguous_short_engine_provider_ref_requires_explicit_mapping_at_load() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "uri": "https://shared.example/v1",
+                            "model": "shared-model"
+                        }
+                    },
+                    "other": {
+                        "subscription": {
+                            "kind": "openai-chat",
+                            "uri": "https://shared.example/v1",
+                            "model": "shared-model"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut cfg = Config::default_provider(Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "subscription".into();
+        cfg.providers[0].base_url = "https://shared.example/v1".into();
+
+        let error = cfg
+            .bind_engine_provider_refs(&registry)
+            .expect_err("same-suffix profiles must not be selected arbitrarily")
+            .to_string();
+        assert!(error.contains("custom.subscription"), "{error}");
+        assert!(error.contains("other.subscription"), "{error}");
+        assert!(error.contains("engine_provider_ref explicitly"), "{error}");
+
+        cfg.providers[0].engine_provider_ref = Some("custom.subscription".into());
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("the dedicated mapping must resolve the ambiguity");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            Some("custom.subscription")
+        );
+    }
+
+    #[test]
+    fn custom_engine_provider_requires_endpoint_at_mapping_load_time() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": { "model": "MiniMax-M3" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = "https://api.minimax.io/v1".into();
+
+        let error = cfg
+            .bind_engine_provider_refs(&registry)
+            .expect_err("a custom profile without uri cannot be cross-validated")
+            .to_string();
+        assert!(error.contains("custom.minimax"), "{error}");
+        assert!(error.contains("no explicit endpoint"), "{error}");
+    }
+
+    #[test]
+    fn engine_model_registry_projects_full_provider_fallback_closure() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.primary]
+model = "safe-primary"
+fallback_models = ["same-provider-backup"]
+fallback = ["custom.secondary"]
+
+[providers.models.custom.secondary]
+model = "paid-secondary"
+fallback_models = ["secondary-backup"]
+fallback = ["custom.tertiary"]
+
+[providers.models.custom.tertiary]
+model = "last-resort"
+
+[agents.author]
+model_provider = "custom.primary"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry
+                .model_candidates_for_agent("author")
+                .unwrap()
+                .unwrap(),
+            vec![
+                "safe-primary",
+                "same-provider-backup",
+                "paid-secondary",
+                "secondary-backup",
+                "last-resort",
+            ]
+        );
+        assert_eq!(registry.model_for_agent("author"), Some("safe-primary"));
+        assert_eq!(
+            registry.agent_for_model("paid-secondary").unwrap(),
+            None,
+            "a fallback model must not become an independently selectable primary route"
+        );
+    }
+
+    #[test]
+    fn engine_model_registry_projects_live_json_fallbacks_and_rejects_cycles() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "one": {
+                            "model": "model-one",
+                            "fallback_models": ["model-one-b"],
+                            "fallback": ["custom.two"]
+                        },
+                        "two": {
+                            "model": "model-two",
+                            "fallback": ["custom.one"]
+                        }
+                    }
+                }
+            },
+            "agents": {
+                "author": { "model_provider": "custom.one" }
+            }
+        }))
+        .unwrap();
+
+        let err = registry
+            .model_candidates_for_agent("author")
+            .expect_err("a fallback cycle must not be silently removed from policy projection");
+        assert!(err
+            .to_string()
+            .contains("custom.one -> custom.two -> custom.one"));
+    }
+
+    #[test]
     fn provider_for_model_routes_by_serves_prefix_else_none() {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
             id: "minimax".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -2247,6 +3897,7 @@ mod tests {
         });
         cfg.providers.push(Provider {
             id: "nvidia-eih".into(),
+            engine_provider_ref: None,
             base_url: "https://integrate.api.nvidia.com/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -2294,6 +3945,7 @@ mod tests {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
             id: "minimax-sub".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/admin/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -2321,6 +3973,7 @@ mod tests {
         });
         cfg.providers.push(Provider {
             id: "minimax-met".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3064,6 +4717,7 @@ auth = { type = "env", var = "ACME_KEY" }
         cfg.providers.clear();
         cfg.providers.push(Provider {
             id: "openai-codex".into(),
+            engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             kind: "openai-responses".into(),
             auth: Auth::None,
@@ -3080,6 +4734,7 @@ auth = { type = "env", var = "ACME_KEY" }
         });
         cfg.providers.push(Provider {
             id: "minimax-sub".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3202,6 +4857,7 @@ auth = { type = "env", var = "ACME_KEY" }
         cfg.providers.clear();
         cfg.providers.push(Provider {
             id: "minimax-personal".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/personal/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3218,6 +4874,7 @@ auth = { type = "env", var = "ACME_KEY" }
         });
         cfg.providers.push(Provider {
             id: "minimax-team".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/team/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3301,6 +4958,7 @@ auth = { type = "env", var = "ACME_KEY" }
         // the dup-id rule is gone).
         cfg.providers.push(Provider {
             id: "minimax-x".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/x/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3312,6 +4970,7 @@ auth = { type = "env", var = "ACME_KEY" }
         });
         cfg.providers.push(Provider {
             id: "minimax-x".into(), // intentional duplicate to also trip dup-id
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/x2/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3355,6 +5014,7 @@ auth = { type = "env", var = "ACME_KEY" }
         cfg.providers.clear();
         cfg.providers.push(Provider {
             id: "minimax-legacy".into(),
+            engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
@@ -3658,6 +5318,7 @@ azure_api_version = "2024-10-21"
         // annotation keeps the field absent for legacy providers.
         let re_serialized = toml::to_string(&Provider {
             id: "azure-gpt4o".into(),
+            engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
             kind: "azure-openai".into(),
             auth: Auth::ApiKeyHeader {
@@ -3693,6 +5354,7 @@ azure_api_version = "2024-10-21"
         cfg.providers.clear();
         cfg.providers.push(Provider {
             id: "azure-legacy".into(),
+            engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
             kind: "azure-openai".into(),
             auth: Auth::ApiKeyHeader {
@@ -3765,6 +5427,7 @@ billing = "metered"
         for (i, v) in pinned_versions.iter().enumerate() {
             cfg.providers.push(Provider {
                 id: format!("azure-{i}"),
+                engine_provider_ref: None,
                 base_url: format!("https://res.openai.azure.com/openai/deployments/gpt4o-{i}"),
                 kind: "azure-openai".into(),
                 auth: Auth::ApiKeyHeader {

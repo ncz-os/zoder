@@ -941,6 +941,7 @@ mod tests {
     fn provider(id: &str, billing: BillingMode) -> Provider {
         Provider {
             id: id.into(),
+            engine_provider_ref: None,
             base_url: format!("https://{id}.example/v1"),
             kind: "openai-chat".into(),
             auth: Auth::None,
