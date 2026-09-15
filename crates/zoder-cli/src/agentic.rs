@@ -748,7 +748,43 @@ fn build_reviewer_candidates(
         push_unique(&mut out, &default);
     }
 
-    Ok(out)
+    // Resolve any ENGINE AGENT ALIAS candidate (e.g. "reviewer", "coder")
+    // to its real served-model-name, the same way the author/`--agent`
+    // lane already resolves aliases via `configured_model_for_agent`
+    // (agent alias -> `[agents.X].model`/`model_provider` -> real model
+    // id). Done ONCE, here, before any candidate reaches dispatch or
+    // health bookkeeping — a prior version of this fix resolved the
+    // alias only inside `dispatch_reviewer_for_model` itself, which left
+    // this function's caller (`complete_once`) recording fallback
+    // health/breaker state against the unresolved alias string instead
+    // of the model that actually answered (2026-09-15 review finding:
+    // mixed alias/resolved identity across dispatch vs. health).
+    //
+    // A candidate that ALREADY resolves to a real provider is left
+    // untouched even when its literal string also happens to match an
+    // agent alias name (e.g. an agent alias coincidentally named after
+    // its own model, "nemotron35") — alias resolution is a FALLBACK for
+    // candidates with no direct provider, never an override of an
+    // already-routable literal model id (2026-09-15 review finding: a
+    // literal model id that collides with an alias name must not be
+    // silently rewritten to whatever that alias happens to be
+    // configured to run today).
+    let routing = crate::RoutingContext::load(&eng.cfg)?;
+    let mut resolved: Vec<String> = Vec::with_capacity(out.len());
+    for candidate in &out {
+        let id = if routing
+            .real_provider_for_model(&eng.cfg, candidate)
+            .is_some()
+        {
+            candidate.clone()
+        } else {
+            crate::configured_model_for_agent(&eng, Some(candidate))
+                .unwrap_or_else(|| candidate.clone())
+        };
+        push_unique(&mut resolved, &id);
+    }
+
+    Ok(resolved)
 }
 
 /// Pure reviewer-candidate ordering (no I/O), so the precedence seam is
@@ -837,6 +873,15 @@ async fn dispatch_reviewer_for_model(
         Ok(eng) => eng,
         Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
     };
+
+    // `model` here is already a resolved, real served-model-name —
+    // `build_reviewer_candidates` translates any ENGINE AGENT ALIAS
+    // candidate (e.g. "reviewer", "coder") before this function ever
+    // sees it, so every consumer of the candidate string (this
+    // function's provider/corpus lookups AND `complete_once`'s own
+    // health/breaker bookkeeping) shares one identity. See that
+    // function's doc comment for why the resolution lives there and
+    // not here (2026-09-15).
 
     // Per-model routing: resolve the provider that actually serves this model
     // (e.g. a pinned MiniMax-M3 -> the minimax provider), not always the default
@@ -9440,6 +9485,220 @@ mod reviewer_chain_dispatch_tests {
             paths.iter().filter(|p| p.contains("/working/")).count(),
             1,
             "tail should answer only after the persistent 5xx: paths={paths:?}"
+        );
+    }
+
+    /// **REGRESSION: 2026-09-15 reviewer-alias-as-wire-model fix.**
+    ///
+    /// `--reviewer <alias>` (and any other reviewer candidate) may name an
+    /// ENGINE AGENT ALIAS (e.g. "reviewer") rather than a literal served-
+    /// model-name. `dispatch_reviewer_for_model` used to send that alias
+    /// string straight onto the wire as `ChatRequest.model`, which is
+    /// correct only when the alias happens to equal the backend's real
+    /// served-model-name. Deliberately configure `serves` to contain ONLY
+    /// the real checkpoint id ("nemotron35"), never the alias
+    /// ("reviewer") itself, so this test fails pre-fix with "no real
+    /// provider is configured for reviewer model 'reviewer'" and, if the
+    /// wire body were ever un-resolved again, would fail on the wiremock
+    /// request-body assertion below instead of silently passing.
+    ///
+    /// The alias is resolved the same way `--agent`/`-m` already resolve
+    /// it for the AUTHOR lane: via the `EngineModelRegistry`
+    /// (`[agents.reviewer].model_provider = "custom.reviewer"` ->
+    /// `[providers.models.custom.reviewer].model = "nemotron35"`), which
+    /// this test writes to `<ZEROCLAW_CONFIG_DIR>/config.toml` alongside
+    /// zoder's own `config.json`/corpus in the shared tempdir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_alias_candidate_resolves_to_real_model_on_the_wire() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        // `Engine::load()` reads the engine (zeroclaw) config from
+        // `ZEROCLAW_CONFIG_DIR`'s `config.toml`, a separate file/dir from
+        // zoder's own `ZODER_HOME`-relative `config.json`. Both point at
+        // this same tempdir's `engine` subdirectory; restored on drop.
+        let engine_dir = home.join("engine");
+        std::fs::create_dir_all(&engine_dir).expect("mkdir engine_dir");
+        let prev_engine_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &engine_dir);
+        struct EngineDirGuard(Option<String>);
+        impl Drop for EngineDirGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
+                    None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
+                }
+            }
+        }
+        let _engine_dir_guard = EngineDirGuard(prev_engine_dir);
+        std::fs::write(
+            engine_dir.join("config.toml"),
+            r#"
+[providers.models.custom.reviewer]
+type = "openai-compatible"
+model = "nemotron35"
+uri = "https://example.invalid/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .expect("write engine config.toml");
+
+        let server = MockServer::start().await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["nemotron35"]);
+        // Deliberately `serves: ["nemotron35"]` only — no "reviewer" entry
+        // — so provider resolution can succeed ONLY via the alias-to-
+        // real-model translation this fix adds, never via a `serves`
+        // list that happens to also carry the alias.
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "wiremock-working",
+                "base_url": format!("{}/working", server.uri()),
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["nemotron35"],
+            }],
+            "default_provider": "wiremock-working",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let cli = dummy_cli();
+        let c = complete_once(&cli, Some("reviewer"), &[], "sys", "user", 2048)
+            .await
+            .expect(
+                "an agent-alias reviewer candidate must resolve to its real \
+                 model before dispatch, not fail with 'no real provider'",
+            );
+        assert_eq!(
+            c.model, "nemotron35",
+            "the reported reviewer model must be the resolved checkpoint id, not the alias"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1, "exactly one dispatch should have fired");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        assert_eq!(
+            sent.get("model").and_then(|v| v.as_str()),
+            Some("nemotron35"),
+            "the wire request must carry the real checkpoint id, never the \
+             alias — sending the alias verbatim is exactly the 404 this \
+             regression pins ('The model `reviewer` does not exist')"
+        );
+    }
+
+    /// **REGRESSION: 2026-09-15 review finding.** A reviewer candidate that
+    /// is ALREADY a literal, directly-routable model id (has a real
+    /// `[[providers]] serves` entry) must be dispatched exactly as given —
+    /// even when its literal string ALSO happens to match an unrelated
+    /// engine agent alias name. This is exactly the real fleet shape found
+    /// while root-causing the incident this fix pins: `[agents.nemotron35]`
+    /// self-references the model "nemotron35" today, but nothing prevents
+    /// an alias sharing a model's name from being repointed at a DIFFERENT
+    /// model later — and a resolver that always tries alias lookup first
+    /// would silently redirect a scenario-routed or explicitly pinned
+    /// literal model id to whatever that alias currently runs, which is
+    /// not what "pin THIS model" means. `build_reviewer_candidates` must
+    /// check `real_provider_for_model` BEFORE attempting alias resolution,
+    /// and only fall back to the alias registry for candidates that have
+    /// no direct provider of their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_literal_model_id_is_not_rewritten_by_a_colliding_alias() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let engine_dir = home.join("engine");
+        std::fs::create_dir_all(&engine_dir).expect("mkdir engine_dir");
+        let prev_engine_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &engine_dir);
+        struct EngineDirGuard(Option<String>);
+        impl Drop for EngineDirGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
+                    None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
+                }
+            }
+        }
+        let _engine_dir_guard = EngineDirGuard(prev_engine_dir);
+        // An agent alias LITERALLY named "nemotron35" that routes to a
+        // DIFFERENT model ("decoy-model") — the collision the fix must
+        // not fall into.
+        std::fs::write(
+            engine_dir.join("config.toml"),
+            r#"
+[providers.models.custom.nemotron35]
+type = "openai-compatible"
+model = "decoy-model"
+uri = "https://example.invalid/v1"
+
+[agents.nemotron35]
+model_provider = "custom.nemotron35"
+"#,
+        )
+        .expect("write engine config.toml");
+
+        let server = MockServer::start().await;
+        mount_200_openai_chat_completion(&server).await;
+
+        // The candidate "nemotron35" IS a real, directly-routable model
+        // here (`serves` contains it) — this must win over the
+        // colliding alias defined above.
+        write_corpus(&home, &["nemotron35"]);
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "wiremock-working",
+                "base_url": format!("{}/working", server.uri()),
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["nemotron35"],
+            }],
+            "default_provider": "wiremock-working",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let cli = dummy_cli();
+        let c = complete_once(&cli, Some("nemotron35"), &[], "sys", "user", 2048)
+            .await
+            .expect("a literal, directly-routable model id must dispatch");
+        assert_eq!(
+            c.model, "nemotron35",
+            "a literal model id with its own real provider must never be \
+             rewritten to a colliding alias's configured model"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 1, "exactly one dispatch should have fired");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        assert_eq!(
+            sent.get("model").and_then(|v| v.as_str()),
+            Some("nemotron35"),
+            "the wire request must carry the literal pinned model id, not \
+             'decoy-model' from the colliding alias"
         );
     }
 
