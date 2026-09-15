@@ -497,6 +497,7 @@ struct EngineProviderModel {
     model: String,
     kind: Option<String>,
     uri: Option<String>,
+    api_key: Option<String>,
     wire_api: Option<String>,
     endpoint: Option<String>,
     resource: Option<String>,
@@ -1436,6 +1437,10 @@ fn collect_engine_models(
                         .get("uri")
                         .and_then(toml::Value::as_str)
                         .map(str::to_owned),
+                    api_key: child
+                        .get("api_key")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
                     wire_api: child
                         .get("wire_api")
                         .and_then(toml::Value::as_str)
@@ -1494,6 +1499,10 @@ fn collect_engine_models_json(
                         .map(str::to_owned),
                     uri: child
                         .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    api_key: child
+                        .get("api_key")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
                     wire_api: child
@@ -2505,6 +2514,54 @@ impl Config {
                 );
             }
             provider.engine_provider_ref = Some(route.provider_ref);
+        }
+
+        // An engine provider profile is a complete dispatch target even when
+        // the operator intentionally omitted it from zoder's router-level
+        // fallback array. Materialize each profile selected by an agent so an
+        // explicit `--agent` pin can retain its provider identity and still
+        // pass through zoder's normal provider gate. Existing zoder providers
+        // always win: synthesis is only for otherwise-unrepresented routes.
+        let agent_provider_refs = registry
+            .agents
+            .values()
+            .filter_map(|agent| agent.model_provider.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        for provider_ref in agent_provider_refs {
+            if self.providers.iter().any(|provider| {
+                provider.id == provider_ref
+                    || provider.engine_provider_ref.as_deref() == Some(provider_ref)
+            }) {
+                continue;
+            }
+            let Some(engine_provider) = registry.models.get(provider_ref) else {
+                // Preserve the existing fail-closed execution diagnostic for
+                // a genuinely dangling agent model_provider reference.
+                continue;
+            };
+            let Some(route) = registry.provider_route_for_ref(provider_ref)? else {
+                continue;
+            };
+            let auth = engine_provider
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map_or(Auth::None, |token| Auth::Bearer {
+                    token: token.to_owned(),
+                });
+            self.providers.push(Provider {
+                id: provider_ref.to_owned(),
+                engine_provider_ref: Some(provider_ref.to_owned()),
+                base_url: route.effective_uri,
+                kind: route.effective_kind,
+                auth,
+                paid: false,
+                billing: BillingMode::default(),
+                subscription: None,
+                serves: vec![engine_provider.model.clone()],
+                azure_api_version: None,
+            });
         }
         Ok(())
     }
@@ -3597,6 +3654,70 @@ name = "ignored by the routing projection"
                 effective_uri: "https://example.invalid/v1".into(),
             })
         );
+    }
+
+    #[test]
+    fn engine_only_agent_provider_is_synthesized_from_real_config_shape() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.groq]
+api_key = "gsk_test_only"
+uri = "https://api.groq.com/openai/v1"
+model = "openai/gpt-oss-120b"
+native_tools = true
+
+[agents.groq]
+enabled = true
+risk_profile = "default"
+runtime_profile = "zoder_coder"
+model_provider = "custom.groq"
+[agents.groq.identity]
+format = "openclaw"
+[agents.groq.memory]
+backend = "sqlite"
+[agents.groq.workspace]
+unrestricted_filesystem = true
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default_provider(Path::new("/tmp/zoder-test"));
+        cfg.providers.clear();
+
+        cfg.bind_engine_provider_refs(&registry).unwrap();
+
+        let provider = cfg
+            .provider("custom.groq")
+            .expect("the engine-only provider must be materialized");
+        assert_eq!(provider.engine_provider_ref.as_deref(), Some("custom.groq"));
+        assert_eq!(provider.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(provider.kind, "openai-chat");
+        assert_eq!(provider.serves, ["openai/gpt-oss-120b"]);
+        assert!(matches!(
+            &provider.auth,
+            Auth::Bearer { token } if token == "gsk_test_only"
+        ));
+    }
+
+    #[test]
+    fn dangling_engine_agent_provider_is_not_invented() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[agents.broken]
+model_provider = "custom.nonexistent"
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default_provider(Path::new("/tmp/zoder-test"));
+        cfg.providers.clear();
+
+        cfg.bind_engine_provider_refs(&registry).unwrap();
+
+        assert!(cfg.provider("custom.nonexistent").is_none());
+        let error = registry
+            .provider_route_for_agent("broken")
+            .expect_err("the dangling provider must still fail loudly")
+            .to_string();
+        assert!(error.contains("is not configured"), "{error}");
     }
 
     #[test]
