@@ -684,6 +684,23 @@ impl EngineModelRegistry {
         })
     }
 
+    /// Return the exact provider-profile reference configured on an agent,
+    /// without projecting or validating the provider's transport metadata.
+    /// Callers that only need to preserve routing identity use this before the
+    /// full live-route attestation validates kind and endpoint.
+    pub fn model_provider_ref_for_agent(&self, alias: &str) -> Option<&str> {
+        self.agents
+            .get(alias)
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|(configured, _)| configured.eq_ignore_ascii_case(alias))
+                    .map(|(_, route)| route)
+            })?
+            .model_provider
+            .as_deref()
+    }
+
     /// Return the complete ordered model-attempt closure for an agent.
     ///
     /// The first entry is the primary model. Remaining entries are every
