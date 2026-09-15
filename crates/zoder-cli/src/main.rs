@@ -3286,7 +3286,7 @@ fn scenario_name_canonical(s: &zoder_core::RouteScenario) -> &'static str {
 /// surfaces. A zoder-side direct pin remains the highest-priority override;
 /// otherwise consult the authoritative zeroclaw `config.toml` projection, then
 /// the legacy zoder-side `model_provider` registry.
-fn configured_model_for_agent(eng: &Engine, alias: Option<&str>) -> Option<String> {
+pub(crate) fn configured_model_for_agent(eng: &Engine, alias: Option<&str>) -> Option<String> {
     let alias = alias?;
     eng.cfg
         .agent_model(Some(alias))
