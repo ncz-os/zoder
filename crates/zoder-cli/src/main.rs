@@ -11801,7 +11801,15 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_config(validate: bool) -> anyhow::Result<()> {
-    let cfg = Config::load()?;
+    let mut cfg = Config::load()?;
+    let engine_models = EngineModelRegistry::load_from(&engine_config_path())?;
+    cfg.bind_engine_provider_refs(&engine_models)
+        .with_context(|| {
+            format!(
+                "validating zoder/Zeroclaw provider mappings while loading {}",
+                engine_config_path().display()
+            )
+        })?;
     println!("home:        {}", Config::home().display());
     println!("corpus:      {}", cfg.corpus_path.display());
     println!("ledger:      {}", cfg.ledger_path.display());
@@ -14510,18 +14518,6 @@ model_provider = "custom.minimax"
     fn agent_pin_preserves_provider_identity_across_colliding_serves_prefix() {
         let mut cfg = fixture_cfg(None, None);
         cfg.providers.push(Provider {
-            id: "custom.groq".into(),
-            engine_provider_ref: Some("custom.groq".into()),
-            base_url: "https://api.groq.com/openai/v1".into(),
-            kind: "openai-chat".into(),
-            auth: ProviderAuth::None,
-            paid: false,
-            billing: BillingMode::Free,
-            subscription: None,
-            serves: Vec::new(),
-            azure_api_version: None,
-        });
-        cfg.providers.push(Provider {
             id: "groq-oss20b".into(),
             engine_provider_ref: None,
             base_url: "https://unrelated.example/v1".into(),
@@ -14538,12 +14534,15 @@ model_provider = "custom.minimax"
 [providers.models.custom.groq]
 model = "openai/gpt-oss-120b"
 uri = "https://api.groq.com/openai/v1"
+api_key = "gsk_test_only"
+native_tools = true
 
 [agents.groq]
 model_provider = "custom.groq"
 "#,
         )
         .unwrap();
+        cfg.bind_engine_provider_refs(&engine_models).unwrap();
         let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "groq"]).unwrap();
         let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
         let routes = resolve_chain(&cli, &eng, &HealthStore::default()).unwrap();
