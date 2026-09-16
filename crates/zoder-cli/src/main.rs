@@ -16999,9 +16999,28 @@ mod events_file_tests {
     /// Regression test: `RoutingContext::load` (strict) must still fail when
     /// the directory is not writable — we must not silently suppress write
     /// failures for the normal (non-dry-run) path.
+    ///
+    /// Skipped under root: POSIX write-permission bits (and this test's whole
+    /// premise) don't apply to the root user, which bypasses them entirely --
+    /// confirmed live in this repo's own GitLab CI, which runs its `rust-gate`
+    /// job as root inside a container. Without this guard the directory is
+    /// still writable despite `0o555`, `RoutingContext::load` succeeds, and
+    /// this test fails on every CI run regardless of the code under test
+    /// (found 2026-09-16 chasing an unrelated fix's CI failure: 522/523
+    /// passing locally as a non-root user, this one test failing in CI every
+    /// time). `unsafe { libc::geteuid() }` has no safety invariants to
+    /// violate; it is a pure read of the calling process's own UID.
     #[test]
     fn load_strict_fails_on_unwritable_ledger_dir() {
         use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping load_strict_fails_on_unwritable_ledger_dir: running as root, \
+                 which ignores POSIX write-permission bits"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.jsonl");
