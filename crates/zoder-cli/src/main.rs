@@ -3335,6 +3335,55 @@ pub(crate) struct ResolvedRoutes {
     pub primary: Vec<String>,
     pub reviewer: Vec<String>,
     pub reason: String,
+    /// Exact Zeroclaw provider-profile reference that selected an agent-pinned
+    /// primary. `None` for `-m` and automatic/scenario routing, whose provider
+    /// identity must continue to come from the model-prefix router.
+    pub agent_provider_ref: Option<String>,
+}
+
+/// Resolve the provider identity attached to an explicit agent pin. The
+/// Zeroclaw projection is authoritative when present; the zoder-side agent
+/// entry is retained for oneshot/config-only operation.
+fn configured_provider_ref_for_agent(eng: &Engine, alias: Option<&str>) -> Option<String> {
+    let alias = alias?;
+    if let Some(provider_ref) = eng.engine_models.model_provider_ref_for_agent(alias) {
+        return Some(provider_ref.to_owned());
+    }
+    eng.cfg
+        .agents
+        .get(alias)
+        .and_then(|agent| agent.model_provider.clone())
+}
+
+/// Preserve an agent pin's provider identity instead of re-deriving it from
+/// the model string. Unpinned and explicit `-m` routes retain the quota-aware
+/// `serves` prefix search.
+fn provider_for_resolved_model<'a>(
+    routing: &RoutingContext,
+    cfg: &'a Config,
+    model: &str,
+    agent_provider_ref: Option<&str>,
+) -> Option<&'a Provider> {
+    match agent_provider_ref {
+        Some(provider_ref) => cfg
+            .providers
+            .iter()
+            .find(|provider| provider.engine_provider_ref.as_deref() == Some(provider_ref))
+            .or_else(|| {
+                cfg.provider(provider_ref).filter(|provider| {
+                    provider
+                        .engine_provider_ref
+                        .as_deref()
+                        .is_none_or(|mapped_provider_ref| mapped_provider_ref == provider_ref)
+                })
+            })
+            .filter(|provider| {
+                !provider
+                    .base_url
+                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+            }),
+        None => routing.real_provider_for_model(cfg, model),
+    }
 }
 
 /// Resolve the routing chain for a single CLI invocation. Honors the
@@ -3401,6 +3450,11 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         .is_none()
         .then(|| configured_model_for_agent(eng, cli.agent.as_deref()))
         .flatten();
+    let agent_provider_ref = if cli_model.is_none() && agent_pin.is_some() {
+        configured_provider_ref_for_agent(eng, cli.agent.as_deref())
+    } else {
+        None
+    };
 
     // Guard: `--agent` without any resolvable model or explicit `-m` must
     // error out immediately rather than silently delegating to the scenario
@@ -3464,6 +3518,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
             primary: chain,
             reviewer: scn_reviewer,
             reason,
+            agent_provider_ref,
         });
     }
 
@@ -3522,6 +3577,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
             primary,
             reviewer: scn_reviewer,
             reason,
+            agent_provider_ref: None,
         });
     }
 
@@ -3574,6 +3630,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         primary,
         reviewer: scn_reviewer,
         reason,
+        agent_provider_ref: None,
     })
 }
 
@@ -4885,6 +4942,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         primary: chain,
         reviewer: _,
         reason,
+        agent_provider_ref,
     } = resolve_chain_for_execution(cli, &eng, &health).await?;
     let primary = chain
         .first()
@@ -4916,13 +4974,23 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     } else {
         RoutingContext::load(&eng.cfg)?
     };
-    let provider_cfg = match routing.real_provider_for_model(&eng.cfg, &primary) {
+    let provider_cfg = match provider_for_resolved_model(
+        &routing,
+        &eng.cfg,
+        &primary,
+        agent_provider_ref.as_deref(),
+    ) {
         Some(provider) => provider,
         None => {
-            let local_hint = format!(
-                "no real provider is configured for model '{primary}' — routing would fall through to the {host} placeholder and fail. Configure a provider that serves it (e.g. in ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
-                host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-            );
+            let local_hint = match agent_provider_ref.as_deref() {
+                Some(provider_ref) => format!(
+                    "agent-pinned model '{primary}' requires model_provider {provider_ref:?}, but no matching real zoder provider is configured; refusing to fall through to a different provider selected by model prefix"
+                ),
+                None => format!(
+                    "no real provider is configured for model '{primary}' — routing would fall through to the {host} placeholder and fail. Configure a provider that serves it (e.g. in ~/.zoder/config.toml), pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
+                    host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+                ),
+            };
             let diagnostic =
                 enrich_no_provider_diagnostic(&engine_socket_path(), &primary, local_hint).await;
             anyhow::bail!(diagnostic);
@@ -4982,14 +5050,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // A Subscription-or-Free serving provider is $0-marginal — the call is
     // cost-neutral even if the corpus has the model non-free, so we let it
     // through (paid must still confirm).
-    let provider_paid = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .map(|p| p.paid || p.billing == BillingMode::Metered)
-        .unwrap_or(false);
-    let provider_cost_neutral = routing
-        .real_provider_for_model(&eng.cfg, &primary)
-        .map(is_cost_neutral_provider)
-        .unwrap_or(false);
+    let provider_paid = provider_cfg.paid || provider_cfg.billing == BillingMode::Metered;
+    let provider_cost_neutral = is_cost_neutral_provider(provider_cfg);
     if let Decision::NeedConfirm(msg) =
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
@@ -5091,17 +5153,26 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // through a subscription provider whose rolling window is at/over
         // cap to its metered sibling, so a single fallback chain can span
         // providers AND billing modes without per-link special-casing.
-        let pid = routing
-            .real_provider_for_model(&eng.cfg, model_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no real provider is configured for fallback model '{model_id}' (would hit the \
+        let pid = provider_for_resolved_model(
+            &routing,
+            &eng.cfg,
+            model_id,
+            (i == 0).then_some(agent_provider_ref.as_deref()).flatten(),
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no real provider is configured for model '{model_id}'{} (would hit the \
                      {host} placeholder)",
-                    host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-                )
-            })?
-            .id
-            .clone();
+                agent_provider_ref
+                    .as_deref()
+                    .filter(|_| i == 0)
+                    .map(|provider_ref| format!(" from agent model_provider {provider_ref:?}"))
+                    .unwrap_or_default(),
+                host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            )
+        })?
+        .id
+        .clone();
         // Per-link paid gate: with per-model routing a fallback can resolve to a
         // DIFFERENT provider than the (already-confirmed) primary, so re-run the
         // policy gate for every fallback link. The primary (i == 0) was gated +
@@ -7907,6 +7978,7 @@ pub(crate) async fn agentic_turn(
         primary: chain,
         reviewer: _,
         reason,
+        agent_provider_ref,
     } = resolve_chain_for_execution(cli, &eng, &health).await?;
     if chain.is_empty() {
         anyhow::bail!("no model resolved");
@@ -7942,13 +8014,25 @@ pub(crate) async fn agentic_turn(
     // transparently demoted to its metered sibling, so this guard only fires
     // when NEITHER path has a real backing provider.
     let routing = RoutingContext::load(&eng.cfg)?;
-    let routed_provider = match routing.real_provider_for_model(&eng.cfg, &primary).cloned() {
+    let routed_provider = match provider_for_resolved_model(
+        &routing,
+        &eng.cfg,
+        &primary,
+        agent_provider_ref.as_deref(),
+    )
+    .cloned()
+    {
         Some(provider) => provider,
         None => {
-            let local_hint = format!(
-                "no real provider is configured for model '{primary}' — it would fall through to the {host} placeholder and fail. Configure a provider that serves it, pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
-                host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
-            );
+            let local_hint = match agent_provider_ref.as_deref() {
+                Some(provider_ref) => format!(
+                    "agent-pinned model '{primary}' requires model_provider {provider_ref:?}, but no matching real zoder provider is configured; refusing to fall through to a different provider selected by model prefix"
+                ),
+                None => format!(
+                    "no real provider is configured for model '{primary}' — it would fall through to the {host} placeholder and fail. Configure a provider that serves it, pin a backed model via [profile].primary_model, or pass `-m <backed-model>`.",
+                    host = zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+                ),
+            };
             let diagnostic =
                 enrich_no_provider_diagnostic(&engine_socket_path(), &primary, local_hint).await;
             anyhow::bail!(diagnostic);
@@ -8357,7 +8441,15 @@ pub(crate) async fn agentic_turn(
             .unwrap_or(chain.len().saturating_sub(1));
         let model = chain[idx].clone();
         let last = chain[idx + 1..].iter().all(|m| skipped.contains(m));
-        let link_provider = routing.real_provider_for_model(&eng.cfg, &model).cloned();
+        let link_provider = provider_for_resolved_model(
+            &routing,
+            &eng.cfg,
+            &model,
+            (idx == 0)
+                .then_some(agent_provider_ref.as_deref())
+                .flatten(),
+        )
+        .cloned();
         let link_provider_paid = link_provider
             .as_ref()
             .map(|p| p.paid || p.billing == BillingMode::Metered)
@@ -8730,6 +8822,7 @@ pub(crate) async fn cmd_exec_agentic(
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(cli, &eng, &health)?;
         let primary = chain.first().cloned().unwrap_or_default();
         // --dry-run must not SPAWN a daemon, but if one is already up we ask it
@@ -11708,7 +11801,15 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_config(validate: bool) -> anyhow::Result<()> {
-    let cfg = Config::load()?;
+    let mut cfg = Config::load()?;
+    let engine_models = EngineModelRegistry::load_from(&engine_config_path())?;
+    cfg.bind_engine_provider_refs(&engine_models)
+        .with_context(|| {
+            format!(
+                "validating zoder/Zeroclaw provider mappings while loading {}",
+                engine_config_path().display()
+            )
+        })?;
     println!("home:        {}", Config::home().display());
     println!("corpus:      {}", cfg.corpus_path.display());
     println!("ledger:      {}", cfg.ledger_path.display());
@@ -14239,6 +14340,7 @@ mod model_selection_tests {
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).unwrap();
         assert_eq!(
             chain.first().map(|s| s.as_str()),
@@ -14286,6 +14388,7 @@ mod model_selection_tests {
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).unwrap();
         assert_eq!(
             chain.first().map(|s| s.as_str()),
@@ -14331,6 +14434,7 @@ mod model_selection_tests {
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health)
             .expect("resolve_chain must NOT error when -m is set with --agent but no config");
         assert_eq!(
@@ -14410,6 +14514,128 @@ model_provider = "custom.minimax"
         assert_eq!(routes.primary, vec!["minimax/MiniMax-M3"]);
     }
 
+    #[test]
+    fn agent_pin_preserves_provider_identity_across_colliding_serves_prefix() {
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers.push(Provider {
+            id: "groq-oss20b".into(),
+            engine_provider_ref: None,
+            base_url: "https://unrelated.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["openai/gpt-oss-120b".into()],
+            azure_api_version: None,
+        });
+        let engine_models = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.groq]
+model = "openai/gpt-oss-120b"
+uri = "https://api.groq.com/openai/v1"
+api_key = "gsk_test_only"
+native_tools = true
+
+[agents.groq]
+model_provider = "custom.groq"
+"#,
+        )
+        .unwrap();
+        cfg.bind_engine_provider_refs(&engine_models).unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent", "groq"]).unwrap();
+        let eng = Engine::from_parts_with_engine_models(cfg, fixture_corpus(), engine_models);
+        let routes = resolve_chain(&cli, &eng, &HealthStore::default()).unwrap();
+        assert_eq!(routes.primary, vec!["openai/gpt-oss-120b"]);
+        assert_eq!(routes.agent_provider_ref.as_deref(), Some("custom.groq"));
+
+        let routing = RoutingContext {
+            entries: Vec::new(),
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        assert_eq!(
+            routing
+                .real_provider_for_model(&eng.cfg, &routes.primary[0])
+                .map(|provider| provider.id.as_str()),
+            Some("groq-oss20b"),
+            "the fixture must reproduce the old prefix-collision selection"
+        );
+        assert_eq!(
+            provider_for_resolved_model(
+                &routing,
+                &eng.cfg,
+                &routes.primary[0],
+                routes.agent_provider_ref.as_deref(),
+            )
+            .map(|provider| provider.id.as_str()),
+            Some("custom.groq"),
+            "agent model_provider identity must override unrelated serves matches"
+        );
+    }
+
+    #[test]
+    fn missing_agent_provider_does_not_fall_through_to_prefix_collision() {
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers.push(Provider {
+            id: "unrelated".into(),
+            engine_provider_ref: None,
+            base_url: "https://unrelated.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["openai/gpt-oss-120b".into()],
+            azure_api_version: None,
+        });
+        let routing = RoutingContext {
+            entries: Vec::new(),
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        assert!(provider_for_resolved_model(
+            &routing,
+            &cfg,
+            "openai/gpt-oss-120b",
+            Some("custom.missing"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bare_model_pin_keeps_prefix_provider_routing() {
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers.push(Provider {
+            id: "prefix-route".into(),
+            engine_provider_ref: None,
+            base_url: "https://router.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["openai/gpt-oss-120b".into()],
+            azure_api_version: None,
+        });
+        let cli = Cli::try_parse_from(["zoder", "exec", "-m", "openai/gpt-oss-120b"]).unwrap();
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let routes = resolve_chain(&cli, &eng, &HealthStore::default()).unwrap();
+        assert_eq!(routes.agent_provider_ref, None);
+        let routing = RoutingContext {
+            entries: Vec::new(),
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        assert_eq!(
+            provider_for_resolved_model(
+                &routing,
+                &eng.cfg,
+                &routes.primary[0],
+                routes.agent_provider_ref.as_deref(),
+            )
+            .map(|provider| provider.id.as_str()),
+            Some("prefix-route")
+        );
+    }
+
     /// ONESHOT with agent that has BOTH .model AND model_provider: the .model
     /// pin MUST be used before the model_provider indirection.
     #[test]
@@ -14436,6 +14662,7 @@ model_provider = "custom.other"
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).unwrap();
         // The chain head must be the .model pin, NOT the model_provider chain.
         assert_eq!(
@@ -15884,6 +16111,7 @@ model_provider = "custom.minimax"
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).unwrap();
         let head = chain.first().expect("chain must have a head");
         assert_eq!(
@@ -15920,6 +16148,7 @@ model_provider = "custom.minimax"
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).expect("primary_model-only run must resolve");
         assert_eq!(
             chain.first().map(|s| s.as_str()),
@@ -15955,6 +16184,7 @@ model_provider = "custom.minimax"
             primary: chain_nb,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).expect("no-fallback run must resolve");
         assert_eq!(
             chain_nb.len(),
@@ -15974,6 +16204,7 @@ model_provider = "custom.minimax"
             primary: chain_full,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli_full, &eng, &health).expect("full run must resolve");
         assert!(
             chain_full.len() > 1,
@@ -16056,6 +16287,7 @@ model_provider = "custom.minimax"
             primary: chain,
             reviewer: _,
             reason: _,
+            ..
         } = resolve_chain(&cli, &eng, &health).expect("--require-free must resolve");
         // The paid head MUST NOT survive the filter (else the bug is
         // back). The chain surface must be either free-only OR empty
@@ -16767,9 +16999,28 @@ mod events_file_tests {
     /// Regression test: `RoutingContext::load` (strict) must still fail when
     /// the directory is not writable — we must not silently suppress write
     /// failures for the normal (non-dry-run) path.
+    ///
+    /// Skipped under root: POSIX write-permission bits (and this test's whole
+    /// premise) don't apply to the root user, which bypasses them entirely --
+    /// confirmed live in this repo's own GitLab CI, which runs its `rust-gate`
+    /// job as root inside a container. Without this guard the directory is
+    /// still writable despite `0o555`, `RoutingContext::load` succeeds, and
+    /// this test fails on every CI run regardless of the code under test
+    /// (found 2026-09-16 chasing an unrelated fix's CI failure: 522/523
+    /// passing locally as a non-root user, this one test failing in CI every
+    /// time). `unsafe { libc::geteuid() }` has no safety invariants to
+    /// violate; it is a pure read of the calling process's own UID.
     #[test]
     fn load_strict_fails_on_unwritable_ledger_dir() {
         use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping load_strict_fails_on_unwritable_ledger_dir: running as root, \
+                 which ignores POSIX write-permission bits"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.jsonl");
