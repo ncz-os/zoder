@@ -142,8 +142,8 @@ upstream-zeroclaw:
   script:
     - rm -rf upstream/src && git clone --depth 50 --branch "$UPSTREAM_REF" "$UPSTREAM_URL" upstream/src
     - cd upstream/src
-    - echo "upstream HEAD: $(git log --oneline -1)"
-    - echo "upstream date: $(git log -1 --format=%cI)"
+    - "echo upstream-HEAD: $(git log --oneline -1)"
+    - "echo upstream-date: $(git log -1 --format=%cI)"
     # The documented zeroclaw CI gate set. ci-all deliberately excludes the
     # native session backends (postgres/oracle/db2/mysql), whose client libs
     # are not present here; zeroclaw-desktop is excluded the same way CI does.
@@ -166,7 +166,6 @@ upstream-zeroclaw:
     expire_in: 2 weeks
     paths:
       - upstream/src/target/release/zeroclaw
-    reports: {}
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
     - if: "$CI_PIPELINE_SOURCE == \"web\""
