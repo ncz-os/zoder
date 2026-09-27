@@ -27,8 +27,23 @@ use tokio::net::UnixListener;
 
 use zoder_core::{
     catalog_models::{merge_or_degrade, CatalogResponse},
-    fetch_catalog_models, Corpus, ModelEntry,
+    fetch_catalog_models, Auth, BillingMode, Corpus, ModelEntry, Provider,
 };
+
+fn provider() -> Provider {
+    Provider {
+        id: "minimax".into(),
+        engine_provider_ref: Some("custom.minimax".into()),
+        base_url: "http://localhost".into(),
+        kind: "openai-chat".into(),
+        auth: Auth::None,
+        paid: false,
+        billing: BillingMode::Subscription,
+        subscription: None,
+        serves: vec!["minimax/".into()],
+        azure_api_version: None,
+    }
+}
 
 /// Spawn a Unix-socket "daemon" that:
 ///   1. acks `initialize` with `{ "protocolVersion": 1 }`,
@@ -73,8 +88,26 @@ async fn spawn_catalog_daemon(
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                 recv.lock().unwrap().push(v);
             }
-            let result: serde_json::Value = serde_json::from_str(&catalog_json)
+            let supplied: serde_json::Value = serde_json::from_str(&catalog_json)
                 .expect("test fixture: catalog_json must be valid JSON");
+            let models = supplied["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| {
+                    model
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| model["id"].as_str().map(str::to_owned))
+                })
+                .collect::<Vec<_>>();
+            let result = serde_json::json!({
+                "model_provider": "custom.minimax",
+                "models": models,
+                "pricing": null,
+                "local": false,
+                "live": true
+            });
             let answer = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": "nvz-catalog",
@@ -141,9 +174,8 @@ async fn spawn_failing_daemon(received: Arc<Mutex<Vec<serde_json::Value>>>) -> T
 
 /// `fetch_catalog_models` must drive the full NDJSON JSON-RPC exchange
 /// (`initialize` + `config/catalog-models`) and decode the response. The
-/// request frame must carry the `config/catalog-models` method with an
-/// empty `params` object so a future daemon that adds query filters can
-/// rely on the field's presence.
+/// request frame must carry the `config/catalog-models` method and the exact
+/// provider profile required by the engine contract.
 #[tokio::test]
 async fn fetch_catalog_models_round_trip() {
     let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -158,7 +190,7 @@ async fn fetch_catalog_models_round_trip() {
     .await;
     let socket = dir.path().join("daemon.sock");
 
-    let resp = fetch_catalog_models(&socket)
+    let resp = fetch_catalog_models(&socket, &provider())
         .await
         .expect("rpc must succeed");
     assert_eq!(resp.models.len(), 2);
@@ -193,11 +225,11 @@ async fn fetch_catalog_models_round_trip() {
         "request method must be config/catalog-models"
     );
     assert_eq!(req.get("id").and_then(|v| v.as_str()), Some("nvz-catalog"));
-    // Empty params object — keeps the wire shape forward-compatible with a
-    // future daemon that adds filter fields.
-    assert!(
-        req.get("params").map(|p| p.is_object()).unwrap_or(false),
-        "config/catalog-models request MUST carry a params object; got {req}"
+    assert_eq!(
+        req.pointer("/params/model_provider")
+            .and_then(|value| value.as_str()),
+        Some("custom.minimax"),
+        "config/catalog-models must identify the provider profile; got {req}"
     );
 }
 
@@ -232,30 +264,27 @@ async fn merge_or_degrade_integration_with_live_rpc() {
         ..Default::default()
     };
 
-    let resp = fetch_catalog_models(&socket)
+    let resp = fetch_catalog_models(&socket, &provider())
         .await
         .expect("rpc must succeed");
     let outcome = merge_or_degrade(Some(&mut corpus), Ok(resp));
 
     assert_eq!(outcome.rows, 2);
     assert_eq!(outcome.added, 1, "newco/newmodel must be a new addition");
-    assert_eq!(
-        outcome.enriched, 1,
-        "minimax/MiniMax-M3 must be enriched in place"
-    );
+    assert_eq!(outcome.enriched, 0, "identical local metadata is a no-op");
     assert_eq!(outcome.skipped, 0);
     assert!(outcome.error.is_none());
     assert!(outcome.has_live_data());
 
-    // The existing model's host rotated (per the daemon's payload), the
-    // new model is in the corpus.
+    // Provider identity and billing classification come from local config;
+    // the daemon supplies ids, not per-model host/free objects.
     assert_eq!(corpus.models.len(), 2);
     let existing = corpus
         .models
         .iter()
         .find(|m| m.id == "minimax/MiniMax-M3")
         .unwrap();
-    assert_eq!(existing.host, "minimax-rotated");
+    assert_eq!(existing.host, "minimax");
     let new_row = corpus
         .models
         .iter()
@@ -292,7 +321,7 @@ async fn merge_or_degrade_records_daemon_error_without_mutating_corpus() {
     };
     let before = corpus.models.clone();
 
-    let rpc = fetch_catalog_models(&socket).await;
+    let rpc = fetch_catalog_models(&socket, &provider()).await;
     let err = rpc.expect_err("daemon returned an error; client must surface it");
     // The message is preserved end-to-end so the operator can see WHY the
     // enrichment was skipped (e.g. "method not found" on an old daemon).
@@ -324,7 +353,7 @@ async fn merge_or_degrade_treats_empty_catalog_as_success_not_error() {
     let socket = dir.path().join("daemon.sock");
 
     let mut corpus = Corpus::default();
-    let resp: CatalogResponse = fetch_catalog_models(&socket)
+    let resp: CatalogResponse = fetch_catalog_models(&socket, &provider())
         .await
         .expect("rpc must succeed");
     let outcome = merge_or_degrade(Some(&mut corpus), Ok(resp));
@@ -346,10 +375,13 @@ async fn missing_socket_fails_fast_without_panic() {
     // The RPC client has a 5s timeout; we wrap it in a tighter test
     // timeout so a regression that hangs the client fails the test
     // fast instead of stalling CI for 5s.
-    let rpc = tokio::time::timeout(Duration::from_secs(7), fetch_catalog_models(&bogus))
-        .await
-        .expect("test timeout: RPC client must not hang on missing socket")
-        .expect_err("missing socket must surface as Err");
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(7),
+        fetch_catalog_models(&bogus, &provider()),
+    )
+    .await
+    .expect("test timeout: RPC client must not hang on missing socket")
+    .expect_err("missing socket must surface as Err");
     let msg = format!("{rpc:#}");
     assert!(
         msg.contains("connecting to catalog engine") || msg.contains("No such file"),
@@ -396,19 +428,19 @@ async fn existing_corpus_entry_shows_live_data_after_merge() {
         ..Default::default()
     };
 
-    let resp: CatalogResponse = fetch_catalog_models(&socket)
+    let resp: CatalogResponse = fetch_catalog_models(&socket, &provider())
         .await
         .expect("rpc must succeed");
     let outcome = merge_or_degrade(Some(&mut corpus), Ok(resp));
-    assert_eq!(outcome.enriched, 1);
+    assert_eq!(outcome.enriched, 0);
     assert_eq!(outcome.added, 0);
     let m = corpus
         .models
         .iter()
         .find(|m| m.id == "minimax/MiniMax-M3")
         .unwrap();
-    assert_eq!(m.host, "minimax-live", "live host must win");
-    assert_eq!(m.family, "minimax-live", "family follows host on rotation");
+    assert_eq!(m.host, "minimax");
+    assert_eq!(m.family, "minimax");
     assert!(
         m.route_candidate,
         "the corpus's route eligibility is preserved"

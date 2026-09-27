@@ -23,30 +23,20 @@
 //!
 //! Wire shape
 //! ----------
-//! The daemon is expected to return a JSON object with the following shape
-//! (matches the field names the zeroclaw engine uses elsewhere in its
-//! `pricing.json` and cost tracker; we accept extra fields without
-//! rejecting, so a future zeroclaw release can add columns without breaking
-//! `zoder`):
+//! The engine accepts one configured `model_provider` per request and returns
+//! model ids plus optional per-token pricing:
 //!
 //! ```json
 //! {
-//!   "models": [
-//!     {
-//!       "id": "minimax/MiniMax-M3",
-//!       "host": "minimax",
-//!       "kind": "chat",
-//!       "free": true,
-//!       "source": "subscription",
-//!       "input_usd_per_mtok": 0.0,
-//!       "output_usd_per_mtok": 0.0,
-//!       "context_window": 200000,
-//!       "tags": ["fast", "code"]
-//!     },
-//!     ...
-//!   ]
+//!   "model_provider": "custom.minimax",
+//!   "models": ["minimax/MiniMax-M3"],
+//!   "pricing": null,
+//!   "local": false,
+//!   "live": true
 //! }
 //! ```
+//! Billing classification and provider identity come from zoder's matching
+//! provider configuration; the engine response does not contain them.
 //!
 //! Transport is the same NDJSON JSON-RPC the `cost/query` client uses
 //! ([`crate::engine_cost::fetch_engine_cost`]): connect, `initialize`, then
@@ -63,6 +53,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::config::{BillingMode, Provider};
 use crate::corpus::{Corpus, Economics, ModelEntry};
 
 /// ACP protocol version the daemon's `initialize` expects. Mirrors
@@ -75,11 +66,8 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 /// CLI for arbitrarily long.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One catalog row, mirroring the daemon's `config/catalog-models` result
-/// entry. Every field is `#[serde(default)]` so a future daemon that omits
-/// `context_window` or `tags` does not break `zoder` — missing fields are
-/// just treated as "unknown", which is exactly the posture the corpus has
-/// always taken for absent metadata.
+/// One normalized catalog row after combining the engine's model id/pricing
+/// response with zoder's local provider and billing configuration.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct CatalogModel {
     #[serde(default)]
@@ -113,13 +101,29 @@ pub struct CatalogModel {
     pub tags: Vec<String>,
 }
 
-/// The full `config/catalog-models` response. The daemon's wire shape is
-/// `{ "models": [...] }`; extra top-level fields are accepted but not
-/// consumed (forward-compatible).
+/// Normalized catalog response consumed by the corpus merge.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CatalogResponse {
     #[serde(default)]
     pub models: Vec<CatalogModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineCatalogResponse {
+    model_provider: String,
+    models: Vec<String>,
+    #[serde(default)]
+    pricing: Option<std::collections::HashMap<String, EngineModelPricing>>,
+    local: bool,
+    live: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineModelPricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
 }
 
 /// Outcome of a `config/catalog-models` enrichment. Lets callers (CLI,
@@ -162,7 +166,14 @@ impl EnrichmentOutcome {
 /// [`QUERY_TIMEOUT`]. Returns the raw [`CatalogResponse`] so callers can
 /// inspect/merge it however they want; most callers will pass the result
 /// straight to [`merge_into_corpus`].
-pub async fn fetch_catalog_models(socket: &Path) -> anyhow::Result<CatalogResponse> {
+pub async fn fetch_catalog_models(
+    socket: &Path,
+    provider: &Provider,
+) -> anyhow::Result<CatalogResponse> {
+    let model_provider = provider
+        .engine_provider_ref
+        .as_deref()
+        .ok_or_else(|| anyhow!("provider {} has no engine_provider_ref", provider.id))?;
     let exchange = async {
         let stream = tokio::net::UnixStream::connect(socket)
             .await
@@ -185,24 +196,58 @@ pub async fn fetch_catalog_models(socket: &Path) -> anyhow::Result<CatalogRespon
         read_response(&mut reader, "nvz-init").await?;
 
         // The actual `config/catalog-models` request. The daemon returns
-        // `{ "models": [...] }`; any `params` is reserved for future
-        // filters (provider id, kind, free-only, …) and intentionally
-        // omitted here so this client stays forward-compatible with old
-        // and new daemon builds alike.
+        // The engine requires one exact model-provider profile per request.
         write_frame(
             &mut write_half,
             &json!({
                 "jsonrpc": "2.0",
                 "id": "nvz-catalog",
                 "method": "config/catalog-models",
-                "params": {},
+                "params": { "model_provider": model_provider },
             }),
         )
         .await?;
         let result = read_response(&mut reader, "nvz-catalog").await?;
-        let resp: CatalogResponse =
+        let wire: EngineCatalogResponse =
             serde_json::from_value(result).context("decoding config/catalog-models result")?;
-        Ok::<CatalogResponse, anyhow::Error>(resp)
+        if wire.model_provider != model_provider {
+            bail!(
+                "incompatible catalog response: requested provider {model_provider:?}, got {:?}",
+                wire.model_provider
+            );
+        }
+        let free = matches!(
+            provider.billing,
+            BillingMode::Free | BillingMode::Subscription
+        );
+        let source = if wire.live {
+            "daemon-live"
+        } else {
+            "daemon-fallback"
+        };
+        let models = wire
+            .models
+            .into_iter()
+            .map(|id| {
+                let prices = wire.pricing.as_ref().and_then(|prices| prices.get(&id));
+                let per_mtok = |value: Option<&String>| {
+                    value
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .map(|v| v * 1_000_000.0)
+                };
+                CatalogModel {
+                    id,
+                    host: provider.id.clone(),
+                    kind: "chat".to_string(),
+                    free: Some(free || wire.local),
+                    source: source.to_string(),
+                    input_usd_per_mtok: prices.and_then(|p| per_mtok(p.prompt.as_ref())),
+                    output_usd_per_mtok: prices.and_then(|p| per_mtok(p.completion.as_ref())),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Ok::<CatalogResponse, anyhow::Error>(CatalogResponse { models })
     };
 
     tokio::time::timeout(QUERY_TIMEOUT, exchange)
