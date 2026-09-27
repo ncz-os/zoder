@@ -2,9 +2,60 @@
 # Runs on GitLab SaaS shared runners (free OSS-grant minutes) — NOT the fleet.
 # Canonical merge gate; native + release artifacts live in GitHub Actions.
 stages:
+  - corpus
   - check
   - security
   - upstream
+
+# -- corpus: daily model / pricing / bench sync -------------------------------
+# Refreshes the public artifacts every zoder client raw-pulls from master:
+# corpus/model_corpus.json, pricing/catalog.json, bench/overlay.json. That
+# corpus is the central model index -- when it goes stale the router ranks on
+# stale capability data, and newly served models never get a real score.
+#
+# GitLab is the SINGLE writer to master and push-mirrors to GitHub, so this
+# must never be re-homed to GitHub Actions: a github-only data commit diverges
+# the two masters and stalls the mirror (that is why e7a6a29 moved it here and
+# deleted .github/workflows/corpus-sync.yml).
+#
+# Runs on the daily schedule (and on demand from the web UI); commits with
+# `-o ci.skip` + [skip ci] so a data commit never re-triggers a pipeline.
+# Needs the masked GITLAB_PUSH_TOKEN (write_repository) CI/CD variable.
+#
+# History: restored after efe9e8a (2026-07-08) rewrote this file and dropped
+# the corpus stage, leaving the daily schedule firing into a pipeline with no
+# sync job for 81 days.
+corpus-sync:
+  stage: corpus
+  image: python:3.12
+  needs: []
+  cache: {}
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
+    - if: "$CI_PIPELINE_SOURCE == \"web\""
+      when: manual
+      allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+    - pip install --quiet -r scripts/ci/corpus-requirements.txt
+  script:
+    # Fetch every bench source, falling back to the last-known-good snapshot
+    # for any source that fails, and write corpus/freshness.json.
+    - python3 scripts/ci/corpus-fetch-and-overlay.py --allow-lkg-fallback
+    # Refuse to publish an overlay degraded past the freshness threshold.
+    - python3 scripts/ci/corpus-freshness-check.py
+    - git config user.name "zoder corpus sync"
+    - git config user.email "jperlow@gmail.com"
+    - git add corpus/model_corpus.json pricing/catalog.json bench/overlay.json corpus/freshness.json
+    - |
+      if git diff --cached --quiet; then
+        echo "corpus/pricing unchanged -- nothing to commit"
+        exit 0
+      fi
+      stamp="$(date -u +%Y-%m-%d)"
+      scored="$(python3 -c "import json;d=json.load(open('corpus/model_corpus.json'));print(d.get('scored','?'),d.get('routable','?'))")"
+      git commit -m "data(corpus): daily sync ${stamp} (scored/routable: ${scored}) [skip ci]"
+      git push -o ci.skip "https://oauth2:${GITLAB_PUSH_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
 
 rust-gate:
   stage: check
