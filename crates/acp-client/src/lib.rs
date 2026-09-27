@@ -2216,15 +2216,15 @@ async fn drive<F: FnMut(AgentEvent)>(
         }),
     )
     .await?;
-    let new_res = match tokio::time::timeout(
-        SETUP_RPC_TIMEOUT,
-        read_result_inner(&mut reader, "new"),
-    )
-    .await
-    .map_err(|_| anyhow!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"))?
-    {
+    let new_res = tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result_inner(&mut reader, "new"))
+        .await
+        .map_err(|_| anyhow!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"))??;
+    let new_res = match new_res {
         Ok(v) => v,
-        Err(msg) => {
+        Err(err) => {
+            if !may_replace_rejected_session(opts, &err) {
+                anyhow::bail!("session/new resume failed: {err}");
+            }
             // Engine rejected the resume. The previous behavior
             // was to clear the on-disk record here so the next
             // run wouldn't keep tripping the same error — but
@@ -2251,31 +2251,17 @@ async fn drive<F: FnMut(AgentEvent)>(
                 }),
             )
             .await?;
-            // A retry-failure is fatal (any repeated error here means
-            // the engine itself is misbehaving — not a stale id).
-            // Wrap the success value in `Ok` so the arm produces a
-            // `Result<Value, String>` matching the outer match (the
-            // outer arm type is `Result<Value, String>` because
-            // `read_result_inner` returns
-            // `anyhow::Result<Result<Value, String>>`).
+            // A retry failure is fatal: only SESSION_NOT_FOUND is eligible
+            // for this fresh-create recovery path.
             tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "new"))
                 .await
                 .map_err(|_| anyhow!("session/new retry timed out after {SETUP_RPC_TIMEOUT:?}"))?
                 .map_err(|_| {
                     anyhow!(
-                        "engine error on session/new: {msg} (and the fresh-create retry also failed)"
+                        "engine error on session/new: {err} (and the fresh-create retry also failed)"
                     )
-                })
-                .map(Ok)?
+                })?
         }
-    };
-    // `new_res` is `Result<Value, String>` here (the outer `?` on the
-    // timeout unwraps the `anyhow::Result`, leaving the engine-error
-    // variant as the inner arm). Unwrap the success path; the error
-    // path is fatal (the retry arm already produced a clear message).
-    let new_res = match new_res {
-        Ok(v) => v,
-        Err(msg) => anyhow::bail!("session/new failed and no retry succeeded: {msg}"),
     };
     let session_id = new_res
         .get("session_id")
@@ -4127,7 +4113,10 @@ where
     };
     let new_res = match new_res {
         Ok(v) => v,
-        Err(msg) => {
+        Err(err) => {
+            if !may_replace_rejected_session(opts, &err) {
+                anyhow::bail!("session/new resume failed: {err}");
+            }
             // Engine rejected a resume. Z-24: do NOT clear the
             // on-disk record here. The previous behavior was to
             // drop the record so the next run wouldn't keep
@@ -4163,8 +4152,8 @@ where
                         ))
                     }
                 };
-            retry.map_err(|retry_msg| {
-                anyhow!("engine error on session/new: {msg} (and the fresh-create retry also failed: {retry_msg})")
+            retry.map_err(|retry_err| {
+                anyhow!("engine error on session/new: {err} (and the fresh-create retry also failed: {retry_err})")
             })?
         }
     };
@@ -4875,7 +4864,25 @@ async fn read_result(
 ) -> anyhow::Result<Value> {
     read_result_inner(reader, want_id)
         .await?
-        .map_err(|msg| anyhow!("engine error on {want_id}: {msg}"))
+        .map_err(|err| anyhow!("engine error on {want_id}: {err}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (code {})", self.message, self.code)
+    }
+}
+
+const SESSION_NOT_FOUND: i64 = -32000;
+
+fn may_replace_rejected_session(opts: &AgentOptions, error: &RpcError) -> bool {
+    opts.session_id.is_none() && opts.persist_session_id && error.code == SESSION_NOT_FOUND
 }
 
 /// Lower-level variant that returns the engine-error message as `Err`
@@ -4892,7 +4899,7 @@ async fn read_result(
 async fn read_result_inner(
     reader: &mut (impl AsyncBufReadExt + Unpin),
     want_id: &str,
-) -> anyhow::Result<Result<Value, String>> {
+) -> anyhow::Result<Result<Value, RpcError>> {
     let mut line = String::new();
     loop {
         let got_line = read_frame_line_capped(reader, &mut line)
@@ -4912,12 +4919,13 @@ async fn read_result_inner(
             continue;
         }
         if let Some(err) = frame.get("error") {
-            let msg = err
+            let message = err
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error")
                 .to_string();
-            return Ok(Err(msg));
+            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+            return Ok(Err(RpcError { code, message }));
         }
         return Ok(Ok(frame.get("result").cloned().unwrap_or(Value::Null)));
     }
@@ -6354,6 +6362,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_resume_rejection_is_never_replaced_with_a_fresh_session() {
+        let mut opts = AgentOptions::new("/tmp/daemon.sock", "agent-b", "/tmp", "task");
+        opts.session_id = Some("session-owned-by-agent-a".into());
+        opts.persist_session_id = true;
+        let ownership_error = RpcError {
+            code: -32602,
+            message: "ACP session belongs to a different agent".into(),
+        };
+        assert!(!may_replace_rejected_session(&opts, &ownership_error));
+
+        let missing_error = RpcError {
+            code: SESSION_NOT_FOUND,
+            message: "Session not found".into(),
+        };
+        assert!(
+            !may_replace_rejected_session(&opts, &missing_error),
+            "even a missing explicit session must be reported to its caller"
+        );
+    }
+
+    #[test]
     fn write_tool_matrix_is_non_empty_and_covers_known_engines() {
         // The matrix MUST cover at least the engines we claim to
         // support (zeroclaw, goose) so --list-schemas is never empty.
@@ -7425,7 +7454,7 @@ mod tests {
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": "new",
-                "error": { "code": -32004, "message": "session not found" }
+                "error": { "code": -32000, "message": "Session not found" }
             }),
         )
         .await;
@@ -7750,7 +7779,7 @@ mod tests {
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": "new",
-                "error": { "code": -32004, "message": "session not found" }
+                "error": { "code": -32000, "message": "Session not found" }
             }),
         )
         .await;
@@ -7822,7 +7851,6 @@ mod tests {
         // NEXT run.
         opts.persist_session_id = true;
         opts.session_store_path = Some(store_path.clone());
-        opts.session_id = Some("session-A".to_string());
         let mut events: Vec<AgentEvent> = Vec::new();
         let run = drive_goose_io(&opts, &mut r, &mut w, &mut |ev| {
             events.push(ev);
