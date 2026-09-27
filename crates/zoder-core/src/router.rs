@@ -57,6 +57,9 @@ pub struct Router<'a> {
 }
 
 impl<'a> Router<'a> {
+    /// Conservative prior for absent latency evidence, on the same 0..1 scale
+    /// as measured latency scores.
+    const AUTO_MISSING_LATENCY_PRIOR: f64 = 0.0;
     pub fn new(corpus: &'a Corpus, health: &'a HealthStore) -> Self {
         Self {
             corpus,
@@ -106,10 +109,12 @@ impl<'a> Router<'a> {
                 None => m.w_swe.or(m.agentic_score).unwrap_or(0.0),
             },
             // Balanced: blend real capability with latency inside the bench band.
-            Tier::Auto => match (cap, m.latency_score) {
-                (Some(c), Some(l)) => 1.0 + 0.6 * c + 0.4 * l,
-                (Some(c), None) => 1.0 + c,
-                (None, _) => m.agentic_score.or(m.w_swe).unwrap_or(0.0),
+            Tier::Auto => match cap {
+                Some(c) => {
+                    let latency = m.latency_score.unwrap_or(Self::AUTO_MISSING_LATENCY_PRIOR);
+                    1.0 + 0.6 * c + 0.4 * latency
+                }
+                None => m.agentic_score.or(m.w_swe).unwrap_or(0.0),
             },
             // Workflow-first: a model the known-good list rates for THIS workflow
             // (top band) outranks one with only a measured capability, which
@@ -293,10 +298,26 @@ impl<'a> Router<'a> {
             (Some(c), Some(src)) => format!("{c:.1} ({src})"),
             _ => "n/a".to_string(),
         };
+        let effective_rank = Self::rank_key(primary, tier);
+        let latency_provenance = match primary.latency_score {
+            Some(score) => format!("measured:{score:.3}"),
+            None if tier == Tier::Auto => {
+                format!("prior:{:.3}", Self::AUTO_MISSING_LATENCY_PRIOR)
+            }
+            None => "absent".to_string(),
+        };
+        let tie_break = ranked
+            .get(1)
+            .is_some_and(|next| Self::rank_key(next, tier) == effective_rank)
+            .then_some("model_id")
+            .unwrap_or("none");
         let reason = format!(
-            "tier={:?} pick={} (code_cap={} swe_elo={:?} ttft={:?}ms tok/s={:?} agentic={:?}) free=$0",
+            "tier={:?} pick={} (rank={:.3} latency={} tie_break={} code_cap={} swe_elo={:?} ttft={:?}ms tok/s={:?} agentic={:?}) free=$0",
             tier,
             primary.id,
+            effective_rank,
+            latency_provenance,
+            tie_break,
             cap_str,
             primary.swe_elo(),
             primary.ttft_ms_p50,
@@ -651,6 +672,21 @@ mod tests {
         };
         assert!(
             Router::rank_key(&fast_lowcap, Tier::Fast) > Router::rank_key(&slow_hicap, Tier::Fast)
+        );
+    }
+
+    #[test]
+    fn auto_missing_latency_cannot_promote_a_candidate() {
+        let measured = ModelEntry {
+            latency_score: Some(0.7),
+            ..benched("measured", 80.0)
+        };
+        let mut missing = measured.clone();
+        missing.id = "missing".into();
+        missing.latency_score = None;
+        assert!(
+            Router::rank_key(&missing, Tier::Auto) <= Router::rank_key(&measured, Tier::Auto),
+            "removing latency evidence must not improve Auto rank"
         );
     }
 }
