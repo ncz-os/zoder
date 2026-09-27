@@ -855,23 +855,15 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 /// string comparison (the `rescue` / `exec` commands test `== "timeout"`).
 ///
 /// Recognized values:
-///   * `completed` — engine explicitly signalled `turn_complete` /
-///     `stopReason: end_turn` (i.e. reached the terminal marker), OR the
-///     engine closed the socket after streaming text AND every
-///     in-flight tool received its `tool_result` (clean partial). The
+///   * `completed` — engine explicitly signalled a successful
+///     `turn_complete` / `stopReason: end_turn` terminal marker. The
 ///     streamed `content` is the final text.
 ///   * `timeout` — wall-clock budget elapsed. The `content` and
 ///     `tool_calls` reflect whatever had streamed before the deadline
 ///     (partial work preserved).
-///   * `interrupted` — engine closed the socket (EOF) before the
-///     terminal marker AND at least one `tool_call` was emitted without
-///     a matching `tool_result` (the tool hung or was severed
-///     mid-execution). Also reported when a `tool_call` was emitted
-///     with no text and the engine vanished — distinct from `completed`
-///     because the tool's output is unobserved. `pending_tool_results`
-///     is tracked per tool name so a single unresolved tool among many
-///     is sufficient to flag the turn as `interrupted` (no false-zero
-///     race on stray or duplicate `tool_result` frames).
+///   * `interrupted` — the connection ended before a terminal marker,
+///     after any text or tool activity arrived. Partial content, session
+///     id, and tool state are retained, but cannot prove completion.
 ///   * `failed` — empty mid-turn disconnect (engine closed without
 ///     emitting any text OR tool calls) OR a JSON-RPC error response on
 ///     a critical RPC, surfaced as `Err` by the driver. Reachable only
@@ -2017,28 +2009,16 @@ pub async fn run_agent<F: FnMut(AgentEvent)>(
 ///
 /// The matrix, ordered most-specific first:
 ///
-/// 1. If ANY entry in `pending_tool_results` is non-zero, the engine emitted
-///    at least one `tool_call` that did NOT receive its matching
-///    `tool_result` before the socket closed. The tool hung or was severed
-///    mid-execution. We MUST NOT call that `completed` — the caller would
-///    (incorrectly) treat the tool as having finished and dispatch on a
-///    result that never streamed. The result is `"interrupted"`. The
-///    per-name `HashMap` makes this branch also fire when only ONE of N
-///    distinct tools is unresolved: `[A] -> [B] -> [result A] -> EOF` is
-///    `interrupted` because `B` is still pending, even though `A` is closed.
-///
-/// 2. If `content` is empty AND no tool calls were emitted, the engine
+/// 1. If `content` is empty AND no tool calls were emitted, the engine
 ///    closed without producing anything. The turn is genuinely empty and
 ///    we surface that as `"failed"` so callers can distinguish "engine
 ///    disconnected with no output" from "engine disconnected after
-///    streaming useful work". (This branch is reached only when
-///    `pending_tool_results` is also empty, by the ordering above — a turn
-///    with a `tool_call` and no text is `interrupted`, not `failed`.)
+///    streaming useful work".
 ///
-/// 3. Otherwise text streamed AND every tool that was called received its
-///    result before EOF. The caller treats this as a clean end with
-///    whatever the engine managed to produce before vanishing. The
-///    result is `"completed"`.
+/// 2. Otherwise some work arrived, but EOF/read failure is not evidence that
+///    the requested turn finished. The result is `"interrupted"`, even when
+///    all observed tool calls have matching results. Only an explicit
+///    successful terminal event may produce `"completed"`.
 ///
 /// `drive_goose_io` does not maintain a per-name pending map (it tracks
 /// `tool_calls` as a flat counter only), so its EOF branch routes through
@@ -2046,16 +2026,14 @@ pub async fn run_agent<F: FnMut(AgentEvent)>(
 /// helper when a pending map IS supplied and otherwise falls back to the
 /// flat-counter matrix.
 fn classify_partial_outcome(
-    pending_tool_results: &HashMap<String, u32>,
+    _pending_tool_results: &HashMap<String, u32>,
     content: &str,
     tool_call_count: u32,
 ) -> String {
-    if pending_tool_results.values().any(|n| *n > 0) {
-        "interrupted".to_string()
-    } else if content.is_empty() && tool_call_count == 0 {
+    if content.is_empty() && tool_call_count == 0 {
         "failed".to_string()
     } else {
-        "completed".to_string()
+        "interrupted".to_string()
     }
 }
 
@@ -2079,11 +2057,8 @@ fn classify_partial_outcome(
 /// across the two wire drivers.
 ///
 /// For callers without a pending map (the flat-counter case used by
-/// `drive_goose_io`'s EOF branch), the helper falls back to the
-/// two-branch decision: empty stream -> `"failed"`, anything else
-/// -> `"completed"`. This preserves the original flat-counter
-/// behavior for callers that genuinely have no per-name state to
-/// pass through.
+/// `drive_goose_io`'s EOF branch), the same two-branch decision applies:
+/// empty stream -> `"failed"`, anything else -> `"interrupted"`.
 ///
 /// **Audit invariant:** when the caller knows that a tool is
 /// pending, this helper MUST be called with `pending_tools =
@@ -2109,7 +2084,7 @@ fn classify_partial_outcome_flat(
     if content.is_empty() && tool_call_count == 0 {
         "failed".to_string()
     } else {
-        "completed".to_string()
+        "interrupted".to_string()
     }
 }
 
@@ -2426,8 +2401,7 @@ async fn drive<F: FnMut(AgentEvent)>(
     // `tool_result` for a name that has no entry is a no-op
     // (`HashMap::get_mut` returns `None`); a duplicate `tool_result`
     // for a name whose count has already hit zero is also a no-op.
-    // The turn is `interrupted` if and only if at least one distinct
-    // tool name is still pending at EOF. Two calls to the same tool
+    // Pending counts retain diagnostic state at EOF. Two calls to the same tool
     // (e.g. two `edit_file` invocations in one turn) are tracked
     // under the same key with a count of 2 and require two distinct
     // `tool_result` frames to close — preserving per-call correctness
@@ -2439,16 +2413,13 @@ async fn drive<F: FnMut(AgentEvent)>(
     // Outcome at EOF (`turn_complete` arriving implicitly resets this
     // to zero because the loop has exited):
     //
-    //   * any entry > 0          -> `"interrupted"`  (a tool's result
-    //     is missing; the caller MUST NOT treat the turn as clean)
-    //   * otherwise, content ==
+    //   * content ==
     //     "" && tool_calls == 0 -> `"failed"`      (engine closed
     //     without emitting anything; the operator can distinguish
     //     "disconnected with no work" from "disconnected after
     //     streaming useful work")
-    //   * otherwise              -> `"completed"`   (every tool that
-    //     was called received its result before the engine vanished;
-    //     text was streamed; the caller accepts the partial)
+    //   * otherwise              -> `"interrupted"` (some work arrived,
+    //     but no terminal event proved the turn completed)
     //
     // In every case the function returns `Ok(AgentRun{..})` — NEVER
     // `Err` — so partial work survives a severed connection.
@@ -2527,13 +2498,10 @@ async fn drive<F: FnMut(AgentEvent)>(
                 // approval-write-failure branches all converge on the same
                 // state matrix. The matrix is documented in that helper's
                 // doc comment; in summary:
-                //   1. `pending_tool_results` non-zero -> "interrupted"
-                //      (a tool was severed mid-execution; the caller must
-                //      NOT treat the tool as completed).
-                //   2. `content` empty AND no tool calls -> "failed"
+                //   1. `content` empty AND no tool calls -> "failed"
                 //      (engine disconnected with no output).
-                //   3. otherwise -> "completed" (text streamed; every
-                //      tool that was called received its result before EOF).
+                //   2. otherwise -> "interrupted" (partial work is retained,
+                //      but only a terminal event can prove completion).
                 //
                 // In every case the function returns `Ok(AgentRun{..})` —
                 // NEVER `Err` — so partial work survives.
@@ -2564,8 +2532,8 @@ async fn drive<F: FnMut(AgentEvent)>(
                 // been emitted to the sink.
                 //
                 // We classify the partial using the SAME state-matrix the
-                // EOF branch uses (pending tools -> interrupted, empty ->
-                // failed, otherwise -> completed). The error string is
+                // EOF branch uses (empty -> failed, otherwise -> interrupted).
+                // The error string is
                 // preserved on `failure_detail` so the operator can diagnose
                 // the wire-side fault, but the function still returns
                 // `Ok(AgentRun{..})` — NEVER `Err` — so the partial
@@ -2790,8 +2758,8 @@ async fn drive<F: FnMut(AgentEvent)>(
                 // work. We instead capture the error on
                 // `failure_detail`, classify the turn using the same
                 // state matrix as the EOF / read-error branches
-                // (pending tool -> interrupted, empty -> failed,
-                // otherwise completed), and return `Ok(AgentRun{..})`
+                // (empty -> failed, otherwise interrupted), and return
+                // `Ok(AgentRun{..})`
                 // with whatever streamed. The caller still gets a
                 // usable session id and partial transcript; the error
                 // is visible on `failure_detail` and on the
@@ -4335,21 +4303,14 @@ where
             Ok(r) => match r {
                 Ok(got_line) => got_line,
                 Err(e) => {
-                    // Distinguish between different types of read errors:
-                    // - InvalidData from frame cap: this is a sign of a misbehaving
-                    //   engine, so we return an error (original Z-17 behavior).
-                    // - Other errors (connection errors, etc.): treat as partial
-                    //   turn - preserve whatever was streamed so far.
-                    if e.kind() == std::io::ErrorKind::InvalidData {
-                        return Err(e.into());
-                    }
+                    let outcome = classify_partial_outcome_flat(None, &content, tool_calls);
                     return Ok(AgentRun {
                         session_id: session_id.clone(),
-                        outcome: "partial".to_string(),
+                        outcome,
                         content,
                         input_tokens,
                         tool_calls,
-                        failure_detail: None,
+                        failure_detail: Some(format!("engine read error mid-turn: {e}")),
                     });
                 }
             },
@@ -4366,14 +4327,7 @@ where
             // pending map. The helper then falls back to the
             // two-branch matrix:
             //   * empty stream -> "failed"
-            //   * otherwise    -> "completed"
-            // Note: this branch only fires on EOF (clean socket
-            // close); non-EOF read errors are surfaced as
-            // `Err(context(...))` above (a separate change tracks
-            // unifying the read-error branch with the per-name
-            // driver; for now the goose driver keeps the pre-fix
-            // behavior on read errors and the audit-acceptable
-            // behavior on EOF).
+            //   * otherwise    -> "interrupted"
             let outcome = classify_partial_outcome_flat(None, &content, tool_calls);
             break outcome;
         }
@@ -8083,9 +8037,15 @@ mod tests {
         })
         .await;
         let _ = server.await;
-        let err =
-            res.expect_err("Z-17: an oversized session/update must make drive_goose_io return Err");
-        let msg = format!("{err:?}");
+        let run = res.expect("a pre-terminal read failure must preserve the partial AgentRun");
+        assert_eq!(
+            run.outcome, "failed",
+            "no work arrived before the read error"
+        );
+        assert!(!run.succeeded());
+        assert_eq!(run.session_id, "goose-overflow-test");
+        assert!(run.content.is_empty());
+        let msg = run.failure_detail.expect("read error detail must survive");
         assert!(
             msg.contains("cap") || msg.contains("exceeds") || msg.contains("too large"),
             "Z-17: expected an overflow / cap diagnostic from the streaming loop, got: {msg}"
@@ -10553,7 +10513,8 @@ mod tests {
         .await;
 
         assert_eq!(run.session_id, "goose-test-session-1");
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, "interrupted");
+        assert!(!run.succeeded());
         assert_eq!(run.content, "Hello World");
         assert!(
             frames.len() >= 3,
@@ -10582,7 +10543,7 @@ mod tests {
     // "engine disconnected after streaming useful work". The pre-fix
     // code returned `Err("engine closed the connection before turn
     // completed")` and threw away the chunk. The post-fix code returns
-    // `Ok(AgentRun { content: "hello-partial", outcome: "completed",
+    // `Ok(AgentRun { content: "hello-partial", outcome: "interrupted",
     // ..})` — partial work survives, and the function never returns
     // `Err` on EOF alone.
     // -----------------------------------------------------------------
@@ -10695,14 +10656,14 @@ mod tests {
             run.content
         );
 
-        // 2. Partial work is reported as `completed` (mirrors
-        //    `drive_goose_io`'s EOF contract — empty turns are
-        //    `failed`, non-empty turns are `completed`).
+        // 2. Partial work is reported as `interrupted`: useful output
+        //    survives, but EOF cannot stand in for `turn_complete`.
         assert_eq!(
-            run.outcome, "completed",
-            "non-empty mid-turn disconnect must be classified as `completed`; got {:?}",
+            run.outcome, "interrupted",
+            "non-empty mid-turn disconnect must be classified as `interrupted`; got {:?}",
             run.outcome
         );
+        assert!(!run.succeeded());
 
         // 3. The session id from the partial handshake is preserved.
         assert_eq!(
@@ -12296,28 +12257,26 @@ mod goose_acp_real_turn {
         );
     }
 
-    /// Pin the "completed-with-partial-text" branch — text streamed
-    /// AND every tool was closed; the engine vanished after producing
-    /// useful work.
+    /// This existing expectation deliberately changed: text is useful
+    /// partial output, but EOF is not an explicit completion event.
     #[test]
-    fn classify_partial_outcome_text_only_is_completed() {
+    fn classify_partial_outcome_text_only_is_interrupted() {
         let pending = HashMap::new();
         let out = classify_partial_outcome(&pending, "hello, world", 0);
         assert_eq!(
-            out, "completed",
-            "text streamed with no pending tools must classify as `completed`; got {out:?}"
+            out, "interrupted",
+            "text streamed without a terminal event must classify as `interrupted`; got {out:?}"
         );
     }
 
-    /// Pin the "completed-after-tool-closed" branch — text streamed
-    /// AND every tool_call has a matching tool_result.
+    /// A matching tool result does not prove the rest of the turn completed.
     #[test]
-    fn classify_partial_outcome_text_with_closed_tools_is_completed() {
+    fn classify_partial_outcome_text_with_closed_tools_is_interrupted() {
         let pending = HashMap::new(); // every tool has closed
         let out = classify_partial_outcome(&pending, "done editing", 1);
         assert_eq!(
-            out, "completed",
-            "text streamed with all tools closed must classify as `completed`; got {out:?}"
+            out, "interrupted",
+            "closed tools without a terminal event must classify as `interrupted`; got {out:?}"
         );
     }
 
@@ -12334,11 +12293,11 @@ mod goose_acp_real_turn {
     /// Pin the flat variant's fallback when `None` is passed and
     /// text was streamed.
     #[test]
-    fn classify_partial_outcome_flat_with_text_is_completed() {
+    fn classify_partial_outcome_flat_with_text_is_interrupted() {
         let out = classify_partial_outcome_flat(None, "some text", 0);
         assert_eq!(
-            out, "completed",
-            "flat (None): text streamed must be `completed`"
+            out, "interrupted",
+            "flat (None): text without a terminal event must be `interrupted`"
         );
     }
 
@@ -12347,11 +12306,11 @@ mod goose_acp_real_turn {
     /// audit-accepted flat-counter behavior for the goose driver
     /// (no per-name pending state is available).
     #[test]
-    fn classify_partial_outcome_flat_with_tool_calls_is_completed() {
+    fn classify_partial_outcome_flat_with_tool_calls_is_interrupted() {
         let out = classify_partial_outcome_flat(None, "", 3);
         assert_eq!(
-            out, "completed",
-            "flat (None): tool calls with no text must be `completed` (drive_goose_io has no per-name pending map); got {out:?}"
+            out, "interrupted",
+            "flat (None): tool calls without a terminal event must be `interrupted`; got {out:?}"
         );
     }
 
@@ -12396,18 +12355,16 @@ mod goose_acp_real_turn {
     }
 
     /// REGRESSION: the flat variant with `Some(pending)` and a
-    /// closed (zero-count) entry must NOT classify as
-    /// `interrupted` — zero is not "pending". A `tool_call` with
-    /// its `tool_result` already received is a closed call, not a
-    /// severed one.
+    /// closed (zero-count) entry still classifies as interrupted because
+    /// completing one tool is not the turn's terminal event.
     #[test]
-    fn classify_partial_outcome_flat_with_some_zero_count_pending_does_not_interrupt() {
+    fn classify_partial_outcome_flat_with_some_zero_count_is_interrupted() {
         let mut pending = HashMap::new();
         pending.insert("edit_file".to_string(), 0); // closed
         let out = classify_partial_outcome_flat(Some(&pending), "done", 1);
         assert_eq!(
-            out, "completed",
-            "flat (Some(zero-count pending)): zero-count is closed, not pending; \
+            out, "interrupted",
+            "flat (Some(zero-count pending)): no terminal event was received; \
              got {out:?}"
         );
     }
@@ -12533,8 +12490,8 @@ mod goose_acp_real_turn {
             "no tool_call frames were streamed; tool_calls must be 0"
         );
         assert_eq!(
-            run.outcome, "completed",
-            "a non-empty stream with no pending tools must classify as `completed` (the read-error path \
+            run.outcome, "interrupted",
+            "a non-empty stream with no terminal event must classify as `interrupted` (the read-error path \
              uses the same state matrix as the EOF path); got {:?}",
             run.outcome
         );
