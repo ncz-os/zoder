@@ -124,7 +124,12 @@ cli-smoke:
 # runners, so it deliberately does NOT run on push or merge requests.
 upstream-zeroclaw:
   stage: upstream
-  image: rust:1.93.0
+  # Upstream tracks its OWN MSRV, not our fork's pinned 1.93.0. Pinning 1.93.0
+  # here made the job die with "failed to parse process output:
+  # .../toolchains/1.96.1-x86_64-unknown-linux-gnu" (cargo exit 101) once
+  # upstream moved to 1.96. A job that tracks someone else's master must use
+  # a current toolchain, not ours.
+  image: rust:latest
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
     CARGO_TERM_COLOR: "always"
@@ -169,4 +174,8 @@ upstream-zeroclaw:
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
     - if: "$CI_PIPELINE_SOURCE == \"web\""
-  allow_failure: false
+  # Upstream breakage is INFORMATION, not a defect in this repo. This job
+  # exists to notice when zeroclaw-labs/zeroclaw master stops building; making
+  # it block turns someone else's commit into a red pipeline on our master
+  # (and a buildwatch alert). It reports; it does not gate.
+  allow_failure: true
