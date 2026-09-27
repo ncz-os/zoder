@@ -334,18 +334,64 @@ async fn non_streaming_meaningful_choice_still_parses() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"message": {
+                "content": "ok",
+                "reasoning_content": "thinking aloud"
+            }}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 1}
         })))
         .mount(&server)
         .await;
 
-    let result = provider(&server.uri())
-        .stream_chat(&req("m", false), None)
-        .await
-        .unwrap();
-    assert_eq!(result.content, "ok");
-    assert_eq!(result.completion_tokens, Some(1));
+    for show_reasoning in [false, true] {
+        let mut request = req("m", false);
+        request.show_reasoning = show_reasoning;
+        let result = provider(&server.uri())
+            .stream_chat(&request, None)
+            .await
+            .unwrap();
+        assert_eq!(result.content, "ok");
+        assert_eq!(result.reasoning.as_deref(), Some("thinking aloud"));
+        assert_eq!(result.completion_tokens, Some(1));
+    }
+}
+
+/// A reasoning-only OpenAI-compatible terminal message is incomplete under
+/// both display settings. Preserve the reasoning on the decode error so it is
+/// not lost or promoted into the final-answer surface.
+#[tokio::test]
+async fn non_streaming_reasoning_only_is_decode_error_for_both_display_settings() {
+    for show_reasoning in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "reasoning_content": "thinking aloud"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut request = req("m", false);
+        request.show_reasoning = show_reasoning;
+        let error = provider(&server.uri())
+            .stream_chat(&request, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            ErrKind::Decode,
+            "show_reasoning={show_reasoning}"
+        );
+        assert_eq!(
+            error.reasoning.as_deref(),
+            Some("thinking aloud"),
+            "show_reasoning={show_reasoning}"
+        );
+        assert!(!error.emitted, "show_reasoning={show_reasoning}");
+    }
 }
 
 #[tokio::test]
