@@ -46,7 +46,13 @@ corpus-sync:
     - python3 scripts/ci/corpus-freshness-check.py
     - git config user.name "zoder corpus sync"
     - git config user.email "jperlow@gmail.com"
-    - git add corpus/model_corpus.json pricing/catalog.json bench/overlay.json corpus/freshness.json
+    # freshness-last.json is the BASELINE the coverage-drop gate compares
+    # against on the next run. It must be committed: the job runs on a clean
+    # checkout with `cache: {}`, so an uncommitted baseline never survives and
+    # corpus-freshness-check.py silently skips the relative check entirely
+    # (its `if last_path.exists():` is simply false), leaving only the
+    # absolute floor of 50 scored models.
+    - git add corpus/model_corpus.json pricing/catalog.json bench/overlay.json corpus/freshness.json corpus/freshness-last.json
     - |
       if git diff --cached --quiet; then
         echo "corpus/pricing unchanged -- nothing to commit"
