@@ -1223,14 +1223,33 @@ async fn enrich_with_live_catalog(cfg: &Config, corpus: &mut Corpus) -> Option<E
     // helper degrades cleanly on any Err, so a daemon that returns
     // `method not found` (older zeroclaw without `config/catalog-models`)
     // is handled identically to a missing socket.
-    let rpc = fetch_catalog_models(&socket).await;
-    let outcome = merge_or_degrade(Some(corpus), rpc);
+    let mut outcome = EnrichmentOutcome::default();
+    for provider in cfg
+        .providers
+        .iter()
+        .filter(|provider| provider.engine_provider_ref.is_some())
+    {
+        let current = merge_or_degrade(
+            Some(&mut *corpus),
+            fetch_catalog_models(&socket, provider).await,
+        );
+        outcome.rows += current.rows;
+        outcome.added += current.added;
+        outcome.enriched += current.enriched;
+        outcome.skipped += current.skipped;
+        if let Some(error) = current.error {
+            let message = format!("provider {}: {error}", provider.id);
+            outcome.error = Some(match outcome.error {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+    }
     // The operator can always run with `--verbose` to see enrichment
     // counts; we keep the default output quiet so the change is truly
     // additive (no new lines on a fresh install). The `cfg` arg is
     // reserved for a future "skip when [catalog].disable_enrichment is
     // set" knob.
-    let _ = cfg;
     Some(outcome)
 }
 
