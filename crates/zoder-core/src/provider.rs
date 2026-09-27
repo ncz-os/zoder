@@ -120,6 +120,10 @@ pub struct ProviderError {
     /// frame; `None` for every other path (HTTP headers, OpenAI-style
     /// envelopes, network failures, etc.).
     pub anthropic_error_body: Option<String>,
+    /// Reasoning returned without a final answer. Kept separate so callers
+    /// may diagnose or persist an incomplete response without promoting
+    /// private reasoning to successful answer content.
+    pub reasoning: Option<String>,
 }
 
 impl ProviderError {
@@ -131,6 +135,7 @@ impl ProviderError {
             retry_after: None,
             emitted: false,
             anthropic_error_body: None,
+            reasoning: None,
         }
     }
     /// Transient and safe to retry on the same model (nothing emitted yet).
@@ -264,6 +269,9 @@ pub struct CallTelemetry {
 #[derive(Debug, Clone, Default)]
 pub struct ChatResult {
     pub content: String,
+    /// Provider reasoning, when supplied separately from the final answer.
+    /// This never substitutes for `content` when validating completion.
+    pub reasoning: Option<String>,
     /// Best-effort output token count: real `completion_tokens` from usage when
     /// the backend reports it, otherwise a streamed-chunk count (see
     /// `completion_tokens` for the authoritative value).
@@ -392,9 +400,8 @@ struct CompletionMessage {
 }
 
 impl CompletionChoice {
-    /// True when this choice carries an actual message whose content (or
-    /// any reasoning field, since `show_reasoning = true` is the most
-    /// permissive surface) is non-empty/whitespace-only. Used by the
+    /// True when this choice carries a nonempty final answer. Reasoning is
+    /// retained separately, but cannot substitute for answer content. Used by the
     /// non-streaming path as the analogue of the streaming `saw_choice`
     /// guard so a 2xx body whose choices array contains only `{}`
     /// placeholders surfaces as a `Decode` error rather than a successful
@@ -403,14 +410,9 @@ impl CompletionChoice {
         let Some(msg) = self.message.as_ref() else {
             return false;
         };
-        pick_text(
-            msg.content.clone(),
-            msg.reasoning_content.clone(),
-            msg.reasoning.clone(),
-            /* show_reasoning = */ true,
-        )
-        .chars()
-        .any(|c| !c.is_whitespace())
+        msg.content
+            .as_deref()
+            .is_some_and(|content| content.chars().any(|c| !c.is_whitespace()))
     }
 }
 
@@ -1075,6 +1077,7 @@ impl OpenAiProvider {
                 retry_after: retry_after_header(resp.headers()),
                 emitted: false,
                 anthropic_error_body: None,
+                reasoning: None,
             });
         }
         let body = self.read_limited_body(resp, "models list").await?;
@@ -1386,6 +1389,7 @@ impl OpenAiProvider {
                 retry_after,
                 emitted: false,
                 anthropic_error_body: None,
+                reasoning: None,
             });
         }
         if req.stream {
@@ -1426,7 +1430,7 @@ impl OpenAiProvider {
     /// Non-streaming path: read the whole body and parse the completion object.
     async fn consume_full(
         &self,
-        req: &ChatRequest,
+        _req: &ChatRequest,
         resp: reqwest::Response,
         telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
@@ -1446,8 +1450,7 @@ impl OpenAiProvider {
         })?;
         // Schema-invalid 2xx body guard: a response is not "successful" just
         // because the HTTP layer returned 2xx. We require at least one choice
-        // whose `message` carries parseable content (or, under
-        // `show_reasoning`, a non-empty reasoning field) — mirroring the
+        // whose `message` carries a nonempty final answer — mirroring the
         // streaming path's `saw_choice` check. Without this `{"choices":[{}]}`
         // would parse, `pick_text` would silently return `""`, the call would
         // succeed with no content, and a `--no-stream` / reviewer / health-
@@ -1461,20 +1464,25 @@ impl OpenAiProvider {
             )
         })?;
         if !choice.has_meaningful_message() {
-            return Err(ProviderError::new(
+            let reasoning = choice.message.as_ref().and_then(|msg| {
+                msg.reasoning_content
+                    .clone()
+                    .or_else(|| msg.reasoning.clone())
+            });
+            let mut error = ProviderError::new(
                 ErrKind::Decode,
                 "malformed chat-completion response: empty completion choice/message",
-            ));
+            );
+            error.reasoning = reasoning;
+            return Err(error);
         }
         let msg = choice
             .message
             .expect("has_meaningful_message guarantees Some(_)");
-        let content = pick_text(
-            msg.content,
-            msg.reasoning_content,
-            msg.reasoning,
-            req.show_reasoning,
-        );
+        let content = msg
+            .content
+            .expect("has_meaningful_message guarantees nonempty content");
+        let reasoning = msg.reasoning_content.or(msg.reasoning);
         if content.len() > MAX_CONTENT_BYTES {
             return Err(ProviderError::new(
                 ErrKind::Decode,
@@ -1495,6 +1503,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
             content,
+            reasoning,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -1550,6 +1559,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
             content,
+            reasoning: None,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -1610,6 +1620,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
             content,
+            reasoning: None,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -1663,6 +1674,7 @@ impl OpenAiProvider {
             retry_after: None,
             emitted,
             anthropic_error_body: None,
+            reasoning: None,
         };
         let mut done = false;
         let mut saw_choice = false;
@@ -1914,6 +1926,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(chunk_count);
         Ok(ChatResult {
             content,
+            reasoning: None,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -1988,6 +2001,7 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            reasoning: None,
         };
         let mut done = false;
         let mut saw_text = false;
@@ -2251,6 +2265,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(chunk_count);
         Ok(ChatResult {
             content,
+            reasoning: None,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -2334,6 +2349,7 @@ impl OpenAiProvider {
             retry_after: None,
             emitted,
             anthropic_error_body: None,
+            reasoning: None,
         };
         let mut done = false;
         let mut saw_text = false;
@@ -2575,6 +2591,7 @@ impl OpenAiProvider {
         let tokens_out = completion_tokens.unwrap_or(chunk_count);
         Ok(ChatResult {
             content,
+            reasoning: None,
             tokens_out,
             prompt_tokens,
             completion_tokens,
@@ -2847,6 +2864,7 @@ mod tests {
             retry_after: None,
             emitted: false,
             anthropic_error_body: None,
+            reasoning: None,
         };
         assert!(
             err.retryable(),
@@ -2863,6 +2881,7 @@ mod tests {
             retry_after: None,
             emitted: true,
             anthropic_error_body: None,
+            reasoning: None,
         };
         assert!(
             !err.retryable(),
@@ -3444,14 +3463,14 @@ mod tests {
             "non-empty content is meaningful"
         );
 
-        // A reasoning-only answer also counts (with show_reasoning=true).
+        // Reasoning is not a final answer, regardless of display policy.
         let reasoning_only: CompletionChoice = serde_json::from_value(serde_json::json!({
             "message": {"content": null, "reasoning_content": "thinking aloud"}
         }))
         .unwrap();
         assert!(
-            reasoning_only.has_meaningful_message(),
-            "a non-empty reasoning_content counts as meaningful"
+            !reasoning_only.has_meaningful_message(),
+            "reasoning_content must not substitute for final answer content"
         );
     }
 
