@@ -1,0 +1,46 @@
+{
+  "sources": [
+    {
+      "name": "fetch-vals-swebench.py",
+      "ok": true,
+      "outputs": [
+        "vals-swebench.json"
+      ],
+      "reason": ""
+    },
+    {
+      "name": "fetch-aider-polyglot.py",
+      "ok": true,
+      "outputs": [
+        "aider-polyglot.json"
+      ],
+      "reason": ""
+    },
+    {
+      "name": "fetch-arena.py",
+      "ok": true,
+      "outputs": [
+        "arena-webdev.json",
+        "arena-agent.json"
+      ],
+      "reason": ""
+    },
+    {
+      "name": "fetch-scale.py",
+      "ok": true,
+      "outputs": [
+        "scale-seal.json"
+      ],
+      "reason": ""
+    },
+    {
+      "name": "fetch-terminal-bench.py",
+      "ok": false,
+      "outputs": [
+        "terminal-bench.json"
+      ],
+      "reason": "terminal-bench: no scored rows found \u2014 format changed?"
+    }
+  ],
+  "ts": "2026-09-27T04:42:53Z"
+}
