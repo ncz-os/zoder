@@ -80,7 +80,214 @@ pub struct ModelEntry {
     pub workflows: Option<Workflows>,
 }
 
+#[cfg(test)]
+mod ingest_free_chat_tests {
+    use super::*;
+
+    fn scored(id: &str, agentic_score: f64, w_swe: f64) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            agentic_score: Some(agentic_score),
+            w_swe: Some(w_swe),
+            capability: Some(Capability {
+                swe_verified: Some(BenchScore {
+                    acc: Some(w_swe * 100.0),
+                    source: "test".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            workflows: Some(Workflows {
+                single_pass: Some(agentic_score),
+                grind: Some(w_swe),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bare_served_id_inherits_prefixed_quality() {
+        let mut corpus = Corpus {
+            models: vec![scored("minimax/MiniMax-M3:nitro", 0.647, 0.875)],
+            ..Default::default()
+        };
+
+        assert_eq!(corpus.ingest_free_chat(&["MiniMax-M3:free".into()]), 1);
+        let served = corpus.get("MiniMax-M3:free").unwrap();
+        assert_eq!(served.agentic_score, Some(0.647));
+        assert_eq!(served.w_swe, Some(0.875));
+        assert_eq!(served.code_capability(), Some(87.5));
+        assert_eq!(served.workflows.as_ref().unwrap().grind, Some(0.875));
+    }
+
+    #[test]
+    fn normalized_match_has_no_substring_bleed() {
+        let mut corpus = Corpus {
+            models: vec![scored("minimax/minimax-m2.7", 0.670, 0.869)],
+            ..Default::default()
+        };
+
+        corpus.ingest_free_chat(&["minimax-m2".into()]);
+        let served = corpus.get("minimax-m2").unwrap();
+        assert_eq!(served.agentic_score, Some(0.5));
+        assert_eq!(served.w_swe, None);
+        assert!(served.capability.is_none());
+    }
+
+    #[test]
+    fn quality_inheritance_never_inherits_billing_and_paid_rows_stay_skipped() {
+        let mut paid_twin = scored("vendor/model-x", 0.8, 0.9);
+        paid_twin.free = false;
+        paid_twin.paid = true;
+        paid_twin.route_candidate = false;
+        paid_twin.gated_reason = Some("paid feed row".into());
+        paid_twin.economics = Some(Economics {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 2.0,
+            source: "paid-feed".into(),
+            ..Default::default()
+        });
+        let directly_paid = ModelEntry {
+            id: "already-paid".into(),
+            paid: true,
+            economics: paid_twin.economics.clone(),
+            kind: "chat".into(),
+            ..Default::default()
+        };
+        let mut corpus = Corpus {
+            models: vec![paid_twin, directly_paid],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            corpus.ingest_free_chat(&["model-x".into(), "already-paid".into()]),
+            1
+        );
+        let served = corpus.get("model-x").unwrap();
+        assert_eq!(served.agentic_score, Some(0.8));
+        assert!(served.free && served.route_candidate && !served.paid);
+        assert!(served.economics.is_none());
+        assert!(served.gated_reason.is_none());
+
+        let skipped = corpus.get("already-paid").unwrap();
+        assert!(skipped.paid && !skipped.free && !skipped.route_candidate);
+        assert!(skipped.economics.is_some());
+    }
+
+    #[test]
+    fn unmatched_model_keeps_unbenched_prior() {
+        let mut corpus = Corpus::default();
+        corpus.ingest_free_chat(&["brand-new-model".into()]);
+        assert_eq!(
+            corpus.get("brand-new-model").unwrap().agentic_score,
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn inherited_scores_fix_minimax_fallback_order() {
+        let scores = [
+            ("MiniMax-M3", 0.647, 0.875),
+            ("MiniMax-M2.7", 0.670, 0.869),
+            ("MiniMax-M2", 0.328, 0.664),
+            ("MiniMax-M2.1", 0.30, 0.60),
+            ("MiniMax-M2.1-highspeed", 0.29, 0.59),
+            ("MiniMax-M2.5", 0.31, 0.61),
+            ("MiniMax-M2.5-highspeed", 0.28, 0.58),
+            ("MiniMax-M1", 0.20, 0.50),
+        ];
+        let mut corpus = Corpus {
+            models: scores
+                .iter()
+                .map(|(id, score, swe)| scored(&format!("minimax/{id}"), *score, *swe))
+                .collect(),
+            ..Default::default()
+        };
+        let served_ids: Vec<String> = scores.iter().map(|(id, _, _)| (*id).into()).collect();
+        corpus.ingest_free_chat(&served_ids);
+
+        let mut ranked: Vec<&ModelEntry> = corpus.free_chat().collect();
+        ranked.sort_by(|a, b| {
+            b.agentic_score
+                .partial_cmp(&a.agentic_score)
+                .unwrap()
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let fallback_cap: Vec<&str> = ranked.iter().take(4).map(|m| m.id.as_str()).collect();
+        assert_eq!(fallback_cap[0..2], ["MiniMax-M2.7", "MiniMax-M3"]);
+        let m2_position = ranked.iter().position(|m| m.id == "MiniMax-M2").unwrap();
+        assert!(ranked.iter().position(|m| m.id == "MiniMax-M3").unwrap() < m2_position);
+        assert!(ranked.iter().position(|m| m.id == "MiniMax-M2.7").unwrap() < m2_position);
+    }
+
+    #[test]
+    fn update_path_replaces_unbenched_prior_with_inherited_quality() {
+        let mut existing = ModelEntry::from_served_id("MiniMax-M3");
+        existing.agentic_score = Some(0.5);
+        let mut corpus = Corpus {
+            models: vec![existing, scored("minimax/MiniMax-M3", 0.647, 0.875)],
+            ..Default::default()
+        };
+
+        corpus.ingest_free_chat(&["MiniMax-M3".into()]);
+        assert_eq!(corpus.get("MiniMax-M3").unwrap().agentic_score, Some(0.647));
+    }
+
+    #[test]
+    fn duplicate_quality_rows_choose_highest_w_swe_deterministically() {
+        let mut corpus = Corpus {
+            models: vec![
+                scored("z_feed/model-x", 0.9, 0.7),
+                scored("a_feed/model-x", 0.6, 0.8),
+            ],
+            ..Default::default()
+        };
+
+        corpus.ingest_free_chat(&["model-x".into()]);
+        let served = corpus.get("model-x").unwrap();
+        assert_eq!(served.w_swe, Some(0.8));
+        assert_eq!(served.agentic_score, Some(0.6));
+    }
+}
+
 impl ModelEntry {
+    /// Provider catalogs often expose a bare id while public feeds namespace
+    /// the same model. Match only the final path component, case-insensitively,
+    /// and discard a provider variant suffix such as `:free` or `:nitro`.
+    fn normalized_model_key(id: &str) -> String {
+        let leaf = id.rsplit('/').next().unwrap_or(id);
+        leaf.split_once(':')
+            .map_or(leaf, |(base, _)| base)
+            .to_ascii_lowercase()
+    }
+
+    fn has_quality_signal(&self) -> bool {
+        self.agentic_score.is_some()
+            || self.w_swe.is_some()
+            || self.code_capability().is_some()
+            || self.workflows.is_some()
+    }
+
+    /// Copy model quality only. In particular, provider classification and
+    /// billing fields must remain properties of the served row.
+    fn inherit_quality_from(&mut self, source: &Self) {
+        self.arena_overall_elo = source.arena_overall_elo;
+        self.arena_coding_elo = source.arena_coding_elo;
+        self.arena_webdev_elo = source.arena_webdev_elo;
+        self.w_overall = source.w_overall;
+        self.w_coding = source.w_coding;
+        self.w_swe = source.w_swe;
+        self.ttft_ms_p50 = source.ttft_ms_p50;
+        self.tok_per_s_p50 = source.tok_per_s_p50;
+        self.total_ms_p50 = source.total_ms_p50;
+        self.latency_score = source.latency_score;
+        self.latency_class = source.latency_class.clone();
+        self.agentic_score = source.agentic_score;
+        self.capability = source.capability.clone();
+        self.preference = source.preference.clone();
+        self.workflows = source.workflows.clone();
+    }
+
     /// SWE capability ELO, preferring the text-coding arena then webdev.
     pub fn swe_elo(&self) -> Option<f64> {
         self.arena_coding_elo.or(self.arena_webdev_elo)
@@ -638,15 +845,39 @@ impl Corpus {
     /// mistralai/*` open-weight NIMs) is upserted as a free, routable chat
     /// candidate. Existing entries keep all benchmark/capability/latency scores
     /// — only the free/route flags are (re)asserted, so re-running a refresh is
-    /// idempotent and never loses bench data. A new (unbenched) entry gets a
-    /// neutral agentic prior so it is selectable as a fallback until the corpus
-    /// builder benches it; a benched entry's real score always wins (the prior
-    /// is only set when no capability/agentic signal exists). Returns the number
-    /// of entries newly promoted into the routing pool.
+    /// idempotent and never loses bench data. A served id inherits quality from
+    /// an exact normalized match in another namespace; only a genuinely
+    /// unbenched id gets the neutral prior. Returns the number of entries newly
+    /// promoted into the routing pool.
     pub fn ingest_free_chat(&mut self, ids: &[String]) -> usize {
         const UNBENCHED_PRIOR: f64 = 0.5;
         let mut promoted = 0usize;
         for id in ids {
+            let key = ModelEntry::normalized_model_key(id);
+            // Multiple feeds can describe the same leaf id. Highest `w_swe`
+            // wins because it is the routing-relevant quality signal; id ASC
+            // is the deterministic tie-breaker so Vec/map ingestion order can
+            // never change which quality row is inherited. Missing `w_swe`
+            // sorts below a measured value.
+            let quality_source = self
+                .models
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != *id
+                        && candidate.has_quality_signal()
+                        && ModelEntry::normalized_model_key(&candidate.id) == key
+                })
+                .min_by(|a, b| {
+                    match (a.w_swe, b.w_swe) {
+                        (Some(a_score), Some(b_score)) => b_score.total_cmp(&a_score),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                    .then_with(|| a.id.cmp(&b.id))
+                })
+                .cloned();
+
             if let Some(m) = self.models.iter_mut().find(|m| &m.id == id) {
                 // Never silently flip a model the corpus already classifies as
                 // paid (or with nonzero per-token economics) into free — an
@@ -665,8 +896,14 @@ impl Corpus {
                 m.route_candidate = true;
                 m.kind = "chat".into();
                 m.gated_reason = None;
-                if m.agentic_score.is_none() && m.code_capability().is_none() {
-                    m.agentic_score = Some(UNBENCHED_PRIOR);
+                let has_only_prior = m.code_capability().is_none()
+                    && (m.agentic_score.is_none() || m.agentic_score == Some(UNBENCHED_PRIOR));
+                if has_only_prior {
+                    if let Some(source) = &quality_source {
+                        m.inherit_quality_from(source);
+                    } else if m.agentic_score.is_none() {
+                        m.agentic_score = Some(UNBENCHED_PRIOR);
+                    }
                 }
                 if !was_routable {
                     promoted += 1;
@@ -678,7 +915,11 @@ impl Corpus {
                 e.route_candidate = true;
                 e.kind = "chat".into();
                 e.gated_reason = None;
-                e.agentic_score = Some(UNBENCHED_PRIOR);
+                if let Some(source) = &quality_source {
+                    e.inherit_quality_from(source);
+                } else {
+                    e.agentic_score = Some(UNBENCHED_PRIOR);
+                }
                 self.models.push(e);
                 promoted += 1;
             }
