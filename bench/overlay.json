@@ -58,7 +58,7 @@
   "preference": {
    "arena_agent": {
     "rank": 20,
-    "score": 0.0302,
+    "score": 0.031,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -71,13 +71,13 @@
   "w_swe": 0.975
  },
  "claude-fable-5-1": {
-  "agentic_score": 0.992,
+  "agentic_score": 0.99,
   "arena_coding_elo": 1751.5,
   "arena_webdev_elo": 1751.5,
   "preference": {
    "arena_agent": {
     "rank": 1,
-    "score": 0.1751,
+    "score": 0.1737,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -217,7 +217,7 @@
   "preference": {
    "arena_agent": {
     "rank": 18,
-    "score": 0.04,
+    "score": 0.0385,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -230,7 +230,7 @@
   "w_swe": 0.943
  },
  "claude-opus-5": {
-  "agentic_score": 0.935,
+  "agentic_score": 0.934,
   "arena_coding_elo": 1692.5,
   "arena_webdev_elo": 1692.5,
   "capability": {
@@ -243,8 +243,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 7,
-    "score": 0.1044,
+    "rank": 6,
+    "score": 0.1018,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -257,13 +257,13 @@
   "w_swe": 0.994
  },
  "claude-opus-5-5": {
-  "agentic_score": 0.96,
+  "agentic_score": 0.972,
   "arena_coding_elo": 1826.7,
   "arena_webdev_elo": 1826.7,
   "preference": {
    "arena_agent": {
     "rank": 2,
-    "score": 0.155,
+    "score": 0.1625,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -331,7 +331,7 @@
   "w_swe": 0.887
  },
  "claude-sonnet-5": {
-  "agentic_score": 0.704,
+  "agentic_score": 0.705,
   "arena_coding_elo": 1538.9,
   "arena_webdev_elo": 1538.9,
   "capability": {
@@ -345,7 +345,7 @@
   "preference": {
    "arena_agent": {
     "rank": 23,
-    "score": 0.0072,
+    "score": 0.0079,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -491,12 +491,12 @@
   "w_swe": 0.838
  },
  "deepseek-v4": {
-  "agentic_score": 0.625,
+  "agentic_score": 0.602,
   "arena_coding_elo": 1582.0,
   "arena_webdev_elo": 1582.0,
   "capability": {
    "scale_seal": {
-    "acc": 27.15,
+    "acc": 27.05,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -508,8 +508,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 17,
-    "score": 0.04,
+    "rank": 26,
+    "score": -0.0128,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -522,13 +522,13 @@
   "w_swe": 0.902
  },
  "deepseek-v4-1-flash": {
-  "agentic_score": 0.817,
+  "agentic_score": 0.812,
   "arena_coding_elo": 1620.7,
   "arena_webdev_elo": 1620.7,
   "preference": {
    "arena_agent": {
     "rank": 4,
-    "score": 0.1241,
+    "score": 0.1208,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -609,14 +609,14 @@
   "w_swe": 0.778
  },
  "fable-5-1": {
-  "agentic_score": 0.635,
+  "agentic_score": 0.67,
   "capability": {
    "scale_seal": {
-    "acc": 63.5,
+    "acc": 67.04,
     "source": "scale-seal"
    }
   },
-  "w_swe": 0.818
+  "w_swe": 0.835
  },
  "gemini": {
   "agentic_score": 0.382,
@@ -779,8 +779,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 35,
-    "score": -0.0771,
+    "rank": 37,
+    "score": -0.0796,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -873,7 +873,7 @@
   "preference": {
    "arena_agent": {
     "rank": 36,
-    "score": -0.0772,
+    "score": -0.0758,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -886,7 +886,7 @@
   "w_swe": 0.898
  },
  "gemini-3-7-flash": {
-  "agentic_score": 0.731,
+  "agentic_score": 0.732,
   "arena_coding_elo": 1593.3,
   "arena_webdev_elo": 1593.3,
   "capability": {
@@ -900,7 +900,7 @@
   "preference": {
    "arena_agent": {
     "rank": 24,
-    "score": 0.001,
+    "score": 0.0027,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -913,12 +913,12 @@
   "w_swe": 0.911
  },
  "gemini-3-8-flash": {
-  "agentic_score": 0.671,
+  "agentic_score": 0.672,
   "arena_coding_elo": 1580.0,
   "arena_webdev_elo": 1580.0,
   "capability": {
    "scale_seal": {
-    "acc": 48.5,
+    "acc": 49.23,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -930,8 +930,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 8,
-    "score": 0.0957,
+    "rank": 7,
+    "score": 0.093,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1093,12 +1093,12 @@
   "w_swe": 0.882
  },
  "glm-5-2": {
-  "agentic_score": 0.643,
+  "agentic_score": 0.636,
   "arena_coding_elo": 1602.4,
   "arena_webdev_elo": 1602.4,
   "capability": {
    "scale_seal": {
-    "acc": 43.99,
+    "acc": 41.93,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1111,7 +1111,7 @@
   "preference": {
    "arena_agent": {
     "rank": 19,
-    "score": 0.0391,
+    "score": 0.0378,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1124,7 +1124,7 @@
   "w_swe": 0.919
  },
  "glm-5-3": {
-  "agentic_score": 0.872,
+  "agentic_score": 0.87,
   "arena_coding_elo": 1619.1,
   "arena_webdev_elo": 1619.1,
   "capability": {
@@ -1138,7 +1138,7 @@
   "preference": {
    "arena_agent": {
     "rank": 14,
-    "score": 0.0633,
+    "score": 0.0599,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1151,7 +1151,7 @@
   "w_swe": 0.977
  },
  "glm-5-3-flash": {
-  "agentic_score": 0.85,
+  "agentic_score": 0.849,
   "arena_coding_elo": 1613.2,
   "arena_webdev_elo": 1613.2,
   "capability": {
@@ -1165,7 +1165,7 @@
   "preference": {
    "arena_agent": {
     "rank": 13,
-    "score": 0.0684,
+    "score": 0.0664,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1351,12 +1351,12 @@
   "w_swe": 0.845
  },
  "gpt-5-3": {
-  "agentic_score": 0.561,
+  "agentic_score": 0.571,
   "arena_coding_elo": 1408.0,
   "arena_webdev_elo": 1408.0,
   "capability": {
    "scale_seal": {
-    "acc": 37.99,
+    "acc": 40.68,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1374,7 +1374,7 @@
     "votes": 2643
    }
   },
-  "w_swe": 0.79
+  "w_swe": 0.797
  },
  "gpt-5-4": {
   "agentic_score": 0.441,
@@ -1388,8 +1388,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 29,
-    "score": -0.0343,
+    "rank": 30,
+    "score": -0.035,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1438,12 +1438,12 @@
   "w_swe": 0.849
  },
  "gpt-5-5": {
-  "agentic_score": 0.588,
+  "agentic_score": 0.582,
   "arena_coding_elo": 1512.2,
   "arena_webdev_elo": 1512.2,
   "capability": {
    "scale_seal": {
-    "acc": 45.43,
+    "acc": 43.69,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1455,8 +1455,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 27,
-    "score": -0.0231,
+    "rank": 28,
+    "score": -0.0261,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1494,8 +1494,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 31,
-    "score": -0.042,
+    "rank": 33,
+    "score": -0.046,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1508,12 +1508,12 @@
   "w_swe": 0.965
  },
  "gpt-5-6-sol": {
-  "agentic_score": 0.694,
+  "agentic_score": 0.695,
   "arena_coding_elo": 1617.4,
   "arena_webdev_elo": 1617.4,
   "capability": {
    "scale_seal": {
-    "acc": 46.0,
+    "acc": 45.9,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1526,7 +1526,7 @@
   "preference": {
    "arena_agent": {
     "rank": 21,
-    "score": 0.0292,
+    "score": 0.0309,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1552,8 +1552,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 34,
-    "score": -0.0616,
+    "rank": 35,
+    "score": -0.0636,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1578,19 +1578,19 @@
   "w_swe": 0.804
  },
  "gpt-6-astra": {
-  "agentic_score": 0.706,
+  "agentic_score": 0.677,
   "arena_coding_elo": 1791.7,
   "arena_webdev_elo": 1791.7,
   "capability": {
    "scale_seal": {
-    "acc": 59.14,
+    "acc": 54.89,
     "source": "scale-seal"
    }
   },
   "preference": {
    "arena_agent": {
     "rank": 3,
-    "score": 0.1293,
+    "score": 0.1268,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1603,10 +1603,15 @@
   "w_swe": 1.0
  },
  "gpt-6-luna": {
-  "agentic_score": 0.821,
+  "agentic_score": 0.66,
   "arena_coding_elo": 1592.6,
   "arena_webdev_elo": 1592.6,
   "preference": {
+   "arena_agent": {
+    "rank": 17,
+    "score": 0.0463,
+    "source": "arena.ai"
+   },
    "arena_webdev": {
     "rank": 24,
     "rating": 1592.6,
@@ -1617,13 +1622,13 @@
   "w_swe": 0.91
  },
  "gpt-6-sol": {
-  "agentic_score": 0.883,
+  "agentic_score": 0.864,
   "arena_coding_elo": 1681.0,
   "arena_webdev_elo": 1681.0,
   "preference": {
    "arena_agent": {
     "rank": 5,
-    "score": 0.1204,
+    "score": 0.1084,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1793,7 +1798,7 @@
   "preference": {
    "arena_agent": {
     "rank": 25,
-    "score": -0.0092,
+    "score": -0.0107,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1819,8 +1824,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 28,
-    "score": -0.0324,
+    "rank": 29,
+    "score": -0.0332,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1833,13 +1838,13 @@
   "w_swe": 0.978
  },
  "grok-4-7": {
-  "agentic_score": 0.797,
+  "agentic_score": 0.773,
   "arena_coding_elo": 1629.3,
   "arena_webdev_elo": 1629.3,
   "preference": {
    "arena_agent": {
-    "rank": 6,
-    "score": 0.1054,
+    "rank": 9,
+    "score": 0.0899,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1907,8 +1912,8 @@
   "arena_webdev_elo": 1509.1,
   "preference": {
    "arena_agent": {
-    "rank": 39,
-    "score": -0.1094,
+    "rank": 41,
+    "score": -0.113,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1921,13 +1926,13 @@
   "w_swe": 0.841
  },
  "hy4": {
-  "agentic_score": 0.753,
+  "agentic_score": 0.751,
   "arena_coding_elo": 1630.6,
   "arena_webdev_elo": 1630.6,
   "preference": {
    "arena_agent": {
     "rank": 11,
-    "score": 0.0765,
+    "score": 0.0753,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1953,8 +1958,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 44,
-    "score": -0.2163,
+    "rank": 45,
+    "score": -0.2189,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1980,8 +1985,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 43,
-    "score": -0.2134,
+    "rank": 44,
+    "score": -0.2126,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2119,7 +2124,7 @@
   "w_swe": 0.891
  },
  "kimi-k3": {
-  "agentic_score": 0.893,
+  "agentic_score": 0.891,
   "arena_coding_elo": 1659.9,
   "arena_webdev_elo": 1659.9,
   "capability": {
@@ -2132,8 +2137,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 9,
-    "score": 0.095,
+    "rank": 8,
+    "score": 0.0918,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2255,7 +2260,7 @@
   "preference": {
    "arena_agent": {
     "rank": 40,
-    "score": -0.1098,
+    "score": -0.1112,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2393,8 +2398,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 41,
-    "score": -0.1427,
+    "rank": 42,
+    "score": -0.1428,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2446,8 +2451,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 42,
-    "score": -0.1584,
+    "rank": 43,
+    "score": -0.1636,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2474,10 +2479,10 @@
   "w_swe": 0.713
  },
  "muse-spark": {
-  "agentic_score": 0.51,
+  "agentic_score": 0.528,
   "capability": {
    "scale_seal": {
-    "acc": 27.66,
+    "acc": 31.11,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -2487,15 +2492,15 @@
     "source": "vals.ai"
    }
   },
-  "w_swe": 0.755
+  "w_swe": 0.764
  },
  "muse-spark-1-1": {
-  "agentic_score": 0.586,
+  "agentic_score": 0.585,
   "arena_coding_elo": 1541.4,
   "arena_webdev_elo": 1541.4,
   "capability": {
    "scale_seal": {
-    "acc": 41.84,
+    "acc": 41.48,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -2507,8 +2512,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 26,
-    "score": -0.0204,
+    "rank": 27,
+    "score": -0.0198,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2534,8 +2539,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 33,
-    "score": -0.0483,
+    "rank": 34,
+    "score": -0.0538,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2548,13 +2553,13 @@
   "w_swe": 0.933
  },
  "muse-spark-1-3": {
-  "agentic_score": 0.793,
+  "agentic_score": 0.794,
   "arena_coding_elo": 1655.5,
   "arena_webdev_elo": 1655.5,
   "preference": {
    "arena_agent": {
     "rank": 10,
-    "score": 0.0832,
+    "score": 0.0835,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2687,24 +2692,24 @@
   "w_swe": 0.743
  },
  "opus-4-8": {
-  "agentic_score": 0.534,
+  "agentic_score": 0.496,
   "capability": {
    "scale_seal": {
-    "acc": 53.45,
+    "acc": 49.63,
     "source": "scale-seal"
    }
   },
-  "w_swe": 0.767
+  "w_swe": 0.748
  },
  "opus-5": {
-  "agentic_score": 0.632,
+  "agentic_score": 0.622,
   "capability": {
    "scale_seal": {
-    "acc": 63.17,
+    "acc": 62.22,
     "source": "scale-seal"
    }
   },
-  "w_swe": 0.816
+  "w_swe": 0.811
  },
  "quasar-alpha": {
   "agentic_score": 0.547,
@@ -2718,15 +2723,15 @@
   "w_swe": 0.774
  },
  "qwen-3-8-27b": {
-  "agentic_score": 0.147,
+  "agentic_score": 0.136,
   "preference": {
    "arena_agent": {
     "rank": 22,
-    "score": 0.0265,
+    "score": 0.0244,
     "source": "arena.ai"
    }
   },
-  "w_swe": 0.574
+  "w_swe": 0.568
  },
  "qwen-max-2025-01-25": {
   "agentic_score": 0.218,
@@ -2932,8 +2937,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 37,
-    "score": -0.0897,
+    "rank": 38,
+    "score": -0.0918,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2949,15 +2954,15 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 38,
-    "score": -0.0935,
+    "rank": 39,
+    "score": -0.0947,
     "source": "arena.ai"
    }
   },
   "w_swe": 0.5
  },
  "qwen3-8": {
-  "agentic_score": 0.824,
+  "agentic_score": 0.823,
   "arena_coding_elo": 1671.5,
   "arena_webdev_elo": 1671.5,
   "capability": {
@@ -2971,7 +2976,7 @@
   "preference": {
    "arena_agent": {
     "rank": 16,
-    "score": 0.0523,
+    "score": 0.0519,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3006,13 +3011,13 @@
   "w_swe": 0.93
  },
  "qwen3-8-flash-next": {
-  "agentic_score": 0.732,
+  "agentic_score": 0.725,
   "arena_coding_elo": 1635.7,
   "arena_webdev_elo": 1635.7,
   "preference": {
    "arena_agent": {
     "rank": 15,
-    "score": 0.0591,
+    "score": 0.0552,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3078,8 +3083,8 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 45,
-    "score": -0.2306,
+    "rank": 46,
+    "score": -0.2315,
     "source": "arena.ai"
    }
   },
