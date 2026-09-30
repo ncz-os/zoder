@@ -546,7 +546,7 @@ pub enum ApprovalPolicy {
 ///
 /// Construction contract (used by tests AND by `zoder-cli`):
 ///   * `provider_id` — the zoder `Provider::id` (e.g. `"minimax"`,
-///     `"nvidia-eih"`, `"openrouter"`). Echoed in logs / surfaces.
+///     `"enterprise-gateway"`, `"openrouter"`). Echoed in logs / surfaces.
 ///   * `kind` — zoder's `Provider::kind` (`openai-chat` |
 ///     `openai-responses` | `anthropic` | `custom`); used to derive
 ///     `GOOSE_PROVIDER` (the value goose keys on) and to decide
@@ -6791,11 +6791,11 @@ mod tests {
         // ambient env. The existing `goose_env_provider_defaults_to_openai`
         // test covers the "no provider set, no override" default.
         let mut opts = goose_opts(None);
-        opts.model_id = Some("nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string());
+        opts.model_id = Some("enterprise/review-model".to_string());
         opts.goose_provider = Some(gpe(
             "openai-chat",
-            "https://integrate.api.nvidia.com/v1",
-            Some("nvapi-test"),
+            "https://gateway.example.invalid/v1",
+            Some("dummy-enterprise-key"),
         ));
         // `provider_override = None` exercises the real production
         // resolution path (which would normally consult $GOOSE_PROVIDER).
@@ -6807,7 +6807,7 @@ mod tests {
         );
         assert_eq!(
             env_get(&env, "GOOSE_MODEL"),
-            "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+            "enterprise/review-model",
             "GOOSE_MODEL = routed model id, NOT the agent alias"
         );
     }

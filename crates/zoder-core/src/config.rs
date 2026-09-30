@@ -338,9 +338,9 @@ pub struct Provider {
     /// (`Config::provider_for_model`). A routed model id is sent to the FIRST
     /// provider whose `serves` prefix it matches, instead of always going to
     /// `default_provider`. This lets one fallback chain span providers — e.g.
-    /// `MiniMax-M3` -> the `minimax` provider, `nvidia/*` -> the `nvidia-eih`
-    /// provider — in a single `zoder exec`. Empty (the default) means this
-    /// provider claims no models by prefix and is only reached as the
+    /// `MiniMax-M3` -> the `minimax` provider, `enterprise/*` -> an
+    /// Enterprise LLM Gateway provider — in a single `zoder exec`. Empty
+    /// (the default) means this provider claims no models by prefix and is only reached as the
     /// `default_provider`. Prefixes are matched with `str::starts_with`.
     #[serde(default)]
     pub serves: Vec<String>,
@@ -495,6 +495,7 @@ struct EngineAgentModel {
 #[derive(Debug, Clone, Default)]
 struct EngineProviderModel {
     model: String,
+    chat_template_kwargs: Option<serde_json::Value>,
     kind: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
@@ -683,6 +684,31 @@ impl EngineModelRegistry {
                 .and_then(|provider| self.models.get(provider))
                 .map(|provider| provider.model.as_str())
         })
+    }
+
+    /// Return the chat-template options attached to the engine profile that
+    /// serves this model. The reviewer alias wins when several profiles serve
+    /// the same checkpoint; an explicit selected agent wins over that alias.
+    /// These options are read-only and contain no auth material.
+    pub fn chat_template_kwargs_for_model(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+    ) -> Option<&serde_json::Value> {
+        for alias in agent_alias.into_iter().chain(std::iter::once("reviewer")) {
+            if let Some(profile) = self
+                .model_provider_ref_for_agent(alias)
+                .and_then(|reference| self.models.get(reference))
+            {
+                if profile.model == model && profile.chat_template_kwargs.is_some() {
+                    return profile.chat_template_kwargs.as_ref();
+                }
+            }
+        }
+        self.models
+            .values()
+            .find(|profile| profile.model == model && profile.chat_template_kwargs.is_some())
+            .and_then(|profile| profile.chat_template_kwargs.as_ref())
     }
 
     /// Return the exact provider-profile reference configured on an agent,
@@ -1398,7 +1424,6 @@ fn fixed_engine_provider_endpoint(family: &str) -> Option<&'static str> {
         "deepmyst" => "https://api.deepmyst.com/v1",
         "venice" => "https://api.venice.ai",
         "nearai" => "https://cloud-api.near.ai/v1",
-        "nvidia" => "https://integrate.api.nvidia.com/v1",
         "atomic_chat" => "http://127.0.0.1:1337/v1",
         "xai" => "https://api.x.ai/v1",
         "lmstudio" => "http://localhost:1234/v1",
@@ -1428,6 +1453,10 @@ fn collect_engine_models(
                 alias.clone(),
                 EngineProviderModel {
                     model: model.to_owned(),
+                    chat_template_kwargs: child
+                        .get("chat_template_kwargs")
+                        .and_then(|value| serde_json::to_value(value).ok())
+                        .filter(serde_json::Value::is_object),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1492,6 +1521,10 @@ fn collect_engine_models_json(
                 alias.clone(),
                 EngineProviderModel {
                     model: model.to_owned(),
+                    chat_template_kwargs: child
+                        .get("chat_template_kwargs")
+                        .filter(|value| value.is_object())
+                        .cloned(),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -3602,6 +3635,31 @@ fn collect_overlays(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_template_kwargs_come_from_selected_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "model-a"
+chat_template_kwargs = { enable_thinking = true }
+[providers.models.custom.reviewer]
+model = "model-a"
+chat_template_kwargs = { enable_thinking = false }
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.chat_template_kwargs_for_model("model-a", None),
+            Some(&serde_json::json!({"enable_thinking": false}))
+        );
+        assert_eq!(
+            registry.chat_template_kwargs_for_model("different", None),
+            None
+        );
+    }
     use crate::ledger::Entry;
     use crate::subscription_tiers::TierCatalog;
     use chrono::{Duration, Utc};
@@ -4034,35 +4092,30 @@ model_provider = "custom.primary"
             azure_api_version: None,
         });
         cfg.providers.push(Provider {
-            id: "nvidia-eih".into(),
+            id: "enterprise-gateway".into(),
             engine_provider_ref: None,
-            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            base_url: "https://gateway.example.invalid/v1".into(),
             kind: "openai-chat".into(),
             auth: Auth::None,
             paid: false,
             billing: BillingMode::Free,
             subscription: None,
-            serves: vec![
-                "nvidia/".into(),
-                "deepseek-ai/".into(),
-                "meta/llama-".into(),
-                "mistralai/".into(),
-            ],
+            serves: vec!["enterprise/".into()],
             azure_api_version: None,
         });
         // Prefix match wins, in config order.
         assert_eq!(cfg.provider_for_model("MiniMax-M3").unwrap().id, "minimax");
         assert_eq!(
-            cfg.provider_for_model("nvidia/llama-3.3-nemotron-super-49b-v1.5")
+            cfg.provider_for_model("enterprise/review-model")
                 .unwrap()
                 .id,
-            "nvidia-eih"
+            "enterprise-gateway"
         );
         assert_eq!(
-            cfg.provider_for_model("deepseek-ai/deepseek-r1")
+            cfg.provider_for_model("enterprise/assistant-model")
                 .unwrap()
                 .id,
-            "nvidia-eih"
+            "enterprise-gateway"
         );
         // No prefix claims it -> returns None (not default_provider).
         assert!(
