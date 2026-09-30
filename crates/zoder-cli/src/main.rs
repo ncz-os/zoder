@@ -1378,6 +1378,11 @@ mod provider_route_corpus_tests {
         assert!(route.get(model_id).unwrap().routable());
         assert!(public.get(model_id).is_none());
         assert_eq!(route.count, 1);
+        let gate = PolicyGate::new(&cfg, false, true);
+        assert!(matches!(
+            gate.check(route.get(model_id).unwrap(), false, true),
+            Decision::Allow
+        ));
 
         cfg.providers[0].serves = vec!["private/".into()];
         assert!(provider_route_corpus(&cfg, &public).is_err());
@@ -5292,13 +5297,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
 
     // Paid/free pre-checks for the primary (the router-built chain is all free;
-    // an explicit model may be paid and needs confirmation here). An explicit
-    // model absent from the corpus cannot be proven free, so it is treated as
-    // unverified (default-deny): refuse under --require-free, otherwise require
-    // the paid confirmation. This preserves the fail-closed posture instead of
-    // silently calling an unknown (possibly paid) model.
+    // an explicit model may be paid and needs confirmation here). Use the
+    // provider-scoped routing view so exact private entitlements can qualify;
+    // an unknown model without such an entitlement remains default-deny.
     let primary_entry = eng
-        .corpus
+        .route_corpus
         .get(&primary)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
@@ -5405,7 +5408,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     for (i, model_id) in chain.iter().enumerate() {
         // Respect the free guard for every link, not just the primary.
-        if let Some(entry) = eng.corpus.get(model_id) {
+        if let Some(entry) = eng.route_corpus.get(model_id) {
             if cli.require_free && !entry.free {
                 continue;
             }
@@ -5457,15 +5460,17 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 .provider(&pid)
                 .map(|p| !p.paid && p.billing != BillingMode::Metered)
                 .unwrap_or(false);
-            let link_entry = eng
-                .corpus
-                .get(model_id)
-                .cloned()
-                .unwrap_or_else(|| ModelEntry {
-                    id: model_id.clone(),
-                    gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
-                    ..Default::default()
-                });
+            let link_entry =
+                eng.route_corpus
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or_else(|| ModelEntry {
+                        id: model_id.clone(),
+                        gated_reason: Some(
+                            "unknown model: not in corpus, cannot verify free".into(),
+                        ),
+                        ..Default::default()
+                    });
             if let Decision::NeedConfirm(_) =
                 gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
             {
@@ -5575,8 +5580,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         anyhow::bail!("{msg}");
     };
 
-    let known_paid_model = eng.corpus.get(&used_model).is_some_and(|model| !model.free);
-    let entry = eng.corpus.get(&used_model).cloned().unwrap_or_default();
+    let known_paid_model = eng
+        .route_corpus
+        .get(&used_model)
+        .is_some_and(|model| !model.free);
+    let entry = eng
+        .route_corpus
+        .get(&used_model)
+        .cloned()
+        .unwrap_or_default();
 
     // C1: the anti-paid-fallback guard governs accounting + exit. Record the
     // winning model's health exactly once here: a verified call is a success,
@@ -8307,7 +8319,7 @@ pub(crate) async fn agentic_turn(
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let primary_entry = eng
-        .corpus
+        .route_corpus
         .get(&primary)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
@@ -8724,7 +8736,7 @@ pub(crate) async fn agentic_turn(
             .map(is_cost_neutral_provider)
             .unwrap_or(provider_cost_neutral);
         let link_entry = eng
-            .corpus
+            .route_corpus
             .get(&model)
             .cloned()
             .unwrap_or_else(|| ModelEntry {
@@ -8944,7 +8956,7 @@ pub(crate) async fn agentic_turn(
     // reported cost/model, so the gate above (`gate.check` on the routed
     // `primary`) is the only signal we can apply.
     let model_used_paid = eng
-        .corpus
+        .route_corpus
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
