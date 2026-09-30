@@ -1,5 +1,7 @@
 //! Smart router: pick the best FREE model for a task by capability x latency x
-//! live health, with a deterministic cross-family fallback chain.
+//! live health, with a deterministic fallback chain. A pinned provider model
+//! stays within its provider family; auto-routing still uses cross-family
+//! diversity when no provider is pinned.
 
 use crate::corpus::{Corpus, ModelEntry};
 use crate::health::HealthStore;
@@ -45,7 +47,7 @@ pub struct Router<'a> {
     health: &'a HealthStore,
     /// Optional operator-pinned primary model id (`Config.primary_model`). When
     /// set, it always leads the chain and the capability/health-ranked free
-    /// pool becomes the fallback chain behind it.
+    /// pool from that provider becomes the fallback chain behind it.
     pinned_primary: Option<String>,
     /// Optional set of model ids that a REAL (non-placeholder) provider serves
     /// on this host (`Config::model_has_real_provider`). When present, the
@@ -54,6 +56,10 @@ pub struct Router<'a> {
     /// placeholder default and fail cryptically. `None` = no filter (legacy
     /// behavior for callers without a config in hand).
     backed: Option<std::collections::HashSet<String>>,
+    /// When a primary is pinned, the exact provider-owned model set. This is
+    /// separate from `backed`, which may contain models from every configured
+    /// provider on the host.
+    provider_scope: Option<std::collections::HashSet<String>>,
 }
 
 impl<'a> Router<'a> {
@@ -63,6 +69,7 @@ impl<'a> Router<'a> {
             health,
             pinned_primary: None,
             backed: None,
+            provider_scope: None,
         }
     }
 
@@ -84,6 +91,13 @@ impl<'a> Router<'a> {
         // don't filter" (legacy). The distinction is what makes an unconfigured
         // host fail cleanly instead of auto-picking an example.com-bound model.
         self.backed = backed;
+        self
+    }
+
+    /// Restrict pinned-model fallbacks to the exact provider-owned ids. Auto
+    /// routing remains unchanged when no scope is supplied.
+    pub fn with_provider_scope(mut self, scope: Option<std::collections::HashSet<String>>) -> Self {
+        self.provider_scope = scope;
         self
     }
 
@@ -195,7 +209,28 @@ impl<'a> Router<'a> {
         fallbacks
     }
 
-    /// Pick a primary + a cross-family fallback chain.
+    /// Build a provider-scoped fallback chain for an operator-pinned model.
+    /// Corpus families are the provider boundary for routable catalog rows
+    /// (for example, `minimax` versus `nvidia`). Preserve ranking and the
+    /// four-model cap, but never substitute another provider family.
+    fn build_provider_fallbacks(
+        ranked: &[&ModelEntry],
+        primary_id: &str,
+        primary_family: &str,
+    ) -> Vec<String> {
+        if primary_family.is_empty() {
+            return Self::build_fallbacks(ranked, primary_id, primary_family);
+        }
+        ranked
+            .iter()
+            .filter(|m| m.id != primary_id && m.family == primary_family)
+            .take(4)
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    /// Pick a primary plus a provider-scoped fallback chain when pinned, or a
+    /// cross-family chain when auto-routing.
     pub fn select(&self, tier: Tier) -> anyhow::Result<Route> {
         let ranked = self.candidates(tier);
 
@@ -207,7 +242,27 @@ impl<'a> Router<'a> {
         if let Some(pin) = &self.pinned_primary {
             let pin_entry = self.corpus.get(pin);
             let pin_family = pin_entry.map(|e| e.family.as_str()).unwrap_or("");
-            let fallbacks = Self::build_fallbacks(&ranked, pin, pin_family);
+            let scoped_ranked: Vec<&ModelEntry> = self
+                .provider_scope
+                .as_ref()
+                .map(|scope| {
+                    ranked
+                        .iter()
+                        .copied()
+                        .filter(|m| scope.contains(&m.id))
+                        .collect()
+                })
+                .unwrap_or_else(|| ranked.clone());
+            let fallbacks = if self.provider_scope.is_some() {
+                scoped_ranked
+                    .iter()
+                    .filter(|m| m.id != *pin)
+                    .take(4)
+                    .map(|m| m.id.clone())
+                    .collect()
+            } else {
+                Self::build_provider_fallbacks(&ranked, pin, pin_family)
+            };
             let cap_str =
                 match pin_entry.and_then(|e| e.code_capability().zip(e.code_capability_source())) {
                     Some((c, src)) => format!("{c:.1} ({src})"),
@@ -354,9 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn pinned_primary_leads_and_ranked_pool_falls_back() {
-        // A pinned primary must lead the chain even though `hi` outranks it in
-        // the free pool; the ranked pool then forms the fallbacks behind it.
+    fn pinned_primary_leads_and_stays_with_provider_family() {
+        // A pinned primary must lead the chain, but a provider failure must
+        // not silently send the request to a different provider family.
         let health = HealthStore::default();
         let corpus = Corpus {
             models: vec![
@@ -372,6 +427,10 @@ mod tests {
                     family: "beta".into(),
                     ..benched("lo", 50.0)
                 },
+                ModelEntry {
+                    family: "minimax".into(),
+                    ..benched("MiniMax-M2.7", 55.0)
+                },
             ]
             .into_iter()
             .map(|mut m| {
@@ -383,12 +442,18 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let router = Router::new(&corpus, &health).with_primary(Some("MiniMax-M3".to_string()));
+        let router = Router::new(&corpus, &health)
+            .with_primary(Some("MiniMax-M3".to_string()))
+            .with_provider_scope(Some(
+                ["MiniMax-M3", "MiniMax-M2.7"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ));
         let route = router.select(Tier::Auto).unwrap();
         assert_eq!(route.primary, "MiniMax-M3");
-        // `hi` (higher SWE) leads the fallbacks, proving the rest stay ranked.
-        assert_eq!(route.fallbacks.first().map(String::as_str), Some("hi"));
-        assert!(!route.fallbacks.contains(&"MiniMax-M3".to_string()));
+        assert_eq!(route.fallbacks, vec!["MiniMax-M2.7"]);
+        assert!(!route.fallbacks.contains(&"hi".to_string()));
     }
 
     #[test]

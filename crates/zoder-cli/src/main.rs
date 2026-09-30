@@ -2918,6 +2918,29 @@ fn backed_free_model_ids(eng: &Engine) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Return the free corpus ids owned by the same real provider as `primary`.
+/// The general backed set intentionally spans every configured provider; a
+/// pinned provider needs this narrower set so its fallback chain cannot jump
+/// to an unrelated endpoint.
+fn provider_scoped_free_model_ids(
+    eng: &Engine,
+    rc: &RoutingContext,
+    primary: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let owner = rc.real_provider_for_model(&eng.cfg, primary)?;
+    let owner_id = owner.id.clone();
+    Some(
+        eng.corpus
+            .free_chat()
+            .filter_map(|m| {
+                rc.real_provider_for_model(&eng.cfg, &m.id)
+                    .filter(|p| p.id == owner_id)
+                    .map(|_| m.id.clone())
+            })
+            .collect(),
+    )
+}
+
 /// Build the flat `(model, class, rank, healthy)` candidate pool the
 /// scenario layer reasons about. Drives both `resolve_chain` (primary) and
 /// `resolve_chain_for_role(reviewer)` — the spec only cares about the
@@ -3530,7 +3553,13 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // ranked free pool becomes `Route.fallbacks`.
     let router = Router::new(&eng.corpus, health)
         .with_primary(eng.cfg.primary_model.clone())
-        .with_backed(Some(backed_free_model_ids(eng)));
+        .with_backed(Some(backed_free_model_ids(eng)))
+        .with_provider_scope(
+            eng.cfg
+                .primary_model
+                .as_deref()
+                .and_then(|primary| provider_scoped_free_model_ids(eng, &rc, primary)),
+        );
     let route = router.select(Tier::parse(&cli.tier))?;
 
     // Find the operator's preferred head: whatever the router put at
@@ -3786,9 +3815,16 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     // corpus as the routing authority.
     let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
+    let provider_scope = RoutingContext::load(&eng.cfg).ok().and_then(|rc| {
+        eng.cfg
+            .primary_model
+            .as_deref()
+            .and_then(|primary| provider_scoped_free_model_ids(&eng, &rc, primary))
+    });
     let router = Router::new(&eng.corpus, &health)
         .with_primary(eng.cfg.primary_model.clone())
-        .with_backed(Some(backed_free_model_ids(&eng)));
+        .with_backed(Some(backed_free_model_ids(&eng)))
+        .with_provider_scope(provider_scope);
     let route = match router.select(Tier::parse(&cli.tier)) {
         Ok(route) => route,
         Err(error) if should_enrich_route_error(&error) => {
