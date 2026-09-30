@@ -4057,7 +4057,7 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.route_corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
     let router = Router::new(&eng.route_corpus, &health)
-        .with_primary(eng.cfg.primary_model.clone())
+        .with_primary(resolve_effective_primary(cli, &eng))
         .with_backed(Some(backed_free_model_ids(&eng)));
     let route = match router.select(Tier::parse(&cli.tier)) {
         Ok(route) => route,
