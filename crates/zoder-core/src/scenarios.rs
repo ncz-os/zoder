@@ -81,41 +81,12 @@ impl ProviderClass {
 
 /// Classify a `(provider, model_id)` pair into a [`ProviderClass`].
 ///
-/// The lookup follows the documented mapping in the module-level docs and
-/// the task spec:
-///
-/// - `nvidia-eih` / `nvcf` providers → `free` (the NVCF free-tier endpoint).
-/// - A provider whose id contains `local` (e.g. `local-llama`) → `free`
-///   (no metered egress).
-/// - A provider whose id contains `minimax-flat` → `free` (the flat-fee
-///   MiniMax subscription is cost-neutral at the routing layer).
-/// - Subscription billing (OAuth / flat-rate-with-windows) → `sub`
-///   (KNEMON-gated).
-/// - Metered billing → `paid`.
-///
-/// The provider-id string matchers are checked **before** the billing-mode
-/// match so a user who happens to name a metered provider `something-local`
-/// is classified from billing, not from the name. (The id matchers exist
-/// because some flat-rate providers are explicitly `BillingMode::Free` in
-/// config — those should stay `free` even though they look subscription-y
-/// to a casual reader.)
+/// Billing configuration is authoritative. A provider name never grants
+/// free routing: an Enterprise LLM Gateway can be free, subscribed, or
+/// metered depending on the operator's account and selected endpoint.
 pub fn classify(provider: &Provider, _model_id: &str) -> ProviderClass {
-    let id = provider.id.to_ascii_lowercase();
-    // Explicit id matchers — checked first so the classification is
-    // stable regardless of which `billing` an operator chose for those
-    // entries.
-    if id == "nvidia-eih" || id == "nvcf" {
-        return ProviderClass::Free;
-    }
-    // Billing is authoritative for heuristic names. A custom metered provider
-    // named `something-local` or `minimax-flat-proxy` must never become free
-    // and bypass the paid gate. The exact NVCF ids above are the sole policy
-    // exceptions because they identify the public free-tier endpoint.
-    if provider.billing == BillingMode::Metered {
+    if provider.paid || provider.billing == BillingMode::Metered {
         return ProviderClass::Paid;
-    }
-    if id.contains("local") || id.contains("minimax-flat") {
-        return ProviderClass::Free;
     }
     match provider.billing {
         BillingMode::Free => ProviderClass::Free,
@@ -990,12 +961,11 @@ mod tests {
     // -------- classify --------------------------------------------------
 
     #[test]
-    fn classify_nvidia_eih_is_free() {
-        // The task spec calls out nvidia-eih / nvcf as free by id.
-        let p = provider("nvidia-eih", BillingMode::Metered);
-        assert_eq!(classify(&p, "any/model"), ProviderClass::Free);
-        let p = provider("nvcf", BillingMode::Metered);
-        assert_eq!(classify(&p, "any/model"), ProviderClass::Free);
+    fn enterprise_gateway_follows_configured_billing() {
+        let p = provider("enterprise-gateway", BillingMode::Metered);
+        assert_eq!(classify(&p, "enterprise/review-model"), ProviderClass::Paid);
+        let p = provider("enterprise-gateway", BillingMode::Free);
+        assert_eq!(classify(&p, "enterprise/review-model"), ProviderClass::Free);
     }
 
     #[test]

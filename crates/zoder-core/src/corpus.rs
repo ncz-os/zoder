@@ -841,7 +841,7 @@ impl Corpus {
 
     /// Fold a free provider's live catalog into the routing pool. Each id in
     /// `ids` (already prefix-filtered to the provider's `serves` allowlist by
-    /// the caller, e.g. NVIDIA EIH's `nvidia/* | deepseek-ai/* | meta/llama-* |
+    /// the caller, e.g. an Enterprise LLM Gateway serving `enterprise/* | provider-a/* | provider-b/* |
     /// mistralai/*` open-weight NIMs) is upserted as a free, routable chat
     /// candidate. Existing entries keep all benchmark/capability/latency scores
     /// — only the free/route flags are (re)asserted, so re-running a refresh is

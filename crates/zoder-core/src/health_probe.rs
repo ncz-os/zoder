@@ -56,7 +56,7 @@ pub const PROBE_PROMPT: &str = "ping";
 pub const PROBE_PING_TIMEOUT_SECS: u64 = 20;
 
 /// Upper bound on how many models one provider may ping in a single
-/// `--probe --all` run. Endpoints like EIH expose hundreds of model ids;
+/// `--probe --all` run. Enterprise LLM Gateway endpoints expose hundreds of model ids;
 /// a daily sweep has no business exercising all of them. When the cap
 /// drops entries the operator sees a logged NOTE — the cap is never
 /// silent.
@@ -358,7 +358,9 @@ mod tests {
                 "openai/gpt-4o".into(),
                 "anthropic/claude-3.7".into(),
             ]))),
-            "nvidia-eih" => Box::new(MockProbe::new(Some(vec!["nvidia/llama-3.3".into()]))),
+            "enterprise-gateway" => {
+                Box::new(MockProbe::new(Some(vec!["enterprise/review-model".into()])))
+            }
             "unsupported" => Box::new(MockProbe::new(None)),
             _ => return Err(anyhow::anyhow!("unknown provider in fixture")),
         })
@@ -424,7 +426,7 @@ mod tests {
     fn probe_all_iterates_every_provider_and_every_target() {
         let providers = vec![
             provider("openrouter", "https://openrouter/v1"),
-            provider("nvidia-eih", "https://nvidia/v1"),
+            provider("enterprise-gateway", "https://enterprise/v1"),
         ];
         let plans = build_probe_plan(&providers, &provider_to_mock);
 
@@ -445,9 +447,9 @@ mod tests {
         );
         openrouter.enqueue("anthropic/claude-3.7", Ok(ChatResult::default()));
 
-        let nvidia = MockProbe::new(Some(vec!["nvidia/llama-3.3".into()]));
-        nvidia.enqueue(
-            "nvidia/llama-3.3",
+        let gateway = MockProbe::new(Some(vec!["enterprise/review-model".into()]));
+        gateway.enqueue(
+            "enterprise/review-model",
             Err(ProviderError {
                 message: "429".into(),
                 kind: ErrKind::RateLimit,
@@ -461,7 +463,10 @@ mod tests {
                 "openrouter".to_string(),
                 Box::new(openrouter) as Box<dyn Probe>,
             ),
-            ("nvidia-eih".to_string(), Box::new(nvidia) as Box<dyn Probe>),
+            (
+                "enterprise-gateway".to_string(),
+                Box::new(gateway) as Box<dyn Probe>,
+            ),
         ]
         .into_iter()
         .collect();
@@ -496,7 +501,7 @@ mod tests {
             Classification::Reachable
         );
         assert_eq!(
-            by_model[&("nvidia-eih", "nvidia/llama-3.3")],
+            by_model[&("enterprise-gateway", "enterprise/review-model")],
             Classification::Capacity
         );
 
@@ -507,14 +512,17 @@ mod tests {
         assert!(gpt.is_skipped_by_classification());
         assert!(gpt.checked_at_unix.is_some());
 
-        let nvidia_llama = &s.models["nvidia/llama-3.3"];
-        assert_eq!(nvidia_llama.provider_id.as_deref(), Some("nvidia-eih"));
-        assert_eq!(nvidia_llama.classification, Some(Classification::Capacity));
-        assert!(nvidia_llama.is_skipped_by_classification());
+        let gateway_model = &s.models["enterprise/review-model"];
+        assert_eq!(
+            gateway_model.provider_id.as_deref(),
+            Some("enterprise-gateway")
+        );
+        assert_eq!(gateway_model.classification, Some(Classification::Capacity));
+        assert!(gateway_model.is_skipped_by_classification());
         // Capacity is a skip-class outcome (W1): consult skips it by
         // classification, so it must NOT count against the breaker.
         assert_eq!(
-            nvidia_llama.failures, 0,
+            gateway_model.failures, 0,
             "Capacity must not count as a breaker failure"
         );
 
@@ -781,7 +789,7 @@ mod tests {
         );
 
         // The per-provider model cap must be positive (otherwise the
-        // sweep pings nothing) and must not exceed 200 — otherwise EIH
+        // sweep pings nothing) and must not exceed 200 — otherwise the gateway
         // and similar broad catalogs still dominate the daily run.
         assert!(
             PROBE_MAX_MODELS_PER_PROVIDER > 0,
