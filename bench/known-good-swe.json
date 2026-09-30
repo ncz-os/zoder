@@ -75,7 +75,7 @@
       "swe": 70,
       "single_pass": 0.9,
       "grind": 0.85,
-      "note": "strong + cheap author; solid grind | HEALTH: deepseek-v4-pro TIMES OUT on EIH (45s) - health-gate OUT as reviewer",
+      "note": "strong + cheap author; solid grind | HEALTH: deepseek-v4-pro TIMES OUT on Enterprise LLM Gateway (45s) - health-gate OUT as reviewer",
       "review": 0.82
     },
     {
@@ -97,7 +97,7 @@
       "single_pass": 0.88,
       "grind": 0.8,
       "review": 0.86,
-      "note": "Qwen3.5 (EIH qwen3.5-397b); EMPIRICAL 2026-06-30 caught BOTH ACP protocol blockers as reviewer"
+      "note": "Qwen3.5 (Enterprise LLM Gateway qwen3.5-397b); EMPIRICAL 2026-06-30 caught BOTH ACP protocol blockers as reviewer"
     },
     {
       "match": [
@@ -160,7 +160,7 @@
       "single_pass": 0.86,
       "grind": 0.78,
       "review": 0.9,
-      "note": "Zhipu GLM-5.x (EIH glm-5.1); EMPIRICAL 2026-06-30 caught BOTH ACP blockers, most precise free reviewer"
+      "note": "Zhipu GLM-5.x (Enterprise LLM Gateway glm-5.1); EMPIRICAL 2026-06-30 caught BOTH ACP blockers, most precise free reviewer"
     },
     {
       "match": [
@@ -234,7 +234,7 @@
       "single_pass": 0.86,
       "grind": 0.78,
       "review": 0.74,
-      "note": "NVIDIA Nemotron Ultra (EIH); EMPIRICAL: intuited both ACP blockers but HEDGED (comment); 550b intermittently DEGRADED/scope-denied"
+      "note": "NVIDIA Nemotron Ultra (Enterprise LLM Gateway); EMPIRICAL: intuited both ACP blockers but HEDGED (comment); 550b intermittently DEGRADED/scope-denied"
     },
     {
       "match": [
@@ -246,7 +246,7 @@
       "single_pass": 0.8,
       "grind": 0.66,
       "review": 0.58,
-      "note": "NVIDIA Nemotron Super (EIH); EMPIRICAL: MISSED both ACP protocol blockers as reviewer"
+      "note": "NVIDIA Nemotron Super (Enterprise LLM Gateway); EMPIRICAL: MISSED both ACP protocol blockers as reviewer"
     },
     {
       "match": [
@@ -267,7 +267,7 @@
       "single_pass": 0.74,
       "grind": 0.56,
       "review": 0.55,
-      "note": "NVIDIA Nemotron family fallback (EIH)"
+      "note": "NVIDIA Nemotron family fallback (Enterprise LLM Gateway)"
     },
     {
       "match": [
@@ -317,7 +317,7 @@
       "single_pass": 0.84,
       "grind": 0.74,
       "review": 0.9,
-      "note": "Mistral Large 3 (EIH 675b); EMPIRICAL 2026-06-30 caught BOTH ACP blockers"
+      "note": "Mistral Large 3 (Enterprise LLM Gateway 675b); EMPIRICAL 2026-06-30 caught BOTH ACP blockers"
     },
     {
       "match": [
@@ -331,5 +331,5 @@
     }
   ],
   "review_field": "review (0..1) = adversarial-review suitability, DISTINCT from single_pass(authoring)/grind(loop). Reviewer selection should weight review x live response-time health (HealthStore); skip degraded/timeout models. Source: empirical 2026-06-30 zoder goose-ACP protocol bake-off, ground truth = Codex+web+real-goose integration test.",
-  "currency_doctrine": "Prefer the LATEST generation that is AVAILABLE + HEALTHY on the target endpoint. Latest-on-paper that is unserved/degraded/timing-out is worse than a healthy prior gen: GLM 5.2 is not on EIH (use 5.1); deepseek-v4-pro times out (use v4-flash); nemotron-3-ultra-550b is intermittently degraded/scope-denied. Bare family tokens (glm/qwen3/deepseek/kimi/minimax/nemotron) remain only as low-scored resilience fallbacks."
+  "currency_doctrine": "Prefer the LATEST generation that is AVAILABLE + HEALTHY on the target endpoint. Latest-on-paper that is unserved/degraded/timing-out is worse than a healthy prior gen: GLM 5.2 is not on Enterprise LLM Gateway (use 5.1); deepseek-v4-pro times out (use v4-flash); nemotron-3-ultra-550b is intermittently degraded/scope-denied. Bare family tokens (glm/qwen3/deepseek/kimi/minimax/nemotron) remain only as low-scored resilience fallbacks."
 }
