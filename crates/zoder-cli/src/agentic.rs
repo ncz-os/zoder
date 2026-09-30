@@ -953,11 +953,11 @@ async fn dispatch_reviewer_for_model(
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let known_paid_model = eng
-        .corpus
+        .route_corpus
         .get(model)
         .is_some_and(|candidate| !candidate.free);
     let model_entry = eng
-        .corpus
+        .route_corpus
         .get(model)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
