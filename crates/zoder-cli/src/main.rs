@@ -1206,24 +1206,30 @@ fn provider_route_corpus(cfg: &Config, public: &Corpus) -> anyhow::Result<Corpus
         if provider.id != entry.provider_id
             || provider.paid
             || provider.billing != BillingMode::Free
+            || !provider
+                .serves
+                .iter()
+                .any(|served| served == &entry.model_id)
         {
             anyhow::bail!(
-                "{} route {} must select the named free provider exactly",
+                "{} route {} must select the named free provider and exact served model",
                 path.display(),
                 entry.model_id
             );
+        }
+        if route.models.iter().all(|m| m.id != entry.model_id) {
+            // Private, exact-provider routes need not appear in a public corpus.
+            // Keep this synthetic entry confined to the routing view.
+            route.models.push(ModelEntry {
+                id: entry.model_id.clone(),
+                ..Default::default()
+            });
         }
         let model = route
             .models
             .iter_mut()
             .find(|m| m.id == entry.model_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} verified model {} is absent from the public corpus",
-                    path.display(),
-                    entry.model_id
-                )
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("route model disappeared after insertion"))?;
         model.kind = "chat".into();
         model.free = true;
         model.paid = false;
@@ -1343,6 +1349,37 @@ mod provider_route_corpus_tests {
             "{bad json",
         )
         .unwrap();
+        assert!(provider_route_corpus(&cfg, &public).is_err());
+    }
+
+    #[test]
+    fn exact_private_entitlement_adds_only_routing_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(home.path());
+        let model_id = "private/preview-model";
+        cfg.providers = vec![serde_json::from_value(json!({
+            "id":"subscription", "base_url":"https://gateway.example.invalid/v1",
+            "kind":"openai-chat", "auth":{"type":"env","var":"SUBSCRIPTION_KEY"},
+            "billing":"free", "serves":[model_id]
+        }))
+        .unwrap()];
+        let public = Corpus::default();
+        std::fs::write(
+            home.path().join("provider-model-overrides.json"),
+            json!({
+                "schema_version":1,
+                "verified_free":[{"provider_id":"subscription","model_id":model_id}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let route = provider_route_corpus(&cfg, &public).unwrap();
+        assert!(route.get(model_id).unwrap().routable());
+        assert!(public.get(model_id).is_none());
+        assert_eq!(route.count, 1);
+
+        cfg.providers[0].serves = vec!["private/".into()];
         assert!(provider_route_corpus(&cfg, &public).is_err());
     }
 }
