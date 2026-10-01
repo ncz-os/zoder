@@ -567,7 +567,14 @@ async fn complete_once(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let candidates = build_reviewer_candidates(cli, model_override, reviewer_chain)?;
+    let mut candidates = build_reviewer_candidates(cli, model_override, reviewer_chain)?;
+    // The global `-m` switch is an exact pin. A standalone review may use it
+    // as its reviewer override, but must not silently fall back to a different
+    // configured reviewer when that pinned endpoint fails — the operator asked
+    // for THIS model, not "any reviewer we have configured".
+    if cli.model.as_deref() == model_override && model_override.is_some() {
+        candidates.truncate(1);
+    }
     if candidates.is_empty() {
         // Empty head — original behavior preserved: no candidates means
         // no model was resolvable, bail without fabricating a review.
@@ -2818,15 +2825,21 @@ pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
 // ---------------------------------------------------------------------------
 
 const REVIEW_SYSTEM: &str = "You are a meticulous senior software engineer performing a code review. \
-Identify bugs, anti-patterns, missing tests, security issues, and documentation gaps. \
-Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
-{\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
+Identify concrete defects in the supplied diff. Approve a sound change; request changes only for a defect you can explain and locate. \
+Return one JSON object with keys verdict, summary, findings, and next_steps. \
+Set verdict to exactly one of approve, request_changes, or comment. \
+Each finding object has severity (critical, high, medium, low, or info), title, body, and optional location as a string (path:line). \
+next_steps is a top-level array of strings. Use empty arrays when there are no findings or next steps. \
+Write an actual review of this diff. Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
 const ADVERSARIAL_SYSTEM: &str = "You are a demanding, skeptical staff engineer and security auditor performing an ADVERSARIAL review. \
 Aggressively pressure-test the logic: assume the author missed edge cases, race conditions, error handling, injection/abuse vectors, and incorrect assumptions. Be specific and uncompromising. \
 A correct change MUST be approved: report `request_changes` only for a defect you can name and locate in this diff, never for style, speculation, or unverified suspicion. Approving a sound change is as important as catching a broken one; withholding approval from correct work is itself a review failure. \
-Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
-{\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
+Return one JSON object with keys verdict, summary, findings, and next_steps. \
+Set verdict to exactly one of approve, request_changes, or comment. \
+Each finding object has severity (critical, high, medium, low, or info), title, body, and optional location as a string (path:line). \
+next_steps is a top-level array of strings. Use empty arrays when there are no findings or next steps. \
+Write an actual review of this diff. Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
@@ -2898,8 +2911,12 @@ pub(crate) async fn cmd_review(
         )
     };
 
-    // Reviewer roster: the routed/`-m` model plus any `--panel` models.
-    let mut models: Vec<Option<String>> = vec![None];
+    // Standalone review has no author turn: `-m` pins its primary reviewer
+    // (so an operator can force qwen38 / nemotron35 / EIH nemotron etc.
+    // without first configuring `[profile].reviewer_model`). Without it,
+    // `None` lets `complete_once` walk the configured reviewer/scenario
+    // route. Additional `--panel` entries remain independent reviewer slots.
+    let mut models: Vec<Option<String>> = vec![cli.model.clone()];
     if let Some(p) = &panel {
         for m in p.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             models.push(Some(m.to_string()));
@@ -5649,6 +5666,152 @@ mod tests {
         assert_eq!(
             out, scenario_chain,
             "scenario chain seeds head+tail when no pin set"
+        );
+    }
+
+    // ---- standalone `zoder review -m <MODEL>` review-path routing --------
+
+    #[test]
+    fn standalone_review_model_pin_is_a_reviewer_override() {
+        // A standalone `zoder review -m qwen38` MUST pin qwen38 as the
+        // primary reviewer slot. The CLI parses `-m` into `cli.model`,
+        // which `cmd_review` now projects as the head of the reviewer
+        // roster. Without this projection the `-m` switch was silently
+        // dropped on the review path (only the configured `reviewer_model`
+        // ran), and an operator trying to override to qwen38/nemotron35/
+        // any local checkpoint saw the wrong reviewer in the panel.
+        let cli = crate::Cli::try_parse_from(["zoder", "review", "-m", "qwen38"])
+            .expect("review CLI accepts -m");
+        assert_eq!(cli.model.as_deref(), Some("qwen38"));
+        // The roster head is the `-m` pin (mirrors what cmd_review builds).
+        let roster_head: Option<String> = cli.model.clone();
+        let out = order_reviewer_candidates(
+            roster_head.as_deref(),
+            Some("configured-reviewer"),
+            &[],
+            &["scenario-reviewer".into()],
+        );
+        assert_eq!(
+            out.first().map(String::as_str),
+            Some("qwen38"),
+            "standalone `zoder review -m qwen38` must pin qwen38 as head, not the configured reviewer"
+        );
+    }
+
+    #[test]
+    fn standalone_review_pin_is_exact_no_fallback_to_configured_reviewer() {
+        // Once `cli.model == model_override`, `complete_once` truncates the
+        // candidate list to the head — a pinned `-m` MUST NOT silently fall
+        // back to a different configured reviewer when the pinned endpoint
+        // returns a fallback-worthy error. The operator asked for THIS
+        // model, not "any reviewer we have configured".
+        let cli = crate::Cli::try_parse_from(["zoder", "review", "-m", "qwen38"])
+            .expect("review CLI accepts -m");
+        let model_override = Some("qwen38");
+        let configured = vec!["nvidia/nemotron-3-ultra-550b-a55b".to_string()];
+        let scenario = vec!["scenario-reviewer".to_string()];
+        // Mirror what complete_once does:
+        let mut candidates =
+            order_reviewer_candidates(model_override, None, &configured, &scenario);
+        if cli.model.as_deref() == model_override && model_override.is_some() {
+            candidates.truncate(1);
+        }
+        assert_eq!(
+            candidates,
+            vec!["qwen38".to_string()],
+            "-m on standalone review must truncate to the pinned model; no silent fallback"
+        );
+    }
+
+    #[test]
+    fn standalone_review_without_pin_uses_full_reviewer_chain() {
+        // No `-m` on the review command: the roster head is None, and
+        // `complete_once` keeps the full chain so the configured reviewer
+        // + scenario tail are still available as fallbacks.
+        let cli =
+            crate::Cli::try_parse_from(["zoder", "review"]).expect("review CLI parses without -m");
+        assert!(cli.model.is_none());
+        let model_override: Option<&str> = None;
+        let configured = vec!["nvidia/nemotron-3-ultra-550b-a55b".to_string()];
+        let scenario = vec!["scenario-reviewer".to_string()];
+        let mut candidates =
+            order_reviewer_candidates(model_override, None, &configured, &scenario);
+        // No truncation: the no-`-m` path MUST preserve the existing
+        // fallback semantics (otherwise the fix would shadow the
+        // `[profile].reviewer_model` pin the operator set).
+        if cli.model.as_deref() == model_override && model_override.is_some() {
+            candidates.truncate(1);
+        }
+        assert_eq!(
+            candidates,
+            vec![
+                "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+                "scenario-reviewer".to_string(),
+            ],
+            "no `-m` => configured reviewer + scenario tail preserved as before"
+        );
+    }
+
+    #[test]
+    fn review_prompts_do_not_offer_template_verdicts() {
+        // The pre-fix prompts included an inline schema with `\"...\"` and a
+        // bare `approve|request_changes|comment` regex-style enum. Thinking
+        // models (qwen38, nemotron35 with reasoning enabled) read those
+        // template fields and could echo them as their own answer — a real
+        // production failure mode. The new prompts spell out the schema in
+        // prose, require a verdict to be exactly one of the three constants,
+        // and forbid copying instructions or emitting template values.
+        for prompt in [REVIEW_SYSTEM, ADVERSARIAL_SYSTEM] {
+            assert!(
+                !prompt.contains("approve|request_changes|comment"),
+                "review prompt must not offer a regex-style enum (a thinking model may echo it as the verdict)"
+            );
+            assert!(
+                !prompt.contains("\"...\""),
+                "review prompt must not contain `\"...\"` template filler (a thinking model may echo it)"
+            );
+            assert!(
+                prompt.contains("Never copy these instructions"),
+                "review prompt must explicitly forbid copying instructions"
+            );
+            // Every canonical verdict word appears literally in the prompt
+            // so the model knows the exact vocabulary; backtick-quoted is
+            // fine — the prompt only forbids the bare regex-shaped enum.
+            assert!(
+                prompt.contains("approve"),
+                "review prompt must mention 'approve' as a canonical verdict"
+            );
+            assert!(
+                prompt.contains("request_changes"),
+                "review prompt must mention 'request_changes' as a canonical verdict"
+            );
+            assert!(
+                prompt.contains("comment"),
+                "review prompt must mention 'comment' as a canonical verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_review_rejects_pure_prose_template_explanation() {
+        // When a thinking model explains the schema in prose WITHOUT emitting
+        // an actual JSON object, `parse_review` must fail closed. There is
+        // no JSON to parse, no verdict keyword to recover, so the function
+        // falls through to `request_changes` with an explicit fail-closed
+        // finding. The pre-fix `parse_review` returned `comment` here, which
+        // let the gate fail open and surface a phantom approval.
+        let echoed_prose =
+            "The user wants me to return a JSON object with verdict, summary, findings, and next_steps.";
+        let r = parse_review(echoed_prose);
+        assert_eq!(
+            r.verdict, "request_changes",
+            "pure-prose schema explanation must fail closed"
+        );
+        assert!(
+            r.summary.contains("parseable")
+                || r.summary.contains("Failing closed")
+                || r.summary.contains("fail-closed"),
+            "fail-closed summary should make the failure mode obvious to operators"
         );
     }
 
