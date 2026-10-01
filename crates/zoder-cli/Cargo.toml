@@ -12,6 +12,10 @@ description = "zoder: a fast, codex-compatible coding+review CLI that routes to 
 name = "zoder"
 path = "src/main.rs"
 
+[[bin]]
+name = "fleet_probe"
+path = "src/bin/fleet_probe.rs"
+
 [dependencies]
 zoder-core = { path = "../zoder-core" }
 zoder-mcp-server = { path = "../zoder-mcp-server" }
