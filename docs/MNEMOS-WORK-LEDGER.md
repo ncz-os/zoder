@@ -15,41 +15,42 @@ Both are required for remote checkpoint posting. If either is missing, the local
 
 ## Local Checkpoint Format
 
-Each local checkpoint is a line in `.git/zoder-work-ledger.jsonl`, written atomically via `git rev-parse --absolute-git-dir` discovery:
+Each local checkpoint is a single line in `.git/zoder-work-ledger.jsonl`, appended after discovery of the Git directory via `git rev-parse --absolute-git-dir`. The entry is the raw evidence object as supplied by the checkpoint caller — no wrapper.
 
 ```json
 {
-  "content": "Human-readable summary of work performed",
-  "category": "projects",
-  "subcategory": "zoder-work",
-  "source_agent": "zoder",
-  "metadata": {
-    "job_id": "hive job identifier if available",
-    "parent_job_id": "parent job identifier for lookup context"
-  }
+  "job_id": "01a0f56a-857c-7de6-b743-c184007c7eee",
+  "workspace": "/home/user/project",
+  "iteration": 1,
+  "head_sha": "a1b2c3d4",
+  "files": ["src/lib.rs", "docs/README.md"],
+  "check_passed": true,
+  "verdict": "passed",
+  "blocking_findings": []
 }
 ```
 
-The checkpoint is **always** written to the local ledger first, regardless of network success. Network failure must not discard work or prevent local recovery.
+The `job_id` field reflects the `HIVE_JOB_ID` environment value if set; otherwise it may be `null`. Local write errors (Git unavailable, disk full, permission denied) can prevent entry — the operation is not guaranteed across processes.
 
 ## Remote Checkpoint Posting
 
-After the local write, zoder attempts to POST the checkpoint to the MNEMOS server at `/v1/memories`. The remote payload includes:
+After the local write attempt, zoder POSTs the checkpoint to the MNEMOS server at `/v1/memories`. The remote payload includes:
 
-- `content`: The evidence stringified
+- `content`: The evidence stringified from the local checkpoint object
 - `category`: `"projects"`
 - `subcategory`: `"zoder-work"`
 - `source_agent`: `"zoder"`
-- `metadata.job_id`: `HIVE_JOB_ID` environment value (optional)
-- `metadata.parent_job_id`: `HIVE_PARENT_JOB_ID` environment value (optional — **this is the lookup context, not a field recorded by the current checkpoint implementation**)
+- `metadata.job_id`: `HIVE_JOB_ID` environment value (optional — recorded only if set)
 
-**Important**: The `parent_job_id` field in metadata serves as a *lookup context* — it lets you search prior work by parent job ID supplied by the worker. It is **not** the same as the `job_id` field, which identifies the current job's checkpoint. The checkpoint records `HIVE_JOB_ID` as the primary job identifier and optionally `HIVE_PARENT_JOB_ID` as contextual metadata for search.
+**`HIVE_PARENT_JOB_ID` is not read or recorded by the current checkpoint implementation.** The worker may supply a parent job ID as a manual lookup hint (e.g. `zoder mnemos --search "$HIVE_PARENT_JOB_ID"`), but it is not stored in the checkpoint metadata.
+
+**Important**: The remote POST may fail even when the local write succeeds. Network errors, auth failures, or server unavailability will result in a "pending" status — the local ledger entry stands as-recorded.
 
 ## CLI Commands
 
 ### `zoder mnemos --search`
 
-Search the MNEMOS ledger for prior work:
+Search the remote MNEMOS server for prior work (the local `.git` ledger is a JSONL file and is not queried by this command):
 
 ```bash
 zoder mnemos --search "query string"
@@ -58,46 +59,43 @@ zoder mnemos --search "query string"
 - Uses `/v1/memories/search` endpoint
 - Filters by `subcategory: zoder-work` and `limit: 5`
 - Returns matching memories with their IDs and content
-- Can supply either a free-text query or a `HIVE_JOB_ID` / parent job ID to retrieve prior work evidence
+- The query is free text. There is no structured field syntax: a job ID is retrievable only because it appears in recorded content.
 
 ### `zoder mnemos --record`
 
-Record a new checkpoint:
+Record a new checkpoint to the remote MNEMOS server:
 
 ```bash
-zoder mnemos --record "content summary"
+zoder mnemos --record "Completed iteration 3: fixed parser crash on malformed input"
 ```
 
-- Uses `/v1/memories` endpoint
 - Posts with `category: projects`, `subcategory: zoder-work`, `source_agent: zoder`
-- Includes `metadata.job_id` from `HIVE_JOB_ID` if set
-- Includes `metadata.parent_job_id` from `HIVE_PARENT_JOB_ID` if set
-- Outputs the remote MNEMOS record ID on success, or "pending" with the error on failure
+- **Does NOT automatically include `metadata.parent_job_id`** — parent job ID must be supplied explicitly if needed
+- Prints the full pretty JSON response on success; a failed request propagates as an error rather than a "pending" notice
+- The automatic checkpoint helper (internal `checkpoint()` function), not manual `--record`, catches network errors and logs `MNEMOS checkpoint pending`
 
 ## HIVE_JOB_ID Context
 
-- `HIVE_JOB_ID` — The current job's identifier. When set, it is recorded in every MNEMOS checkpoint's `metadata.job_id` field, enabling job-scoped lookup of prior work.
+- `HIVE_JOB_ID` — The current job's identifier. When set, it is recorded in the `metadata.job_id` field of remote checkpoints, enabling job-scoped lookup of prior work.
 - Supply this via the hive worker environment; it distinguishes the current job's checkpoints from others.
 
 ## Parent Job ID Lookup
 
-- `HIVE_PARENT_JOB_ID` — An optional identifier supplied by the worker. When present, it is recorded in checkpoint metadata as a **lookup context** (not as a recorded field of the current checkpoint itself).
-- To retrieve prior work by parent job ID, use:
+`HIVE_PARENT_JOB_ID` is never read or recorded. To retrieve prior work by parent job ID, include it in the record text and search for it as free text:
 
 ```bash
-zoder mnemos --search "job_id:PARENT_ID"
+zoder mnemos --search "01a0f515-bf70-73ee-94d6-94f3b3dd7e46"
 ```
-
-or equivalently, the search UI may filter by the parent job ID context.
 
 ## Failure Behavior and Limits
 
-- **Local failure**: If `.git/` is not available or `git rev-parse` fails, the local `.git/zoder-work-ledger.jsonl` write is skipped. No error is propagated to the user beyond the console message.
-- **Network failure**: The local checkpoint is **still written**. The remote POST may fail; in that case the user sees `MNEMOS checkpoint pending: <error>`. Work is not discarded.
+- **Local write failure**: If `.git/` is not available or `git rev-parse` fails, the local `.git/zoder-work-ledger.jsonl` write is skipped. No error is propagated beyond the console message. Automatic remote attempt may still proceed.
+- **Network failure**: The local checkpoint write is attempted first. If the remote POST fails, the user sees `MNEMOS checkpoint pending: <error>`. The local ledger entry stands as-recorded; the remote absence is informational. No retry or replay is triggered.
 - **Auth failure**: If `MNEMOS_TOKEN` is invalid, the remote POST returns HTTP 401 and the error is reported as pending. Credentials are never exposed in error messages.
 - **Concurrent writes**: The local ledger uses append-mode `OpenOptions`, which is safe for process-local use but not guaranteed atomic across processes.
 - **Pending checkpoints do not automatically replay**: A failed remote POST does not trigger a retry or replay. The local ledger entry stands as-recorded; the remote absence is informational.
-- **Checkpoint is evidence, not proof of Git delivery**: A checkpoint records what work was attempted, not that Git successfully delivered it. The `--check` CLI command verifies Git delivery separately; do not represent MNEMOS checkpoints as proof of build/test correctness.
+- **Checkpoint is evidence, not proof of Git delivery**: A checkpoint records what work was attempted, not that Git operations succeeded. `--check` is a zoder loop option that executes a caller-supplied shell check; it is not a Git-delivery verifier. Keep checkpoint evidence, Git delivery and correctness as three separate claims.
+- **Automatic checkpoints occur at the checkpoint call after recorded loop iterations**, not every failed or aborted turn. Pending remote records do not auto-replay.
 
 ## Search and Record Examples
 
@@ -107,10 +105,10 @@ or equivalently, the search UI may filter by the parent job ID context.
 zoder mnemos --search "agent review feedback"
 ```
 
-### Search by HIVE_JOB_ID
+### Search for a job's prior work
 
 ```bash
-zoder mnemos --search "job_id:fb30400fb491527619293e2cdf1e868565d4eeab"
+zoder mnemos --search "01a0f56a-857c-7de6-b743-c184007c7eee"
 ```
 
 ### Record a checkpoint
@@ -119,18 +117,20 @@ zoder mnemos --search "job_id:fb30400fb491527619293e2cdf1e868565d4eeab"
 zoder mnemos --record "Completed iteration 3: fixed parser crash on malformed input"
 ```
 
-### Record with HIVE_JOB_ID and parent context
+Neither `HIVE_JOB_ID` nor `HIVE_PARENT_JOB_ID` is added automatically: only the text passed to `--record` is stored. To make a job ID searchable, include it in that text.
+
+### Record a parent job ID so it stays searchable
 
 ```bash
-zoder mnemos --record "Completed iteration 3: fixed parser crash on malformed input"
+zoder mnemos --record "Parent 01a0f515-bf70-73ee-94d6-94f3b3dd7e46: iteration 3 review findings"
 ```
 
-(Both `HIVE_JOB_ID` and `HIVE_PARENT_JOB_ID` are picked up from the environment if set.)
+`HIVE_PARENT_JOB_ID` is never read by the checkpoint implementation. Put the parent ID in the record text if you need to find it later.
 
 ## Relationship to Git Delivery
 
 - MNEMOS checkpoints are **independent** of Git delivery. A checkpoint records work progress; it does not guarantee or imply that Git operations succeeded.
-- The `zoder --check` command verifies Git delivery (e.g., whether the working tree is clean, whether commits are reachable). That verification is separate from MNEMOS checkpointing.
+- `--check` is a zoder loop option that runs the caller-supplied shell check. It is not a Git-delivery command, and zoder does not itself assert commit cleanliness or reachability. A Hive worker may choose a Git-delivery verifier; other callers may choose tests or builds.
 - Never represent MNEMOS checkpointing as proof of Git delivery or build/test correctness.
 
 ## Local Recovery
