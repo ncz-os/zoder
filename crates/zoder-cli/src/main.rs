@@ -13,6 +13,7 @@ mod exec_safety;
 mod goose;
 mod jobs;
 mod mnemos;
+mod reviewer_pool;
 mod sop;
 mod utilization;
 
@@ -278,6 +279,13 @@ struct Cli {
     /// An empty or unavailable allowlist fails before dispatch.
     #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
     reviewer_allowed_routes: Option<String>,
+    /// Verified secondary reviewer pool as exact provider=model pairs.
+    /// Requires --reviewer-allowed-routes. Keeps the configured primary first;
+    /// pool members need a matching-provider successful health probe within
+    /// one hour and are ranked by measured latency. No healthy member means
+    /// no pool fallback. Refresh with health --probe --all -m MODEL.
+    #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
+    reviewer_pool_routes: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
     /// (default auto). Out-of-set values are rejected at parse time so a
     /// typo (e.g. `strogn`) can never silently downgrade to `auto` routing.

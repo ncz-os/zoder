@@ -847,6 +847,42 @@ pub(crate) fn build_reviewer_candidates(
         }
     }
 
+    if let Some(raw_pool) = cli.reviewer_pool_routes.as_deref() {
+        if cli.reviewer_allowed_routes.is_none() {
+            anyhow::bail!("--reviewer-pool-routes requires --reviewer-allowed-routes");
+        }
+        let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
+        let routing = crate::RoutingContext::load(&eng.cfg)?;
+        let health = HealthStore::load(&eng.cfg.health_path);
+        let author_routes = crate::resolve_chain(cli, &eng, &health)?;
+        let primary = out.first().cloned().ok_or_else(|| {
+            anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
+        })?;
+        if author_routes.primary.contains(&primary) {
+            anyhow::bail!("reviewer pool primary must not be an author route");
+        }
+        for (provider, model) in &pool {
+            crate::require_allowed_reviewer_route(cli, provider, model)?;
+            if model == &primary || author_routes.primary.contains(model) {
+                anyhow::bail!("secondary reviewer pool must not contain the primary reviewer or an author route");
+            }
+            let actual = routing.real_provider_for_model(&eng.cfg, model);
+            if actual.is_none_or(|actual| actual.id != *provider) {
+                anyhow::bail!("secondary reviewer pool route {provider}={model} is not backed by that exact provider");
+            }
+        }
+        // The pool is a secondary-only policy: preserve the primary and replace
+        // every other candidate with verified, healthy, latency-ranked members.
+        out = vec![primary];
+        if !cli.no_fallback {
+            for model in
+                crate::reviewer_pool::healthy_models(&pool, &health, Utc::now().timestamp())
+            {
+                push_unique(&mut out, &model);
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -1137,8 +1173,28 @@ async fn dispatch_reviewer_for_model(
                     attempt += 1;
                     continue;
                 }
-                if provider_error_is_model_unavailable(&e, server_failures) {
+                // An explicit reviewer pool permits bounded failover after
+                // same-model retries are exhausted. The next candidate is
+                // already restricted to the verified reviewer pool; author
+                // and legacy reviewer retry policies remain unchanged.
+                if provider_error_is_model_unavailable(&e, server_failures)
+                    || (cli.reviewer_pool_routes.is_some() && e.retryable())
+                {
                     return Err(ReviewerError::fallback_worthy_from(e));
+                }
+                if cli.reviewer_pool_routes.is_some() {
+                    let classification = e
+                        .status
+                        .map(zoder_core::Classification::from_status)
+                        .unwrap_or_else(|| zoder_core::classify_err_kind(e.kind));
+                    let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |health| {
+                        health.record_classified_failure(
+                            model,
+                            &e.message,
+                            &provider_cfg.id,
+                            classification,
+                        );
+                    });
                 }
                 return Err(ReviewerError::Fatal {
                     message: format!("reviewer {model}: {}", e.message),
@@ -1238,7 +1294,16 @@ async fn dispatch_reviewer_for_model(
     // bare `eprintln!` warning here, which we preserve verbatim.
     let elapsed_ms = started.elapsed().as_millis() as f64;
     if let Err(e) = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
-        h.record_success(model, elapsed_ms);
+        if cli.reviewer_pool_routes.is_some() {
+            h.record_classified_success(
+                model,
+                elapsed_ms,
+                &provider_cfg.id,
+                zoder_core::Classification::Reachable,
+            );
+        } else {
+            h.record_success(model, elapsed_ms);
+        }
     }) {
         eprintln!(
             "zoder: warning: failed to persist reviewer health store (success for {model}): {e}"
@@ -9757,6 +9822,108 @@ mod reviewer_chain_dispatch_tests {
     /// `eprintln` not stdout.
     fn dummy_cli() -> Cli {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_pool_fails_over_only_to_verified_healthy_secondary() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/reviewer",
+            ],
+        );
+        write_config(
+            home,
+            &server.uri(),
+            "broken-model/reviewer,working-model/reviewer",
+        );
+        let mut cli = Cli::try_parse_from([
+            "zoder", "exec", "-m", "broken-model/coder", "--retries", "0",
+            "--allowed-routes", "wiremock-broken=broken-model/coder,wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-allowed-routes", "wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-pool-routes", "wiremock-working=working-model/reviewer",
+        ]).unwrap();
+        assert_eq!(
+            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            ["broken-model/reviewer"]
+        );
+        HealthStore::mutate_locked(&home.join("health.json"), |health| {
+            health.record_classified_success(
+                "working-model/reviewer",
+                100.0,
+                "wiremock-working",
+                zoder_core::Classification::Reachable,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            ["broken-model/reviewer", "working-model/reviewer"]
+        );
+        cli.no_fallback = true;
+        assert_eq!(
+            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            ["broken-model/reviewer"]
+        );
+        cli.no_fallback = false;
+        let completion = complete_once(&cli, None, &[], "system", "review", 1024)
+            .await
+            .unwrap();
+        assert_eq!(completion.model, "working-model/reviewer");
+        let health = HealthStore::load(&home.join("health.json"));
+        assert_eq!(
+            health.models["broken-model/reviewer"].classification,
+            Some(zoder_core::Classification::Capacity)
+        );
+        assert_eq!(
+            health.models["working-model/reviewer"].classification,
+            Some(zoder_core::Classification::Reachable)
+        );
+        for request in server.received_requests().await.unwrap() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_ne!(body["model"], "broken-model/coder");
+        }
+        HealthStore::mutate_locked(&home.join("health.json"), |health| {
+            health.record_classified_failure(
+                "working-model/reviewer",
+                "503",
+                "wiremock-working",
+                zoder_core::Classification::Capacity,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            ["broken-model/reviewer"]
+        );
+        cli.reviewer_allowed_routes = cli.allowed_routes.clone();
+        cli.reviewer_pool_routes = Some("wiremock-broken=broken-model/coder".into());
+        assert!(build_reviewer_candidates(&cli, None, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("author route"));
+        cli.reviewer_pool_routes = Some("wiremock-broken=broken-model/reviewer".into());
+        assert!(build_reviewer_candidates(&cli, None, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("primary reviewer"));
+        cli.reviewer_allowed_routes = None;
+        assert!(build_reviewer_candidates(&cli, None, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("requires --reviewer-allowed-routes"));
     }
 
     #[test]
