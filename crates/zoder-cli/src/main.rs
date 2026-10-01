@@ -12,6 +12,7 @@ mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
+mod mnemos;
 mod sop;
 mod utilization;
 
@@ -462,6 +463,13 @@ enum ReportPeriod {
 
 #[derive(Subcommand, Clone)]
 enum Cmd {
+    /// Search or record work history using MNEMOS_URL and MNEMOS_TOKEN.
+    Mnemos {
+        #[arg(long, conflicts_with = "record", required_unless_present = "record")]
+        search: Option<String>,
+        #[arg(long, conflicts_with = "search", required_unless_present = "search")]
+        record: Option<String>,
+    },
     /// Non-interactive run for automation/CI (codex-compatible). `-` reads stdin.
     Exec { prompt: Option<String> },
     /// Launch the zerocode terminal UI, wired to the local zeroclaw engine.
@@ -1730,6 +1738,9 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let result = match &cli.cmd {
+        Some(Cmd::Mnemos { search, record }) => {
+            mnemos::command(search.as_deref(), record.as_deref()).await
+        }
         Some(Cmd::Models { free, paid, all }) => {
             cmd_models(*free, *paid, *all, cli.json, cli.verbose).await
         }
