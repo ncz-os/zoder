@@ -65,6 +65,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -198,6 +201,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --scope <SCOPE>
           Possible values:
           - auto:         Working tree if dirty, else the branch vs its base
@@ -205,6 +211,9 @@ Options:
           - branch:       Committed branch changes vs base
           
           [default: auto]
+
+      --panel <M1,M2,...>
+          
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -214,9 +223,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --panel <M1,M2,...>
-          
 
       --background
           
@@ -338,6 +344,9 @@ Arguments:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -466,6 +475,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -593,6 +605,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -718,6 +733,9 @@ Options:
 
       --validate
           Exit non-zero if the configuration is invalid
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -845,14 +863,17 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --validate
+          Exit non-zero if the configuration is invalid
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
-
-      --validate
-          Exit non-zero if the configuration is invalid
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
@@ -973,6 +994,9 @@ Options:
 
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --limit <LIMIT>
           Show at most N rows
@@ -1103,6 +1127,9 @@ Arguments:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1236,22 +1263,25 @@ Options:
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --until <UNTIL>
+          Only include spend on/before this date (YYYY-MM-DD)
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --until <UNTIL>
-          Only include spend on/before this date (YYYY-MM-DD)
-
-      --allow-paid
-          Allow paid models without interactive confirmation (scripts/CI)
-
       --window-days <WINDOW_DAYS>
           Forecast window in days
           
           [default: 30]
+
+      --allow-paid
+          Allow paid models without interactive confirmation (scripts/CI)
 
       --json
           Emit machine-readable JSON to stdout
@@ -1370,8 +1400,14 @@ Options:
       --root <DIR>
           Repo root to gate (default: current working directory)
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --local-iterate
           Local-iterate mode: missing tools become Skipped (Yellow) so you can iterate fast on a dev box. The gate reports which checks were skipped and what install commands restore the strict posture. Use this only for inner-loop speed; the `--strict` default is the posture that earns the "it passed the gate" claim
+
+      --strict
+          Strict mode (fail-closed). This is the DEFAULT; the flag exists so `zoder gate --strict` is a legible escape hatch when `--local-iterate` is wired into a wrapper
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1382,26 +1418,23 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
-      --strict
-          Strict mode (fail-closed). This is the DEFAULT; the flag exists so `zoder gate --strict` is a legible escape hatch when `--local-iterate` is wired into a wrapper
-
-      --require-free
-          Only ever use free models; never fall back to paid
-
       --tools-only
           Print what gate tools are installed vs missing + the install hint for each missing tool, then exit. Does not run any steps. Useful for `zoder gate --tools-only` in CI caches
-
-      --dry-run
-          Print the routing decision + cost estimate without calling
 
       --plan-only
           Print the derived plan (ecosystems + framework hints + step list) without running anything. Useful for inspecting what the gate would actually do
 
-      --explain
-          Explain why a model was chosen
+      --require-free
+          Only ever use free models; never fall back to paid
+
+      --dry-run
+          Print the routing decision + cost estimate without calling
 
       --json
           Emit machine-readable JSON to stdout (the GateReport + tool-probe, serialized). Suppresses the pretty renderer
+
+      --explain
+          Explain why a model was chosen
 
       --max-tokens <MAX_TOKENS>
           Max output tokens
@@ -1511,6 +1544,12 @@ Options:
       --all
           Probe every configured provider's live model catalog (not just the default provider / free chat candidates). With `-m`, probe only that exact model on providers configured to serve it. Discovery calls `GET /v1/models` per provider; if that fails, falls back to the provider's declared model. Output is a per-provider report with model/status/latency rows
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --install-daily
+          Install the daily `--probe --all` sweep into launchd (macOS) or a systemd user timer (Linux). Idempotent: re-running overwrites the existing job
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1520,14 +1559,11 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
-      --install-daily
-          Install the daily `--probe --all` sweep into launchd (macOS) or a systemd user timer (Linux). Idempotent: re-running overwrites the existing job
+      --uninstall-daily
+          Remove the daily sweep installed by `install-daily`. Idempotent
 
       --require-free
           Only ever use free models; never fall back to paid
-
-      --uninstall-daily
-          Remove the daily sweep installed by `install-daily`. Idempotent
 
       --dry-run
           Print the routing decision + cost estimate without calling
@@ -1644,6 +1680,9 @@ Commands:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1775,10 +1814,16 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --max-iters <MAX_ITERS>
           Maximum author/review iterations before giving up
           
           [default: 6]
+
+      --check <CMD>
+          Validation command that must exit 0 (e.g. "cargo test -p foo"). Run after each author turn; failing output is fed to the next iteration
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1789,23 +1834,17 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
-      --check <CMD>
-          Validation command that must exit 0 (e.g. "cargo test -p foo"). Run after each author turn; failing output is fed to the next iteration
-
-      --require-free
-          Only ever use free models; never fall back to paid
-
       --reviewer <MODEL>
           Reviewer model id (default: the routed/`-m` model). Use a different strong model for a genuine adversarial second opinion
 
       --base <BASE>
           Base ref for branch-scope diffing
 
+      --require-free
+          Only ever use free models; never fall back to paid
+
       --dry-run
           Print the routing decision + cost estimate without calling
-
-      --explain
-          Explain why a model was chosen
 
       --scope <SCOPE>
           Diff scope shown to the reviewer: auto | working-tree | branch
@@ -1820,13 +1859,13 @@ Options:
       --accept-on-green
           Resolve as soon as `--check` exits 0, treating reviewer findings as advisory (escape hatch for over-strict reviewers). Requires `--check`
 
+      --explain
+          Explain why a model was chosen
+
       --max-tokens <MAX_TOKENS>
           Max output tokens
           
           [default: 1024]
-
-      --no-stream
-          Disable streaming output
 
       --require-approval
           Require an explicit approve verdict with no blocking findings
@@ -1834,11 +1873,14 @@ Options:
       --allow-dangerous-check
           Skip the pre-exec denylist inspection of the `--check` command string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`, `curl|sh`, …). Default is to refuse to run a `--check` command that matches the denylist — set this flag to allow such commands explicitly. The denylist is best-effort, not a sandbox; see `exec_safety.rs` for the honest scope statement
 
-      --json
-          JSON output (codex/claude-compatible)
+      --no-stream
+          Disable streaming output
 
       --background
           Run detached as a tracked background job
+
+      --json
+          JSON output (codex/claude-compatible)
 
       --show-reasoning
           Include model reasoning/thinking in the answer (default: off)
@@ -1939,6 +1981,9 @@ Commands:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2062,6 +2107,9 @@ Usage: zoder mcp-server [OPTIONS]
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2188,6 +2236,9 @@ Options:
 
       --search <SEARCH>
           
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --record <RECORD>
           
@@ -2318,7 +2369,13 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --paid
+          
+
+      --all
           
 
       --tier <TIER>
@@ -2326,9 +2383,6 @@ Options:
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
-
-      --all
-          
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
@@ -2452,6 +2506,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2574,6 +2631,9 @@ Usage: zoder providers [OPTIONS]
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2703,6 +2763,9 @@ Commands:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2836,6 +2899,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2958,6 +3024,9 @@ Usage: zoder refresh [OPTIONS]
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3092,22 +3161,25 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
-      --tier <TIER>
-          Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
-          
-          [default: auto]
-          [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --top <TOP>
           Max rows in the by-model table (e.g. `--top 100`). 0 = show all
           
           [default: 20]
 
-      --allow-paid
-          Allow paid models without interactive confirmation (scripts/CI)
+      --tier <TIER>
+          Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
+          
+          [default: auto]
+          [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
       --vendor <VENDOR>
           Restrict the report to one vendor profile (e.g. `--vendor enterprise`). Reads `~/.zoder/config.<vendor>.toml` and only counts ledger entries whose `provider` id was contributed by that TOML. The totals, counterfactual, and avoided-spend headline are all recomputed over the filtered set so the headline is meaningful. See README §"Config overlays" for how to add a vendor
+
+      --allow-paid
+          Allow paid models without interactive confirmation (scripts/CI)
 
       --host <HOST>
           Restrict the report to one publisher host (e.g. `--host meta`), counting every provider that served that publisher's models. The host is the segment before `/` in the model id, so it sums enterprise direct + OpenRouter + any other route for the same publisher. Mutually exclusive with `--vendor` (which scopes by who served the call, not who published the model)
@@ -3232,6 +3304,9 @@ Options:
 
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3360,6 +3435,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3486,6 +3564,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --scope <SCOPE>
           Review scope: auto | working-tree | branch
 
@@ -3496,6 +3577,9 @@ Options:
           
           [default: auto]
 
+      --panel <M1,M2,...>
+          Run additional reviewer models in parallel (comma-separated ids)
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3504,9 +3588,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --panel <M1,M2,...>
-          Run additional reviewer models in parallel (comma-separated ids)
 
       --background
           Run detached as a tracked background job (see `status`/`result`)
@@ -3628,6 +3709,9 @@ Arguments:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3756,6 +3840,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3878,6 +3965,9 @@ Usage: zoder sessions [OPTIONS]
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4009,6 +4099,9 @@ Commands:
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4142,20 +4235,23 @@ Options:
       --since <SINCE>
           Only include spend on/after this date (YYYY-MM-DD)
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --until <UNTIL>
+          Only include spend on/before this date (YYYY-MM-DD)
+
+      --by-model
+          Group by model instead of by period bucket
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --until <UNTIL>
-          Only include spend on/before this date (YYYY-MM-DD)
-
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --by-model
-          Group by model instead of by period bucket
 
       --host <HOST>
           Restrict to one publisher host (the segment before `/` in the model id, e.g. `--host meta`), summed across every provider that served that publisher's models
@@ -4281,6 +4377,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4403,6 +4502,9 @@ Usage: zoder transfer [OPTIONS]
 Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4531,6 +4633,9 @@ Options:
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4656,6 +4761,9 @@ Options:
 
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
+
+      --allowed-routes <PROVIDER=MODEL,...>
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
