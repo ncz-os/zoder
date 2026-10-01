@@ -20,7 +20,7 @@ ZODER="./target/debug/zoder"
 # All known subcommand names (must stay in sync with Cmd enum in zoder-cli).
 SUBCOMMANDS=(
   exec tui models agents update route consult spend report health finops
-  providers config refresh pricing reconcile sessions
+  providers config refresh pricing reconcile sessions mnemos
   review adversarial-review rescue status result cancel jobs
   loop transfer session recipe mcp mcp-server sop configure completions gate
 )
