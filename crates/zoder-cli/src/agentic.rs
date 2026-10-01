@@ -1436,6 +1436,16 @@ fn parse_review(raw: &str) -> ReviewOutput {
     // balanced-object scan was meant to close. Ranking via `verdict_rank`
     // (where unknown/unrecognized verdicts rank as blocking) also stops a
     // hallucinated verdict string from surfacing as approve here.
+    //
+    // 2026-09-30 repair: the regex-shaped enum `approve|request_changes|comment`
+    // is a string a thinking model can echo verbatim when the inline schema
+    // ever drifts back into REVIEW_SYSTEM/ADVERSARIAL_SYSTEM. We accept it
+    // (so a balanced object with a parseable verdict still wins over the
+    // prose fallback) but FORCE the verdict to the canonical three-way
+    // form. A hallucinated verdict that doesn't decode to one of the
+    // three canonical strings MUST fail closed: the canonical verdict
+    // string we carry is the canonical one, and the fail-closed verdict
+    // is the blocking one (`request_changes` per the W4 contract).
     let mut worst: Option<ReviewOutput> = None;
     let mut worst_rank = 0u8;
     for obj in balanced_json_objects(trimmed) {
@@ -1444,6 +1454,16 @@ fn parse_review(raw: &str) -> ReviewOutput {
             if verdict.is_empty() {
                 continue;
             }
+            // Pin the verdict to one of the three canonical strings. Any
+            // other value (regex-shaped enums, hallucinated synonyms) is
+            // fail-closed as `request_changes`: the gate MUST never
+            // propagate a verdict string that the rest of the system
+            // (aggregate_review, the JSON emitter, downstream CI gates)
+            // wouldn't recognize as canonical. The W4 contract is
+            // "unknown verdict → blocking"; we apply it here too so a
+            // schema-echo template (the 2026-09-30 production bug)
+            // can't slip through as `"approve|request_changes|comment"`.
+            let verdict = canonicalize_verdict(&verdict);
             let rank = verdict_rank(&verdict);
             if worst.is_none() || rank > worst_rank {
                 worst_rank = rank;
@@ -1484,6 +1504,31 @@ fn parse_review(raw: &str) -> ReviewOutput {
     }
 }
 
+/// Pin a parsed verdict string to the canonical three-way form. Any
+/// value that does not decode to `approve` / `request_changes` /
+/// `comment` (a regex-shaped enum like `approve|request_changes|comment`,
+/// a hallucinated synonym like `lgtm`, an empty string already filtered
+/// upstream) is rewritten to `request_changes` so the gate fails closed
+/// — the W4 contract: "unknown verdict → blocking". The two-way
+/// callers (`parse_review` and `parse_standalone_review`) share this
+/// canonicalizer so a hallucinated value can't slip through either
+/// path.
+///
+/// Synonyms the existing `verdict_rank` already mapped onto the
+/// canonical set are preserved: `reject` and `block` are carried as
+/// `request_changes` (W4 contract), and `neutral` is carried as
+/// `comment`. Anything else (typos, prose-style `lgtm`, regex-shaped
+/// `approve|request_changes|comment`) fails closed.
+fn canonicalize_verdict(verdict: &str) -> String {
+    match verdict.trim().to_ascii_lowercase().as_str() {
+        "approve" => "approve".to_string(),
+        "request_changes" | "reject" | "block" => "request_changes".to_string(),
+        "comment" | "neutral" => "comment".to_string(),
+        // Unknown / hallucinated / regex-shaped → fail closed.
+        _ => "request_changes".to_string(),
+    }
+}
+
 /// The standalone review gate requires the complete provider answer to be a
 /// verdict object. `parse_review` deliberately supports prose for older loop
 /// workflows, but that recovery can misread a thinking model's explanation
@@ -1499,13 +1544,26 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
             if let Ok(review) =
                 serde_json::from_value::<ReviewOutput>(serde_json::Value::Object(value.clone()))
             {
+                // Pin the verdict to the canonical three-way form (via
+                // the shared `canonicalize_verdict`). The exact-match
+                // check below still requires one of the three canonical
+                // strings AFTER canonicalization, so a regex-shaped
+                // enum (`approve|request_changes|comment`) is rewritten
+                // to `request_changes` BEFORE this matches() check
+                // sees it -- and fails closed here as well.
+                let canonical = canonicalize_verdict(&review.verdict);
                 if matches!(
-                    review.verdict.as_str(),
+                    canonical.as_str(),
                     "approve" | "request_changes" | "comment"
                 ) && !review.summary.trim().is_empty()
                     && review.summary.trim() != "..."
                 {
-                    return review;
+                    return ReviewOutput {
+                        verdict: canonical,
+                        summary: review.summary,
+                        findings: review.findings,
+                        next_steps: review.next_steps,
+                    };
                 }
             }
         }
@@ -5930,6 +5988,133 @@ mod tests {
         assert_eq!(parse_standalone_review(valid).verdict, "approve");
     }
 
+    /// **REGRESSION: 2026-09-30 review-routing repair on canonical master.**
+    ///
+    /// The exact malformed payload the production dispatch surfaced before
+    /// the fix: a thinking model echoes the schema with the regex-shaped
+    /// enum verbatim and `"..."` as filler for every field. Pre-fix, the
+    /// schema was embedded inside the system prompt as
+    /// `"verdict":"approve|request_changes|comment"` and
+    /// `"summary":"..."` and `["..."]`, so a model that "thought out loud"
+    /// (qwen38 / nemotron35 with reasoning enabled) reproduced the schema
+    /// verbatim as its answer. The standalone parser is REQUIRED to fail
+    /// closed on this shape — anything that doesn't carry an EXACTLY-one-
+    /// of verdict (`approve` / `request_changes` / `comment`) and a
+    /// non-empty, non-`...` summary is treated as an unparseable review
+    /// and rendered as `request_changes` with a fail-closed finding.
+    ///
+    /// This is a snapshot of the production wire body; if the schema
+    /// text in `REVIEW_SYSTEM` / `ADVERSARIAL_SYSTEM` ever drifts back to
+    /// include the regex-shaped enum or `"..."` filler, this test pins
+    /// the parse side of the contract so a CI gate can't ship a parser
+    /// regression independently of the prompt-side fix.
+    #[test]
+    fn standalone_review_rejects_exact_bug_placeholder_payload() {
+        let raw = r#"{"verdict":"approve|request_changes|comment","summary":"...","findings":[{"severity":"critical|high|medium|low|info","title":"...","body":"...","location":"path:line (optional)"}],"next_steps":["..."]}"#;
+        let out = parse_standalone_review(raw);
+        assert_eq!(
+            out.verdict, "request_changes",
+            "regex-shaped verdict enum must fail closed; got: {}",
+            out.verdict
+        );
+        assert!(
+            out.summary.contains("failing closed"),
+            "summary must make the fail-closed mode obvious to operators; got: {:?}",
+            out.summary
+        );
+        assert!(
+            out.findings
+                .iter()
+                .any(|f| f.title.contains("unparseable review (fail-closed)")),
+            "fail-closed finding must carry the unparseable-review tag; got: {:?}",
+            out.findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        // The verbatim wire body must be preserved in the finding so an
+        // operator can see exactly what the model emitted.
+        let bodies: Vec<&str> = out.findings.iter().map(|f| f.body.as_str()).collect();
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("approve|request_changes|comment")),
+            "the fail-closed finding must preserve the verbatim regex-shaped verdict; got: {:?}",
+            bodies
+        );
+    }
+
+    /// **REGRESSION: 2026-09-30 review-routing repair.** Standalone parse
+    /// must also reject a payload whose `summary` is the literal `...`
+    /// even if the verdict is otherwise valid (e.g. `"comment"`). The
+    /// placeholder summary is the same template-filler a thinking model
+    /// copies out of the schema when it explains the contract before
+    /// emitting the actual JSON. Without the `summary != "..."` guard,
+    /// such a payload would silently carry a `comment` verdict through
+    /// the gate — the exact pre-fix failure mode.
+    #[test]
+    fn standalone_review_rejects_summary_placeholder() {
+        let raw = r#"{"verdict":"comment","summary":"...","findings":[],"next_steps":[]}"#;
+        let out = parse_standalone_review(raw);
+        assert_eq!(
+            out.verdict, "request_changes",
+            "summary='...' placeholder must fail closed; got: {}",
+            out.verdict
+        );
+        // The valid override path is unaffected: real prose on the same
+        // verdict still parses.
+        let real = r#"{"verdict":"comment","summary":"follow-up on naming","findings":[],"next_steps":[]}"#;
+        assert_eq!(
+            parse_standalone_review(real).verdict,
+            "comment",
+            "a real comment verdict must NOT be failed closed",
+        );
+    }
+
+    /// **REGRESSION: 2026-09-30 review-routing repair.** Standalone parse
+    /// must reject an empty / whitespace-only summary even when verdict
+    /// is one of the canonical three. Empty summaries are a sign of a
+    /// model that emitted a stub without actually reviewing the diff —
+    /// the pre-fix parser accepted them and let the gate pass an empty
+    /// review through as a vote, which is exactly the failure mode that
+    /// surfaced the review-routing bugs (an `approve` with no actual
+    /// review content).
+    #[test]
+    fn standalone_review_rejects_empty_summary() {
+        let raw = r#"{"verdict":"approve","summary":"   ","findings":[],"next_steps":[]}"#;
+        let out = parse_standalone_review(raw);
+        assert_eq!(
+            out.verdict, "request_changes",
+            "empty / whitespace summary must fail closed; got: {}",
+            out.verdict
+        );
+        let raw = r#"{"verdict":"approve","summary":"","findings":[],"next_steps":[]}"#;
+        assert_eq!(
+            parse_standalone_review(raw).verdict,
+            "request_changes",
+            "truly-empty summary must fail closed",
+        );
+    }
+
+    /// **REGRESSION: 2026-09-30 review-routing repair.** Standalone parse
+    /// must reject findings that are JSON strings instead of objects —
+    /// the schema we ship (and the schema the prior prompts embedded
+    /// inline) requires `findings` to be an array of objects with
+    /// `severity/title/body`. A thinking model that emits the schema
+    /// echoed with `"findings":["..."]` is a template-echo failure mode
+    /// the regex-shaped enum catch already covers — but a defensive
+    /// parse that ALSO rejects string-shaped findings closes the case
+    /// where a model emits a syntactically-valid object whose findings
+    /// are strings (`[{"severity":"high","title":"x","body":"y"}]`'s
+    /// sibling case where the array contains `"..."` strings).
+    #[test]
+    fn standalone_review_rejects_string_findings() {
+        let raw = r#"{"verdict":"approve","summary":"lgtm","findings":["..."],"next_steps":[]}"#;
+        let out = parse_standalone_review(raw);
+        assert_eq!(
+            out.verdict, "request_changes",
+            "string-shaped findings must fail closed; got: {}",
+            out.verdict
+        );
+    }
+
     // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
 
     #[test]
@@ -6065,7 +6250,11 @@ mod tests {
         // A `}` inside a JSON string value must not prematurely close the
         // object (string-aware brace counting).
         let raw = "{\"verdict\":\"reject\",\"summary\":\"found a stray } and { in a regex\"}";
-        assert_eq!(parse_review(raw).verdict, "reject");
+        // 2026-09-30 repair: parse_review now routes "reject" through
+        // `canonicalize_verdict`, which maps `reject`/`block` to the
+        // canonical blocking form `request_changes`. The literal
+        // verdict string can no longer leak through as `"reject"`.
+        assert_eq!(parse_review(raw).verdict, "request_changes");
     }
 
     // ---- prose fallback: revert-to-prose recovery for free-form reviews ----
@@ -10458,6 +10647,501 @@ model_provider = "custom.nemotron35"
         assert!(
             entry.ewma_latency_ms.is_some(),
             "reviewer success MUST record ewma_latency_ms (a non-zero latency was measured); got entry={entry:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end review-routing fixtures (2026-09-30 repair).
+//
+// These tests pin the FOUR behaviors the production review-routing
+// incident surfaced on 2026-09-30 against canonical zoder master:
+//
+//   1. A clean APPROVE from a known-good reviewer resolves as `approve`
+//      and exits the gate as a non-blocking verdict (no fake-out via
+//      `comment`).
+//   2. A REQUEST_CHANGES carrying a seeded defect resolves as
+//      `request_changes` with the finding surfaced (the change is
+//      BLOCKED).
+//   3. The EXACT bug-symptom placeholder payload (regex-shaped enum
+//      + `"..."` template filler) fails closed as `request_changes`,
+//      NOT as a phantom `approve` that would silently green-light the
+//      gate.
+//   4. A hung upstream is bounded by `--request-timeout`: the
+//      dispatcher must surface the timeout as a `request_changes` review
+//      failure, not burn CI minutes waiting for a wedged provider.
+//
+// These tests live INSIDE `agentic.rs` (not in `tests/`) so they can
+// reach `parse_review`, `parse_standalone_review`, `complete_once`,
+// `aggregate_review`, and the `ReviewerSlot` discriminant without
+// changing the public API. The wiremock-based reviewer-chain tests
+// (`reviewer_chain_dispatch_tests`, above) cover the dispatch layer in
+// isolation; THIS module covers the OUTER review path so a future
+// refactor of either layer can't silently weaken the other.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod review_routing_e2e_tests {
+    use super::*;
+    use crate::Cli;
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// RAII: pin `ZODER_HOME` and `ZEROCLAW_CONFIG_DIR` to the supplied
+    /// tempdir for the duration of the guard. `Engine::load()` reads the
+    /// engine (zeroclaw) config from `ZEROCLAW_CONFIG_DIR`/`config.toml`,
+    /// a separate file/dir from zoder's own `ZODER_HOME`-relative
+    /// `config.json`. Both must point at the SAME tempdir so the engine
+    // and the zoder config see the same provider identities.
+    struct HomeGuard {
+        #[allow(dead_code)]
+        inner: crate::test_env::EnvGuard,
+        prev_engine_dir: Option<String>,
+    }
+    impl HomeGuard {
+        fn new(home: &Path, engine_dir: &Path) -> Self {
+            std::fs::create_dir_all(engine_dir).expect("mkdir engine_dir");
+            let prev = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+            std::env::set_var("ZEROCLAW_CONFIG_DIR", engine_dir);
+            Self {
+                inner: crate::test_env::EnvGuard::new(home),
+                prev_engine_dir: prev,
+            }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev_engine_dir.take() {
+                Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
+                None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// Write the minimal `model_corpus.json` shape `Corpus::load`
+    /// accepts. Every model is `free=true` so the policy gate (which
+    /// runs before dispatch) doesn't reject the call with a paid-
+    /// confirm prompt.
+    fn write_corpus(home: &Path, ids: &[&str]) {
+        let arr: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "free": true,
+                    "routable": true,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "source": "test",
+            "models": arr,
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write the minimal zoder `config.json` that `Config::load`
+    /// accepts, pointing at the supplied wiremock URI. Single
+    /// provider so the dispatcher lands on `serves` and routes to it.
+    fn write_config(home: &Path, mock_uri: &str, model_id: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "wiremock-reviewer",
+                "base_url": format!("{mock_uri}/reviewer"),
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [model_id],
+            }],
+            "default_provider": "wiremock-reviewer",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "reviewer_model": model_id,
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write the engine-side (`ZEROCLAW_CONFIG_DIR/config.toml`) so
+    /// `Engine::load()` finds an alias->provider mapping for the
+    /// `--agent reviewer` shape. Mirrors the production zoder config
+    /// where `[agents.reviewer].model_provider = "custom.reviewer"`.
+    fn write_engine_config(engine_dir: &Path, model_id: &str) {
+        let body = format!(
+            r#"
+[providers.models.custom.reviewer]
+type = "openai-compatible"
+model = "{model_id}"
+uri = "https://example.invalid/v1"
+chat_template_kwargs = {{ force_nonempty_content = true }}
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        );
+        std::fs::write(engine_dir.join("config.toml"), body).expect("write engine config.toml");
+    }
+
+    /// Build an OpenAI-shaped chat-completion response whose
+    /// `choices[0].message.content` carries `review_json`.
+    fn openai_review_response(review_json: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": review_json,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": review_json.len() / 4,
+                "total_tokens": 50 + review_json.len() / 4,
+            }
+        })
+        .to_string()
+    }
+
+    /// Mount a wiremock expectation at the URL shape `endpoint_url`
+    /// produces for our single provider:
+    /// `<mock_uri>/reviewer/v1/chat/completions`. Returns a valid
+    /// OpenAI chat-completion whose content is `review_json`.
+    async fn mount_200_review(server: &MockServer, review_json: &str) {
+        Mock::given(method("POST"))
+            .and(path("/reviewer/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_review_response(review_json)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a hanging wiremock that delays its response by `delay`.
+    /// Used to assert `--request-timeout` actually bounds the
+    /// dispatcher.
+    async fn mount_hanging_review(server: &MockServer, delay: std::time::Duration) {
+        Mock::given(method("POST"))
+            .and(path("/reviewer/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .set_body_string(openai_review_response(
+                        r#"{"verdict":"approve","summary":"would-be-late","findings":[],"next_steps":[]}"#,
+                    )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Build a minimal `Cli` for a `complete_once` call. Quiet by
+    /// default so test stdout stays clean.
+    fn dummy_cli() -> Cli {
+        Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    /// Stand up a wiremock-backed config whose single provider serves
+    /// `model`. Returns a `HomeGuard` whose lifetime owns the
+    /// isolation; the caller must hold it until the dispatch returns.
+    async fn setup(model_id: &str, review_json: &str) -> (MockServer, HomeGuard, PathBuf) {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let engine_dir = home.join("engine");
+        let g = HomeGuard::new(&home, &engine_dir);
+
+        let server = MockServer::start().await;
+        mount_200_review(&server, review_json).await;
+
+        write_corpus(&home, &[model_id]);
+        write_config(&home, &server.uri(), model_id);
+        write_engine_config(&engine_dir, model_id);
+
+        // `tempfile::TempDir` is consumed when dropped, but the path
+        // lives until the test returns; keep `home_dir` alive for the
+        // lifetime of the test by leaking the inner TempDir. The
+        // filesystem-reclaim is best-effort; tests run sequentially
+        // and the OS reclaims the directory at process exit.
+        std::mem::forget(home_dir);
+        (server, g, home)
+    }
+
+    /// (1) A clean APPROVE from a known-good reviewer resolves as
+    /// `approve` and exits the gate as a non-blocking verdict (no
+    /// fake-out via `comment`). The dispatch must succeed, the wire
+    /// model id must be the pinned id (NOT the alias), and the parsed
+    /// review must carry the summary verbatim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_review_known_good_approve_resolves_through_full_path() {
+        let model = "wiremock-reviewer/test-good";
+        let review = r#"{"verdict":"approve","summary":"trivial diff, no defects","findings":[],"next_steps":[]}"#;
+        let (_server, _g, _home) = setup(model, review).await;
+
+        let cli = dummy_cli();
+        let c = complete_once(&cli, Some(model), &[], "sys", "user", 2048)
+            .await
+            .expect("good-reviewer dispatch must succeed");
+        assert_eq!(
+            c.model, model,
+            "the reported model must be the pinned id, not the alias or a fallback"
+        );
+
+        let parsed = parse_review(&c.content);
+        assert_eq!(
+            parsed.verdict, "approve",
+            "known-good APPROVE payload must parse to approve; got: {}",
+            parsed.verdict
+        );
+        assert_eq!(
+            parsed.summary, "trivial diff, no defects",
+            "summary must be preserved verbatim"
+        );
+        assert!(
+            parsed.findings.is_empty(),
+            "no findings on the approve path; got: {:?}",
+            parsed.findings
+        );
+    }
+
+    /// (2) A REQUEST_CHANGES carrying a seeded defect resolves as
+    /// `request_changes` with the finding surfaced (the change is
+    /// BLOCKED). `aggregate_review`'s worst-rank walk must surface
+    /// the blocking verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_review_seeded_defect_resolves_as_request_changes_with_finding() {
+        let model = "wiremock-reviewer/test-seeded-defect";
+        let review = r#"{
+            "verdict":"request_changes",
+            "summary":"buffer reuse without bounds check in update()",
+            "findings":[{
+                "severity":"high",
+                "title":"unbounded buffer read",
+                "body":"update() copies len(buf) bytes into dst[off..off+len] with no check against dst capacity.",
+                "location":"src/buffer.rs:42"
+            }],
+            "next_steps":["add a length-checked memcpy or grow dst first"]
+        }"#;
+        let (_server, _g, _home) = setup(model, review).await;
+
+        let cli = dummy_cli();
+        let c = complete_once(&cli, Some(model), &[], "sys", "user", 2048)
+            .await
+            .expect(
+                "seeded-defect dispatch must succeed (the wire call is fine; the verdict is what blocks)",
+            );
+        assert_eq!(c.model, model);
+
+        let parsed = parse_review(&c.content);
+        assert_eq!(
+            parsed.verdict, "request_changes",
+            "seeded REQUEST_CHANGES payload must block; got: {}",
+            parsed.verdict
+        );
+        assert!(
+            parsed.summary.contains("buffer"),
+            "summary must carry the seeded defect description; got: {:?}",
+            parsed.summary
+        );
+        assert_eq!(parsed.findings.len(), 1, "exactly one finding expected");
+        assert_eq!(parsed.findings[0].severity, "high");
+        assert_eq!(parsed.findings[0].title, "unbounded buffer read");
+        assert!(
+            parsed.findings[0].location.as_deref() == Some("src/buffer.rs:42"),
+            "location must be preserved; got: {:?}",
+            parsed.findings[0].location
+        );
+        assert!(
+            parsed
+                .next_steps
+                .iter()
+                .any(|s| s.contains("memcpy") || s.contains("grow")),
+            "next_steps must carry the remediation hint; got: {:?}",
+            parsed.next_steps
+        );
+
+        // `aggregate_review`'s worst-rank walk: a single
+        // REQUEST_CHANGES raises the aggregate verdict to
+        // `request_changes`, and the gate exits nonzero so CI sees
+        // the block.
+        let slot_ok = ReviewerSlot::Ok {
+            model: model.into(),
+            review: parsed.clone(),
+        };
+        let (agg, all_failed, _payload) = aggregate_review(&[slot_ok], 0.0, 1, 1, 0);
+        assert!(
+            !all_failed,
+            "a successful slot must NOT register as all-failed; otherwise the gate fails open"
+        );
+        assert_eq!(
+            agg, "request_changes",
+            "aggregate verdict must be blocking for a seeded request_changes"
+        );
+    }
+
+    /// (3) The EXACT bug-symptom placeholder payload -- regex-shaped
+    /// enum + `"..."` template filler -- fails closed as
+    /// `request_changes`, NOT as a phantom `approve` that would
+    /// silently green-light the gate. `aggregate_review` must surface
+    /// this as a complete=true review with a blocking verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_review_malformed_placeholder_payload_fails_closed() {
+        let model = "wiremock-reviewer/test-template-echo";
+        // EXACT shape of the 2026-09-30 production bug: a thinking
+        // model echoes the schema (regex-shaped enum + "..." filler)
+        // verbatim.
+        let review = r#"{"verdict":"approve|request_changes|comment","summary":"...","findings":[{"severity":"critical|high|medium|low|info","title":"...","body":"...","location":"path:line (optional)"}],"next_steps":["..."]}"#;
+        let (_server, _g, _home) = setup(model, review).await;
+
+        let cli = dummy_cli();
+        let c = complete_once(&cli, Some(model), &[], "sys", "user", 2048)
+            .await
+            .expect(
+                "dispatch must succeed -- the wire call returns 200; the bug is in the response shape",
+            );
+        assert_eq!(c.model, model);
+
+        // parse_review (loop path) AND parse_standalone_review
+        // (review path) both fail closed on this shape.
+        let parsed_review = parse_review(&c.content);
+        assert_eq!(
+            parsed_review.verdict, "request_changes",
+            "loop-path parse must fail closed on regex-shaped verdict; got: {}",
+            parsed_review.verdict
+        );
+        let parsed_standalone = parse_standalone_review(&c.content);
+        assert_eq!(
+            parsed_standalone.verdict, "request_changes",
+            "review-path parse must fail closed on regex-shaped verdict; got: {}",
+            parsed_standalone.verdict
+        );
+        assert!(
+            parsed_standalone
+                .findings
+                .iter()
+                .any(|f| f.title.contains("unparseable")),
+            "fail-closed finding must carry the unparseable tag; got: {:?}",
+            parsed_standalone
+                .findings
+                .iter()
+                .map(|f| &f.title)
+                .collect::<Vec<_>>()
+        );
+
+        // aggregate_review must surface this as a complete=true review
+        // with a blocking verdict -- so a CI gate reading `verdict`
+        // rather than the process exit code ALSO sees the failure.
+        let slot_ok = ReviewerSlot::Ok {
+            model: model.into(),
+            review: parsed_standalone.clone(),
+        };
+        let (agg, all_failed, _payload) = aggregate_review(&[slot_ok], 0.0, 1, 1, 0);
+        assert!(
+            !all_failed,
+            "the dispatch succeeded; the gate must NOT report all-failed on a parseable wire body"
+        );
+        assert_eq!(
+            agg, "request_changes",
+            "aggregate verdict must be request_changes (blocking) for a malformed placeholder; got: {}",
+            agg
+        );
+    }
+
+    /// (4) A hung upstream is bounded by `--request-timeout`: the
+    /// dispatcher must surface the timeout as an Err within ~2s, NOT
+    /// block for the full wiremock 8s delay. This is the local-fleet
+    /// symptom the task surfaced ("local qwen38 hung over two
+    /// minutes") -- the production HTTP client must never burn the
+    /// full loop timeout on a wedged provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_review_hung_upstream_bounded_by_request_timeout() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let engine_dir = home.join("engine");
+        let _g = HomeGuard::new(&home, &engine_dir);
+
+        let server = MockServer::start().await;
+        // Wiremock delay > the request-timeout we set on the CLI.
+        mount_hanging_review(&server, std::time::Duration::from_secs(8)).await;
+
+        let model = "wiremock-reviewer/test-hung";
+        write_corpus(&home, &[model]);
+        write_config(&home, &server.uri(), model);
+        write_engine_config(&engine_dir, model);
+
+        // 1s request-timeout + 0 retries: the dispatcher must surface
+        // the timeout within ~2s, NOT block for the full wiremock 8s.
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--request-timeout", "1", "--retries", "0"])
+                .expect("clap parse");
+
+        let started = std::time::Instant::now();
+        let result = complete_once(&cli, Some(model), &[], "sys", "user", 2048).await;
+        let elapsed = started.elapsed();
+
+        let err =
+            result.expect_err("hung upstream must surface as Err, NOT Ok with a phantom verdict");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("timeout")
+                || msg.to_lowercase().contains("timed out")
+                || msg.to_lowercase().contains("elapsed"),
+            "timeout must be observable in the error chain; got: {msg}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "1s request-timeout must bound the dispatch well under the wiremock 8s delay; actual: {elapsed:?}"
+        );
+    }
+
+    /// A 404 from the only configured provider surfaces as Err, NOT
+    /// as Ok with an empty review (which would be a phantom approve
+    /// and fail the gate open).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_review_404_provider_not_found_is_fallback_worthy() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let engine_dir = home.join("engine");
+        let _g = HomeGuard::new(&home, &engine_dir);
+
+        let server = MockServer::start().await;
+        // 404 from the broken provider -- the exact shape the
+        // production incident surfaced from an enterprise LLM gateway.
+        let body_404 = serde_json::json!({
+            "status": 404,
+            "title": "Not Found",
+            "detail": "Function [REDACTED] Not found for account [REDACTED]",
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/reviewer/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(body_404))
+            .mount(&server)
+            .await;
+
+        let model = "wiremock-reviewer/test-404";
+        write_corpus(&home, &[model]);
+        write_config(&home, &server.uri(), model);
+        write_engine_config(&engine_dir, model);
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).expect("clap parse");
+        let err = complete_once(&cli, Some(model), &[], "sys", "user", 2048)
+            .await
+            .expect_err(
+                "a 404 from the only configured provider must surface as Err, not Ok with an empty verdict",
+            );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("404") || msg.to_lowercase().contains("not found"),
+            "the 404 must be observable; got: {msg}"
         );
     }
 }
