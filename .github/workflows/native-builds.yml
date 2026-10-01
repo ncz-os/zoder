@@ -30,6 +30,7 @@ jobs:
       zoder_sha: ${{ steps.resolve.outputs.zoder_sha }}
       engine_sha: ${{ steps.resolve.outputs.engine_sha }}
       upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+      channel: ${{ steps.resolve.outputs.channel }}
     steps:
       - name: Resolve immutable source revisions
         id: resolve
@@ -56,6 +57,7 @@ jobs:
           git -C engine-history fetch --filter=blob:none --no-tags "https://${ENGINE_REPO}" "$ENGINE_SHA"
           git -C engine-history fetch --filter=blob:none --no-tags https://github.com/zeroclaw-labs/zeroclaw.git "$UPSTREAM_SHA"
           git -C engine-history merge-base --is-ancestor "$UPSTREAM_SHA" "$ENGINE_SHA" || { echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA; run ZeroClaw source sync first."; exit 1; }
+          echo "channel=run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "zoder_sha=$ZODER_SHA" >> "$GITHUB_OUTPUT"
           echo "engine_sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
@@ -104,6 +106,7 @@ jobs:
           ZODER_SHA: ${{ needs.sources.outputs.zoder_sha }}
           ENGINE_SHA: ${{ needs.sources.outputs.engine_sha }}
           UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
+          CHANNEL: ${{ needs.sources.outputs.channel }}
           ENGINE_USER: ${{ secrets.GITLAB_ENGINE_USER }}
           ENGINE_TOKEN: ${{ secrets.GITLAB_ENGINE_TOKEN }}
         run: |
@@ -123,9 +126,11 @@ jobs:
           cp "target/${TRIPLE}/release/zoder" "dist/zoder-${TRIPLE}/"
           cp ".zc-src/target/${TRIPLE}/release/zerocode" ".zc-src/target/${TRIPLE}/release/zeroclaw" "dist/zoder-${TRIPLE}/"
           python3 - <<'PY'
-          import json, os, pathlib
+          import hashlib, json, os, pathlib
           p = pathlib.Path('dist') / ('zoder-' + os.environ['TRIPLE']) / 'manifest.json'
           p.write_text(json.dumps({
+              'schema': 1, 'channel': os.environ['CHANNEL'],
+              'binaries': {b: hashlib.sha256((p.parent / b).read_bytes()).hexdigest() for b in ('zoder', 'zerocode', 'zeroclaw')},
               'zoder': {'repository': 'https://gitlab.com/ncz-os/zoder', 'sha': os.environ['ZODER_SHA']},
               'engine': {'repository': 'https://' + os.environ['ENGINE_REPO'], 'sha': os.environ['ENGINE_SHA'], 'upstream_sha': os.environ['UPSTREAM_SHA']},
               'target': os.environ['TRIPLE'], 'locked': True,
@@ -162,6 +167,7 @@ jobs:
           ZODER_SHA: ${{ needs.sources.outputs.zoder_sha }}
           ENGINE_SHA: ${{ needs.sources.outputs.engine_sha }}
           UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
+          CHANNEL: ${{ needs.sources.outputs.channel }}
           PKG_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -171,14 +177,16 @@ jobs:
             sha256sum -c "zoder-${triple}.tar.gz.sha256"
             tar -xzf "zoder-${triple}.tar.gz"
             TRIPLE="$triple" python3 - <<'PY'
-          import json, os, pathlib
+          import hashlib, json, os, pathlib
           root = pathlib.Path('zoder-' + os.environ['TRIPLE'])
           m = json.loads((root / 'manifest.json').read_text())
+          assert m['schema'] == 1 and m['channel'] == os.environ['CHANNEL']
           assert m['zoder']['sha'] == os.environ['ZODER_SHA']
           assert m['engine']['sha'] == os.environ['ENGINE_SHA']
           assert m['engine']['upstream_sha'] == os.environ['UPSTREAM_SHA']
           assert m['target'] == os.environ['TRIPLE'] and m['locked'] is True
-          assert all((root / b).is_file() for b in ('zoder', 'zerocode', 'zeroclaw'))
+          assert set(m['binaries']) == {'zoder', 'zerocode', 'zeroclaw'}
+          assert all(hashlib.sha256((root / b).read_bytes()).hexdigest() == m['binaries'][b] for b in m['binaries'])
           PY
           done
           DATE="$(date -u +%F)"
@@ -188,12 +196,22 @@ jobs:
               src="zoder-${triple}/${bin}"
               dst="${bin}-${triple}"
               sha256sum "$src" | cut -d' ' -f1 > checksum
-              for channel in "$DATE" master; do
+              for channel in "$CHANNEL" "$DATE" master; do
                 curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file "$src" "${BASE}/${channel}/${dst}"
                 curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file checksum "${BASE}/${channel}/${dst}.sha256"
               done
             done
           done
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          targets = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')
+          release = {'schema': 1, 'channel': os.environ['CHANNEL'],
+                     'zoder_sha': os.environ['ZODER_SHA'], 'engine_sha': os.environ['ENGINE_SHA'],
+                     'upstream_sha': os.environ['UPSTREAM_SHA'],
+                     'manifests': {t: hashlib.sha256((pathlib.Path('zoder-' + t) / 'manifest.json').read_bytes()).hexdigest() for t in targets}}
+          pathlib.Path('release.json').write_text(json.dumps(release, indent=2) + '\n')
+          PY
+          curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file release.json "${BASE}/${CHANNEL}/release.json"
           NOTES="Rolling nightly trio, ${DATE} UTC. zoder ${ZODER_SHA}; engine ${ENGINE_SHA}. All three native targets built with --locked. Each archive includes manifest.json with exact source SHAs and build run."
           # Preserve old downloads until all targets and manifests pass.
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -201,4 +219,6 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.sha256 --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --notes "$NOTES"
+          # Activate one complete immutable snapshot only after both publishers succeed.
+          curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file release.json "${BASE}/master/release.json"
           echo "$NOTES" >> "$GITHUB_STEP_SUMMARY"

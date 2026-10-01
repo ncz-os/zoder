@@ -3173,7 +3173,7 @@ pub(crate) async fn cmd_review(
                 // by variant. `model` here is only cosmetic ("(failed)").
                 reviews.push(ReviewerSlot::Failed {
                     model: "(failed)".into(),
-                    err: format!("{e}"),
+                    err: format!("{e:#}"),
                 });
             }
         }
@@ -4806,17 +4806,15 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     if p { "PASSES" } else { "FAILS" }
                 ));
                 if p {
-                    // Green-aware calibration: the objective gate already proves
-                    // the change works. Keep the reviewer adversarial but stop it
-                    // manufacturing blockers on a correct tree — block only on real
-                    // regressions, each citing a concrete location.
+                    // A configured check may validate delivery or lint only.
+                    // Do not turn its success into evidence for untested behavior.
                     u.push_str(
-                        "\nThe objective gate is GREEN: the build/tests pass, so the change is \
-functionally correct. Do NOT block on style, naming, missing-test-coverage, or hypothetical \
-concerns. Use verdict `request_changes` with a `critical` finding ONLY for a concrete \
-correctness or security REGRESSION introduced by this diff, and every blocking finding MUST \
-cite an exact `location` (path:line). Otherwise return `approve` (or `comment` for non-blocking \
-nits).\n",
+                        "\nThe configured validation command passed. This proves only what that \
+command actually checks; it may not build or test the code and does not establish functional \
+correctness. Review the diff independently for concrete correctness or security defects, \
+including behavior outside the command's coverage. Do not manufacture blockers for style \
+or hypothetical concerns. Assign findings their appropriate severity and cite an exact \
+`location` (path:line) for each blocking finding. Approve only when no blocking defects remain.\n",
                     );
                 } else {
                     u.push_str(&format!(

@@ -42,11 +42,21 @@ class NightlyPublishTests(unittest.TestCase):
                 for binary in ("zoder", "zerocode", "zeroclaw"):
                     (stage / binary).write_bytes(b"fixture binary")
                 manifest = {
+                    "schema": 1,
+                    "channel": "run-123-1",
+                    "binaries": {
+                        b: hashlib.sha256((stage / b).read_bytes()).hexdigest()
+                        for b in ("zoder", "zerocode", "zeroclaw")
+                    },
                     "zoder": {"sha": "a" * 40},
                     "engine": {"sha": "b" * 40, "upstream_sha": "e" * 40},
                     "target": target,
                     "locked": True,
                 }
+                if defect == "wrong_binary" and target == TARGETS[-1]:
+                    (stage / "zoder").write_bytes(b"unexpected binary")
+                if defect == "wrong_channel" and target == TARGETS[-1]:
+                    manifest["channel"] = "run-122-1"
                 if defect == "wrong_source" and target == TARGETS[-1]:
                     manifest["engine"]["sha"] = "c" * 40
                 (stage / "manifest.json").write_text(json.dumps(manifest))
@@ -63,6 +73,8 @@ class NightlyPublishTests(unittest.TestCase):
                 "ZODER_SHA": "a" * 40,
                 "ENGINE_SHA": "b" * 40,
                 "UPSTREAM_SHA": "e" * 40,
+                "CHANNEL": "run-123-1",
+                "DEFECT": defect or "",
                 "PROJECT_ID": "fixture",
                 "PKG_TOKEN": "fixture",
                 "RELEASE_TAG": "fixture",
@@ -72,9 +84,7 @@ class NightlyPublishTests(unittest.TestCase):
                 "EVENTS": str(root / "events"),
             }
             # Functions intercept every network mutation in the unmodified script.
-            stubs = (
-                'curl() { echo curl >> "$EVENTS"; }; gh() { echo gh >> "$EVENTS"; };\n'
-            )
+            stubs = 'curl() { echo "curl ${*: -1}" >> "$EVENTS"; }; gh() { echo "gh $*" >> "$EVENTS"; [[ "$DEFECT" != gh_failure || "$2" != upload ]]; };\n'
             result = subprocess.run(
                 ["bash"],
                 input=stubs + SCRIPT,
@@ -135,6 +145,8 @@ class NightlyPublishTests(unittest.TestCase):
                     "ENGINE_BRANCH": "master",
                     "GITHUB_REF": "refs/heads/master",
                     "GITHUB_SHA": "a" * 40,
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_OUTPUT": str(root / "outputs"),
                     "GITHUB_STEP_SUMMARY": str(root / "summary"),
                 }
@@ -162,11 +174,24 @@ class NightlyPublishTests(unittest.TestCase):
     def test_complete_matrix_publishes(self):
         result, events = self.run_publish()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events.count("curl"), 48)
-        self.assertEqual(events.count("gh"), 3)
+        self.assertEqual(sum(e.startswith("curl ") for e in events), 74)
+        self.assertEqual(sum(e.startswith("gh ") for e in events), 3)
+        self.assertTrue(events[-1].endswith("/master/release.json"))
+        self.assertTrue(events[-2].startswith("gh release edit"))
+
+    def test_failed_github_publication_does_not_activate(self):
+        result, events = self.run_publish("gh_failure")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(e.endswith("/master/release.json") for e in events))
 
     def test_bad_artifacts_never_publish(self):
-        for defect in ("missing_target", "wrong_source", "corrupt_archive"):
+        for defect in (
+            "missing_target",
+            "wrong_source",
+            "corrupt_archive",
+            "wrong_binary",
+            "wrong_channel",
+        ):
             with self.subTest(defect=defect):
                 result, events = self.run_publish(defect)
                 self.assertNotEqual(result.returncode, 0)
