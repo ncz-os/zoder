@@ -69,6 +69,11 @@ pluggable vector backends. It's the system of record that lets a fleet of
 agents share context across runs and hosts instead of each keeping scattered
 local files.
 
+See **[MNEMOS-WORK-LEDGER.md](MNEMOS-WORK-LEDGER.md)** for the zoder-specific
+MNEMOS work ledger: configuration, `zoder mnemos --search`/`--record` examples,
+per-iteration local `.git` ledger, remote checkpoints, `HIVE_JOB_ID` context,
+failure behavior, and limits.
+
 When a MNEMOS datastore is configured, zoder logs memories and recall there. For
 durable session history zoder also ships **database-backed session persistence**
 (PostgreSQL / MySQL / Oracle / Db2, feature-gated) — so a hive of headless
