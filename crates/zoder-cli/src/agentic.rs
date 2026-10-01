@@ -801,26 +801,49 @@ pub(crate) fn build_reviewer_candidates(
         out.truncate(1);
     }
 
-    if let Some(allowed) = crate::parsed_allowed_routes(cli)? {
+    let global_allowed = crate::parsed_allowed_routes(cli)?;
+    let reviewer_allowed = crate::parsed_reviewer_allowed_routes(cli)?;
+    if global_allowed.is_some() || reviewer_allowed.is_some() {
+        let restriction = if reviewer_allowed.is_some() {
+            "--reviewer-allowed-routes"
+        } else {
+            "--allowed-routes"
+        };
         let routing = crate::RoutingContext::load(&eng.cfg)?;
         let permitted = |model: &str| {
             routing
                 .real_provider_for_model(&eng.cfg, model)
                 .is_some_and(|provider| {
-                    allowed
-                        .iter()
-                        .any(|pair| pair.0 == provider.id && pair.1 == model)
+                    let in_global = global_allowed
+                        .as_ref()
+                        .map(|allowed| {
+                            allowed
+                                .iter()
+                                .any(|pair| pair.0 == provider.id && pair.1 == model)
+                        })
+                        .unwrap_or(true);
+                    let in_reviewer = reviewer_allowed
+                        .as_ref()
+                        .map(|allowed| {
+                            allowed
+                                .iter()
+                                .any(|pair| pair.0 == provider.id && pair.1 == model)
+                        })
+                        .unwrap_or(true);
+                    in_global && in_reviewer
                 })
         };
         if resolved_override
             .as_deref()
             .is_some_and(|model| !permitted(model))
         {
-            anyhow::bail!("explicit reviewer route is outside --allowed-routes");
+            anyhow::bail!("explicit reviewer route is outside {restriction}");
         }
         out.retain(|model| permitted(model));
         if out.is_empty() {
-            anyhow::bail!("no reviewer route matches --allowed-routes; refusing fallback outside the allowlist");
+            anyhow::bail!(
+                "no reviewer route matches {restriction}; refusing fallback outside the allowlist"
+            );
         }
     }
 
@@ -972,7 +995,7 @@ async fn dispatch_reviewer_for_model(
             )));
         }
     };
-    if let Err(error) = crate::require_allowed_route(cli, &provider_cfg.id, model) {
+    if let Err(error) = crate::require_allowed_reviewer_route(cli, &provider_cfg.id, model) {
         return Err(ReviewerError::fatal(error.to_string()));
     }
 
@@ -9737,6 +9760,113 @@ mod reviewer_chain_dispatch_tests {
     }
 
     #[test]
+    fn reviewer_role_allowlist_is_separate_from_author() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "working-model/reviewer,broken-model/head",
+        );
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "route",
+            "-m",
+            "broken-model/head",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/head,wiremock-working=working-model/reviewer",
+            "--reviewer-allowed-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        let engine = Engine::load().unwrap();
+        let routes = crate::resolve_chain(&cli, &engine, &HealthStore::default()).unwrap();
+        assert_eq!(routes.primary, vec!["broken-model/head"]);
+        assert_eq!(
+            build_reviewer_candidates(&cli, None, &routes.reviewer).unwrap(),
+            vec!["working-model/reviewer"]
+        );
+        assert!(build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).is_err());
+        assert!(crate::require_allowed_route(&cli, "wiremock-broken", "broken-model/head").is_ok());
+        assert!(crate::require_allowed_reviewer_route(
+            &cli,
+            "wiremock-broken",
+            "broken-model/head"
+        )
+        .is_err());
+        assert!(crate::require_allowed_reviewer_route(
+            &cli,
+            "wiremock-working",
+            "working-model/reviewer"
+        )
+        .is_ok());
+        assert!(crate::require_allowed_reviewer_route(
+            &cli,
+            "other-provider",
+            "working-model/reviewer"
+        )
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_role_preview_fails_closed_and_intersects_global_policy() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "working-model/reviewer,broken-model/head",
+        );
+        for reviewer_list in [
+            "wiremock-working=working-model/reviewer",
+            "missing=missing",
+            "",
+            "malformed",
+            "wiremock-working=",
+        ] {
+            let cli = Cli::try_parse_from([
+                "zoder",
+                "route",
+                "-m",
+                "broken-model/head",
+                "--dry-run",
+                "--json",
+                "--reviewer-allowed-routes",
+                reviewer_list,
+            ])
+            .unwrap();
+            let result = crate::cmd_route(&cli, None).await;
+            assert_eq!(
+                result.is_ok(),
+                reviewer_list == "wiremock-working=working-model/reviewer",
+                "{reviewer_list:?}: {result:?}"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "route",
+            "-m",
+            "broken-model/head",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/head",
+            "--reviewer-allowed-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        assert!(build_reviewer_candidates(&cli, None, &[]).is_err());
+        assert!(crate::require_allowed_reviewer_route(
+            &cli,
+            "wiremock-working",
+            "working-model/reviewer"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn no_fallback_truncates_before_allowlist() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
@@ -9905,6 +10035,8 @@ mod reviewer_chain_dispatch_tests {
             "--retries",
             "0",
             "--allowed-routes",
+            "wiremock-broken=broken-model/coder-6.7b,wiremock-working=working-model/glm-5.1",
+            "--reviewer-allowed-routes",
             "wiremock-broken=broken-model/coder-6.7b",
         ])
         .expect("clap parse");
@@ -10353,7 +10485,13 @@ model_provider = "custom.nemotron35"
             "broken-model/coder-6.7b,working-model/glm-5.1",
         );
 
-        let cli = dummy_cli();
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--reviewer-allowed-routes",
+            "wiremock-broken=broken-model/coder-6.7b,wiremock-working=working-model/glm-5.1",
+        ])
+        .unwrap();
         let result = complete_once(
             &cli,
             None,
