@@ -118,7 +118,6 @@ jobs:
           p = pathlib.Path('dist') / ('zoder-' + __import__('os').environ['TRIPLE'] + '.tar.gz')
           p.with_suffix(p.suffix + '.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n')
           PY
-          echo "Built $TRIPLE: zoder $ZODER_SHA; engine $ENGINE_SHA (locked)." >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
