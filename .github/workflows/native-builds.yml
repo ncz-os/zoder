@@ -66,7 +66,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.sources.outputs.zoder_sha }}
+          persist-credentials: false
+
+      - name: Fetch pinned canonical zoder source
+        env:
+          ZODER_SHA: ${{ needs.sources.outputs.zoder_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 https://gitlab.com/ncz-os/zoder.git "$ZODER_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$ZODER_SHA"
 
       - name: Native build deps (Linux)
         if: runner.os == 'Linux'
@@ -175,7 +184,7 @@ jobs:
           NOTES="Rolling nightly trio, ${DATE} UTC. zoder ${ZODER_SHA}; engine ${ENGINE_SHA}. All three native targets built with --locked. Each archive includes manifest.json with exact source SHAs and build run."
           # Preserve old downloads until all targets and manifests pass.
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --target "$ZODER_SHA" --title "zoder nightly (rolling)" --notes "$NOTES"
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "zoder nightly (rolling)" --notes "$NOTES"
           fi
           gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.sha256 --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --notes "$NOTES"

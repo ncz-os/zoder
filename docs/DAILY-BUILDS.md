@@ -4,12 +4,12 @@ The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/
 
 ## Source and acceptance
 
-- Scheduled/default-branch runs resolve the latest canonical GitLab `ncz-os/zoder` **master** at start. The GitHub mirror must contain that revision for checkout to succeed.
+- Scheduled/default-branch runs resolve the latest canonical GitLab `ncz-os/zoder` **master** at start. The build fetches that exact revision directly from GitLab, so mirror delay does not select old source or block checkout.
 - The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The separate ZeroClaw upstream CI tracks upstream master.
 - Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
 - Every archive contains `manifest.json`: exact repository/commit pairs, target, and run URL. The raw package channel also contains `manifest.json-<target>` plus its checksum.
 - All three targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.
-- Manual dispatch on a topic branch validates that branch and uploads Actions artifacts, but does not replace the master/nightly fleet channels. Fixes on a topic branch must be reviewed and merged to master before the scheduled nightly includes them.
+- Manual dispatch on a topic branch validates that branch and uploads Actions artifacts, but does not replace the master/nightly fleet channels. Fixes on a topic branch must be reviewed and merged to master before the scheduled nightly includes them. The GitHub hosting tag uses the workflow commit; archive manifests and release notes identify the canonical commits actually compiled.
 
 ## Verify a nightly
 
