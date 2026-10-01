@@ -272,6 +272,12 @@ struct Cli {
     /// tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b.
     #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
     allowed_routes: Option<String>,
+
+    /// Restrict reviewer attempts to exact provider=model pairs (comma
+    /// separated). Intersects with --allowed-routes if both are provided.
+    /// An empty or unavailable allowlist fails before dispatch.
+    #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
+    reviewer_allowed_routes: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
     /// (default auto). Out-of-set values are rejected at parse time so a
     /// typo (e.g. `strogn`) can never silently downgrade to `auto` routing.
@@ -3677,23 +3683,34 @@ fn provider_for_resolved_model<'a>(
     }
 }
 
-fn parsed_allowed_routes(cli: &Cli) -> anyhow::Result<Option<Vec<(String, String)>>> {
-    let Some(raw) = cli.allowed_routes.as_deref() else {
-        return Ok(None);
-    };
+fn parse_route_list(raw: &str, flag_name: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut routes = Vec::new();
     for entry in raw.split(',') {
         let (provider, model) = entry.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--allowed-routes entries must be exact PROVIDER=MODEL pairs")
+            anyhow::anyhow!("{flag_name} entries must be exact PROVIDER=MODEL pairs")
         })?;
         let provider = provider.trim();
         let model = model.trim();
         if provider.is_empty() || model.is_empty() {
-            anyhow::bail!("--allowed-routes contains an empty provider or model");
+            anyhow::bail!("{flag_name} contains an empty provider or model");
         }
         routes.push((provider.to_string(), model.to_string()));
     }
-    Ok(Some(routes))
+    Ok(routes)
+}
+
+fn parsed_allowed_routes(cli: &Cli) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    let Some(raw) = cli.allowed_routes.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(parse_route_list(raw, "--allowed-routes")?))
+}
+
+fn parsed_reviewer_allowed_routes(cli: &Cli) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    let Some(raw) = cli.reviewer_allowed_routes.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(parse_route_list(raw, "--reviewer-allowed-routes")?))
 }
 
 fn require_allowed_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Result<()> {
@@ -3704,6 +3721,22 @@ fn require_allowed_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Resu
         {
             anyhow::bail!(
                 "effective route {provider}={model} is outside --allowed-routes; refusing dispatch"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_allowed_reviewer_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Result<()> {
+    require_allowed_route(cli, provider, model)?;
+    // Check reviewer-specific allowed routes
+    if let Some(reviewer_allowed) = parsed_reviewer_allowed_routes(cli)? {
+        if !reviewer_allowed
+            .iter()
+            .any(|pair| pair.0 == provider && pair.1 == model)
+        {
+            anyhow::bail!(
+                "effective route {provider}={model} is outside --reviewer-allowed-routes; refusing dispatch"
             );
         }
     }
