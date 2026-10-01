@@ -797,6 +797,29 @@ fn build_reviewer_candidates(
         push_unique(&mut out, &default);
     }
 
+    if let Some(allowed) = crate::parsed_allowed_routes(cli)? {
+        let routing = crate::RoutingContext::load(&eng.cfg)?;
+        let permitted = |model: &str| {
+            routing
+                .real_provider_for_model(&eng.cfg, model)
+                .is_some_and(|provider| {
+                    allowed
+                        .iter()
+                        .any(|pair| pair.0 == provider.id && pair.1 == model)
+                })
+        };
+        if resolved_override
+            .as_deref()
+            .is_some_and(|model| !permitted(model))
+        {
+            anyhow::bail!("explicit reviewer route is outside --allowed-routes");
+        }
+        out.retain(|model| permitted(model));
+        if out.is_empty() {
+            anyhow::bail!("no reviewer route matches --allowed-routes; refusing fallback outside the allowlist");
+        }
+    }
+
     Ok(out)
 }
 
@@ -945,6 +968,9 @@ async fn dispatch_reviewer_for_model(
             )));
         }
     };
+    if let Err(error) = crate::require_allowed_route(cli, &provider_cfg.id, model) {
+        return Err(ReviewerError::fatal(error.to_string()));
+    }
 
     // Gate the reviewer/panel model. Reviewers run non-interactively (panel +
     // fix loop), so a PAID reviewer is REJECTED rather than prompted — pass
@@ -9704,6 +9730,35 @@ mod reviewer_chain_dispatch_tests {
     /// `eprintln` not stdout.
     fn dummy_cli() -> Cli {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    #[test]
+    fn reviewer_allowlist_filters_configured_and_scenario_fallbacks() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(home, "http://127.0.0.1:9", "broken-model/head");
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "--allowed-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        let scenario = vec![
+            "working-model/reviewer".to_string(),
+            "broken-model/head".to_string(),
+        ];
+        let candidates = build_reviewer_candidates(&cli, None, &scenario).unwrap();
+        assert_eq!(candidates, vec!["working-model/reviewer"]);
+        assert!(
+            build_reviewer_candidates(&cli, Some("broken-model/head"), &scenario)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("explicit reviewer route is outside")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
