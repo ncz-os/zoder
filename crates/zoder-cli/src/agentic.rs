@@ -715,7 +715,7 @@ async fn complete_once(
 /// route a same-family reviewer ahead of a configured cross-family one. The
 /// pure ordering for 1--4 lives in `order_reviewer_candidates` so the
 /// precedence seam is unit-testable without I/O.
-fn build_reviewer_candidates(
+pub(crate) fn build_reviewer_candidates(
     cli: &crate::Cli,
     model_override: Option<&str>,
     reviewer_chain: &[String],
@@ -9758,6 +9758,72 @@ mod reviewer_chain_dispatch_tests {
                 .unwrap()
                 .to_string()
                 .contains("explicit reviewer route is outside")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_route_regression_valid_and_impossible_allowlists() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(home, "http://127.0.0.1:9", "working-model/reviewer");
+
+        // Valid CLI parse
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "route",
+            "--model",
+            "broken-model/head",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/head,wiremock-working=working-model/reviewer",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        // crate::cmd_route(&cli, None).await must succeed
+        crate::cmd_route(&cli, None)
+            .await
+            .expect("cmd_route should succeed for valid allowlist");
+
+        // Check crate::resolve_chain with Engine::load and HealthStore::default
+        let engine = Engine::load().expect("engine load");
+        let health_store = HealthStore::default();
+        let chain = crate::resolve_chain(&cli, &engine, &health_store)
+            .expect("resolve_chain should succeed");
+
+        // build_reviewer_candidates returns includes configured working reviewer
+        let candidates = build_reviewer_candidates(&cli, None, &chain.reviewer)
+            .expect("build_reviewer_candidates should succeed");
+        assert!(
+            candidates.contains(&"working-model/reviewer".to_string()),
+            "candidates should include working-model/reviewer"
+        );
+
+        // Impossible parse allowlist
+        let cli_impossible = Cli::try_parse_from([
+            "zoder",
+            "route",
+            "--model",
+            "broken-model/head",
+            "--allowed-routes",
+            "no-such-provider=not-a-model",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        let result = crate::cmd_route(&cli_impossible, None).await;
+        assert!(
+            result.is_err(),
+            "cmd_route should fail for impossible allowlist"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no author route matches"),
+            "error should contain 'no author route matches', got: {}",
+            err_msg
         );
     }
 

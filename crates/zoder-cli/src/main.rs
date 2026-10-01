@@ -4158,9 +4158,26 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.route_corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
     let resolved = resolve_chain_for_execution(cli, &eng, &health).await?;
+    if resolved.primary.is_empty() {
+        anyhow::bail!("no runnable author route under the requested policy");
+    }
     // Echo the task so the decision is traceable; routing is currently
     // capability/health based, not prompt-content based (see roadmap).
     let task = prompt.filter(|p| p != "-" && !p.trim().is_empty());
+    // Resolve the effective reviewer chain using the same logic as the
+    // agentic execution path to ensure the preview matches reality.
+    // This handles configured reviewers and allowlist filtering.
+    let reviewer_resolution = agentic::build_reviewer_candidates(cli, None, &resolved.reviewer);
+    let reviewers = match reviewer_resolution {
+        Ok(r) => r,
+        Err(e) => {
+            // Fail-closed behavior: if reviewer resolution fails (e.g., strict
+            // allowlist with no valid candidates), we must not silently proceed
+            // or output an empty list that implies success. We return an error
+            // to the caller to maintain a predictable contract.
+            return Err(anyhow::anyhow!("reviewer resolution failed: {e}"));
+        }
+    };
     if cli.json {
         if cli.verbose > 0 {
             if let Some(out) = &enrichment {
@@ -4181,7 +4198,7 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
                 "primary": resolved.primary.first().cloned().unwrap_or_default(),
                 "fallbacks": resolved.primary.iter().skip(1).cloned().collect::<Vec<_>>(),
                 "reason": resolved.reason,
-                "reviewer": resolved.reviewer,
+                "reviewers": reviewers,
             })
         );
     } else {
@@ -4209,8 +4226,8 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
                 println!("fallbacks: {}", fallbacks.join(", "));
             }
         }
-        if !resolved.reviewer.is_empty() {
-            println!("reviewer: {}", resolved.reviewer.join(", "));
+        if !reviewers.is_empty() {
+            println!("reviewers: {}", reviewers.join(", "));
         }
     }
     Ok(())
