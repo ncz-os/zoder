@@ -2022,34 +2022,24 @@ impl PatchJournal {
             .map(|s| s.lines().map(|l| l.to_string()).collect())
             .unwrap_or_default();
 
-        // Capture untracked (non-ignored) files. Use --directory flag so
-        // directory entries are included (they contain nested untracked files).
-        let untracked_raw = run_git(
-            cwd,
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--directory",
-                "-z",
-            ],
-        )
-        .ok()
-        .map(|s| {
-            let mut files = Vec::new();
-            for entry in s.split('\0') {
-                if entry.is_empty() {
-                    continue;
+        // Capture exact non-ignored file paths, matching current-file enumeration.
+        let untracked_raw = run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])
+            .ok()
+            .map(|s| {
+                let mut files = Vec::new();
+                for entry in s.split('\0') {
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    // Strip trailing slash for directories; only add files.
+                    let path = entry.trim_end_matches('/');
+                    if !path.is_empty() && !path.starts_with(".git/") {
+                        files.push(path.to_string());
+                    }
                 }
-                // Strip trailing slash for directories; only add files.
-                let path = entry.trim_end_matches('/');
-                if !path.is_empty() && !path.starts_with(".git/") {
-                    files.push(path.to_string());
-                }
-            }
-            files
-        })
-        .unwrap_or_default();
+                files
+            })
+            .unwrap_or_default();
 
         self.baseline = Some(Baseline {
             head_sha,
@@ -2106,9 +2096,11 @@ impl PatchJournal {
                         &["diff", "--cached", tree],
                         &[("GIT_INDEX_FILE", &idx_s)],
                     ) {
-                        if !output.trim().is_empty() {
-                            result.push_str(&output);
-                        }
+                        // The snapshot already includes every non-ignored file.
+                        // Return even an empty diff: appending synthetic hunks
+                        // would duplicate new files and misattribute old files.
+                        let _ = std::fs::remove_file(&idx);
+                        return output;
                     }
                 }
                 let _ = std::fs::remove_file(&idx);
@@ -11688,6 +11680,23 @@ mod completion_integrity_tests {
         assert!(diff.contains("fn added()"));
         assert_eq!(diff.matches("+++ ").count(), 2);
         assert!(!diff.contains(&repo.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn task_snapshot_excludes_existing_nested_untracked_and_counts_new_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        std::fs::create_dir(repo.join("notes")).unwrap();
+        std::fs::write(repo.join("notes/existing.md"), "preexisting evidence\n").unwrap();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        assert!(journal.agent_diff(repo).is_empty());
+        std::fs::write(repo.join("notes/new.md"), "new evidence\n").unwrap();
+        let diff = journal.agent_diff(repo);
+        assert_eq!(diff.matches("diff --git").count(), 1);
+        assert!(!diff.contains("preexisting evidence"));
+        assert!(diff.contains("new evidence"));
     }
 
     #[test]
