@@ -347,7 +347,7 @@ struct Cli {
     approve: Option<ApprovalArg>,
     /// Hard wall-clock budget for an agentic turn, in seconds (default 900).
     /// When used with `zoder loop`, this is the per-turn budget; the outer
-    /// loop-phase watchdog (`--loop-timeout`, default 900) must exceed this
+    /// loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this
     /// value or the watchdog fires before the first turn completes.
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
@@ -367,7 +367,7 @@ struct Cli {
     #[arg(long = "persist-session", global = true)]
     persist_session: bool,
     /// Hard wall-clock budget for a single `loop` phase (author, `--check`,
-    /// review), in seconds (default 900). The watchdog kills the spawned
+    /// review), in seconds (default 1200). The watchdog kills the spawned
     /// child AND its process group when the budget elapses, so a wedged
     /// child can never hang the loop indefinitely. `agent_timeout` controls
     /// the engine's internal turn budget (default 900) and is independent.
@@ -1897,7 +1897,9 @@ async fn run() -> anyhow::Result<()> {
             background,
         }) => {
             let agent_timeout_secs = cli.agent_timeout.unwrap_or(900);
-            let loop_timeout_secs = cli.loop_timeout.unwrap_or(900);
+            let loop_timeout_secs = cli
+                .loop_timeout
+                .unwrap_or(agentic::DEFAULT_LOOP_TIMEOUT_SECS);
             agentic::cmd_loop(
                 &cli,
                 task,

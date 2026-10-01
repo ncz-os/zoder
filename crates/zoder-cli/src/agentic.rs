@@ -3521,12 +3521,14 @@ zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-time
 // ---------------------------------------------------------------------------
 
 /// Default per-phase wall-clock budget for the `loop` (author / `--check` /
-/// review). Mirrors the `--loop-timeout` flag default; honored when the flag
+/// review). Leaves room beyond the default 900-second engine turn for the
+/// engine to finish or acknowledge cancellation before the outer watchdog.
+/// Mirrors the `--loop-timeout` flag default; honored when the flag
 /// is left unset. `#[allow(dead_code)]` so the constant doubles as the
 /// single source of truth referenced by docs/the flag help text, even on
 /// downstream builds that wire the default through a different path.
 #[allow(dead_code)]
-pub(crate) const DEFAULT_LOOP_TIMEOUT_SECS: u64 = 900;
+pub(crate) const DEFAULT_LOOP_TIMEOUT_SECS: u64 = 1200;
 
 /// Validates that the loop timeout configuration is sensible.
 ///
@@ -3581,7 +3583,7 @@ impl LoopPhase {
 }
 
 /// Hard-timeout wrapper for a single `loop` phase. The inner future is raced
-/// against a wall-clock budget (default ~900s). On expiry we don't just drop
+/// against a wall-clock budget (default 1200s). On expiry we don't just drop
 /// the future — the phase is recorded as a hard timeout and the caller is
 /// expected to treat it like a failed child: kill any spawned process group
 /// and decide whether to abort. The streak bookkeeping that decides abort vs.
@@ -4642,7 +4644,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     if timed_out {
                         eprintln!(
                             "[loop] hint: raise the per-turn budget with `--agent-timeout <secs>` \
-(default 900) or the loop-phase watchdog with `--loop-timeout <secs>` (default 900), or \
+(default 900) or the loop-phase watchdog with `--loop-timeout <secs>` (default 1200), or \
 pick a faster model with `-m` for the loop. Preserving partial edits and continuing."
                         );
                     }
@@ -10966,16 +10968,12 @@ mod commit_author_enforcement_tests {
         );
     }
 
-    /// When loop-timeout == agent-timeout the validator must warn — the
-    /// watchdog fires before the first turn can even complete.
+    /// The shipped defaults must leave the engine time to finish before the
+    /// outer author-phase watchdog fires.
     #[test]
-    fn validate_loop_timeouts_warns_on_equal_defaults() {
-        let warn = validate_loop_timeouts(900, 900);
-        assert!(warn.is_some(), "equal defaults must warn");
-        assert!(
-            warn.unwrap().contains("900"),
-            "must display the actual timeout values"
-        );
+    fn default_loop_timeout_exceeds_default_agent_timeout() {
+        assert!(DEFAULT_LOOP_TIMEOUT_SECS >= 960);
+        assert!(validate_loop_timeouts(DEFAULT_LOOP_TIMEOUT_SECS, 900).is_none());
     }
 
     /// When loop-timeout > agent-timeout no warning is emitted — the
