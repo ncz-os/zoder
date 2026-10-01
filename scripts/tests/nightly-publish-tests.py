@@ -7,6 +7,7 @@ Run: uv run --with pyyaml python scripts/tests/nightly-publish-tests.py
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -42,7 +43,7 @@ class NightlyPublishTests(unittest.TestCase):
                     (stage / binary).write_bytes(b"fixture binary")
                 manifest = {
                     "zoder": {"sha": "a" * 40},
-                    "engine": {"sha": "b" * 40},
+                    "engine": {"sha": "b" * 40, "upstream_sha": "e" * 40},
                     "target": target,
                     "locked": True,
                 }
@@ -61,6 +62,7 @@ class NightlyPublishTests(unittest.TestCase):
             env = os.environ | {
                 "ZODER_SHA": "a" * 40,
                 "ENGINE_SHA": "b" * 40,
+                "UPSTREAM_SHA": "e" * 40,
                 "PROJECT_ID": "fixture",
                 "PKG_TOKEN": "fixture",
                 "RELEASE_TAG": "fixture",
@@ -88,6 +90,74 @@ class NightlyPublishTests(unittest.TestCase):
                 else []
             )
             return result, events
+
+    def test_source_gate_rejects_stale_engine(self):
+        for stale in (False, True):
+            with self.subTest(stale=stale), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                upstream = root / "upstream"
+                engine = root / "engine"
+
+                def git(*args):
+                    return subprocess.check_output(
+                        ["git", *map(str, args)], text=True, stderr=subprocess.DEVNULL
+                    ).strip()
+
+                git("init", "-b", "master", upstream)
+                for key, value in (
+                    ("user.name", "Fixture"),
+                    ("user.email", "fixture@example.invalid"),
+                ):
+                    git("-C", upstream, "config", key, value)
+                (upstream / "source").write_text("upstream")
+                git("-C", upstream, "add", "source")
+                git("-C", upstream, "commit", "-m", "initial")
+                git("clone", upstream, engine)
+                if stale:
+                    (upstream / "source").write_text("new upstream")
+                    git("-C", upstream, "commit", "-am", "advance upstream")
+                prefixes = []
+                for url, repo in (
+                    ("https://gitlab.com/ncz-os/zoder.git", engine),
+                    ("https://gitlab.com/ncz-os/zeroclaw.git", engine),
+                    ("https://github.com/zeroclaw-labs/zeroclaw.git", upstream),
+                ):
+                    prefixes += ["-c", f"url.file://{repo}.insteadOf={url}"]
+                stub = (
+                    "git() { command git "
+                    + " ".join(map(shlex.quote, prefixes))
+                    + ' "$@"; };\n'
+                )
+                env = os.environ | {
+                    "ENGINE_USER": "fixture",
+                    "ENGINE_TOKEN": "fixture",
+                    "ENGINE_REPO": "gitlab.com/ncz-os/zeroclaw.git",
+                    "ENGINE_BRANCH": "master",
+                    "GITHUB_REF": "refs/heads/master",
+                    "GITHUB_SHA": "a" * 40,
+                    "GITHUB_OUTPUT": str(root / "outputs"),
+                    "GITHUB_STEP_SUMMARY": str(root / "summary"),
+                }
+                source_script = WORKFLOW["jobs"]["sources"]["steps"][-1]["run"]
+                result = subprocess.run(
+                    ["bash"],
+                    input=stub + source_script,
+                    text=True,
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    check=False,
+                )
+                if stale:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("has not incorporated upstream", result.stdout)
+                    self.assertFalse((root / "outputs").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(
+                        "upstream_sha=" + git("-C", upstream, "rev-parse", "HEAD"),
+                        (root / "outputs").read_text(),
+                    )
 
     def test_complete_matrix_publishes(self):
         result, events = self.run_publish()

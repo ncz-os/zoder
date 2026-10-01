@@ -29,6 +29,7 @@ jobs:
     outputs:
       zoder_sha: ${{ steps.resolve.outputs.zoder_sha }}
       engine_sha: ${{ steps.resolve.outputs.engine_sha }}
+      upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
     steps:
       - name: Resolve immutable source revisions
         id: resolve
@@ -45,8 +46,17 @@ jobs:
             ZODER_SHA="$(git ls-remote https://gitlab.com/ncz-os/zoder.git refs/heads/master | cut -f1)"
           fi
           ENGINE_SHA="$(git ls-remote "https://${ENGINE_REPO}" "refs/heads/${ENGINE_BRANCH}" | cut -f1)"
+          UPSTREAM_SHA="$(git ls-remote https://github.com/zeroclaw-labs/zeroclaw.git refs/heads/master | cut -f1)"
+          [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$ZODER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # Cron times do not guarantee cross-repository run ordering.
+          # Reject a stale fork instead of silently shipping an old engine.
+          git init --bare engine-history
+          git -C engine-history fetch --filter=blob:none --no-tags "https://${ENGINE_REPO}" "$ENGINE_SHA"
+          git -C engine-history fetch --filter=blob:none --no-tags https://github.com/zeroclaw-labs/zeroclaw.git "$UPSTREAM_SHA"
+          git -C engine-history merge-base --is-ancestor "$UPSTREAM_SHA" "$ENGINE_SHA" || { echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA; run ZeroClaw source sync first."; exit 1; }
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "zoder_sha=$ZODER_SHA" >> "$GITHUB_OUTPUT"
           echo "engine_sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
           printf 'Pinned zoder: `%s`\nPinned engine (%s): `%s`\n' "$ZODER_SHA" "$ENGINE_BRANCH" "$ENGINE_SHA" >> "$GITHUB_STEP_SUMMARY"
@@ -93,6 +103,7 @@ jobs:
           TRIPLE: ${{ matrix.triple }}
           ZODER_SHA: ${{ needs.sources.outputs.zoder_sha }}
           ENGINE_SHA: ${{ needs.sources.outputs.engine_sha }}
+          UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
           ENGINE_USER: ${{ secrets.GITLAB_ENGINE_USER }}
           ENGINE_TOKEN: ${{ secrets.GITLAB_ENGINE_TOKEN }}
         run: |
@@ -116,7 +127,7 @@ jobs:
           p = pathlib.Path('dist') / ('zoder-' + os.environ['TRIPLE']) / 'manifest.json'
           p.write_text(json.dumps({
               'zoder': {'repository': 'https://gitlab.com/ncz-os/zoder', 'sha': os.environ['ZODER_SHA']},
-              'engine': {'repository': 'https://' + os.environ['ENGINE_REPO'], 'sha': os.environ['ENGINE_SHA']},
+              'engine': {'repository': 'https://' + os.environ['ENGINE_REPO'], 'sha': os.environ['ENGINE_SHA'], 'upstream_sha': os.environ['UPSTREAM_SHA']},
               'target': os.environ['TRIPLE'], 'locked': True,
               'run': os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID']
           }, indent=2) + '\n')
@@ -150,6 +161,7 @@ jobs:
         env:
           ZODER_SHA: ${{ needs.sources.outputs.zoder_sha }}
           ENGINE_SHA: ${{ needs.sources.outputs.engine_sha }}
+          UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
           PKG_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -164,6 +176,7 @@ jobs:
           m = json.loads((root / 'manifest.json').read_text())
           assert m['zoder']['sha'] == os.environ['ZODER_SHA']
           assert m['engine']['sha'] == os.environ['ENGINE_SHA']
+          assert m['engine']['upstream_sha'] == os.environ['UPSTREAM_SHA']
           assert m['target'] == os.environ['TRIPLE'] and m['locked'] is True
           assert all((root / b).is_file() for b in ('zoder', 'zerocode', 'zeroclaw'))
           PY
