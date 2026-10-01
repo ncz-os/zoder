@@ -1,115 +1,40 @@
 # Daily trio builds
 
-Automated daily builds of the version-matched trio (`zoder` + `zerocode` +
-`zeroclaw`) produced on the host that builds each target **natively**, then
-published to ARGONAS. This avoids cross-from-macOS toolchain breakage (a pinned
-`1.94.1-x86_64-unknown-linux-gnu` toolchain can't install on an arm64 Mac) and
-does not depend on GitLab fleet runners being online.
+The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/native-builds.yml), scheduled at **09:15 UTC daily**. GitHub may delay scheduled runs. It builds native macOS arm64, Linux arm64, and Linux x86_64 on hosted runners, then publishes the `zoder` / `zerocode` / `zeroclaw` trio to the GitLab `zoder-nightly/master` package channel and GitHub rolling `nightly` release.
 
-## Host → target map
+## Source and acceptance
 
-| Host | IP | Targets | How |
-|---|---|---|---|
-| ULTRA | 192.168.207.60 | `aarch64-apple-darwin` | native `cargo` (rust-toolchain 1.94.1) |
-| ULTRA | 192.168.207.60 | `aarch64-unknown-linux-gnu` | native **arm64** `rust:1.94` Docker (Apple Silicon) |
-| HYDRA | 192.168.207.78 | `x86_64-unknown-linux-gnu` | **amd64** `rust:1.94` Docker |
-| TYDEUS | 192.168.207.73 | `aarch64-unknown-linux-gnu` | native arm64 `rust:1.94` Docker (real arm64 HW) |
+- Scheduled/default-branch runs resolve the latest canonical GitLab `ncz-os/zoder` **master** at start. The GitHub mirror must contain that revision for checkout to succeed.
+- The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The separate ZeroClaw upstream CI tracks upstream master.
+- Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
+- Every archive contains `manifest.json`: exact repository/commit pairs, target, and run URL. The raw package channel also contains `manifest.json-<target>` plus its checksum.
+- All three targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.
+- Manual dispatch on a topic branch validates that branch and uploads Actions artifacts, but does not replace the master/nightly fleet channels. Fixes on a topic branch must be reviewed and merged to master before the scheduled nightly includes them.
 
-TYDEUS (IGX Thor, native arm64 **Linux**) builds `aarch64-unknown-linux-gnu` on
-real arm64 hardware with **no qemu emulation** — this supersedes ULTRA's
-*emulated* arm64-linux path (ULTRA runs the same arm64 container under emulation
-on Apple Silicon). ULTRA is left as-is for now; the operator may later prune
-ULTRA's `linux/arm64` step so only TYDEUS produces the linux-arm64 tarball.
-
-Linux targets build inside a pinned `rust:1.94` container so the release
-toolchain matches the GitLab quality gate exactly. macOS binaries build natively
-(no Docker for Mach-O).
-
-The driver is [`scripts/daily-build.sh`](../scripts/daily-build.sh): it detects
-the host, pulls the latest `main` of zoder, builds its target(s) via
-`scripts/package.sh`, stamps the commit SHA, and publishes to
-`ARGONAS:/mnt/datapool/zoder-releases/<YYYYMMDD>-<sha>/` plus a `latest/` mirror.
-
-## One-time host setup
-
-On **ULTRA**, **HYDRA**, and **TYDEUS**:
+## Verify a nightly
 
 ```sh
-# 1. Secret env (NOT committed) — gitlab read token + the build role. Set the
-#    role explicitly (hostnames are unreliable; ULTRA reports "MacBookPersonal").
-#    ULTRA: ZODER_BUILD_ROLE=ultra   HYDRA: ZODER_BUILD_ROLE=hydra
-#    TYDEUS: ZODER_BUILD_ROLE=tydeus
-cat > ~/.zoder-build.env <<'EOF'
-export ZODER_PAT=glpat-xxxxxxxxxxxxxxxxxxxx
-export ZODER_BUILD_ROLE=ultra
-# Optional: a GitHub token (repo scope) enables the rolling `nightly` prerelease
-# on github.com/ncz-os/zoder. Omit to publish to ARGONAS only.
-export GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-EOF
-chmod 600 ~/.zoder-build.env
-
-# 2. Cron — staggered so the two hosts don't both hammer the zeroclaw clone at once.
-#    ULTRA at 03:30, HYDRA at 04:00, TYDEUS at 04:30 (local time). `package.sh`
-#    is on PATH via the checkout; the script self-locates the repo under
-#    ~/zoder-daily.
-#    ULTRA crontab line:
-#      30 3 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
-#    HYDRA crontab line:
-#      0  4 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
-#    TYDEUS crontab line:
-#      30 4 * * *  /bin/bash $HOME/zoder-daily/zoder/scripts/daily-build.sh >> $HOME/zoder-daily/daily-build.log 2>&1
+gh run list -R ncz-os/zoder --workflow native-builds.yml --limit 5
+gh run view <run-id> -R ncz-os/zoder --log
+# Manual latest-master build:
+gh workflow run native-builds.yml -R ncz-os/zoder --ref master
 ```
 
-On first run the checkout under `~/zoder-daily/zoder` may not exist yet; seed it
-once with `git clone -b main https://oauth2:$ZODER_PAT@gitlab.com/ncz-os/zoder.git ~/zoder-daily/zoder`
-(the script also self-clones if missing).
+Require completed success for all three build jobs and publication, and read the archive manifest. A green build of an old source revision does not prove a newer repair was shipped. A scheduled pipeline is not evidence of fleet installation; verify installed binary provenance separately.
 
-## Artifacts
+## Other automation
 
-```
-ARGONAS:/mnt/datapool/zoder-releases/
-  20260630-f32340a/
-    zoder-0.2.1-aarch64-apple-darwin.tar.gz(.sha256)
-    zoder-0.2.1-aarch64-unknown-linux-gnu.tar.gz(.sha256)
-    zoder-0.2.1-x86_64-unknown-linux-gnu.tar.gz(.sha256)
-    GIT_COMMIT
-  latest/   # newest of each, overwritten daily
-```
+GitLab's active `nightly master-of-the-day` schedule runs at **09:00 UTC**. It refreshes the model corpus and runs scheduled advisory/upstream checks. Per-push Rust gates remain in GitLab. Tagged/dispatch CLI builds are in `release.yml`; the weekly stack image is in `container-weekly.yml`.
 
-## GitHub nightly prerelease (optional)
+`scripts/daily-build.sh` is a retired host-local fallback, not the nightly source of truth. HYDRA's former 04:00 cron is explicitly retired. Do not re-enable stale host cron instructions or assume a local build updates fleet installations. Current fleet pullers consume the canonical rolling channel independently.
 
-When `GH_TOKEN` (repo scope) is present in `~/.zoder-build.env`, each host also
-publishes its arch tarballs to a single **rolling `nightly` prerelease** on
-`github.com/ncz-os/zoder` via `gh release upload --clobber`. Because each host
-clobbers only the assets it built, the `nightly` release accumulates all three
-arches across ULTRA (darwin-arm64 + linux-arm64) and HYDRA (x86-linux). The git
-tag is cosmetic for a rolling artifact; the release notes + the `GIT_COMMIT`
-asset record the actual source SHA.
+## Preserve the rolling release through mirroring
 
-This is distinct from **tagged** GitHub releases: pushing a `vX.Y.Z` tag triggers
-`.github/workflows/release.yml`, which builds on GitHub-hosted runners and
-publishes a versioned Release. That path is independent of the fleet and of this
-cron.
-
-**Mirror requirement (one-time):** `ncz-os/zoder` is a GitLab→GitHub push mirror.
-By default the mirror force-syncs all refs and **deletes** any GitHub-only ref —
-which silently un-tags the `nightly` release (it reverts to a draft) on every
-sync. The mirror must have **`keep_divergent_refs = true`** so the GitHub-side
-`nightly` tag survives:
+The GitLab push mirror must set `keep_divergent_refs=true`. Otherwise its next sync can delete GitHub's `nightly` tag and silently turn a successfully built release into a draft, breaking public download URLs. Verify both the mirror's successful update timestamp and the public release after a sync:
 
 ```sh
-MID=$(glab api projects/ncz-os%2Fzoder/remote_mirrors --jq '.[0].id')
-glab api -X PUT projects/ncz-os%2Fzoder/remote_mirrors/$MID -f keep_divergent_refs=true
+glab api projects/ncz-os%2Fzoder/remote_mirrors
+gh api repos/ncz-os/zoder/releases/tags/nightly --jq '{draft, tag_name}'
 ```
 
-The build script additionally forces `--draft=false` each run as a backstop.
-
-## Relationship to GitLab CI
-
-`.gitlab-ci.yml` still defines `trio:*` package jobs tagged for fleet runners
-(`fleet-x86`, `fleet-macos-arm64`, `fleet-linux-arm64`); they run on a tag push
-or manually. Those require the fleet runners to be **registered and online** —
-currently they are not (TYPHON was reimaged to Proxmox). This cron-based path is
-the reliable daily mechanism and is independent of runner state. If the fleet
-runners are brought back, a daily GitLab pipeline **schedule** plus a
-`$CI_PIPELINE_SOURCE == "schedule"` rule on the trio jobs would mirror this in CI.
+On 2026-10-01 the Sep 30 green nightly had six assets but was a draft. Mirror retention was corrected and that existing release republished. This setting is part of nightly operation, independent of compiler success.
