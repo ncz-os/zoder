@@ -71,6 +71,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -224,6 +227,9 @@ Options:
       --background
           
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -356,6 +362,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -490,6 +499,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -623,6 +635,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -754,6 +769,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -890,6 +908,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1025,6 +1046,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1157,6 +1181,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1307,6 +1334,9 @@ Options:
       --json
           Emit machine-readable JSON to stdout
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1442,20 +1472,23 @@ Options:
       --strict
           Strict mode (fail-closed). This is the DEFAULT; the flag exists so `zoder gate --strict` is a legible escape hatch when `--local-iterate` is wired into a wrapper
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
+      --tools-only
+          Print what gate tools are installed vs missing + the install hint for each missing tool, then exit. Does not run any steps. Useful for `zoder gate --tools-only` in CI caches
+
+      --plan-only
+          Print the derived plan (ecosystems + framework hints + step list) without running anything. Useful for inspecting what the gate would actually do
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --tools-only
-          Print what gate tools are installed vs missing + the install hint for each missing tool, then exit. Does not run any steps. Useful for `zoder gate --tools-only` in CI caches
-
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --plan-only
-          Print the derived plan (ecosystems + framework hints + step list) without running anything. Useful for inspecting what the gate would actually do
 
       --json
           Emit machine-readable JSON to stdout (the GateReport + tool-probe, serialized). Suppresses the pretty renderer
@@ -1586,14 +1619,17 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
+      --uninstall-daily
+          Remove the daily sweep installed by `install-daily`. Idempotent
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
-
-      --uninstall-daily
-          Remove the daily sweep installed by `install-daily`. Idempotent
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
@@ -1722,6 +1758,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1870,6 +1909,12 @@ Options:
       --reviewer <MODEL>
           Reviewer model id (default: the routed/`-m` model). Use a different strong model for a genuine adversarial second opinion
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
+      --base <BASE>
+          Base ref for branch-scope diffing
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1878,12 +1923,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --base <BASE>
-          Base ref for branch-scope diffing
-
-      --require-free
-          Only ever use free models; never fall back to paid
 
       --scope <SCOPE>
           Diff scope shown to the reviewer: auto | working-tree | branch
@@ -1898,11 +1937,11 @@ Options:
       --accept-on-green
           Resolve as soon as `--check` exits 0, treating reviewer findings as advisory (escape hatch for over-strict reviewers). Requires `--check`
 
+      --require-free
+          Only ever use free models; never fall back to paid
+
       --dry-run
           Print the routing decision + cost estimate without calling
-
-      --explain
-          Explain why a model was chosen
 
       --require-approval
           Require an explicit approve verdict with no blocking findings
@@ -1910,13 +1949,16 @@ Options:
       --allow-dangerous-check
           Skip the pre-exec denylist inspection of the `--check` command string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`, `curl|sh`, …). Default is to refuse to run a `--check` command that matches the denylist — set this flag to allow such commands explicitly. The denylist is best-effort, not a sandbox; see `exec_safety.rs` for the honest scope statement
 
+      --explain
+          Explain why a model was chosen
+
+      --background
+          Run detached as a tracked background job
+
       --max-tokens <MAX_TOKENS>
           Max output tokens
           
           [default: 1024]
-
-      --background
-          Run detached as a tracked background job
 
       --no-stream
           Disable streaming output
@@ -2029,6 +2071,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2158,6 +2203,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2293,6 +2341,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2432,6 +2483,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2566,6 +2620,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2694,6 +2751,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2829,6 +2889,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2968,6 +3031,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3096,6 +3162,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3247,6 +3316,9 @@ Options:
       --host <HOST>
           Restrict the report to one publisher host (e.g. `--host meta`), counting every provider that served that publisher's models. The host is the segment before `/` in the model id, so it sums enterprise direct + OpenRouter + any other route for the same publisher. Mutually exclusive with `--vendor` (which scopes by who served the call, not who published the model)
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3383,6 +3455,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3515,6 +3590,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3664,6 +3742,9 @@ Options:
       --background
           Run detached as a tracked background job (see `status`/`result`)
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3796,6 +3877,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3930,6 +4014,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4058,6 +4145,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4195,6 +4285,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4343,6 +4436,9 @@ Options:
       --host <HOST>
           Restrict to one publisher host (the segment before `/` in the model id, e.g. `--host meta`), summed across every provider that served that publisher's models
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4479,6 +4575,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4607,6 +4706,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4741,6 +4843,9 @@ Options:
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4872,6 +4977,9 @@ Options:
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer-pool-routes <PROVIDER=MODEL,...>
+          Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
