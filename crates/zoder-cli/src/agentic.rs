@@ -4969,6 +4969,18 @@ nits).\n",
             ),
         }));
 
+        crate::mnemos::checkpoint(
+            &cwd,
+            json!({
+                "job_id": std::env::var("HIVE_JOB_ID").ok(),
+                "workspace": cwd.to_string_lossy(), "iteration": i,
+                "head_sha": rev_parse_head(&cwd), "files": touched,
+                "check_passed": check_passed, "verdict": review.verdict,
+                "blocking_findings": blocking,
+            }),
+        )
+        .await;
+
         // 6. Decide: review gate AND objective gate AND anti-gaming substance gate.
         //    `review_ok` is now AUTHORITATIVE on the explicit verdict — see
         //    `loop_review_ok`. `check_satisfied` does not fabricate a green check
