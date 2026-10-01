@@ -797,6 +797,10 @@ pub(crate) fn build_reviewer_candidates(
         push_unique(&mut out, &default);
     }
 
+    if cli.no_fallback {
+        out.truncate(1);
+    }
+
     if let Some(allowed) = crate::parsed_allowed_routes(cli)? {
         let routing = crate::RoutingContext::load(&eng.cfg)?;
         let permitted = |model: &str| {
@@ -9730,6 +9734,45 @@ mod reviewer_chain_dispatch_tests {
     /// `eprintln` not stdout.
     fn dummy_cli() -> Cli {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    #[test]
+    fn no_fallback_truncates_before_allowlist() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "broken-model/head,working-model/reviewer",
+        );
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "--no-fallback",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/head,wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+
+        let candidates = build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).unwrap();
+        assert_eq!(candidates, vec!["broken-model/head"]);
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "--no-fallback",
+            "--allowed-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+
+        let err = build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("explicit reviewer route is outside --allowed-routes"));
     }
 
     #[test]
