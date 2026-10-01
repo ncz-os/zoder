@@ -1993,6 +1993,13 @@ impl PatchJournal {
         let idx = unique_index_path("baseline");
         let _ = std::fs::remove_file(&idx);
         let idx_s = idx.to_string_lossy().to_string();
+        // Seed from the real index: tracked files may match .gitignore, and
+        // an empty alternate index would silently omit their changes.
+        let index_path = run_git(cwd, &["rev-parse", "--git-path", "index"]).ok()?;
+        let index_path = cwd.join(index_path.trim());
+        if index_path.exists() {
+            std::fs::copy(index_path, &idx).ok()?;
+        }
         // `add -A` honours .gitignore, so build artefacts stay out.
         run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
         let tree = run_git_env(cwd, &["write-tree"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
@@ -2087,23 +2094,14 @@ impl PatchJournal {
             // agent started. Falls back to the old HEAD diff only when no tree
             // was captured.
             if let Some(tree) = &self.baseline_tree {
-                let idx = unique_index_path("now");
-                let _ = std::fs::remove_file(&idx);
-                let idx_s = idx.to_string_lossy().to_string();
-                if run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).is_ok() {
-                    if let Ok(output) = run_git_env(
-                        cwd,
-                        &["diff", "--cached", tree],
-                        &[("GIT_INDEX_FILE", &idx_s)],
-                    ) {
-                        // The snapshot already includes every non-ignored file.
-                        // Return even an empty diff: appending synthetic hunks
-                        // would duplicate new files and misattribute old files.
-                        let _ = std::fs::remove_file(&idx);
+                if let Some(current) = Self::snapshot_tree(cwd) {
+                    if let Ok(output) = run_git_diff(cwd, &["diff", tree, &current]) {
+                        // Includes every tracked/non-ignored file, even when empty.
                         return output;
                     }
                 }
-                let _ = std::fs::remove_file(&idx);
+                // Failed snapshots cannot establish an accepted task delta.
+                return String::new();
             } else if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
                 if !output.trim().is_empty() {
                     result.push_str(&output);
@@ -4098,6 +4096,10 @@ fn loop_task_diff(
     task_journal: &PatchJournal,
 ) -> anyhow::Result<(String, String)> {
     if matches!(scope, ReviewScope::Auto) {
+        anyhow::ensure!(
+            task_journal.baseline_tree.is_some(),
+            "task baseline snapshot unavailable"
+        );
         Ok(("task".into(), task_journal.agent_diff(cwd)))
     } else {
         build_diff(cwd, scope, base)
@@ -11697,6 +11699,23 @@ mod completion_integrity_tests {
         assert_eq!(diff.matches("diff --git").count(), 1);
         assert!(!diff.contains("preexisting evidence"));
         assert!(diff.contains("new evidence"));
+    }
+
+    #[test]
+    fn task_snapshot_keeps_tracked_files_that_match_ignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "tracked.rs\n").unwrap();
+        std::fs::write(repo.join("tracked.rs"), "fn before() {}\n").unwrap();
+        git(&["add", "-f", ".gitignore", "tracked.rs"]);
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        std::fs::write(repo.join("tracked.rs"), "fn after() {}\n").unwrap();
+        let diff = journal.agent_diff(repo);
+        assert!(diff.contains("+fn after()"));
+        assert!(diff.contains("-fn before()"));
     }
 
     #[test]
