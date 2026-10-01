@@ -266,6 +266,12 @@ struct Cli {
     /// model_provider route.
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
+    /// Restrict every author and reviewer attempt, including fallbacks, to
+    /// exact provider=model pairs (comma separated). An empty or unavailable
+    /// allowlist fails before dispatch; for example:
+    /// tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b.
+    #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
+    allowed_routes: Option<String>,
     /// Routing tier: fast | strong | auto | single-pass | grind
     /// (default auto). Out-of-set values are rejected at parse time so a
     /// typo (e.g. `strogn`) can never silently downgrade to `auto` routing.
@@ -3671,6 +3677,70 @@ fn provider_for_resolved_model<'a>(
     }
 }
 
+fn parsed_allowed_routes(cli: &Cli) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    let Some(raw) = cli.allowed_routes.as_deref() else {
+        return Ok(None);
+    };
+    let mut routes = Vec::new();
+    for entry in raw.split(',') {
+        let (provider, model) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--allowed-routes entries must be exact PROVIDER=MODEL pairs")
+        })?;
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() {
+            anyhow::bail!("--allowed-routes contains an empty provider or model");
+        }
+        routes.push((provider.to_string(), model.to_string()));
+    }
+    Ok(Some(routes))
+}
+
+fn require_allowed_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Result<()> {
+    if let Some(allowed) = parsed_allowed_routes(cli)? {
+        if !allowed
+            .iter()
+            .any(|pair| pair.0 == provider && pair.1 == model)
+        {
+            anyhow::bail!(
+                "effective route {provider}={model} is outside --allowed-routes; refusing dispatch"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn restrict_resolved_routes(
+    cli: &Cli,
+    eng: &Engine,
+    routing: &RoutingContext,
+    mut routes: ResolvedRoutes,
+) -> anyhow::Result<ResolvedRoutes> {
+    let Some(allowed) = parsed_allowed_routes(cli)? else {
+        return Ok(routes);
+    };
+    let permitted = |model: &String, provider_ref: Option<&str>| {
+        provider_for_resolved_model(routing, &eng.cfg, model, provider_ref).is_some_and(
+            |provider| {
+                allowed
+                    .iter()
+                    .any(|pair| pair.0 == provider.id && pair.1 == *model)
+            },
+        )
+    };
+    let provider_ref = routes.agent_provider_ref.as_deref();
+    routes
+        .primary
+        .retain(|model| permitted(model, provider_ref));
+    routes.reviewer.retain(|model| permitted(model, None));
+    if routes.primary.is_empty() {
+        anyhow::bail!(
+            "no author route matches --allowed-routes; refusing fallback outside the allowlist"
+        );
+    }
+    Ok(routes)
+}
+
 /// Resolve the routing chain for a single CLI invocation. Honors the
 /// precedence:
 ///
@@ -3799,12 +3869,17 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         } else {
             vec![pin]
         };
-        return Ok(ResolvedRoutes {
-            primary: chain,
-            reviewer: scn_reviewer,
-            reason,
-            agent_provider_ref,
-        });
+        return restrict_resolved_routes(
+            cli,
+            eng,
+            &rc,
+            ResolvedRoutes {
+                primary: chain,
+                reviewer: scn_reviewer,
+                reason,
+                agent_provider_ref,
+            },
+        );
     }
 
     // Precedence steps (2)-(3): primary_model preferred head + scenario
@@ -3858,12 +3933,17 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         } else {
             primary
         };
-        return Ok(ResolvedRoutes {
-            primary,
-            reviewer: scn_reviewer,
-            reason,
-            agent_provider_ref: None,
-        });
+        return restrict_resolved_routes(
+            cli,
+            eng,
+            &rc,
+            ResolvedRoutes {
+                primary,
+                reviewer: scn_reviewer,
+                reason,
+                agent_provider_ref: None,
+            },
+        );
     }
 
     let mut chain = vec![head.clone()];
@@ -3912,12 +3992,17 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     } else {
         chain
     };
-    Ok(ResolvedRoutes {
-        primary,
-        reviewer: scn_reviewer,
-        reason,
-        agent_provider_ref: None,
-    })
+    restrict_resolved_routes(
+        cli,
+        eng,
+        &rc,
+        ResolvedRoutes {
+            primary,
+            reviewer: scn_reviewer,
+            reason,
+            agent_provider_ref: None,
+        },
+    )
 }
 
 /// Add the daemon's own Quickstart view to a local routing/configuration
@@ -5457,6 +5542,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         })?
         .id
         .clone();
+        require_allowed_route(cli, &pid, model_id)?;
         // Per-link paid gate: with per-model routing a fallback can resolve to a
         // DIFFERENT provider than the (already-confirmed) primary, so re-run the
         // policy gate for every fallback link. The primary (i == 0) was gated +
@@ -8743,6 +8829,9 @@ pub(crate) async fn agentic_turn(
                 .flatten(),
         )
         .cloned();
+        if let Some(provider) = &link_provider {
+            require_allowed_route(cli, &provider.id, &model)?;
+        }
         let link_provider_paid = link_provider
             .as_ref()
             .map(|p| p.paid || p.billing == BillingMode::Metered)
@@ -14488,6 +14577,66 @@ mod model_selection_tests {
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
         cfg
+    }
+
+    #[test]
+    fn allowed_routes_remove_minimax_from_effective_author_chain() {
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--allowed-routes",
+            "enterprise-gateway=nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        ])
+        .unwrap();
+        let routes = resolve_chain(&cli, &eng, &HealthStore::default()).unwrap();
+        assert_eq!(
+            routes.primary,
+            vec!["nvidia/llama-3.3-nemotron-super-49b-v1.5"]
+        );
+        assert!(routes
+            .reviewer
+            .iter()
+            .all(|model| !model.contains("minimax")));
+    }
+
+    #[test]
+    fn allowed_routes_reject_disallowed_pin_and_malformed_entries() {
+        let cfg = fixture_cfg(Some("minimax/MiniMax-M3"), None);
+        let eng = Engine::from_parts(cfg, fixture_corpus());
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "-m",
+            "minimax/MiniMax-M3",
+            "--allowed-routes",
+            "enterprise-gateway=nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        ])
+        .unwrap();
+        assert!(resolve_chain(&cli, &eng, &HealthStore::default())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no author route matches"));
+        for malformed in ["", "qwen38", "=qwen38", "tydeus-reviewer="] {
+            let cli =
+                Cli::try_parse_from(["zoder", "exec", "--allowed-routes", malformed]).unwrap();
+            assert!(parsed_allowed_routes(&cli).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--allowed-routes",
+            "tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b",
+        ])
+        .unwrap();
+        assert!(require_allowed_route(&cli, "tydeus-reviewer", "qwen38").is_ok());
+        assert!(
+            require_allowed_route(&cli, "nvidia-eih", "nvidia/nemotron-3-ultra-550b-a55b").is_ok()
+        );
+        assert!(require_allowed_route(&cli, "minimax-m3", "MiniMax-M3").is_err());
+        assert!(require_allowed_route(&cli, "minimax-m3", "qwen38").is_err());
     }
 
     fn fixture_gated_provider(id: &str, base_url: &str, billing: BillingMode) -> Provider {
