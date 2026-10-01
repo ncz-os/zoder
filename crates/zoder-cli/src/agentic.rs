@@ -9762,6 +9762,73 @@ mod reviewer_chain_dispatch_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_allowlist_prevents_tail_after_failure() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path().to_path_buf();
+        let _g = HomeGuard::new(&home);
+
+        let server = MockServer::start().await;
+        let broken_hits = Arc::new(AtomicUsize::new(0));
+        let broken_hits_for_responder = Arc::clone(&broken_hits);
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                broken_hits_for_responder.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error": "permanent provider failure"}"#)
+            })
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+
+        write_corpus(&home, &["broken-model/coder-6.7b", "working-model/glm-5.1"]);
+        write_config(
+            &home,
+            &server.uri(),
+            "broken-model/coder-6.7b,working-model/glm-5.1",
+        );
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--request-timeout",
+            "1",
+            "--retries",
+            "0",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/coder-6.7b",
+        ])
+        .expect("clap parse");
+        let result = complete_once(
+            &cli,
+            Some("broken-model/coder-6.7b"),
+            &[],
+            "sys",
+            "user",
+            2048,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected error due to permanent failure on head and tail exclusion by allowlist"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+        assert!(
+            paths.iter().filter(|p| p.contains("/broken/")).count() > 0,
+            "broken head must be attempted: paths={paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| p.contains("/working/")).count(),
+            0,
+            "working tail must not be attempted due to allowlist exclusion: paths={paths:?}"
+        );
+        assert!(broken_hits.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewer_retries_timeout_on_same_model_before_trying_tail() {
         let home_dir = tempfile::tempdir().expect("tempdir");
         let home = home_dir.path().to_path_buf();

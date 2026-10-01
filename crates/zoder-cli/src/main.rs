@@ -4157,20 +4157,7 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     // corpus as the routing authority.
     let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.route_corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
-    let router = Router::new(&eng.route_corpus, &health)
-        .with_primary(resolve_effective_primary(cli, &eng))
-        .with_backed(Some(backed_free_model_ids(&eng)));
-    let route = match router.select(Tier::parse(&cli.tier)) {
-        Ok(route) => route,
-        Err(error) if should_enrich_route_error(&error) => {
-            let model =
-                resolve_effective_primary(cli, &eng).unwrap_or_else(|| "unknown".to_string());
-            let hint = error.to_string();
-            let enriched = enrich_no_provider_diagnostic(&engine_socket_path(), &model, hint).await;
-            anyhow::bail!(enriched);
-        }
-        Err(error) => return Err(error),
-    };
+    let resolved = resolve_chain_for_execution(cli, &eng, &health).await?;
     // Echo the task so the decision is traceable; routing is currently
     // capability/health based, not prompt-content based (see roadmap).
     let task = prompt.filter(|p| p != "-" && !p.trim().is_empty());
@@ -4191,9 +4178,10 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
             "{}",
             serde_json::json!({
                 "task": task,
-                "primary": route.primary,
-                "fallbacks": route.fallbacks,
-                "reason": route.reason,
+                "primary": resolved.primary.first().cloned().unwrap_or_default(),
+                "fallbacks": resolved.primary.iter().skip(1).cloned().collect::<Vec<_>>(),
+                "reason": resolved.reason,
+                "reviewer": resolved.reviewer,
             })
         );
     } else {
@@ -4212,8 +4200,18 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
         if let Some(t) = &task {
             println!("task: {t}");
         }
-        println!("{}", route.reason);
-        println!("fallbacks: {}", route.fallbacks.join(", "));
+        println!("{}", resolved.reason);
+        if !resolved.primary.is_empty() {
+            let primary = resolved.primary.first().unwrap();
+            let fallbacks = resolved.primary.iter().skip(1).cloned().collect::<Vec<_>>();
+            println!("primary: {primary}");
+            if !fallbacks.is_empty() {
+                println!("fallbacks: {}", fallbacks.join(", "));
+            }
+        }
+        if !resolved.reviewer.is_empty() {
+            println!("reviewer: {}", resolved.reviewer.join(", "));
+        }
     }
     Ok(())
 }
