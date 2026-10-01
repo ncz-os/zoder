@@ -2295,16 +2295,7 @@ fn build_diff(
 /// failure (no git, missing binary, etc.) returns an empty string — this is
 /// a best-effort supplement to the tracked diff and must not break review.
 fn untracked_not_ignored_diff(cwd: &Path) -> String {
-    let Ok(listing) = run_git(
-        cwd,
-        &[
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--directory",
-        ],
-    ) else {
+    let Ok(listing) = run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]) else {
         return String::new();
     };
     if listing.is_empty() {
@@ -2424,12 +2415,11 @@ fn synthetic_new_file_hunk(rel: &Path, abs: &Path) -> String {
 fn rewrite_no_index_hunk(stdout: &str, rel: &Path) -> String {
     let rel_display = rel.to_string_lossy();
     let mut out = String::new();
-    let mut lines = stdout.lines();
-    // Drop `diff --git ...`, `index ...`, `--- /dev/null`, `+++ b/<path>`.
-    let _ = lines.next();
-    let _ = lines.next();
-    let _ = lines.next();
-    let _ = lines.next();
+    // New files include an optional `new file mode` line; header length is
+    // not fixed. Keep only body hunks so absolute +++ paths cannot leak in.
+    let lines = stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("@@ ") && !line.starts_with("Binary files "));
     out.push_str(&format!(
         "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n",
         rel = rel_display,
@@ -11676,6 +11666,22 @@ mod patch_journal_tests {
 #[cfg(test)]
 mod completion_integrity_tests {
     use super::*;
+
+    #[test]
+    fn untracked_review_respects_nested_ignores_and_has_one_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        std::fs::create_dir(repo.join("new")).unwrap();
+        std::fs::write(repo.join("new/.gitignore"), "secret.env\n").unwrap();
+        std::fs::write(repo.join("new/secret.env"), "SECRET_SHOULD_NOT_APPEAR").unwrap();
+        std::fs::write(repo.join("new/code.rs"), "fn added() {}\n").unwrap();
+        let diff = untracked_not_ignored_diff(repo);
+        assert!(!diff.contains("SECRET_SHOULD_NOT_APPEAR"));
+        assert!(diff.contains("fn added()"));
+        assert_eq!(diff.matches("+++ ").count(), 2);
+        assert!(!diff.contains(&repo.to_string_lossy().to_string()));
+    }
 
     #[test]
     fn strict_review_requires_approval_and_no_blockers() {
