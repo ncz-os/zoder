@@ -4097,6 +4097,24 @@ fn loop_review_ok(r: &ReviewOutput, blocking: usize) -> bool {
     v == "approve" || blocking == 0
 }
 
+fn explicit_loop_approval(review: &ReviewOutput, blocking: usize) -> bool {
+    review.verdict.trim().eq_ignore_ascii_case("approve") && blocking == 0
+}
+
+/// Auto uses a stable task baseline; explicit review scopes keep their contract.
+fn loop_task_diff(
+    cwd: &Path,
+    scope: ReviewScope,
+    base: Option<&str>,
+    task_journal: &PatchJournal,
+) -> anyhow::Result<(String, String)> {
+    if matches!(scope, ReviewScope::Auto) {
+        Ok(("task".into(), task_journal.agent_diff(cwd)))
+    } else {
+        build_diff(cwd, scope, base)
+    }
+}
+
 /// All signals needed by [`decide_loop_resolution`] for one iteration.
 /// Lifted out of `cmd_loop` as a struct so the (substance × check ×
 /// verdict × heuristic-blocking × no-new-progress) matrix can be pinned
@@ -4140,7 +4158,11 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
     // A never-configured check (`s.check_configured == false`) carries
     // NO negative information; treat it as "no obstacle to resolution",
     // but resolution still has to clear `review_ok && substance_ok`.
-    let check_satisfied = s.check_passed != Some(false);
+    let check_satisfied = if s.check_configured {
+        s.check_passed == Some(true)
+    } else {
+        s.check_passed != Some(false)
+    };
     let review = ReviewOutput {
         verdict: s.verdict.clone(),
         ..Default::default()
@@ -4397,6 +4419,7 @@ pub(crate) async fn cmd_loop(
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
     allow_dangerous_check: bool,
+    require_approval: bool,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
     if background && active_job_dir().is_none() {
@@ -4476,6 +4499,11 @@ pub(crate) async fn cmd_loop(
     // later-turn inspection use the journal instead of `git diff HEAD`
     // to avoid confusing pre-existing user edits with agent work.
     let mut journal = PatchJournal::new();
+    // Autonomous runs own this checkout. Review the cumulative task delta,
+    // including commits made by the author, against the initial working state.
+    // Auto must never switch to an unrelated branch diff after a commit.
+    let mut task_journal = PatchJournal::new();
+    task_journal.record_baseline(&cwd);
     for i in 1..=max_iters {
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
@@ -4660,7 +4688,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
+        let (label, diff) = loop_task_diff(&cwd, scope, base.as_deref(), &task_journal)?;
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -4774,11 +4802,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // When the patch journal has turns, use its `agent_diff` so the
         // reviewer sees EXACTLY what the agent changed — not the full
         // working-tree diff which may contain pre-existing user edits.
-        let review_diff = if !journal.turns.is_empty() {
-            journal.agent_diff(&cwd)
-        } else {
-            diff.clone()
-        };
+        let review_diff = diff.clone();
         let review_user = {
             let mut u = format!(
                 "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
@@ -4972,7 +4996,7 @@ nits).\n",
         let resolve_now = decide_loop_resolution(
             &loop_signals_from_review(diff_substance, check.is_some(), check_passed, &review),
             accept_on_green,
-        );
+        ) && (!require_approval || explicit_loop_approval(&review, blocking));
 
         // Anti-gaming guard rail: if the check is green but the diff is
         // not substantive, the iteration MUST NOT resolve. Emit a clear
@@ -11633,6 +11657,74 @@ mod patch_journal_tests {
             !additions.iter().any(|l| l.contains("user fix")),
             "user's committed change should NOT be added in agent_diff: {:?}",
             agent_diff_v3
+        );
+    }
+}
+
+#[cfg(test)]
+mod completion_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn strict_review_requires_approval_and_no_blockers() {
+        for (verdict, blockers, expected) in [
+            ("comment", 0, false),
+            ("neutral", 0, false),
+            ("approve", 1, false),
+            ("request_changes", 0, false),
+            ("approve", 0, true),
+        ] {
+            let review = ReviewOutput {
+                verdict: verdict.into(),
+                ..Default::default()
+            };
+            assert_eq!(explicit_loop_approval(&review, blockers), expected);
+        }
+    }
+
+    #[test]
+    fn configured_check_without_result_cannot_resolve() {
+        let s = LoopResolutionSignals {
+            substance: DiffSubstance::Substantive,
+            check_configured: true,
+            check_passed: None,
+            verdict: "approve".into(),
+            blocking_findings: 0,
+        };
+        assert!(!decide_loop_resolution(&s, false));
+    }
+
+    #[test]
+    fn task_diff_survives_commit_and_excludes_old_branch_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("old.rs"), "fn old_branch_work() {}\n").unwrap();
+        git(&["add", "old.rs"]);
+        git(&["commit", "-qm", "old branch work"]);
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        assert!(loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+            .unwrap()
+            .1
+            .is_empty());
+        std::fs::write(repo.join("new.rs"), "fn job_work() {}\n").unwrap();
+        git(&["add", "new.rs"]);
+        git(&["commit", "-qm", "task change"]);
+        let diff = loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+            .unwrap()
+            .1;
+        assert!(diff.contains("job_work"));
+        assert!(!diff.contains("old_branch_work"));
+        // A subsequent author turn with no changes must review the same task delta.
+        assert_eq!(
+            diff,
+            loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+                .unwrap()
+                .1
         );
     }
 }
