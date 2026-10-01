@@ -767,6 +767,9 @@ enum Cmd {
         /// advisory (escape hatch for over-strict reviewers). Requires `--check`.
         #[arg(long)]
         accept_on_green: bool,
+        /// Require an explicit approve verdict with no blocking findings.
+        #[arg(long)]
+        require_approval: bool,
         /// Skip the pre-exec denylist inspection of the `--check` command
         /// string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`,
         /// `curl|sh`, …). Default is to refuse to run a `--check` command
@@ -1878,6 +1881,7 @@ async fn run() -> anyhow::Result<()> {
             base,
             scope,
             accept_on_green,
+            require_approval,
             allow_dangerous_check,
             background,
         }) => {
@@ -1897,6 +1901,7 @@ async fn run() -> anyhow::Result<()> {
                 loop_timeout_secs,
                 agent_timeout_secs,
                 *allow_dangerous_check,
+                *require_approval,
             )
             .await
         }
