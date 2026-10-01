@@ -10013,8 +10013,7 @@ mod reviewer_chain_dispatch_tests {
             .and(path("/broken/v1/chat/completions"))
             .respond_with(move |_: &wiremock::Request| {
                 broken_hits_for_responder.fetch_add(1, Ordering::SeqCst);
-                ResponseTemplate::new(400)
-                    .set_body_string(r#"{"error": "permanent provider failure"}"#)
+                ResponseTemplate::new(404).set_body_string(r#"{"error": "model not found"}"#)
             })
             .mount(&server)
             .await;
