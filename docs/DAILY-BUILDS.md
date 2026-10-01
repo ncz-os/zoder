@@ -5,7 +5,7 @@ The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/
 ## Source and acceptance
 
 - Scheduled/default-branch runs resolve the latest canonical GitLab `ncz-os/zoder` **master** at start. The build fetches that exact revision directly from GitLab, so mirror delay does not select old source or block checkout.
-- The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The separate ZeroClaw upstream CI tracks upstream master.
+- The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The source gate also resolves upstream master once and requires it to be an ancestor of that fork commit. A delayed or failed source sync makes the nightly fail clearly rather than silently shipping a stale engine; cron times alone do not establish ordering. The separate ZeroClaw CI performs the source sync.
 - Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
 - Every archive contains `manifest.json`: exact repository/commit pairs, target, and run URL. The raw package channel also contains `manifest.json-<target>` plus its checksum.
 - All three targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.

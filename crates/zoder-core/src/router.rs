@@ -306,11 +306,14 @@ impl<'a> Router<'a> {
             }
             None => "absent".to_string(),
         };
-        let tie_break = ranked
+        let tie_break = if ranked
             .get(1)
             .is_some_and(|next| Self::rank_key(next, tier) == effective_rank)
-            .then_some("model_id")
-            .unwrap_or("none");
+        {
+            "model_id"
+        } else {
+            "none"
+        };
         let reason = format!(
             "tier={:?} pick={} (rank={:.3} latency={} tie_break={} code_cap={} swe_elo={:?} ttft={:?}ms tok/s={:?} agentic={:?}) free=$0",
             tier,
