@@ -68,6 +68,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -215,6 +218,12 @@ Options:
       --panel <M1,M2,...>
           
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --background
+          
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -223,9 +232,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --background
-          
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -347,6 +353,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -478,6 +487,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -608,6 +620,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -736,6 +751,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -869,6 +887,9 @@ Options:
       --validate
           Exit non-zero if the configuration is invalid
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1001,6 +1022,9 @@ Options:
       --limit <LIMIT>
           Show at most N rows
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1130,6 +1154,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1269,22 +1296,25 @@ Options:
       --until <UNTIL>
           Only include spend on/before this date (YYYY-MM-DD)
 
-      --tier <TIER>
-          Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
-          
-          [default: auto]
-          [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --window-days <WINDOW_DAYS>
           Forecast window in days
           
           [default: 30]
 
-      --allow-paid
-          Allow paid models without interactive confirmation (scripts/CI)
-
       --json
           Emit machine-readable JSON to stdout
+
+      --tier <TIER>
+          Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
+          
+          [default: auto]
+          [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
+
+      --allow-paid
+          Allow paid models without interactive confirmation (scripts/CI)
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -1406,6 +1436,9 @@ Options:
       --local-iterate
           Local-iterate mode: missing tools become Skipped (Yellow) so you can iterate fast on a dev box. The gate reports which checks were skipped and what install commands restore the strict posture. Use this only for inner-loop speed; the `--strict` default is the posture that earns the "it passed the gate" claim
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --strict
           Strict mode (fail-closed). This is the DEFAULT; the flag exists so `zoder gate --strict` is a legible escape hatch when `--local-iterate` is wired into a wrapper
 
@@ -1415,23 +1448,23 @@ Options:
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --allow-paid
-          Allow paid models without interactive confirmation (scripts/CI)
-
       --tools-only
           Print what gate tools are installed vs missing + the install hint for each missing tool, then exit. Does not run any steps. Useful for `zoder gate --tools-only` in CI caches
 
+      --allow-paid
+          Allow paid models without interactive confirmation (scripts/CI)
+
       --plan-only
           Print the derived plan (ecosystems + framework hints + step list) without running anything. Useful for inspecting what the gate would actually do
+
+      --json
+          Emit machine-readable JSON to stdout (the GateReport + tool-probe, serialized). Suppresses the pretty renderer
 
       --require-free
           Only ever use free models; never fall back to paid
 
       --dry-run
           Print the routing decision + cost estimate without calling
-
-      --json
-          Emit machine-readable JSON to stdout (the GateReport + tool-probe, serialized). Suppresses the pretty renderer
 
       --explain
           Explain why a model was chosen
@@ -1550,17 +1583,20 @@ Options:
       --install-daily
           Install the daily `--probe --all` sweep into launchd (macOS) or a systemd user timer (Linux). Idempotent: re-running overwrites the existing job
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --allow-paid
-          Allow paid models without interactive confirmation (scripts/CI)
-
       --uninstall-daily
           Remove the daily sweep installed by `install-daily`. Idempotent
+
+      --allow-paid
+          Allow paid models without interactive confirmation (scripts/CI)
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -1683,6 +1719,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -1825,6 +1864,12 @@ Options:
       --check <CMD>
           Validation command that must exit 0 (e.g. "cargo test -p foo"). Run after each author turn; failing output is fed to the next iteration
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --reviewer <MODEL>
+          Reviewer model id (default: the routed/`-m` model). Use a different strong model for a genuine adversarial second opinion
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -1834,17 +1879,11 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
-      --reviewer <MODEL>
-          Reviewer model id (default: the routed/`-m` model). Use a different strong model for a genuine adversarial second opinion
-
       --base <BASE>
           Base ref for branch-scope diffing
 
       --require-free
           Only ever use free models; never fall back to paid
-
-      --dry-run
-          Print the routing decision + cost estimate without calling
 
       --scope <SCOPE>
           Diff scope shown to the reviewer: auto | working-tree | branch
@@ -1859,13 +1898,11 @@ Options:
       --accept-on-green
           Resolve as soon as `--check` exits 0, treating reviewer findings as advisory (escape hatch for over-strict reviewers). Requires `--check`
 
+      --dry-run
+          Print the routing decision + cost estimate without calling
+
       --explain
           Explain why a model was chosen
-
-      --max-tokens <MAX_TOKENS>
-          Max output tokens
-          
-          [default: 1024]
 
       --require-approval
           Require an explicit approve verdict with no blocking findings
@@ -1873,11 +1910,16 @@ Options:
       --allow-dangerous-check
           Skip the pre-exec denylist inspection of the `--check` command string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`, `curl|sh`, …). Default is to refuse to run a `--check` command that matches the denylist — set this flag to allow such commands explicitly. The denylist is best-effort, not a sandbox; see `exec_safety.rs` for the honest scope statement
 
-      --no-stream
-          Disable streaming output
+      --max-tokens <MAX_TOKENS>
+          Max output tokens
+          
+          [default: 1024]
 
       --background
           Run detached as a tracked background job
+
+      --no-stream
+          Disable streaming output
 
       --json
           JSON output (codex/claude-compatible)
@@ -1984,6 +2026,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2110,6 +2155,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2242,6 +2290,9 @@ Options:
 
       --record <RECORD>
           
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2378,6 +2429,9 @@ Options:
       --all
           
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2509,6 +2563,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -2634,6 +2691,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2766,6 +2826,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -2902,6 +2965,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3027,6 +3093,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3169,20 +3238,23 @@ Options:
           
           [default: 20]
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --vendor <VENDOR>
+          Restrict the report to one vendor profile (e.g. `--vendor enterprise`). Reads `~/.zoder/config.<vendor>.toml` and only counts ledger entries whose `provider` id was contributed by that TOML. The totals, counterfactual, and avoided-spend headline are all recomputed over the filtered set so the headline is meaningful. See README §"Config overlays" for how to add a vendor
+
+      --host <HOST>
+          Restrict the report to one publisher host (e.g. `--host meta`), counting every provider that served that publisher's models. The host is the segment before `/` in the model id, so it sums enterprise direct + OpenRouter + any other route for the same publisher. Mutually exclusive with `--vendor` (which scopes by who served the call, not who published the model)
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
           [default: auto]
           [possible values: fast, strong, codex, auto, single-pass, singlepass, single, oneshot, grind, loop]
 
-      --vendor <VENDOR>
-          Restrict the report to one vendor profile (e.g. `--vendor enterprise`). Reads `~/.zoder/config.<vendor>.toml` and only counts ledger entries whose `provider` id was contributed by that TOML. The totals, counterfactual, and avoided-spend headline are all recomputed over the filtered set so the headline is meaningful. See README §"Config overlays" for how to add a vendor
-
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --host <HOST>
-          Restrict the report to one publisher host (e.g. `--host meta`), counting every provider that served that publisher's models. The host is the segment before `/` in the model id, so it sums enterprise direct + OpenRouter + any other route for the same publisher. Mutually exclusive with `--vendor` (which scopes by who served the call, not who published the model)
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -3307,6 +3379,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3437,6 +3512,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3580,6 +3658,12 @@ Options:
       --panel <M1,M2,...>
           Run additional reviewer models in parallel (comma-separated ids)
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --background
+          Run detached as a tracked background job (see `status`/`result`)
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3588,9 +3672,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --background
-          Run detached as a tracked background job (see `status`/`result`)
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -3712,6 +3793,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -3843,6 +3927,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3968,6 +4055,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4102,6 +4192,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4244,6 +4337,12 @@ Options:
       --by-model
           Group by model instead of by period bucket
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
+      --host <HOST>
+          Restrict to one publisher host (the segment before `/` in the model id, e.g. `--host meta`), summed across every provider that served that publisher's models
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4252,9 +4351,6 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
-
-      --host <HOST>
-          Restrict to one publisher host (the segment before `/` in the model id, e.g. `--host meta`), summed across every provider that served that publisher's models
 
       --require-free
           Only ever use free models; never fall back to paid
@@ -4379,6 +4475,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4505,6 +4604,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
@@ -4636,6 +4738,9 @@ Options:
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
 
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -4764,6 +4869,9 @@ Options:
 
       --allowed-routes <PROVIDER=MODEL,...>
           Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+
+      --reviewer-allowed-routes <PROVIDER=MODEL,...>
+          Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
 
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
