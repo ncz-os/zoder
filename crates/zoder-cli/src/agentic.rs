@@ -567,7 +567,11 @@ async fn complete_once(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let candidates = build_reviewer_candidates(cli, model_override, reviewer_chain)?;
+    let mut candidates = build_reviewer_candidates(cli, model_override, reviewer_chain)?;
+    // The global `-m` switch is an exact pin. A standalone review may use it
+    // as its reviewer override, but must not silently fall back to a different
+    // configured reviewer when that pinned endpoint fails.
+    candidates = enforce_exact_model_pin(candidates, cli.model.as_deref(), model_override);
     if candidates.is_empty() {
         // Empty head — original behavior preserved: no candidates means
         // no model was resolvable, bail without fabricating a review.
@@ -860,6 +864,31 @@ fn push_unique(out: &mut Vec<String>, candidate: &str) {
     }
 }
 
+fn enforce_exact_model_pin(
+    mut candidates: Vec<String>,
+    cli_model: Option<&str>,
+    reviewer_override: Option<&str>,
+) -> Vec<String> {
+    if cli_model.is_some() && cli_model == reviewer_override {
+        candidates.truncate(1);
+    }
+    candidates
+}
+
+fn review_roster(cli_model: Option<&str>, panel: Option<&str>) -> Vec<Option<String>> {
+    let mut models = vec![cli_model.map(str::to_owned)];
+    if let Some(panel) = panel {
+        models.extend(
+            panel
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| Some(model.to_owned())),
+        );
+    }
+    models
+}
+
 /// Run the single-model reviewer dispatch for an explicit model id. The
 /// caller is responsible for selecting the model (this helper just runs
 /// it). The return type mirrors `try_model` in the author path: success
@@ -924,11 +953,11 @@ async fn dispatch_reviewer_for_model(
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let known_paid_model = eng
-        .corpus
+        .route_corpus
         .get(model)
         .is_some_and(|candidate| !candidate.free);
     let model_entry = eng
-        .corpus
+        .route_corpus
         .get(model)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
@@ -952,11 +981,11 @@ async fn dispatch_reviewer_for_model(
 
     let ledger_path = eng.cfg.ledger_path.clone();
     let messages = vec![Message::new("system", system), Message::new("user", user)];
-    // Per-model sampling from `[providers.models.*]`, matched on model id.
-    // Without this a model's own documented settings cannot reach the wire --
-    // and for some backends that is not a tuning nicety: Nemotron 3.5 returns
-    // empty content for coding work unless `force_nonempty_content` is passed
-    // as a chat-template kwarg.
+    // Per-model sampling from zoder's vendor overlay, matched on model id.
+    // The engine's `config.toml` is deliberately excluded from Config::load,
+    // yet local review checkpoints keep their chat-template options there.
+    // Fall back to that read-only engine registry for kwargs, or a thinking
+    // model can spend the whole output budget without returning an answer.
     let model_cfg = eng
         .cfg
         .models
@@ -973,7 +1002,13 @@ async fn dispatch_reviewer_for_model(
         top_p: model_cfg.and_then(|m| m.top_p),
         top_k: model_cfg.and_then(|m| m.top_k),
         presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
-        chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
+        chat_template_kwargs: model_cfg
+            .and_then(|m| m.chat_template_kwargs.clone())
+            .or_else(|| {
+                eng.engine_models
+                    .chat_template_kwargs_for_model(model, cli.agent.as_deref())
+                    .cloned()
+            }),
     };
     let provider = match OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
@@ -1024,7 +1059,9 @@ async fn dispatch_reviewer_for_model(
                     server_failures = server_failures.saturating_add(1);
                 }
                 if e.emitted {
-                    return Err(ReviewerError::Fatal { message: e.message });
+                    return Err(ReviewerError::Fatal {
+                        message: format!("reviewer {model}: {}", e.message),
+                    });
                 }
                 if e.retryable() && attempt < cli.retries {
                     let delay = zoder_core::backoff_delay(attempt, e.retry_after);
@@ -1050,7 +1087,9 @@ async fn dispatch_reviewer_for_model(
                 if provider_error_is_model_unavailable(&e, server_failures) {
                     return Err(ReviewerError::fallback_worthy_from(e));
                 }
-                return Err(ReviewerError::Fatal { message: e.message });
+                return Err(ReviewerError::Fatal {
+                    message: format!("reviewer {model}: {}", e.message),
+                });
             }
         }
     };
@@ -1439,6 +1478,46 @@ fn parse_review(raw: &str) -> ReviewOutput {
             severity: "info".into(),
             title: "unparseable review (fail-closed)".into(),
             body: trimmed.to_string(),
+            location: None,
+        }],
+        next_steps: vec![],
+    }
+}
+
+/// The standalone review gate requires the complete provider answer to be a
+/// verdict object. `parse_review` deliberately supports prose for older loop
+/// workflows, but that recovery can misread a thinking model's explanation
+/// of the schema ("approve or request_changes") as an actual approval.
+fn parse_standalone_review(raw: &str) -> ReviewOutput {
+    let trimmed = raw.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    if let Some(value) = parsed.as_ref().and_then(serde_json::Value::as_object) {
+        let has_shape = ["verdict", "summary", "findings", "next_steps"]
+            .iter()
+            .all(|key| value.contains_key(*key));
+        if has_shape {
+            if let Ok(review) =
+                serde_json::from_value::<ReviewOutput>(serde_json::Value::Object(value.clone()))
+            {
+                if matches!(
+                    review.verdict.as_str(),
+                    "approve" | "request_changes" | "comment"
+                ) && !review.summary.trim().is_empty()
+                    && review.summary.trim() != "..."
+                {
+                    return review;
+                }
+            }
+        }
+    }
+    ReviewOutput {
+        verdict: "request_changes".into(),
+        summary: "Reviewer did not return one complete structured JSON verdict; failing closed."
+            .into(),
+        findings: vec![Finding {
+            severity: "info".into(),
+            title: "unparseable review (fail-closed)".into(),
+            body: trimmed.chars().take(8_000).collect(),
             location: None,
         }],
         next_steps: vec![],
@@ -1914,6 +1993,13 @@ impl PatchJournal {
         let idx = unique_index_path("baseline");
         let _ = std::fs::remove_file(&idx);
         let idx_s = idx.to_string_lossy().to_string();
+        // Seed from the real index: tracked files may match .gitignore, and
+        // an empty alternate index would silently omit their changes.
+        let index_path = run_git(cwd, &["rev-parse", "--git-path", "index"]).ok()?;
+        let index_path = cwd.join(index_path.trim());
+        if index_path.exists() {
+            std::fs::copy(index_path, &idx).ok()?;
+        }
         // `add -A` honours .gitignore, so build artefacts stay out.
         run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
         let tree = run_git_env(cwd, &["write-tree"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
@@ -1943,34 +2029,24 @@ impl PatchJournal {
             .map(|s| s.lines().map(|l| l.to_string()).collect())
             .unwrap_or_default();
 
-        // Capture untracked (non-ignored) files. Use --directory flag so
-        // directory entries are included (they contain nested untracked files).
-        let untracked_raw = run_git(
-            cwd,
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--directory",
-                "-z",
-            ],
-        )
-        .ok()
-        .map(|s| {
-            let mut files = Vec::new();
-            for entry in s.split('\0') {
-                if entry.is_empty() {
-                    continue;
+        // Capture exact non-ignored file paths, matching current-file enumeration.
+        let untracked_raw = run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])
+            .ok()
+            .map(|s| {
+                let mut files = Vec::new();
+                for entry in s.split('\0') {
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    // Strip trailing slash for directories; only add files.
+                    let path = entry.trim_end_matches('/');
+                    if !path.is_empty() && !path.starts_with(".git/") {
+                        files.push(path.to_string());
+                    }
                 }
-                // Strip trailing slash for directories; only add files.
-                let path = entry.trim_end_matches('/');
-                if !path.is_empty() && !path.starts_with(".git/") {
-                    files.push(path.to_string());
-                }
-            }
-            files
-        })
-        .unwrap_or_default();
+                files
+            })
+            .unwrap_or_default();
 
         self.baseline = Some(Baseline {
             head_sha,
@@ -2018,21 +2094,14 @@ impl PatchJournal {
             // agent started. Falls back to the old HEAD diff only when no tree
             // was captured.
             if let Some(tree) = &self.baseline_tree {
-                let idx = unique_index_path("now");
-                let _ = std::fs::remove_file(&idx);
-                let idx_s = idx.to_string_lossy().to_string();
-                if run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).is_ok() {
-                    if let Ok(output) = run_git_env(
-                        cwd,
-                        &["diff", "--cached", tree],
-                        &[("GIT_INDEX_FILE", &idx_s)],
-                    ) {
-                        if !output.trim().is_empty() {
-                            result.push_str(&output);
-                        }
+                if let Some(current) = Self::snapshot_tree(cwd) {
+                    if let Ok(output) = run_git_diff(cwd, &["diff", tree, &current]) {
+                        // Includes every tracked/non-ignored file, even when empty.
+                        return output;
                     }
                 }
-                let _ = std::fs::remove_file(&idx);
+                // Failed snapshots cannot establish an accepted task delta.
+                return String::new();
             } else if let Ok(output) = run_git(cwd, &["diff", &baseline.head_sha]) {
                 if !output.trim().is_empty() {
                     result.push_str(&output);
@@ -2216,16 +2285,7 @@ fn build_diff(
 /// failure (no git, missing binary, etc.) returns an empty string — this is
 /// a best-effort supplement to the tracked diff and must not break review.
 fn untracked_not_ignored_diff(cwd: &Path) -> String {
-    let Ok(listing) = run_git(
-        cwd,
-        &[
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--directory",
-        ],
-    ) else {
+    let Ok(listing) = run_git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]) else {
         return String::new();
     };
     if listing.is_empty() {
@@ -2345,12 +2405,11 @@ fn synthetic_new_file_hunk(rel: &Path, abs: &Path) -> String {
 fn rewrite_no_index_hunk(stdout: &str, rel: &Path) -> String {
     let rel_display = rel.to_string_lossy();
     let mut out = String::new();
-    let mut lines = stdout.lines();
-    // Drop `diff --git ...`, `index ...`, `--- /dev/null`, `+++ b/<path>`.
-    let _ = lines.next();
-    let _ = lines.next();
-    let _ = lines.next();
-    let _ = lines.next();
+    // New files include an optional `new file mode` line; header length is
+    // not fixed. Keep only body hunks so absolute +++ paths cannot leak in.
+    let lines = stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("@@ ") && !line.starts_with("Binary files "));
     out.push_str(&format!(
         "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n",
         rel = rel_display,
@@ -2818,15 +2877,151 @@ pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
 // ---------------------------------------------------------------------------
 
 const REVIEW_SYSTEM: &str = "You are a meticulous senior software engineer performing a code review. \
-Identify bugs, anti-patterns, missing tests, security issues, and documentation gaps. \
-Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
-{\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
+Identify concrete defects in the supplied diff. Approve a sound change; request changes only for a defect you can explain and locate. \
+Return one JSON object with keys verdict, summary, findings, and next_steps. \
+Set verdict to exactly one of approve, request_changes, or comment. \
+Findings MUST be an array of objects, never an array of strings. Each finding object has severity (critical, high, medium, low, or info), title, body, and optional location as a string (path:line). \
+next_steps MUST be a top-level array of strings. Use empty arrays when there are no findings or actions. \
+Write an actual review of this diff. Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
 const ADVERSARIAL_SYSTEM: &str = "You are a demanding, skeptical staff engineer and security auditor performing an ADVERSARIAL review. \
 Aggressively pressure-test the logic: assume the author missed edge cases, race conditions, error handling, injection/abuse vectors, and incorrect assumptions. Be specific and uncompromising. \
 A correct change MUST be approved: report `request_changes` only for a defect you can name and locate in this diff, never for style, speculation, or unverified suspicion. Approving a sound change is as important as catching a broken one; withholding approval from correct work is itself a review failure. \
-Respond with ONLY a single JSON object (no markdown, no prose) matching this schema: \
-{\"verdict\":\"approve|request_changes|comment\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low|info\",\"title\":\"...\",\"body\":\"...\",\"location\":\"path:line (optional)\"}],\"next_steps\":[\"...\"]}";
+Return one JSON object with keys verdict, summary, findings, and next_steps. \
+Set verdict to exactly one of approve, request_changes, or comment. \
+Findings MUST be an array of objects, never an array of strings. Each finding object has severity (critical, high, medium, low, or info), title, body, and optional location as a string (path:line). \
+next_steps MUST be a top-level array of strings. Use empty arrays when there are no findings or next steps. Write an actual review of this diff. \
+Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
+
+const REVIEW_CHUNK_BYTES: usize = 9_000;
+const MAX_REVIEW_CHUNKS: usize = 24;
+
+/// Split at file and hunk boundaries so a reviewer never sees a line cut in
+/// half. Each hunk carries its file header; this also keeps locations useful
+/// when one file spans several requests. Oversized individual hunks fail
+/// closed instead of silently clipping code the reviewer needs to inspect.
+fn review_diff_chunks(diff: &str) -> anyhow::Result<Vec<String>> {
+    let mut starts = vec![0usize];
+    starts.extend(diff.match_indices("\ndiff --git ").map(|(i, _)| i + 1));
+    let mut units = Vec::new();
+    for (idx, start) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(diff.len());
+        let file = &diff[*start..end];
+        let Some(first_hunk) = file.find("\n@@").map(|i| i + 1) else {
+            units.push(file.to_owned());
+            continue;
+        };
+        let header = &file[..first_hunk];
+        let body = &file[first_hunk..];
+        let mut hunk_starts = vec![0usize];
+        hunk_starts.extend(body.match_indices("\n@@").map(|(i, _)| i + 1));
+        for (hidx, hstart) in hunk_starts.iter().enumerate() {
+            let hend = hunk_starts.get(hidx + 1).copied().unwrap_or(body.len());
+            units.push(format!("{header}{}", &body[*hstart..hend]));
+        }
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    for unit in units {
+        if unit.len() > REVIEW_CHUNK_BYTES {
+            anyhow::bail!(
+                "one diff hunk is {} bytes, above the {}-byte review limit; split the change into smaller commits",
+                unit.len(), REVIEW_CHUNK_BYTES
+            );
+        }
+        if chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() + unit.len() > REVIEW_CHUNK_BYTES)
+        {
+            chunks.push(String::new());
+        }
+        chunks
+            .last_mut()
+            .expect("chunk was just created")
+            .push_str(&unit);
+        if chunks.len() > MAX_REVIEW_CHUNKS {
+            anyhow::bail!("diff needs more than {MAX_REVIEW_CHUNKS} review chunks; narrow the branch or review its commits separately");
+        }
+    }
+    Ok(chunks)
+}
+
+fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usize, count: usize) {
+    if verdict_rank(&review.verdict) > verdict_rank(&merged.verdict) {
+        merged.verdict = review.verdict;
+    }
+    if count == 1 {
+        merged.summary = review.summary;
+    } else {
+        merged.summary.push_str(&format!(
+            "Chunk {}/{}: {}\n",
+            idx + 1,
+            count,
+            review.summary
+        ));
+    }
+    merged.findings.extend(review.findings);
+    merged.next_steps.extend(review.next_steps);
+}
+
+async fn complete_review_chunks(
+    cli: &crate::Cli,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    system: &str,
+    users: &[String],
+    max_tokens: u32,
+) -> anyhow::Result<Completion> {
+    let mut selected_model: Option<String> = None;
+    let mut cost_usd = 0.0;
+    let mut merged = ReviewOutput {
+        verdict: "approve".into(),
+        ..ReviewOutput::default()
+    };
+    for (idx, user) in users.iter().enumerate() {
+        let user = format!(
+            "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
+Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
+is not evidence of a defect. Report only defects established by the supplied code; do not \
+invent missing integration or compiler failures from omitted context.\n\n{}",
+            idx + 1, users.len(), user
+        );
+        let completion = complete_once(
+            cli,
+            model_override,
+            reviewer_chain,
+            system,
+            &user,
+            max_tokens,
+        )
+        .await
+        .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
+        if let Some(first) = &selected_model {
+            if first != &completion.model {
+                anyhow::bail!(
+                    "review chunk {}/{} used {}, after earlier chunks used {}; refusing a mixed-model approval",
+                    idx + 1,
+                    users.len(),
+                    completion.model,
+                    first
+                );
+            }
+        } else {
+            selected_model = Some(completion.model);
+        }
+        cost_usd += completion.cost_usd;
+        append_chunk_review(
+            &mut merged,
+            parse_standalone_review(&completion.content),
+            idx,
+            users.len(),
+        );
+    }
+    Ok(Completion {
+        model: selected_model.ok_or_else(|| anyhow!("no review chunks were generated"))?,
+        content: serde_json::to_string(&merged)?,
+        cost_usd,
+    })
+}
 
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
@@ -2886,25 +3081,32 @@ pub(crate) async fn cmd_review(
         REVIEW_SYSTEM
     };
     let focus_txt = focus.join(" ");
-    let user = if focus_txt.trim().is_empty() {
-        format!(
-            "Review the following {label} diff:\n\n```diff\n{}\n```",
-            cap_diff(&diff, 120_000)
-        )
-    } else {
-        format!(
-            "Review the following {label} diff. Focus especially on: {focus_txt}\n\n```diff\n{}\n```",
-            cap_diff(&diff, 120_000)
-        )
-    };
-
-    // Reviewer roster: the routed/`-m` model plus any `--panel` models.
-    let mut models: Vec<Option<String>> = vec![None];
-    if let Some(p) = &panel {
-        for m in p.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            models.push(Some(m.to_string()));
-        }
+    if diff.len() > 120_000 {
+        anyhow::bail!("review diff is {} bytes, above the 120000-byte limit; narrow the branch or review its commits separately", diff.len());
     }
+    let chunks = review_diff_chunks(&diff)?;
+    let users: Vec<String> = chunks
+        .iter()
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let portion = if chunks.len() == 1 {
+                format!("{label} diff")
+            } else {
+                format!("{label} diff, chunk {}/{}", idx + 1, chunks.len())
+            };
+            let focus = if focus_txt.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" Focus especially on: {focus_txt}.")
+            };
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.\n\n```diff\n{chunk}\n```")
+        })
+        .collect();
+
+    // Standalone review has no author turn: `-m` pins its primary reviewer.
+    // Without it, use the configured reviewer/scenario route. Additional
+    // `--panel` entries remain independent reviewer slots.
+    let models = review_roster(cli.model.as_deref(), panel.as_deref());
 
     // Scenario-routed reviewer chain: loaded once and passed to every
     // `complete_once` call so the default reviewer (the "head" of the
@@ -2928,12 +3130,12 @@ pub(crate) async fn cmd_review(
     // a non-Send sink type, so we poll them together via join_all instead).
     let max_tokens = cli.max_tokens.max(2048);
     let futs = models.iter().map(|m| {
-        complete_once(
+        complete_review_chunks(
             cli,
             m.as_deref(),
             &reviewer_chain,
             system,
-            &user,
+            &users,
             max_tokens,
         )
     });
@@ -3882,6 +4084,28 @@ fn loop_review_ok(r: &ReviewOutput, blocking: usize) -> bool {
     v == "approve" || blocking == 0
 }
 
+fn explicit_loop_approval(review: &ReviewOutput, blocking: usize) -> bool {
+    review.verdict.trim().eq_ignore_ascii_case("approve") && blocking == 0
+}
+
+/// Auto uses a stable task baseline; explicit review scopes keep their contract.
+fn loop_task_diff(
+    cwd: &Path,
+    scope: ReviewScope,
+    base: Option<&str>,
+    task_journal: &PatchJournal,
+) -> anyhow::Result<(String, String)> {
+    if matches!(scope, ReviewScope::Auto) {
+        anyhow::ensure!(
+            task_journal.baseline_tree.is_some(),
+            "task baseline snapshot unavailable"
+        );
+        Ok(("task".into(), task_journal.agent_diff(cwd)))
+    } else {
+        build_diff(cwd, scope, base)
+    }
+}
+
 /// All signals needed by [`decide_loop_resolution`] for one iteration.
 /// Lifted out of `cmd_loop` as a struct so the (substance × check ×
 /// verdict × heuristic-blocking × no-new-progress) matrix can be pinned
@@ -3925,7 +4149,11 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
     // A never-configured check (`s.check_configured == false`) carries
     // NO negative information; treat it as "no obstacle to resolution",
     // but resolution still has to clear `review_ok && substance_ok`.
-    let check_satisfied = s.check_passed != Some(false);
+    let check_satisfied = if s.check_configured {
+        s.check_passed == Some(true)
+    } else {
+        s.check_passed != Some(false)
+    };
     let review = ReviewOutput {
         verdict: s.verdict.clone(),
         ..Default::default()
@@ -4182,6 +4410,7 @@ pub(crate) async fn cmd_loop(
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
     allow_dangerous_check: bool,
+    require_approval: bool,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
     if background && active_job_dir().is_none() {
@@ -4261,6 +4490,11 @@ pub(crate) async fn cmd_loop(
     // later-turn inspection use the journal instead of `git diff HEAD`
     // to avoid confusing pre-existing user edits with agent work.
     let mut journal = PatchJournal::new();
+    // Autonomous runs own this checkout. Review the cumulative task delta,
+    // including commits made by the author, against the initial working state.
+    // Auto must never switch to an unrelated branch diff after a commit.
+    let mut task_journal = PatchJournal::new();
+    task_journal.record_baseline(&cwd);
     for i in 1..=max_iters {
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
@@ -4445,7 +4679,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
+        let (label, diff) = loop_task_diff(&cwd, scope, base.as_deref(), &task_journal)?;
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -4559,11 +4793,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // When the patch journal has turns, use its `agent_diff` so the
         // reviewer sees EXACTLY what the agent changed — not the full
         // working-tree diff which may contain pre-existing user edits.
-        let review_diff = if !journal.turns.is_empty() {
-            journal.agent_diff(&cwd)
-        } else {
-            diff.clone()
-        };
+        let review_diff = diff.clone();
         let review_user = {
             let mut u = format!(
                 "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
@@ -4730,6 +4960,18 @@ nits).\n",
             ),
         }));
 
+        crate::mnemos::checkpoint(
+            &cwd,
+            json!({
+                "job_id": std::env::var("HIVE_JOB_ID").ok(),
+                "workspace": cwd.to_string_lossy(), "iteration": i,
+                "head_sha": rev_parse_head(&cwd), "files": touched,
+                "check_passed": check_passed, "verdict": review.verdict,
+                "blocking_findings": blocking,
+            }),
+        )
+        .await;
+
         // 6. Decide: review gate AND objective gate AND anti-gaming substance gate.
         //    `review_ok` is now AUTHORITATIVE on the explicit verdict — see
         //    `loop_review_ok`. `check_satisfied` does not fabricate a green check
@@ -4757,7 +4999,7 @@ nits).\n",
         let resolve_now = decide_loop_resolution(
             &loop_signals_from_review(diff_substance, check.is_some(), check_passed, &review),
             accept_on_green,
-        );
+        ) && (!require_approval || explicit_loop_approval(&review, blocking));
 
         // Anti-gaming guard rail: if the check is green but the diff is
         // not substantive, the iteration MUST NOT resolve. Emit a clear
@@ -5570,6 +5812,125 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn review_prompts_do_not_offer_template_verdicts() {
+        for prompt in [REVIEW_SYSTEM, ADVERSARIAL_SYSTEM] {
+            assert!(!prompt.contains("approve|request_changes|comment"));
+            assert!(!prompt.contains("\"...\""));
+            assert!(prompt.contains("Never copy these instructions"));
+        }
+    }
+
+    #[test]
+    fn standalone_review_model_pin_is_a_reviewer_override() {
+        let cli = crate::Cli::try_parse_from(["zoder", "review", "-m", "model-a"])
+            .expect("review CLI accepts model pin");
+        assert_eq!(cli.model.as_deref(), Some("model-a"));
+        let roster = review_roster(cli.model.as_deref(), Some("model-b, model-c"));
+        assert_eq!(
+            roster,
+            vec![
+                Some("model-a".into()),
+                Some("model-b".into()),
+                Some("model-c".into())
+            ]
+        );
+        let out = order_reviewer_candidates(
+            roster[0].as_deref(),
+            Some("configured-reviewer"),
+            &[],
+            &["scenario-reviewer".into()],
+        );
+        assert_eq!(
+            enforce_exact_model_pin(out, cli.model.as_deref(), roster[0].as_deref()),
+            vec!["model-a"]
+        );
+        assert_eq!(review_roster(None, None), vec![None]);
+    }
+
+    #[test]
+    fn review_chunks_keep_complete_hunks_and_file_headers() {
+        let header = "diff --git a/auth.rs b/auth.rs\n--- a/auth.rs\n+++ b/auth.rs\n";
+        let mut diff = header.to_owned();
+        for n in 0..32 {
+            diff.push_str(&format!("@@ -{n},1 +{n},1 @@\n"));
+            diff.push_str(&format!("+changed_{n}_{}\n", "x".repeat(350)));
+        }
+        let chunks = review_diff_chunks(&diff).unwrap();
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.len() <= REVIEW_CHUNK_BYTES);
+            assert!(chunk.starts_with(header));
+        }
+        for n in 0..32 {
+            let marker = format!("@@ -{n},1 +{n},1 @@");
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| chunk.contains(&marker))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn review_chunks_reject_oversized_single_hunk() {
+        let diff = format!(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+{}\n",
+            "x".repeat(REVIEW_CHUNK_BYTES)
+        );
+        assert!(review_diff_chunks(&diff)
+            .unwrap_err()
+            .to_string()
+            .contains("one diff hunk"));
+    }
+
+    #[test]
+    fn chunked_review_keeps_the_blocking_vote() {
+        let mut merged = ReviewOutput {
+            verdict: "approve".into(),
+            ..ReviewOutput::default()
+        };
+        append_chunk_review(
+            &mut merged,
+            ReviewOutput {
+                verdict: "request_changes".into(),
+                summary: "authorization removed".into(),
+                findings: vec![Finding {
+                    title: "auth".into(),
+                    ..Finding::default()
+                }],
+                ..ReviewOutput::default()
+            },
+            0,
+            2,
+        );
+        append_chunk_review(
+            &mut merged,
+            ReviewOutput {
+                verdict: "approve".into(),
+                summary: "second hunk sound".into(),
+                ..ReviewOutput::default()
+            },
+            1,
+            2,
+        );
+        assert_eq!(merged.verdict, "request_changes");
+        assert_eq!(merged.findings.len(), 1);
+        assert!(merged.summary.contains("Chunk 2/2"));
+    }
+
+    #[test]
+    fn standalone_review_does_not_approve_schema_echo_or_prose() {
+        let echoed = "We should return {\"verdict\":\"approve\",\"summary\":\"fine\",\"findings\":[],\"next_steps\":[]} after analyzing the diff.";
+        assert_eq!(parse_standalone_review(echoed).verdict, "request_changes");
+        let prose = "The available verdicts are approve, request_changes, or comment.";
+        assert_eq!(parse_standalone_review(prose).verdict, "request_changes");
+        let valid = r#"{"verdict":"approve","summary":"No concrete defects.","findings":[],"next_steps":[]}"#;
+        assert_eq!(parse_standalone_review(valid).verdict, "approve");
+    }
 
     // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
 
@@ -9224,7 +9585,7 @@ mod reviewer_chain_dispatch_tests {
     /// `wiremock-broken` provider — i.e.
     /// `<mock_uri>/broken/v1/chat/completions`. The body shape
     /// mirrors the production incident
-    /// (`deepseek-ai/deepseek-coder-6.7b-instruct` on NVIDIA EIH,
+    /// (`deepseek-ai/deepseek-coder-6.7b-instruct` on an Enterprise LLM Gateway,
     /// redacted): `"Function [REDACTED] Not found for account
     /// [REDACTED]"`. The 404 mirrors what the production
     /// `provider.rs` code surfaces as `"provider HTTP 404 Not Found"`.
@@ -9548,6 +9909,7 @@ mod reviewer_chain_dispatch_tests {
 type = "openai-compatible"
 model = "nemotron35"
 uri = "https://example.invalid/v1"
+chat_template_kwargs = { force_nonempty_content = true }
 
 [agents.reviewer]
 model_provider = "custom.reviewer"
@@ -9606,6 +9968,10 @@ model_provider = "custom.reviewer"
             "the wire request must carry the real checkpoint id, never the \
              alias — sending the alias verbatim is exactly the 404 this \
              regression pins ('The model `reviewer` does not exist')"
+        );
+        assert_eq!(
+            sent["chat_template_kwargs"]["force_nonempty_content"], true,
+            "review dispatch must carry the engine profile's template options"
         );
     }
 
@@ -9733,7 +10099,7 @@ model_provider = "custom.nemotron35"
     /// head to the working tail and produce a real completion from the
     /// second candidate. This pins the production incident
     /// (`deepseek-ai/deepseek-coder-6.7b-instruct` was the broken head
-    /// on NVIDIA EIH) at the dispatch boundary: the new behaviour is
+    /// on an Enterprise LLM Gateway) at the dispatch boundary: the new behaviour is
     /// "the broken head's 404 is treated as fallback-worthy; the next
     /// candidate takes over and the review completes." Before the fix
     /// this test would have surfaced the verbatim `404 Not Found`
@@ -11294,6 +11660,124 @@ mod patch_journal_tests {
             !additions.iter().any(|l| l.contains("user fix")),
             "user's committed change should NOT be added in agent_diff: {:?}",
             agent_diff_v3
+        );
+    }
+}
+
+#[cfg(test)]
+mod completion_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn untracked_review_respects_nested_ignores_and_has_one_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        std::fs::create_dir(repo.join("new")).unwrap();
+        std::fs::write(repo.join("new/.gitignore"), "secret.env\n").unwrap();
+        std::fs::write(repo.join("new/secret.env"), "SECRET_SHOULD_NOT_APPEAR").unwrap();
+        std::fs::write(repo.join("new/code.rs"), "fn added() {}\n").unwrap();
+        let diff = untracked_not_ignored_diff(repo);
+        assert!(!diff.contains("SECRET_SHOULD_NOT_APPEAR"));
+        assert!(diff.contains("fn added()"));
+        assert_eq!(diff.matches("+++ ").count(), 2);
+        assert!(!diff.contains(&repo.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn task_snapshot_excludes_existing_nested_untracked_and_counts_new_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q"]).unwrap();
+        std::fs::create_dir(repo.join("notes")).unwrap();
+        std::fs::write(repo.join("notes/existing.md"), "preexisting evidence\n").unwrap();
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        assert!(journal.agent_diff(repo).is_empty());
+        std::fs::write(repo.join("notes/new.md"), "new evidence\n").unwrap();
+        let diff = journal.agent_diff(repo);
+        assert_eq!(diff.matches("diff --git").count(), 1);
+        assert!(!diff.contains("preexisting evidence"));
+        assert!(diff.contains("new evidence"));
+    }
+
+    #[test]
+    fn task_snapshot_keeps_tracked_files_that_match_ignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "tracked.rs\n").unwrap();
+        std::fs::write(repo.join("tracked.rs"), "fn before() {}\n").unwrap();
+        git(&["add", "-f", ".gitignore", "tracked.rs"]);
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        std::fs::write(repo.join("tracked.rs"), "fn after() {}\n").unwrap();
+        let diff = journal.agent_diff(repo);
+        assert!(diff.contains("+fn after()"));
+        assert!(diff.contains("-fn before()"));
+    }
+
+    #[test]
+    fn strict_review_requires_approval_and_no_blockers() {
+        for (verdict, blockers, expected) in [
+            ("comment", 0, false),
+            ("neutral", 0, false),
+            ("approve", 1, false),
+            ("request_changes", 0, false),
+            ("approve", 0, true),
+        ] {
+            let review = ReviewOutput {
+                verdict: verdict.into(),
+                ..Default::default()
+            };
+            assert_eq!(explicit_loop_approval(&review, blockers), expected);
+        }
+    }
+
+    #[test]
+    fn configured_check_without_result_cannot_resolve() {
+        let s = LoopResolutionSignals {
+            substance: DiffSubstance::Substantive,
+            check_configured: true,
+            check_passed: None,
+            verdict: "approve".into(),
+            blocking_findings: 0,
+        };
+        assert!(!decide_loop_resolution(&s, false));
+    }
+
+    #[test]
+    fn task_diff_survives_commit_and_excludes_old_branch_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("old.rs"), "fn old_branch_work() {}\n").unwrap();
+        git(&["add", "old.rs"]);
+        git(&["commit", "-qm", "old branch work"]);
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        assert!(loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+            .unwrap()
+            .1
+            .is_empty());
+        std::fs::write(repo.join("new.rs"), "fn job_work() {}\n").unwrap();
+        git(&["add", "new.rs"]);
+        git(&["commit", "-qm", "task change"]);
+        let diff = loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+            .unwrap()
+            .1;
+        assert!(diff.contains("job_work"));
+        assert!(!diff.contains("old_branch_work"));
+        // A subsequent author turn with no changes must review the same task delta.
+        assert_eq!(
+            diff,
+            loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+                .unwrap()
+                .1
         );
     }
 }

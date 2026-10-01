@@ -7,7 +7,7 @@ zoder and the tokenomics plugins pull (raw.githubusercontent.com/ncz-os/zoder/ma
   corpus/model_corpus.json   the classified routing corpus (zoder-core ModelEntry shape)
   pricing/catalog.json       per-token rates ({"models": {id: {input_usd_per_mtok, output_usd_per_mtok}}})
 
-Data sources are ALL PUBLIC — no internal/EIH dependency:
+Data sources are ALL PUBLIC — no private gateway dependency:
   * LiteLLM model_prices_and_context_window.json  (cost + mode)  [authoritative pricing]
   * OpenRouter /api/v1/models                      (cost, gap-fill) [best-effort]
   * Public coding benchmarks (LMArena / SWE-bench / terminal-bench) [best-effort overlay]

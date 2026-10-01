@@ -12,6 +12,7 @@ mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
+mod mnemos;
 mod sop;
 mod utilization;
 
@@ -462,6 +463,13 @@ enum ReportPeriod {
 
 #[derive(Subcommand, Clone)]
 enum Cmd {
+    /// Search or record work history using MNEMOS_URL and MNEMOS_TOKEN.
+    Mnemos {
+        #[arg(long, conflicts_with = "record", required_unless_present = "record")]
+        search: Option<String>,
+        #[arg(long, conflicts_with = "search", required_unless_present = "search")]
+        record: Option<String>,
+    },
     /// Non-interactive run for automation/CI (codex-compatible). `-` reads stdin.
     Exec { prompt: Option<String> },
     /// Launch the zerocode terminal UI, wired to the local zeroclaw engine.
@@ -565,7 +573,9 @@ enum Cmd {
         #[arg(long)]
         probe: bool,
         /// Probe every configured provider's live model catalog (not just
-        /// the default provider / free chat candidates). Discovery calls
+        /// the default provider / free chat candidates). With `-m`, probe
+        /// only that exact model on providers configured to serve it.
+        /// Discovery calls
         /// `GET /v1/models` per provider; if that fails, falls back to
         /// the provider's declared model. Output is a per-provider report
         /// with model/status/latency rows.
@@ -765,6 +775,9 @@ enum Cmd {
         /// advisory (escape hatch for over-strict reviewers). Requires `--check`.
         #[arg(long)]
         accept_on_green: bool,
+        /// Require an explicit approve verdict with no blocking findings.
+        #[arg(long)]
+        require_approval: bool,
         /// Skip the pre-exec denylist inspection of the `--check` command
         /// string (`rm -rf /`, redirects to `/etc/...`, `dd of=/dev/...`,
         /// `curl|sh`, …). Default is to refuse to run a `--check` command
@@ -1141,8 +1154,250 @@ fn read_prompt(arg: Option<String>) -> anyhow::Result<String> {
 
 struct Engine {
     cfg: Config,
+    /// Public corpus keeps its published economics for policy and accounting.
     corpus: Corpus,
+    /// Provider-scoped, verified free models are projected only for routing.
+    route_corpus: Corpus,
     engine_models: EngineModelRegistry,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderModelOverrides {
+    schema_version: u32,
+    verified_free: Vec<VerifiedFreeRoute>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedFreeRoute {
+    provider_id: String,
+    model_id: String,
+}
+
+/// Apply a local, exact-provider entitlement to a routing-only view. The
+/// public corpus and pricing catalog remain untouched: the same model may be
+/// paid through one provider and free through another verified provider. A malformed
+/// overlay fails the load rather than silently broadening or dropping routes.
+fn provider_route_corpus(cfg: &Config, public: &Corpus) -> anyhow::Result<Corpus> {
+    let path = cfg
+        .corpus_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("corpus path has no parent"))?
+        .join("provider-model-overrides.json");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(public.clone()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut raw = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if raw.len() > 64 * 1024 {
+        anyhow::bail!(
+            "{} exceeds the 64 KiB provider override limit",
+            path.display()
+        );
+    }
+    let overlay: ProviderModelOverrides =
+        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    if overlay.schema_version != 1 {
+        anyhow::bail!("{} has unsupported schema_version", path.display());
+    }
+    let mut route = public.clone();
+    let mut seen = std::collections::HashSet::new();
+    for entry in overlay.verified_free {
+        if entry.model_id.trim().is_empty() || !seen.insert(entry.model_id.clone()) {
+            anyhow::bail!("{} contains an empty or duplicate model id", path.display());
+        }
+        let provider = cfg
+            .real_provider_for_model(&entry.model_id)
+            .ok_or_else(|| anyhow::anyhow!("no real provider serves {}", entry.model_id))?;
+        if provider.id != entry.provider_id
+            || provider.paid
+            || provider.billing != BillingMode::Free
+            || !provider
+                .serves
+                .iter()
+                .any(|served| served == &entry.model_id)
+        {
+            anyhow::bail!(
+                "{} route {} must select the named free provider and exact served model",
+                path.display(),
+                entry.model_id
+            );
+        }
+        if route.models.iter().all(|m| m.id != entry.model_id) {
+            // Private, exact-provider routes need not appear in a public corpus.
+            // Keep this synthetic entry confined to the routing view.
+            route.models.push(ModelEntry {
+                id: entry.model_id.clone(),
+                ..Default::default()
+            });
+        }
+        let model = route
+            .models
+            .iter_mut()
+            .find(|m| m.id == entry.model_id)
+            .ok_or_else(|| anyhow::anyhow!("route model disappeared after insertion"))?;
+        model.kind = "chat".into();
+        model.free = true;
+        model.paid = false;
+        model.route_candidate = true;
+        model.gated_reason = None;
+        model.economics = None;
+        if model.agentic_score.is_none() {
+            model.agentic_score = Some(0.5);
+        }
+    }
+    route.count = route.models.len();
+    Ok(route)
+}
+
+#[cfg(test)]
+mod provider_route_corpus_tests {
+    use super::*;
+
+    #[test]
+    fn enterprise_gateway_entitlement_preserves_paid_public_model() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(home.path());
+        cfg.providers = vec![serde_json::from_value(json!({
+            "id":"enterprise-gateway", "base_url":"https://gateway.example.invalid/v1",
+            "kind":"openai-chat", "auth":{"type":"env","var":"ENTERPRISE_LLM_GATEWAY_KEY"},
+            "billing":"free", "serves":["enterprise/review-model"]
+        }))
+        .unwrap()];
+        let model_id = "enterprise/review-model";
+        let public = Corpus {
+            models: vec![ModelEntry {
+                id: model_id.into(),
+                kind: "chat".into(),
+                paid: true,
+                free: false,
+                route_candidate: false,
+                w_swe: Some(0.64),
+                economics: Some(zoder_core::corpus::Economics {
+                    input_usd_per_mtok: 0.08,
+                    output_usd_per_mtok: 0.45,
+                    source: "public-catalog".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let path = home.path().join("provider-model-overrides.json");
+        std::fs::write(
+            &path,
+            json!({
+                "schema_version":1,
+                "verified_free":[{"provider_id":"enterprise-gateway","model_id":model_id}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let route = provider_route_corpus(&cfg, &public).unwrap();
+        let effective = route.get(model_id).unwrap();
+        assert!(effective.routable());
+        assert!(effective.economics.is_none());
+        assert!(public.get(model_id).unwrap().paid);
+        assert_eq!(
+            public
+                .get(model_id)
+                .unwrap()
+                .economics
+                .as_ref()
+                .unwrap()
+                .source,
+            "public-catalog"
+        );
+        let backed = [model_id.to_string()].into_iter().collect();
+        let selected = Router::new(&route, &HealthStore::default())
+            .with_backed(Some(backed))
+            .select(Tier::Auto)
+            .unwrap();
+        assert_eq!(selected.primary, model_id);
+        let gate = PolicyGate::new(&cfg, false, false);
+        assert!(matches!(
+            gate.check(public.get(model_id).unwrap(), false, true),
+            Decision::Allow
+        ));
+
+        cfg.providers = vec![serde_json::from_value(json!({
+            "id":"provider-b", "base_url":"https://provider-b.example.invalid/v1",
+            "kind":"openai-chat", "auth":{"type":"env","var":"PROVIDER_B_TOKEN"},
+            "paid":true, "billing":"metered", "serves":[model_id]
+        }))
+        .unwrap()];
+        assert!(provider_route_corpus(&cfg, &public).is_err());
+        let paid_gate = PolicyGate::new(&cfg, false, false);
+        assert!(matches!(
+            paid_gate.check(public.get(model_id).unwrap(), true, false),
+            Decision::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn absent_or_malformed_overlay_never_promotes_public_paid_model() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(home.path());
+        let public = Corpus {
+            models: vec![ModelEntry {
+                id: "paid/model".into(),
+                kind: "chat".into(),
+                paid: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let absent = provider_route_corpus(&cfg, &public).unwrap();
+        assert!(!absent.get("paid/model").unwrap().routable());
+        std::fs::write(
+            home.path().join("provider-model-overrides.json"),
+            "{bad json",
+        )
+        .unwrap();
+        assert!(provider_route_corpus(&cfg, &public).is_err());
+    }
+
+    #[test]
+    fn exact_private_entitlement_adds_only_routing_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(home.path());
+        let model_id = "private/preview-model";
+        cfg.providers = vec![serde_json::from_value(json!({
+            "id":"subscription", "base_url":"https://gateway.example.invalid/v1",
+            "kind":"openai-chat", "auth":{"type":"env","var":"SUBSCRIPTION_KEY"},
+            "billing":"free", "serves":[model_id]
+        }))
+        .unwrap()];
+        let public = Corpus::default();
+        std::fs::write(
+            home.path().join("provider-model-overrides.json"),
+            json!({
+                "schema_version":1,
+                "verified_free":[{"provider_id":"subscription","model_id":model_id}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let route = provider_route_corpus(&cfg, &public).unwrap();
+        assert!(route.get(model_id).unwrap().routable());
+        assert!(public.get(model_id).is_none());
+        assert_eq!(route.count, 1);
+        let gate = PolicyGate::new(&cfg, false, true);
+        assert!(matches!(
+            gate.check(route.get(model_id).unwrap(), false, true),
+            Decision::Allow
+        ));
+
+        cfg.providers[0].serves = vec!["private/".into()];
+        assert!(provider_route_corpus(&cfg, &public).is_err());
+    }
 }
 
 impl Engine {
@@ -1157,9 +1412,11 @@ impl Engine {
                 )
             })?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
+        let route_corpus = provider_route_corpus(&cfg, &corpus)?;
         Ok(Self {
             cfg,
             corpus,
+            route_corpus,
             engine_models,
         })
     }
@@ -1170,9 +1427,11 @@ impl Engine {
     /// callers always use [`Engine::load`].
     #[cfg(test)]
     fn from_parts(cfg: Config, corpus: Corpus) -> Self {
+        let route_corpus = corpus.clone();
         Self {
             cfg,
             corpus,
+            route_corpus,
             engine_models: EngineModelRegistry::default(),
         }
     }
@@ -1183,9 +1442,11 @@ impl Engine {
         corpus: Corpus,
         engine_models: EngineModelRegistry,
     ) -> Self {
+        let route_corpus = corpus.clone();
         Self {
             cfg,
             corpus,
+            route_corpus,
             engine_models,
         }
     }
@@ -1477,6 +1738,9 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let result = match &cli.cmd {
+        Some(Cmd::Mnemos { search, record }) => {
+            mnemos::command(search.as_deref(), record.as_deref()).await
+        }
         Some(Cmd::Models { free, paid, all }) => {
             cmd_models(*free, *paid, *all, cli.json, cli.verbose).await
         }
@@ -1628,6 +1892,7 @@ async fn run() -> anyhow::Result<()> {
             base,
             scope,
             accept_on_green,
+            require_approval,
             allow_dangerous_check,
             background,
         }) => {
@@ -1647,6 +1912,7 @@ async fn run() -> anyhow::Result<()> {
                 loop_timeout_secs,
                 agent_timeout_secs,
                 *allow_dangerous_check,
+                *require_approval,
             )
             .await
         }
@@ -2930,7 +3196,7 @@ async fn cmd_models(
 /// this host. The router uses this to avoid auto-picking a free-pool model that
 /// would fall through to the `api.example.com` placeholder default and fail.
 fn backed_free_model_ids(eng: &Engine) -> std::collections::HashSet<String> {
-    eng.corpus
+    eng.route_corpus
         .free_chat()
         .filter(|m| eng.cfg.model_has_real_provider(&m.id))
         .map(|m| m.id.clone())
@@ -2956,7 +3222,7 @@ fn build_scenario_candidates(
     health: &HealthStore,
 ) -> Vec<RoutableCandidate> {
     let mut out: Vec<RoutableCandidate> = Vec::new();
-    for m in eng.corpus.models.iter() {
+    for m in eng.route_corpus.models.iter() {
         // Only chat-form chat models are routed; embed/utility/image
         // classes are kept out of the scenario preference layer.
         if m.kind != "chat" {
@@ -3517,7 +3783,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         let chain: Vec<String> = if cli.require_free {
             let backed = backed_free_model_ids(eng);
             let is_free = |m: &String| {
-                eng.corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m)
+                eng.route_corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m)
             };
             if is_free(&pin) {
                 vec![pin]
@@ -3547,7 +3813,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // diversity / outage-hedge behavior). Its `.with_primary()` honors
     // `Config::primary_model` by setting `Route.primary` while the
     // ranked free pool becomes `Route.fallbacks`.
-    let router = Router::new(&eng.corpus, health)
+    let router = Router::new(&eng.route_corpus, health)
         .with_primary(eng.cfg.primary_model.clone())
         .with_backed(Some(backed_free_model_ids(eng)));
     let route = router.select(Tier::parse(&cli.tier))?;
@@ -3578,7 +3844,7 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
         let primary = if cli.require_free {
             let backed = backed_free_model_ids(eng);
             let is_free = |m: &String| {
-                eng.corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m)
+                eng.route_corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m)
             };
             if is_free(&primary[0]) {
                 primary
@@ -3633,8 +3899,9 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // deliberately.
     let primary = if cli.require_free {
         let backed = backed_free_model_ids(eng);
-        let is_free =
-            |m: &String| eng.corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m);
+        let is_free = |m: &String| {
+            eng.route_corpus.get(m).map(|e| e.free).unwrap_or(false) || backed.contains(m)
+        };
         let free_chain: Vec<String> = chain.iter().filter(|m| is_free(m)).cloned().collect();
         if free_chain.is_empty() || free_chain.len() == chain.len() {
             chain
@@ -3803,10 +4070,10 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     // may be a different row than the static corpus shows). The RPC
     // is best-effort: a missing/erroring daemon leaves the static
     // corpus as the routing authority.
-    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
+    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.route_corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
-    let router = Router::new(&eng.corpus, &health)
-        .with_primary(eng.cfg.primary_model.clone())
+    let router = Router::new(&eng.route_corpus, &health)
+        .with_primary(resolve_effective_primary(cli, &eng))
         .with_backed(Some(backed_free_model_ids(&eng)));
     let route = match router.select(Tier::parse(&cli.tier)) {
         Ok(route) => route,
@@ -3877,10 +4144,10 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
     // model rotated from one provider to another), not just the
     // benched-at-build-time static corpus. Best-effort; the static
     // corpus is the fallback.
-    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.corpus).await;
+    let enrichment = enrich_with_live_catalog(&eng.cfg, &mut eng.route_corpus).await;
     let health = HealthStore::load(&eng.cfg.health_path);
     let rows = zoder_core::consultant::consult(
-        &eng.corpus,
+        &eng.route_corpus,
         &health,
         &zoder_core::consultant::ConsultOptions { free_only, limit },
     );
@@ -4979,7 +5246,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // primary may belong to a different provider than `default_provider`
     // (e.g. a pinned `MiniMax-M3` -> the `minimax` provider). Each link in the
     // chain is resolved independently in the loop below, so one chain can span
-    // providers (MiniMax -> EIH). `routing.real_provider_for_model` is the
+    // providers (Provider A -> Enterprise LLM Gateway). `routing.real_provider_for_model` is the
     // quota-aware variant: when two providers (e.g. a subscription and its
     // metered sibling) claim the same prefix, it picks the cost-neutral one
     // while the subscription's rolling window has headroom and transparently
@@ -5018,7 +5285,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // L2: --dry-run short-circuits before reading stdin and any paid confirm.
     if cli.dry_run {
-        let entry = eng.corpus.get(&primary);
+        let entry = eng.route_corpus.get(&primary);
         if cli.json {
             println!(
                 "{}",
@@ -5046,13 +5313,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
 
     // Paid/free pre-checks for the primary (the router-built chain is all free;
-    // an explicit model may be paid and needs confirmation here). An explicit
-    // model absent from the corpus cannot be proven free, so it is treated as
-    // unverified (default-deny): refuse under --require-free, otherwise require
-    // the paid confirmation. This preserves the fail-closed posture instead of
-    // silently calling an unknown (possibly paid) model.
+    // an explicit model may be paid and needs confirmation here). Use the
+    // provider-scoped routing view so exact private entitlements can qualify;
+    // an unknown model without such an entitlement remains default-deny.
     let primary_entry = eng
-        .corpus
+        .route_corpus
         .get(&primary)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
@@ -5141,7 +5406,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     // Per-model provider clients, built lazily and cached by provider id. A
     // single fallback chain can span providers (e.g. a pinned `MiniMax-M3` on
-    // the `minimax` provider, then `nvidia/*` EIH NIMs on `nvidia-eih`), so the
+    // the `minimax` provider, then `enterprise/*` models on `enterprise-gateway`), so the
     // serving provider is resolved per link via `provider_for_model` rather
     // than using one `default_provider` client for the whole chain.
     let mut provider_clients: std::collections::HashMap<String, OpenAiProvider> =
@@ -5159,7 +5424,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     for (i, model_id) in chain.iter().enumerate() {
         // Respect the free guard for every link, not just the primary.
-        if let Some(entry) = eng.corpus.get(model_id) {
+        if let Some(entry) = eng.route_corpus.get(model_id) {
             if cli.require_free && !entry.free {
                 continue;
             }
@@ -5211,15 +5476,17 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 .provider(&pid)
                 .map(|p| !p.paid && p.billing != BillingMode::Metered)
                 .unwrap_or(false);
-            let link_entry = eng
-                .corpus
-                .get(model_id)
-                .cloned()
-                .unwrap_or_else(|| ModelEntry {
-                    id: model_id.clone(),
-                    gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
-                    ..Default::default()
-                });
+            let link_entry =
+                eng.route_corpus
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or_else(|| ModelEntry {
+                        id: model_id.clone(),
+                        gated_reason: Some(
+                            "unknown model: not in corpus, cannot verify free".into(),
+                        ),
+                        ..Default::default()
+                    });
             if let Decision::NeedConfirm(_) =
                 gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
             {
@@ -5329,8 +5596,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         anyhow::bail!("{msg}");
     };
 
-    let known_paid_model = eng.corpus.get(&used_model).is_some_and(|model| !model.free);
-    let entry = eng.corpus.get(&used_model).cloned().unwrap_or_default();
+    let known_paid_model = eng
+        .route_corpus
+        .get(&used_model)
+        .is_some_and(|model| !model.free);
+    let entry = eng
+        .route_corpus
+        .get(&used_model)
+        .cloned()
+        .unwrap_or_default();
 
     // C1: the anti-paid-fallback guard governs accounting + exit. Record the
     // winning model's health exactly once here: a verified call is a success,
@@ -6095,7 +6369,7 @@ fn reconcile_alias(known: &std::collections::HashSet<String>, want: &str) -> Str
 /// (2026-06-30 bake-off) CROSS-FAMILY free model — never the author's own model.
 /// Self-review is weak, and a flat-subscription author (e.g. minimax) uses env-auth
 /// on the review path and 401s while the agentic engine authed fine; a cross-family
-/// EIH reviewer routes to the working-auth provider.
+/// Enterprise LLM Gateway reviewer routes to the configured provider.
 pub(crate) fn default_cross_family_reviewer(author_model: &str) -> &'static str {
     let a = author_model.to_ascii_lowercase();
     if a.contains("glm") || a.contains("z-ai") {
@@ -8061,7 +8335,7 @@ pub(crate) async fn agentic_turn(
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
     let primary_entry = eng
-        .corpus
+        .route_corpus
         .get(&primary)
         .cloned()
         .unwrap_or_else(|| ModelEntry {
@@ -8478,7 +8752,7 @@ pub(crate) async fn agentic_turn(
             .map(is_cost_neutral_provider)
             .unwrap_or(provider_cost_neutral);
         let link_entry = eng
-            .corpus
+            .route_corpus
             .get(&model)
             .cloned()
             .unwrap_or_else(|| ModelEntry {
@@ -8698,7 +8972,7 @@ pub(crate) async fn agentic_turn(
     // reported cost/model, so the gate above (`gate.check` on the routed
     // `primary`) is the only signal we can apply.
     let model_used_paid = eng
-        .corpus
+        .route_corpus
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
@@ -10470,6 +10744,14 @@ fn probe_targets_for_unbuilt_provider(
     capped
 }
 
+fn exact_probe_target(provider: &zoder_core::config::Provider, model: &str) -> Option<String> {
+    provider
+        .serves
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+        .then(|| model.to_string())
+}
+
 async fn run_probe_all(
     cli: &Cli,
     eng: &Engine,
@@ -10514,6 +10796,13 @@ async fn run_probe_all(
     // `--json` shape is preserved).
     let mut plans: Vec<Plan> = Vec::new();
     for p in &eng.cfg.providers {
+        if cli
+            .model
+            .as_deref()
+            .is_some_and(|model| exact_probe_target(p, model).is_none())
+        {
+            continue;
+        }
         if p.base_url
             .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
         {
@@ -10537,7 +10826,12 @@ async fn run_probe_all(
                 // derived candidate target as a skip-class `Error` first —
                 // mirroring `health_probe::probe_all`'s prober-unavailable
                 // arm — so the skip filter has something to skip.
-                for target in probe_targets_for_unbuilt_provider(p, &eng.corpus) {
+                let targets = if let Some(model) = cli.model.as_deref() {
+                    vec![model.to_string()]
+                } else {
+                    probe_targets_for_unbuilt_provider(p, &eng.corpus)
+                };
+                for target in targets {
                     health.record_classified_failure(
                         &target,
                         &e.to_string(),
@@ -10572,10 +10866,17 @@ async fn run_probe_all(
         // logged, never silent: when dropped > 0 the human-readable
         // path emits a "(capped: probing X of Y models)" note alongside
         // the provider header.
-        let (targets, dropped) = cap_targets(
-            live.unwrap_or_else(|| vec![p.id.clone()]),
-            PROBE_MAX_MODELS_PER_PROVIDER,
-        );
+        let (targets, dropped) = if let Some(model) = cli.model.as_deref() {
+            (vec![model.to_string()], 0)
+        } else {
+            cap_targets(
+                live.unwrap_or_else(|| vec![p.id.clone()]),
+                PROBE_MAX_MODELS_PER_PROVIDER,
+            )
+        };
+        if targets.is_empty() {
+            continue;
+        }
         plans.push(Plan {
             provider_id: p.id.clone(),
             provider_paid: p.paid || p.billing == BillingMode::Metered,
@@ -10584,6 +10885,10 @@ async fn run_probe_all(
             targets,
             dropped,
         });
+    }
+
+    if plans.is_empty() && cli.model.is_some() {
+        anyhow::bail!("no configured provider serves the exact model selected for health probe");
     }
 
     let mut flat_outcomes: Vec<ProbeOutcome> = Vec::new();
@@ -10995,9 +11300,8 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
     // Free-provider catalog ingestion: every provider that declares `serves`
     // prefixes and is billed free contributes its live open-weight catalog to
     // the routing pool. Each provider's returned ids are filtered to its own
-    // `serves` allowlist — so e.g. NVIDIA EIH's azure/aws/oci/gcp/google-hosted
-    // catalog entries are dropped, leaving only the free NIMs (nvidia/* |
-    // deepseek-ai/* | meta/llama-* | mistralai/*). A provider that is down or
+    // `serves` allowlist — so e.g. an Enterprise LLM Gateway's unrelated catalog entries
+    // are dropped, leaving only model ids matching configured prefixes. A provider that is down or
     // missing its key is warned and skipped, never fatal to the refresh.
     let mut all_served = served.clone();
     let mut free_ids: Vec<String> = Vec::new();
@@ -12567,7 +12871,7 @@ mod health_install_tests {
 //   3. `RoutingConfig::active()` layers an operator override on the
 //      named preset.
 //   4. The four built-in presets materialize with the documented knobs.
-//   5. `classify_provider` matches the spec's id list verbatim.
+//   5. `classify_provider` follows configured billing without name exceptions.
 //
 // These are non-vacuous — every assertion exercises either a code path or
 // a documented invariant of the routing-scenario layer.
@@ -12612,16 +12916,35 @@ mod probe_skip_class_tests {
         }
     }
 
+    #[test]
+    fn exact_health_probe_only_selects_a_provider_that_serves_the_model() {
+        let provider_a = mk_provider("enterprise-gateway", &["enterprise/"]);
+        let provider_b = mk_provider("provider-b", &["other/"]);
+        assert_eq!(
+            exact_probe_target(&provider_a, "enterprise/review-model"),
+            Some("enterprise/review-model".to_string())
+        );
+        assert_eq!(
+            exact_probe_target(&provider_b, "enterprise/review-model"),
+            None
+        );
+        assert_eq!(exact_probe_target(&provider_a, "other/model"), None);
+    }
+
     /// HP1: when a provider declares `serves` prefixes, the derived probe
     /// targets are every corpus model matching a prefix (so each dead
     /// model gets classified, not just the bare provider id).
     #[test]
     fn unbuilt_provider_targets_come_from_corpus_by_serves_prefix() {
-        let p = mk_provider("nvidia-eih", &["nvidia/"]);
-        let corpus = corpus_with(&["nvidia/llama-3.3", "nvidia/nemotron", "openai/gpt-x"]);
+        let p = mk_provider("enterprise-gateway", &["enterprise/"]);
+        let corpus = corpus_with(&[
+            "enterprise/review-model",
+            "enterprise/assistant-model",
+            "openai/gpt-x",
+        ]);
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
-        assert!(targets.contains(&"nvidia/llama-3.3".to_string()));
-        assert!(targets.contains(&"nvidia/nemotron".to_string()));
+        assert!(targets.contains(&"enterprise/review-model".to_string()));
+        assert!(targets.contains(&"enterprise/assistant-model".to_string()));
         assert!(
             !targets.contains(&"openai/gpt-x".to_string()),
             "a non-matching model must not be probed for this provider"
@@ -12633,7 +12956,7 @@ mod probe_skip_class_tests {
     #[test]
     fn unbuilt_provider_falls_back_to_provider_id() {
         let p = mk_provider("weird-provider", &[]);
-        let corpus = corpus_with(&["nvidia/llama"]);
+        let corpus = corpus_with(&["enterprise/review-model"]);
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
         assert_eq!(targets, vec!["weird-provider".to_string()]);
 
@@ -12650,7 +12973,7 @@ mod probe_skip_class_tests {
     #[test]
     fn unbuilt_provider_targets_are_capped() {
         let ids: Vec<String> = (0..(PROBE_MAX_MODELS_PER_PROVIDER + 25))
-            .map(|i| format!("nvidia/m{i}"))
+            .map(|i| format!("enterprise/m{i}"))
             .collect();
         let corpus = Corpus {
             source: "test".into(),
@@ -12664,7 +12987,7 @@ mod probe_skip_class_tests {
                 })
                 .collect(),
         };
-        let p = mk_provider("nvidia-eih", &["nvidia/"]);
+        let p = mk_provider("enterprise-gateway", &["enterprise/"]);
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
         assert_eq!(targets.len(), PROBE_MAX_MODELS_PER_PROVIDER);
     }
@@ -12691,16 +13014,16 @@ mod probe_skip_class_tests {
                 .as_nanos()
         ));
         let mut health = HealthStore::load(&dir.join("health.json"));
-        let p = mk_provider("nvidia-eih", &["nvidia/"]);
-        let corpus = corpus_with(&["nvidia/llama-3.3", "nvidia/nemotron"]);
+        let p = mk_provider("enterprise-gateway", &["enterprise/"]);
+        let corpus = corpus_with(&["enterprise/review-model", "enterprise/assistant-model"]);
 
         // Baseline: an un-probed model has no record at all — the exact gap
         // the fix closes (nothing recorded => router cannot skip it).
-        assert!(!health.models.contains_key("nvidia/llama-3.3"));
-        assert!(!health.breaker_open("nvidia/llama-3.3"));
+        assert!(!health.models.contains_key("enterprise/review-model"));
+        assert!(!health.breaker_open("enterprise/review-model"));
 
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
-        assert!(targets.contains(&"nvidia/llama-3.3".to_string()));
+        assert!(targets.contains(&"enterprise/review-model".to_string()));
         // A single sweep records the failure and stamps the classification.
         for target in &targets {
             health.record_classified_failure(
@@ -12710,7 +13033,7 @@ mod probe_skip_class_tests {
                 zoder_core::Classification::Error,
             );
         }
-        let h = &health.models["nvidia/llama-3.3"];
+        let h = &health.models["enterprise/review-model"];
         assert_eq!(h.classification, Some(zoder_core::Classification::Error));
         assert_eq!(h.failures, 1);
         assert!(h
@@ -12732,10 +13055,10 @@ mod probe_skip_class_tests {
             }
         }
         assert!(
-            health.breaker_open("nvidia/llama-3.3"),
+            health.breaker_open("enterprise/review-model"),
             "after BREAKER_THRESHOLD Error sweeps the router must skip the model"
         );
-        assert!(health.breaker_open("nvidia/nemotron"));
+        assert!(health.breaker_open("enterprise/assistant-model"));
     }
 
     /// HP2: a gated (paid) model recorded as `Error` (instead of BAILING
@@ -12790,7 +13113,7 @@ mod probe_skip_class_tests {
         health.record_classified_success(
             "free/model-a",
             12.0,
-            "nvidia-eih",
+            "enterprise-gateway",
             zoder_core::Classification::Reachable,
         );
         // Simulate the caller's unconditional persist.
@@ -12888,15 +13211,15 @@ mod scenario_routing_tests {
         assert_eq!(presets["unlimited"].budget_mode, BudgetMode::Chargeback);
     }
 
-    /// The `classify_provider` helper matches the spec's id list:
-    /// `nvidia-eih`/`nvcf` -> free, `local*` and `minimax-flat` -> free,
-    /// and the billing-mode-driven default.
+    /// The `classify_provider` helper follows billing configuration:
+    /// configured free billing -> free; metered billing -> paid,
+    /// regardless of provider id.
     #[test]
-    fn classify_provider_matches_task_spec() {
+    fn classify_provider_follows_configured_billing() {
         let p = Provider {
-            id: "nvidia-eih".into(),
+            id: "enterprise-gateway".into(),
             engine_provider_ref: None,
-            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            base_url: "https://gateway.example.invalid/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
             paid: false,
@@ -12905,11 +13228,14 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
         };
-        assert_eq!(classify_provider(&p, "nvidia/llama"), ProviderClass::Free);
+        assert_eq!(
+            classify_provider(&p, "enterprise/review-model"),
+            ProviderClass::Free
+        );
         let p = Provider {
-            id: "nvcf".into(),
+            id: "provider-b".into(),
             engine_provider_ref: None,
-            base_url: "https://nvcf.example/v1".into(),
+            base_url: "https://provider-b.example.invalid/v1".into(),
             kind: "openai-chat".into(),
             auth: zoder_core::Auth::None,
             paid: false,
@@ -12918,7 +13244,7 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
         };
-        assert_eq!(classify_provider(&p, "x"), ProviderClass::Free);
+        assert_eq!(classify_provider(&p, "x"), ProviderClass::Paid);
         let p = Provider {
             id: "minimax-flat".into(),
             engine_provider_ref: None,
@@ -14142,9 +14468,9 @@ mod model_selection_tests {
             azure_api_version: None,
         });
         cfg.providers.push(Provider {
-            id: "nvidia-eih".into(),
+            id: "enterprise-gateway".into(),
             engine_provider_ref: None,
-            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            base_url: "https://gateway.example.invalid/v1".into(),
             kind: "openai-chat".into(),
             auth: ProviderAuth::None,
             paid: false,
