@@ -9908,6 +9908,20 @@ mod reviewer_chain_dispatch_tests {
             build_reviewer_candidates(&cli, None, &[]).unwrap(),
             ["broken-model/reviewer"]
         );
+        assert!(complete_once(&cli, None, &[], "system", "review", 1024)
+            .await
+            .is_err());
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().contains("/working/"))
+                .count(),
+            1,
+            "an unhealthy pool must not reuse its secondary or escape to another route"
+        );
         cli.reviewer_allowed_routes = cli.allowed_routes.clone();
         cli.reviewer_pool_routes = Some("wiremock-broken=broken-model/coder".into());
         assert!(build_reviewer_candidates(&cli, None, &[])
