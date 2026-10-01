@@ -68,9 +68,17 @@ pub(crate) async fn checkpoint(cwd: &std::path::Path, evidence: Value) {
                 .append(true)
                 .open(path)
             {
-                let _ = writeln!(file, "{evidence}");
+                if writeln!(file, "{evidence}").is_err() {
+                    eprintln!("[zoder] local MNEMOS ledger write failed");
+                }
+            } else {
+                eprintln!("[zoder] local MNEMOS ledger could not be opened");
             }
+        } else {
+            eprintln!("[zoder] local MNEMOS ledger unavailable: not a Git checkout");
         }
+    } else {
+        eprintln!("[zoder] local MNEMOS ledger unavailable: Git failed");
     }
     let (Ok(base), Ok(token)) = (std::env::var("MNEMOS_URL"), std::env::var("MNEMOS_TOKEN")) else {
         return;
