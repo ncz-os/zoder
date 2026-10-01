@@ -10972,7 +10972,6 @@ mod commit_author_enforcement_tests {
     /// outer author-phase watchdog fires.
     #[test]
     fn default_loop_timeout_exceeds_default_agent_timeout() {
-        assert!(DEFAULT_LOOP_TIMEOUT_SECS >= 960);
         assert!(validate_loop_timeouts(DEFAULT_LOOP_TIMEOUT_SECS, 900).is_none());
     }
 

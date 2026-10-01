@@ -126,7 +126,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -134,7 +134,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -273,7 +273,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -281,7 +281,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -400,7 +400,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -408,7 +408,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -527,7 +527,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -535,7 +535,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -654,7 +654,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -662,7 +662,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -780,7 +780,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -788,7 +788,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -909,7 +909,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -917,7 +917,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1038,7 +1038,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1046,7 +1046,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1165,7 +1165,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1173,7 +1173,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1305,7 +1305,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1313,7 +1313,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1443,7 +1443,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1451,7 +1451,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1578,7 +1578,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1586,7 +1586,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1706,7 +1706,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1714,7 +1714,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -1872,7 +1872,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1880,7 +1880,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2001,7 +2001,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2009,7 +2009,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2124,7 +2124,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2132,7 +2132,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2253,7 +2253,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2261,7 +2261,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2385,7 +2385,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2393,7 +2393,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2513,7 +2513,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2521,7 +2521,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2636,7 +2636,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2644,7 +2644,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2765,7 +2765,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2773,7 +2773,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -2897,7 +2897,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2905,7 +2905,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3020,7 +3020,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3028,7 +3028,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3164,7 +3164,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3172,7 +3172,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3294,7 +3294,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3302,7 +3302,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3421,7 +3421,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3429,7 +3429,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3563,7 +3563,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3571,7 +3571,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3690,7 +3690,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3698,7 +3698,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3817,7 +3817,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3825,7 +3825,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -3940,7 +3940,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3948,7 +3948,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4071,7 +4071,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4079,7 +4079,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4212,7 +4212,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4220,7 +4220,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4342,7 +4342,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4350,7 +4350,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4465,7 +4465,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4473,7 +4473,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4592,7 +4592,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4600,7 +4600,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
@@ -4718,7 +4718,7 @@ Options:
           - none:      Deny every tool (read-only review runs)
 
       --agent-timeout <SECS>
-          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+          Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 1200) must exceed this value or the watchdog fires before the first turn completes
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4726,7 +4726,7 @@ Options:
           The driver falls back to creating a fresh session automatically when the engine rejects a resume (e.g. the session was evicted server-side since the last run), so a stale id never hard-fails a run.
 
       --loop-timeout <SECS>
-          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 900). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
+          Hard wall-clock budget for a single `loop` phase (author, `--check`, review), in seconds (default 1200). The watchdog kills the spawned child AND its process group when the budget elapses, so a wedged child can never hang the loop indefinitely. `agent_timeout` controls the engine's internal turn budget (default 900) and is independent.
           
           ⚠️ **Important:** `--loop-timeout` must exceed `--agent-timeout`. The loop-phase watchdog covers the author turn *plus* the check and review phases. If you raise `--agent-timeout` without also raising `--loop-timeout`, the watchdog will still kill the loop at its (unchanged) budget — you must bump both flags together.
 
