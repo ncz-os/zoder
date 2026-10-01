@@ -2988,12 +2988,19 @@ async fn complete_review_chunks(
         ..ReviewOutput::default()
     };
     for (idx, user) in users.iter().enumerate() {
+        let user = format!(
+            "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
+Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
+is not evidence of a defect. Report only defects established by the supplied code; do not \
+invent missing integration or compiler failures from omitted context.\n\n{}",
+            idx + 1, users.len(), user
+        );
         let completion = complete_once(
             cli,
             model_override,
             reviewer_chain,
             system,
-            user,
+            &user,
             max_tokens,
         )
         .await
