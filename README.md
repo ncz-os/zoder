@@ -818,6 +818,14 @@ record instead of scattered local files. For enterprise engines beyond Postgres
 (Oracle / Db2 / MySQL / MariaDB), use **path 1** — MNEMOS provides those backends
 and zoder reaches them over MCP.
 
+### 3. MNEMOS Work Ledger
+
+zoder records factual progress checkpoints to a local JSONL ledger and optionally
+posts them to a remote MNEMOS server. See [MNEMOS-WORK-LEDGER](MNEMOS-WORK-LEDGER.md)
+for complete documentation on checkpoint format, `MNEMOS_URL`/`MNEMOS_TOKEN`,
+`HIVE_JOB_ID`/`HIVE_PARENT_JOB_ID` lookup, search and record CLI examples, and
+failure behavior.
+
 ---
 
 ## License
