@@ -65,6 +65,7 @@ class NightlyPublishTests(unittest.TestCase):
                 "PKG_TOKEN": "fixture",
                 "RELEASE_TAG": "fixture",
                 "GITHUB_REPOSITORY": "fixture/repo",
+                "GITHUB_SHA": "d" * 40,
                 "GITHUB_STEP_SUMMARY": str(root / "summary"),
                 "EVENTS": str(root / "events"),
             }
