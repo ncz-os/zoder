@@ -1,6 +1,7 @@
 //! Optional MNEMOS work history. Credentials are read only from the environment.
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::Duration;
 
 async fn request(base: &str, token: &str, path: &str, body: Value) -> anyhow::Result<Value> {
@@ -127,5 +128,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "MNEMOS returned HTTP 401");
+    }
+    #[test]
+    fn work_ledger_doc_matches_source_behavior() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let doc_path = manifest.ancestors().nth(2).unwrap().join("docs/MNEMOS-WORK-LEDGER.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("work-ledger doc {} missing: {e}", doc_path.display()));
+        let readme = std::fs::read_to_string(manifest.ancestors().nth(2).unwrap().join("README.md"))
+            .expect("README.md readable from repo root");
+        // The README must link the doc from the root.
+        assert!(
+            readme.contains("docs/MNEMOS-WORK-LEDGER.md"),
+            "README.md must link docs/MNEMOS-WORK-LEDGER.md"
+        );
+        // Every user-facing fact documented here must match the source above:
+        let required = [
+            // env contract
+            "MNEMOS_URL",
+            "MNEMOS_TOKEN",
+            "without embedded credentials",
+            // CLI surface (mutually exclusive flags, fixed request shapes)
+            "zoder mnemos --search",
+            "zoder mnemos --record",
+            "/v1/memories/search",
+            "/v1/memories",
+            "\"limit\": 5",
+            "\"subcategory\": \"zoder-work\"",
+            "\"source_agent\": \"zoder\"",
+            // local ledger path + remote payload metadata
+            "zoder-work-ledger.jsonl",
+            "git rev-parse --absolute-git-dir",
+            "metadata.job_id",
+            // job context + free-text retrieval by parent ID
+            "HIVE_JOB_ID",
+            // failure messages emitted by the code
+            "[zoder] MNEMOS checkpoint pending",
+            // documented limits
+            "not proof",
+            "not currently auto-replay",
+        ];
+        for needle in required {
+            assert!(
+                doc.contains(needle),
+                "docs/MNEMOS-WORK-LEDGER.md must document {needle:?} to match source behavior"
+            );
+        }
     }
 }

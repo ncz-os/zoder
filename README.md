@@ -75,6 +75,11 @@ durable session history zoder also ships **database-backed session persistence**
 workers shares one system of record. See **[Enterprise memory & persistence](#enterprise-memory--persistence)**
 for the two wiring paths (MCP-per-agent recall vs. direct DB logging).
 
+The coding loop also keeps a **per-iteration MNEMOS work ledger** (local
+`.git` JSONL + optional remote checkpoints) — see
+[**docs/MNEMOS-WORK-LEDGER.md**](docs/MNEMOS-WORK-LEDGER.md) for configuration,
+`zoder mnemos --search`/`--record` examples, and its honest limits.
+
 ---
 
 ## Commands
