@@ -45,8 +45,8 @@
  },
  "claude-fable-5": {
   "agentic_score": 0.867,
-  "arena_coding_elo": 1625.6,
-  "arena_webdev_elo": 1625.6,
+  "arena_coding_elo": 1625.3,
+  "arena_webdev_elo": 1625.3,
   "capability": {
    "swe_verified": {
     "acc": 95.0,
@@ -57,23 +57,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 16,
+    "rank": 17,
     "score": 0.055,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 17,
-    "rating": 1625.6,
+    "rank": 18,
+    "rating": 1625.3,
     "source": "arena.ai",
-    "votes": 13952
+    "votes": 14126
    }
   },
   "w_swe": 0.975
  },
  "claude-fable-5-1": {
   "agentic_score": 0.991,
-  "arena_coding_elo": 1750.7,
-  "arena_webdev_elo": 1750.7,
+  "arena_coding_elo": 1749.2,
+  "arena_webdev_elo": 1749.2,
   "preference": {
    "arena_agent": {
     "rank": 1,
@@ -81,10 +81,10 @@
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 4,
-    "rating": 1750.7,
+    "rank": 5,
+    "rating": 1749.2,
     "source": "arena.ai",
-    "votes": 6137
+    "votes": 6318
    }
   },
   "w_swe": 1.0
@@ -103,10 +103,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 113,
+    "rank": 114,
     "rating": 1329.4,
     "source": "arena.ai",
-    "votes": 29175
+    "votes": 29184
    }
   },
   "w_swe": 0.833
@@ -123,23 +123,23 @@
   "w_swe": 0.86
  },
  "claude-opus-4-1": {
-  "agentic_score": 0.483,
-  "arena_coding_elo": 1389.7,
-  "arena_webdev_elo": 1389.7,
+  "agentic_score": 0.482,
+  "arena_coding_elo": 1389.4,
+  "arena_webdev_elo": 1389.4,
   "preference": {
    "arena_webdev": {
-    "rank": 91,
-    "rating": 1389.7,
+    "rank": 92,
+    "rating": 1389.4,
     "source": "arena.ai",
-    "votes": 6929
+    "votes": 6926
    }
   },
   "w_swe": 0.741
  },
  "claude-opus-4-5": {
   "agentic_score": 0.734,
-  "arena_coding_elo": 1493.4,
-  "arena_webdev_elo": 1493.4,
+  "arena_coding_elo": 1493.3,
+  "arena_webdev_elo": 1493.3,
   "capability": {
    "swe_verified": {
     "acc": 76.4,
@@ -150,18 +150,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 54,
-    "rating": 1493.4,
+    "rank": 55,
+    "rating": 1493.3,
     "source": "arena.ai",
-    "votes": 11030
+    "votes": 11034
    }
   },
   "w_swe": 0.882
  },
  "claude-opus-4-6": {
   "agentic_score": 0.771,
-  "arena_coding_elo": 1546.1,
-  "arena_webdev_elo": 1546.1,
+  "arena_coding_elo": 1545.9,
+  "arena_webdev_elo": 1545.9,
   "capability": {
    "swe_verified": {
     "acc": 78.2,
@@ -172,18 +172,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 37,
-    "rating": 1546.1,
+    "rank": 38,
+    "rating": 1545.9,
     "source": "arena.ai",
-    "votes": 19503
+    "votes": 19519
    }
   },
   "w_swe": 0.891
  },
  "claude-opus-4-7": {
   "agentic_score": 0.804,
-  "arena_coding_elo": 1557.2,
-  "arena_webdev_elo": 1557.2,
+  "arena_coding_elo": 1557.3,
+  "arena_webdev_elo": 1557.3,
   "capability": {
    "swe_verified": {
     "acc": 82.0,
@@ -194,18 +194,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 33,
-    "rating": 1557.2,
+    "rank": 34,
+    "rating": 1557.3,
     "source": "arena.ai",
-    "votes": 17754
+    "votes": 17982
    }
   },
   "w_swe": 0.91
  },
  "claude-opus-4-8": {
   "agentic_score": 0.793,
-  "arena_coding_elo": 1556.0,
-  "arena_webdev_elo": 1556.0,
+  "arena_coding_elo": 1555.5,
+  "arena_webdev_elo": 1555.5,
   "capability": {
    "swe_verified": {
     "acc": 88.6,
@@ -216,23 +216,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 19,
+    "rank": 21,
     "score": 0.0488,
     "source": "arena.ai"
    },
    "arena_webdev": {
     "rank": 35,
-    "rating": 1556.0,
+    "rating": 1555.5,
     "source": "arena.ai",
-    "votes": 18685
+    "votes": 18908
    }
   },
   "w_swe": 0.943
  },
  "claude-opus-5": {
   "agentic_score": 0.934,
-  "arena_coding_elo": 1693.7,
-  "arena_webdev_elo": 1693.7,
+  "arena_coding_elo": 1695.0,
+  "arena_webdev_elo": 1695.0,
   "capability": {
    "swe_verified": {
     "acc": 97.0,
@@ -248,18 +248,18 @@
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 6,
-    "rating": 1693.7,
+    "rank": 7,
+    "rating": 1695.0,
     "source": "arena.ai",
-    "votes": 16747
+    "votes": 16954
    }
   },
-  "w_swe": 0.995
+  "w_swe": 0.996
  },
  "claude-opus-5-5": {
   "agentic_score": 0.936,
-  "arena_coding_elo": 1817.8,
-  "arena_webdev_elo": 1817.8,
+  "arena_coding_elo": 1815.4,
+  "arena_webdev_elo": 1815.4,
   "preference": {
    "arena_agent": {
     "rank": 3,
@@ -268,9 +268,9 @@
    },
    "arena_webdev": {
     "rank": 1,
-    "rating": 1817.8,
+    "rating": 1815.4,
     "source": "arena.ai",
-    "votes": 1976
+    "votes": 2062
    }
   },
   "w_swe": 1.0
@@ -288,8 +288,8 @@
  },
  "claude-sonnet-4-5": {
   "agentic_score": 0.641,
-  "arena_coding_elo": 1393.1,
-  "arena_webdev_elo": 1393.1,
+  "arena_coding_elo": 1393.0,
+  "arena_webdev_elo": 1393.0,
   "capability": {
    "swe_verified": {
     "acc": 70.0,
@@ -300,18 +300,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 90,
-    "rating": 1393.1,
+    "rank": 91,
+    "rating": 1393.0,
     "source": "arena.ai",
-    "votes": 13251
+    "votes": 13253
    }
   },
   "w_swe": 0.85
  },
  "claude-sonnet-4-6": {
   "agentic_score": 0.754,
-  "arena_coding_elo": 1521.6,
-  "arena_webdev_elo": 1521.6,
+  "arena_coding_elo": 1521.4,
+  "arena_webdev_elo": 1521.4,
   "capability": {
    "swe_verified": {
     "acc": 77.4,
@@ -322,18 +322,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 44,
-    "rating": 1521.6,
+    "rank": 45,
+    "rating": 1521.4,
     "source": "arena.ai",
-    "votes": 22931
+    "votes": 22960
    }
   },
   "w_swe": 0.887
  },
  "claude-sonnet-5": {
   "agentic_score": 0.708,
-  "arena_coding_elo": 1539.5,
-  "arena_webdev_elo": 1539.5,
+  "arena_coding_elo": 1539.4,
+  "arena_webdev_elo": 1539.4,
   "capability": {
    "swe_verified": {
     "acc": 79.6,
@@ -344,29 +344,29 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 24,
+    "rank": 26,
     "score": 0.013,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 39,
-    "rating": 1539.5,
+    "rank": 40,
+    "rating": 1539.4,
     "source": "arena.ai",
-    "votes": 13915
+    "votes": 14130
    }
   },
   "w_swe": 0.898
  },
  "claude-sonnet-5-5": {
   "agentic_score": 1.0,
-  "arena_coding_elo": 1708.7,
-  "arena_webdev_elo": 1708.7,
+  "arena_coding_elo": 1786.3,
+  "arena_webdev_elo": 1786.3,
   "preference": {
    "arena_webdev": {
-    "rank": 5,
-    "rating": 1708.7,
+    "rank": 3,
+    "rating": 1786.3,
     "source": "arena.ai",
-    "votes": 1810
+    "votes": 1531
    }
   },
   "w_swe": 1.0
@@ -473,8 +473,8 @@
  },
  "deepseek-v3-2": {
   "agentic_score": 0.657,
-  "arena_coding_elo": 1361.6,
-  "arena_webdev_elo": 1361.6,
+  "arena_coding_elo": 1361.7,
+  "arena_webdev_elo": 1361.7,
   "capability": {
    "aider_polyglot": {
     "acc": 74.2,
@@ -484,8 +484,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 100,
-    "rating": 1361.6,
+    "rank": 101,
+    "rating": 1361.7,
     "source": "arena.ai",
     "votes": 6921
    }
@@ -505,9 +505,9 @@
   "w_swe": 0.838
  },
  "deepseek-v4": {
-  "agentic_score": 0.602,
-  "arena_coding_elo": 1582.3,
-  "arena_webdev_elo": 1582.3,
+  "agentic_score": 0.603,
+  "arena_coding_elo": 1582.6,
+  "arena_webdev_elo": 1582.6,
   "capability": {
    "scale_seal": {
     "acc": 27.15,
@@ -522,23 +522,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 29,
+    "rank": 31,
     "score": -0.0123,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 29,
-    "rating": 1582.3,
+    "rank": 30,
+    "rating": 1582.6,
     "source": "arena.ai",
-    "votes": 4884
+    "votes": 4882
    }
   },
   "w_swe": 0.902
  },
  "deepseek-v4-1-flash": {
   "agentic_score": 0.756,
-  "arena_coding_elo": 1620.0,
-  "arena_webdev_elo": 1620.0,
+  "arena_coding_elo": 1619.9,
+  "arena_webdev_elo": 1619.9,
   "preference": {
    "arena_agent": {
     "rank": 7,
@@ -547,9 +547,9 @@
    },
    "arena_webdev": {
     "rank": 21,
-    "rating": 1620.0,
+    "rating": 1619.9,
     "source": "arena.ai",
-    "votes": 3958
+    "votes": 3960
    }
   },
   "w_swe": 0.933
@@ -578,8 +578,8 @@
  },
  "devstral": {
   "agentic_score": 0.454,
-  "arena_coding_elo": 1075.9,
-  "arena_webdev_elo": 1075.9,
+  "arena_coding_elo": 1075.8,
+  "arena_webdev_elo": 1075.8,
   "capability": {
    "swe_verified": {
     "acc": 62.8,
@@ -590,8 +590,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 137,
-    "rating": 1075.9,
+    "rank": 138,
+    "rating": 1075.8,
     "source": "arena.ai",
     "votes": 842
    }
@@ -604,7 +604,7 @@
   "arena_webdev_elo": 1196.1,
   "preference": {
    "arena_webdev": {
-    "rank": 132,
+    "rank": 133,
     "rating": 1196.1,
     "source": "arena.ai",
     "votes": 1182
@@ -678,8 +678,8 @@
  },
  "gemini-2-5": {
   "agentic_score": 0.452,
-  "arena_coding_elo": 1226.8,
-  "arena_webdev_elo": 1226.8,
+  "arena_coding_elo": 1227.0,
+  "arena_webdev_elo": 1227.0,
   "capability": {
    "swe_verified": {
     "acc": 54.4,
@@ -690,10 +690,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 130,
-    "rating": 1226.8,
+    "rank": 131,
+    "rating": 1227.0,
     "source": "arena.ai",
-    "votes": 2728
+    "votes": 2729
    }
   },
   "w_swe": 0.772
@@ -755,8 +755,8 @@
  },
  "gemini-3": {
   "agentic_score": 0.709,
-  "arena_coding_elo": 1438.9,
-  "arena_webdev_elo": 1438.9,
+  "arena_coding_elo": 1439.0,
+  "arena_webdev_elo": 1439.0,
   "capability": {
    "swe_verified": {
     "acc": 76.4,
@@ -767,10 +767,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 70,
-    "rating": 1438.9,
+    "rank": 71,
+    "rating": 1439.0,
     "source": "arena.ai",
-    "votes": 14096
+    "votes": 14092
    }
   },
   "w_swe": 0.882
@@ -793,23 +793,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 38,
+    "rank": 40,
     "score": -0.0937,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 66,
+    "rank": 67,
     "rating": 1446.2,
     "source": "arena.ai",
-    "votes": 24319
+    "votes": 24347
    }
   },
   "w_swe": 0.788
  },
  "gemini-3-1-flash-lite": {
   "agentic_score": 0.526,
-  "arena_coding_elo": 1255.9,
-  "arena_webdev_elo": 1255.9,
+  "arena_coding_elo": 1255.7,
+  "arena_webdev_elo": 1255.7,
   "capability": {
    "swe_verified": {
     "acc": 62.8,
@@ -820,18 +820,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 122,
-    "rating": 1255.9,
+    "rank": 123,
+    "rating": 1255.7,
     "source": "arena.ai",
-    "votes": 14405
+    "votes": 14417
    }
   },
   "w_swe": 0.814
  },
  "gemini-3-5-flash": {
   "agentic_score": 0.754,
-  "arena_coding_elo": 1499.1,
-  "arena_webdev_elo": 1499.1,
+  "arena_coding_elo": 1499.0,
+  "arena_webdev_elo": 1499.0,
   "capability": {
    "swe_verified": {
     "acc": 78.8,
@@ -842,10 +842,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 53,
-    "rating": 1499.1,
+    "rank": 54,
+    "rating": 1499.0,
     "source": "arena.ai",
-    "votes": 9495
+    "votes": 9497
    }
   },
   "w_swe": 0.894
@@ -864,7 +864,7 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 69,
+    "rank": 70,
     "rating": 1439.7,
     "source": "arena.ai",
     "votes": 242
@@ -886,23 +886,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 36,
+    "rank": 38,
     "score": -0.0556,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 41,
+    "rank": 42,
     "rating": 1536.3,
     "source": "arena.ai",
-    "votes": 8826
+    "votes": 8823
    }
   },
   "w_swe": 0.898
  },
  "gemini-3-7-flash": {
   "agentic_score": 0.736,
-  "arena_coding_elo": 1592.2,
-  "arena_webdev_elo": 1592.2,
+  "arena_coding_elo": 1591.7,
+  "arena_webdev_elo": 1591.7,
   "capability": {
    "swe_verified": {
     "acc": 80.8,
@@ -913,15 +913,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 25,
+    "rank": 27,
     "score": 0.0108,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 26,
-    "rating": 1592.2,
+    "rank": 27,
+    "rating": 1591.7,
     "source": "arena.ai",
-    "votes": 9386
+    "votes": 9624
    }
   },
   "w_swe": 0.91
@@ -949,18 +949,18 @@
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 28,
+    "rank": 29,
     "rating": 1582.7,
     "source": "arena.ai",
-    "votes": 8357
+    "votes": 8524
    }
   },
   "w_swe": 0.902
  },
  "gemini-3-flash": {
   "agentic_score": 0.537,
-  "arena_coding_elo": 1438.7,
-  "arena_webdev_elo": 1438.7,
+  "arena_coding_elo": 1438.9,
+  "arena_webdev_elo": 1438.9,
   "capability": {
    "scale_seal": {
     "acc": 30.3,
@@ -975,8 +975,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 71,
-    "rating": 1438.7,
+    "rank": 72,
+    "rating": 1438.9,
     "source": "arena.ai",
     "votes": 10896
    }
@@ -985,8 +985,8 @@
  },
  "gemini-4-argon": {
   "agentic_score": 0.914,
-  "arena_coding_elo": 1679.0,
-  "arena_webdev_elo": 1679.0,
+  "arena_coding_elo": 1679.5,
+  "arena_webdev_elo": 1679.5,
   "preference": {
    "arena_agent": {
     "rank": 2,
@@ -994,13 +994,13 @@
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 8,
-    "rating": 1679.0,
+    "rank": 9,
+    "rating": 1679.5,
     "source": "arena.ai",
-    "votes": 2184
+    "votes": 2422
    }
   },
-  "w_swe": 0.982
+  "w_swe": 0.983
  },
  "gemma-3-27b": {
   "agentic_score": 0.049,
@@ -1019,7 +1019,7 @@
   "arena_webdev_elo": 1358.5,
   "preference": {
    "arena_webdev": {
-    "rank": 102,
+    "rank": 103,
     "rating": 1358.5,
     "source": "arena.ai",
     "votes": 1502
@@ -1033,24 +1033,24 @@
   "arena_webdev_elo": 1364.7,
   "preference": {
    "arena_webdev": {
-    "rank": 99,
+    "rank": 100,
     "rating": 1364.7,
     "source": "arena.ai",
-    "votes": 13170
+    "votes": 13325
    }
   },
   "w_swe": 0.721
  },
  "glm-4-6": {
   "agentic_score": 0.399,
-  "arena_coding_elo": 1339.5,
-  "arena_webdev_elo": 1339.5,
+  "arena_coding_elo": 1339.4,
+  "arena_webdev_elo": 1339.4,
   "preference": {
    "arena_webdev": {
-    "rank": 109,
-    "rating": 1339.5,
+    "rank": 110,
+    "rating": 1339.4,
     "source": "arena.ai",
-    "votes": 6781
+    "votes": 6780
    }
   },
   "w_swe": 0.7
@@ -1069,7 +1069,7 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 74,
+    "rank": 75,
     "rating": 1434.5,
     "source": "arena.ai",
     "votes": 4007
@@ -1095,10 +1095,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 75,
+    "rank": 76,
     "rating": 1434.0,
     "source": "arena.ai",
-    "votes": 7505
+    "votes": 7504
    }
   },
   "w_swe": 0.778
@@ -1117,18 +1117,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 51,
+    "rank": 52,
     "rating": 1508.5,
     "source": "arena.ai",
-    "votes": 10799
+    "votes": 10797
    }
   },
   "w_swe": 0.882
  },
  "glm-5-2": {
-  "agentic_score": 0.651,
-  "arena_coding_elo": 1604.6,
-  "arena_webdev_elo": 1604.6,
+  "agentic_score": 0.652,
+  "arena_coding_elo": 1605.0,
+  "arena_webdev_elo": 1605.0,
   "capability": {
    "scale_seal": {
     "acc": 43.99,
@@ -1143,23 +1143,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 18,
+    "rank": 20,
     "score": 0.0523,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 25,
-    "rating": 1604.6,
+    "rank": 26,
+    "rating": 1605.0,
     "source": "arena.ai",
-    "votes": 14543
+    "votes": 14729
    }
   },
-  "w_swe": 0.92
+  "w_swe": 0.921
  },
  "glm-5-3": {
-  "agentic_score": 0.868,
-  "arena_coding_elo": 1622.0,
-  "arena_webdev_elo": 1622.0,
+  "agentic_score": 0.869,
+  "arena_coding_elo": 1623.0,
+  "arena_webdev_elo": 1623.0,
   "capability": {
    "swe_verified": {
     "acc": 95.4,
@@ -1170,23 +1170,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 15,
+    "rank": 16,
     "score": 0.0555,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 19,
-    "rating": 1622.0,
+    "rank": 20,
+    "rating": 1623.0,
     "source": "arena.ai",
-    "votes": 7457
+    "votes": 7658
    }
   },
   "w_swe": 0.977
  },
  "glm-5-3-flash": {
-  "agentic_score": 0.838,
-  "arena_coding_elo": 1614.8,
-  "arena_webdev_elo": 1614.8,
+  "agentic_score": 0.839,
+  "arena_coding_elo": 1615.6,
+  "arena_webdev_elo": 1615.6,
   "capability": {
    "swe_verified": {
     "acc": 92.0,
@@ -1197,15 +1197,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 20,
+    "rank": 22,
     "score": 0.0464,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 24,
-    "rating": 1614.8,
+    "rank": 25,
+    "rating": 1615.6,
     "source": "arena.ai",
-    "votes": 9648
+    "votes": 10355
    }
   },
   "w_swe": 0.96
@@ -1216,7 +1216,7 @@
   "arena_webdev_elo": 1399.8,
   "preference": {
    "arena_webdev": {
-    "rank": 84,
+    "rank": 85,
     "rating": 1399.8,
     "source": "arena.ai",
     "votes": 2416
@@ -1303,7 +1303,7 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 78,
+    "rank": 79,
     "rating": 1417.1,
     "source": "arena.ai",
     "votes": 3091
@@ -1313,14 +1313,14 @@
  },
  "gpt-5-1": {
   "agentic_score": 0.491,
-  "arena_coding_elo": 1394.7,
-  "arena_webdev_elo": 1394.7,
+  "arena_coding_elo": 1394.8,
+  "arena_webdev_elo": 1394.8,
   "preference": {
    "arena_webdev": {
-    "rank": 89,
-    "rating": 1394.7,
+    "rank": 90,
+    "rating": 1394.8,
     "source": "arena.ai",
-    "votes": 4915
+    "votes": 4911
    }
   },
   "w_swe": 0.746
@@ -1351,7 +1351,7 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 79,
+    "rank": 80,
     "rating": 1415.5,
     "source": "arena.ai",
     "votes": 1082
@@ -1385,8 +1385,8 @@
  },
  "gpt-5-3": {
   "agentic_score": 0.561,
-  "arena_coding_elo": 1408.1,
-  "arena_webdev_elo": 1408.1,
+  "arena_coding_elo": 1408.0,
+  "arena_webdev_elo": 1408.0,
   "capability": {
    "scale_seal": {
     "acc": 37.99,
@@ -1401,8 +1401,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 82,
-    "rating": 1408.1,
+    "rank": 83,
+    "rating": 1408.0,
     "source": "arena.ai",
     "votes": 2643
    }
@@ -1410,9 +1410,9 @@
   "w_swe": 0.79
  },
  "gpt-5-4": {
-  "agentic_score": 0.441,
-  "arena_coding_elo": 1465.3,
-  "arena_webdev_elo": 1465.3,
+  "agentic_score": 0.44,
+  "arena_coding_elo": 1464.9,
+  "arena_webdev_elo": 1464.9,
   "capability": {
    "scale_seal": {
     "acc": 44.36,
@@ -1421,15 +1421,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 30,
+    "rank": 32,
     "score": -0.0265,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 62,
-    "rating": 1465.3,
+    "rank": 63,
+    "rating": 1464.9,
     "source": "arena.ai",
-    "votes": 1350
+    "votes": 1351
    }
   },
   "w_swe": 0.804
@@ -1472,8 +1472,8 @@
  },
  "gpt-5-5": {
   "agentic_score": 0.588,
-  "arena_coding_elo": 1512.1,
-  "arena_webdev_elo": 1512.1,
+  "arena_coding_elo": 1512.3,
+  "arena_webdev_elo": 1512.3,
   "capability": {
    "scale_seal": {
     "acc": 45.43,
@@ -1488,18 +1488,18 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 27,
+    "rank": 29,
     "score": -0.0044,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 49,
-    "rating": 1512.1,
+    "rank": 50,
+    "rating": 1512.3,
     "source": "arena.ai",
-    "votes": 15857
+    "votes": 15873
    }
   },
-  "w_swe": 0.843
+  "w_swe": 0.844
  },
  "gpt-5-5-factory": {
   "agentic_score": 0.762,
@@ -1515,8 +1515,8 @@
  },
  "gpt-5-6-luna": {
   "agentic_score": 0.779,
-  "arena_coding_elo": 1517.9,
-  "arena_webdev_elo": 1517.9,
+  "arena_coding_elo": 1518.0,
+  "arena_webdev_elo": 1518.0,
   "capability": {
    "swe_verified": {
     "acc": 93.0,
@@ -1527,23 +1527,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 31,
+    "rank": 33,
     "score": -0.0288,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 46,
-    "rating": 1517.9,
+    "rank": 47,
+    "rating": 1518.0,
     "source": "arena.ai",
-    "votes": 12545
+    "votes": 12776
    }
   },
   "w_swe": 0.965
  },
  "gpt-5-6-sol": {
   "agentic_score": 0.71,
-  "arena_coding_elo": 1619.3,
-  "arena_webdev_elo": 1619.3,
+  "arena_coding_elo": 1619.8,
+  "arena_webdev_elo": 1619.8,
   "capability": {
    "scale_seal": {
     "acc": 46.0,
@@ -1558,23 +1558,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 14,
+    "rank": 15,
     "score": 0.0564,
     "source": "arena.ai"
    },
    "arena_webdev": {
     "rank": 22,
-    "rating": 1619.3,
+    "rating": 1619.8,
     "source": "arena.ai",
-    "votes": 16911
+    "votes": 17128
    }
   },
   "w_swe": 0.933
  },
  "gpt-5-6-terra": {
   "agentic_score": 0.795,
-  "arena_coding_elo": 1519.5,
-  "arena_webdev_elo": 1519.5,
+  "arena_coding_elo": 1519.1,
+  "arena_webdev_elo": 1519.1,
   "capability": {
    "swe_verified": {
     "acc": 95.4,
@@ -1585,15 +1585,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 33,
+    "rank": 35,
     "score": -0.0423,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 45,
-    "rating": 1519.5,
+    "rank": 46,
+    "rating": 1519.1,
     "source": "arena.ai",
-    "votes": 12298
+    "votes": 12526
    }
   },
   "w_swe": 0.977
@@ -1612,22 +1612,22 @@
  },
  "gpt-6-1-sol": {
   "agentic_score": 1.0,
-  "arena_coding_elo": 1758.7,
-  "arena_webdev_elo": 1758.7,
+  "arena_coding_elo": 1757.8,
+  "arena_webdev_elo": 1757.8,
   "preference": {
    "arena_webdev": {
-    "rank": 3,
-    "rating": 1758.7,
+    "rank": 4,
+    "rating": 1757.8,
     "source": "arena.ai",
-    "votes": 1264
+    "votes": 1620
    }
   },
   "w_swe": 1.0
  },
  "gpt-6-astra": {
   "agentic_score": 0.701,
-  "arena_coding_elo": 1789.1,
-  "arena_webdev_elo": 1789.1,
+  "arena_coding_elo": 1787.7,
+  "arena_webdev_elo": 1787.7,
   "capability": {
    "scale_seal": {
     "acc": 59.14,
@@ -1642,36 +1642,36 @@
    },
    "arena_webdev": {
     "rank": 2,
-    "rating": 1789.1,
+    "rating": 1787.7,
     "source": "arena.ai",
-    "votes": 5918
+    "votes": 6123
    }
   },
   "w_swe": 1.0
  },
  "gpt-6-luna": {
-  "agentic_score": 0.58,
-  "arena_coding_elo": 1581.9,
-  "arena_webdev_elo": 1581.9,
+  "agentic_score": 0.576,
+  "arena_coding_elo": 1578.7,
+  "arena_webdev_elo": 1578.7,
   "preference": {
    "arena_agent": {
-    "rank": 26,
+    "rank": 28,
     "score": 0.0038,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 30,
-    "rating": 1581.9,
+    "rank": 32,
+    "rating": 1578.7,
     "source": "arena.ai",
-    "votes": 5577
+    "votes": 6429
    }
   },
-  "w_swe": 0.902
+  "w_swe": 0.899
  },
  "gpt-6-sol": {
   "agentic_score": 0.858,
-  "arena_coding_elo": 1689.3,
-  "arena_webdev_elo": 1689.3,
+  "arena_coding_elo": 1689.0,
+  "arena_webdev_elo": 1689.0,
   "preference": {
    "arena_agent": {
     "rank": 6,
@@ -1679,10 +1679,10 @@
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 7,
-    "rating": 1689.3,
+    "rank": 8,
+    "rating": 1689.0,
     "source": "arena.ai",
-    "votes": 3197
+    "votes": 3411
    }
   },
   "w_swe": 0.991
@@ -1705,18 +1705,18 @@
   "w_swe": 0.689
  },
  "granite-4-1-8b": {
-  "agentic_score": 0.151,
-  "arena_coding_elo": 1190.8,
-  "arena_webdev_elo": 1190.8,
+  "agentic_score": 0.15,
+  "arena_coding_elo": 1190.3,
+  "arena_webdev_elo": 1190.3,
   "preference": {
    "arena_webdev": {
-    "rank": 133,
-    "rating": 1190.8,
+    "rank": 134,
+    "rating": 1190.3,
     "source": "arena.ai",
-    "votes": 1773
+    "votes": 1786
    }
   },
-  "w_swe": 0.576
+  "w_swe": 0.575
  },
  "grok-3": {
   "agentic_score": 0.533,
@@ -1752,7 +1752,7 @@
   "arena_webdev_elo": 1213.8,
   "preference": {
    "arena_webdev": {
-    "rank": 131,
+    "rank": 132,
     "rating": 1213.8,
     "source": "arena.ai",
     "votes": 961
@@ -1762,8 +1762,8 @@
  },
  "grok-4-1-fast-reasoning": {
   "agentic_score": 0.364,
-  "arena_coding_elo": 1241.4,
-  "arena_webdev_elo": 1241.4,
+  "arena_coding_elo": 1241.3,
+  "arena_webdev_elo": 1241.3,
   "capability": {
    "swe_verified": {
     "acc": 41.4,
@@ -1774,10 +1774,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 127,
-    "rating": 1241.4,
+    "rank": 128,
+    "rating": 1241.3,
     "source": "arena.ai",
-    "votes": 5492
+    "votes": 5491
    }
   },
   "w_swe": 0.707
@@ -1800,10 +1800,10 @@
   "arena_webdev_elo": 1374.1,
   "preference": {
    "arena_webdev": {
-    "rank": 96,
+    "rank": 97,
     "rating": 1374.1,
     "source": "arena.ai",
-    "votes": 15489
+    "votes": 15503
    }
   },
   "w_swe": 0.728
@@ -1822,18 +1822,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 104,
+    "rank": 105,
     "rating": 1356.6,
     "source": "arena.ai",
-    "votes": 15048
+    "votes": 15057
    }
   },
   "w_swe": 0.857
  },
  "grok-4-5": {
   "agentic_score": 0.759,
-  "arena_coding_elo": 1552.0,
-  "arena_webdev_elo": 1552.0,
+  "arena_coding_elo": 1551.8,
+  "arena_webdev_elo": 1551.8,
   "capability": {
    "swe_verified": {
     "acc": 86.6,
@@ -1844,23 +1844,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 23,
+    "rank": 25,
     "score": 0.0147,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 36,
-    "rating": 1552.0,
+    "rank": 37,
+    "rating": 1551.8,
     "source": "arena.ai",
-    "votes": 11397
+    "votes": 11393
    }
   },
   "w_swe": 0.933
  },
  "grok-4-6": {
   "agentic_score": 0.838,
-  "arena_coding_elo": 1620.1,
-  "arena_webdev_elo": 1620.1,
+  "arena_coding_elo": 1619.5,
+  "arena_webdev_elo": 1619.5,
   "capability": {
    "swe_verified": {
     "acc": 95.6,
@@ -1871,42 +1871,42 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 28,
+    "rank": 30,
     "score": -0.0073,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 20,
-    "rating": 1620.1,
+    "rank": 23,
+    "rating": 1619.5,
     "source": "arena.ai",
-    "votes": 8120
+    "votes": 8315
    }
   },
   "w_swe": 0.978
  },
  "grok-4-7": {
-  "agentic_score": 0.737,
-  "arena_coding_elo": 1636.3,
-  "arena_webdev_elo": 1636.3,
+  "agentic_score": 0.739,
+  "arena_coding_elo": 1637.5,
+  "arena_webdev_elo": 1637.5,
   "preference": {
    "arena_agent": {
-    "rank": 13,
+    "rank": 14,
     "score": 0.0623,
     "source": "arena.ai"
    },
    "arena_webdev": {
     "rank": 15,
-    "rating": 1636.3,
+    "rating": 1637.5,
     "source": "arena.ai",
-    "votes": 3062
+    "votes": 3216
    }
   },
-  "w_swe": 0.947
+  "w_swe": 0.948
  },
  "grok-4-fast-reasoning": {
   "agentic_score": 0.355,
-  "arena_coding_elo": 1159.5,
-  "arena_webdev_elo": 1159.5,
+  "arena_coding_elo": 1158.9,
+  "arena_webdev_elo": 1158.9,
   "capability": {
    "swe_verified": {
     "acc": 45.4,
@@ -1917,10 +1917,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 136,
-    "rating": 1159.5,
+    "rank": 137,
+    "rating": 1158.9,
     "source": "arena.ai",
-    "votes": 743
+    "votes": 742
    }
   },
   "w_swe": 0.727
@@ -1931,7 +1931,7 @@
   "arena_webdev_elo": 1167.0,
   "preference": {
    "arena_webdev": {
-    "rank": 135,
+    "rank": 136,
     "rating": 1167.0,
     "source": "arena.ai",
     "votes": 789
@@ -1941,33 +1941,33 @@
  },
  "hunyuan-hy3": {
   "agentic_score": 0.426,
-  "arena_coding_elo": 1355.8,
-  "arena_webdev_elo": 1355.8,
+  "arena_coding_elo": 1355.7,
+  "arena_webdev_elo": 1355.7,
   "preference": {
    "arena_webdev": {
-    "rank": 105,
-    "rating": 1355.8,
+    "rank": 106,
+    "rating": 1355.7,
     "source": "arena.ai",
-    "votes": 1450
+    "votes": 1455
    }
   },
   "w_swe": 0.713
  },
  "hy3": {
-  "agentic_score": 0.486,
-  "arena_coding_elo": 1508.1,
-  "arena_webdev_elo": 1508.1,
+  "agentic_score": 0.485,
+  "arena_coding_elo": 1507.4,
+  "arena_webdev_elo": 1507.4,
   "preference": {
    "arena_agent": {
-    "rank": 41,
+    "rank": 43,
     "score": -0.1147,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 52,
-    "rating": 1508.1,
+    "rank": 53,
+    "rating": 1507.4,
     "source": "arena.ai",
-    "votes": 5713
+    "votes": 5802
    }
   },
   "w_swe": 0.84
@@ -1978,12 +1978,12 @@
   "arena_webdev_elo": 1633.2,
   "preference": {
    "arena_agent": {
-    "rank": 11,
+    "rank": 12,
     "score": 0.0637,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 16,
+    "rank": 17,
     "rating": 1633.2,
     "source": "arena.ai",
     "votes": 5088
@@ -1992,9 +1992,9 @@
   "w_swe": 0.944
  },
  "inkling": {
-  "agentic_score": 0.634,
-  "arena_coding_elo": 1412.0,
-  "arena_webdev_elo": 1412.0,
+  "agentic_score": 0.635,
+  "arena_coding_elo": 1412.6,
+  "arena_webdev_elo": 1412.6,
   "capability": {
    "swe_verified": {
     "acc": 77.6,
@@ -2005,23 +2005,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 45,
+    "rank": 47,
     "score": -0.2074,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 80,
-    "rating": 1412.0,
+    "rank": 81,
+    "rating": 1412.6,
     "source": "arena.ai",
-    "votes": 13499
+    "votes": 13705
    }
   },
   "w_swe": 0.888
  },
  "inkling-small": {
   "agentic_score": 0.663,
-  "arena_coding_elo": 1408.3,
-  "arena_webdev_elo": 1408.3,
+  "arena_coding_elo": 1408.2,
+  "arena_webdev_elo": 1408.2,
   "capability": {
    "swe_verified": {
     "acc": 82.2,
@@ -2032,15 +2032,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 44,
+    "rank": 46,
     "score": -0.1951,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 81,
-    "rating": 1408.3,
+    "rank": 82,
+    "rating": 1408.2,
     "source": "arena.ai",
-    "votes": 5420
+    "votes": 5421
    }
   },
   "w_swe": 0.911
@@ -2051,7 +2051,7 @@
   "arena_webdev_elo": 1255.3,
   "preference": {
    "arena_webdev": {
-    "rank": 123,
+    "rank": 124,
     "rating": 1255.3,
     "source": "arena.ai",
     "votes": 1504
@@ -2078,10 +2078,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 115,
+    "rank": 116,
     "rating": 1321.4,
     "source": "arena.ai",
-    "votes": 13096
+    "votes": 13093
    }
   },
   "w_swe": 0.798
@@ -2104,24 +2104,24 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 73,
+    "rank": 74,
     "rating": 1435.8,
     "source": "arena.ai",
-    "votes": 20139
+    "votes": 20149
    }
   },
   "w_swe": 0.78
  },
  "kimi-k2-5-instant": {
   "agentic_score": 0.506,
-  "arena_coding_elo": 1403.6,
-  "arena_webdev_elo": 1403.6,
+  "arena_coding_elo": 1403.7,
+  "arena_webdev_elo": 1403.7,
   "preference": {
    "arena_webdev": {
-    "rank": 83,
-    "rating": 1403.6,
+    "rank": 84,
+    "rating": 1403.7,
     "source": "arena.ai",
-    "votes": 3266
+    "votes": 3271
    }
   },
   "w_swe": 0.753
@@ -2140,10 +2140,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 50,
+    "rank": 51,
     "rating": 1508.7,
     "source": "arena.ai",
-    "votes": 10202
+    "votes": 10208
    }
   },
   "w_swe": 0.881
@@ -2162,10 +2162,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 60,
+    "rank": 61,
     "rating": 1472.9,
     "source": "arena.ai",
-    "votes": 4992
+    "votes": 4993
    }
   },
   "w_swe": 0.891
@@ -2184,23 +2184,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 9,
+    "rank": 10,
     "score": 0.0732,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 12,
+    "rank": 13,
     "rating": 1657.8,
     "source": "arena.ai",
-    "votes": 16246
+    "votes": 16513
    }
   },
   "w_swe": 0.967
  },
  "laguna-m-1": {
   "agentic_score": 0.531,
-  "arena_coding_elo": 1347.9,
-  "arena_webdev_elo": 1347.9,
+  "arena_coding_elo": 1348.1,
+  "arena_webdev_elo": 1348.1,
   "capability": {
    "swe_verified": {
     "acc": 57.6,
@@ -2211,8 +2211,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 107,
-    "rating": 1347.9,
+    "rank": 108,
+    "rating": 1348.1,
     "source": "arena.ai",
     "votes": 5418
    }
@@ -2221,8 +2221,8 @@
  },
  "laguna-xs-2": {
   "agentic_score": 0.492,
-  "arena_coding_elo": 1301.8,
-  "arena_webdev_elo": 1301.8,
+  "arena_coding_elo": 1301.9,
+  "arena_webdev_elo": 1301.9,
   "capability": {
    "swe_verified": {
     "acc": 55.2,
@@ -2233,10 +2233,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 116,
-    "rating": 1301.8,
+    "rank": 117,
+    "rating": 1301.9,
     "source": "arena.ai",
-    "votes": 4254
+    "votes": 4256
    }
   },
   "w_swe": 0.776
@@ -2270,7 +2270,7 @@
   "arena_webdev_elo": 1170.0,
   "preference": {
    "arena_webdev": {
-    "rank": 134,
+    "rank": 135,
     "rating": 1170.0,
     "source": "arena.ai",
     "votes": 955
@@ -2280,22 +2280,22 @@
  },
  "mimo-v2": {
   "agentic_score": 0.555,
-  "arena_coding_elo": 1432.9,
-  "arena_webdev_elo": 1432.9,
+  "arena_coding_elo": 1432.8,
+  "arena_webdev_elo": 1432.8,
   "preference": {
    "arena_webdev": {
-    "rank": 76,
-    "rating": 1432.9,
+    "rank": 77,
+    "rating": 1432.8,
     "source": "arena.ai",
-    "votes": 7247
+    "votes": 7253
    }
   },
   "w_swe": 0.777
  },
  "mimo-v2-5": {
   "agentic_score": 0.638,
-  "arena_coding_elo": 1476.9,
-  "arena_webdev_elo": 1476.9,
+  "arena_coding_elo": 1477.6,
+  "arena_webdev_elo": 1477.6,
   "capability": {
    "swe_verified": {
     "acc": 74.0,
@@ -2306,32 +2306,48 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 39,
+    "rank": 41,
     "score": -0.094,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 59,
-    "rating": 1476.9,
+    "rank": 60,
+    "rating": 1477.6,
     "source": "arena.ai",
-    "votes": 20096
+    "votes": 20313
    }
   },
   "w_swe": 0.87
  },
  "mimo-v2-6": {
-  "agentic_score": 0.864,
-  "arena_coding_elo": 1618.5,
-  "arena_webdev_elo": 1618.5,
+  "agentic_score": 0.734,
+  "arena_coding_elo": 1618.4,
+  "arena_webdev_elo": 1618.4,
   "preference": {
+   "arena_agent": {
+    "rank": 9,
+    "score": 0.0735,
+    "source": "arena.ai"
+   },
    "arena_webdev": {
-    "rank": 23,
-    "rating": 1618.5,
+    "rank": 24,
+    "rating": 1618.4,
     "source": "arena.ai",
-    "votes": 2736
+    "votes": 2734
    }
   },
   "w_swe": 0.932
+ },
+ "mimo-v2-6-flash": {
+  "agentic_score": 0.302,
+  "preference": {
+   "arena_agent": {
+    "rank": 18,
+    "score": 0.0544,
+    "source": "arena.ai"
+   }
+  },
+  "w_swe": 0.651
  },
  "mimo-v2-flash": {
   "agentic_score": 0.383,
@@ -2339,32 +2355,32 @@
   "arena_webdev_elo": 1329.6,
   "preference": {
    "arena_webdev": {
-    "rank": 112,
+    "rank": 113,
     "rating": 1329.6,
     "source": "arena.ai",
-    "votes": 5688
+    "votes": 5692
    }
   },
   "w_swe": 0.691
  },
  "minimax-m2": {
   "agentic_score": 0.328,
-  "arena_coding_elo": 1296.7,
-  "arena_webdev_elo": 1296.7,
+  "arena_coding_elo": 1296.6,
+  "arena_webdev_elo": 1296.6,
   "preference": {
    "arena_webdev": {
-    "rank": 117,
-    "rating": 1296.7,
+    "rank": 118,
+    "rating": 1296.6,
     "source": "arena.ai",
-    "votes": 6717
+    "votes": 6714
    }
   },
   "w_swe": 0.664
  },
  "minimax-m2-1": {
   "agentic_score": 0.672,
-  "arena_coding_elo": 1384.0,
-  "arena_webdev_elo": 1384.0,
+  "arena_coding_elo": 1383.9,
+  "arena_webdev_elo": 1383.9,
   "capability": {
    "swe_verified": {
     "acc": 74.8,
@@ -2375,18 +2391,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 95,
-    "rating": 1384.0,
+    "rank": 96,
+    "rating": 1383.9,
     "source": "arena.ai",
-    "votes": 7645
+    "votes": 7644
    }
   },
   "w_swe": 0.874
  },
  "minimax-m2-5": {
   "agentic_score": 0.471,
-  "arena_coding_elo": 1386.3,
-  "arena_webdev_elo": 1386.3,
+  "arena_coding_elo": 1386.2,
+  "arena_webdev_elo": 1386.2,
   "capability": {
    "scale_seal": {
     "acc": 19.52,
@@ -2401,18 +2417,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 92,
-    "rating": 1386.3,
+    "rank": 93,
+    "rating": 1386.2,
     "source": "arena.ai",
-    "votes": 7628
+    "votes": 7637
    }
   },
   "w_swe": 0.739
  },
  "minimax-m2-7": {
-  "agentic_score": 0.671,
-  "arena_coding_elo": 1397.1,
-  "arena_webdev_elo": 1397.1,
+  "agentic_score": 0.67,
+  "arena_coding_elo": 1397.0,
+  "arena_webdev_elo": 1397.0,
   "capability": {
    "swe_verified": {
     "acc": 73.8,
@@ -2423,18 +2439,18 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 86,
-    "rating": 1397.1,
+    "rank": 88,
+    "rating": 1397.0,
     "source": "arena.ai",
-    "votes": 16079
+    "votes": 16074
    }
   },
   "w_swe": 0.869
  },
  "minimax-m3": {
   "agentic_score": 0.647,
-  "arena_coding_elo": 1482.4,
-  "arena_webdev_elo": 1482.4,
+  "arena_coding_elo": 1482.0,
+  "arena_webdev_elo": 1482.0,
   "capability": {
    "swe_verified": {
     "acc": 75.0,
@@ -2445,15 +2461,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 42,
+    "rank": 44,
     "score": -0.1306,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 57,
-    "rating": 1482.4,
+    "rank": 58,
+    "rating": 1482.0,
     "source": "arena.ai",
-    "votes": 17427
+    "votes": 17613
    }
   },
   "w_swe": 0.875
@@ -2476,7 +2492,7 @@
   "arena_webdev_elo": 1229.8,
   "preference": {
    "arena_webdev": {
-    "rank": 129,
+    "rank": 130,
     "rating": 1229.8,
     "source": "arena.ai",
     "votes": 840
@@ -2485,9 +2501,9 @@
   "w_swe": 0.608
  },
  "mistral-medium-3-5": {
-  "agentic_score": 0.5,
-  "arena_coding_elo": 1263.1,
-  "arena_webdev_elo": 1263.1,
+  "agentic_score": 0.499,
+  "arena_coding_elo": 1262.9,
+  "arena_webdev_elo": 1262.9,
   "capability": {
    "swe_verified": {
     "acc": 66.4,
@@ -2498,15 +2514,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 43,
+    "rank": 45,
     "score": -0.1352,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 121,
-    "rating": 1263.1,
+    "rank": 122,
+    "rating": 1262.9,
     "source": "arena.ai",
-    "votes": 2318
+    "votes": 2322
    }
   },
   "w_swe": 0.832
@@ -2517,7 +2533,7 @@
   "arena_webdev_elo": 1354.8,
   "preference": {
    "arena_webdev": {
-    "rank": 106,
+    "rank": 107,
     "rating": 1354.8,
     "source": "arena.ai",
     "votes": 1663
@@ -2543,8 +2559,8 @@
  },
  "muse-spark-1-1": {
   "agentic_score": 0.587,
-  "arena_coding_elo": 1541.9,
-  "arena_webdev_elo": 1541.9,
+  "arena_coding_elo": 1541.7,
+  "arena_webdev_elo": 1541.7,
   "capability": {
    "scale_seal": {
     "acc": 41.84,
@@ -2559,15 +2575,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 32,
+    "rank": 34,
     "score": -0.0391,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 38,
-    "rating": 1541.9,
+    "rank": 39,
+    "rating": 1541.7,
     "source": "arena.ai",
-    "votes": 8074
+    "votes": 8070
    }
   },
   "w_swe": 0.868
@@ -2586,12 +2602,12 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 35,
+    "rank": 37,
     "score": -0.0478,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 43,
+    "rank": 44,
     "rating": 1531.8,
     "source": "arena.ai",
     "votes": 2183
@@ -2600,23 +2616,23 @@
   "w_swe": 0.933
  },
  "muse-spark-1-3": {
-  "agentic_score": 0.76,
-  "arena_coding_elo": 1655.4,
-  "arena_webdev_elo": 1655.4,
+  "agentic_score": 0.762,
+  "arena_coding_elo": 1656.6,
+  "arena_webdev_elo": 1656.6,
   "preference": {
    "arena_agent": {
-    "rank": 12,
+    "rank": 13,
     "score": 0.0625,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 13,
-    "rating": 1655.4,
+    "rank": 14,
+    "rating": 1656.6,
     "source": "arena.ai",
-    "votes": 7004
+    "votes": 7249
    }
   },
-  "w_swe": 0.963
+  "w_swe": 0.964
  },
  "nemotron-3-ultra-550b-a55b": {
   "agentic_score": 0.69,
@@ -2773,7 +2789,7 @@
   "agentic_score": 0.084,
   "preference": {
    "arena_agent": {
-    "rank": 22,
+    "rank": 24,
     "score": 0.0151,
     "source": "arena.ai"
    }
@@ -2830,36 +2846,36 @@
   "arena_webdev_elo": 1359.8,
   "preference": {
    "arena_webdev": {
-    "rank": 101,
+    "rank": 102,
     "rating": 1359.8,
     "source": "arena.ai",
-    "votes": 8242
+    "votes": 8249
    }
   },
   "w_swe": 0.716
  },
  "qwen3-5-27b": {
   "agentic_score": 0.429,
-  "arena_coding_elo": 1357.4,
-  "arena_webdev_elo": 1357.4,
+  "arena_coding_elo": 1357.3,
+  "arena_webdev_elo": 1357.3,
   "preference": {
    "arena_webdev": {
-    "rank": 103,
-    "rating": 1357.4,
+    "rank": 104,
+    "rating": 1357.3,
     "source": "arena.ai",
-    "votes": 7779
+    "votes": 7794
    }
   },
-  "w_swe": 0.715
+  "w_swe": 0.714
  },
  "qwen3-5-35b-a3b": {
   "agentic_score": 0.256,
-  "arena_coding_elo": 1253.5,
-  "arena_webdev_elo": 1253.5,
+  "arena_coding_elo": 1253.4,
+  "arena_webdev_elo": 1253.4,
   "preference": {
    "arena_webdev": {
-    "rank": 124,
-    "rating": 1253.5,
+    "rank": 125,
+    "rating": 1253.4,
     "source": "arena.ai",
     "votes": 1617
    }
@@ -2868,22 +2884,22 @@
  },
  "qwen3-5-397b-a17b": {
   "agentic_score": 0.499,
-  "arena_coding_elo": 1399.6,
-  "arena_webdev_elo": 1399.6,
+  "arena_coding_elo": 1399.4,
+  "arena_webdev_elo": 1399.4,
   "preference": {
    "arena_webdev": {
-    "rank": 85,
-    "rating": 1399.6,
+    "rank": 86,
+    "rating": 1399.4,
     "source": "arena.ai",
-    "votes": 21270
+    "votes": 21280
    }
   },
   "w_swe": 0.75
  },
  "qwen3-5-flash": {
   "agentic_score": 0.531,
-  "arena_coding_elo": 1243.2,
-  "arena_webdev_elo": 1243.2,
+  "arena_coding_elo": 1243.1,
+  "arena_webdev_elo": 1243.1,
   "capability": {
    "swe_verified": {
     "acc": 64.4,
@@ -2894,8 +2910,8 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 126,
-    "rating": 1243.2,
+    "rank": 127,
+    "rating": 1243.1,
     "source": "arena.ai",
     "votes": 1329
    }
@@ -2915,9 +2931,9 @@
   "w_swe": 0.856
  },
  "qwen3-6": {
-  "agentic_score": 0.703,
-  "arena_coding_elo": 1481.8,
-  "arena_webdev_elo": 1481.8,
+  "agentic_score": 0.702,
+  "arena_coding_elo": 1481.5,
+  "arena_webdev_elo": 1481.5,
   "capability": {
    "swe_verified": {
     "acc": 72.8,
@@ -2928,10 +2944,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 58,
-    "rating": 1481.8,
+    "rank": 59,
+    "rating": 1481.5,
     "source": "arena.ai",
-    "votes": 2708
+    "votes": 2716
    }
   },
   "w_swe": 0.864
@@ -2950,8 +2966,8 @@
  },
  "qwen3-6-plus": {
   "agentic_score": 0.697,
-  "arena_coding_elo": 1460.6,
-  "arena_webdev_elo": 1460.6,
+  "arena_coding_elo": 1460.7,
+  "arena_webdev_elo": 1460.7,
   "capability": {
    "swe_verified": {
     "acc": 73.4,
@@ -2962,10 +2978,10 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 64,
-    "rating": 1460.6,
+    "rank": 65,
+    "rating": 1460.7,
     "source": "arena.ai",
-    "votes": 18685
+    "votes": 18688
    }
   },
   "w_swe": 0.867
@@ -2984,15 +3000,15 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 37,
+    "rank": 39,
     "score": -0.0907,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 48,
+    "rank": 49,
     "rating": 1514.9,
     "source": "arena.ai",
-    "votes": 8917
+    "votes": 8922
    }
   },
   "w_swe": 0.846
@@ -3001,7 +3017,7 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 40,
+    "rank": 42,
     "score": -0.1014,
     "source": "arena.ai"
    }
@@ -3022,23 +3038,23 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 17,
+    "rank": 19,
     "score": 0.0524,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 9,
+    "rank": 10,
     "rating": 1671.2,
     "source": "arena.ai",
-    "votes": 3453
+    "votes": 3454
    }
   },
   "w_swe": 0.976
  },
  "qwen3-8-27b": {
-  "agentic_score": 0.848,
-  "arena_coding_elo": 1590.4,
-  "arena_webdev_elo": 1590.4,
+  "agentic_score": 0.849,
+  "arena_coding_elo": 1591.2,
+  "arena_webdev_elo": 1591.2,
   "capability": {
    "swe_verified": {
     "acc": 86.0,
@@ -3049,43 +3065,43 @@
   },
   "preference": {
    "arena_webdev": {
-    "rank": 27,
-    "rating": 1590.4,
+    "rank": 28,
+    "rating": 1591.2,
     "source": "arena.ai",
-    "votes": 12030
+    "votes": 12388
    }
   },
   "w_swe": 0.93
  },
  "qwen3-8-flash-next": {
-  "agentic_score": 0.697,
-  "arena_coding_elo": 1637.8,
-  "arena_webdev_elo": 1637.8,
+  "agentic_score": 0.696,
+  "arena_coding_elo": 1637.5,
+  "arena_webdev_elo": 1637.5,
   "preference": {
    "arena_agent": {
-    "rank": 21,
+    "rank": 23,
     "score": 0.0356,
     "source": "arena.ai"
    },
    "arena_webdev": {
-    "rank": 14,
-    "rating": 1637.8,
+    "rank": 16,
+    "rating": 1637.5,
     "source": "arena.ai",
-    "votes": 5980
+    "votes": 6193
    }
   },
   "w_swe": 0.948
  },
  "qwen3-coder-480b-a35b": {
   "agentic_score": 0.29,
-  "arena_coding_elo": 1274.3,
-  "arena_webdev_elo": 1274.3,
+  "arena_coding_elo": 1274.2,
+  "arena_webdev_elo": 1274.2,
   "preference": {
    "arena_webdev": {
-    "rank": 119,
-    "rating": 1274.3,
+    "rank": 120,
+    "rating": 1274.2,
     "source": "arena.ai",
-    "votes": 12718
+    "votes": 12719
    }
   },
   "w_swe": 0.645
@@ -3114,14 +3130,14 @@
  },
  "seed-2-1": {
   "agentic_score": 0.695,
-  "arena_coding_elo": 1517.0,
-  "arena_webdev_elo": 1517.0,
+  "arena_coding_elo": 1516.9,
+  "arena_webdev_elo": 1516.9,
   "preference": {
    "arena_webdev": {
-    "rank": 47,
-    "rating": 1517.0,
+    "rank": 48,
+    "rating": 1516.9,
     "source": "arena.ai",
-    "votes": 13139
+    "votes": 13312
    }
   },
   "w_swe": 0.847
@@ -3130,7 +3146,7 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 46,
+    "rank": 48,
     "score": -0.2084,
     "source": "arena.ai"
    }
@@ -3139,14 +3155,14 @@
  },
  "solar-pro4": {
   "agentic_score": 0.45,
-  "arena_coding_elo": 1370.3,
-  "arena_webdev_elo": 1370.3,
+  "arena_coding_elo": 1370.2,
+  "arena_webdev_elo": 1370.2,
   "preference": {
    "arena_webdev": {
-    "rank": 98,
-    "rating": 1370.3,
+    "rank": 99,
+    "rating": 1370.2,
     "source": "arena.ai",
-    "votes": 4941
+    "votes": 4945
    }
   },
   "w_swe": 0.725
@@ -3162,18 +3178,18 @@
   "w_swe": 0.66
  },
  "step-5": {
-  "agentic_score": 0.783,
-  "arena_coding_elo": 1569.6,
-  "arena_webdev_elo": 1569.6,
+  "agentic_score": 0.784,
+  "arena_coding_elo": 1570.2,
+  "arena_webdev_elo": 1570.2,
   "preference": {
    "arena_webdev": {
-    "rank": 32,
-    "rating": 1569.6,
+    "rank": 33,
+    "rating": 1570.2,
     "source": "arena.ai",
-    "votes": 2326
+    "votes": 2506
    }
   },
-  "w_swe": 0.891
+  "w_swe": 0.892
  },
  "trinity-large": {
   "agentic_score": 0.229,
@@ -3181,7 +3197,7 @@
   "arena_webdev_elo": 1237.6,
   "preference": {
    "arena_webdev": {
-    "rank": 128,
+    "rank": 129,
     "rating": 1237.6,
     "source": "arena.ai",
     "votes": 1362
