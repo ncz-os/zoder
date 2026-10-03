@@ -457,6 +457,17 @@ pub struct ModelEntry {
     /// rather than an allow-list of the kwargs we happen to know about today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Default `reasoning_effort` for this model (`none` | `minimal` | `low` |
+    /// `medium` | `high`). An explicit `--reasoning` flag wins. `None` omits
+    /// the field.
+    ///
+    /// Reasoning "flash" models spend the whole output budget thinking on a
+    /// large review chunk and return an empty message: measured 2026-10-03 on
+    /// deepseek-flash and nvidia/nemotron-3-ultra-550b-a55b, both of which
+    /// return content with `none`. MiniMax-M3.1-Flash-Preview rejects `none`
+    /// ("requires adaptive thinking") and accepts `minimal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Read-only projection of the zeroclaw engine's `config.toml` model routing.
@@ -496,6 +507,7 @@ struct EngineAgentModel {
 struct EngineProviderModel {
     model: String,
     chat_template_kwargs: Option<serde_json::Value>,
+    reasoning_effort: Option<String>,
     kind: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
@@ -709,6 +721,30 @@ impl EngineModelRegistry {
             .values()
             .find(|profile| profile.model == model && profile.chat_template_kwargs.is_some())
             .and_then(|profile| profile.chat_template_kwargs.as_ref())
+    }
+
+    /// Return the `reasoning_effort` attached to the engine profile that serves
+    /// this model, with the same precedence as
+    /// [`Self::chat_template_kwargs_for_model`].
+    pub fn reasoning_effort_for_model(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+    ) -> Option<&str> {
+        for alias in agent_alias.into_iter().chain(std::iter::once("reviewer")) {
+            if let Some(profile) = self
+                .model_provider_ref_for_agent(alias)
+                .and_then(|reference| self.models.get(reference))
+            {
+                if profile.model == model && profile.reasoning_effort.is_some() {
+                    return profile.reasoning_effort.as_deref();
+                }
+            }
+        }
+        self.models
+            .values()
+            .find(|profile| profile.model == model && profile.reasoning_effort.is_some())
+            .and_then(|profile| profile.reasoning_effort.as_deref())
     }
 
     /// Return the exact provider-profile reference configured on an agent,
@@ -1457,6 +1493,16 @@ fn collect_engine_models(
                         .get("chat_template_kwargs")
                         .and_then(|value| serde_json::to_value(value).ok())
                         .filter(serde_json::Value::is_object),
+                    // zeroclaw forwards provider_extra verbatim into the request
+                    // body, so provider_extra.reasoning_effort is the one place an
+                    // operator sets it for both the engine loop and zoder's direct
+                    // reviewer path (which does not forward provider_extra).
+                    reasoning_effort: child
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("reasoning_effort"))
+                        .or_else(|| child.get("reasoning_effort"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1525,6 +1571,12 @@ fn collect_engine_models_json(
                         .get("chat_template_kwargs")
                         .filter(|value| value.is_object())
                         .cloned(),
+                    reasoning_effort: child
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("reasoning_effort"))
+                        .or_else(|| child.get("reasoning_effort"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -3659,6 +3711,35 @@ model_provider = "custom.reviewer"
             registry.chat_template_kwargs_for_model("different", None),
             None
         );
+    }
+
+    #[test]
+    fn reviewer_reasoning_effort_comes_from_selected_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "model-a"
+reasoning_effort = "high"
+[providers.models.custom.reviewer]
+model = "model-a"
+provider_extra = { reasoning_effort = "none" }
+[providers.models.custom.flash]
+model = "flash-b"
+reasoning_effort = "minimal"
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.reasoning_effort_for_model("model-a", None),
+            Some("none")
+        );
+        assert_eq!(
+            registry.reasoning_effort_for_model("flash-b", None),
+            Some("minimal")
+        );
+        assert_eq!(registry.reasoning_effort_for_model("different", None), None);
     }
     use crate::ledger::Entry;
     use crate::subscription_tiers::TierCatalog;

@@ -5672,7 +5672,10 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
-            reasoning_effort: cli.reasoning.clone(),
+            reasoning_effort: cli
+                .reasoning
+                .clone()
+                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone())),
             top_p: model_cfg.and_then(|m| m.top_p),
             top_k: model_cfg.and_then(|m| m.top_k),
             presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
