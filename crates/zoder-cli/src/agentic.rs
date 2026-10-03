@@ -1602,13 +1602,39 @@ fn parse_review(raw: &str) -> ReviewOutput {
     }
 }
 
+/// Unwrap an answer that is *exactly one* markdown code fence (optionally with
+/// an alphanumeric info string such as `json`) and nothing else.
+///
+/// Chat models routinely wrap a complete verdict object in a ```json fence even
+/// when told not to, and the standalone gate used to fail every such answer
+/// closed. This stays as strict as the bare-object rule: prose before or after
+/// the fence, a second fence, or a non-alphanumeric info string all leave the
+/// text untouched, so the existing "no decoy object next to prose" protection
+/// still holds.
+fn strip_single_code_fence(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return s;
+    };
+    let Some((info, inner)) = body.split_once('\n') else {
+        return s;
+    };
+    if info.trim().chars().all(|c| c.is_ascii_alphanumeric()) && !inner.contains("```") {
+        inner.trim()
+    } else {
+        s
+    }
+}
+
 /// The standalone review gate requires the complete provider answer to be a
 /// verdict object. `parse_review` deliberately supports prose for older loop
 /// workflows, but that recovery can misread a thinking model's explanation
 /// of the schema ("approve or request_changes") as an actual approval.
 fn parse_standalone_review(raw: &str) -> ReviewOutput {
     let trimmed = raw.trim();
-    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    let parsed = serde_json::from_str::<serde_json::Value>(strip_single_code_fence(trimmed)).ok();
     if let Some(value) = parsed.as_ref().and_then(serde_json::Value::as_object) {
         let has_shape = ["verdict", "summary", "findings", "next_steps"]
             .iter()
@@ -6046,6 +6072,48 @@ mod tests {
         assert_eq!(parse_standalone_review(prose).verdict, "request_changes");
         let valid = r#"{"verdict":"approve","summary":"No concrete defects.","findings":[],"next_steps":[]}"#;
         assert_eq!(parse_standalone_review(valid).verdict, "approve");
+    }
+
+    #[test]
+    fn standalone_review_accepts_one_fenced_verdict_object() {
+        let obj = r#"{"verdict":"approve","summary":"No concrete defects.","findings":[],"next_steps":[]}"#;
+        for fenced in [
+            format!("```json\n{obj}\n```"),
+            format!("```\n{obj}\n```"),
+            format!("  ```JSON\n{obj}\n```\n"),
+        ] {
+            assert_eq!(
+                parse_standalone_review(&fenced).verdict,
+                "approve",
+                "{fenced}"
+            );
+        }
+        let blocking =
+            r#"{"verdict":"request_changes","summary":"Bug.","findings":[],"next_steps":[]}"#;
+        assert_eq!(
+            parse_standalone_review(&format!("```json\n{blocking}\n```")).verdict,
+            "request_changes"
+        );
+    }
+
+    #[test]
+    fn standalone_review_fence_unwrap_does_not_reopen_decoys() {
+        let obj = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
+        // prose around the fence, two fences, and a decoy next to the real block
+        for answer in [
+            format!("Here is my review:\n```json\n{obj}\n```"),
+            format!("```json\n{obj}\n```\nHope that helps."),
+            format!("```json\n{obj}\n```\n```json\n{obj}\n```"),
+            format!("```json\n{obj}\n```\n{obj}"),
+            format!("```not a lang!\n{obj}\n```"),
+            "```json\n```".to_string(),
+        ] {
+            assert_eq!(
+                parse_standalone_review(&answer).verdict,
+                "request_changes",
+                "{answer}"
+            );
+        }
     }
 
     // ---- C2-1: configured reviewer_model pin must outrank scenario auto-routing ----
