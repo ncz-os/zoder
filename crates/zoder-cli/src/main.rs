@@ -5680,6 +5680,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             top_k: model_cfg.and_then(|m| m.top_k),
             presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
             chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
+            response_format: None,
         };
         // Per-model timer: health latency must reflect THIS model's call, not
         // the chain-wide elapsed time (which would fold in prior models' time
@@ -10802,6 +10803,7 @@ async fn run_probe_default(
             top_k: None,
             presence_penalty: None,
             chat_template_kwargs: None,
+            response_format: None,
         };
         let mut reservation = Ledger::new(&eng.cfg.ledger_path)
             .reserve_billable()
