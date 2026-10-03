@@ -1087,7 +1087,15 @@ async fn dispatch_reviewer_for_model(
         temperature: model_cfg.and_then(|m| m.temperature).or(Some(0.1)),
         stream: false,
         show_reasoning: false,
-        reasoning_effort: cli.reasoning.clone(),
+        reasoning_effort: cli
+            .reasoning
+            .clone()
+            .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone()))
+            .or_else(|| {
+                eng.engine_models
+                    .reasoning_effort_for_model(model, cli.agent.as_deref())
+                    .map(str::to_owned)
+            }),
         top_p: model_cfg.and_then(|m| m.top_p),
         top_k: model_cfg.and_then(|m| m.top_k),
         presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
