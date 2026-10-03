@@ -56,7 +56,27 @@ jobs:
           git init --bare engine-history
           git -C engine-history fetch --filter=blob:none --no-tags "https://${ENGINE_REPO}" "$ENGINE_SHA"
           git -C engine-history fetch --filter=blob:none --no-tags https://github.com/zeroclaw-labs/zeroclaw.git "$UPSTREAM_SHA"
-          git -C engine-history merge-base --is-ancestor "$UPSTREAM_SHA" "$ENGINE_SHA" || { echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA; run ZeroClaw source sync first."; exit 1; }
+          # GitHub runs scheduled workflows hours late (ncz-os/zeroclaw's
+          # 08:30 daily-master-sync actually ran 13:32, 14:49 and 15:31 UTC on
+          # 2026-10-01..03), so this 09:15 build routinely reads a fork that
+          # has not merged upstream's overnight commits yet. Requiring the live
+          # upstream HEAD failed the nightly every time upstream moved. The
+          # gate exists to catch a fork that STOPPED syncing (master once
+          # drifted a month), so it fails only when the oldest upstream commit
+          # the fork lacks is older than the grace window.
+          if ! git -C engine-history merge-base --is-ancestor "$UPSTREAM_SHA" "$ENGINE_SHA"; then
+            MISSING="$(git -C engine-history rev-list --count "$ENGINE_SHA..$UPSTREAM_SHA")"
+            OLDEST="$(git -C engine-history log --format=%ct "$ENGINE_SHA..$UPSTREAM_SHA" | sort -n | head -1)"
+            # Non-empty by construction (upstream is not an ancestor of the
+            # engine), but an unreadable history must fail, not pass.
+            [[ "$OLDEST" =~ ^[0-9]+$ ]] || { echo "::error::Could not date the upstream commits missing from the engine; run ZeroClaw source sync first."; exit 1; }
+            AGE_H=$(( ( $(date +%s) - OLDEST ) / 3600 ))
+            if [ "$AGE_H" -ge "${ENGINE_SYNC_GRACE_HOURS:-36}" ]; then
+              echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA: $MISSING upstream commit(s) missing, oldest ${AGE_H}h old (grace ${ENGINE_SYNC_GRACE_HOURS:-36}h); run ZeroClaw source sync first."
+              exit 1
+            fi
+            echo "::warning::Engine lags upstream by $MISSING commit(s), oldest ${AGE_H}h old -- within the ${ENGINE_SYNC_GRACE_HOURS:-36}h sync grace window."
+          fi
           echo "channel=run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "zoder_sha=$ZODER_SHA" >> "$GITHUB_OUTPUT"

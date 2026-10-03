@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -102,15 +103,22 @@ class NightlyPublishTests(unittest.TestCase):
             return result, events
 
     def test_source_gate_rejects_stale_engine(self):
-        for stale in (False, True):
-            with self.subTest(stale=stale), tempfile.TemporaryDirectory() as temporary:
+        # "synced": engine contains upstream HEAD. "lagging": upstream moved
+        # minutes ago (normal sync lag -- passes with a warning). "stale":
+        # the missing upstream commit is 3 days old (sync stopped -- fails).
+        for mode in ("synced", "lagging", "stale"):
+            stale = mode == "stale"
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 upstream = root / "upstream"
                 engine = root / "engine"
 
-                def git(*args):
+                def git(*args, env=None):
                     return subprocess.check_output(
-                        ["git", *map(str, args)], text=True, stderr=subprocess.DEVNULL
+                        ["git", *map(str, args)],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                        env=env,
                     ).strip()
 
                 git("init", "-b", "master", upstream)
@@ -123,9 +131,21 @@ class NightlyPublishTests(unittest.TestCase):
                 git("-C", upstream, "add", "source")
                 git("-C", upstream, "commit", "-m", "initial")
                 git("clone", upstream, engine)
-                if stale:
+                if mode != "synced":
                     (upstream / "source").write_text("new upstream")
-                    git("-C", upstream, "commit", "-am", "advance upstream")
+                    when = int(time.time()) - (72 * 3600 if stale else 60)
+                    git(
+                        "-C",
+                        upstream,
+                        "commit",
+                        "-am",
+                        "advance upstream",
+                        env=os.environ
+                        | {
+                            "GIT_AUTHOR_DATE": f"@{when} +0000",
+                            "GIT_COMMITTER_DATE": f"@{when} +0000",
+                        },
+                    )
                 prefixes = []
                 for url, repo in (
                     ("https://gitlab.com/ncz-os/zoder.git", engine),
@@ -170,6 +190,8 @@ class NightlyPublishTests(unittest.TestCase):
                         "upstream_sha=" + git("-C", upstream, "rev-parse", "HEAD"),
                         (root / "outputs").read_text(),
                     )
+                    if mode == "lagging":
+                        self.assertIn("within the 36h sync grace window", result.stdout)
 
     def test_complete_matrix_publishes(self):
         result, events = self.run_publish()
