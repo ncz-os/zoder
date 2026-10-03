@@ -253,6 +253,13 @@ pub struct ChatRequest {
     /// behaviour on them (vLLM forwards this to the Jinja template). `None`
     /// omits the field.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Optional OpenAI-style `response_format` object forwarded verbatim on the
+    /// chat-completions / Azure wire. Operators set this in the engine's
+    /// `provider_extra.response_format` (mirroring `reasoning_effort`) so a
+    /// structured reviewer can be asked for `json_object`. `None` omits the
+    /// field entirely; the Anthropic and Responses branches ignore it because
+    /// neither API has a `response_format` field.
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Telemetry parsed from LiteLLM response headers (authoritative, no guessing).
@@ -1157,6 +1164,11 @@ impl OpenAiProvider {
         // served model). Left unset => the model's own default behavior.
         if let Some(eff) = &req.reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(eff);
+        }
+        // Forward `response_format` verbatim (OpenAI chat / Azure share this
+        // body). Left unset => the provider's default text response.
+        if let Some(response_format) = &req.response_format {
+            body["response_format"] = response_format.clone();
         }
         body
     }
@@ -3298,6 +3310,7 @@ mod tests {
             top_k: None,
             presence_penalty: None,
             chat_template_kwargs: None,
+            response_format: None,
         };
         let body = p.body(&req);
         // The chat-completions shape MUST carry `messages`,
@@ -3509,6 +3522,7 @@ mod tests {
             top_k: None,
             presence_penalty: None,
             chat_template_kwargs: None,
+            response_format: None,
         }
     }
 
@@ -3706,6 +3720,7 @@ mod tests {
             top_k: None,
             presence_penalty: None,
             chat_template_kwargs: None,
+            response_format: None,
         }
     }
 
@@ -4068,6 +4083,7 @@ mod tests {
             top_k: None,
             presence_penalty: None,
             chat_template_kwargs: kwargs,
+            response_format: None,
         }
     }
 
@@ -4135,6 +4151,24 @@ mod tests {
         assert!(
             body.get("chat_template_kwargs").is_none(),
             "chat_template_kwargs must be absent, not null"
+        );
+    }
+
+    /// `response_format` must reach the OpenAI chat wire verbatim when set,
+    /// and be absent (not null) when unset — the same contract `temperature`,
+    /// `top_p`, and `reasoning_effort` keep.
+    #[test]
+    fn chat_body_carries_response_format() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.response_format = Some(serde_json::json!({"type": "json_object"}));
+        let body = p.body(&req);
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        let body = p.body(&sampling_req(None, None));
+        assert!(
+            body.get("response_format").is_none(),
+            "response_format must be absent, not null"
         );
     }
 }
