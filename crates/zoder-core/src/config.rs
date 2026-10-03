@@ -1496,7 +1496,9 @@ fn collect_engine_models(
                     // zeroclaw forwards provider_extra verbatim into the request
                     // body, so provider_extra.reasoning_effort is the one place an
                     // operator sets it for both the engine loop and zoder's direct
-                    // reviewer path (which does not forward provider_extra).
+                    // reviewer path (which does not forward provider_extra). When
+                    // both are set, provider_extra wins: it is the value the
+                    // engine actually sends on the wire.
                     reasoning_effort: child
                         .get("provider_extra")
                         .and_then(|extra| extra.get("reasoning_effort"))
@@ -3740,6 +3742,23 @@ model_provider = "custom.reviewer"
             Some("minimal")
         );
         assert_eq!(registry.reasoning_effort_for_model("different", None), None);
+    }
+
+    #[test]
+    fn provider_extra_reasoning_effort_wins_over_top_level() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.both]
+model = "model-c"
+reasoning_effort = "high"
+provider_extra = { reasoning_effort = "none" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.reasoning_effort_for_model("model-c", None),
+            Some("none")
+        );
     }
     use crate::ledger::Entry;
     use crate::subscription_tiers::TierCatalog;
