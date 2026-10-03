@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-10-02",
-  "generated": "2026-10-02",
-  "count": 3659,
-  "routable": 105,
-  "scored": 2245,
+  "arena_date": "2026-10-03",
+  "generated": "2026-10-03",
+  "count": 3646,
+  "routable": 107,
+  "scored": 2229,
   "models": [
     {
       "id": "ai21.j2-mid-v1",
@@ -162,7 +162,7 @@
         "output_usd_per_mtok": 55.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -180,8 +180,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -247,7 +247,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -265,8 +265,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -292,7 +292,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -310,8 +310,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -337,7 +337,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -355,8 +355,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -566,8 +566,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -762,8 +762,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -842,7 +842,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -855,8 +855,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -939,7 +939,7 @@
         "output_usd_per_mtok": 7.889,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -961,8 +961,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -988,7 +988,7 @@
         "output_usd_per_mtok": 3.9438000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -1006,8 +1006,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1033,7 +1033,7 @@
         "output_usd_per_mtok": 0.39438,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -1051,8 +1051,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1177,8 +1177,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1220,8 +1220,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1263,8 +1263,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1341,8 +1341,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1390,8 +1390,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1435,8 +1435,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1509,8 +1509,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1628,8 +1628,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1689,8 +1689,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1717,13 +1717,13 @@
         "output_usd_per_mtok": 2.5349999999999997,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.727,
       "arena_coding_elo": 1633.2,
       "arena_webdev_elo": 1633.2,
       "preference": {
         "arena_agent": {
-          "rank": 12,
-          "score": 0.0637,
+          "rank": 15,
+          "score": 0.0581,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1819,7 +1819,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -1838,7 +1838,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -1998,8 +1998,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -2038,8 +2038,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 37,
-          "score": -0.0478,
+          "rank": 40,
+          "score": -0.0543,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -2287,8 +2287,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 42,
-          "score": -0.1014,
+          "rank": 43,
+          "score": -0.093,
           "source": "arena.ai"
         }
       }
@@ -2366,7 +2366,7 @@
         "output_usd_per_mtok": 5.069999999999999,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -2384,8 +2384,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -2599,8 +2599,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 2.1875,
-        "output_usd_per_mtok": 17.5,
+        "input_usd_per_mtok": 1.25,
+        "output_usd_per_mtok": 10.0,
         "source": "litellm"
       }
     },
@@ -2985,7 +2985,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -3003,8 +3003,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3030,7 +3030,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -3048,7 +3048,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3386,7 +3386,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -3404,8 +3404,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3431,7 +3431,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -3449,8 +3449,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3476,7 +3476,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -3493,8 +3493,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3618,7 +3618,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -3636,8 +3636,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3663,7 +3663,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -3679,6 +3679,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -3760,7 +3765,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -3778,8 +3783,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -3805,7 +3810,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -3823,7 +3828,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -4251,7 +4256,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -4269,8 +4274,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -4325,7 +4330,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -4343,8 +4348,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -4370,7 +4375,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -4387,8 +4392,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -4639,7 +4644,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -4657,8 +4662,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -4684,7 +4689,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -4700,6 +4705,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -4985,8 +4995,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 2.1875,
-        "output_usd_per_mtok": 17.5,
+        "input_usd_per_mtok": 1.375,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       }
     },
@@ -5798,35 +5808,6 @@
       }
     },
     {
-      "id": "azure/eu/codex-mini",
-      "host": "azure",
-      "leaf": "eu/codex-mini",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.6500000000000001,
-        "output_usd_per_mtok": 6.6000000000000005,
-        "source": "litellm"
-      },
-      "agentic_score": 0.76,
-      "w_swe": 0.76,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      }
-    },
-    {
       "id": "azure/eu/computer-use-preview",
       "host": "azure",
       "leaf": "eu/computer-use-preview",
@@ -6078,45 +6059,6 @@
       }
     },
     {
-      "id": "azure/eu/gpt-5-codex",
-      "host": "azure",
-      "leaf": "eu/gpt-5-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.375,
-        "output_usd_per_mtok": 11.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.782,
-      "w_swe": 0.94,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1417.1,
-      "arena_webdev_elo": 1417.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 79,
-          "rating": 1417.1,
-          "source": "arena.ai",
-          "votes": 3091
-        }
-      }
-    },
-    {
       "id": "azure/eu/gpt-5-mini",
       "host": "azure",
       "leaf": "eu/gpt-5-mini",
@@ -6244,45 +6186,6 @@
       }
     },
     {
-      "id": "azure/eu/gpt-5-pro",
-      "host": "azure",
-      "leaf": "eu/gpt-5-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 16.5,
-        "output_usd_per_mtok": 132.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.782,
-      "w_swe": 0.94,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1417.1,
-      "arena_webdev_elo": 1417.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 79,
-          "rating": 1417.1,
-          "source": "arena.ai",
-          "votes": 3091
-        }
-      }
-    },
-    {
       "id": "azure/eu/gpt-5.1",
       "host": "azure",
       "leaf": "eu/gpt-5.1",
@@ -6348,45 +6251,6 @@
       "workflows": {
         "single_pass": 0.94,
         "grind": 0.9
-      },
-      "arena_coding_elo": 1394.8,
-      "arena_webdev_elo": 1394.8,
-      "preference": {
-        "arena_webdev": {
-          "rank": 90,
-          "rating": 1394.8,
-          "source": "arena.ai",
-          "votes": 4911
-        }
-      }
-    },
-    {
-      "id": "azure/eu/gpt-5.1-codex-max",
-      "host": "azure",
-      "leaf": "eu/gpt-5.1-codex-max",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.375,
-        "output_usd_per_mtok": 11.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.491,
-      "w_swe": 0.746,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
       },
       "arena_coding_elo": 1394.8,
       "arena_webdev_elo": 1394.8,
@@ -6480,86 +6344,6 @@
       }
     },
     {
-      "id": "azure/eu/gpt-5.2-codex",
-      "host": "azure",
-      "leaf": "eu/gpt-5.2-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.9250000000000003,
-        "output_usd_per_mtok": 15.400000000000002,
-        "source": "litellm"
-      },
-      "agentic_score": 0.669,
-      "w_swe": 0.862,
-      "capability": {
-        "swe_verified": {
-          "acc": 72.4,
-          "cost_per_test": 0.3115,
-          "latency_s": 188.4,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1415.5,
-      "arena_webdev_elo": 1415.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 80,
-          "rating": 1415.5,
-          "source": "arena.ai",
-          "votes": 1082
-        }
-      }
-    },
-    {
-      "id": "azure/eu/gpt-5.2-pro",
-      "host": "azure",
-      "leaf": "eu/gpt-5.2-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 23.099999999999998,
-        "output_usd_per_mtok": 184.79999999999998,
-        "source": "litellm"
-      },
-      "agentic_score": 0.669,
-      "w_swe": 0.862,
-      "capability": {
-        "swe_verified": {
-          "acc": 72.4,
-          "cost_per_test": 0.3115,
-          "latency_s": 188.4,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1415.5,
-      "arena_webdev_elo": 1415.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 80,
-          "rating": 1415.5,
-          "source": "arena.ai",
-          "votes": 1082
-        }
-      }
-    },
-    {
       "id": "azure/eu/gpt-5.3-chat",
       "host": "azure",
       "leaf": "eu/gpt-5.3-chat",
@@ -6604,50 +6388,6 @@
       }
     },
     {
-      "id": "azure/eu/gpt-5.3-codex",
-      "host": "azure",
-      "leaf": "eu/gpt-5.3-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.9250000000000003,
-        "output_usd_per_mtok": 15.400000000000002,
-        "source": "litellm"
-      },
-      "agentic_score": 0.561,
-      "w_swe": 0.79,
-      "capability": {
-        "scale_seal": {
-          "acc": 37.99,
-          "source": "scale-seal"
-        },
-        "swe_verified": {
-          "acc": 78.0,
-          "cost_per_test": 0.4554,
-          "latency_s": 246.5,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1408.0,
-      "arena_webdev_elo": 1408.0,
-      "preference": {
-        "arena_webdev": {
-          "rank": 83,
-          "rating": 1408.0,
-          "source": "arena.ai",
-          "votes": 2643
-        }
-      }
-    },
-    {
       "id": "azure/eu/gpt-5.4",
       "host": "azure",
       "leaf": "eu/gpt-5.4",
@@ -6678,8 +6418,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -6751,8 +6491,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -6793,49 +6533,6 @@
       }
     },
     {
-      "id": "azure/eu/gpt-5.4-pro",
-      "host": "azure",
-      "leaf": "eu/gpt-5.4-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 33.0,
-        "output_usd_per_mtok": 198.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.44,
-      "w_swe": 0.804,
-      "capability": {
-        "scale_seal": {
-          "acc": 44.36,
-          "source": "scale-seal"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1464.9,
-      "arena_webdev_elo": 1464.9,
-      "preference": {
-        "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
-          "source": "arena.ai"
-        },
-        "arena_webdev": {
-          "rank": 63,
-          "rating": 1464.9,
-          "source": "arena.ai",
-          "votes": 1351
-        }
-      }
-    },
-    {
       "id": "azure/eu/gpt-5.5",
       "host": "azure",
       "leaf": "eu/gpt-5.5",
@@ -6872,8 +6569,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7004,8 +6701,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7031,7 +6728,7 @@
         "output_usd_per_mtok": 22.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -7053,8 +6750,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7098,8 +6795,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7125,7 +6822,7 @@
         "output_usd_per_mtok": 60.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -7136,8 +6833,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7164,13 +6861,13 @@
         "output_usd_per_mtok": 0.6,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -7197,13 +6894,13 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -8555,8 +8252,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -8628,8 +8325,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -8766,8 +8463,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -8898,8 +8595,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -8954,7 +8651,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -8976,8 +8673,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -9050,8 +8747,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -9106,7 +8803,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -9117,8 +8814,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -9161,13 +8858,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -9210,13 +8907,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -9259,10 +8956,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -9730,35 +9432,6 @@
       "w_swe": 0.925
     },
     {
-      "id": "azure/us/codex-mini",
-      "host": "azure",
-      "leaf": "us/codex-mini",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.6500000000000001,
-        "output_usd_per_mtok": 6.6000000000000005,
-        "source": "litellm"
-      },
-      "agentic_score": 0.76,
-      "w_swe": 0.76,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      }
-    },
-    {
       "id": "azure/us/computer-use-preview",
       "host": "azure",
       "leaf": "us/computer-use-preview",
@@ -10058,45 +9731,6 @@
       }
     },
     {
-      "id": "azure/us/gpt-5-codex",
-      "host": "azure",
-      "leaf": "us/gpt-5-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.375,
-        "output_usd_per_mtok": 11.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.782,
-      "w_swe": 0.94,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1417.1,
-      "arena_webdev_elo": 1417.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 79,
-          "rating": 1417.1,
-          "source": "arena.ai",
-          "votes": 3091
-        }
-      }
-    },
-    {
       "id": "azure/us/gpt-5-mini",
       "host": "azure",
       "leaf": "us/gpt-5-mini",
@@ -10224,45 +9858,6 @@
       }
     },
     {
-      "id": "azure/us/gpt-5-pro",
-      "host": "azure",
-      "leaf": "us/gpt-5-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 16.5,
-        "output_usd_per_mtok": 132.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.782,
-      "w_swe": 0.94,
-      "capability": {
-        "aider_polyglot": {
-          "acc": 88.0,
-          "date": "2025-08-23",
-          "source": "aider"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1417.1,
-      "arena_webdev_elo": 1417.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 79,
-          "rating": 1417.1,
-          "source": "arena.ai",
-          "votes": 3091
-        }
-      }
-    },
-    {
       "id": "azure/us/gpt-5.1",
       "host": "azure",
       "leaf": "us/gpt-5.1",
@@ -10328,45 +9923,6 @@
       "workflows": {
         "single_pass": 0.94,
         "grind": 0.9
-      },
-      "arena_coding_elo": 1394.8,
-      "arena_webdev_elo": 1394.8,
-      "preference": {
-        "arena_webdev": {
-          "rank": 90,
-          "rating": 1394.8,
-          "source": "arena.ai",
-          "votes": 4911
-        }
-      }
-    },
-    {
-      "id": "azure/us/gpt-5.1-codex-max",
-      "host": "azure",
-      "leaf": "us/gpt-5.1-codex-max",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.375,
-        "output_usd_per_mtok": 11.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.491,
-      "w_swe": 0.746,
-      "capability": {
-        "swe_verified": {
-          "acc": 76.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
       },
       "arena_coding_elo": 1394.8,
       "arena_webdev_elo": 1394.8,
@@ -10460,86 +10016,6 @@
       }
     },
     {
-      "id": "azure/us/gpt-5.2-codex",
-      "host": "azure",
-      "leaf": "us/gpt-5.2-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.9250000000000003,
-        "output_usd_per_mtok": 15.400000000000002,
-        "source": "litellm"
-      },
-      "agentic_score": 0.669,
-      "w_swe": 0.862,
-      "capability": {
-        "swe_verified": {
-          "acc": 72.4,
-          "cost_per_test": 0.3115,
-          "latency_s": 188.4,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1415.5,
-      "arena_webdev_elo": 1415.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 80,
-          "rating": 1415.5,
-          "source": "arena.ai",
-          "votes": 1082
-        }
-      }
-    },
-    {
-      "id": "azure/us/gpt-5.2-pro",
-      "host": "azure",
-      "leaf": "us/gpt-5.2-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 23.099999999999998,
-        "output_usd_per_mtok": 184.79999999999998,
-        "source": "litellm"
-      },
-      "agentic_score": 0.669,
-      "w_swe": 0.862,
-      "capability": {
-        "swe_verified": {
-          "acc": 72.4,
-          "cost_per_test": 0.3115,
-          "latency_s": 188.4,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1415.5,
-      "arena_webdev_elo": 1415.5,
-      "preference": {
-        "arena_webdev": {
-          "rank": 80,
-          "rating": 1415.5,
-          "source": "arena.ai",
-          "votes": 1082
-        }
-      }
-    },
-    {
       "id": "azure/us/gpt-5.3-chat",
       "host": "azure",
       "leaf": "us/gpt-5.3-chat",
@@ -10584,50 +10060,6 @@
       }
     },
     {
-      "id": "azure/us/gpt-5.3-codex",
-      "host": "azure",
-      "leaf": "us/gpt-5.3-codex",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 1.9250000000000003,
-        "output_usd_per_mtok": 15.400000000000002,
-        "source": "litellm"
-      },
-      "agentic_score": 0.561,
-      "w_swe": 0.79,
-      "capability": {
-        "scale_seal": {
-          "acc": 37.99,
-          "source": "scale-seal"
-        },
-        "swe_verified": {
-          "acc": 78.0,
-          "cost_per_test": 0.4554,
-          "latency_s": 246.5,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.95,
-        "grind": 0.94
-      },
-      "arena_coding_elo": 1408.0,
-      "arena_webdev_elo": 1408.0,
-      "preference": {
-        "arena_webdev": {
-          "rank": 83,
-          "rating": 1408.0,
-          "source": "arena.ai",
-          "votes": 2643
-        }
-      }
-    },
-    {
       "id": "azure/us/gpt-5.4",
       "host": "azure",
       "leaf": "us/gpt-5.4",
@@ -10658,8 +10090,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -10731,8 +10163,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -10773,49 +10205,6 @@
       }
     },
     {
-      "id": "azure/us/gpt-5.4-pro",
-      "host": "azure",
-      "leaf": "us/gpt-5.4-pro",
-      "family": "azure",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 33.0,
-        "output_usd_per_mtok": 198.0,
-        "source": "litellm"
-      },
-      "agentic_score": 0.44,
-      "w_swe": 0.804,
-      "capability": {
-        "scale_seal": {
-          "acc": 44.36,
-          "source": "scale-seal"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.94,
-        "grind": 0.9
-      },
-      "arena_coding_elo": 1464.9,
-      "arena_webdev_elo": 1464.9,
-      "preference": {
-        "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
-          "source": "arena.ai"
-        },
-        "arena_webdev": {
-          "rank": 63,
-          "rating": 1464.9,
-          "source": "arena.ai",
-          "votes": 1351
-        }
-      }
-    },
-    {
       "id": "azure/us/gpt-5.5",
       "host": "azure",
       "leaf": "us/gpt-5.5",
@@ -10852,8 +10241,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -10984,8 +10373,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -11011,7 +10400,7 @@
         "output_usd_per_mtok": 22.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -11033,8 +10422,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -11078,8 +10467,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -11105,7 +10494,7 @@
         "output_usd_per_mtok": 55.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -11116,8 +10505,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -11144,13 +10533,13 @@
         "output_usd_per_mtok": 0.55,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -11177,13 +10566,13 @@
         "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12402,7 +11791,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -12420,8 +11809,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12447,7 +11836,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -12465,7 +11854,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12651,7 +12040,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -12669,8 +12058,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12696,7 +12085,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -12714,8 +12103,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12741,7 +12130,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -12758,8 +12147,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12865,7 +12254,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -12883,8 +12272,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -12910,7 +12299,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -12926,6 +12315,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -13211,8 +12605,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13238,7 +12632,7 @@
         "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -13255,8 +12649,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13298,8 +12692,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13371,8 +12765,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13509,8 +12903,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13594,7 +12988,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -13605,8 +12999,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13633,13 +13027,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13666,13 +13060,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -13699,10 +13093,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -14125,8 +13524,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -14521,8 +13920,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 45,
-          "score": -0.1352,
+          "rank": 48,
+          "score": -0.1454,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -14809,8 +14208,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -14858,8 +14257,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -14885,7 +14284,7 @@
         "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -14902,8 +14301,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -14929,7 +14328,7 @@
         "output_usd_per_mtok": 2.4,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -14946,8 +14345,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15187,7 +14586,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -15206,7 +14605,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15338,8 +14737,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15379,8 +14778,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 46,
-          "score": -0.1951,
+          "rank": 49,
+          "score": -0.2014,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15530,7 +14929,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -15552,8 +14951,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15579,7 +14978,7 @@
         "output_usd_per_mtok": 6.6000000000000005,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -15601,8 +15000,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15628,7 +15027,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -15646,8 +15045,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15673,7 +15072,7 @@
         "output_usd_per_mtok": 6.6000000000000005,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -15691,8 +15090,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -15718,7 +15117,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -15736,8 +15135,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -18761,7 +18160,7 @@
         "output_usd_per_mtok": 60.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -18779,7 +18178,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -18834,7 +18233,7 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -18852,8 +18251,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -18879,7 +18278,7 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -18897,8 +18296,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -18924,7 +18323,7 @@
         "output_usd_per_mtok": 24.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -18941,8 +18340,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -18997,7 +18396,7 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -19015,8 +18414,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19042,7 +18441,7 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -19058,6 +18457,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -19412,7 +18816,7 @@
         "output_usd_per_mtok": 60.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -19430,7 +18834,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19485,7 +18889,7 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -19503,8 +18907,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19530,7 +18934,7 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -19548,8 +18952,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19575,7 +18979,7 @@
         "output_usd_per_mtok": 24.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -19592,8 +18996,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19648,7 +19052,7 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -19666,8 +19070,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -19693,7 +19097,7 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -19709,6 +19113,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -20491,7 +19900,7 @@
         "output_usd_per_mtok": 22.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -20508,8 +19917,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -20535,7 +19944,7 @@
         "output_usd_per_mtok": 11.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -20551,6 +19960,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -21108,8 +20522,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -21135,7 +20549,7 @@
         "output_usd_per_mtok": 24.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -21152,8 +20566,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -21179,7 +20593,7 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -21195,6 +20609,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -21412,8 +20831,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -21497,8 +20916,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -21791,15 +21210,15 @@
         "output_usd_per_mtok": 1.49,
         "source": "litellm"
       },
-      "agentic_score": 0.084,
+      "agentic_score": 0.053,
       "preference": {
         "arena_agent": {
-          "rank": 24,
-          "score": 0.0151,
+          "rank": 30,
+          "score": 0.0096,
           "source": "arena.ai"
         }
       },
-      "w_swe": 0.542
+      "w_swe": 0.527
     },
     {
       "id": "chat-latest",
@@ -21848,7 +21267,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -21866,8 +21285,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -21893,7 +21312,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -21911,7 +21330,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -22344,7 +21763,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -22362,8 +21781,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -22389,7 +21808,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -22407,8 +21826,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -22434,7 +21853,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -22451,8 +21870,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -22627,7 +22046,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -22645,8 +22064,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -22672,7 +22091,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -22688,6 +22107,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -23334,7 +22758,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -23356,8 +22780,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -24101,8 +23525,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -24168,7 +23592,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -24190,8 +23614,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -24609,8 +24033,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -24665,7 +24089,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -24683,8 +24107,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -26304,8 +25728,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27124,8 +26548,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27220,7 +26644,7 @@
         "output_usd_per_mtok": 4.951,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -27238,8 +26662,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27326,8 +26750,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27367,8 +26791,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27498,7 +26922,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -27516,8 +26940,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27623,7 +27047,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -27641,8 +27065,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27668,7 +27092,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -27686,8 +27110,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -27753,7 +27177,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -27771,8 +27195,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -28229,8 +27653,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -28278,8 +27702,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -28410,8 +27834,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -28474,7 +27898,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -28487,8 +27911,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -29274,7 +28698,7 @@
         "output_usd_per_mtok": 14.25,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -29293,7 +28717,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -29700,8 +29124,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -29741,8 +29165,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -29782,8 +29206,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 46,
-          "score": -0.1951,
+          "rank": 49,
+          "score": -0.2014,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -30031,7 +29455,7 @@
         "output_usd_per_mtok": 2.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -30053,8 +29477,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -30297,8 +29721,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -30668,7 +30092,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.27,
         "output_usd_per_mtok": 1.0,
         "source": "openrouter"
       },
@@ -30815,7 +30239,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0051,
+        "input_usd_per_mtok": 0.0171,
         "output_usd_per_mtok": 1.28,
         "source": "openrouter"
       },
@@ -30910,8 +30334,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -30933,8 +30357,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 1.32,
-        "output_usd_per_mtok": 3.9600000000000004,
+        "input_usd_per_mtok": 0.66,
+        "output_usd_per_mtok": 1.9800000000000002,
         "source": "openrouter"
       },
       "agentic_score": 0.603,
@@ -30959,8 +30383,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -30986,7 +30410,7 @@
         "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -31003,8 +30427,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -31087,8 +30511,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 2.1875,
-        "output_usd_per_mtok": 17.5,
+        "input_usd_per_mtok": 1.375,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       }
     },
@@ -33127,8 +32551,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -33176,8 +32600,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -33989,8 +33413,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -34335,7 +33759,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -34354,7 +33778,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -34988,8 +34412,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -37745,7 +37169,7 @@
         "output_usd_per_mtok": 22.5,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -37764,7 +37188,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -37950,8 +37374,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -38563,7 +37987,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -38582,7 +38006,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -38608,7 +38032,7 @@
         "output_usd_per_mtok": 22.5,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -38627,7 +38051,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -38729,8 +38153,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39040,7 +38464,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -39062,8 +38486,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39089,7 +38513,7 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -39107,8 +38531,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39134,7 +38558,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -39152,8 +38576,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39632,8 +39056,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39761,8 +39185,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 38,
-          "score": -0.0556,
+          "rank": 41,
+          "score": -0.0567,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39789,7 +39213,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -39802,8 +39226,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -39830,7 +39254,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.66,
+      "agentic_score": 0.657,
       "arena_coding_elo": 1582.7,
       "arena_webdev_elo": 1582.7,
       "capability": {
@@ -39847,8 +39271,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 8,
-          "score": 0.0741,
+          "rank": 13,
+          "score": 0.0685,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -40282,8 +39706,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -40411,8 +39835,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 38,
-          "score": -0.0556,
+          "rank": 41,
+          "score": -0.0567,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -40439,7 +39863,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -40452,8 +39876,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -40480,7 +39904,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.66,
+      "agentic_score": 0.657,
       "arena_coding_elo": 1582.7,
       "arena_webdev_elo": 1582.7,
       "capability": {
@@ -40497,8 +39921,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 8,
-          "score": 0.0741,
+          "rank": 13,
+          "score": 0.0685,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -42912,8 +42336,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -43089,8 +42513,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 38,
-          "score": -0.0556,
+          "rank": 41,
+          "score": -0.0567,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -43133,7 +42557,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "openrouter"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -43146,8 +42570,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -43190,7 +42614,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "openrouter"
       },
-      "agentic_score": 0.66,
+      "agentic_score": 0.657,
       "arena_coding_elo": 1582.7,
       "arena_webdev_elo": 1582.7,
       "capability": {
@@ -43207,8 +42631,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 8,
-          "score": 0.0741,
+          "rank": 13,
+          "score": 0.0685,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -43320,8 +42744,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.0675,
+        "output_usd_per_mtok": 0.22499999999999998,
         "source": "openrouter"
       },
       "agentic_score": 0.431,
@@ -44524,8 +43948,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -44597,8 +44021,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -44735,8 +44159,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -44896,8 +44320,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -44923,7 +44347,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -44945,8 +44369,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -44990,8 +44414,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -45017,7 +44441,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -45028,8 +44452,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -45056,13 +44480,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -45089,13 +44513,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -45122,10 +44546,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -46134,8 +45563,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 0.18,
+        "input_usd_per_mtok": 0.041999999999999996,
+        "output_usd_per_mtok": 0.12319999999999999,
         "source": "openrouter"
       }
     },
@@ -46168,6 +45597,22 @@
       "economics": {
         "input_usd_per_mtok": 0.020999999999999998,
         "output_usd_per_mtok": 0.061599999999999995,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "inclusionai/ling-3.1-flash",
+      "host": "inclusionai",
+      "leaf": "ling-3.1-flash",
+      "family": "inclusionai",
+      "kind": "chat",
+      "route_candidate": true,
+      "free": true,
+      "paid": false,
+      "gated_reason": null,
+      "economics": {
+        "input_usd_per_mtok": 0.0,
+        "output_usd_per_mtok": 0.0,
         "source": "openrouter"
       }
     },
@@ -48336,8 +47781,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 34,
-          "score": -0.0391,
+          "rank": 38,
+          "score": -0.0428,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -48377,8 +47822,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 37,
-          "score": -0.0478,
+          "rank": 40,
+          "score": -0.0543,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -48421,13 +47866,13 @@
         "output_usd_per_mtok": 4.25,
         "source": "litellm"
       },
-      "agentic_score": 0.762,
+      "agentic_score": 0.742,
       "arena_coding_elo": 1656.6,
       "arena_webdev_elo": 1656.6,
       "preference": {
         "arena_agent": {
-          "rank": 13,
-          "score": 0.0625,
+          "rank": 20,
+          "score": 0.0502,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -48824,8 +48269,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -49119,8 +48564,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -49584,7 +49029,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -49606,8 +49051,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -50049,8 +49494,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 45,
-          "score": -0.1352,
+          "rank": 48,
+          "score": -0.1454,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -50090,8 +49535,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 45,
-          "score": -0.1352,
+          "rank": 48,
+          "score": -0.1454,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -50732,8 +50177,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 45,
-          "score": -0.1352,
+          "rank": 48,
+          "score": -0.1454,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -51121,7 +50566,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -51140,7 +50585,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -51322,7 +50767,7 @@
         "output_usd_per_mtok": 16.5,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -51341,7 +50786,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -51542,8 +50987,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.43415,
-        "output_usd_per_mtok": 1.8279999999999998,
+        "input_usd_per_mtok": 0.95,
+        "output_usd_per_mtok": 4.0,
         "source": "openrouter"
       },
       "agentic_score": 0.74,
@@ -51626,7 +51071,7 @@
         "output_usd_per_mtok": 13.5,
         "source": "openrouter"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -51645,7 +51090,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -51794,8 +51239,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -52548,8 +51993,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -52597,8 +52042,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -52624,7 +52069,7 @@
         "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -52641,8 +52086,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -52869,7 +52314,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -52888,7 +52333,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -53253,7 +52698,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -53275,8 +52720,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -53302,7 +52747,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -53320,8 +52765,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -53347,7 +52792,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -53365,8 +52810,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -54289,8 +53734,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -54338,8 +53783,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -55016,8 +54461,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -55347,7 +54792,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -55366,7 +54811,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -56404,8 +55849,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -56431,7 +55876,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -56449,8 +55894,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -56561,8 +56006,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -56659,8 +56104,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -56700,8 +56145,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -57138,7 +56583,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -57160,8 +56605,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -57187,7 +56632,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -57205,8 +56650,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -57948,8 +57393,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 0.16,
+        "input_usd_per_mtok": 0.0595,
+        "output_usd_per_mtok": 0.16999999999999998,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -57993,6 +57438,22 @@
       "workflows": {
         "single_pass": 0.74,
         "grind": 0.56
+      }
+    },
+    {
+      "id": "nvidia/switchyard",
+      "host": "nvidia",
+      "leaf": "switchyard",
+      "family": "nvidia",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": -1000000.0,
+        "output_usd_per_mtok": -1000000.0,
+        "source": "openrouter"
       }
     },
     {
@@ -59439,13 +58900,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -59472,13 +58933,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -59505,10 +58966,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -60809,8 +60275,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -60881,8 +60347,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61011,8 +60477,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61118,8 +60584,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61167,8 +60633,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61270,8 +60736,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61315,8 +60781,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61400,7 +60866,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -61422,8 +60888,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61449,7 +60915,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -61471,8 +60937,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61574,8 +61040,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61619,8 +61085,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61733,7 +61199,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -61744,8 +61210,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61772,7 +61238,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -61783,8 +61249,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61843,13 +61309,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61876,13 +61342,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61941,13 +61407,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -61974,13 +61440,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -62039,10 +61505,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -62067,10 +61538,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -62803,7 +62279,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -62821,8 +62297,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -62848,7 +62324,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -62866,7 +62342,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -63294,7 +62770,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -63312,8 +62788,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -63368,7 +62844,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -63386,8 +62862,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -63413,7 +62889,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -63430,8 +62906,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -63682,7 +63158,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -63700,8 +63176,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -63727,7 +63203,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -63743,6 +63219,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -64338,7 +63819,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.27,
         "output_usd_per_mtok": 1.0,
         "source": "litellm"
       },
@@ -64445,8 +63926,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.04186,
-        "output_usd_per_mtok": 0.08372,
+        "input_usd_per_mtok": 0.028,
+        "output_usd_per_mtok": 0.056,
         "source": "litellm"
       },
       "agentic_score": 0.864,
@@ -64485,7 +63966,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0108,
+        "input_usd_per_mtok": 0.0051,
         "output_usd_per_mtok": 1.28,
         "source": "litellm"
       },
@@ -64580,8 +64061,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -64629,8 +64110,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -64652,11 +64133,11 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.03,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -64673,8 +64154,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -65263,8 +64744,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -65440,8 +64921,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 38,
-          "score": -0.0556,
+          "rank": 41,
+          "score": -0.0567,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -65484,7 +64965,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -65497,8 +64978,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -65541,7 +65022,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.66,
+      "agentic_score": 0.657,
       "arena_coding_elo": 1582.7,
       "arena_webdev_elo": 1582.7,
       "capability": {
@@ -65558,8 +65039,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 8,
-          "score": 0.0741,
+          "rank": 13,
+          "score": 0.0685,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -65671,8 +65152,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0765,
-        "output_usd_per_mtok": 0.255,
+        "input_usd_per_mtok": 0.0675,
+        "output_usd_per_mtok": 0.22499999999999998,
         "source": "litellm"
       },
       "agentic_score": 0.431,
@@ -65877,8 +65358,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 0.18,
+        "input_usd_per_mtok": 0.041999999999999996,
+        "output_usd_per_mtok": 0.12319999999999999,
         "source": "litellm"
       }
     },
@@ -65934,6 +65415,22 @@
       "id": "openrouter/inclusionai/ling-3.0-flash-vl:free",
       "host": "openrouter",
       "leaf": "inclusionai/ling-3.0-flash-vl:free",
+      "family": "openrouter",
+      "kind": "chat",
+      "route_candidate": true,
+      "free": true,
+      "paid": false,
+      "gated_reason": null,
+      "economics": {
+        "input_usd_per_mtok": 0.0,
+        "output_usd_per_mtok": 0.0,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "openrouter/inclusionai/ling-3.1-flash",
+      "host": "openrouter",
+      "leaf": "inclusionai/ling-3.1-flash",
       "family": "openrouter",
       "kind": "chat",
       "route_candidate": true,
@@ -66260,8 +65757,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 34,
-          "score": -0.0391,
+          "rank": 38,
+          "score": -0.0428,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -66301,8 +65798,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 37,
-          "score": -0.0478,
+          "rank": 40,
+          "score": -0.0543,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -66345,13 +65842,13 @@
         "output_usd_per_mtok": 4.25,
         "source": "litellm"
       },
-      "agentic_score": 0.762,
+      "agentic_score": 0.742,
       "arena_coding_elo": 1656.6,
       "arena_webdev_elo": 1656.6,
       "preference": {
         "arena_agent": {
-          "rank": 13,
-          "score": 0.0625,
+          "rank": 20,
+          "score": 0.0502,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -66723,8 +66220,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -67101,8 +66598,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 45,
-          "score": -0.1352,
+          "rank": 48,
+          "score": -0.1454,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -67576,11 +67073,11 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.43570000000000003,
-        "output_usd_per_mtok": 10.0,
+        "input_usd_per_mtok": 2.7,
+        "output_usd_per_mtok": 13.5,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -67599,7 +67096,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -67910,8 +67407,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.6,
-        "output_usd_per_mtok": 2.4,
+        "input_usd_per_mtok": 0.5,
+        "output_usd_per_mtok": 2.2,
         "source": "litellm"
       },
       "agentic_score": 0.69,
@@ -69342,8 +68839,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69414,8 +68911,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69544,8 +69041,8 @@
       "arena_webdev_elo": 1464.9,
       "preference": {
         "arena_agent": {
-          "rank": 32,
-          "score": -0.0265,
+          "rank": 35,
+          "score": -0.0254,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69651,8 +69148,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69700,8 +69197,8 @@
       "arena_webdev_elo": 1512.3,
       "preference": {
         "arena_agent": {
-          "rank": 29,
-          "score": -0.0044,
+          "rank": 33,
+          "score": -0.0086,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69803,8 +69300,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69848,8 +69345,8 @@
       "arena_webdev_elo": 1518.0,
       "preference": {
         "arena_agent": {
-          "rank": 33,
-          "score": -0.0288,
+          "rank": 36,
+          "score": -0.0333,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69933,7 +69430,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -69955,8 +69452,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -69982,7 +69479,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.71,
+      "agentic_score": 0.707,
       "w_swe": 0.933,
       "capability": {
         "scale_seal": {
@@ -70004,8 +69501,8 @@
       "arena_webdev_elo": 1619.8,
       "preference": {
         "arena_agent": {
-          "rank": 15,
-          "score": 0.0564,
+          "rank": 19,
+          "score": 0.0503,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70107,8 +69604,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70152,8 +69649,8 @@
       "arena_webdev_elo": 1519.1,
       "preference": {
         "arena_agent": {
-          "rank": 35,
-          "score": -0.0423,
+          "rank": 37,
+          "score": -0.0389,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70266,7 +69763,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -70277,8 +69774,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70305,7 +69802,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.701,
+      "agentic_score": 0.708,
       "arena_coding_elo": 1787.7,
       "arena_webdev_elo": 1787.7,
       "capability": {
@@ -70316,8 +69813,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 4,
-          "score": 0.1203,
+          "rank": 6,
+          "score": 0.1324,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70376,13 +69873,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70409,13 +69906,13 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.576,
+      "agentic_score": 0.57,
       "arena_coding_elo": 1578.7,
       "arena_webdev_elo": 1578.7,
       "preference": {
         "arena_agent": {
-          "rank": 28,
-          "score": 0.0038,
+          "rank": 31,
+          "score": -0.0012,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70474,13 +69971,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70507,13 +70004,13 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.858,
+      "agentic_score": 0.814,
       "arena_coding_elo": 1689.0,
       "arena_webdev_elo": 1689.0,
       "preference": {
         "arena_agent": {
-          "rank": 6,
-          "score": 0.0987,
+          "rank": 12,
+          "score": 0.0713,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -70572,10 +70069,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -70600,10 +70102,15 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.96,
       "arena_coding_elo": 1757.8,
       "arena_webdev_elo": 1757.8,
       "preference": {
+        "arena_agent": {
+          "rank": 2,
+          "score": 0.1547,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 4,
           "rating": 1757.8,
@@ -71598,8 +71105,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.04815,
-        "output_usd_per_mtok": 0.19305,
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.3,
         "source": "litellm"
       },
       "agentic_score": 0.6,
@@ -72256,8 +71763,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.1625,
-        "output_usd_per_mtok": 1.3,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 1.0,
         "source": "litellm"
       },
       "agentic_score": 0.256,
@@ -72670,8 +72177,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -72712,8 +72219,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 42,
-          "score": -0.1014,
+          "rank": 43,
+          "score": -0.093,
           "source": "arena.ai"
         }
       }
@@ -72860,7 +72367,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -72878,8 +72385,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -72905,7 +72412,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -72923,8 +72430,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73317,8 +72824,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73350,8 +72857,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73378,13 +72885,13 @@
         "output_usd_per_mtok": 2.501,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.727,
       "arena_coding_elo": 1633.2,
       "arena_webdev_elo": 1633.2,
       "preference": {
         "arena_agent": {
-          "rank": 12,
-          "score": 0.0637,
+          "rank": 15,
+          "score": 0.0581,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73455,7 +72962,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 1.0,
+        "input_usd_per_mtok": 0.95,
         "output_usd_per_mtok": 4.05,
         "source": "litellm"
       },
@@ -73472,8 +72979,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73513,8 +73020,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 46,
-          "score": -0.1951,
+          "rank": 49,
+          "score": -0.2014,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73893,8 +73400,8 @@
       "arena_webdev_elo": 1551.8,
       "preference": {
         "arena_agent": {
-          "rank": 25,
-          "score": 0.0147,
+          "rank": 27,
+          "score": 0.0134,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73938,8 +73445,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -73965,7 +73472,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.739,
+      "agentic_score": 0.727,
       "w_swe": 0.948,
       "capability": {
         "swe_verified": {
@@ -73982,8 +73489,8 @@
       "arena_webdev_elo": 1637.5,
       "preference": {
         "arena_agent": {
-          "rank": 14,
-          "score": 0.0623,
+          "rank": 17,
+          "score": 0.0548,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74079,8 +73586,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74120,8 +73627,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74148,15 +73655,15 @@
         "output_usd_per_mtok": 0.28,
         "source": "litellm"
       },
-      "agentic_score": 0.302,
+      "agentic_score": 0.311,
       "preference": {
         "arena_agent": {
-          "rank": 18,
-          "score": 0.0544,
+          "rank": 16,
+          "score": 0.0559,
           "source": "arena.ai"
         }
       },
-      "w_swe": 0.651
+      "w_swe": 0.655
     },
     {
       "id": "openrouter/xiaomi/mimo-v2.6-pro",
@@ -74173,13 +73680,13 @@
         "output_usd_per_mtok": 0.87,
         "source": "litellm"
       },
-      "agentic_score": 0.734,
+      "agentic_score": 0.74,
       "arena_coding_elo": 1618.4,
       "arena_webdev_elo": 1618.4,
       "preference": {
         "arena_agent": {
           "rank": 9,
-          "score": 0.0735,
+          "score": 0.0774,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74559,8 +74066,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.9646,
-        "output_usd_per_mtok": 3.0316,
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
       "agentic_score": 0.741,
@@ -74603,7 +74110,7 @@
         "output_usd_per_mtok": 3.9899999999999998,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -74625,8 +74132,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74677,11 +74184,11 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.2219,
-        "output_usd_per_mtok": 3.39,
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -74699,8 +74206,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -74726,7 +74233,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -74744,8 +74251,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -76413,7 +75920,7 @@
         "output_usd_per_mtok": 0.63,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -76430,8 +75937,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -77041,8 +76548,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09999999999999999,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.04815,
+        "output_usd_per_mtok": 0.19305,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -78113,8 +77620,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -78155,8 +77662,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 42,
-          "score": -0.1014,
+          "rank": 43,
+          "score": -0.093,
           "source": "arena.ai"
         }
       }
@@ -78303,7 +77810,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -78321,8 +77828,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -78508,8 +78015,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -78575,7 +78082,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -78597,8 +78104,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79016,8 +78523,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79072,7 +78579,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -79090,8 +78597,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79264,8 +78771,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79331,7 +78838,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -79353,8 +78860,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79772,8 +79279,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -79799,7 +79306,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -79817,8 +79324,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -80999,8 +80506,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -81026,7 +80533,7 @@
         "output_usd_per_mtok": 0.6,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -81043,8 +80550,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -81154,7 +80661,7 @@
         "output_usd_per_mtok": 12.5,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -81173,7 +80680,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -81250,7 +80757,7 @@
         "output_usd_per_mtok": 3.08,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -81268,8 +80775,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -81295,7 +80802,7 @@
         "output_usd_per_mtok": 0.35,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -81313,8 +80820,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -81753,7 +81260,7 @@
         "output_usd_per_mtok": 5.5,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -81775,8 +81282,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82055,7 +81562,7 @@
         "output_usd_per_mtok": 1.9800000000000002,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -82077,8 +81584,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82104,7 +81611,7 @@
         "output_usd_per_mtok": 4.989999999999999,
         "source": "litellm"
       },
-      "agentic_score": 0.824,
+      "agentic_score": 0.821,
       "w_swe": 0.976,
       "capability": {
         "swe_verified": {
@@ -82122,8 +81629,8 @@
       "arena_webdev_elo": 1671.2,
       "preference": {
         "arena_agent": {
-          "rank": 19,
-          "score": 0.0524,
+          "rank": 22,
+          "score": 0.0472,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82752,8 +82259,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82848,8 +82355,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82881,8 +82388,8 @@
       "arena_webdev_elo": 1507.4,
       "preference": {
         "arena_agent": {
-          "rank": 43,
-          "score": -0.1147,
+          "rank": 46,
+          "score": -0.1117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82909,13 +82416,13 @@
         "output_usd_per_mtok": 2.501,
         "source": "openrouter"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.727,
       "arena_coding_elo": 1633.2,
       "arena_webdev_elo": 1633.2,
       "preference": {
         "arena_agent": {
-          "rank": 12,
-          "score": 0.0637,
+          "rank": 15,
+          "score": 0.0581,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -82960,8 +82467,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -83401,8 +82908,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -83442,8 +82949,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 46,
-          "score": -0.1951,
+          "rank": 49,
+          "score": -0.2014,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -83656,8 +83163,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -84203,8 +83710,8 @@
       "arena_webdev_elo": 1514.9,
       "preference": {
         "arena_agent": {
-          "rank": 39,
-          "score": -0.0907,
+          "rank": 42,
+          "score": -0.0908,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -84245,8 +83752,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 42,
-          "score": -0.1014,
+          "rank": 43,
+          "score": -0.093,
           "source": "arena.ai"
         }
       }
@@ -84592,8 +84099,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -84619,7 +84126,7 @@
         "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -84636,8 +84143,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -85159,7 +84666,7 @@
         "output_usd_per_mtok": 15.0,
         "source": "litellm"
       },
-      "agentic_score": 0.88,
+      "agentic_score": 0.882,
       "w_swe": 0.967,
       "capability": {
         "swe_verified": {
@@ -85178,7 +84685,7 @@
       "preference": {
         "arena_agent": {
           "rank": 10,
-          "score": 0.0732,
+          "score": 0.0761,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -85368,8 +84875,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 47,
-          "score": -0.2074,
+          "rank": 51,
+          "score": -0.2067,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -85604,7 +85111,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -85626,8 +85133,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -85653,7 +85160,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -85671,8 +85178,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -85698,7 +85205,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -85716,8 +85223,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -86285,8 +85792,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 2.1875,
-        "output_usd_per_mtok": 17.5,
+        "input_usd_per_mtok": 1.375,
+        "output_usd_per_mtok": 11.0,
         "source": "litellm"
       }
     },
@@ -90079,7 +89586,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.867,
+      "agentic_score": 0.87,
       "w_swe": 0.975,
       "capability": {
         "swe_verified": {
@@ -90097,8 +89604,8 @@
       "arena_webdev_elo": 1625.3,
       "preference": {
         "arena_agent": {
-          "rank": 17,
-          "score": 0.055,
+          "rank": 14,
+          "score": 0.0607,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90124,7 +89631,7 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.991,
+      "agentic_score": 0.994,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -90142,7 +89649,7 @@
       "preference": {
         "arena_agent": {
           "rank": 1,
-          "score": 0.1746,
+          "score": 0.1764,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90524,7 +90031,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.793,
+      "agentic_score": 0.789,
       "w_swe": 0.943,
       "capability": {
         "swe_verified": {
@@ -90542,8 +90049,8 @@
       "arena_webdev_elo": 1555.5,
       "preference": {
         "arena_agent": {
-          "rank": 21,
-          "score": 0.0488,
+          "rank": 25,
+          "score": 0.0425,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90598,7 +90105,7 @@
         "output_usd_per_mtok": 25.0,
         "source": "litellm"
       },
-      "agentic_score": 0.934,
+      "agentic_score": 0.931,
       "w_swe": 0.996,
       "capability": {
         "swe_verified": {
@@ -90616,8 +90123,8 @@
       "arena_webdev_elo": 1695.0,
       "preference": {
         "arena_agent": {
-          "rank": 5,
-          "score": 0.1009,
+          "rank": 7,
+          "score": 0.0952,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90643,7 +90150,7 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.936,
+      "agentic_score": 0.938,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -90660,8 +90167,8 @@
       "arena_webdev_elo": 1815.4,
       "preference": {
         "arena_agent": {
-          "rank": 3,
-          "score": 0.1395,
+          "rank": 4,
+          "score": 0.1412,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90894,7 +90401,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "w_swe": 0.898,
       "capability": {
         "swe_verified": {
@@ -90912,8 +90419,8 @@
       "arena_webdev_elo": 1539.4,
       "preference": {
         "arena_agent": {
-          "rank": 26,
-          "score": 0.013,
+          "rank": 28,
+          "score": 0.0121,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -90939,7 +90446,7 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.935,
       "w_swe": 1.0,
       "capability": {
         "swe_verified": {
@@ -90955,6 +90462,11 @@
       "arena_coding_elo": 1786.3,
       "arena_webdev_elo": 1786.3,
       "preference": {
+        "arena_agent": {
+          "rank": 5,
+          "score": 0.1391,
+          "source": "arena.ai"
+        },
         "arena_webdev": {
           "rank": 3,
           "rating": 1786.3,
@@ -91474,8 +90986,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 40,
-          "score": -0.0937,
+          "rank": 45,
+          "score": -0.0994,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -91603,8 +91115,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 38,
-          "score": -0.0556,
+          "rank": 41,
+          "score": -0.0567,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -91631,7 +91143,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.736,
+      "agentic_score": 0.737,
       "arena_coding_elo": 1591.7,
       "arena_webdev_elo": 1591.7,
       "capability": {
@@ -91644,8 +91156,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 27,
-          "score": 0.0108,
+          "rank": 29,
+          "score": 0.0117,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -91672,7 +91184,7 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.66,
+      "agentic_score": 0.657,
       "arena_coding_elo": 1582.7,
       "arena_webdev_elo": 1582.7,
       "capability": {
@@ -91689,8 +91201,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 8,
-          "score": 0.0741,
+          "rank": 13,
+          "score": 0.0685,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -92855,8 +92367,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -92882,7 +92394,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.739,
+      "agentic_score": 0.727,
       "w_swe": 0.948,
       "capability": {
         "swe_verified": {
@@ -92899,8 +92411,8 @@
       "arena_webdev_elo": 1637.5,
       "preference": {
         "arena_agent": {
-          "rank": 14,
-          "score": 0.0623,
+          "rank": 17,
+          "score": 0.0548,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93079,8 +92591,8 @@
       "arena_webdev_elo": 1482.0,
       "preference": {
         "arena_agent": {
-          "rank": 44,
-          "score": -0.1306,
+          "rank": 47,
+          "score": -0.1374,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93433,8 +92945,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93482,8 +92994,8 @@
       "arena_webdev_elo": 1582.6,
       "preference": {
         "arena_agent": {
-          "rank": 31,
-          "score": -0.0123,
+          "rank": 34,
+          "score": -0.0167,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93509,7 +93021,7 @@
         "output_usd_per_mtok": 0.65,
         "source": "litellm"
       },
-      "agentic_score": 0.756,
+      "agentic_score": 0.753,
       "w_swe": 0.933,
       "capability": {
         "swe_verified": {
@@ -93526,8 +93038,8 @@
       "arena_webdev_elo": 1619.9,
       "preference": {
         "arena_agent": {
-          "rank": 7,
-          "score": 0.0865,
+          "rank": 8,
+          "score": 0.0843,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93947,7 +93459,7 @@
         "output_usd_per_mtok": 2.42,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -93969,8 +93481,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -93996,7 +93508,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -94014,8 +93526,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -94789,8 +94301,8 @@
       "arena_webdev_elo": 1551.8,
       "preference": {
         "arena_agent": {
-          "rank": 25,
-          "score": 0.0147,
+          "rank": 27,
+          "score": 0.0134,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -94834,8 +94346,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -94861,7 +94373,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.739,
+      "agentic_score": 0.727,
       "w_swe": 0.948,
       "capability": {
         "swe_verified": {
@@ -94878,8 +94390,8 @@
       "arena_webdev_elo": 1637.5,
       "preference": {
         "arena_agent": {
-          "rank": 14,
-          "score": 0.0623,
+          "rank": 17,
+          "score": 0.0548,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -94934,7 +94446,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.739,
+      "agentic_score": 0.727,
       "w_swe": 0.948,
       "capability": {
         "swe_verified": {
@@ -94951,8 +94463,8 @@
       "arena_webdev_elo": 1637.5,
       "preference": {
         "arena_agent": {
-          "rank": 14,
-          "score": 0.0623,
+          "rank": 17,
+          "score": 0.0548,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -95812,8 +95324,8 @@
       "arena_webdev_elo": 1551.8,
       "preference": {
         "arena_agent": {
-          "rank": 25,
-          "score": 0.0147,
+          "rank": 27,
+          "score": 0.0134,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -95857,8 +95369,8 @@
       "arena_webdev_elo": 1551.8,
       "preference": {
         "arena_agent": {
-          "rank": 25,
-          "score": 0.0147,
+          "rank": 27,
+          "score": 0.0134,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -95902,8 +95414,8 @@
       "arena_webdev_elo": 1619.5,
       "preference": {
         "arena_agent": {
-          "rank": 30,
-          "score": -0.0073,
+          "rank": 32,
+          "score": -0.0059,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -95929,7 +95441,7 @@
         "output_usd_per_mtok": 6.0,
         "source": "litellm"
       },
-      "agentic_score": 0.739,
+      "agentic_score": 0.727,
       "w_swe": 0.948,
       "capability": {
         "swe_verified": {
@@ -95946,8 +95458,8 @@
       "arena_webdev_elo": 1637.5,
       "preference": {
         "arena_agent": {
-          "rank": 14,
-          "score": 0.0623,
+          "rank": 17,
+          "score": 0.0548,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96151,8 +95663,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96192,8 +95704,8 @@
       },
       "preference": {
         "arena_agent": {
-          "rank": 41,
-          "score": -0.094,
+          "rank": 44,
+          "score": -0.0959,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96220,15 +95732,15 @@
         "output_usd_per_mtok": 0.28,
         "source": "openrouter"
       },
-      "agentic_score": 0.302,
+      "agentic_score": 0.311,
       "preference": {
         "arena_agent": {
-          "rank": 18,
-          "score": 0.0544,
+          "rank": 16,
+          "score": 0.0559,
           "source": "arena.ai"
         }
       },
-      "w_swe": 0.651
+      "w_swe": 0.655
     },
     {
       "id": "xiaomi/mimo-v2.6-pro",
@@ -96245,13 +95757,13 @@
         "output_usd_per_mtok": 0.87,
         "source": "openrouter"
       },
-      "agentic_score": 0.734,
+      "agentic_score": 0.74,
       "arena_coding_elo": 1618.4,
       "arena_webdev_elo": 1618.4,
       "preference": {
         "arena_agent": {
           "rank": 9,
-          "score": 0.0735,
+          "score": 0.0774,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96294,15 +95806,15 @@
         "output_usd_per_mtok": 0.28,
         "source": "litellm"
       },
-      "agentic_score": 0.302,
+      "agentic_score": 0.311,
       "preference": {
         "arena_agent": {
-          "rank": 18,
-          "score": 0.0544,
+          "rank": 16,
+          "score": 0.0559,
           "source": "arena.ai"
         }
       },
-      "w_swe": 0.651
+      "w_swe": 0.655
     },
     {
       "id": "xiaomi_mimo/mimo-v2.6-pro",
@@ -96319,13 +95831,13 @@
         "output_usd_per_mtok": 0.87,
         "source": "litellm"
       },
-      "agentic_score": 0.734,
+      "agentic_score": 0.74,
       "arena_coding_elo": 1618.4,
       "arena_webdev_elo": 1618.4,
       "preference": {
         "arena_agent": {
           "rank": 9,
-          "score": 0.0735,
+          "score": 0.0774,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96660,8 +96172,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.9646,
-        "output_usd_per_mtok": 3.0316,
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
         "source": "openrouter"
       },
       "agentic_score": 0.741,
@@ -96704,7 +96216,7 @@
         "output_usd_per_mtok": 3.9899999999999998,
         "source": "openrouter"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -96726,8 +96238,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96753,7 +96265,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "openrouter"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -96771,8 +96283,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -96798,7 +96310,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -96816,8 +96328,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -97535,7 +97047,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.649,
       "w_swe": 0.921,
       "capability": {
         "scale_seal": {
@@ -97557,8 +97069,8 @@
       "arena_webdev_elo": 1605.0,
       "preference": {
         "arena_agent": {
-          "rank": 20,
-          "score": 0.0523,
+          "rank": 21,
+          "score": 0.0476,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -97584,7 +97096,7 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.869,
+      "agentic_score": 0.867,
       "w_swe": 0.977,
       "capability": {
         "swe_verified": {
@@ -97602,8 +97114,8 @@
       "arena_webdev_elo": 1623.0,
       "preference": {
         "arena_agent": {
-          "rank": 16,
-          "score": 0.0555,
+          "rank": 18,
+          "score": 0.0526,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -97629,7 +97141,7 @@
         "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
-      "agentic_score": 0.839,
+      "agentic_score": 0.837,
       "w_swe": 0.96,
       "capability": {
         "swe_verified": {
@@ -97647,8 +97159,8 @@
       "arena_webdev_elo": 1615.6,
       "preference": {
         "arena_agent": {
-          "rank": 22,
-          "score": 0.0464,
+          "rank": 24,
+          "score": 0.0435,
           "source": "arena.ai"
         },
         "arena_webdev": {
@@ -97786,8 +97298,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.015,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.02,
+        "output_usd_per_mtok": 0.6,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
@@ -97815,8 +97327,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.13199999999999998,
-        "output_usd_per_mtok": 0.396,
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 4.199999999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
@@ -97844,7 +97356,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0051,
+        "input_usd_per_mtok": 0.0171,
         "output_usd_per_mtok": 1.28,
         "source": "openrouter"
       },
@@ -97925,8 +97437,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.425,
-        "output_usd_per_mtok": 13.405,
+        "input_usd_per_mtok": 0.98,
+        "output_usd_per_mtok": 13.0,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -98063,8 +97575,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.02625,
-        "output_usd_per_mtok": 0.8999999999999999,
+        "input_usd_per_mtok": 0.035,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
