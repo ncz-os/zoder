@@ -15,26 +15,42 @@ of what a checkpoint does and does not prove.
 
 ## What the ledger records
 
-At the end of each iteration of the `zoder exec` coding loop (author turn,
-review, objective check), zoder builds a small evidence object:
+At the end of each recorded iteration of the `zoder` loop, zoder builds a small
+evidence object (`crates/zoder-cli/src/agentic.rs`, the `mnemos::checkpoint`
+call) from exactly these fields — no wrapper, no extra fields:
 
 ```json
 {
-  "job_id": "01a0f56a-857c-7de6-b743-c184007c7eee",
+  "job_id": "01a0f515-bf70-73ee-94d6-94f3b3dd7e46",
   "workspace": "/home/user/project",
   "iteration": 1,
-  "head_sha": "a1b2c3d4",
+  "head_sha": "71334bc",
   "files": ["src/lib.rs"],
   "check_passed": true,
-  "verdict": "passed",
-  "blocking_findings": []
+  "verdict": "approve",
+  "blocking_findings": 0
 }
 ```
+
+Field notes:
+
+- `job_id` — the `HIVE_JOB_ID` environment value when set, otherwise `null`.
+- `head_sha` — the repository HEAD SHA at that point (a Git SHA, **not** a job ID).
+- `files` — the files touched this iteration.
+- `check_passed` — `true`/`false`/`null`: the exit outcome of the caller's
+  `--check` command, or `null` when no check was configured.
+- `verdict` — the reviewer's verdict string as recorded by the loop:
+  `approve`, `request_changes`, `comment`, `neutral`, or `reject`/`block`
+  (the known set in `agentic.rs`), normalized to lowercase; anything
+  unrecognized fail-closes as blocking.
+- `blocking_findings` — an **integer** count of the reviewer's blocking
+  findings (`0` means none).
 
 The checkpoint is deliberately **factual**: it excludes prompts, model output,
 and environment data. It records *what was worked on* (workspace, iteration,
 HEAD SHA, touched files, check outcome, review verdict) — not *what the model
-said*.
+said*. The object above is stored **raw** in the local ledger; the remote
+post wraps it (see *Automatic checkpoints* below).
 
 ---
 
@@ -59,15 +75,18 @@ Behavior when either variable is unset:
 
 - `zoder mnemos --search/--record` **fails** with `MNEMOS_URL is required` or
   `MNEMOS_TOKEN is required`.
-- The automatic per-iteration checkpoint **still writes the local ledger** and
-  then **skips the remote post** silently (it is optional and best-effort).
+- The automatic per-iteration checkpoint **still attempts the local ledger
+  append** and then **skips the remote post** silently (it is optional and
+  best-effort).
 
 ---
 
-## CLI: `zoder mnemos`
+## CLI: `zoder mnemos` (manual, remote-only)
 
 The `zoder mnemos` subcommand offers two **mutually exclusive** modes — exactly
-one of `--search` or `--record` must be given:
+one of `--search` or `--record` must be given. Both are **manual** and both go
+**only to the remote MNEMOS server**; neither reads or writes the local `.git`
+ledger, and neither automatically attaches job IDs or any other metadata.
 
 ### Search — `--search <query>`
 
@@ -86,10 +105,15 @@ The local `.git` ledger is **not** queried — search goes to the remote server.
 zoder mnemos --record "Completed auth refactor: fixed token leak in session validation"
 ```
 
-Posts to the `"/v1/memories"` endpoint with body
+Posts to the `/v1/memories` endpoint with **only**
+
 `{"content": "<content>", "category": "projects", "subcategory": "zoder-work", "source_agent": "zoder"}`
-and prints the response. The **only** thing stored is the text you pass — no
-job ID, timestamp, or environment data is added automatically by `--record`.
+
+and prints the full pretty JSON response on success. **That is everything that
+is stored** — no job ID, timestamp, parent ID, or environment data is added
+automatically by `--record`. If you want a job ID findable by later search,
+write it into the `<content>` text yourself (see *Job context* below). Errors
+from the server or network propagate as failures of the command.
 
 ### Errors and secrets
 
@@ -101,81 +125,81 @@ job ID, timestamp, or environment data is added automatically by `--record`.
 
 ---
 
-## Automatic per-iteration checkpoints
+## Automatic per-iteration checkpoints (inside the loop)
 
-When the coding loop runs (e.g. `zoder exec` with an iteration budget), each
-iteration ends with an automatic checkpoint — this is what the `zoder mnemos`
-CLI does *not* do; it happens inside the loop.
+The automatic checkpoint (`mnemos::checkpoint`) runs **inside the loop after
+each recorded loop iteration** — this is what the `zoder mnemos` CLI does *not*
+do. It performs two distinct steps, in order:
 
-### 1. Local `.git` ledger (always attempted, first)
+### 1. Local `.git` ledger (attempted first)
 
-The checkpoint is **first** appended to a JSONL file inside the repository's
-`.git` directory:
+The evidence object (the raw JSON shown in *What the ledger records*) is
+appended as one line to a JSONL file inside the repository's Git directory:
 
 ```
 <git dir>/zoder-work-ledger.jsonl
 ```
 
 The git directory is discovered via `git rev-parse --absolute-git-dir` from the
-loop's working directory. Each line is one checkpoint's evidence object (the
-JSON shown above). This write is append-mode and is the **recovery path**:
-network failure must never discard work or prevent local recovery.
-
-Local-write failures (not a git checkout, git invocation fails, file cannot be
-opened or written) are reported to stderr as `[zoder] local MNEMOS ledger …`
-messages — they **do not** abort the loop.
+loop's working directory; the append is attempted first, so the local record
+exists even when no remote is configured. The append is a plain file open in
+`append` mode plus a `write` — it is **not** an atomic write, and it is not
+guaranteed to succeed: if the path is not a Git checkout, `git rev-parse`
+fails, or the file cannot be opened or written, the append is **skipped** and a
+`[zoder] local MNEMOS ledger …` note goes to stderr. These failures **do not**
+abort the loop, and the remote attempt below still proceeds.
 
 ### 2. Remote MNEMOS checkpoint (optional, second)
 
 If **both** `MNEMOS_URL` and `MNEMOS_TOKEN` are set, the checkpoint is then
-posted to `/v1/memories` with:
+posted to `/v1/memories` with a **wrapper** around the same evidence:
 
-- `content` — the evidence object stringified
+- `content` — the evidence object **stringified** (`evidence.to_string()`)
 - `category`: `"projects"`, `subcategory`: `"zoder-work"`, `source_agent`: `"zoder"`
-- `metadata.job_id` — the `HIVE_JOB_ID` value, when set
+- `metadata.job_id` — the `HIVE_JOB_ID` value, when set (the **only** metadata
+  key sent)
 
 On success the loop logs `[zoder] MNEMOS checkpoint <memory-id>` to stderr; on
 failure it logs `[zoder] MNEMOS checkpoint pending: <error>` and **moves on**
-(the loop result is unaffected — see *Failure behavior*).
+(the loop result is unaffected — see *Failure behavior*). The automatic
+checkpoint helper is the one that **catches** network errors and logs
+`pending`; the manual `--record` command does not — it propagates them.
 
 ---
 
-## Job context: `HIVE_JOB_ID` and retrieval by parent ID
+## Job context: `HIVE_JOB_ID`, parent IDs, and search
 
-- **`HIVE_JOB_ID`** — the hive job identifier for the *current* job, read from
-  the environment by the worker. When set, it is stored as
-  `metadata.job_id` on every remote checkpoint, and it is also included as a
-  `job_id` field in the local ledger evidence. This lets you attribute
-  checkpoints to one job's run.
-
-- **Retrieval by parent job ID** — the checkpoint records only the *current*
-  job's ID; a parent/supervisor job ID is **not** read or stored automatically.
-  If your workflow parents jobs, include the parent ID **in the record text**
-  when you log it manually so it stays searchable, then retrieve it by
-  searching for that ID as free text:
+- **`HIVE_JOB_ID`** — the hive job identifier for the *current* job. The loop
+  reads it to populate `job_id` in the local evidence and `metadata.job_id` in
+  the remote post. This is the only job metadata the code reads or records.
+- **Parent job IDs are not read or recorded.** `HIVE_PARENT_JOB_ID` is **not**
+  read or recorded anywhere in `mnemos.rs`. If your workflow parents jobs, the
+  worker provides the parent ID only as a **manual lookup hint**: include it
+  explicitly in a manual record's text so it stays searchable, then retrieve
+  it by searching for that ID as free text:
 
   ```bash
   # Log so the parent ID is findable later (include it in the text)
   zoder mnemos --record "Parent 01a0f515-bf70-73ee-94d6-94f3b3dd7e46: iteration 3 review findings"
 
   # Retrieve by parent ID (free-text search over recorded content)
-  zoder mnemos --search "01a0f515-bf70-73ee-94d6-94f3b3dd7e46"
+  zoder mnemos --search "$HIVE_PARENT_JOB_ID"
   ```
 
-  A job ID is retrievable by search **only because it appears in the recorded
-  content** — search is free-text over `zoder-work` memories, not a structured
-  ID lookup.
+  An ID is retrievable by search **only because it appears in the recorded
+  content** — search is free-text over the remote `zoder-work` memories, not a
+  structured ID lookup, and not a search of the local ledger.
 
 ---
 
 ## Failure behavior
 
-- **Local ledger write fails** (no git checkout / git error / I/O error): the
+- **Local ledger append fails** (no git checkout / git error / I/O error): the
   loop continues; a `[zoder] local MNEMOS ledger …` note goes to stderr. The
   remote attempt (if configured) still proceeds.
 - **Remote checkpoint fails** (network, timeout, auth, server error): the loop
   continues; you see `[zoder] MNEMOS checkpoint pending: <error>` on stderr.
-  The local ledger entry remains as recorded.
+  A `pending` record is **not** retried or replayed automatically.
 - **Auth failure** (bad token): the server's HTTP 401 surfaces as
   `MNEMOS returned HTTP 401` — the response body is never echoed, so the token
   and any sensitive server output stay out of logs.
@@ -198,6 +222,13 @@ Be precise about what a checkpoint *is*:
   delivery succeeded, or that the build/tests are green. Keep *checkpoint
   evidence*, *Git delivery*, and *correctness* as three separate claims —
   verify each independently.
+- **`--check` is not a Git-delivery verifier.** `--check` is a zoder loop
+  option: it executes the *caller-supplied* shell check after each author turn
+  (the loop's `check_passed` just records that command's exit outcome). A Hive
+  worker may choose its own Git-delivery verifier as that check; other callers
+  may choose tests or builds. zoder itself does not inspect commits or
+  worktree cleanliness on your behalf — a passing `--check` proves only what
+  that specific command checks.
 - **Pending records do not currently auto-replay.** If a remote checkpoint
   fails and is logged as `pending`, there is **no automatic retry or replay**
   of that record. The local `.git` ledger keeps the evidence; re-logging a
@@ -207,5 +238,9 @@ Be precise about what a checkpoint *is*:
   local `.git` ledger.
 - **`--record` stores only your text.** No automatic job ID, timestamp, or
   environment is attached to a manual record.
-- **Local ledger is per-checkout.** It lives in the repository's `.git`
-  directory, so it is scoped to that checkout (not shared across clones).
+- **Local ledger is per-checkout.** It lives in the repository's Git directory,
+  so it is scoped to that checkout (not shared across clones).
+- **Local appends are best-effort, not atomic.** A single append is a file
+  open in append mode plus a write; there is no cross-process atomic
+  guarantee, and local Git or I/O errors can prevent an append (see
+  *Automatic checkpoints* and *Failure behavior*).
