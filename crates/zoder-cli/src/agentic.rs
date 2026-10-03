@@ -6678,6 +6678,104 @@ mod tests {
         );
     }
 
+    /// zoder#23: a loop that RESOLVED must never be reported `[failed]`.
+    ///
+    /// The worker's process outcome is not the only truth: the loop writes its
+    /// own structured `result.json` (`"resolved": true`). When the two disagree
+    /// — a non-zero process exit after a verified resolve — the result wins and
+    /// the job is named `resolved-with-warnings`, never `failed`, because
+    /// `failed` already means "no verified work". Before the fix,
+    /// `finalize_job` stamped `failed` from the process outcome alone.
+    #[test]
+    fn finalize_job_resolved_loop_is_not_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("resolved-loop", 4242)).expect("write meta");
+        std::fs::write(
+            dir.path().join("result.json"),
+            serde_json::to_string(&json!({
+                "kind": "loop",
+                "resolved": true,
+                "total_cost_usd": 0.0,
+            }))
+            .unwrap(),
+        )
+        .expect("write result.json");
+
+        // Process outcome says failure; the structured result says resolved.
+        finalize_job(dir.path(), false);
+
+        let meta = read_meta(dir.path()).expect("read meta");
+        assert_ne!(
+            meta.status, "failed",
+            "a resolved loop must never be stamped failed (zoder#23)"
+        );
+        assert_eq!(
+            meta.status, "resolved-with-warnings",
+            "the non-zero exit after a resolve must be named, not reused as failed"
+        );
+        assert!(
+            meta.finished.is_some(),
+            "terminal status must stamp a finish time"
+        );
+    }
+
+    /// Fail-closed companion to the zoder#23 fix: ONLY an explicit loop
+    /// `resolved: true` payload may move a failed process out of `[failed]`.
+    /// Missing, malformed, non-loop, and unresolved results stay failed.
+    #[test]
+    fn finalize_job_without_resolved_loop_result_stays_failed() {
+        let cases: [(&str, Option<Value>); 4] = [
+            ("missing", None),
+            ("unresolved", Some(json!({"kind": "loop", "resolved": false}))),
+            ("non-loop", Some(json!({"kind": "rescue", "ok": true}))),
+            ("not-an-object", Some(json!("resolved"))),
+        ];
+        for (name, result) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_meta(dir.path(), &meta_for_test_id_pid(name, 4242)).expect("write meta");
+            if let Some(v) = &result {
+                std::fs::write(
+                    dir.path().join("result.json"),
+                    serde_json::to_string(v).unwrap(),
+                )
+                .expect("write result.json");
+            }
+            finalize_job(dir.path(), false);
+            assert_eq!(
+                read_meta(dir.path()).expect("read meta").status,
+                "failed",
+                "case `{name}` must stay failed"
+            );
+        }
+
+        // A malformed (non-JSON) result is likewise fail-closed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("malformed", 4242)).expect("write meta");
+        std::fs::write(dir.path().join("result.json"), "{not json").expect("write bad result");
+        finalize_job(dir.path(), false);
+        assert_eq!(
+            read_meta(dir.path()).expect("read meta").status,
+            "failed",
+            "a malformed result must not be read as a resolve"
+        );
+    }
+
+    /// A successful process outcome is `done` regardless of the result payload;
+    /// the derivation only ever rescues a *failed* process from a false
+    /// `failed`, never reclassifies a successful one.
+    #[test]
+    fn finalize_job_success_is_done_regardless_of_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("ok-loop", 4242)).expect("write meta");
+        std::fs::write(
+            dir.path().join("result.json"),
+            serde_json::to_string(&json!({"kind": "loop", "resolved": false})).unwrap(),
+        )
+        .expect("write result.json");
+        finalize_job(dir.path(), true);
+        assert_eq!(read_meta(dir.path()).expect("read meta").status, "done");
+    }
+
     #[test]
     fn cancel_running_background_job_kills_process_group_descendants() {
         let dir = tempfile::tempdir().expect("tempdir");
