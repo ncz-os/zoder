@@ -4433,10 +4433,7 @@ fn sanitize_ledger_field(raw: &str, max: usize) -> String {
 /// Sanitized, bounded (`<= MAX_LEDGER_FINDINGS_CHARS`) handoff record of an
 /// iteration's LOCATED findings — severity, title, location only, no code
 /// bodies — plus the reviewer model. A resumed job can start from this.
-pub(crate) fn bounded_located_findings(
-    findings: &[Finding],
-    reviewer_model: Option<&str>,
-) -> String {
+fn bounded_located_findings(findings: &[Finding], reviewer_model: Option<&str>) -> String {
     let mut out = format!(
         "reviewer={}",
         sanitize_ledger_field(reviewer_model.unwrap_or("(none)"), 120)
