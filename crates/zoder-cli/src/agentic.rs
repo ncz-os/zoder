@@ -6790,7 +6790,10 @@ mod tests {
     fn finalize_job_without_resolved_loop_result_stays_failed() {
         let cases: [(&str, Option<Value>); 4] = [
             ("missing", None),
-            ("unresolved", Some(json!({"kind": "loop", "resolved": false}))),
+            (
+                "unresolved",
+                Some(json!({"kind": "loop", "resolved": false})),
+            ),
             ("non-loop", Some(json!({"kind": "rescue", "ok": true}))),
             ("not-an-object", Some(json!("resolved"))),
         ];
