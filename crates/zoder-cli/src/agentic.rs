@@ -4387,6 +4387,34 @@ pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
     approvals * 2 > samples.len()
 }
 
+/// C. Pure decision for the unchanged-diff three-sample majority.
+///
+/// Callers reach this only when the *current* review is a non-approve on a
+/// diff identical to the previous iteration's. The three samples are
+/// `[current, fresh0, fresh1]`, where both fresh samples are independent
+/// re-reviews of the SAME unchanged diff. Because `current` is a non-approve,
+/// resolution therefore requires BOTH fresh samples to approve — a strict
+/// majority can only be reached when two independent reviewers overrule the
+/// one noisy block. The current sample is included in `majority_loop_approval`
+/// so a single fresh approve cannot resolve, and in the located-blocker veto
+/// (see `majority_loop_approval`) so a located `critical`/`high` finding in ANY
+/// sample blocks — on an unchanged diff it is by definition still unaddressed.
+///
+/// The objective gate and the anti-gaming substance gate must both hold.
+/// An unparseable, unavailable, or synthesized-failure sample is not an
+/// `approve`, so it counts as a non-approve and fails closed.
+fn majority_resolves_on_unchanged_diff(
+    current: &ReviewOutput,
+    fresh: &[ReviewOutput; 2],
+    check_satisfied: bool,
+    substance_ok: bool,
+) -> bool {
+    if !check_satisfied || !substance_ok {
+        return false;
+    }
+    majority_loop_approval(&[current.clone(), fresh[0].clone(), fresh[1].clone()])
+}
+
 /// Fail-closed review for an iteration where no reviewer in the pool returned
 /// a parseable JSON verdict. Prose is preserved as a finding body for humans.
 fn synthesize_reviewer_unavailable(prose: &str) -> ReviewOutput {
@@ -4903,9 +4931,6 @@ pub(crate) async fn cmd_loop(
     let max_iters = max_iters.max(1);
     let mut session: Option<String> = None;
     let mut prev_diff = String::new();
-    // The previous iteration's parsed review, used by the C unchanged-diff
-    // majority path (three samples: prev + current + one re-run).
-    let mut prev_review: Option<ReviewOutput> = None;
     let mut iterations: Vec<Value> = Vec::new();
     let mut total_cost = 0.0;
     let mut feedback = String::new();
@@ -5642,57 +5667,71 @@ consecutive non-substantive iteration(s); stopping."
             }
             // C. Unchanged diff + same blockers: do NOT keep re-prompting the
             // author for the same findings a third time. Once we have already
-            // stalled and hold the previous sample, re-run the reviewer ONCE
-            // more and decide by majority of the three samples (approve vs
-            // not), recording all three verdicts. A located blocking finding in
-            // ANY sample vetoes approval (the diff is unchanged, so it is still
-            // unaddressed).
-            if !review_ok && stall_streak >= 1 && prev_review.is_some() {
-                let mut samples: Vec<ReviewOutput> = Vec::new();
-                if let Some(p) = &prev_review {
-                    samples.push(p.clone());
-                }
-                samples.push(review.clone());
+            // stalled, take TWO fresh independent reviews of the unchanged diff
+            // and decide by majority of the three samples
+            // `[current, fresh0, fresh1]`. Because `current` is a non-approve,
+            // resolution requires BOTH fresh samples to approve — one noisy
+            // block is overruled only by two independent fresh approvals. All
+            // three verdicts are recorded. A located blocking finding
+            // (critical/high) in ANY sample vetoes approval (the diff is
+            // unchanged, so it is still unaddressed), and an unparseable /
+            // unavailable / synthesized-failure sample is a non-approve
+            // (fail closed).
+            if !review_ok && stall_streak >= 1 {
                 if !cli.quiet {
                     eprintln!(
                         "[loop] iter {i}: unchanged diff with the same blocker; \
-re-running the reviewer for a 3-sample majority…"
+re-running the reviewer twice for a 3-sample majority (both fresh samples must \
+approve)…"
                     );
                 }
-                let (r3, m3, c3, _p3) = match phase_watchdog(
-                    LoopPhase::Review,
-                    loop_timeout_secs,
-                    cli.quiet,
-                    review_phase_verdict(
-                        cli,
-                        reviewer.as_deref(),
-                        &reviewer_chain,
-                        ADVERSARIAL_SYSTEM,
-                        &review_user,
-                        max_tokens,
-                    ),
-                )
-                .await
-                {
-                    Ok(t) => t,
-                    Err(msg) => (
-                        synthesize_review_phase_failure(&msg),
-                        None,
-                        0.0,
-                        String::new(),
-                    ),
-                };
-                total_cost += c3;
-                if m3.is_some() {
-                    reviewer_model = m3;
+                let mut fresh: Vec<ReviewOutput> = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let (r, m, c, _p) = match phase_watchdog(
+                        LoopPhase::Review,
+                        loop_timeout_secs,
+                        cli.quiet,
+                        review_phase_verdict(
+                            cli,
+                            reviewer.as_deref(),
+                            &reviewer_chain,
+                            ADVERSARIAL_SYSTEM,
+                            &review_user,
+                            max_tokens,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(msg) => (
+                            synthesize_review_phase_failure(&msg),
+                            None,
+                            0.0,
+                            String::new(),
+                        ),
+                    };
+                    total_cost += c;
+                    if m.is_some() {
+                        reviewer_model = m;
+                    }
+                    fresh.push(r);
                 }
-                samples.push(r3);
-                let verdicts: Vec<String> = samples.iter().map(|r| r.verdict.clone()).collect();
+                let fresh: [ReviewOutput; 2] = fresh
+                    .try_into()
+                    .expect("exactly two fresh reviews are collected");
+                let verdicts: Vec<String> = std::iter::once(review.verdict.clone())
+                    .chain(fresh.iter().map(|r| r.verdict.clone()))
+                    .collect();
                 if let Some(last) = iterations.last_mut() {
                     last["majority_samples"] = json!(verdicts);
                     last["reviewer_model"] = json!(reviewer_model);
                 }
-                if check_satisfied && substance_ok && majority_loop_approval(&samples) {
+                if majority_resolves_on_unchanged_diff(
+                    &review,
+                    &fresh,
+                    check_satisfied,
+                    substance_ok,
+                ) {
                     resolved = true;
                     final_verdict = "approve".into();
                     if !cli.quiet {
@@ -5786,7 +5825,6 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
                 fb.push_str(&format!("- {s}\n"));
             }
         }
-        prev_review = Some(review.clone());
         feedback = fb;
     }
 
@@ -6852,6 +6890,113 @@ mod tests {
             majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
             "an unlocated request_changes is comment-with-no-evidence, not a veto"
         );
+    }
+
+    // ---- C: unchanged diff, fresh two-sample resolution decision ----
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_requires_both_fresh_approvals() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        let block = review_with("block", vec![]);
+
+        // current=block, r2=approve, r3=approve => resolves.
+        assert!(
+            majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), approve.clone()],
+                true,
+                true,
+            ),
+            "two independent fresh approvals overrule the current non-approve"
+        );
+
+        // current=block, r2=approve, r3=block => no strict majority => false.
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), block.clone()],
+                true,
+                true,
+            ),
+            "one fresh approve is not a majority against the current non-approve"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_vetoes_located_blocker_in_any_fresh_sample() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        // An `approve` verdict that still carries a located high finding must
+        // not be allowed to resolve: the located blocker vetoes across all
+        // three samples.
+        let located_high = review_with("approve", vec![located_finding("high")]);
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[located_high.clone(), approve.clone()],
+                true,
+                true,
+            ),
+            "a located blocking finding in fresh r2 vetoes approval"
+        );
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), located_high.clone()],
+                true,
+                true,
+            ),
+            "a located blocking finding in fresh r3 vetoes approval"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_respects_objective_and_substance_gates() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        let both = [approve.clone(), approve.clone()];
+        assert!(
+            !majority_resolves_on_unchanged_diff(&current, &both, false, true),
+            "a failed/unknown check blocks even two fresh approvals"
+        );
+        assert!(
+            !majority_resolves_on_unchanged_diff(&current, &both, true, false),
+            "a non-substantive diff blocks even two fresh approvals"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_fails_closed_on_unavailable_or_unparseable_sample() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        // The three fail-closed shapes a fresh sample can take: reviewer never
+        // answered (unavailable), the phase watchdog fired (synthesized
+        // request_changes), and a verdict the parser could not recognize.
+        for bad in [
+            synthesize_reviewer_unavailable("prose only, no JSON verdict"),
+            synthesize_review_phase_failure("review phase timed out"),
+            review_with("", vec![]),
+        ] {
+            assert!(
+                !majority_resolves_on_unchanged_diff(
+                    &current,
+                    &[bad.clone(), approve.clone()],
+                    true,
+                    true,
+                ),
+                "an unavailable/unparseable fresh sample is a non-approve (fail closed)"
+            );
+            assert!(
+                !majority_resolves_on_unchanged_diff(
+                    &current,
+                    &[approve.clone(), bad.clone()],
+                    true,
+                    true,
+                ),
+                "an unavailable/unparseable fresh sample is a non-approve (fail closed)"
+            );
+        }
     }
 
     // ---- D: bounded located-findings ledger handoff ----
