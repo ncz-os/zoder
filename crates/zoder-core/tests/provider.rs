@@ -35,6 +35,7 @@ fn req(model: &str, stream: bool) -> ChatRequest {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     }
 }
 
@@ -844,6 +845,7 @@ fn anthropic_req(model: &str, stream: bool) -> ChatRequest {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     }
 }
 
@@ -1035,6 +1037,7 @@ async fn openai_chat_path_remains_byte_identical_after_anthropic_fork() {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -1493,6 +1496,7 @@ fn responses_req(model: &str, stream: bool) -> ChatRequest {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     }
 }
 
@@ -1624,6 +1628,7 @@ async fn openai_chat_path_remains_byte_identical_after_responses_fork() {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -1918,6 +1923,7 @@ fn azure_req(model: &str, stream: bool) -> ChatRequest {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     }
 }
 
@@ -2098,6 +2104,7 @@ async fn openai_chat_path_remains_byte_identical_after_azure_fork() {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     };
     let res = p.stream_chat(&req, None).await.unwrap();
     assert_eq!(res.content, "hello");
@@ -2402,6 +2409,7 @@ async fn drive_live_arm(
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     };
     let err = p_local.stream_chat(&req, None).await.unwrap_err();
     let cls = classify_err(&err);
