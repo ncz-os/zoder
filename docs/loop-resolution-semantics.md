@@ -37,18 +37,31 @@ repeats the unlocated block, the iteration is downgraded to
 it does **not** count toward the no-new-progress stall counter. Explicit blocks
 with located findings keep the existing semantics.
 
-## C. Unchanged diff + same blockers ⇒ three-sample majority
+## C. Unchanged diff + same blockers ⇒ three fresh-sample majority
 
-When the author produced no new diff since the previous review and the reviewer
-is still blocking, the loop stops re-prompting the author for the same findings
-a third time. It re-runs the reviewer ONCE more and decides by strict majority
-of the three samples (approve vs not). All three verdicts are recorded in the
-iteration record under `majority_samples`.
+When the author produced no new diff since the previous review, the reviewer is
+still blocking, and the loop has already stalled at least once, the loop stops
+re-prompting the author for the same findings a third time. It takes **two
+additional, independent fresh reviews of the same unchanged diff** and decides
+by a strict majority of the three samples `[current, fresh_1, fresh_2]`. All
+three verdicts are recorded in the iteration record under `majority_samples`,
+and the cost of both fresh reviews is added to the run total.
+
+Because `current` is by construction a non-approve, resolution requires **both
+fresh samples to approve**: a single noisy block is overruled only when two
+independent fresh reviews both approve. The previous iteration's verdict is not
+reused as one of the three samples.
 
 A located blocking finding (`critical`/`high` with a concrete location) in ANY
-sample vetoes approval — with an unchanged diff it is by definition
-unaddressed. The majority approval also still requires a satisfied check and a
-substantive diff, so the objective gate is not bypassed.
+of the three samples vetoes approval — with an unchanged diff it is by
+definition unaddressed. An unparseable, unavailable, or synthesized-failure
+sample is not an approval, so it counts as a non-approve and fails closed. The
+majority approval also still requires a satisfied check and a substantive diff,
+so the objective gate is not bypassed.
+
+The pure decision is `majority_resolves_on_unchanged_diff` (which delegates the
+vote to `majority_loop_approval`); the loop only calls it after one stalled
+iteration on an identical diff.
 
 ## D. Ledger handoff
 
