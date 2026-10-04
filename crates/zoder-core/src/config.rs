@@ -6201,6 +6201,106 @@ auth = { type = "env", var = "GUARD_KEY" }
         }
     }
 
+    /// Self-defense bounds for [`run_swap_loop`].
+    ///
+    /// The coordinator (the test thread) normally sets the `stop` flag as
+    /// soon as the reader finishes its 64 iterations — well inside the
+    /// 10s receive budget below. These bounds exist purely so a
+    /// *panicked or starved* coordinator cannot leave the swapper thread
+    /// spinning a core forever. That unbounded-under-contention failure
+    /// mode is ncz-os/zoder#20: `cargo test` ran 3.96 days instead of
+    /// failing. With these bounds the worst case is a bounded wait and a
+    /// failed assertion.
+    #[cfg(unix)]
+    const SWAP_MAX_ITERS: u64 = 100_000;
+    #[cfg(unix)]
+    const SWAP_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Why a [`run_swap_loop`] invocation returned. Lets the TOCTOU
+    /// race test distinguish a clean coordinator stop from one of the
+    /// self-defense bounds, and lets the bound tests below assert on it.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum SwapExit {
+        /// The coordinator set the `stop` flag (the normal path).
+        Stopped,
+        /// The swapper's handshake wait elapsed before the reader
+        /// signalled — the race was never exercised.
+        HandshakeTimeout,
+        /// The loop hit its explicit iteration cap.
+        IterationCap,
+        /// The loop hit its explicit wall-clock deadline.
+        Deadline,
+    }
+
+    /// Run the rename/mkfifo/restore swap cycle until `stop` is set,
+    /// `max_iters` cycles have run, or `deadline` elapses.
+    ///
+    /// The explicit bounds are the fix for ncz-os/zoder#20. The
+    /// coordinating test thread is the only thing that used to end this
+    /// loop; if it panicked (or was starved past the test harness's
+    /// patience) the swapper would spin a core forever and `cargo test`
+    /// would never return. Bounding the loop here turns that failure
+    /// mode into a bounded return — and, at the call site, a failed
+    /// assertion — instead of an immortal process.
+    #[cfg(unix)]
+    fn run_swap_loop(
+        dir: &std::path::Path,
+        target: &std::path::Path,
+        stop: &std::sync::atomic::AtomicBool,
+        max_iters: u64,
+        deadline: std::time::Instant,
+    ) -> SwapExit {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let mut i: u64 = 0;
+        while !stop.load(Ordering::Relaxed) {
+            // Check both self-defense bounds before doing any work so a
+            // starved coordinator can never extend the loop past them.
+            if i >= max_iters {
+                return SwapExit::IterationCap;
+            }
+            if Instant::now() >= deadline {
+                return SwapExit::Deadline;
+            }
+
+            // Brief "file present" pause so at least *some* reader
+            // iterations after the handshake can race past the swap
+            // into the happy path too — keeps the swapper's duty cycle
+            // honest without making the test's outcomes depend on this
+            // interval.
+            std::thread::sleep(Duration::from_micros(2000));
+
+            // Now perform the swap: rename target aside, mkfifo,
+            // unlink, restore.
+            let backup = dir.join(format!("config.bak.{i}"));
+            if std::fs::rename(target, &backup).is_ok() {
+                let mkfifo = std::process::Command::new("mkfifo").arg(target).status();
+                if matches!(&mkfifo, Ok(s) if s.success()) {
+                    let _ = std::fs::remove_file(target);
+                }
+                let _ = std::fs::rename(&backup, target);
+            }
+            i += 1;
+        }
+        SwapExit::Stopped
+    }
+
+    /// RAII flag-flipper: sets the wrapped `AtomicBool` to `true` on
+    /// drop, including during unwind. Used so a panicking coordinator
+    /// releases the swapper thread promptly instead of making it wait
+    /// out its full self-defense deadline.
+    #[cfg(unix)]
+    struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(unix)]
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Continuous swapper, synchronized to the reader so the wall-clock
     /// timing assumptions don't hold the test hostage to host load.
     ///
@@ -6245,7 +6345,7 @@ auth = { type = "env", var = "GUARD_KEY" }
         use std::sync::mpsc;
         use std::sync::Arc;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.json");
@@ -6281,47 +6381,42 @@ auth = { type = "env", var = "GUARD_KEY" }
         // `ok-original > 0` assertion below with a clear tally, which
         // is the right behavior.
         let stop = Arc::new(AtomicBool::new(false));
+        // Belt-and-braces (ncz-os/zoder#20): if the reader or an
+        // assertion panics, this guard still flips `stop` during unwind
+        // so the swapper leaves at the top of its next iteration rather
+        // than waiting out its full self-defense deadline. The loop's
+        // own bounds are the load-bearing fix; this just makes the
+        // common panic path prompt.
+        let _stop_on_drop = StopOnDrop(stop.clone());
         let stop_clone = stop.clone();
         let swap_dir = dir.path().to_path_buf();
         let swap_target = target.clone();
+        // Explicit self-defense bounds for the swapper loop (see
+        // `run_swap_loop`). The coordinator normally sets `stop` well
+        // before these fire; they exist so a panicked or starved
+        // coordinator can never leave the swapper spinning forever.
+        let swap_deadline = Instant::now() + SWAP_MAX_WALL;
         let swapper = thread::spawn(move || {
             // Block until the reader has at least one successful
             // read of the original inode. The 2s budget is generous:
             // a stable 2-byte file reads in microseconds, so anything
-            // past 2s is a regression, not a flake. We exit cleanly
-            // (without entering the racing loop) on timeout — main
-            // thread's `swapper.join()` will return as soon as this
-            // closure returns, and the `ok-original > 0` assertion
-            // below will fire with a clear tally to point the next
-            // reader at the helper regression that caused it.
+            // past 2s is a regression, not a flake. On timeout we
+            // return `HandshakeTimeout` (never entering the racing
+            // loop) so the assertion below fails with a clear reason
+            // instead of silently passing without exercising the race.
             if go_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-                return;
+                return SwapExit::HandshakeTimeout;
             }
 
-            let mut i: u64 = 0;
-            while !stop_clone.load(Ordering::Relaxed) {
-                // Brief "file present" pause so at least *some* reader
-                // iterations after the handshake can race past the
-                // swap into the happy path too — keeps the swapper's
-                // duty cycle honest without making the test's
-                // outcomes depend on this interval.
-                thread::sleep(Duration::from_micros(2000));
-
-                // Now perform the swap: rename target aside,
-                // mkfifo, unlink, restore.
-                let backup = swap_dir.join(format!("config.bak.{i}"));
-                if std::fs::rename(&swap_target, &backup).is_ok() {
-                    let mkfifo = std::process::Command::new("mkfifo")
-                        .arg(&swap_target)
-                        .status();
-                    let fifo_ok = matches!(&mkfifo, Ok(s) if s.success());
-                    if fifo_ok {
-                        let _ = std::fs::remove_file(&swap_target);
-                    }
-                    let _ = std::fs::rename(&backup, &swap_target);
-                }
-                i += 1;
-            }
+            // Bounded loop — exits on `stop`, the iteration cap, or the
+            // wall-clock deadline, never unboundedly.
+            run_swap_loop(
+                &swap_dir,
+                &swap_target,
+                &stop_clone,
+                SWAP_MAX_ITERS,
+                swap_deadline,
+            )
         });
 
         // Reader: run N iterations and collect observations. Each
@@ -6405,7 +6500,7 @@ auth = { type = "env", var = "GUARD_KEY" }
             .expect("read_bounded_regular_file must not block past 10s — TOCTOU regression");
         reader.join().expect("reader thread panicked");
         stop.store(true, Ordering::Relaxed);
-        swapper.join().expect("swapper thread panicked");
+        let swap_exit = swapper.join().expect("swapper thread panicked");
 
         // Tally the observations for the failure message.
         let ok_original = observations.iter().filter(|o| **o == "ok-original").count();
@@ -6452,6 +6547,21 @@ auth = { type = "env", var = "GUARD_KEY" }
              eprintln above the assertion."
         );
 
+        // The swapper must have exited because the coordinator set
+        // `stop`, not because it hit one of its self-defense bounds. A
+        // bound hit means the test was starved long enough that the old,
+        // unbounded design could have spun forever (ncz-os/zoder#20);
+        // surface that as a clear failure instead of a silent pass.
+        assert_eq!(
+            swap_exit,
+            SwapExit::Stopped,
+            "swapper must stop via the coordinator's `stop` signal; got \
+             {swap_exit:?}. A bound hit means the test was starved past \
+             {SWAP_MAX_WALL:?} or the handshake never arrived — under the \
+             old unbounded loop this would have been an immortal process \
+             rather than a failed test."
+        );
+
         // The error mix is informational. ENOENT, ENXIO, and "not a
         // regular file" are all expected outcomes under a swap —
         // they prove the helper is rejecting dangerous targets fast
@@ -6460,5 +6570,64 @@ auth = { type = "env", var = "GUARD_KEY" }
         // permission-flipped file); we don't fail on `err-other`
         // alone; we just want to make sure it's not masking a deeper
         // issue.
+    }
+
+    /// Regression test for ncz-os/zoder#20: the swapper loop must
+    /// terminate on its own wall-clock bound even when the coordinator
+    /// never sets `stop` (e.g. it panicked). Without the bound in
+    /// [`run_swap_loop`] this test would hang forever — which is exactly
+    /// the four-day `cargo test` hang the issue reports.
+    #[test]
+    #[cfg(unix)]
+    fn swap_loop_terminates_on_deadline_without_stop_signal() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        std::fs::write(&target, b"{}").unwrap();
+        // Deliberately never set: simulates a coordinator that panicked
+        // before it could signal the swapper.
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let exit = run_swap_loop(
+            dir.path(),
+            &target,
+            &stop,
+            u64::MAX,
+            started + Duration::from_millis(250),
+        );
+        assert_eq!(exit, SwapExit::Deadline);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "deadline-bound swapper must return promptly instead of \
+             hanging; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Companion to the deadline test: the iteration cap is an
+    /// independent bound, so a coordinator that never sets `stop` still
+    /// cannot run the swap loop more than `max_iters` times
+    /// (ncz-os/zoder#20).
+    #[test]
+    #[cfg(unix)]
+    fn swap_loop_terminates_on_iteration_cap_without_stop_signal() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        std::fs::write(&target, b"{}").unwrap();
+        // Never set — the cap, not the coordinator, must end the loop.
+        let stop = AtomicBool::new(false);
+        let exit = run_swap_loop(
+            dir.path(),
+            &target,
+            &stop,
+            3,
+            Instant::now() + Duration::from_secs(300),
+        );
+        assert_eq!(exit, SwapExit::IterationCap);
     }
 }
