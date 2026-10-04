@@ -5941,8 +5941,11 @@ pub(crate) async fn cmd_transfer(cli: &crate::Cli) -> anyhow::Result<()> {
 pub(crate) struct JobMeta {
     pub(crate) id: String,
     pub(crate) kind: String,
-    /// `running` | `done` | `failed` | `cancelled` — the same on-disk
-    /// vocabulary `status`/`result`/`cancel` already key on.
+    /// `running` | `done` | `resolved-with-warnings` | `failed` |
+    /// `cancelled` — the same on-disk vocabulary `status`/`result`/`cancel`
+    /// already key on. `resolved-with-warnings` is a terminal success whose
+    /// process nevertheless exited non-zero; see [`finalize_job`] and
+    /// [`JOB_STATUS_RESOLVED_WITH_WARNINGS`].
     pub(crate) status: String,
     pub(crate) cwd: String,
     pub(crate) pid: u32,
@@ -5977,6 +5980,46 @@ pub(crate) fn active_job_dir() -> Option<PathBuf> {
 /// `meta.json` larger than this cap is treated identically to a
 /// missing or unreadable file by `read_meta`.
 pub(crate) const MAX_JOB_META_BYTES: u64 = 64 * 1024;
+
+/// Terminal status for a job whose process reported a failure but whose own
+/// structured loop result says the work actually resolved (zoder#23). It is
+/// deliberately NOT `failed` — that already means "no verified work" — and
+/// deliberately NOT `done` — the non-zero exit is real and worth surfacing.
+/// `cmd_status` renders it as `[resolved-with-warnings]`.
+pub(crate) const JOB_STATUS_RESOLVED_WITH_WARNINGS: &str = "resolved-with-warnings";
+
+/// Upper bound on the structured `result.json` a worker may leave behind for
+/// terminal-status derivation. A loop's `log` array makes this file much
+/// larger than [`MAX_JOB_META_BYTES`], so the cap is generous; a result larger
+/// than this is treated as absent (fail-closed to the process outcome).
+pub(crate) const MAX_JOB_RESULT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// True iff the job's own `result.json` is a loop payload that explicitly
+/// resolved. Fail-closed: a missing, symlinked/non-regular, oversized,
+/// unreadable, malformed, non-loop, or `resolved:false` result all read as
+/// `false`, leaving the process outcome to stand. Never let an
+/// unparseable/unavailable verdict become an approval (CLAUDE.md directive).
+fn result_indicates_resolved_loop(dir: &Path) -> bool {
+    let path = dir.join("result.json");
+    // Reject symlinks at this path outright: the jobs tree is user-writable,
+    // and following a link here would let a crafted job dir point the reader
+    // at an arbitrary file. A non-regular file (FIFO, device) is likewise
+    // not a result payload.
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_JOB_RESULT_BYTES {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    v.get("kind").and_then(Value::as_str) == Some("loop")
+        && v.get("resolved").and_then(Value::as_bool) == Some(true)
+}
 
 fn read_meta(dir: &Path) -> Option<JobMeta> {
     let path = dir.join("meta.json");
@@ -6188,10 +6231,31 @@ pub(crate) fn spawn_background(kind: &str, cwd: &Path) -> anyhow::Result<String>
 }
 
 /// Mark a worker's job terminal (called from `main` once the work returns).
+///
+/// The process outcome (`ok`) alone is not a reliable loop verdict (zoder#23):
+/// a loop that RESOLVED writes `result.json` with `"resolved": true`, yet on a
+/// non-zero-exit-after-resolve path the job was stamped `failed`. That is wrong
+/// in the most damaging direction — `failed` already means "no verified work",
+/// so an operator triaging a fan-out with `zoder status` would discard a
+/// successful, verified result. The loop's own structured result is therefore
+/// authoritative: when the process failed but its result explicitly resolved,
+/// name the job [`JOB_STATUS_RESOLVED_WITH_WARNINGS`] rather than reusing
+/// `failed`.
+///
+/// Fail-closed: an unresolved, missing, malformed, non-loop, or oversized
+/// result leaves the process outcome to stand. A successful process is always
+/// `done`; this derivation only ever rescues a failed process from a false
+/// `failed`, never reclassifies a successful one.
 pub(crate) fn finalize_job(dir: &Path, ok: bool) {
     if let Some(mut meta) = read_meta(dir) {
         if meta.status == "running" {
-            meta.status = if ok { "done" } else { "failed" }.into();
+            meta.status = if ok {
+                "done".into()
+            } else if result_indicates_resolved_loop(dir) {
+                JOB_STATUS_RESOLVED_WITH_WARNINGS.into()
+            } else {
+                "failed".into()
+            };
             meta.finished = Some(Utc::now());
             let _ = write_meta(dir, &meta);
         }
@@ -7427,6 +7491,107 @@ mod tests {
             meta.finished.is_some(),
             "reconciled job must have a finish time"
         );
+    }
+
+    /// zoder#23: a loop that RESOLVED must never be reported `[failed]`.
+    ///
+    /// The worker's process outcome is not the only truth: the loop writes its
+    /// own structured `result.json` (`"resolved": true`). When the two disagree
+    /// — a non-zero process exit after a verified resolve — the result wins and
+    /// the job is named `resolved-with-warnings`, never `failed`, because
+    /// `failed` already means "no verified work". Before the fix,
+    /// `finalize_job` stamped `failed` from the process outcome alone.
+    #[test]
+    fn finalize_job_resolved_loop_is_not_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("resolved-loop", 4242)).expect("write meta");
+        std::fs::write(
+            dir.path().join("result.json"),
+            serde_json::to_string(&json!({
+                "kind": "loop",
+                "resolved": true,
+                "total_cost_usd": 0.0,
+            }))
+            .unwrap(),
+        )
+        .expect("write result.json");
+
+        // Process outcome says failure; the structured result says resolved.
+        finalize_job(dir.path(), false);
+
+        let meta = read_meta(dir.path()).expect("read meta");
+        assert_ne!(
+            meta.status, "failed",
+            "a resolved loop must never be stamped failed (zoder#23)"
+        );
+        assert_eq!(
+            meta.status, "resolved-with-warnings",
+            "the non-zero exit after a resolve must be named, not reused as failed"
+        );
+        assert!(
+            meta.finished.is_some(),
+            "terminal status must stamp a finish time"
+        );
+    }
+
+    /// Fail-closed companion to the zoder#23 fix: ONLY an explicit loop
+    /// `resolved: true` payload may move a failed process out of `[failed]`.
+    /// Missing, malformed, non-loop, and unresolved results stay failed.
+    #[test]
+    fn finalize_job_without_resolved_loop_result_stays_failed() {
+        let cases: [(&str, Option<Value>); 4] = [
+            ("missing", None),
+            (
+                "unresolved",
+                Some(json!({"kind": "loop", "resolved": false})),
+            ),
+            ("non-loop", Some(json!({"kind": "rescue", "ok": true}))),
+            ("not-an-object", Some(json!("resolved"))),
+        ];
+        for (name, result) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_meta(dir.path(), &meta_for_test_id_pid(name, 4242)).expect("write meta");
+            if let Some(v) = &result {
+                std::fs::write(
+                    dir.path().join("result.json"),
+                    serde_json::to_string(v).unwrap(),
+                )
+                .expect("write result.json");
+            }
+            finalize_job(dir.path(), false);
+            assert_eq!(
+                read_meta(dir.path()).expect("read meta").status,
+                "failed",
+                "case `{name}` must stay failed"
+            );
+        }
+
+        // A malformed (non-JSON) result is likewise fail-closed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("malformed", 4242)).expect("write meta");
+        std::fs::write(dir.path().join("result.json"), "{not json").expect("write bad result");
+        finalize_job(dir.path(), false);
+        assert_eq!(
+            read_meta(dir.path()).expect("read meta").status,
+            "failed",
+            "a malformed result must not be read as a resolve"
+        );
+    }
+
+    /// A successful process outcome is `done` regardless of the result payload;
+    /// the derivation only ever rescues a *failed* process from a false
+    /// `failed`, never reclassifies a successful one.
+    #[test]
+    fn finalize_job_success_is_done_regardless_of_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_meta(dir.path(), &meta_for_test_id_pid("ok-loop", 4242)).expect("write meta");
+        std::fs::write(
+            dir.path().join("result.json"),
+            serde_json::to_string(&json!({"kind": "loop", "resolved": false})).unwrap(),
+        )
+        .expect("write result.json");
+        finalize_job(dir.path(), true);
+        assert_eq!(read_meta(dir.path()).expect("read meta").status, "done");
     }
 
     #[test]
