@@ -92,6 +92,7 @@ async fn complete_once(
         stream: false,
         show_reasoning: false,
         reasoning_effort: cli.reasoning.clone(),
+        response_format: None,
     };
     let provider = OpenAiProvider::new(provider_cfg)?;
     let res = provider

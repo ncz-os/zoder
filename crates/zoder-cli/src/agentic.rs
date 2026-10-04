@@ -699,6 +699,137 @@ async fn complete_once(
     Err(anyhow!(msg))
 }
 
+/// Loop reviewer dispatch that insists on a structured JSON verdict (A).
+///
+/// `complete_once` accepts any non-empty completion and leaves parsing to the
+/// caller; the loop used to then run `parse_review`, whose prose keyword
+/// recovery could turn free-form analysis into a verdict. This helper walks
+/// the configured reviewer pool and, for each candidate:
+///
+///   1. asks once with `primary_system` (the loop's adversarial prompt);
+///   2. if the answer is not a JSON verdict object, re-asks that SAME candidate
+///      ONCE with [`REVIEW_SYSTEM`] (the neutral prompt) plus a directive to
+///      return only JSON. `provider_extra.response_format` is applied by
+///      [`dispatch_reviewer_for_model`] from the engine profile, so a
+///      configured `json_object` hint rides along on that retry;
+///   3. if that is also prose, advances to the next candidate in the pool.
+///
+/// Returns the first structured verdict, or
+/// [`synthesize_reviewer_unavailable`] when no candidate produced one. `cost`
+/// accumulates every attempt; `prose` preserves the raw text of every rejected
+/// answer for the human-facing finding body.
+async fn complete_review_json_verdict(
+    cli: &crate::Cli,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    primary_system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> (ReviewOutput, Option<String>, f64, String) {
+    let mut candidates = match build_reviewer_candidates(cli, reviewer_override, reviewer_chain) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                synthesize_reviewer_unavailable(&format!("no reviewer chain: {e}")),
+                None,
+                0.0,
+                String::new(),
+            );
+        }
+    };
+    candidates = enforce_exact_model_pin(candidates, cli.model.as_deref(), reviewer_override);
+    if candidates.is_empty() {
+        return (
+            synthesize_reviewer_unavailable("no reviewer model resolved"),
+            None,
+            0.0,
+            String::new(),
+        );
+    }
+    let retry_user = format!(
+        "{user}\n\nYour previous answer was prose, not the required structured verdict. \
+Return ONLY one JSON object with keys verdict, summary, findings, next_steps. \
+Set verdict to exactly one of approve, request_changes, or comment. \
+Every finding MUST cite a concrete location (path:line). No markdown or prose outside the JSON object.\n"
+    );
+    let mut cost = 0.0f64;
+    let mut prose = String::new();
+    let mut last_model: Option<String> = None;
+    for model in &candidates {
+        match complete_once(
+            cli,
+            Some(model.as_str()),
+            &[],
+            primary_system,
+            user,
+            max_tokens,
+        )
+        .await
+        {
+            Ok(c) => {
+                cost += c.cost_usd;
+                last_model = Some(c.model.clone());
+                if let Some(r) = parse_review_json_only(&c.content) {
+                    return (r, last_model, cost, prose);
+                }
+                prose.push_str(&format!("[{model} primary]\n{}\n---\n", c.content));
+            }
+            Err(e) => {
+                prose.push_str(&format!("[{model} primary error] {e}\n---\n"));
+                continue;
+            }
+        }
+        match complete_once(
+            cli,
+            Some(model.as_str()),
+            &[],
+            REVIEW_SYSTEM,
+            &retry_user,
+            max_tokens,
+        )
+        .await
+        {
+            Ok(c) => {
+                cost += c.cost_usd;
+                last_model = Some(c.model.clone());
+                if let Some(r) = parse_review_json_only(&c.content) {
+                    return (r, last_model, cost, prose);
+                }
+                prose.push_str(&format!("[{model} retry]\n{}\n---\n", c.content));
+            }
+            Err(e) => prose.push_str(&format!("[{model} retry error] {e}\n---\n")),
+        }
+    }
+    (
+        synthesize_reviewer_unavailable(&prose),
+        last_model,
+        cost,
+        prose,
+    )
+}
+
+/// `phase_watchdog` wrapper around [`complete_review_json_verdict`]: the
+/// watchdog requires an `anyhow::Result` inner future, and this dispatch never
+/// fails (it synthesizes `reviewer_unavailable` instead).
+async fn review_phase_verdict(
+    cli: &crate::Cli,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    primary_system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> anyhow::Result<(ReviewOutput, Option<String>, f64, String)> {
+    Ok(complete_review_json_verdict(
+        cli,
+        reviewer_override,
+        reviewer_chain,
+        primary_system,
+        user,
+        max_tokens,
+    )
+    .await)
+}
+
 /// Build the ordered reviewer candidate list `complete_once` walks.
 ///
 /// Precedence, highest first (matches the `complete_once` doc above and the
@@ -1106,6 +1237,14 @@ async fn dispatch_reviewer_for_model(
                     .chat_template_kwargs_for_model(model, cli.agent.as_deref())
                     .cloned()
             }),
+        // Structured-output hint for the direct (non-agentic) reviewer call.
+        // Sourced from the engine profile's `provider_extra.response_format`,
+        // exactly like `reasoning_effort` above; `None` omits the field so the
+        // provider's default text response is used.
+        response_format: eng
+            .engine_models
+            .response_format_for_model(model, cli.agent.as_deref())
+            .cloned(),
     };
     let provider = match OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
@@ -1547,21 +1686,28 @@ fn balanced_json_objects(s: &str) -> Vec<&str> {
     out
 }
 
-fn parse_review(raw: &str) -> ReviewOutput {
+/// Strict JSON-only review parse. Returns `Some` iff at least one BALANCED
+/// `{...}` object in `raw` decodes as a `ReviewOutput` with a non-empty
+/// verdict; among those it keeps the MOST BLOCKING verdict. Unlike
+/// [`parse_review`] it NEVER recovers a verdict from prose keywords, so it is
+/// the parser the loop uses to decide whether a reviewer actually returned
+/// structured output.
+///
+/// Y-3: scan for the first BALANCED `{...}` object that decodes as a
+/// ReviewOutput with a non-empty verdict, rather than `first-'{'..last-'}'`
+/// — which a stray `{` in prose before the JSON (or trailing prose after
+/// it) turns into invalid JSON, silently dropping a real `request_changes`
+/// and falling through to the (previously non-blocking) fallback. A
+/// chatty or hostile model could smuggle a `{` to neuter its own block.
+/// W3: scan EVERY balanced object and keep the MOST BLOCKING verdict, not
+/// the first non-empty one. Returning on the first verdict let a decoy
+/// `{"verdict":"approve"}` placed before the real
+/// `{"verdict":"request_changes"}` win — the exact gaming vector the
+/// balanced-object scan was meant to close. Ranking via `verdict_rank`
+/// (where unknown/unrecognized verdicts rank as blocking) also stops a
+/// hallucinated verdict string from surfacing as approve here.
+fn parse_review_json_only(raw: &str) -> Option<ReviewOutput> {
     let trimmed = raw.trim();
-    // Y-3: scan for the first BALANCED `{...}` object that decodes as a
-    // ReviewOutput with a non-empty verdict, rather than `first-'{'..last-'}'`
-    // — which a stray `{` in prose before the JSON (or trailing prose after
-    // it) turns into invalid JSON, silently dropping a real `request_changes`
-    // and falling through to the (previously non-blocking) fallback. A
-    // chatty or hostile model could smuggle a `{` to neuter its own block.
-    // W3: scan EVERY balanced object and keep the MOST BLOCKING verdict,
-    // not the first non-empty one. Returning on the first verdict let a
-    // decoy `{"verdict":"approve"}` placed before the real
-    // `{"verdict":"request_changes"}` win — the exact gaming vector the
-    // balanced-object scan was meant to close. Ranking via `verdict_rank`
-    // (where unknown/unrecognized verdicts rank as blocking) also stops a
-    // hallucinated verdict string from surfacing as approve here.
     let mut worst: Option<ReviewOutput> = None;
     let mut worst_rank = 0u8;
     for obj in balanced_json_objects(trimmed) {
@@ -1582,7 +1728,12 @@ fn parse_review(raw: &str) -> ReviewOutput {
             }
         }
     }
-    if let Some(r) = worst {
+    worst
+}
+
+fn parse_review(raw: &str) -> ReviewOutput {
+    let trimmed = raw.trim();
+    if let Some(r) = parse_review_json_only(trimmed) {
         return r;
     }
     // Fallback for free-form prose: try to recover an explicit verdict keyword
@@ -4160,6 +4311,180 @@ fn has_concrete_location(f: &Finding) -> bool {
     }
 }
 
+/// Verdict marker for an iteration where no reviewer in the pool returned a
+/// parseable JSON verdict. It is UNKNOWN to [`loop_review_ok`], which fails
+/// closed on unrecognized verdicts, so this can never resolve the loop.
+pub(crate) const REVIEWER_UNAVAILABLE_VERDICT: &str = "reviewer_unavailable";
+
+/// Verdict marker for an unlocated `request_changes` that the loop refuses to
+/// treat as a blocking defect. Like [`REVIEWER_UNAVAILABLE_VERDICT`] it is
+/// unknown to [`loop_review_ok`] and therefore fail-closed.
+pub(crate) const COMMENT_NO_EVIDENCE_VERDICT: &str = "comment_no_evidence";
+
+/// Is this an explicit blocking verdict class?
+fn is_block_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "request_changes" | "reject" | "block"
+    )
+}
+
+/// A `request_changes` is only a valid defect report when at least one finding
+/// cites a concrete location. Non-blocking verdicts are trivially "located".
+fn request_changes_is_located(r: &ReviewOutput) -> bool {
+    !is_block_verdict(&r.verdict) || r.findings.iter().any(has_concrete_location)
+}
+
+/// A blocking verdict with no located finding — invalid as a defect report and
+/// never acceptable as a reason to re-prompt the author.
+fn is_unlocated_block(r: &ReviewOutput) -> bool {
+    is_block_verdict(&r.verdict) && !request_changes_is_located(r)
+}
+
+/// Does any finding block (`critical`/`high`) AND cite a concrete location?
+/// Used by the three-sample majority: a sample carrying a located blocking
+/// finding vetoes approval outright (the diff is unchanged, so it is still
+/// unaddressed).
+fn has_located_blocking_finding(r: &ReviewOutput) -> bool {
+    r.findings.iter().any(|f| {
+        let s = f.severity.to_ascii_lowercase();
+        (s == "critical" || s == "high") && has_concrete_location(f)
+    })
+}
+
+/// Downgrade an unlocated `request_changes` to the fail-closed
+/// `comment_no_evidence` state. `loop_review_ok` fails closed on the unknown
+/// verdict so this can NEVER resolve; the loop additionally exempts it from
+/// the no-new-progress stall counter so an invalid block does not burn the
+/// stall budget.
+fn mark_unlocated_no_evidence(r: &ReviewOutput) -> ReviewOutput {
+    ReviewOutput {
+        verdict: COMMENT_NO_EVIDENCE_VERDICT.into(),
+        summary: format!(
+            "Reviewer requested changes with no located finding; treating as \
+comment-with-no-evidence, NOT as a blocking defect. Original summary: {}",
+            r.summary
+        ),
+        findings: r.findings.clone(),
+        next_steps: r.next_steps.clone(),
+    }
+}
+
+/// Majority decision over the loop's three reviewer samples. Approve iff a
+/// strict majority approve AND no sample carries a located blocking finding.
+/// An empty sample set or a tie is never an approval (fail-closed).
+pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    if samples.iter().any(has_located_blocking_finding) {
+        return false;
+    }
+    let approvals = samples
+        .iter()
+        .filter(|r| r.verdict.trim().eq_ignore_ascii_case("approve"))
+        .count();
+    approvals * 2 > samples.len()
+}
+
+/// C. Pure decision for the unchanged-diff three-sample majority.
+///
+/// Callers reach this only when the *current* review is a non-approve on a
+/// diff identical to the previous iteration's. The three samples are
+/// `[current, fresh0, fresh1]`, where both fresh samples are independent
+/// re-reviews of the SAME unchanged diff. Because `current` is a non-approve,
+/// resolution therefore requires BOTH fresh samples to approve — a strict
+/// majority can only be reached when two independent reviewers overrule the
+/// one noisy block. The current sample is included in `majority_loop_approval`
+/// so a single fresh approve cannot resolve, and in the located-blocker veto
+/// (see `majority_loop_approval`) so a located `critical`/`high` finding in ANY
+/// sample blocks — on an unchanged diff it is by definition still unaddressed.
+///
+/// The objective gate and the anti-gaming substance gate must both hold.
+/// An unparseable, unavailable, or synthesized-failure sample is not an
+/// `approve`, so it counts as a non-approve and fails closed.
+fn majority_resolves_on_unchanged_diff(
+    current: &ReviewOutput,
+    fresh: &[ReviewOutput; 2],
+    check_satisfied: bool,
+    substance_ok: bool,
+) -> bool {
+    if !check_satisfied || !substance_ok {
+        return false;
+    }
+    majority_loop_approval(&[current.clone(), fresh[0].clone(), fresh[1].clone()])
+}
+
+/// Fail-closed review for an iteration where no reviewer in the pool returned
+/// a parseable JSON verdict. Prose is preserved as a finding body for humans.
+fn synthesize_reviewer_unavailable(prose: &str) -> ReviewOutput {
+    ReviewOutput {
+        verdict: REVIEWER_UNAVAILABLE_VERDICT.into(),
+        summary: "No reviewer returned a parseable structured JSON verdict; \
+loop stays unresolved (reviewer_unavailable)."
+            .into(),
+        findings: vec![Finding {
+            severity: "info".into(),
+            title: "reviewer_unavailable (prose-only output)".into(),
+            body: prose.chars().take(8_000).collect(),
+            location: None,
+        }],
+        next_steps: vec![],
+    }
+}
+
+/// Bound (in characters) for the located-findings ledger handoff (D).
+const MAX_LEDGER_FINDINGS_CHARS: usize = 1500;
+
+/// Flatten control whitespace and clamp a single ledger field to `max` chars.
+fn sanitize_ledger_field(raw: &str, max: usize) -> String {
+    let flattened: String = raw
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = flattened.trim();
+    if trimmed.chars().count() <= max {
+        trimmed.to_string()
+    } else {
+        let mut out: String = trimmed.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Sanitized, bounded (`<= MAX_LEDGER_FINDINGS_CHARS`) handoff record of an
+/// iteration's LOCATED findings — severity, title, location only, no code
+/// bodies — plus the reviewer model. A resumed job can start from this.
+fn bounded_located_findings(findings: &[Finding], reviewer_model: Option<&str>) -> String {
+    let mut out = format!(
+        "reviewer={}",
+        sanitize_ledger_field(reviewer_model.unwrap_or("(none)"), 120)
+    );
+    for f in findings.iter().filter(|f| has_concrete_location(f)) {
+        let loc = f.location.as_deref().unwrap_or("");
+        let line = format!(
+            "\n[{}] {} @ {}",
+            sanitize_ledger_field(&f.severity, 24),
+            sanitize_ledger_field(&f.title, 160),
+            sanitize_ledger_field(loc, 160),
+        );
+        if out.chars().count() + line.chars().count() > MAX_LEDGER_FINDINGS_CHARS {
+            if out.chars().count() + 2 <= MAX_LEDGER_FINDINGS_CHARS {
+                out.push_str("\n…");
+            }
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
 /// Count "blocking" findings. Severity that blocks depends on whether the
 /// objective gate is already green: when the build/test check passes we only
 /// block on `critical` (treat `high` as advisory), otherwise `critical|high`.
@@ -5002,12 +5327,18 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // fires: two runs with different reviewers are indistinguishable in the
         // artifact. `None` means no reviewer completed -- also a real outcome,
         // and distinct from "some reviewer approved".
-        let mut reviewer_model: Option<String> = None;
-        let review = match phase_watchdog(
+        // A. The loop reviewer path accepts ONLY a structured JSON verdict.
+        // Free-form prose is not a verdict: `complete_review_json_verdict`
+        // re-asks ONCE through the direct reviewer path (with
+        // `provider_extra.response_format` applied from the engine profile
+        // when configured) and then walks the rest of the reviewer pool. If
+        // no candidate returns JSON the outcome is `reviewer_unavailable`
+        // and the loop stays unresolved with that reason.
+        let (mut review, mut reviewer_model, review_cost, _prose) = match phase_watchdog(
             LoopPhase::Review,
             loop_timeout_secs,
             cli.quiet,
-            complete_once(
+            review_phase_verdict(
                 cli,
                 reviewer.as_deref(),
                 &reviewer_chain,
@@ -5018,16 +5349,13 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         )
         .await
         {
-            Ok(c) => {
-                total_cost += c.cost_usd;
-                reviewer_model = Some(c.model.clone());
-                parse_review(&c.content)
-            }
+            Ok(t) => t,
             Err(msg) => {
-                // `complete_once` already has its own HTTP client timeout, so
-                // surfacing an Elapsed here means the entire provider request
-                // hung (TCP never returned) — record as a timeout-error
-                // review so the next author turn sees the wall-clock context.
+                // The reviewer phase hung. `complete_review_json_verdict`
+                // already has its own HTTP client timeout, so surfacing an
+                // Elapsed here means the entire provider request hung (TCP
+                // never returned) — record as a timeout-error review so the
+                // next author turn sees the wall-clock context.
                 //
                 // Z-1 REGRESSION GUARD: the synthesized ReviewOutput MUST be
                 // fail-closed. With a non-blocking `"comment"` verdict, the
@@ -5037,10 +5365,15 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                 // run. The synthesizer (above) emits `"request_changes"` for
                 // exactly this reason; see its doc comment and the
                 // `review_phase_failure_synthesis_is_request_changes` test.
-                synthesize_review_phase_failure(&msg)
+                (
+                    synthesize_review_phase_failure(&msg),
+                    None,
+                    0.0,
+                    String::new(),
+                )
             }
         };
-        final_verdict = review.verdict.clone();
+        total_cost += review_cost;
         // The objective gate is "green" ONLY when an actual `--check` ran and
         // passed. A never-configured check is NOT green — it is unknown, and
         // this branch must NOT fabricate one. `check_satisfied` is the
@@ -5050,6 +5383,57 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // calibration only) follows the same honest rule.
         let green = check_passed == Some(true);
         let check_satisfied = check_passed != Some(false);
+
+        // B. A `request_changes` whose findings array is empty or carries no
+        // `location` is an invalid review, not a real blocker. Re-ask ONCE
+        // with a note that a located defect is required; if it repeats, treat
+        // the iteration as comment-with-no-evidence (still fail-closed — the
+        // unknown verdict can never resolve) and exempt it from the
+        // no-new-progress stall counter. An explicit block WITH a located
+        // finding keeps today's semantics.
+        let mut review_unlocated_no_evidence = false;
+        if is_unlocated_block(&review) {
+            let located_user = format!(
+                "{review_user}\n\nThe reviewer returned request_changes with no located finding. \
+A blocking defect MUST cite a concrete location (path:line). Re-review this diff; if you still \
+request changes, include at least one finding with an exact location. Otherwise return approve \
+or comment.\n"
+            );
+            let (r2, m2, c2, _p2) = match phase_watchdog(
+                LoopPhase::Review,
+                loop_timeout_secs,
+                cli.quiet,
+                review_phase_verdict(
+                    cli,
+                    reviewer.as_deref(),
+                    &reviewer_chain,
+                    ADVERSARIAL_SYSTEM,
+                    &located_user,
+                    max_tokens,
+                ),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(msg) => (
+                    synthesize_review_phase_failure(&msg),
+                    None,
+                    0.0,
+                    String::new(),
+                ),
+            };
+            total_cost += c2;
+            if m2.is_some() {
+                reviewer_model = m2;
+            }
+            if is_unlocated_block(&r2) {
+                review = mark_unlocated_no_evidence(&r2);
+                review_unlocated_no_evidence = true;
+            } else {
+                review = r2;
+            }
+        }
+        final_verdict = review.verdict.clone();
         let blocking = count_blocking(&review, green);
 
         let author_model = turn.as_ref().map(|t| t.model.clone());
@@ -5103,6 +5487,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
             "loop_timeout_secs": loop_timeout_secs,
             "verdict": review.verdict,
             "blocking_findings": blocking,
+            "review_unlocated_no_evidence": review_unlocated_no_evidence,
             "summary": review.summary,
             "cost_usd_cumulative": total_cost,
             "commit_author_enforcement": commit_author_enforcement_to_json(
@@ -5118,6 +5503,14 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                 "head_sha": rev_parse_head(&cwd), "files": touched,
                 "check_passed": check_passed, "verdict": review.verdict,
                 "blocking_findings": blocking,
+                // D. Bounded, sanitized handoff: severity/title/location of the
+                // iteration's located findings plus the reviewer model, so a
+                // resumed job can start from the last findings. No code bodies.
+                "reviewer_model": reviewer_model,
+                "located_findings": bounded_located_findings(
+                    &review.findings,
+                    reviewer_model.as_deref(),
+                ),
             }),
         )
         .await;
@@ -5272,7 +5665,90 @@ consecutive non-substantive iteration(s); stopping."
                     review.verdict
                 );
             }
-            stall_streak += 1;
+            // C. Unchanged diff + same blockers: do NOT keep re-prompting the
+            // author for the same findings a third time. Once we have already
+            // stalled, take TWO fresh independent reviews of the unchanged diff
+            // and decide by majority of the three samples
+            // `[current, fresh0, fresh1]`. Because `current` is a non-approve,
+            // resolution requires BOTH fresh samples to approve — one noisy
+            // block is overruled only by two independent fresh approvals. All
+            // three verdicts are recorded. A located blocking finding
+            // (critical/high) in ANY sample vetoes approval (the diff is
+            // unchanged, so it is still unaddressed), and an unparseable /
+            // unavailable / synthesized-failure sample is a non-approve
+            // (fail closed).
+            if !review_ok && stall_streak >= 1 {
+                if !cli.quiet {
+                    eprintln!(
+                        "[loop] iter {i}: unchanged diff with the same blocker; \
+re-running the reviewer twice for a 3-sample majority (both fresh samples must \
+approve)…"
+                    );
+                }
+                let mut fresh: Vec<ReviewOutput> = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let (r, m, c, _p) = match phase_watchdog(
+                        LoopPhase::Review,
+                        loop_timeout_secs,
+                        cli.quiet,
+                        review_phase_verdict(
+                            cli,
+                            reviewer.as_deref(),
+                            &reviewer_chain,
+                            ADVERSARIAL_SYSTEM,
+                            &review_user,
+                            max_tokens,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(msg) => (
+                            synthesize_review_phase_failure(&msg),
+                            None,
+                            0.0,
+                            String::new(),
+                        ),
+                    };
+                    total_cost += c;
+                    if m.is_some() {
+                        reviewer_model = m;
+                    }
+                    fresh.push(r);
+                }
+                let fresh: [ReviewOutput; 2] = fresh
+                    .try_into()
+                    .expect("exactly two fresh reviews are collected");
+                let verdicts: Vec<String> = std::iter::once(review.verdict.clone())
+                    .chain(fresh.iter().map(|r| r.verdict.clone()))
+                    .collect();
+                if let Some(last) = iterations.last_mut() {
+                    last["majority_samples"] = json!(verdicts);
+                    last["reviewer_model"] = json!(reviewer_model);
+                }
+                if majority_resolves_on_unchanged_diff(
+                    &review,
+                    &fresh,
+                    check_satisfied,
+                    substance_ok,
+                ) {
+                    resolved = true;
+                    final_verdict = "approve".into();
+                    if !cli.quiet {
+                        eprintln!(
+                            "[loop] iter {i}: RESOLVED by majority of three reviewer \
+samples on an unchanged diff"
+                        );
+                    }
+                    break;
+                }
+            }
+            // An unlocated block is comment-with-no-evidence: it must not burn
+            // the no-new-progress stall budget (there is no actionable defect
+            // to re-prompt against).
+            if !review_unlocated_no_evidence {
+                stall_streak += 1;
+            }
             if stall_streak >= STALL_LIMIT {
                 if !cli.quiet {
                     eprintln!(
@@ -6276,6 +6752,281 @@ mod tests {
         assert!(
             r.summary.to_ascii_lowercase().contains("approve"),
             "recovered summary should mention the recovered verdict"
+        );
+    }
+
+    // ---- A: prose is NOT a verdict on the loop path ----
+
+    #[test]
+    fn prose_is_not_a_json_verdict_on_the_loop_path() {
+        // The strict parser must reject keyword-recoverable prose...
+        assert!(
+            parse_review_json_only(
+                "I looked at the code. My verdict is approve. The implementation is clean."
+            )
+            .is_none(),
+            "prose must not be accepted as a loop verdict"
+        );
+        // ...while the legacy `parse_review` prose recovery is unchanged for
+        // non-loop callers (e.g. the standalone review surfaces).
+        assert_eq!(
+            parse_review(
+                "I looked at the code. My verdict is approve. The implementation is clean."
+            )
+            .verdict,
+            "approve"
+        );
+        // A real JSON verdict object is still accepted.
+        let parsed = parse_review_json_only(
+            "{\"verdict\":\"approve\",\"summary\":\"lgtm\",\"findings\":[]}",
+        )
+        .expect("a JSON verdict object must parse");
+        assert_eq!(parsed.verdict, "approve");
+    }
+
+    #[test]
+    fn reviewer_unavailable_is_fail_closed() {
+        let r = synthesize_reviewer_unavailable("free-form analysis without any verdict");
+        assert_eq!(r.verdict, REVIEWER_UNAVAILABLE_VERDICT);
+        assert!(
+            !loop_review_ok(&r, 0),
+            "reviewer_unavailable must never resolve the loop"
+        );
+        assert!(
+            !explicit_loop_approval(&r, 0),
+            "reviewer_unavailable must never count as explicit approval"
+        );
+        assert_eq!(
+            r.findings[0].body, "free-form analysis without any verdict",
+            "prose is preserved as a finding body for humans"
+        );
+    }
+
+    // ---- B: request_changes must be located ----
+
+    fn review_with(verdict: &str, findings: Vec<Finding>) -> ReviewOutput {
+        ReviewOutput {
+            verdict: verdict.into(),
+            summary: "summary".into(),
+            findings,
+            next_steps: vec![],
+        }
+    }
+
+    fn located_finding(severity: &str) -> Finding {
+        Finding {
+            severity: severity.into(),
+            title: "defect".into(),
+            body: "code body that must not reach the ledger".into(),
+            location: Some("crates/zoder-cli/src/agentic.rs:42".into()),
+        }
+    }
+
+    fn unlocated_finding(severity: &str) -> Finding {
+        Finding {
+            severity: severity.into(),
+            title: "defect".into(),
+            body: "code body".into(),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn unlocated_request_changes_is_invalid_and_fail_closed() {
+        let unlocated = review_with("request_changes", vec![unlocated_finding("high")]);
+        assert!(is_unlocated_block(&unlocated));
+        assert!(!request_changes_is_located(&unlocated));
+
+        let located = review_with("request_changes", vec![located_finding("high")]);
+        assert!(!is_unlocated_block(&located));
+        assert!(request_changes_is_located(&located));
+
+        // An empty findings array is likewise an invalid (unlocated) block.
+        assert!(is_unlocated_block(&review_with("request_changes", vec![])));
+
+        // The downgraded form is comment-with-no-evidence: readable, but it
+        // can NEVER resolve (unknown verdict => fail closed).
+        let marked = mark_unlocated_no_evidence(&unlocated);
+        assert_eq!(marked.verdict, COMMENT_NO_EVIDENCE_VERDICT);
+        assert!(!loop_review_ok(&marked, 0));
+        assert!(!explicit_loop_approval(&marked, 0));
+    }
+
+    // ---- C: unchanged diff + same blockers => 3-sample majority ----
+
+    #[test]
+    fn majority_loop_approval_requires_strict_majority() {
+        let approve = review_with("approve", vec![]);
+        let comment = review_with("comment", vec![]);
+        assert!(
+            majority_loop_approval(&[approve.clone(), approve.clone(), comment.clone()]),
+            "2/3 approve is a majority"
+        );
+        assert!(
+            majority_loop_approval(&[approve.clone(), approve.clone(), approve.clone()]),
+            "3/3 approve is a majority"
+        );
+        assert!(
+            !majority_loop_approval(&[approve.clone(), comment.clone(), comment.clone()]),
+            "1/3 approve is not a majority"
+        );
+        assert!(
+            !majority_loop_approval(&[]),
+            "an empty sample set is never an approval"
+        );
+    }
+
+    #[test]
+    fn majority_never_approves_with_an_unaddressed_located_blocker() {
+        let approve = review_with("approve", vec![]);
+        let located_block = review_with("request_changes", vec![located_finding("critical")]);
+        assert!(
+            !majority_loop_approval(&[approve.clone(), approve.clone(), located_block]),
+            "a located blocking finding in any sample vetoes approval"
+        );
+        // An UNLOCATED block is not a valid defect and does not veto a majority.
+        let unlocated_block = review_with("request_changes", vec![unlocated_finding("critical")]);
+        assert!(
+            majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
+            "an unlocated request_changes is comment-with-no-evidence, not a veto"
+        );
+    }
+
+    // ---- C: unchanged diff, fresh two-sample resolution decision ----
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_requires_both_fresh_approvals() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        let block = review_with("block", vec![]);
+
+        // current=block, r2=approve, r3=approve => resolves.
+        assert!(
+            majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), approve.clone()],
+                true,
+                true,
+            ),
+            "two independent fresh approvals overrule the current non-approve"
+        );
+
+        // current=block, r2=approve, r3=block => no strict majority => false.
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), block.clone()],
+                true,
+                true,
+            ),
+            "one fresh approve is not a majority against the current non-approve"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_vetoes_located_blocker_in_any_fresh_sample() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        // An `approve` verdict that still carries a located high finding must
+        // not be allowed to resolve: the located blocker vetoes across all
+        // three samples.
+        let located_high = review_with("approve", vec![located_finding("high")]);
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[located_high.clone(), approve.clone()],
+                true,
+                true,
+            ),
+            "a located blocking finding in fresh r2 vetoes approval"
+        );
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve.clone(), located_high.clone()],
+                true,
+                true,
+            ),
+            "a located blocking finding in fresh r3 vetoes approval"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_respects_objective_and_substance_gates() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        let both = [approve.clone(), approve.clone()];
+        assert!(
+            !majority_resolves_on_unchanged_diff(&current, &both, false, true),
+            "a failed/unknown check blocks even two fresh approvals"
+        );
+        assert!(
+            !majority_resolves_on_unchanged_diff(&current, &both, true, false),
+            "a non-substantive diff blocks even two fresh approvals"
+        );
+    }
+
+    #[test]
+    fn majority_resolves_on_unchanged_diff_fails_closed_on_unavailable_or_unparseable_sample() {
+        let current = review_with("request_changes", vec![]);
+        let approve = review_with("approve", vec![]);
+        // The three fail-closed shapes a fresh sample can take: reviewer never
+        // answered (unavailable), the phase watchdog fired (synthesized
+        // request_changes), and a verdict the parser could not recognize.
+        for bad in [
+            synthesize_reviewer_unavailable("prose only, no JSON verdict"),
+            synthesize_review_phase_failure("review phase timed out"),
+            review_with("", vec![]),
+        ] {
+            assert!(
+                !majority_resolves_on_unchanged_diff(
+                    &current,
+                    &[bad.clone(), approve.clone()],
+                    true,
+                    true,
+                ),
+                "an unavailable/unparseable fresh sample is a non-approve (fail closed)"
+            );
+            assert!(
+                !majority_resolves_on_unchanged_diff(
+                    &current,
+                    &[approve.clone(), bad.clone()],
+                    true,
+                    true,
+                ),
+                "an unavailable/unparseable fresh sample is a non-approve (fail closed)"
+            );
+        }
+    }
+
+    // ---- D: bounded located-findings ledger handoff ----
+
+    #[test]
+    fn bounded_located_findings_is_sanitized_and_capped() {
+        let findings = vec![located_finding("high"), unlocated_finding("critical")];
+        let out = bounded_located_findings(&findings, Some("reviewer-x"));
+        assert!(out.contains("reviewer-x"));
+        assert!(out.contains("high"));
+        assert!(out.contains("agentic.rs:42"));
+        assert!(
+            !out.contains("code body that must not reach the ledger"),
+            "code bodies must not reach the ledger"
+        );
+
+        // Many long findings must still fit the bound.
+        let many: Vec<Finding> = (0..200)
+            .map(|i| Finding {
+                severity: "critical".into(),
+                title: format!("finding {i} {}", "x".repeat(200)),
+                body: "y".repeat(500),
+                location: Some(format!("src/file{i}.rs:{}", i + 1)),
+            })
+            .collect();
+        let bounded = bounded_located_findings(&many, Some("reviewer-y"));
+        assert!(
+            bounded.chars().count() <= MAX_LEDGER_FINDINGS_CHARS,
+            "ledger handoff must be <= {MAX_LEDGER_FINDINGS_CHARS} chars, got {}",
+            bounded.chars().count()
         );
     }
 
