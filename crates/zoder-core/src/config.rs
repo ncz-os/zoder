@@ -508,6 +508,7 @@ struct EngineProviderModel {
     model: String,
     chat_template_kwargs: Option<serde_json::Value>,
     reasoning_effort: Option<String>,
+    response_format: Option<serde_json::Value>,
     kind: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
@@ -745,6 +746,32 @@ impl EngineModelRegistry {
             .values()
             .find(|profile| profile.model == model && profile.reasoning_effort.is_some())
             .and_then(|profile| profile.reasoning_effort.as_deref())
+    }
+
+    /// Return the OpenAI-style `response_format` object attached to the engine
+    /// profile that serves this model, with the same precedence as
+    /// [`Self::reasoning_effort_for_model`]. A direct reviewer call (which does
+    /// not forward the engine's `provider_extra` blob) uses this to ask a
+    /// structured-output reviewer for `json_object`. `None` omits the field.
+    pub fn response_format_for_model(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+    ) -> Option<&serde_json::Value> {
+        for alias in agent_alias.into_iter().chain(std::iter::once("reviewer")) {
+            if let Some(profile) = self
+                .model_provider_ref_for_agent(alias)
+                .and_then(|reference| self.models.get(reference))
+            {
+                if profile.model == model && profile.response_format.is_some() {
+                    return profile.response_format.as_ref();
+                }
+            }
+        }
+        self.models
+            .values()
+            .find(|profile| profile.model == model && profile.response_format.is_some())
+            .and_then(|profile| profile.response_format.as_ref())
     }
 
     /// Return the exact provider-profile reference configured on an agent,
@@ -1505,6 +1532,19 @@ fn collect_engine_models(
                         .or_else(|| child.get("reasoning_effort"))
                         .and_then(toml::Value::as_str)
                         .map(str::to_owned),
+                    // zeroclaw forwards `provider_extra` verbatim, so
+                    // `provider_extra.response_format` is the one place an
+                    // operator pins an OpenAI-style structured-output object
+                    // for both the engine loop and zoder's direct reviewer
+                    // path. Only a table/object is accepted (a stray string or
+                    // array is ignored rather than forwarded as a malformed
+                    // body field).
+                    response_format: child
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("response_format"))
+                        .or_else(|| child.get("response_format"))
+                        .and_then(|value| serde_json::to_value(value).ok())
+                        .filter(serde_json::Value::is_object),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1579,6 +1619,12 @@ fn collect_engine_models_json(
                         .or_else(|| child.get("reasoning_effort"))
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
+                    response_format: child
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("response_format"))
+                        .or_else(|| child.get("response_format"))
+                        .filter(|value| value.is_object())
+                        .cloned(),
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -3759,6 +3805,50 @@ provider_extra = { reasoning_effort = "none" }
             registry.reasoning_effort_for_model("model-c", None),
             Some("none")
         );
+    }
+
+    #[test]
+    fn reviewer_response_format_comes_from_selected_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "model-a"
+response_format = { type = "text" }
+[providers.models.custom.reviewer]
+model = "model-a"
+provider_extra = { response_format = { type = "json_object" } }
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .unwrap();
+        // The reviewer alias wins over the other profile serving the same model.
+        assert_eq!(
+            registry.response_format_for_model("model-a", None),
+            Some(&serde_json::json!({"type": "json_object"}))
+        );
+        assert_eq!(registry.response_format_for_model("different", None), None);
+    }
+
+    #[test]
+    fn provider_extra_response_format_wins_over_top_level_and_rejects_non_objects() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.both]
+model = "model-c"
+response_format = { type = "text" }
+provider_extra = { response_format = { type = "json_object" } }
+[providers.models.custom.bogus]
+model = "model-d"
+response_format = "not-an-object"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.response_format_for_model("model-c", None),
+            Some(&serde_json::json!({"type": "json_object"}))
+        );
+        assert_eq!(registry.response_format_for_model("model-d", None), None);
     }
     use crate::ledger::Entry;
     use crate::subscription_tiers::TierCatalog;

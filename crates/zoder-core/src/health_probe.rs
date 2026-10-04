@@ -95,6 +95,7 @@ pub fn probe_request(model_id: &str) -> ChatRequest {
         top_k: None,
         presence_penalty: None,
         chat_template_kwargs: None,
+        response_format: None,
     }
 }
 
