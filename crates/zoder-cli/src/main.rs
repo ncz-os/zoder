@@ -13,6 +13,7 @@ mod exec_safety;
 mod goose;
 mod jobs;
 mod mnemos;
+mod review_diff;
 mod reviewer_pool;
 mod sop;
 mod utilization;
@@ -674,6 +675,26 @@ enum Cmd {
         /// Run detached as a tracked background job (see `status`/`result`).
         #[arg(long)]
         background: bool,
+        /// Exclude a path glob from the diff sent to reviewers (repeatable).
+        /// Excluded paths also drop out of the size check; the output reports
+        /// how many files/bytes were excluded. Repo-level defaults come from
+        /// a `.zoderignore` file and the `[review].exclude` config list.
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
+        /// Raise the total-diff byte cap (default 120000; config key
+        /// `[review].max_diff_bytes`). Useful for a long-context reviewer.
+        #[arg(long, value_name = "N")]
+        max_diff_bytes: Option<usize>,
+        /// Raise the per-hunk byte cap (default 9000; config key
+        /// `[review].max_hunk_bytes`).
+        #[arg(long, value_name = "N")]
+        max_hunk_bytes: Option<usize>,
+        /// Fail instead of deterministically splitting an oversized hunk.
+        #[arg(long)]
+        no_split_hunks: bool,
+        /// Print the review chunks and diff map without calling any model.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Adversarial review: challenge the approach, design, and assumptions.
     /// Accepts optional focus text after the flags.
@@ -687,6 +708,16 @@ enum Cmd {
         panel: Option<String>,
         #[arg(long)]
         background: bool,
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
+        #[arg(long, value_name = "N")]
+        max_diff_bytes: Option<usize>,
+        #[arg(long, value_name = "N")]
+        max_hunk_bytes: Option<usize>,
+        #[arg(long)]
+        no_split_hunks: bool,
+        #[arg(long)]
+        dry_run: bool,
         /// Extra focus for the reviewer (free text).
         #[arg(trailing_var_arg = true)]
         focus: Vec<String>,
@@ -1834,6 +1865,11 @@ async fn run() -> anyhow::Result<()> {
             scope,
             panel,
             background,
+            exclude,
+            max_diff_bytes,
+            max_hunk_bytes,
+            no_split_hunks,
+            dry_run,
         }) => {
             agentic::cmd_review(
                 &cli,
@@ -1843,6 +1879,13 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 false,
                 &[],
+                agentic::ReviewSizeOptions {
+                    excludes: exclude.clone(),
+                    max_diff_bytes: *max_diff_bytes,
+                    max_hunk_bytes: *max_hunk_bytes,
+                    split_hunks: !*no_split_hunks,
+                    dry_run: *dry_run,
+                },
             )
             .await
         }
@@ -1851,6 +1894,11 @@ async fn run() -> anyhow::Result<()> {
             scope,
             panel,
             background,
+            exclude,
+            max_diff_bytes,
+            max_hunk_bytes,
+            no_split_hunks,
+            dry_run,
             focus,
         }) => {
             agentic::cmd_review(
@@ -1861,6 +1909,13 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 true,
                 focus,
+                agentic::ReviewSizeOptions {
+                    excludes: exclude.clone(),
+                    max_diff_bytes: *max_diff_bytes,
+                    max_hunk_bytes: *max_hunk_bytes,
+                    split_hunks: !*no_split_hunks,
+                    dry_run: *dry_run,
+                },
             )
             .await
         }

@@ -1866,6 +1866,39 @@ pub struct Config {
     /// `crates/zoder-cli/src/exec_safety::wrap_spawn_command`).
     #[serde(default)]
     pub exec_safety: ExecSafetyConfig,
+    /// `[review]` block: size caps and generated-file exclusions for
+    /// `zoder review` / `adversarial-review`. An absent block preserves the
+    /// historical 120000-byte total cap and 9000-byte per-hunk cap and
+    /// excludes nothing, so default behavior is unchanged.
+    #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
+    pub review: ReviewConfig,
+}
+
+/// `[review]` block from `config.json` / an overlay TOML. Every field is
+/// optional: an absent block preserves the historical review size caps and
+/// excludes nothing. CLI flags (`--max-diff-bytes`, `--max-hunk-bytes`,
+/// `--exclude`) take precedence over these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Total diff byte cap for a single review pass. CLI: `--max-diff-bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<usize>,
+    /// Per-hunk byte cap; an oversized hunk is split into ordered sub-hunks
+    /// when splitting is enabled. CLI: `--max-hunk-bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hunk_bytes: Option<usize>,
+    /// Globs excluded from the diff sent to reviewers (and from the size
+    /// check), in addition to any `.zoderignore` at the repo root and any
+    /// `--exclude` on the command line. CLI: `--exclude`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+impl ReviewConfig {
+    fn is_empty(&self) -> bool {
+        self.max_diff_bytes.is_none() && self.max_hunk_bytes.is_none() && self.exclude.is_empty()
+    }
 }
 
 /// Routing-scenario block from `config.json` / an overlay TOML. Mirrors the
@@ -2785,6 +2818,7 @@ impl Config {
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
+            review: ReviewConfig::default(),
         }
     }
 
