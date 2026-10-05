@@ -230,6 +230,9 @@ Options:
       --reviewer-pool-routes <PROVIDER=MODEL,...>
           Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
+      --exclude <GLOB>
+          
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -239,11 +242,20 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
+      --max-diff-bytes <N>
+          
+
+      --max-hunk-bytes <N>
+          
+
       --require-free
           Only ever use free models; never fall back to paid
 
+      --no-split-hunks
+          
+
       --dry-run
-          Print the routing decision + cost estimate without calling
+          
 
       --explain
           Explain why a model was chosen
@@ -3745,6 +3757,9 @@ Options:
       --reviewer-pool-routes <PROVIDER=MODEL,...>
           Verified secondary reviewer pool as exact provider=model pairs. Requires --reviewer-allowed-routes. Keeps the configured primary first; pool members need a matching-provider successful health probe within one hour and are ranked by measured latency. No healthy member means no pool fallback. Refresh with health --probe --all -m MODEL
 
+      --exclude <GLOB>
+          Exclude a path glob from the diff sent to reviewers (repeatable). Excluded paths also drop out of the size check; the output reports how many files/bytes were excluded. Repo-level defaults come from a `.zoderignore` file and the `[review].exclude` config list
+
       --tier <TIER>
           Routing tier: fast | strong | auto | single-pass | grind (default auto). Out-of-set values are rejected at parse time so a typo (e.g. `strogn`) can never silently downgrade to `auto` routing. The accepted set mirrors `zoder_core::router::Tier::parse`
           
@@ -3754,11 +3769,20 @@ Options:
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
 
+      --max-diff-bytes <N>
+          Raise the total-diff byte cap (default 120000; config key `[review].max_diff_bytes`). Useful for a long-context reviewer
+
+      --max-hunk-bytes <N>
+          Raise the per-hunk byte cap (default 9000; config key `[review].max_hunk_bytes`)
+
       --require-free
           Only ever use free models; never fall back to paid
 
+      --no-split-hunks
+          Fail instead of deterministically splitting an oversized hunk
+
       --dry-run
-          Print the routing decision + cost estimate without calling
+          Print the review chunks and diff map without calling any model
 
       --explain
           Explain why a model was chosen

@@ -25,6 +25,17 @@ use zoder_core::{
 
 use crate::{Engine, ReviewScope};
 
+/// Size/exclusion knobs for `zoder review` / `adversarial-review`, resolved
+/// from CLI flags, the `[review]` config block, and built-in defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewSizeOptions {
+    pub excludes: Vec<String>,
+    pub max_diff_bytes: Option<usize>,
+    pub max_hunk_bytes: Option<usize>,
+    pub split_hunks: bool,
+    pub dry_run: bool,
+}
+
 #[cfg(test)]
 static TEST_BACKGROUND_WORKER_COMMAND: std::sync::Mutex<Option<(PathBuf, Vec<String>)>> =
     std::sync::Mutex::new(None);
@@ -3196,58 +3207,6 @@ Findings MUST be an array of objects, never an array of strings. Each finding ob
 next_steps MUST be a top-level array of strings. Use empty arrays when there are no findings or next steps. Write an actual review of this diff. \
 Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
-const REVIEW_CHUNK_BYTES: usize = 9_000;
-const MAX_REVIEW_CHUNKS: usize = 24;
-
-/// Split at file and hunk boundaries so a reviewer never sees a line cut in
-/// half. Each hunk carries its file header; this also keeps locations useful
-/// when one file spans several requests. Oversized individual hunks fail
-/// closed instead of silently clipping code the reviewer needs to inspect.
-fn review_diff_chunks(diff: &str) -> anyhow::Result<Vec<String>> {
-    let mut starts = vec![0usize];
-    starts.extend(diff.match_indices("\ndiff --git ").map(|(i, _)| i + 1));
-    let mut units = Vec::new();
-    for (idx, start) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).copied().unwrap_or(diff.len());
-        let file = &diff[*start..end];
-        let Some(first_hunk) = file.find("\n@@").map(|i| i + 1) else {
-            units.push(file.to_owned());
-            continue;
-        };
-        let header = &file[..first_hunk];
-        let body = &file[first_hunk..];
-        let mut hunk_starts = vec![0usize];
-        hunk_starts.extend(body.match_indices("\n@@").map(|(i, _)| i + 1));
-        for (hidx, hstart) in hunk_starts.iter().enumerate() {
-            let hend = hunk_starts.get(hidx + 1).copied().unwrap_or(body.len());
-            units.push(format!("{header}{}", &body[*hstart..hend]));
-        }
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    for unit in units {
-        if unit.len() > REVIEW_CHUNK_BYTES {
-            anyhow::bail!(
-                "one diff hunk is {} bytes, above the {}-byte review limit; split the change into smaller commits",
-                unit.len(), REVIEW_CHUNK_BYTES
-            );
-        }
-        if chunks
-            .last()
-            .is_none_or(|chunk| chunk.len() + unit.len() > REVIEW_CHUNK_BYTES)
-        {
-            chunks.push(String::new());
-        }
-        chunks
-            .last_mut()
-            .expect("chunk was just created")
-            .push_str(&unit);
-        if chunks.len() > MAX_REVIEW_CHUNKS {
-            anyhow::bail!("diff needs more than {MAX_REVIEW_CHUNKS} review chunks; narrow the branch or review its commits separately");
-        }
-    }
-    Ok(chunks)
-}
-
 fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usize, count: usize) {
     if verdict_rank(&review.verdict) > verdict_rank(&merged.verdict) {
         merged.verdict = review.verdict;
@@ -3326,6 +3285,59 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
     })
 }
 
+/// Print exactly what `review` would send, without calling any model. Used by
+/// `--dry-run` and by the size/exclusion acceptance checks.
+fn print_review_dry_run(
+    label: &str,
+    raw_diff: &str,
+    prepared: &crate::review_diff::PreparedDiff,
+    prompts: &[String],
+    max_diff_bytes: usize,
+    max_hunk_bytes: usize,
+) {
+    println!("[zoder] dry-run: {label}");
+    println!(
+        "[zoder] diff bytes: {} raw, {} after exclusions",
+        raw_diff.len(),
+        prepared.filtered.len()
+    );
+    println!("[zoder] caps: max-diff-bytes={max_diff_bytes} max-hunk-bytes={max_hunk_bytes}");
+    if prepared.excluded.is_empty() {
+        println!("[zoder] excluded: none");
+    } else {
+        println!("[zoder] excluded: {}", prepared.excluded.render());
+    }
+    println!(
+        "[zoder] chunks: {} (diff map: {})",
+        prepared.chunks.len(),
+        prepared
+            .diff_map
+            .as_ref()
+            .map(|m| format!("{} bytes", m.len()))
+            .unwrap_or_else(|| "not needed (single chunk)".to_string())
+    );
+    if let Some(map) = &prepared.diff_map {
+        println!("[zoder] diff map:\n{map}");
+    }
+    // Print the assembled per-chunk prompts (map included), not the raw diff
+    // slices, so a dry-run shows exactly what each reviewer would receive.
+    for (i, prompt) in prompts.iter().enumerate() {
+        println!(
+            "[zoder] ---- prompt chunk {}/{} ({} bytes) ----",
+            i + 1,
+            prompts.len(),
+            prompt.len()
+        );
+        print!("{prompt}");
+        if !prompt.ends_with('\n') {
+            println!();
+        }
+    }
+}
+
+// Signature grows with review options; the size/exclusion knobs are bundled
+// into `ReviewSizeOptions`, so the arg count stays close to the historical one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
     base: Option<String>,
@@ -3334,6 +3346,7 @@ pub(crate) async fn cmd_review(
     background: bool,
     adversarial: bool,
     focus: &[String],
+    opts: ReviewSizeOptions,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
 
@@ -3383,28 +3396,81 @@ pub(crate) async fn cmd_review(
     } else {
         REVIEW_SYSTEM
     };
-    let focus_txt = focus.join(" ");
-    if diff.len() > 120_000 {
-        anyhow::bail!("review diff is {} bytes, above the 120000-byte limit; narrow the branch or review its commits separately", diff.len());
+
+    // Resolve the review caps and exclusions. Loading the engine here (not
+    // just below for the reviewer chain) lets `[review]` config participate;
+    // a config problem degrades to the built-in defaults rather than blocking
+    // a review.
+    let eng = Engine::load().ok();
+    let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
+    let max_diff_bytes = crate::review_diff::resolve_limit(
+        opts.max_diff_bytes,
+        review_cfg.as_ref().and_then(|r| r.max_diff_bytes),
+        crate::review_diff::DEFAULT_MAX_DIFF_BYTES,
+    );
+    let max_hunk_bytes = crate::review_diff::resolve_limit(
+        opts.max_hunk_bytes,
+        review_cfg.as_ref().and_then(|r| r.max_hunk_bytes),
+        crate::review_diff::DEFAULT_MAX_HUNK_BYTES,
+    );
+    let config_excludes = review_cfg.map(|r| r.exclude).unwrap_or_default();
+    let root = crate::review_diff::repo_root(&cwd);
+    let prepared = crate::review_diff::prepare_review_diff(
+        &root,
+        &diff,
+        &opts.excludes,
+        &config_excludes,
+        max_diff_bytes,
+        max_hunk_bytes,
+        opts.split_hunks,
+    )?;
+    if !prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
+        eprintln!("[zoder] {}", prepared.excluded.render());
     }
-    let chunks = review_diff_chunks(&diff)?;
-    let users: Vec<String> = chunks
+
+    let focus_txt = focus.join(" ");
+    let chunk_count = prepared.chunks.len();
+    let users: Vec<String> = prepared
+        .chunks
         .iter()
         .enumerate()
         .map(|(idx, chunk)| {
-            let portion = if chunks.len() == 1 {
+            let portion = if chunk_count == 1 {
                 format!("{label} diff")
             } else {
-                format!("{label} diff, chunk {}/{}", idx + 1, chunks.len())
+                format!("{label} diff, chunk {}/{}", idx + 1, chunk_count)
             };
             let focus = if focus_txt.trim().is_empty() {
                 String::new()
             } else {
                 format!(" Focus especially on: {focus_txt}.")
             };
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.\n\n```diff\n{chunk}\n```")
+            // A multi-chunk review gets the cross-chunk map prepended so a
+            // symbol defined in another chunk is never reported as missing.
+            let map = prepared.diff_map.as_ref().map_or(String::new(), |map| {
+                format!(
+                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; \
+the chunk under review is {}/{}). Before reporting a symbol as undefined, \
+redefined, or recursively calling a missing function, check it against this map:\n{}",
+                    idx + 1,
+                    chunk_count,
+                    map
+                )
+            });
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
         })
         .collect();
+    if opts.dry_run {
+        print_review_dry_run(
+            &label,
+            &diff,
+            &prepared,
+            &users,
+            max_diff_bytes,
+            max_hunk_bytes,
+        );
+        return Ok(());
+    }
 
     // Standalone review has no author turn: `-m` pins its primary reviewer.
     // Without it, use the configured reviewer/scenario route. Additional
@@ -3420,7 +3486,6 @@ pub(crate) async fn cmd_review(
     // pin, then profile-level `Config::reviewer_model`), then the
     // scenario-eligible reviewer as a tail fallback, then the cross-family
     // legacy default. Scenario auto-routing never shadows a configured pin.
-    let eng = Engine::load().ok();
     let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
@@ -6547,10 +6612,10 @@ mod tests {
             diff.push_str(&format!("@@ -{n},1 +{n},1 @@\n"));
             diff.push_str(&format!("+changed_{n}_{}\n", "x".repeat(350)));
         }
-        let chunks = review_diff_chunks(&diff).unwrap();
+        let chunks = crate::review_diff::review_diff_chunks(&diff, 9_000, true, 64).unwrap();
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= REVIEW_CHUNK_BYTES);
+            assert!(chunk.len() <= 9_000);
             assert!(chunk.starts_with(header));
         }
         for n in 0..32 {
@@ -6566,15 +6631,27 @@ mod tests {
     }
 
     #[test]
-    fn review_chunks_reject_oversized_single_hunk() {
+    fn review_chunks_split_oversized_hunk_when_enabled() {
+        let body: String = (0..1200).map(|i| format!("+line_{i}\n")).collect();
+        let diff = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n{body}");
+        let chunks = crate::review_diff::review_diff_chunks(&diff, 9_000, true, 64).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 9_000));
+        assert!(chunks.join("").contains("part 1/"));
+    }
+
+    #[test]
+    fn review_chunks_reject_oversized_hunk_when_splitting_disabled() {
         let diff = format!(
             "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+{}\n",
-            "x".repeat(REVIEW_CHUNK_BYTES)
+            "x".repeat(9_000)
         );
-        assert!(review_diff_chunks(&diff)
-            .unwrap_err()
-            .to_string()
-            .contains("one diff hunk"));
+        assert!(
+            crate::review_diff::review_diff_chunks(&diff, 9_000, false, 64)
+                .unwrap_err()
+                .to_string()
+                .contains("--max-hunk-bytes")
+        );
     }
 
     #[test]
