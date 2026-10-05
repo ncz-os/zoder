@@ -1,7 +1,7 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-10-04",
-  "generated": "2026-10-04",
+  "arena_date": "2026-10-05",
+  "generated": "2026-10-05",
   "count": 3647,
   "routable": 107,
   "scored": 2230,
@@ -29905,8 +29905,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.25,
-        "output_usd_per_mtok": 1.0,
+        "input_usd_per_mtok": 0.29,
+        "output_usd_per_mtok": 1.1400000000000001,
         "source": "openrouter"
       },
       "agentic_score": 0.484,
@@ -30402,8 +30402,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.55,
-        "output_usd_per_mtok": 4.199999999999999,
+        "input_usd_per_mtok": 0.44999999999999996,
+        "output_usd_per_mtok": 5.0,
         "source": "openrouter"
       },
       "agentic_score": 0.603,
@@ -30451,8 +30451,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.003,
-        "output_usd_per_mtok": 2.4,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       },
       "agentic_score": 0.753,
@@ -42789,8 +42789,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0675,
-        "output_usd_per_mtok": 0.22499999999999998,
+        "input_usd_per_mtok": 0.09,
+        "output_usd_per_mtok": 0.3,
         "source": "openrouter"
       },
       "agentic_score": 0.431,
@@ -47475,8 +47475,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.22,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.32,
         "source": "openrouter"
       }
     },
@@ -51112,8 +51112,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.72,
-        "output_usd_per_mtok": 13.0,
+        "input_usd_per_mtok": 0.67,
+        "output_usd_per_mtok": 14.0,
         "source": "openrouter"
       },
       "agentic_score": 0.882,
@@ -57438,8 +57438,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0595,
-        "output_usd_per_mtok": 0.16999999999999998,
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 0.16,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -60956,8 +60956,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 4.0,
-        "output_usd_per_mtok": 20.0,
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
       "agentic_score": 0.707,
@@ -63971,8 +63971,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.028,
-        "output_usd_per_mtok": 0.056,
+        "input_usd_per_mtok": 0.0224,
+        "output_usd_per_mtok": 1.28,
         "source": "litellm"
       },
       "agentic_score": 0.864,
@@ -64129,8 +64129,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.22,
-        "output_usd_per_mtok": 4.199999999999999,
+        "input_usd_per_mtok": 0.85,
+        "output_usd_per_mtok": 5.0,
         "source": "litellm"
       },
       "agentic_score": 0.603,
@@ -64178,8 +64178,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.003,
+        "output_usd_per_mtok": 2.4,
         "source": "litellm"
       },
       "agentic_score": 0.753,
@@ -67118,8 +67118,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.499,
-        "output_usd_per_mtok": 13.0,
+        "input_usd_per_mtok": 0.72,
+        "output_usd_per_mtok": 14.0,
         "source": "litellm"
       },
       "agentic_score": 0.882,
@@ -72310,8 +72310,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.42,
-        "output_usd_per_mtok": 3.0,
+        "input_usd_per_mtok": 0.425,
+        "output_usd_per_mtok": 2.5500000000000003,
         "source": "litellm"
       },
       "agentic_score": 0.849,
@@ -74151,8 +74151,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 3.49,
+        "input_usd_per_mtok": 0.10400000000000001,
+        "output_usd_per_mtok": 8.0,
         "source": "litellm"
       },
       "agentic_score": 0.649,
@@ -77447,7 +77447,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.32,
-        "output_usd_per_mtok": 3.1999999999999997,
+        "output_usd_per_mtok": 2.7,
         "source": "openrouter"
       },
       "agentic_score": 0.7,
@@ -77753,8 +77753,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.42,
-        "output_usd_per_mtok": 3.0,
+        "input_usd_per_mtok": 0.425,
+        "output_usd_per_mtok": 2.5500000000000003,
         "source": "openrouter"
       },
       "agentic_score": 0.849,
@@ -96257,8 +96257,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.38,
-        "output_usd_per_mtok": 3.49,
+        "input_usd_per_mtok": 0.0224,
+        "output_usd_per_mtok": 16.0,
         "source": "openrouter"
       },
       "agentic_score": 0.649,
@@ -96306,8 +96306,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 1.4,
-        "output_usd_per_mtok": 4.4,
+        "input_usd_per_mtok": 0.049999999999999996,
+        "output_usd_per_mtok": 7.0,
         "source": "openrouter"
       },
       "agentic_score": 0.867,
@@ -97482,7 +97482,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.6624,
+        "input_usd_per_mtok": 0.66,
         "output_usd_per_mtok": 13.0,
         "source": "openrouter"
       },
@@ -97649,8 +97649,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 5.0,
+        "input_usd_per_mtok": 0.03,
+        "output_usd_per_mtok": 12.0,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
