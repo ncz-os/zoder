@@ -510,14 +510,10 @@
   "w_swe": 0.838
  },
  "deepseek-v4": {
-  "agentic_score": 0.602,
+  "agentic_score": 0.827,
   "arena_coding_elo": 1581.9,
   "arena_webdev_elo": 1581.9,
   "capability": {
-   "scale_seal": {
-    "acc": 27.15,
-    "source": "scale-seal"
-   },
    "swe_verified": {
     "acc": 96.4,
     "cost_per_test": 0.1031,
@@ -538,7 +534,7 @@
     "votes": 4744
    }
   },
-  "w_swe": 0.902
+  "w_swe": 0.982
  },
  "deepseek-v4-1-flash": {
   "agentic_score": 0.751,
@@ -628,14 +624,14 @@
   "w_swe": 0.774
  },
  "fable-5-1": {
-  "agentic_score": 0.6,
+  "agentic_score": 0.567,
   "capability": {
    "scale_seal": {
-    "acc": 59.95,
+    "acc": 56.67,
     "source": "scale-seal"
    }
   },
-  "w_swe": 0.8
+  "w_swe": 0.783
  },
  "gemini": {
   "agentic_score": 0.382,
@@ -932,12 +928,12 @@
   "w_swe": 0.91
  },
  "gemini-3-8-flash": {
-  "agentic_score": 0.649,
+  "agentic_score": 0.645,
   "arena_coding_elo": 1583.3,
   "arena_webdev_elo": 1583.3,
   "capability": {
    "scale_seal": {
-    "acc": 45.9,
+    "acc": 44.76,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1131,12 +1127,12 @@
   "w_swe": 0.882
  },
  "glm-5-2": {
-  "agentic_score": 0.652,
+  "agentic_score": 0.643,
   "arena_coding_elo": 1603.0,
   "arena_webdev_elo": 1603.0,
   "capability": {
    "scale_seal": {
-    "acc": 45.25,
+    "acc": 42.38,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1389,12 +1385,12 @@
   "w_swe": 0.845
  },
  "gpt-5-3": {
-  "agentic_score": 0.56,
+  "agentic_score": 0.578,
   "arena_coding_elo": 1408.6,
   "arena_webdev_elo": 1408.6,
   "capability": {
    "scale_seal": {
-    "acc": 37.49,
+    "acc": 42.38,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1412,7 +1408,7 @@
     "votes": 2643
    }
   },
-  "w_swe": 0.789
+  "w_swe": 0.801
  },
  "gpt-5-4": {
   "agentic_score": 0.44,
@@ -1476,12 +1472,12 @@
   "w_swe": 0.849
  },
  "gpt-5-5": {
-  "agentic_score": 0.588,
+  "agentic_score": 0.586,
   "arena_coding_elo": 1512.7,
   "arena_webdev_elo": 1512.7,
   "capability": {
    "scale_seal": {
-    "acc": 45.43,
+    "acc": 44.79,
     "source": "scale-seal"
    },
    "swe_verified": {
@@ -1546,14 +1542,10 @@
   "w_swe": 0.965
  },
  "gpt-5-6-sol": {
-  "agentic_score": 0.706,
+  "agentic_score": 0.869,
   "arena_coding_elo": 1617.8,
   "arena_webdev_elo": 1617.8,
   "capability": {
-   "scale_seal": {
-    "acc": 46.0,
-    "source": "scale-seal"
-   },
    "swe_verified": {
     "acc": 96.2,
     "cost_per_test": 1.1513,
@@ -1574,7 +1566,7 @@
     "votes": 16439
    }
   },
-  "w_swe": 0.931
+  "w_swe": 0.981
  },
  "gpt-5-6-terra": {
   "agentic_score": 0.796,
@@ -1635,12 +1627,12 @@
   "w_swe": 1.0
  },
  "gpt-6-astra": {
-  "agentic_score": 0.708,
+  "agentic_score": 0.707,
   "arena_coding_elo": 1787.6,
   "arena_webdev_elo": 1787.6,
   "capability": {
    "scale_seal": {
-    "acc": 59.14,
+    "acc": 59.05,
     "source": "scale-seal"
    }
   },
@@ -2574,12 +2566,8 @@
   "w_swe": 0.713
  },
  "muse-spark": {
-  "agentic_score": 0.493,
+  "agentic_score": 0.744,
   "capability": {
-   "scale_seal": {
-    "acc": 24.2,
-    "source": "scale-seal"
-   },
    "swe_verified": {
     "acc": 74.4,
     "cost_per_test": 0.4445,
@@ -2587,17 +2575,13 @@
     "source": "vals.ai"
    }
   },
-  "w_swe": 0.747
+  "w_swe": 0.872
  },
  "muse-spark-1-1": {
-  "agentic_score": 0.588,
+  "agentic_score": 0.717,
   "arena_coding_elo": 1542.2,
   "arena_webdev_elo": 1542.2,
   "capability": {
-   "scale_seal": {
-    "acc": 42.2,
-    "source": "scale-seal"
-   },
    "swe_verified": {
     "acc": 82.0,
     "cost_per_test": 0.352,
@@ -2618,7 +2602,7 @@
     "votes": 8008
    }
   },
-  "w_swe": 0.869
+  "w_swe": 0.91
  },
  "muse-spark-1-2": {
   "agentic_score": 0.743,
@@ -2787,24 +2771,14 @@
   "w_swe": 0.743
  },
  "opus-4-8": {
-  "agentic_score": 0.573,
+  "agentic_score": 0.467,
   "capability": {
    "scale_seal": {
-    "acc": 57.26,
+    "acc": 46.67,
     "source": "scale-seal"
    }
   },
-  "w_swe": 0.786
- },
- "opus-5": {
-  "agentic_score": 0.632,
-  "capability": {
-   "scale_seal": {
-    "acc": 63.17,
-    "source": "scale-seal"
-   }
-  },
-  "w_swe": 0.816
+  "w_swe": 0.733
  },
  "quasar-alpha": {
   "agentic_score": 0.547,

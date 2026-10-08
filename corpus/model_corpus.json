@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-10-07",
-  "generated": "2026-10-07",
-  "count": 3658,
+  "arena_date": "2026-10-08",
+  "generated": "2026-10-08",
+  "count": 3677,
   "routable": 105,
-  "scored": 2240,
+  "scored": 2259,
   "models": [
     {
       "id": "ai21.j2-mid-v1",
@@ -544,13 +544,9 @@
         "output_usd_per_mtok": 3.38,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -939,11 +935,11 @@
         "output_usd_per_mtok": 7.889,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -1117,11 +1113,11 @@
         "output_usd_per_mtok": 14.0,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -1319,11 +1315,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -1368,11 +1364,11 @@
         "output_usd_per_mtok": 180.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -3129,6 +3125,35 @@
       }
     },
     {
+      "id": "anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "anthropic.claude-haiku-5-5",
+      "family": "anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "anthropic.claude-instant-v1",
       "host": "",
       "leaf": "anthropic.claude-instant-v1",
@@ -3950,6 +3975,64 @@
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 2.5,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "anthropic/claude-haiku-5.5",
+      "host": "anthropic",
+      "leaf": "claude-haiku-5.5",
+      "family": "anthropic",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "anthropic/claude-haiku-5.5:batch",
+      "host": "anthropic",
+      "leaf": "claude-haiku-5.5:batch",
+      "family": "anthropic",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.049999999999999996,
+        "output_usd_per_mtok": 0.25,
         "source": "openrouter"
       },
       "agentic_score": 0.74,
@@ -5107,6 +5190,35 @@
       }
     },
     {
+      "id": "apac.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "apac.anthropic.claude-haiku-5-5",
+      "family": "apac.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "apac.anthropic.claude-mythos-preview",
       "host": "",
       "leaf": "apac.anthropic.claude-mythos-preview",
@@ -5453,6 +5565,35 @@
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 5.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "au.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "au.anthropic.claude-haiku-5-5",
+      "family": "au.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -6391,11 +6532,11 @@
         "output_usd_per_mtok": 15.400000000000002,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -6580,11 +6721,11 @@
         "output_usd_per_mtok": 33.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -6761,13 +6902,9 @@
         "output_usd_per_mtok": 22.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -6855,12 +6992,12 @@
         "output_usd_per_mtok": 60.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -8258,11 +8395,11 @@
         "output_usd_per_mtok": 14.0,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -8507,11 +8644,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -8717,13 +8854,9 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -8869,12 +9002,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -10112,11 +10245,11 @@
         "output_usd_per_mtok": 15.400000000000002,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -10301,11 +10434,11 @@
         "output_usd_per_mtok": 33.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -10482,13 +10615,9 @@
         "output_usd_per_mtok": 22.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -10576,12 +10705,12 @@
         "output_usd_per_mtok": 55.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -12021,6 +12150,35 @@
       }
     },
     {
+      "id": "azure_ai/claude-haiku-5-5",
+      "host": "azure_ai",
+      "leaf": "claude-haiku-5-5",
+      "family": "azure_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "azure_ai/claude-opus-4-5",
       "host": "azure_ai",
       "leaf": "claude-opus-4-5",
@@ -12698,13 +12856,9 @@
         "output_usd_per_mtok": 3.48,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -12996,11 +13150,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -13103,12 +13257,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -14390,13 +14544,9 @@
         "output_usd_per_mtok": 3.48,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -14439,13 +14589,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -15133,11 +15279,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -15182,11 +15328,11 @@
         "output_usd_per_mtok": 6.6000000000000005,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -18423,6 +18569,35 @@
       }
     },
     {
+      "id": "bedrock/us-gov-east-1/anthropic.claude-haiku-5-5",
+      "host": "bedrock",
+      "leaf": "us-gov-east-1/anthropic.claude-haiku-5-5",
+      "family": "bedrock",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 0.6,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "bedrock/us-gov-east-1/anthropic.claude-opus-4-8",
       "host": "bedrock",
       "leaf": "us-gov-east-1/anthropic.claude-opus-4-8",
@@ -19062,6 +19237,35 @@
       "economics": {
         "input_usd_per_mtok": 1.2,
         "output_usd_per_mtok": 6.0,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "bedrock/us-gov-west-1/anthropic.claude-haiku-5-5",
+      "host": "bedrock",
+      "leaf": "us-gov-west-1/anthropic.claude-haiku-5-5",
+      "family": "bedrock",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 0.6,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -20090,6 +20294,35 @@
       }
     },
     {
+      "id": "bedrock_mantle/anthropic.claude-haiku-5-5",
+      "host": "bedrock_mantle",
+      "leaf": "anthropic.claude-haiku-5-5",
+      "family": "bedrock_mantle",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "bedrock_mantle/anthropic.claude-opus-5-5",
       "host": "bedrock_mantle",
       "leaf": "anthropic.claude-opus-5-5",
@@ -20736,6 +20969,35 @@
           "source": "arena.ai",
           "votes": 8750
         }
+      }
+    },
+    {
+      "id": "bedrock_mantle/us-gov-west-1/anthropic.claude-haiku-5-5",
+      "host": "bedrock_mantle",
+      "leaf": "us-gov-west-1/anthropic.claude-haiku-5-5",
+      "family": "bedrock_mantle",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 0.6,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
       }
     },
     {
@@ -21623,6 +21885,35 @@
           "source": "arena.ai",
           "votes": 29148
         }
+      }
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "host": "",
+      "leaf": "claude-haiku-5-5",
+      "family": "claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
       }
     },
     {
@@ -22962,11 +23253,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -23707,13 +23998,9 @@
         "output_usd_per_mtok": 4.8,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -23796,11 +24083,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -27851,13 +28138,9 @@
         "output_usd_per_mtok": 2.6,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -27900,13 +28183,9 @@
         "output_usd_per_mtok": 2.6,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -29675,11 +29954,11 @@
         "output_usd_per_mtok": 2.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -29919,13 +30198,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -30532,13 +30807,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -30581,13 +30852,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "openrouter"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -30626,7 +30893,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
+        "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       },
@@ -31000,6 +31267,35 @@
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 5.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "eu.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "eu.anthropic.claude-haiku-5-5",
+      "family": "eu.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -32749,13 +33045,9 @@
         "output_usd_per_mtok": 1.2,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -32798,13 +33090,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -37572,13 +37860,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -38684,11 +38968,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -39474,12 +39758,12 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.649,
+      "agentic_score": 0.645,
       "arena_coding_elo": 1583.3,
       "arena_webdev_elo": 1583.3,
       "capability": {
         "scale_seal": {
-          "acc": 45.9,
+          "acc": 44.76,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -40124,12 +40408,12 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.649,
+      "agentic_score": 0.645,
       "arena_coding_elo": 1583.3,
       "arena_webdev_elo": 1583.3,
       "capability": {
         "scale_seal": {
-          "acc": 45.9,
+          "acc": 44.76,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -40865,6 +41149,35 @@
       "economics": {
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 5.0,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "global.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "global.anthropic.claude-haiku-5-5",
+      "family": "global.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -42863,12 +43176,12 @@
         "output_usd_per_mtok": 3.75,
         "source": "openrouter"
       },
-      "agentic_score": 0.649,
+      "agentic_score": 0.645,
       "arena_coding_elo": 1583.3,
       "arena_webdev_elo": 1583.3,
       "capability": {
         "scale_seal": {
-          "acc": 45.9,
+          "acc": 44.76,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -44153,11 +44466,11 @@
         "output_usd_per_mtok": 14.0,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -44402,11 +44715,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -44612,13 +44925,9 @@
         "output_usd_per_mtok": 20.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -44706,12 +45015,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -46099,6 +46408,35 @@
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 5.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "jp.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "jp.anthropic.claude-haiku-5-5",
+      "family": "jp.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -47708,8 +48046,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.22,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.32,
         "source": "openrouter"
       }
     },
@@ -48042,14 +48380,10 @@
         "output_usd_per_mtok": 4.25,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.717,
       "arena_coding_elo": 1542.2,
       "arena_webdev_elo": 1542.2,
       "capability": {
-        "scale_seal": {
-          "acc": 42.2,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 82.0,
           "cost_per_test": 0.352,
@@ -48070,7 +48404,7 @@
           "votes": 8008
         }
       },
-      "w_swe": 0.869
+      "w_swe": 0.91
     },
     {
       "id": "meta/muse-spark-1.2",
@@ -49307,11 +49641,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -51443,7 +51777,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.62,
-        "output_usd_per_mtok": 15.0,
+        "output_usd_per_mtok": 12.3,
         "source": "openrouter"
       },
       "agentic_score": 0.881,
@@ -52346,13 +52680,9 @@
         "output_usd_per_mtok": 3.5,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -52395,13 +52725,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -53073,11 +53399,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -54087,13 +54413,9 @@
         "output_usd_per_mtok": 3.2,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -54136,13 +54458,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -56958,11 +57276,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -57536,8 +57854,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 0.19999999999999998,
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 0.24,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -57594,8 +57912,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.08,
-        "output_usd_per_mtok": 0.44999999999999996,
+        "input_usd_per_mtok": 0.08499999999999999,
+        "output_usd_per_mtok": 0.39999999999999997,
         "source": "openrouter"
       },
       "agentic_score": 0.64,
@@ -57768,8 +58086,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 0.16,
+        "input_usd_per_mtok": 0.049,
+        "output_usd_per_mtok": 0.14,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -60590,11 +60908,11 @@
         "output_usd_per_mtok": 14.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -60937,11 +61255,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -60986,11 +61304,11 @@
         "output_usd_per_mtok": 180.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -61241,13 +61559,9 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -61290,13 +61604,9 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -61574,12 +61884,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -61613,12 +61923,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -62839,6 +63149,35 @@
       "economics": {
         "input_usd_per_mtok": 0.5,
         "output_usd_per_mtok": 2.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "openrouter/anthropic/claude-haiku-5.5",
+      "host": "openrouter",
+      "leaf": "anthropic/claude-haiku-5.5",
+      "family": "openrouter",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -64414,13 +64753,9 @@
         "output_usd_per_mtok": 0.41759999999999997,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -64463,13 +64798,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -65397,12 +65728,12 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.649,
+      "agentic_score": 0.645,
       "arena_coding_elo": 1583.3,
       "arena_webdev_elo": 1583.3,
       "capability": {
         "scale_seal": {
-          "acc": 45.9,
+          "acc": 44.76,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -66131,14 +66462,10 @@
         "output_usd_per_mtok": 4.25,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.717,
       "arena_coding_elo": 1542.2,
       "arena_webdev_elo": 1542.2,
       "capability": {
-        "scale_seal": {
-          "acc": 42.2,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 82.0,
           "cost_per_test": 0.352,
@@ -66159,7 +66486,7 @@
           "votes": 8008
         }
       },
-      "w_swe": 0.869
+      "w_swe": 0.91
     },
     {
       "id": "openrouter/meta/muse-spark-1.2",
@@ -69199,11 +69526,11 @@
         "output_usd_per_mtok": 14.0,
         "source": "litellm"
       },
-      "agentic_score": 0.56,
-      "w_swe": 0.789,
+      "agentic_score": 0.578,
+      "w_swe": 0.801,
       "capability": {
         "scale_seal": {
-          "acc": 37.49,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -69546,11 +69873,11 @@
         "output_usd_per_mtok": 30.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -69595,11 +69922,11 @@
         "output_usd_per_mtok": 180.0,
         "source": "litellm"
       },
-      "agentic_score": 0.588,
+      "agentic_score": 0.586,
       "w_swe": 0.844,
       "capability": {
         "scale_seal": {
-          "acc": 45.43,
+          "acc": 44.79,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -69850,13 +70177,9 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -69899,13 +70222,9 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.706,
-      "w_swe": 0.931,
+      "agentic_score": 0.869,
+      "w_swe": 0.981,
       "capability": {
-        "scale_seal": {
-          "acc": 46.0,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.2,
           "cost_per_test": 1.1513,
@@ -70183,12 +70502,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -70222,12 +70541,12 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm"
       },
-      "agentic_score": 0.708,
+      "agentic_score": 0.707,
       "arena_coding_elo": 1787.6,
       "arena_webdev_elo": 1787.6,
       "capability": {
         "scale_seal": {
-          "acc": 59.14,
+          "acc": 59.05,
           "source": "scale-seal"
         }
       },
@@ -74538,11 +74857,11 @@
         "output_usd_per_mtok": 12.0,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -77263,8 +77582,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09999999999999999,
-        "output_usd_per_mtok": 1.1,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 1.5,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -77563,8 +77882,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.195,
-        "output_usd_per_mtok": 1.56,
+        "input_usd_per_mtok": 0.26,
+        "output_usd_per_mtok": 2.6,
         "source": "openrouter"
       },
       "agentic_score": 0.43,
@@ -78360,13 +78679,9 @@
         "output_usd_per_mtok": 4.8,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -78449,11 +78764,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -79116,13 +79431,9 @@
         "output_usd_per_mtok": 4.8,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -79205,11 +79516,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -80851,13 +81162,9 @@
         "output_usd_per_mtok": 2.77,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -81627,11 +81934,11 @@
         "output_usd_per_mtok": 5.5,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -81929,11 +82236,11 @@
         "output_usd_per_mtok": 1.9800000000000002,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -82588,13 +82895,9 @@
         "output_usd_per_mtok": 0.87,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -84428,13 +84731,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -85462,11 +85761,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -85723,6 +86022,35 @@
       "economics": {
         "input_usd_per_mtok": 12.0,
         "output_usd_per_mtok": 60.0,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "us-gov.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "us-gov.anthropic.claude-haiku-5-5",
+      "family": "us-gov.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.12,
+        "output_usd_per_mtok": 0.6,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -86412,6 +86740,35 @@
       "economics": {
         "input_usd_per_mtok": 1.1,
         "output_usd_per_mtok": 5.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "us.anthropic.claude-haiku-5-5",
+      "host": "",
+      "leaf": "us.anthropic.claude-haiku-5-5",
+      "family": "us.anthropic.claude-haiku-5-5",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
         "source": "litellm"
       },
       "agentic_score": 0.74,
@@ -90179,6 +90536,64 @@
       }
     },
     {
+      "id": "vertex_ai/claude-haiku-5-5",
+      "host": "vertex_ai",
+      "leaf": "claude-haiku-5-5",
+      "family": "vertex_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
+      "id": "vertex_ai/claude-haiku-5-5@default",
+      "host": "vertex_ai",
+      "leaf": "claude-haiku-5-5@default",
+      "family": "vertex_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm"
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      }
+    },
+    {
       "id": "vertex_ai/claude-opus-4-5",
       "host": "vertex_ai",
       "leaf": "claude-opus-4-5",
@@ -91580,12 +91995,12 @@
         "output_usd_per_mtok": 3.75,
         "source": "litellm"
       },
-      "agentic_score": 0.649,
+      "agentic_score": 0.645,
       "arena_coding_elo": 1583.3,
       "arena_webdev_elo": 1583.3,
       "capability": {
         "scale_seal": {
-          "acc": 45.9,
+          "acc": 44.76,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -93319,13 +93734,9 @@
         "output_usd_per_mtok": 2.5500000000000003,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -93368,13 +93779,9 @@
         "output_usd_per_mtok": 3.9600000000000004,
         "source": "litellm"
       },
-      "agentic_score": 0.602,
-      "w_swe": 0.902,
+      "agentic_score": 0.827,
+      "w_swe": 0.982,
       "capability": {
-        "scale_seal": {
-          "acc": 27.15,
-          "source": "scale-seal"
-        },
         "swe_verified": {
           "acc": 96.4,
           "cost_per_test": 0.1031,
@@ -93855,11 +94262,11 @@
         "output_usd_per_mtok": 2.42,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -96624,15 +97031,15 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.171,
-        "output_usd_per_mtok": 7.199999999999999,
+        "input_usd_per_mtok": 0.03,
+        "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -96673,8 +97080,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.07,
-        "output_usd_per_mtok": 7.0,
+        "input_usd_per_mtok": 0.049,
+        "output_usd_per_mtok": 3.39,
         "source": "openrouter"
       },
       "agentic_score": 0.867,
@@ -97459,11 +97866,11 @@
         "output_usd_per_mtok": 4.4,
         "source": "litellm"
       },
-      "agentic_score": 0.652,
+      "agentic_score": 0.643,
       "w_swe": 0.919,
       "capability": {
         "scale_seal": {
-          "acc": 45.25,
+          "acc": 42.38,
           "source": "scale-seal"
         },
         "swe_verified": {
@@ -97623,8 +98030,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 1.0,
-        "output_usd_per_mtok": 5.0,
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
       "agentic_score": 0.74,
@@ -97710,8 +98117,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.035,
+        "output_usd_per_mtok": 0.6,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
@@ -97739,8 +98146,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.39999999999999997,
-        "output_usd_per_mtok": 4.300000000000001,
+        "input_usd_per_mtok": 0.108,
+        "output_usd_per_mtok": 8.0,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
@@ -97768,8 +98175,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.018,
-        "output_usd_per_mtok": 1.28,
+        "input_usd_per_mtok": 0.0144,
+        "output_usd_per_mtok": 0.482013,
         "source": "openrouter"
       },
       "agentic_score": 0.864,
@@ -97849,8 +98256,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.61,
-        "output_usd_per_mtok": 13.0,
+        "input_usd_per_mtok": 0.55,
+        "output_usd_per_mtok": 15.0,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -97987,8 +98394,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.036,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.032,
+        "output_usd_per_mtok": 1.8830570000000002,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -98016,8 +98423,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.063,
-        "output_usd_per_mtok": 6.3,
+        "input_usd_per_mtok": 0.036,
+        "output_usd_per_mtok": 12.0,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
