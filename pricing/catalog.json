@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-10-08",
+  "generated": "2026-10-09",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -2122,10 +2122,6 @@
     "azure_ai/model_router": {
       "input_usd_per_mtok": 0.14,
       "output_usd_per_mtok": 0.0
-    },
-    "baidu/ernie-4.5-vl-424b-a47b": {
-      "input_usd_per_mtok": 0.42,
-      "output_usd_per_mtok": 1.25
     },
     "baseten/MiniMaxAI/MiniMax-M2.5": {
       "input_usd_per_mtok": 0.3,
@@ -4608,10 +4604,10 @@
       }
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.018,
+      "input_usd_per_mtok": 0.0046,
       "output_usd_per_mtok": 1.28,
       "off_peak": {
-        "input_usd_per_mtok": 0.009,
+        "input_usd_per_mtok": 0.0023,
         "output_usd_per_mtok": 0.64,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -7407,9 +7403,9 @@
       "input_usd_per_mtok": 0.041999999999999996,
       "output_usd_per_mtok": 0.12319999999999999
     },
-    "inclusionai/ling-3.0-flash-sante:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
+    "inclusionai/ling-3.0-flash-sante": {
+      "input_usd_per_mtok": 0.041999999999999996,
+      "output_usd_per_mtok": 0.12319999999999999
     },
     "inclusionai/ling-3.0-flash-vl": {
       "input_usd_per_mtok": 0.020999999999999998,
@@ -7778,8 +7774,8 @@
       "output_usd_per_mtok": 0.33
     },
     "meta-llama/llama-3.3-70b-instruct": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.32
+      "input_usd_per_mtok": 0.22,
+      "output_usd_per_mtok": 0.5
     },
     "meta-llama/llama-4-maverick": {
       "input_usd_per_mtok": 0.1875,
@@ -8270,7 +8266,7 @@
       "output_usd_per_mtok": 1.0
     },
     "mistralai/mistral-nemo": {
-      "input_usd_per_mtok": 0.019000000000000003,
+      "input_usd_per_mtok": 0.029,
       "output_usd_per_mtok": 0.03
     },
     "mistralai/mistral-saba": {
@@ -8386,8 +8382,8 @@
       "output_usd_per_mtok": 3.35
     },
     "moonshotai/kimi-k3": {
-      "input_usd_per_mtok": 0.62,
-      "output_usd_per_mtok": 12.3
+      "input_usd_per_mtok": 0.5,
+      "output_usd_per_mtok": 12.0
     },
     "moonshotai/kimi-k3:batch": {
       "input_usd_per_mtok": 2.2800000000000002,
@@ -9466,8 +9462,8 @@
       "output_usd_per_mtok": 0.0
     },
     "nvidia/nemotron-3-super-120b-a12b": {
-      "input_usd_per_mtok": 0.08499999999999999,
-      "output_usd_per_mtok": 0.39999999999999997
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.44999999999999996
     },
     "nvidia/nemotron-3-super-120b-a12b:free": {
       "input_usd_per_mtok": 0.0,
@@ -9490,8 +9486,8 @@
       "output_usd_per_mtok": 0.0
     },
     "nvidia/nemotron-3.5-lightning": {
-      "input_usd_per_mtok": 0.049,
-      "output_usd_per_mtok": 0.14
+      "input_usd_per_mtok": 0.046900000000000004,
+      "output_usd_per_mtok": 0.134
     },
     "nvidia/nemotron-3.5-lightning:free": {
       "input_usd_per_mtok": 0.0,
@@ -9762,10 +9758,6 @@
       "output_usd_per_mtok": 0.5
     },
     "openai.gpt-6-sol": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openai.gpt-6.1-sol": {
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 10.0
     },
@@ -10117,6 +10109,14 @@
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 10.0
     },
+    "openai/gpt-6.1-sol-pro:batch": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 5.0
+    },
+    "openai/gpt-6.1-sol:batch": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 5.0
+    },
     "openai/gpt-audio": {
       "input_usd_per_mtok": 2.5,
       "output_usd_per_mtok": 10.0
@@ -10280,6 +10280,10 @@
     "openrouter/anthropic/claude-haiku-5.5": {
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.5
+    },
+    "openrouter/anthropic/claude-haiku-5.5:batch": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.25
     },
     "openrouter/anthropic/claude-opus-4.1": {
       "input_usd_per_mtok": 15.0,
@@ -10524,10 +10528,10 @@
       }
     },
     "openrouter/deepseek/deepseek-v3.2": {
-      "input_usd_per_mtok": 0.28,
+      "input_usd_per_mtok": 0.25899999999999995,
       "output_usd_per_mtok": 0.42,
       "off_peak": {
-        "input_usd_per_mtok": 0.14,
+        "input_usd_per_mtok": 0.1295,
         "output_usd_per_mtok": 0.21,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -10544,20 +10548,20 @@
       }
     },
     "openrouter/deepseek/deepseek-v4-flash": {
-      "input_usd_per_mtok": 0.03,
+      "input_usd_per_mtok": 0.0075,
       "output_usd_per_mtok": 1.28,
       "off_peak": {
-        "input_usd_per_mtok": 0.015,
+        "input_usd_per_mtok": 0.00375,
         "output_usd_per_mtok": 0.64,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
     },
     "openrouter/deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.016300000000000002,
+      "input_usd_per_mtok": 0.006,
       "output_usd_per_mtok": 1.28,
       "off_peak": {
-        "input_usd_per_mtok": 0.00815,
+        "input_usd_per_mtok": 0.003,
         "output_usd_per_mtok": 0.64,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -10574,11 +10578,11 @@
       }
     },
     "openrouter/deepseek/deepseek-v4-pro": {
-      "input_usd_per_mtok": 0.20879999999999999,
-      "output_usd_per_mtok": 0.41759999999999997,
+      "input_usd_per_mtok": 0.28727400000000003,
+      "output_usd_per_mtok": 0.5745480000000001,
       "off_peak": {
-        "input_usd_per_mtok": 0.1044,
-        "output_usd_per_mtok": 0.2088,
+        "input_usd_per_mtok": 0.143637,
+        "output_usd_per_mtok": 0.287274,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -10594,11 +10598,11 @@
       }
     },
     "openrouter/deepseek/deepseek-v4.1-flash": {
-      "input_usd_per_mtok": 0.044,
-      "output_usd_per_mtok": 0.3,
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2,
       "off_peak": {
-        "input_usd_per_mtok": 0.022,
-        "output_usd_per_mtok": 0.15,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.6,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -10829,6 +10833,10 @@
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
     },
+    "openrouter/inclusionai/ling-3.0-flash-sante": {
+      "input_usd_per_mtok": 0.041999999999999996,
+      "output_usd_per_mtok": 0.12319999999999999
+    },
     "openrouter/inclusionai/ling-3.0-flash-sante:free": {
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
@@ -11050,7 +11058,7 @@
       "output_usd_per_mtok": 1.0
     },
     "openrouter/mistralai/mistral-nemo": {
-      "input_usd_per_mtok": 0.019000000000000003,
+      "input_usd_per_mtok": 0.029,
       "output_usd_per_mtok": 0.03
     },
     "openrouter/mistralai/mistral-saba": {
@@ -11102,16 +11110,16 @@
       "output_usd_per_mtok": 2.25
     },
     "openrouter/moonshotai/kimi-k2.6": {
-      "input_usd_per_mtok": 0.95,
-      "output_usd_per_mtok": 4.0
+      "input_usd_per_mtok": 0.46499999999999997,
+      "output_usd_per_mtok": 2.4499999999999997
     },
     "openrouter/moonshotai/kimi-k2.7-code": {
       "input_usd_per_mtok": 0.6712,
       "output_usd_per_mtok": 3.35
     },
     "openrouter/moonshotai/kimi-k3": {
-      "input_usd_per_mtok": 0.7899999999999999,
-      "output_usd_per_mtok": 15.0
+      "input_usd_per_mtok": 0.76,
+      "output_usd_per_mtok": 13.0
     },
     "openrouter/moonshotai/kimi-k3:batch": {
       "input_usd_per_mtok": 2.2800000000000002,
@@ -11154,8 +11162,8 @@
       "output_usd_per_mtok": 3.0
     },
     "openrouter/nvidia/nemotron-3-nano-30b-a3b": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.19999999999999998
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.24
     },
     "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": {
       "input_usd_per_mtok": 0.0,
@@ -11186,8 +11194,8 @@
       "output_usd_per_mtok": 0.0
     },
     "openrouter/nvidia/nemotron-3.5-lightning": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.16
+      "input_usd_per_mtok": 0.049,
+      "output_usd_per_mtok": 0.14
     },
     "openrouter/nvidia/nemotron-3.5-lightning:free": {
       "input_usd_per_mtok": 0.0,
@@ -11734,8 +11742,8 @@
       "output_usd_per_mtok": 0.5
     },
     "openrouter/qwen/qwen3-30b-a3b-instruct-2507": {
-      "input_usd_per_mtok": 0.04815,
-      "output_usd_per_mtok": 0.19305
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.3
     },
     "openrouter/qwen/qwen3-30b-a3b-thinking-2507": {
       "input_usd_per_mtok": 0.19999999999999998,
@@ -11778,7 +11786,7 @@
       "output_usd_per_mtok": 3.9
     },
     "openrouter/qwen/qwen3-next-80b-a3b-instruct": {
-      "input_usd_per_mtok": 0.09999999999999999,
+      "input_usd_per_mtok": 0.09,
       "output_usd_per_mtok": 1.1
     },
     "openrouter/qwen/qwen3-next-80b-a3b-thinking": {
@@ -11818,16 +11826,16 @@
       "output_usd_per_mtok": 2.08
     },
     "openrouter/qwen/qwen3.5-27b": {
-      "input_usd_per_mtok": 0.195,
-      "output_usd_per_mtok": 1.56
+      "input_usd_per_mtok": 0.26,
+      "output_usd_per_mtok": 2.6
     },
     "openrouter/qwen/qwen3.5-35b-a3b": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.0
+      "input_usd_per_mtok": 0.1625,
+      "output_usd_per_mtok": 1.3
     },
     "openrouter/qwen/qwen3.5-397b-a17b": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 3.0
+      "input_usd_per_mtok": 0.55,
+      "output_usd_per_mtok": 3.5
     },
     "openrouter/qwen/qwen3.5-9b": {
       "input_usd_per_mtok": 0.09999999999999999,
@@ -11846,8 +11854,8 @@
       "output_usd_per_mtok": 1.7999999999999998
     },
     "openrouter/qwen/qwen3.6-27b": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.0
+      "input_usd_per_mtok": 0.44999999999999996,
+      "output_usd_per_mtok": 2.7
     },
     "openrouter/qwen/qwen3.6-35b-a3b": {
       "input_usd_per_mtok": 0.15,
@@ -11964,6 +11972,10 @@
     "openrouter/stepfun/step-3.7-flash": {
       "input_usd_per_mtok": 0.19999999999999998,
       "output_usd_per_mtok": 1.15
+    },
+    "openrouter/stepfun/step-5-preview": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 2.7
     },
     "openrouter/switchpoint/router": {
       "input_usd_per_mtok": 0.85,
@@ -12162,16 +12174,16 @@
       "output_usd_per_mtok": 3.036
     },
     "openrouter/z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.15200000000000002,
-      "output_usd_per_mtok": 12.0
+      "input_usd_per_mtok": 0.06899999999999999,
+      "output_usd_per_mtok": 4.300000000000001
     },
     "openrouter/z-ai/glm-5.2:free": {
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
     },
     "openrouter/z-ai/glm-5.3": {
-      "input_usd_per_mtok": 0.07,
-      "output_usd_per_mtok": 7.0
+      "input_usd_per_mtok": 0.039,
+      "output_usd_per_mtok": 3.39
     },
     "openrouter/z-ai/glm-5.3-flash": {
       "input_usd_per_mtok": 0.15,
@@ -12202,8 +12214,8 @@
       "output_usd_per_mtok": 50.0
     },
     "openrouter/~anthropic/claude-haiku-latest": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.5
     },
     "openrouter/~anthropic/claude-opus-latest": {
       "input_usd_per_mtok": 4.0,
@@ -12612,8 +12624,8 @@
       "output_usd_per_mtok": 0.5
     },
     "qwen/qwen3-30b-a3b-instruct-2507": {
-      "input_usd_per_mtok": 0.04815,
-      "output_usd_per_mtok": 0.19305
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.3
     },
     "qwen/qwen3-30b-a3b-thinking-2507": {
       "input_usd_per_mtok": 0.19999999999999998,
@@ -12656,8 +12668,8 @@
       "output_usd_per_mtok": 3.9
     },
     "qwen/qwen3-next-80b-a3b-instruct": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.5
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 1.1
     },
     "qwen/qwen3-next-80b-a3b-thinking": {
       "input_usd_per_mtok": 0.15,
@@ -12700,12 +12712,12 @@
       "output_usd_per_mtok": 2.6
     },
     "qwen/qwen3.5-35b-a3b": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.0
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.75
     },
     "qwen/qwen3.5-397b-a17b": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 3.0
+      "input_usd_per_mtok": 0.55,
+      "output_usd_per_mtok": 3.5
     },
     "qwen/qwen3.5-9b": {
       "input_usd_per_mtok": 0.09999999999999999,
@@ -12724,8 +12736,8 @@
       "output_usd_per_mtok": 1.7999999999999998
     },
     "qwen/qwen3.6-27b": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.0
+      "input_usd_per_mtok": 0.44999999999999996,
+      "output_usd_per_mtok": 2.7
     },
     "qwen/qwen3.6-35b-a3b": {
       "input_usd_per_mtok": 0.15,
@@ -13528,6 +13540,10 @@
     "stepfun/step-3.7-flash": {
       "input_usd_per_mtok": 0.19999999999999998,
       "output_usd_per_mtok": 1.15
+    },
+    "stepfun/step-5-preview": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 2.7
     },
     "tencent/deepseek-v4-flash": {
       "input_usd_per_mtok": 0.14,
@@ -15569,10 +15585,6 @@
       "input_usd_per_mtok": 1.0,
       "output_usd_per_mtok": 2.0
     },
-    "xai.grok-4.7": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
     "xai/grok-4.20": {
       "input_usd_per_mtok": 1.25,
       "output_usd_per_mtok": 2.5
@@ -15786,12 +15798,12 @@
       "output_usd_per_mtok": 3.036
     },
     "z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.03,
-      "output_usd_per_mtok": 10.0
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 4.199999999999999
     },
     "z-ai/glm-5.3": {
-      "input_usd_per_mtok": 0.049,
-      "output_usd_per_mtok": 3.39
+      "input_usd_per_mtok": 0.039,
+      "output_usd_per_mtok": 4.8
     },
     "z-ai/glm-5.3-flash": {
       "input_usd_per_mtok": 0.15,
@@ -15910,19 +15922,19 @@
       "output_usd_per_mtok": 10.0
     },
     "~deepseek/deepseek-flash-latest": {
-      "input_usd_per_mtok": 0.035,
-      "output_usd_per_mtok": 0.6
+      "input_usd_per_mtok": 0.016,
+      "output_usd_per_mtok": 1.2
     },
     "~deepseek/deepseek-pro-latest": {
-      "input_usd_per_mtok": 0.108,
+      "input_usd_per_mtok": 0.198,
       "output_usd_per_mtok": 8.0
     },
     "~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.0144,
-      "output_usd_per_mtok": 0.482013,
+      "input_usd_per_mtok": 0.00368,
+      "output_usd_per_mtok": 0.09774,
       "off_peak": {
-        "input_usd_per_mtok": 0.0072,
-        "output_usd_per_mtok": 0.241007,
+        "input_usd_per_mtok": 0.00184,
+        "output_usd_per_mtok": 0.04887,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -15936,8 +15948,8 @@
       "output_usd_per_mtok": 12.0
     },
     "~moonshotai/kimi-latest": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 15.0
+      "input_usd_per_mtok": 0.49,
+      "output_usd_per_mtok": 13.0
     },
     "~openai/gpt-astra-latest": {
       "input_usd_per_mtok": 10.0,
@@ -15965,11 +15977,11 @@
     },
     "~z-ai/glm-flash-latest": {
       "input_usd_per_mtok": 0.032,
-      "output_usd_per_mtok": 1.8830570000000002
+      "output_usd_per_mtok": 1.041434
     },
     "~z-ai/glm-latest": {
-      "input_usd_per_mtok": 0.036,
-      "output_usd_per_mtok": 12.0
+      "input_usd_per_mtok": 0.031200000000000002,
+      "output_usd_per_mtok": 4.4
     }
   }
 }
