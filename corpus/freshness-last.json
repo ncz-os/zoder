@@ -1,5 +1,5 @@
 {
-  "models_with_score": 188,
+  "models_with_score": 190,
   "sources": [
     {
       "name": "fetch-vals-swebench.py",
@@ -43,5 +43,5 @@
       "reason": "terminal-bench: no scored rows found \u2014 format changed?"
     }
   ],
-  "ts": "2026-10-08T09:11:50Z"
+  "ts": "2026-10-09T09:09:55Z"
 }
