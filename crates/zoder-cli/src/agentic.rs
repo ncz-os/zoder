@@ -3723,7 +3723,7 @@ fn aggregate_review(
         // also sees the failure. The bail() in `cmd_review` remains the
         // authoritative signal: a total-failure review exits nonzero.
         "request_changes"
-    } else if worst_rank >= 1 {
+    } else if failed_models > 0 || worst_rank >= 1 {
         "comment"
     } else {
         "approve"
@@ -9198,8 +9198,8 @@ not run to max_iters"
         let (agg, all_failed, payload) = aggregate_review(&reviews, 0.01, 2, 1, 1);
         assert!(!all_failed, "one successful reviewer -> not all-failed");
         assert_eq!(
-            agg, "approve",
-            "the 'error' record must NOT lift the aggregate out of approve"
+            agg, "comment",
+            "an incomplete panel must not advertise aggregate approval"
         );
         assert_eq!(payload["complete"].as_bool(), Some(false));
         assert_eq!(payload["requested"].as_u64(), Some(2));
@@ -9264,8 +9264,8 @@ not run to max_iters"
         let mixed = vec![ok_slot("real-approver", "approve"), failed_slot("timeout")];
         let (agg2, _, payload2) = aggregate_review(&mixed, 0.0, 2, 1, 1);
         assert_eq!(
-            agg2, "approve",
-            "a Failed slot casts no vote -> aggregate stays approve"
+            agg2, "comment",
+            "a failed slot does not approve the incomplete panel"
         );
         assert_eq!(payload2["ok_models"].as_u64(), Some(1));
         assert_eq!(payload2["failed_models"].as_u64(), Some(1));
