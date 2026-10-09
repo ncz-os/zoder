@@ -8,6 +8,166 @@ use std::io::Write;
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
+#[cfg(test)]
+mod reliability_deadline_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn delayed_server(
+        header_delay: u64,
+        body_delay: u64,
+        first: &str,
+        last: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let first = first.to_owned();
+        let last = last.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(header_delay)).await;
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", first.len() + last.len());
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(first.as_bytes()).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(body_delay)).await;
+            let _ = socket.write_all(last.as_bytes()).await;
+        });
+        (uri, task)
+    }
+
+    fn fixture(uri: &str, total_ms: u64, idle_ms: u64) -> (OpenAiProvider, ChatRequest) {
+        let config = Provider {
+            id: "deadline-test".into(),
+            engine_provider_ref: None,
+            base_url: uri.into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: crate::BillingMode::Metered,
+            subscription: None,
+            serves: vec![],
+            azure_api_version: None,
+        };
+        let mut p = OpenAiProvider::new(&config).unwrap();
+        p.request_timeout = Duration::from_millis(total_ms);
+        p.idle_timeout = Duration::from_millis(idle_ms);
+        let request = ChatRequest {
+            model: "model".into(),
+            messages: vec![crate::Message::new("user", "review")],
+            max_tokens: 32,
+            temperature: None,
+            stream: true,
+            show_reasoning: false,
+            reasoning_effort: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: None,
+            response_format: None,
+        };
+        (p, request)
+    }
+
+    const DELTA: &str =
+        "data: {\"model\":\"model\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn slow_prefill_gets_request_budget_not_stream_idle_budget() {
+        let body = format!("{DELTA}{DONE}");
+        let (uri, task) = delayed_server(0, 150, "", &body).await;
+        let (p, request) = fixture(&uri, 1000, 50);
+        let result = p.stream_chat(&request, None).await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.telemetry.response_model.as_deref(), Some("model"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_latency_cannot_restart_overall_request_budget() {
+        let body = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let (uri, task) = delayed_server(150, 180, "", body).await;
+        let (p, mut request) = fixture(&uri, 250, 1000);
+        request.stream = false;
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(!error.emitted);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn total_deadline_preserves_emitted_no_replay_flag() {
+        let (uri, task) = delayed_server(0, 1000, DELTA, DONE).await;
+        let (p, request) = fixture(&uri, 150, 1000);
+        let mut sink = Vec::new();
+        let error = p.stream_chat(&request, Some(&mut sink)).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(error.emitted);
+        assert!(!error.retryable());
+        assert_eq!(sink, b"hello");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn generated_answer_still_has_idle_stall_guard() {
+        let (uri, task) = delayed_server(0, 1000, DELTA, DONE).await;
+        let (p, request) = fixture(&uri, 2000, 100);
+        let mut sink = Vec::new();
+        let error = p.stream_chat(&request, Some(&mut sink)).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(error.message.contains("stream stalled"));
+        assert!(error.emitted);
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+/// Preserve the no-replay boundary when the overall deadline drops a stream
+/// consumer before it can return its own emitted flag.
+struct TrackedSink<'a> {
+    sink: &'a mut dyn Write,
+    emitted: bool,
+}
+
+impl Write for TrackedSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.sink.write(bytes)?;
+        self.emitted |= n > 0;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
 /// Anthropic Messages API version header. Pinned to the value the wire
 /// adapter always sends; Anthropic's docs guarantee this version is honored
 /// indefinitely. The constant lives here so the request builder and the
@@ -266,6 +426,9 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CallTelemetry {
     pub served_model: Option<String>,
+    /// Literal model reported in the completion body, distinct from a proxy's
+    /// opaque x-litellm-model-id deployment identifier.
+    pub response_model: Option<String>,
     pub api_base: Option<String>,
     pub attempted_fallbacks: Option<i64>,
     pub cost_usd: Option<f64>,
@@ -306,6 +469,7 @@ fn header_str(h: &reqwest::header::HeaderMap, k: &str) -> Option<String> {
 fn telemetry_from_headers(h: &reqwest::header::HeaderMap) -> CallTelemetry {
     CallTelemetry {
         served_model: header_str(h, "x-litellm-model-id"),
+        response_model: None,
         api_base: header_str(h, "x-litellm-model-api-base"),
         attempted_fallbacks: header_i64(h, "x-litellm-attempted-fallbacks"),
         cost_usd: header_f64(h, "x-litellm-response-cost-original"),
@@ -350,6 +514,8 @@ impl Usage {
 
 #[derive(Deserialize)]
 struct StreamChunk {
+    #[serde(default)]
+    model: Option<String>,
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
@@ -373,6 +539,8 @@ struct Delta {
 /// Non-streaming chat-completion response shape (subset we consume).
 #[derive(Deserialize)]
 struct ChatCompletion {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<CompletionChoice>,
     #[serde(default)]
@@ -570,6 +738,8 @@ fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
 #[derive(Deserialize)]
 struct AnthropicResponse {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     content: Vec<AnthropicContent>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
@@ -730,6 +900,8 @@ fn responses_body(req: &ChatRequest) -> serde_json::Value {
 /// therefore leaves the answer empty) MUST surface as `ErrKind::Decode`.
 #[derive(Deserialize)]
 struct ResponsesResponse {
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
     #[serde(default)]
@@ -1345,6 +1517,36 @@ impl OpenAiProvider {
         req: &ChatRequest,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
+        let mut tracked = sink.map(|sink| TrackedSink {
+            sink,
+            emitted: false,
+        });
+        let result = timeout(
+            self.request_timeout,
+            self.stream_chat_inner(req, tracked.as_mut().map(|s| s as &mut dyn Write)),
+        )
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                let mut error = ProviderError::new(
+                    ErrKind::Timeout,
+                    format!(
+                        "request timeout after {:?} (headers and body combined)",
+                        self.request_timeout
+                    ),
+                );
+                error.emitted = tracked.is_some_and(|s| s.emitted);
+                Err(error)
+            }
+        }
+    }
+
+    async fn stream_chat_inner(
+        &self,
+        req: &ChatRequest,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<ChatResult, ProviderError> {
         tracing::debug!(model = %req.model, stream = req.stream, max_tokens = req.max_tokens, "chat call");
         let resp = match timeout(self.request_timeout, self.request(req).send()).await {
             Ok(Ok(r)) => r,
@@ -1444,7 +1646,7 @@ impl OpenAiProvider {
         &self,
         _req: &ChatRequest,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         if self.is_anthropic() {
@@ -1460,6 +1662,7 @@ impl OpenAiProvider {
                 format!("malformed chat-completion response: {e}"),
             )
         })?;
+        telemetry.response_model = parsed.model;
         // Schema-invalid 2xx body guard: a response is not "successful" just
         // because the HTTP layer returned 2xx. We require at least one choice
         // whose `message` carries a nonempty final answer — mirroring the
@@ -1535,7 +1738,7 @@ impl OpenAiProvider {
     async fn consume_full_anthropic(
         &self,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         let body = self.read_limited_body(resp, "anthropic message").await?;
@@ -1552,6 +1755,7 @@ impl OpenAiProvider {
                 "malformed anthropic response: empty content",
             ));
         }
+        telemetry.response_model = parsed.model.clone();
         let content = parsed.joined_text();
         if content.len() > MAX_CONTENT_BYTES {
             return Err(ProviderError::new(
@@ -1597,7 +1801,7 @@ impl OpenAiProvider {
     async fn consume_full_responses(
         &self,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         let body = self.read_limited_body(resp, "responses message").await?;
@@ -1614,6 +1818,7 @@ impl OpenAiProvider {
                 "malformed responses response: empty output text",
             ));
         }
+        telemetry.response_model = parsed.model.clone();
         let content = parsed.joined_text();
         if content.len() > MAX_CONTENT_BYTES {
             return Err(ProviderError::new(
@@ -1656,7 +1861,7 @@ impl OpenAiProvider {
         &self,
         req: &ChatRequest,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         if self.is_anthropic() {
@@ -1713,7 +1918,13 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.idle_timeout.min(remaining);
+            // Prompt prefill/queue latency is covered by the overall request
+            // budget. The idle guard applies once answer generation begins.
+            let step = if saw_content {
+                self.idle_timeout.min(remaining)
+            } else {
+                remaining
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -1803,6 +2014,20 @@ impl OpenAiProvider {
                         emitted,
                     )
                 })?;
+                if let Some(model) = parsed.model {
+                    if telemetry
+                        .response_model
+                        .as_ref()
+                        .is_some_and(|prior| prior != &model)
+                    {
+                        return Err(fail(
+                            ErrKind::Decode,
+                            "provider changed model during stream".into(),
+                            emitted,
+                        ));
+                    }
+                    telemetry.response_model = Some(model);
+                }
                 // Y-2: accept `finish_reason` in a choice delta as a terminal
                 // marker alongside `[DONE]` — a final chunk carrying
                 // `finish_reason: "stop"` (or `"length"`, `"content_filter"`,
@@ -2033,7 +2258,11 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.idle_timeout.min(remaining);
+            let step = if saw_text {
+                self.idle_timeout.min(remaining)
+            } else {
+                remaining
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2375,7 +2604,11 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.idle_timeout.min(remaining);
+            let step = if saw_text {
+                self.idle_timeout.min(remaining)
+            } else {
+                remaining
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {

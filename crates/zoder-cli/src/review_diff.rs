@@ -737,7 +737,7 @@ fn split_oversized_hunk(
     }
 
     // Reserve room for the repeated file header plus a generated hunk header.
-    let overhead = header.len() + 160;
+    let overhead = header.len() + path.len() + 160;
     if overhead >= cap {
         bail!(
             "cannot split the diff hunk for {path}: the {}-byte cap is smaller than its file header; pass --max-hunk-bytes N to raise it",
@@ -778,12 +778,17 @@ fn split_oversized_hunk(
             continue;
         }
         let prev = &plain[gi - 1];
-        let start = prev.len().saturating_sub(HUNK_OVERLAP_LINES);
-        let mut overlap: Vec<usize> = prev[start..]
+        // Only a contiguous suffix can be carried forward without moving
+        // context across intervening additions/deletions and corrupting the
+        // generated line numbers.
+        let mut overlap: Vec<usize> = prev
             .iter()
+            .rev()
             .copied()
-            .filter(|&j| lines[j].starts_with(' '))
+            .take_while(|&j| lines[j].starts_with(' '))
+            .take(HUNK_OVERLAP_LINES)
             .collect();
+        overlap.reverse();
         // Never let the carried context defeat the cap.
         let mut overlap_bytes: usize = overlap.iter().map(|&j| lines[j].len()).sum();
         while !overlap.is_empty()
@@ -836,6 +841,7 @@ fn split_oversized_hunk(
         if !part.ends_with('\n') {
             part.push('\n');
         }
+        anyhow::ensure!(part.len() <= cap, "split hunk exceeded {cap}-byte cap");
         parts.push(part);
         old_pos += core_old;
         new_pos += core_new;
@@ -848,6 +854,7 @@ fn line_counts(line: &str) -> (usize, usize) {
     match line.as_bytes().first() {
         Some(b'-') => (1, 0),
         Some(b'+') => (0, 1),
+        Some(b'\\') => (0, 0), // "No newline at end of file" is metadata.
         _ => (1, 1),
     }
 }
@@ -865,7 +872,7 @@ fn parse_hunk_header(header: &str) -> (usize, usize, usize, usize) {
     let rest = header.strip_prefix("@@ ").unwrap_or(header);
     let mut old = (0usize, 1usize);
     let mut new = (0usize, 1usize);
-    for tok in rest.split_whitespace() {
+    for tok in rest.split_whitespace().take(2) {
         if let Some(s) = tok.strip_prefix('-') {
             old = parse_pair(s);
         } else if let Some(s) = tok.strip_prefix('+') {
@@ -1185,5 +1192,43 @@ mod tests {
             24
         );
         assert!(derived_max_chunks(1_000_000, 9000) > 100);
+    }
+
+    #[test]
+    fn split_long_utf8_path_preserves_bytes_and_bound() {
+        let path = format!("{}/résumé.rs", "nested/".repeat(50));
+        let body = "+let message = \"こんにちは\";\n".repeat(700);
+        let chunks = review_diff_chunks(&new_file(&path, &body), 9000, true, 64).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 9000));
+        let recovered: String = chunks
+            .iter()
+            .flat_map(|c| c.split_inclusive('\n'))
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert_eq!(recovered, body);
+    }
+
+    #[test]
+    fn hunk_positions_ignore_metadata_and_function_tail() {
+        assert_eq!(line_counts("\\ No newline at end of file\n"), (0, 0));
+        assert_eq!(
+            parse_hunk_header("@@ -10,3 +20,4 @@ fn f() +999 -888"),
+            (10, 3, 20, 4)
+        );
+        let header = "diff --git a/a b/a\n--- a/a\n+++ b/a\n";
+        // Force groups with a context line followed by an addition at the
+        // boundary. Non-contiguous context must not be moved into part 2.
+        let hunk = format!(
+            "@@ -1,1 +1,4 @@\n {}\n+{}\n+{}\n+{}\n",
+            "c".repeat(48),
+            "a".repeat(48),
+            "b".repeat(48),
+            "d".repeat(48)
+        );
+        let parts = split_oversized_hunk(header, &hunk, "a", header.len() + 161 + 102).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[1].contains("@@ -2,0 +3,2 @@"), "{}", parts[1]);
+        assert!(!parts[1].contains(&"c".repeat(48)));
     }
 }
