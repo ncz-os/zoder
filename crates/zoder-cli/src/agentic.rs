@@ -4066,15 +4066,13 @@ where
 ///   return: `build_diff` is captured AFTER `settled` resolves, so the
 ///   loop never reviews a torn mid-edit tree. In production `settled`
 ///   is the bounded wait inside `cancel_session` itself (it returns
-///   only after the daemon acknowledges the cancel or the settle
-///   budget elapses, which is "settled enough"). In tests `settled`
+///   only after the daemon acknowledges the cancel). In tests `settled`
 ///   is a channel/tokio task the test drives explicitly.
 ///
 /// On timeout the function logs the standard "timed out, killing"
 /// marker, awaits `cancel`, awaits `settled`, and returns `Err`. On
-/// success it forwards the inner result verbatim. Non-timeout errors
-/// from `cancel` / `settled` are swallowed (we're already on the
-/// timeout path and the loop wants to RECOVER, not bubble IO errors).
+/// success it forwards the inner result verbatim. A failed or timed-out
+/// cancellation stops the loop before any diff capture or further edits.
 ///
 /// NON-BREAKING on success: when the inner future completes within
 /// budget, `cancel` and `settled` are never invoked.
@@ -4097,10 +4095,7 @@ where
             if !quiet {
                 eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
             }
-            // Issue the cancel. Best-effort: a failure here means we
-            // couldn't reach the daemon, but the caller's loop still
-            // wants to recover (not bubble IO). The settle wait below
-            // gives the daemon a bounded grace to wind down regardless.
+            // An acknowledgement is required before reviewing this tree.
             let cancelled =
                 tokio::time::timeout(std::time::Duration::from_secs(SETTLE_BUDGET_SECS), cancel)
                     .await
@@ -5161,41 +5156,32 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         let engine_kind = crate::resolve_engine_kind(cli)?;
-        // The cancel future needs the session id to address the right turn on
-        // the daemon. For iterations 2+ (`session == Some(sid)`) we resume the
-        // same session, so the cancel has a known target. For the very first
-        // iteration without `--session`/`--continue`/`--persist-session`,
-        // `session` is `None` — the inner engine mints a new session id we
-        // cannot observe from outside the in-flight future. We still open a
-        // daemon connection and wait for the settle budget; if the daemon
-        // happens to expose the freshly-minted session via a notification
-        // before the budget elapses, the cancel will land; if not, the bounded
-        // wait is the best we can do without invasive plumbing. (The first
-        // iteration is also the one most likely to succeed — a wedged
-        // mid-session is much rarer than a wedged mid-prompt on a resumed
-        // session.) The settle signal is implicit: `cancel_session` itself
-        // awaits `session/update {type: "turn_complete"}` (or the settle
-        // budget) before returning, so `build_diff` is gated on the daemon
-        // having actually wound down.
-        let session_id_for_cancel = session.clone();
+        // Capture the daemon's actual session/new result before prompt
+        // dispatch, including first turns and rejected-resume replacements.
+        // The tracker survives dropping the author future on timeout.
+        let active_session = std::sync::Arc::new(std::sync::Mutex::new(session.clone()));
+        let session_id_for_cancel = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
-            crate::agentic_turn(
-                cli,
-                engine_kind,
-                author_prompt,
-                session.clone(),
-                false,
-                None,
+            zoder_core::engine_rpc::track_session_id(
+                active_session,
+                crate::agentic_turn(
+                    cli,
+                    engine_kind,
+                    author_prompt,
+                    session.clone(),
+                    false,
+                    None,
+                ),
             ),
             async move {
-                // Cancel the daemon turn for `session_id_for_cancel` (best-
-                // effort). If `None`, the daemon may have a freshly-minted
-                // session we can't address from outside — we still wait for
-                // the settle budget so the daemon has a chance to wind down
-                // any in-flight tool calls before we capture the diff.
+                // Require cancellation acknowledgement before diff capture.
                 let socket = crate::engine_socket_path();
+                let session_id_for_cancel = session_id_for_cancel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 if let Some(sid) = session_id_for_cancel.as_deref() {
                     zoder_core::cancel_session(
                         &socket,

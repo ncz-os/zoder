@@ -31,6 +31,103 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use tokio::net::UnixStream;
 use tokio::process::Child;
 
+tokio::task_local! {
+    static SESSION_TRACKER: std::sync::Arc<std::sync::Mutex<Option<String>>>;
+}
+
+/// Expose the actual newly-created daemon session to an outer watchdog before
+/// the prompt can start editing. Task-local scope prevents concurrent turns
+/// from overwriting each other's cancellation target.
+pub async fn track_session_id<F: std::future::Future>(
+    tracker: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    turn: F,
+) -> F::Output {
+    SESSION_TRACKER.scope(tracker, turn).await
+}
+
+fn record_active_session(session: &str) {
+    let _ = SESSION_TRACKER.try_with(|tracker| {
+        *tracker.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.to_owned());
+    });
+}
+
+#[cfg(test)]
+mod watchdog_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_session_is_available_to_watchdog_before_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let tracker = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = tracker.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            for (id, result) in [
+                ("init", json!({})),
+                ("new", json!({"session_id":"fresh-session"})),
+            ] {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                write_frame(
+                    &mut write,
+                    &json!({"jsonrpc":"2.0","id":id,"result":result}),
+                )
+                .await
+                .unwrap();
+            }
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let prompt: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt["method"], "session/prompt");
+            assert_eq!(observed.lock().unwrap().as_deref(), Some("fresh-session"));
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"prompt","result":{}}),
+            )
+            .await
+            .unwrap();
+            let (cancel, _) = listener.accept().await.unwrap();
+            let (cancel_read, mut cancel_write) = tokio::io::split(cancel);
+            let mut cancel_reader = BufReader::new(cancel_read);
+            line.clear();
+            cancel_reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut cancel_write,
+                &json!({"jsonrpc":"2.0","id":"init","result":{}}),
+            )
+            .await
+            .unwrap();
+            line.clear();
+            cancel_reader.read_line(&mut line).await.unwrap();
+            let cancel: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(cancel["method"], "session/cancel");
+            assert_eq!(cancel["params"]["session_id"], "fresh-session");
+            write_frame(&mut cancel_write, &json!({"jsonrpc":"2.0","method":"session/update","params":{"session_id":"fresh-session","type":"turn_complete","outcome":"cancelled"}})).await.unwrap();
+        });
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "test prompt");
+        opts.timeout = Duration::from_secs(5);
+        let timed = tokio::time::timeout(
+            Duration::from_millis(200),
+            track_session_id(tracker.clone(), run_agent(&opts, |_| {})),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "mock must remain in-flight until watchdog fires"
+        );
+        let session = tracker.lock().unwrap().clone().unwrap();
+        cancel_session(&socket, &session, Duration::from_secs(1))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+}
+
 /// Maximum bytes the wire layer will buffer for a single JSON-RPC
 /// frame. ACP frames are small (a few KB for typical tool calls; a few
 /// hundred KB for the largest streamed text chunk the engine
@@ -2243,6 +2340,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("session/new returned no session_id"))?
         .to_string();
+    record_active_session(&session_id);
     // 3. optional model override (rpc-only).
     if let Some(model) = &opts.model_override {
         write_frame(
