@@ -2645,6 +2645,33 @@ impl PatchJournal {
 }
 
 /// Build the diff for the requested scope. Returns `(label, diff)`.
+/// savers F4: `--scope branch` on a branch with no commits since its base
+/// produces an empty diff, which used to "approve" (exit 0) without calling
+/// any reviewer -- even when the work the caller meant to review sat
+/// uncommitted in the working tree. Returns the refusal text when an explicit
+/// branch-scope diff is empty while the working tree is dirty; `None`
+/// otherwise (a genuinely empty change, or any other scope).
+fn empty_diff_hides_uncommitted_work(
+    cwd: &Path,
+    scope: ReviewScope,
+    label: &str,
+    diff: &str,
+) -> Option<String> {
+    if !matches!(scope, ReviewScope::Branch) || !diff.trim().is_empty() {
+        return None;
+    }
+    let dirty = run_git(cwd, &["status", "--porcelain"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    dirty.then(|| {
+        format!(
+            "the {label} diff is empty but the working tree has uncommitted changes; no reviewer \
+             was called. Pass --scope working-tree (or --scope auto) to review them, or commit \
+             them first"
+        )
+    })
+}
+
 fn build_diff(
     cwd: &Path,
     scope: ReviewScope,
@@ -3522,6 +3549,25 @@ pub(crate) async fn cmd_review(
     }
 
     let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
+    if let Some(reason) = empty_diff_hides_uncommitted_work(&cwd, scope, &label, &diff) {
+        let failed = ReviewerSlot::Failed {
+            model: "(no diff)".into(),
+            err: reason.clone(),
+        };
+        let agg = emit_reviews(
+            cli,
+            &ReviewAggregate {
+                reviewers: &[failed],
+                cost_usd: 0.0,
+                requested: 1,
+                ok_models: 0,
+                failed_models: 1,
+                receipts: &[],
+                exclusions: None,
+            },
+        );
+        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
+    }
     if diff.trim().is_empty() {
         let out = ReviewOutput {
             verdict: "approve".into(),
@@ -13798,6 +13844,40 @@ mod completion_integrity_tests {
             blocking_findings: 0,
         };
         assert!(!decide_loop_resolution(&s, false));
+    }
+
+    /// savers F4 regression: an empty branch diff with uncommitted work must
+    /// be refused, not approved without a reviewer.
+    #[test]
+    fn empty_branch_diff_with_dirty_tree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "a.rs"]);
+        git(&["commit", "-qm", "base"]);
+        let (label, diff) = build_diff(repo, ReviewScope::Branch, Some("HEAD")).unwrap();
+        assert!(diff.trim().is_empty());
+        // Clean tree: an empty change is honestly empty.
+        assert!(
+            empty_diff_hides_uncommitted_work(repo, ReviewScope::Branch, &label, &diff).is_none()
+        );
+        // Uncommitted edit: refuse with a pointer to --scope working-tree.
+        std::fs::write(repo.join("a.rs"), "fn a() { let _x = 1; }\n").unwrap();
+        let reason =
+            empty_diff_hides_uncommitted_work(repo, ReviewScope::Branch, &label, &diff).unwrap();
+        assert!(reason.contains("--scope working-tree"), "{reason}");
+        assert!(reason.contains("no reviewer was called"), "{reason}");
+        // Other scopes and non-empty diffs are untouched.
+        assert!(
+            empty_diff_hides_uncommitted_work(repo, ReviewScope::WorkingTree, &label, "").is_none()
+        );
+        assert!(
+            empty_diff_hides_uncommitted_work(repo, ReviewScope::Branch, &label, "+x").is_none()
+        );
     }
 
     #[test]
