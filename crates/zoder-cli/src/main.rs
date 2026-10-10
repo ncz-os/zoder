@@ -8,6 +8,7 @@ use anyhow::Context;
 use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
+mod eih_health;
 mod evals;
 mod exec_safety;
 mod goose;
@@ -5773,6 +5774,27 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // Per-model timer: health latency must reflect THIS model's call, not
         // the chain-wide elapsed time (which would fold in prior models' time
         // plus retry backoff and skew the router's latency EWMA).
+        // EIH models are never queried blindly (crate::eih_health): an open
+        // breaker or a failed health probe skips this link.
+        let link_gated = eng
+            .cfg
+            .provider(&pid)
+            .is_some_and(crate::eih_health::is_gated);
+        if link_gated {
+            let pcfg = eng
+                .cfg
+                .provider(&pid)
+                .ok_or_else(|| anyhow::anyhow!("provider {pid} not configured"))?;
+            if let Err(message) =
+                crate::eih_health::admit(&eng.cfg.health_path, pcfg, provider, model_id).await
+            {
+                if !cli.quiet {
+                    eprintln!("[zoder] {message}");
+                }
+                attempt_failures.push(format!("{model_id} via {pid}: {message}"));
+                continue;
+            }
+        }
         let model_started = std::time::Instant::now();
         match try_model(
             provider,
@@ -5786,6 +5808,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         .await?
         {
             Ok((res, reservation)) => {
+                if link_gated {
+                    crate::eih_health::record_success(&eng.cfg.health_path, &pid, model_id);
+                }
                 // Defer the winning model's health recording until after the
                 // policy verify below, so a policy-violating "success" is
                 // recorded as a single failure (not success + failure).
@@ -5798,6 +5823,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             }
             Err((e, fatal)) => {
                 attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
+                if link_gated {
+                    crate::eih_health::record_call_error(&eng.cfg.health_path, &pid, model_id, &e);
+                }
                 // Y-8: route the failure through the same classify + record
                 // path the `--probe --all` sweep uses, so a 401/403 from
                 // the API key OR a 429/503/529 capacity signal do NOT trip
@@ -5976,6 +6004,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "latency_ms": elapsed_ms,
                 "headers_ms": res.telemetry.headers_ms,
                 "first_token_ms": res.telemetry.first_token_ms,
+                "skipped_unhealthy": crate::eih_health::take_skipped(),
             })
         );
         if substituted && !cli.quiet {
@@ -8571,6 +8600,29 @@ pub(crate) async fn agentic_turn(
 
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
+    // EIH author routes are never queried blindly either (crate::eih_health).
+    // The agentic engine does not switch models on its own, so an unhealthy
+    // EIH route stops here with the reason instead of being dialed.
+    if crate::eih_health::is_gated(&routed_provider) {
+        let probe_client = OpenAiProvider::new_with_request_timeout_s(
+            &routed_provider,
+            Some(provider_request_timeout_s(cli, &eng.cfg)),
+        )?;
+        if let Err(message) = crate::eih_health::admit(
+            &eng.cfg.health_path,
+            &routed_provider,
+            &probe_client,
+            &primary,
+        )
+        .await
+        {
+            anyhow::bail!(
+                "{message}. The agentic engine does not switch models by itself: pick another \
+                 route with -m (for example qwen38 or MiniMax-M3) or retry after the breaker \
+                 window"
+            );
+        }
+    }
     let primary_entry = eng
         .route_corpus
         .get(&primary)

@@ -244,9 +244,126 @@ pub struct ModelHealth {
     /// uses this to render "checked 3h ago" freshness in its report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at_unix: Option<i64>,
+    /// Pre-query gate (circuit breaker with exponential backoff) for models
+    /// that must never be queried blindly (EIH). Absent = closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<PreQueryGate>,
+}
+
+/// Base and cap of the pre-query gate's exponential backoff.
+pub const GATE_BACKOFF_BASE_SECS: i64 = 30;
+pub const GATE_BACKOFF_CAP_SECS: i64 = 900;
+/// How long one process holds the half-open probe claim.
+pub const GATE_HALF_OPEN_CLAIM_SECS: i64 = 60;
+
+/// Persisted circuit-breaker state for the pre-query health gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreQueryGate {
+    /// Consecutive gate failures (429 / 5xx / timeout / failed probe).
+    pub open_count: u32,
+    /// Do not query before this time (backoff, or the provider's
+    /// Retry-After when that is longer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_unix: Option<i64>,
+    /// A process holding the half-open probe until this time; others skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_open_claim_until_unix: Option<i64>,
+    /// Why the gate opened (last failure, bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What the pre-query gate says about querying a model now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precheck {
+    /// Checked healthy within the TTL: query without probing.
+    Fresh { checked_at_unix: i64 },
+    /// Never checked, stale, or half-open: run a bounded health probe first.
+    NeedsProbe { half_open: bool },
+    /// Do not query: breaker open (backoff / Retry-After) or another process
+    /// holds the half-open probe.
+    Skip { until_unix: i64, reason: String },
 }
 
 impl ModelHealth {
+    /// Pre-query gate decision at `now` with a freshness `ttl_secs`.
+    pub fn precheck_at(&self, now: i64, ttl_secs: i64) -> Precheck {
+        if let Some(gate) = &self.gate {
+            if let Some(until) = gate.retry_not_before_unix.filter(|&t| t > now) {
+                return Precheck::Skip {
+                    until_unix: until,
+                    reason: gate
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "circuit breaker open".into()),
+                };
+            }
+            if gate.open_count > 0 {
+                if let Some(claim) = gate.half_open_claim_until_unix.filter(|&t| t > now) {
+                    return Precheck::Skip {
+                        until_unix: claim,
+                        reason: "half-open health probe in progress in another zoder process"
+                            .into(),
+                    };
+                }
+                return Precheck::NeedsProbe { half_open: true };
+            }
+        }
+        match (self.classification, self.checked_at_unix) {
+            (Some(Classification::Reachable), Some(ts)) if now.saturating_sub(ts) < ttl_secs => {
+                Precheck::Fresh {
+                    checked_at_unix: ts,
+                }
+            }
+            _ => Precheck::NeedsProbe { half_open: false },
+        }
+    }
+
+    /// Claim the single half-open probe slot (call under the store lock after
+    /// `precheck_at` returned `NeedsProbe { half_open: true }`).
+    pub fn claim_half_open_at(&mut self, now: i64) {
+        if let Some(gate) = self.gate.as_mut() {
+            gate.half_open_claim_until_unix = Some(now + GATE_HALF_OPEN_CLAIM_SECS);
+        }
+    }
+
+    /// Record a gate failure: open (or re-open) the breaker with exponential
+    /// backoff, never shorter than the provider's Retry-After.
+    pub fn record_gate_failure_at(
+        &mut self,
+        now: i64,
+        provider_id: &str,
+        classification: Classification,
+        retry_after_secs: Option<u64>,
+        reason: &str,
+    ) {
+        let gate = self.gate.get_or_insert_with(PreQueryGate::default);
+        gate.open_count = gate.open_count.saturating_add(1);
+        let exp = gate.open_count.saturating_sub(1).min(16);
+        let backoff = GATE_BACKOFF_BASE_SECS
+            .saturating_mul(1i64 << exp)
+            .min(GATE_BACKOFF_CAP_SECS);
+        let retry_after = retry_after_secs
+            .map(|s| i64::try_from(s).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        gate.retry_not_before_unix = Some(now.saturating_add(backoff.max(retry_after)));
+        gate.half_open_claim_until_unix = None;
+        gate.reason = Some(reason.chars().take(160).collect());
+        self.checked_at_unix = Some(now);
+        self.provider_id = Some(provider_id.to_string());
+        self.classification = Some(classification);
+        self.last_error = Some(reason.chars().take(160).collect());
+        self.last_failure_unix = Some(now);
+    }
+
+    /// Record a healthy check or successful call: close the gate.
+    pub fn record_gate_success_at(&mut self, now: i64, provider_id: &str) {
+        self.gate = None;
+        self.checked_at_unix = Some(now);
+        self.provider_id = Some(provider_id.to_string());
+        self.classification = Some(Classification::Reachable);
+    }
+
     /// Stamp the record as just-checked. Callers do this on every probe,
     /// success or failure, so consult can show freshness and so a model that
     /// flipped to Capacity is recognised even though its breaker didn't open.
@@ -1592,5 +1709,97 @@ mod tests {
             path.exists(),
             "load must not have renamed the store away as corrupt"
         );
+    }
+}
+
+#[cfg(test)]
+mod pre_query_gate_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_check_skips_probe_and_stale_or_unknown_needs_one() {
+        let mut m = ModelHealth::default();
+        assert_eq!(
+            m.precheck_at(1000, 300),
+            Precheck::NeedsProbe { half_open: false }
+        );
+        m.record_gate_success_at(1000, "nvidia-eih");
+        assert_eq!(
+            m.precheck_at(1200, 300),
+            Precheck::Fresh {
+                checked_at_unix: 1000
+            }
+        );
+        assert_eq!(
+            m.precheck_at(1301, 300),
+            Precheck::NeedsProbe { half_open: false }
+        );
+    }
+
+    #[test]
+    fn failures_back_off_exponentially_honor_retry_after_and_half_open() {
+        let mut m = ModelHealth::default();
+        m.record_gate_failure_at(
+            1000,
+            "nvidia-eih",
+            Classification::Capacity,
+            None,
+            "HTTP 429",
+        );
+        match m.precheck_at(1001, 300) {
+            Precheck::Skip { until_unix, reason } => {
+                assert_eq!(until_unix, 1000 + GATE_BACKOFF_BASE_SECS);
+                assert!(reason.contains("429"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Backoff elapsed: half-open probe; one claimer at a time.
+        let t = 1000 + GATE_BACKOFF_BASE_SECS;
+        assert_eq!(
+            m.precheck_at(t, 300),
+            Precheck::NeedsProbe { half_open: true }
+        );
+        m.claim_half_open_at(t);
+        assert!(matches!(m.precheck_at(t + 1, 300), Precheck::Skip { .. }));
+        // Probe fails again: doubled backoff.
+        m.record_gate_failure_at(t + 2, "nvidia-eih", Classification::Error, None, "timeout");
+        match m.precheck_at(t + 3, 300) {
+            Precheck::Skip { until_unix, .. } => {
+                assert_eq!(until_unix, t + 2 + 2 * GATE_BACKOFF_BASE_SECS)
+            }
+            other => panic!("{other:?}"),
+        }
+        // Retry-After longer than the backoff wins.
+        m.record_gate_failure_at(
+            5000,
+            "nvidia-eih",
+            Classification::Capacity,
+            Some(600),
+            "429",
+        );
+        assert!(
+            matches!(m.precheck_at(5000 + 300, 300), Precheck::Skip { until_unix, .. } if until_unix == 5600)
+        );
+        // The cap bounds growth.
+        for _ in 0..20 {
+            m.record_gate_failure_at(9000, "nvidia-eih", Classification::Capacity, None, "429");
+        }
+        assert!(
+            matches!(m.precheck_at(9001, 300), Precheck::Skip { until_unix, .. } if until_unix == 9000 + GATE_BACKOFF_CAP_SECS)
+        );
+        // A success closes the gate.
+        m.record_gate_success_at(20000, "nvidia-eih");
+        assert!(m.gate.is_none());
+        assert!(matches!(m.precheck_at(20001, 300), Precheck::Fresh { .. }));
+    }
+
+    #[test]
+    fn gate_round_trips_and_legacy_records_have_none() {
+        let legacy: ModelHealth = serde_json::from_str(r#"{"calls":1,"failures":0,"consecutive_failures":0,"ewma_latency_ms":null,"last_error":null}"#).unwrap();
+        assert!(legacy.gate.is_none());
+        let mut m = ModelHealth::default();
+        m.record_gate_failure_at(1, "p", Classification::Capacity, Some(5), "429");
+        let back: ModelHealth = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.gate, m.gate);
     }
 }

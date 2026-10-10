@@ -104,3 +104,35 @@ reviews all go to the same two reviewer routes.
   raising timeouts.
 
 These are recommendations; nothing is applied automatically.
+
+## EIH health gate (before any EIH query)
+
+NVIDIA EIH (`https://integrate.api.nvidia.com/v1`) rate-limits fleet-wide:
+a study run saw HTTP 429 on 7.5% of reviewer calls, in bursts, even at one
+request in flight. zoder therefore never queries an EIH model blindly:
+
+- Before the first query of a run, and again once the last check is older
+  than `ZODER_EIH_HEALTH_TTL_S` (default 300s) or after any 429/5xx/timeout,
+  it runs a bounded `GET {base}/models` (`ZODER_EIH_PROBE_TIMEOUT_MS`,
+  default 5000) that must list the model. EIH has no per-model status
+  endpoint. The "Healthy" table seen in fleet logs is zoder's own
+  `~/.zoder/health.json` (`zoder health`), which is where the gate keeps its
+  state, so all zoder processes on a host share it.
+- A per-model circuit breaker in that store opens on 429, 5xx, timeouts and
+  failed probes: 30s backoff doubling to 15 min, never shorter than the
+  provider's Retry-After. After the backoff one process claims a half-open
+  probe; success closes the breaker.
+- An EIH 429 is not retried in-process (that only hammers the shared
+  limiter): the breaker opens and the reviewer chain falls to the next
+  configured route.
+- While the breaker is open the model is skipped without any request. The
+  review JSON lists it in `skipped_unhealthy` (model, provider, reason,
+  `retry_not_before_unix`), and each EIH receipt carries a `health` object
+  (`source`: `cache`, `probe` or `half_open_probe`). A skipped reviewer is
+  never a pass: the slot either falls back (its receipt names the serving
+  model) or fails, and a panel missing a member stays incomplete.
+- `zoder exec --oneshot` skips an unhealthy EIH link in its chain the same
+  way; an agentic `zoder exec` whose route is EIH stops with the reason
+  (the engine does not switch models by itself).
+
+Routing rules are unchanged: Nemotron is served only by the EIH route.
