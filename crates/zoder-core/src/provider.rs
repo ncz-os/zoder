@@ -197,6 +197,37 @@ mod reliability_deadline_tests {
         let _ = task.await;
     }
 
+    /// Queue visibility: a slow first token with notices on is reported as a
+    /// notice (not an error) and measured in `first_token_ms`.
+    #[tokio::test]
+    async fn slow_first_token_with_notices_succeeds_and_is_measured() {
+        let body = format!("{DELTA}{DONE}");
+        let (uri, task) = delayed_server(0, 400, "", &body).await;
+        let (mut p, request) = fixture(&uri, 5000, 100);
+        p.wait_notice_interval = Some(Duration::from_millis(50));
+        let result = p.stream_chat(&request, None).await.unwrap();
+        assert_eq!(result.content, "hello");
+        let first = result.telemetry.first_token_ms.expect("first_token_ms");
+        assert!(first >= 350, "first_token_ms={first}");
+        assert!(result.telemetry.headers_ms.expect("headers_ms") < first);
+        task.await.unwrap();
+    }
+
+    /// Notices never turn a dead stream into an endless wait: the request
+    /// budget still ends it.
+    #[tokio::test]
+    async fn notices_do_not_extend_the_request_budget() {
+        let (uri, task) = delayed_server(0, 5000, "", DONE).await;
+        let (mut p, request) = fixture(&uri, 300, 100);
+        p.wait_notice_interval = Some(Duration::from_millis(50));
+        let started = Instant::now();
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(2000));
+        task.abort();
+        let _ = task.await;
+    }
+
     /// A11 (Anthropic wire format): a stream that emits only extended-thinking
     /// deltas and then hangs must trip the idle guard, not ride the overall
     /// request budget.
@@ -291,6 +322,8 @@ pub const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
 /// Default stream inactivity budget (seconds). A model that stops emitting for
 /// this long is treated as stalled. Override: ZODER_IDLE_S.
 const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
+/// Default interval for "still waiting for the first token" notices.
+const DEFAULT_WAIT_NOTICE_S: u64 = 30;
 
 /// Error text for an idle-stall timeout. Keeps the stable `stream stalled:`
 /// prefix that callers and health classification match on, and says whether
@@ -542,6 +575,14 @@ pub struct CallTelemetry {
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<f64>,
     pub key_spend: Option<f64>,
+    /// Milliseconds from sending the request to receiving response headers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers_ms: Option<u64>,
+    /// Milliseconds from sending the request to the first generation delta
+    /// (answer or reasoning) on a streamed call. Large values mean the server
+    /// queued or prefilled for that long -- the queueing signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -583,6 +624,8 @@ fn telemetry_from_headers(h: &reqwest::header::HeaderMap) -> CallTelemetry {
         cost_usd: header_f64(h, "x-litellm-response-cost-original"),
         duration_ms: header_f64(h, "x-litellm-response-duration-ms"),
         key_spend: header_f64(h, "x-litellm-key-spend"),
+        headers_ms: None,
+        first_token_ms: None,
     }
 }
 
@@ -1154,6 +1197,11 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     request_timeout: Duration,
     idle_timeout: Duration,
+    /// When set, a streamed call that has produced no generation yet prints a
+    /// "still waiting" notice on stderr at this interval instead of waiting
+    /// silently for the whole request budget. Off by default; CLI callers
+    /// opt in via [`OpenAiProvider::with_wait_notices`].
+    wait_notice_interval: Option<Duration>,
     /// Resolved Azure OpenAI Data Plane `api-version` for
     /// `kind == "azure-openai"` providers. Populated at construction time
     /// from the precedence documented on [`crate::config::Provider::azure_api_version`]:
@@ -1242,8 +1290,42 @@ impl OpenAiProvider {
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_S),
             ),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
+            wait_notice_interval: None,
             azure_api_version,
         })
+    }
+
+    /// Opt in to periodic stderr notices while a streamed call waits for its
+    /// first token (interval `ZODER_WAIT_NOTICE_S`, default 30s). Long silent
+    /// waits on a busy shared server were indistinguishable from a hang.
+    pub fn with_wait_notices(mut self, on: bool) -> Self {
+        self.wait_notice_interval = on.then(|| {
+            Duration::from_secs(env_secs("ZODER_WAIT_NOTICE_S", DEFAULT_WAIT_NOTICE_S).max(1))
+        });
+        self
+    }
+
+    /// Read step for a stream loop: the idle budget once generation began;
+    /// before that, the remaining request budget, sliced by the notice
+    /// interval when notices are on.
+    fn stream_read_step(&self, saw_generation: bool, remaining: Duration) -> Duration {
+        if saw_generation {
+            self.idle_timeout.min(remaining)
+        } else if let Some(every) = self.wait_notice_interval {
+            every.min(remaining)
+        } else {
+            remaining
+        }
+    }
+
+    fn wait_notice(&self, waited: Duration) {
+        eprintln!(
+            "[zoder] still waiting for the first token from {} after {}s (server busy, \
+             queueing or prefilling; request budget {}s)",
+            self.provider_id,
+            waited.as_secs(),
+            self.request_timeout.as_secs()
+        );
     }
 
     /// KNEMON per-account identity resolved at construction time from
@@ -1656,6 +1738,7 @@ impl OpenAiProvider {
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         tracing::debug!(model = %req.model, stream = req.stream, max_tokens = req.max_tokens, "chat call");
+        let sent = Instant::now();
         let resp = match timeout(self.request_timeout, self.request(req).send()).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(classify_reqwest(e)),
@@ -1668,6 +1751,7 @@ impl OpenAiProvider {
         };
         let status = resp.status();
         let mut telemetry = telemetry_from_headers(resp.headers());
+        telemetry.headers_ms = Some(sent.elapsed().as_millis() as u64);
         // Direct providers (not fronted by a LiteLLM proxy) don't emit the
         // `x-litellm-model-api-base` served-backend header. Fall back to this
         // provider's configured base_url so the served host is still known —
@@ -2026,6 +2110,8 @@ impl OpenAiProvider {
         // Z-9 terminal meaning (a non-empty *answer* delta is required for
         // success).
         let mut saw_generation = false;
+        let loop_started = Instant::now();
+        let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -2041,11 +2127,7 @@ impl OpenAiProvider {
             // Prompt prefill/queue latency is covered by the overall request
             // budget. The idle guard applies once generation begins — which
             // includes a stream that has so far emitted only reasoning.
-            let step = if saw_generation {
-                self.idle_timeout.min(remaining)
-            } else {
-                remaining
-            };
+            let step = self.stream_read_step(saw_generation, remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2055,6 +2137,10 @@ impl OpenAiProvider {
                             format!("request timeout after {:?}", self.request_timeout),
                             emitted,
                         ));
+                    }
+                    if !saw_generation && self.wait_notice_interval.is_some() {
+                        self.wait_notice(loop_started.elapsed() + headers_wait);
+                        continue;
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -2200,6 +2286,10 @@ impl OpenAiProvider {
                             .is_some_and(|s| !s.is_empty())
                         || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
                     {
+                        if !saw_generation {
+                            telemetry.first_token_ms =
+                                Some((headers_wait + loop_started.elapsed()).as_millis() as u64);
+                        }
                         saw_generation = true;
                     }
                     let piece = pick_text(
@@ -2343,7 +2433,7 @@ impl OpenAiProvider {
     async fn consume_stream_anthropic(
         &self,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         let deadline = Instant::now() + self.request_timeout;
@@ -2382,6 +2472,8 @@ impl OpenAiProvider {
         // argument deltas -- not only on answer text. See `saw_generation`
         // in the chat-completions loop.
         let mut saw_generation = false;
+        let loop_started = Instant::now();
+        let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
         // Track the most recent `event:` line so the next `data:` line is
         // paired with the right envelope. SSE resets per-event, so we keep
         // the LAST seen event name until a new one arrives. A missing
@@ -2398,11 +2490,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = if saw_generation {
-                self.idle_timeout.min(remaining)
-            } else {
-                remaining
-            };
+            let step = self.stream_read_step(saw_generation, remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2412,6 +2500,10 @@ impl OpenAiProvider {
                             format!("request timeout after {:?}", self.request_timeout),
                             emitted,
                         ));
+                    }
+                    if !saw_generation && self.wait_notice_interval.is_some() {
+                        self.wait_notice(loop_started.elapsed() + headers_wait);
+                        continue;
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -2550,6 +2642,11 @@ impl OpenAiProvider {
                         Some("content_block_delta") => {
                             // text_delta, thinking_delta and input_json_delta
                             // all prove the model is generating.
+                            if !saw_generation {
+                                telemetry.first_token_ms = Some(
+                                    (headers_wait + loop_started.elapsed()).as_millis() as u64,
+                                );
+                            }
                             saw_generation = true;
                             // The deltas carry `delta.type` ∈
                             // {"text_delta","input_json_delta","thinking_delta"}.
@@ -2699,7 +2796,7 @@ impl OpenAiProvider {
     async fn consume_stream_responses(
         &self,
         resp: reqwest::Response,
-        telemetry: CallTelemetry,
+        mut telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         // The endpoint URL is read in `request()`; we accept the same
@@ -2742,6 +2839,8 @@ impl OpenAiProvider {
         // argument deltas -- not only on answer text. See `saw_generation`
         // in the chat-completions loop.
         let mut saw_generation = false;
+        let loop_started = Instant::now();
+        let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
         let mut current_event: Option<String> = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2752,11 +2851,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = if saw_generation {
-                self.idle_timeout.min(remaining)
-            } else {
-                remaining
-            };
+            let step = self.stream_read_step(saw_generation, remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2766,6 +2861,10 @@ impl OpenAiProvider {
                             format!("request timeout after {:?}", self.request_timeout),
                             emitted,
                         ));
+                    }
+                    if !saw_generation && self.wait_notice_interval.is_some() {
+                        self.wait_notice(loop_started.elapsed() + headers_wait);
+                        continue;
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -2890,6 +2989,10 @@ impl OpenAiProvider {
                     // summary, function-call arguments) proves generation
                     // has begun, so the idle guard arms on it.
                     if event_type.is_some_and(|t| t.ends_with(".delta")) {
+                        if !saw_generation {
+                            telemetry.first_token_ms =
+                                Some((headers_wait + loop_started.elapsed()).as_millis() as u64);
+                        }
                         saw_generation = true;
                     }
                     match event_type {

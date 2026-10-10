@@ -13,6 +13,7 @@ mod exec_safety;
 mod goose;
 mod jobs;
 mod mnemos;
+mod provider_slots;
 mod review_diff;
 mod reviewer_pool;
 mod sop;
@@ -5736,7 +5737,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 OpenAiProvider::new_with_request_timeout_s(
                     pcfg,
                     Some(provider_request_timeout_s(cli, &eng.cfg)),
-                )?,
+                )?
+                .with_wait_notices(!cli.quiet),
             );
         }
         let provider = &provider_clients[&pid];
@@ -5972,6 +5974,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "key_spend": res.telemetry.key_spend,
                 "duration_ms": res.telemetry.duration_ms,
                 "latency_ms": elapsed_ms,
+                "headers_ms": res.telemetry.headers_ms,
+                "first_token_ms": res.telemetry.first_token_ms,
             })
         );
         if substituted && !cli.quiet {
