@@ -62,11 +62,20 @@ mod reliability_deadline_tests {
     }
 
     fn fixture(uri: &str, total_ms: u64, idle_ms: u64) -> (OpenAiProvider, ChatRequest) {
+        fixture_kind(uri, total_ms, idle_ms, "openai-chat")
+    }
+
+    fn fixture_kind(
+        uri: &str,
+        total_ms: u64,
+        idle_ms: u64,
+        kind: &str,
+    ) -> (OpenAiProvider, ChatRequest) {
         let config = Provider {
             id: "deadline-test".into(),
             engine_provider_ref: None,
             base_url: uri.into(),
-            kind: "openai-chat".into(),
+            kind: kind.into(),
             auth: Auth::None,
             paid: false,
             billing: crate::BillingMode::Metered,
@@ -167,6 +176,59 @@ mod reliability_deadline_tests {
         // No answer bytes reached the sink: the stall fired on reasoning alone.
         assert!(!error.emitted);
         assert!(sink.is_empty());
+        assert!(
+            error.message.contains("still reasoning"),
+            "reasoning-only stall must say so: {}",
+            error.message
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn answer_stall_message_says_answer_had_begun() {
+        let (uri, task) = delayed_server(0, 1000, DELTA, DONE).await;
+        let (p, request) = fixture(&uri, 5000, 100);
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(error.message.starts_with("stream stalled:"));
+        assert!(error.message.contains("after answer output began"));
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A11 (Anthropic wire format): a stream that emits only extended-thinking
+    /// deltas and then hangs must trip the idle guard, not ride the overall
+    /// request budget.
+    #[tokio::test]
+    async fn anthropic_thinking_only_stream_has_idle_stall_guard() {
+        let first = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"model\",\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n";
+        let last = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (uri, task) = delayed_server(0, 1500, first, last).await;
+        let (p, request) = fixture_kind(&uri, 8000, 100, "anthropic");
+        let started = Instant::now();
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout, "{}", error.message);
+        assert!(error.message.contains("still reasoning"), "{}", error.message);
+        assert!(started.elapsed() < Duration::from_millis(1200));
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A11 (Responses wire format): reasoning-summary deltas alone arm the
+    /// idle guard.
+    #[tokio::test]
+    async fn responses_reasoning_only_stream_has_idle_stall_guard() {
+        let first = "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hmm\"}\n\n";
+        let last = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let (uri, task) = delayed_server(0, 1500, first, last).await;
+        let (p, request) = fixture_kind(&uri, 8000, 100, "openai-responses");
+        let started = Instant::now();
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout, "{}", error.message);
+        assert!(error.message.contains("still reasoning"), "{}", error.message);
+        assert!(started.elapsed() < Duration::from_millis(1200));
         task.abort();
         let _ = task.await;
     }
@@ -221,6 +283,22 @@ pub const DEFAULT_REQUEST_TIMEOUT_S: u64 = 120;
 /// Default stream inactivity budget (seconds). A model that stops emitting for
 /// this long is treated as stalled. Override: ZODER_IDLE_S.
 const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
+
+/// Error text for an idle-stall timeout. Keeps the stable `stream stalled:`
+/// prefix that callers and health classification match on, and says whether
+/// the stall happened while the model was still reasoning (no answer text
+/// yet) so a reasoning-only hang is distinguishable from a mid-answer hang.
+fn stream_stall_message(idle: Duration, answer_started: bool) -> String {
+    if answer_started {
+        format!("stream stalled: no data for {idle:?} after answer output began")
+    } else {
+        format!(
+            "stream stalled: no data for {idle:?} while the model was still reasoning \
+             (no answer text yet); raise ZODER_IDLE_S if this model legitimately \
+             pauses longer mid-reasoning"
+        )
+    }
+}
 /// Max bytes for a single SSE line before we treat the stream as hostile.
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
 /// Max bytes buffered without a line terminator before we bail.
@@ -1972,7 +2050,7 @@ impl OpenAiProvider {
                     }
                     return Err(fail(
                         ErrKind::Timeout,
-                        format!("stream stalled: no data for {:?}", self.idle_timeout),
+                        stream_stall_message(self.idle_timeout, saw_content),
                         emitted,
                     ));
                 }
@@ -2291,6 +2369,11 @@ impl OpenAiProvider {
         };
         let mut done = false;
         let mut saw_text = false;
+        // Arms the idle (stall) guard on the first generation event of any
+        // kind -- answer text, extended-thinking / reasoning deltas, or tool
+        // argument deltas -- not only on answer text. See `saw_generation`
+        // in the chat-completions loop.
+        let mut saw_generation = false;
         // Track the most recent `event:` line so the next `data:` line is
         // paired with the right envelope. SSE resets per-event, so we keep
         // the LAST seen event name until a new one arrives. A missing
@@ -2307,7 +2390,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = if saw_text {
+            let step = if saw_generation {
                 self.idle_timeout.min(remaining)
             } else {
                 remaining
@@ -2324,7 +2407,7 @@ impl OpenAiProvider {
                     }
                     return Err(fail(
                         ErrKind::Timeout,
-                        format!("stream stalled: no data for {:?}", self.idle_timeout),
+                        stream_stall_message(self.idle_timeout, saw_text),
                         emitted,
                     ));
                 }
@@ -2457,6 +2540,9 @@ impl OpenAiProvider {
                             }
                         }
                         Some("content_block_delta") => {
+                            // text_delta, thinking_delta and input_json_delta
+                            // all prove the model is generating.
+                            saw_generation = true;
                             // The deltas carry `delta.type` ∈
                             // {"text_delta","input_json_delta","thinking_delta"}.
                             // We only surface `text_delta` for parity
@@ -2643,6 +2729,11 @@ impl OpenAiProvider {
         };
         let mut done = false;
         let mut saw_text = false;
+        // Arms the idle (stall) guard on the first generation event of any
+        // kind -- answer text, extended-thinking / reasoning deltas, or tool
+        // argument deltas -- not only on answer text. See `saw_generation`
+        // in the chat-completions loop.
+        let mut saw_generation = false;
         let mut current_event: Option<String> = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2653,7 +2744,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = if saw_text {
+            let step = if saw_generation {
                 self.idle_timeout.min(remaining)
             } else {
                 remaining
@@ -2670,7 +2761,7 @@ impl OpenAiProvider {
                     }
                     return Err(fail(
                         ErrKind::Timeout,
-                        format!("stream stalled: no data for {:?}", self.idle_timeout),
+                        stream_stall_message(self.idle_timeout, saw_text),
                         emitted,
                     ));
                 }
@@ -2786,6 +2877,12 @@ impl OpenAiProvider {
                             format!("responses stream failed: {}", redact(payload)),
                             emitted,
                         ));
+                    }
+                    // Any `*.delta` event (output text, reasoning text /
+                    // summary, function-call arguments) proves generation
+                    // has begun, so the idle guard arms on it.
+                    if event_type.is_some_and(|t| t.ends_with(".delta")) {
+                        saw_generation = true;
                     }
                     match event_type {
                         // Text deltas: the Responses API carries the
