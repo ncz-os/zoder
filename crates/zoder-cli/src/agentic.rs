@@ -797,7 +797,7 @@ Every finding MUST cite a concrete location (path:line). No markdown or prose ou
             &[],
             REVIEW_SYSTEM,
             &retry_user,
-            max_tokens,
+            reviewer_retry_budget(max_tokens),
         )
         .await
         {
@@ -3262,6 +3262,32 @@ pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
 // review / adversarial-review.
 // ---------------------------------------------------------------------------
 
+/// Minimum output-token budget for a reviewer completion.
+///
+/// Reasoning models (EIH `nemotron-3-ultra`, DeepSeek `deepseek-flash`) spend
+/// the majority of the output budget on hidden reasoning tokens before they
+/// emit the JSON verdict. With the old 2048-token floor the reply was cut off
+/// mid-reasoning (`finish_reason: length`, plain prose) and the strict verdict
+/// parser failed closed — `zoder review`'s own default reviewer reported
+/// "returned invalid JSON twice" on a chunk of only 9 KB. A measured
+/// Nemotron chunk-1 reply needed 6,769 completion tokens before the 2,225-byte
+/// JSON object; 8,192 clears it with headroom while a non-reasoning reviewer
+/// (gemma, qwen38) simply never reaches the cap.
+const REVIEW_MIN_MAX_TOKENS: u32 = 8192;
+
+/// Absolute ceiling for the escalated reviewer retry budget, so a pathological
+/// model cannot ask for an unbounded generation.
+const REVIEW_MAX_TOKENS_CEILING: u32 = 32768;
+
+/// Budget for the single JSON-only reviewer retry. The first attempt may have
+/// been truncated mid-reasoning rather than malformed, so the retry gets double
+/// the first attempt's budget (bounded by [`REVIEW_MAX_TOKENS_CEILING`]).
+fn reviewer_retry_budget(first_attempt: u32) -> u32 {
+    first_attempt
+        .saturating_mul(2)
+        .min(REVIEW_MAX_TOKENS_CEILING)
+}
+
 const REVIEW_SYSTEM: &str = "You are a meticulous senior software engineer performing a code review. \
 Identify concrete defects in the supplied diff. Approve a sound change; request changes only for a defect you can explain and locate. \
 Return one JSON object with keys verdict, summary, findings, and next_steps. \
@@ -3344,7 +3370,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                     &[],
                     system,
                     &repair_user,
-                    max_tokens,
+                    reviewer_retry_budget(max_tokens),
                 )
                 .await?;
                 cost_usd += completion.cost_usd;
@@ -3627,7 +3653,7 @@ redefined, or recursively calling a missing function, check it against this map:
 
     // Fan out concurrently on this task (no spawn: the completion future borrows
     // a non-Send sink type, so we poll them together via join_all instead).
-    let max_tokens = cli.max_tokens.max(2048);
+    let max_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
     let futs = models.iter().map(|m| {
         complete_review_chunks(
             cli,
@@ -5512,7 +5538,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         if !cli.quiet {
             eprintln!("[loop] iter {i}: adversarial review…");
         }
-        let max_tokens = cli.max_tokens.max(2048);
+        let max_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
         // Resolve a fresh scenario-routed reviewer chain per review
         // pass so KNEMON's "most-idle sub first" view reflects the
         // current cycle's actual readings (not the chain as it stood at
@@ -8359,6 +8385,28 @@ must reap the direct shell on the timeout branch)"
             r#"{"verdict":"approve","summary":"Sound change.","findings":[],"next_steps":[]}"#
         )
         .is_some());
+    }
+
+    /// Regression: reasoning reviewers (EIH nemotron, DeepSeek) spend most of
+    /// the output budget on hidden reasoning before emitting the JSON verdict.
+    /// The old 2048-token review floor truncated them mid-reasoning
+    /// (`finish_reason: length`, prose) and the strict parser failed closed
+    /// with "returned invalid JSON twice" on real diffs. A measured Nemotron
+    /// chunk needed 6,769 completion tokens before its 2,225-byte JSON object.
+    #[test]
+    fn reviewer_budget_clears_reasoning_models_and_retry_escalates() {
+        let floor = REVIEW_MIN_MAX_TOKENS;
+        assert!(
+            floor >= 8192,
+            "review floor must clear a reasoning model's pre-answer reasoning budget"
+        );
+        assert_eq!(reviewer_retry_budget(REVIEW_MIN_MAX_TOKENS), 16384);
+        assert_eq!(
+            reviewer_retry_budget(REVIEW_MAX_TOKENS_CEILING),
+            REVIEW_MAX_TOKENS_CEILING,
+            "retry budget must be bounded"
+        );
+        assert_eq!(reviewer_retry_budget(0), 0);
     }
 
     /// Z-8 REGRESSION GUARD (diff-capture ordering): `build_diff` in
