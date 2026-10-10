@@ -17,8 +17,8 @@
 //!    is split deterministically into ordered sub-hunks at line boundaries
 //!    (each labelled `part k/n of <file>`), unless splitting is disabled.
 //!
-//! Everything in here is pure except [`load_zoderignore`] and
-//! [`repo_root`], which read the repository.
+//! Everything in here is pure except [`load_zoderignore`],
+//! [`load_zoderignore_at`] and [`repo_root`], which read the repository.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -184,7 +184,13 @@ fn section_path(section: &str) -> Option<String> {
             break;
         }
     }
-    clean_git_path(plus.or(minus)?)
+    // Prefer the post-image path, but fall back to the pre-image path when the
+    // post-image is `/dev/null` (a deletion). Previously `plus.or(minus)` fed
+    // `/dev/null` into `clean_git_path`, which returns `None`, so a deleted
+    // file had no path at all: it could not be excluded, was skipped by the
+    // diff map, and any split part label carried an empty path.
+    plus.and_then(clean_git_path)
+        .or_else(|| minus.and_then(clean_git_path))
 }
 
 fn clean_git_path(raw: &str) -> Option<String> {
@@ -346,6 +352,31 @@ pub fn load_zoderignore(root: &Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
+    parse_zoderignore(&raw)
+}
+
+/// Read repository-relative exclude globs from `<rev>:.zoderignore` in the git
+/// repository at `cwd`.
+///
+/// Branch/base review scopes use this so a change cannot exempt itself: the
+/// branch's own `.zoderignore` additions/edits are part of the diff under
+/// review and must not take effect until the base moves. A revision with no
+/// `.zoderignore`, a non-git `cwd`, or any git failure yields no patterns (the
+/// caller's explicit `--exclude` / `[review].exclude` still apply).
+pub fn load_zoderignore_at(cwd: &Path, rev: &str) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["show", &format!("{rev}:.zoderignore")])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_zoderignore(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse `.zoderignore` text: trim, drop blanks and `#` comments.
+fn parse_zoderignore(raw: &str) -> Vec<String> {
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -561,6 +592,15 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// `is_ident_char` over a decoded `char`. Any non-ASCII character counts as a
+/// non-identifier character, matching the historical byte test while keeping
+/// the answer well-defined for multi-byte input. Using this instead of a
+/// `c as u8` cast avoids treating a name like `Łódź` (whose `Ł` truncates to
+/// ASCII `L`) as if it were an identifier.
+fn is_ident_char_ch(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
 fn keyword_def(line: &str) -> Option<String> {
     // Only scan the declaration part: a `struct` inside a parameter list is
     // not the definition keyword (`static int wl_handle_init(struct s *st)`).
@@ -617,7 +657,11 @@ fn c_style_def(line: &str) -> Option<String> {
     if prefix.contains('=') {
         return None;
     }
-    let name_start = prefix.rfind(|c: char| !is_ident_char(c as u8))? + 1;
+    let name_start = prefix
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !is_ident_char_ch(c))
+        .map(|(i, c)| i + c.len_utf8())?;
     let name = &prefix[name_start..];
     if name.is_empty() || !is_ident_start(name.as_bytes()[0]) {
         return None;
@@ -659,6 +703,12 @@ pub fn review_diff_chunks(
     max_chunks: usize,
 ) -> anyhow::Result<Vec<String>> {
     let cap = max_hunk_bytes.max(1);
+    // An empty (or whitespace-only) diff has no chunks. Returning `[""]` here
+    // would hand a reviewer a single empty chunk, which typically draws an
+    // APPROVE -- the exact fail-open path this module now guards against.
+    if diff.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let mut units: Vec<String> = Vec::new();
     for section in sections(diff) {
         let path = section_path(section).unwrap_or_default();
@@ -895,15 +945,23 @@ pub struct PreparedDiff {
     /// `None` when the diff fits in a single chunk (no cross-chunk blindness).
     pub diff_map: Option<String>,
     pub chunks: Vec<String>,
+    /// True when the raw diff was non-empty but exclusions removed every
+    /// section, leaving nothing to review. Callers MUST fail closed (non-approve
+    /// and a nonzero exit) rather than send an empty chunk to a reviewer.
+    pub emptied_by_exclusion: bool,
 }
 
 /// Full prep pipeline shared by `zoder review` and the dry-run mode.
 ///
-/// Pattern precedence for exclusion is union (repo `.zoderignore`, then
-/// configured `[review].exclude`, then `--exclude`). The total cap is checked
-/// *after* exclusion; a diff over it fails naming `--max-diff-bytes`.
+/// `zoderignore` is the already-resolved repo-level glob list: the caller reads
+/// it from the working tree for working-tree scope and from the base revision
+/// for branch/base scope (see `review_zoderignore_patterns`), so a change under
+/// review cannot exempt itself. Pattern precedence for exclusion is union
+/// (`zoderignore`, then configured `[review].exclude`, then `--exclude`). The
+/// total cap is checked *after* exclusion; a diff over it fails naming
+/// `--max-diff-bytes`.
 pub fn prepare_review_diff(
-    repo_root: &Path,
+    zoderignore: &[String],
     raw_diff: &str,
     cli_excludes: &[String],
     config_excludes: &[String],
@@ -911,11 +969,14 @@ pub fn prepare_review_diff(
     max_hunk_bytes: usize,
     split_hunks: bool,
 ) -> anyhow::Result<PreparedDiff> {
-    let mut patterns = load_zoderignore(repo_root);
+    let mut patterns = zoderignore.to_vec();
     patterns.extend(config_excludes.iter().cloned());
     patterns.extend(cli_excludes.iter().cloned());
 
     let (filtered, excluded) = filter_diff(raw_diff, &patterns);
+    // A non-empty diff that exclusions reduce to nothing is a fail-closed
+    // condition, not an "approve" one. Record it so the caller can refuse.
+    let emptied_by_exclusion = !raw_diff.trim().is_empty() && filtered.trim().is_empty();
     if filtered.len() > max_diff_bytes {
         bail!(
             "review diff is {} bytes, above the {}-byte limit; pass --max-diff-bytes N (or set [review].max_diff_bytes) to raise it, or --exclude <glob> to drop generated files",
@@ -935,6 +996,7 @@ pub fn prepare_review_diff(
         excluded,
         diff_map,
         chunks,
+        emptied_by_exclusion,
     })
 }
 
@@ -1068,8 +1130,7 @@ mod tests {
     #[test]
     fn size_check_names_the_knob_without_excludes() {
         let d = new_file("assets/generated.tsv", &"+x\n".repeat(2000));
-        let dir = tempfile::tempdir().unwrap();
-        let err = prepare_review_diff(dir.path(), &d, &[], &[], 5000, 9000, true).unwrap_err();
+        let err = prepare_review_diff(&[], &d, &[], &[], 5000, 9000, true).unwrap_err();
         assert!(err.to_string().contains("--max-diff-bytes"), "{err}");
     }
 
@@ -1081,29 +1142,21 @@ mod tests {
             "@@ -1,2 +1,2 @@\n-int old(void) {\n+int old_once(void) {\n return 0;\n",
         );
         let d = format!("{generated}{real}");
-        let dir = tempfile::tempdir().unwrap();
 
         // Without --exclude the generated file pushes it over the cap: the
         // error must name the knob.
-        let err = prepare_review_diff(dir.path(), &d, &[], &[], 5000, 9000, true).unwrap_err();
+        let err = prepare_review_diff(&[], &d, &[], &[], 5000, 9000, true).unwrap_err();
         assert!(err.to_string().contains("--max-diff-bytes"), "{err}");
 
         // With --exclude it proceeds and reports exactly what was dropped.
-        let prepared = prepare_review_diff(
-            dir.path(),
-            &d,
-            &["*.tsv".to_string()],
-            &[],
-            5000,
-            9000,
-            true,
-        )
-        .unwrap();
+        let prepared =
+            prepare_review_diff(&[], &d, &["*.tsv".to_string()], &[], 5000, 9000, true).unwrap();
         assert!(prepared.excluded.files.len() == 1);
         assert!(prepared.filtered.contains("src/real.c"));
         assert!(!prepared.filtered.contains("assets/catalog.tsv"));
         assert!(prepared.excluded.render().contains("matched `*.tsv`"));
         assert!(!prepared.chunks.is_empty());
+        assert!(!prepared.emptied_by_exclusion);
     }
 
     #[test]
@@ -1113,17 +1166,8 @@ mod tests {
             new_file("assets/big.tsv", "+a\n"),
             diff_file("src/real.c", "@@ -1 +1 @@\n-x\n+y\n")
         );
-        let dir = tempfile::tempdir().unwrap();
-        let prepared = prepare_review_diff(
-            dir.path(),
-            &d,
-            &[],
-            &["*.tsv".to_string()],
-            9000,
-            9000,
-            true,
-        )
-        .unwrap();
+        let prepared =
+            prepare_review_diff(&[], &d, &[], &["*.tsv".to_string()], 9000, 9000, true).unwrap();
         assert!(!prepared.filtered.contains("big.tsv"));
     }
 
@@ -1137,6 +1181,204 @@ mod tests {
         .unwrap();
         let pats = load_zoderignore(dir.path());
         assert_eq!(pats, vec!["*.tsv".to_string(), "*.min.js".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect 1: c_style_def must not slice mid-UTF-8-char.
+    // -----------------------------------------------------------------------
+
+    /// A multi-byte char immediately before `(` used to make
+    /// `c_style_def` slice one byte into the codepoint and PANIC. These inputs
+    /// must simply produce no candidate definition.
+    #[test]
+    fn c_style_def_handles_multibyte_before_paren() {
+        // `é` (2 bytes) as the last identifier-ish char before `(`.
+        assert!(extract_defs("Voir la fonction café(x)").is_empty());
+        // CJK (3 bytes).
+        assert!(extract_defs("参照(foo)").is_empty());
+        // Emoji (4 bytes).
+        assert!(extract_defs("🚀(x)").is_empty());
+        // A non-ASCII name followed by an ASCII identifier: the ASCII tail is
+        // still recovered without panicking.
+        assert_eq!(extract_defs("café int foo(x)"), vec!["foo".to_string()]);
+    }
+
+    /// Full split-diff regression: a diff larger than the per-hunk cap that
+    /// gets split runs `extract_defs` over every added/removed line via
+    /// `build_diff_map`. The multi-byte definition line must not panic there.
+    #[test]
+    fn split_diff_with_multibyte_definition_does_not_panic() {
+        let mut body = String::new();
+        for i in 0..700 {
+            body.push_str(&format!("+int filler_{i}(void) {{ return {i}; }}\n"));
+        }
+        body.push_str("+Voir la fonction café(x)\n");
+        body.push_str("+参照(foo)\n");
+        let d = new_file("src/i18n.c", &body);
+        assert!(d.len() > 9000, "fixture only {} bytes", d.len());
+        let chunks = review_diff_chunks(&d, 9000, true, 64).unwrap();
+        assert!(chunks.len() > 1, "fixture should split");
+        // build_diff_map is what reaches extract_defs for a multi-chunk diff.
+        let map = build_diff_map(&d);
+        assert!(map.contains("src/i18n.c"), "{map}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect 2: a deleted file's path must come from the `---` side.
+    // -----------------------------------------------------------------------
+
+    fn deleted_file(path: &str, body: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex 2222222..0000000\n--- a/{path}\n+++ /dev/null\n@@ -1,{n} +0,0 @@\n{body}",
+            n = body.lines().count()
+        )
+    }
+
+    #[test]
+    fn deleted_file_path_falls_back_to_preimage() {
+        let d = deleted_file("src/old.c", "-int old_impl(void) {\n-}\n");
+        assert_eq!(section_path(sections(&d)[0]).as_deref(), Some("src/old.c"));
+    }
+
+    #[test]
+    fn deleted_file_is_excludable_and_appears_in_diff_map() {
+        // Excludable: a deleted `*.tsv` matches even though `+++` is /dev/null.
+        let d = deleted_file("assets/data.tsv", "-col\n-val\n");
+        let (out, rep) = filter_diff(&d, &["*.tsv".to_string()]);
+        assert!(
+            out.trim().is_empty(),
+            "deleted file was not excluded: {out}"
+        );
+        assert_eq!(rep.files.len(), 1);
+        assert_eq!(rep.files[0].path, "assets/data.tsv");
+        assert_eq!(rep.files[0].pattern, "*.tsv");
+
+        // Diff map: removed definitions of a deleted file are now visible.
+        let d2 = deleted_file("src/old.c", "-int removed_symbol(void) {\n-}\n");
+        let map = build_diff_map(&d2);
+        assert!(map.contains("f src/old.c"), "{map}");
+        assert!(map.contains("removed_symbol"), "{map}");
+        assert!(map.contains("-defs"), "{map}");
+    }
+
+    #[test]
+    fn deleted_file_split_labels_carry_the_path() {
+        let body: String = (0..2000)
+            .map(|i| format!("-int removed_{i}(void) {{\n"))
+            .collect();
+        let d = deleted_file("src/legacy.c", &body);
+        assert!(d.len() > 9000, "fixture only {} bytes", d.len());
+        let chunks = review_diff_chunks(&d, 9000, true, 64).unwrap();
+        assert!(chunks.len() > 1, "fixture should split");
+        assert!(
+            chunks.iter().all(|c| c.contains("part ")),
+            "split parts lost their labels"
+        );
+        assert!(
+            chunks.iter().all(|c| c.contains("src/legacy.c")),
+            "split part labels must carry the deleted file's path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect 3: empty-after-exclusion must be detectable (fail closed).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn self_hiding_zoderignore_star_is_detected_as_emptied() {
+        // The change under review adds `.zoderignore` containing `*` and a real
+        // edit. If those patterns applied to the diff, every section (including
+        // the ignore file itself) would vanish, leaving an empty review.
+        let d = format!(
+            "{}{}",
+            new_file(".zoderignore", "+*\n"),
+            diff_file("src/real.c", "@@ -1 +1 @@\n-old\n+new\n")
+        );
+        let prepared =
+            prepare_review_diff(&["*".to_string()], &d, &[], &[], 120_000, 9_000, true).unwrap();
+        assert!(prepared.filtered.trim().is_empty());
+        assert_eq!(prepared.excluded.files.len(), 2);
+        assert!(
+            prepared.emptied_by_exclusion,
+            "an all-excluded, non-empty diff must be flagged"
+        );
+        // The old bug sent one EMPTY chunk; there must be none now.
+        assert!(
+            prepared.chunks.is_empty(),
+            "no chunk must be produced for an emptied diff"
+        );
+    }
+
+    #[test]
+    fn partial_exclusion_is_not_flagged_as_emptied() {
+        let d = format!(
+            "{}{}",
+            new_file("assets/big.tsv", "+a\n"),
+            diff_file("src/real.c", "@@ -1 +1 @@\n-x\n+y\n")
+        );
+        let prepared =
+            prepare_review_diff(&[], &d, &["*.tsv".to_string()], &[], 120_000, 9_000, true)
+                .unwrap();
+        assert!(!prepared.emptied_by_exclusion);
+        assert!(!prepared.chunks.is_empty());
+    }
+
+    #[test]
+    fn empty_diff_produces_no_chunks() {
+        assert!(review_diff_chunks("", 9000, true, 24).unwrap().is_empty());
+        assert!(review_diff_chunks("   \n", 9000, true, 24)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Defect 3 (part 2): base/branch scopes read `.zoderignore` from the base
+    /// revision, so a change cannot exempt itself. Working-tree scope is the
+    /// only scope that reads the working tree.
+    #[test]
+    fn zoderignore_is_read_from_a_revision_for_base_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "review-diff-test"]);
+        std::fs::write(repo.join(".zoderignore"), "*.tsv\n# comment\n\n").unwrap();
+        run(&["add", ".zoderignore"]);
+        run(&["commit", "-q", "-m", "add zoderignore"]);
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        assert_eq!(load_zoderignore_at(&repo, &sha), vec!["*.tsv".to_string()]);
+
+        // The branch then rewrites `.zoderignore` to hide everything. Working
+        // tree sees `*`, but the base revision still reports the original set.
+        std::fs::write(repo.join(".zoderignore"), "*\n").unwrap();
+        assert_eq!(load_zoderignore(&repo), vec!["*".to_string()]);
+        assert_eq!(load_zoderignore_at(&repo, &sha), vec!["*.tsv".to_string()]);
+        // A revision with no `.zoderignore` (or an unknown rev) yields nothing.
+        assert!(load_zoderignore_at(&repo, "0000000000000000000000000000000000000000").is_empty());
     }
 
     #[test]
