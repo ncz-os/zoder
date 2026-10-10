@@ -4232,6 +4232,17 @@ where
         Some(s) if !s.is_empty() => s,
         _ => return Err(anyhow!("session/new returned no sessionId")),
     };
+    // A10: publish the freshly-minted (or resumed) goose session id to the
+    // outer watchdog tracker BEFORE `session/prompt`, exactly as the zeroclaw
+    // `drive` does after its own `session/new`. Without this the task-local
+    // `SESSION_TRACKER` never learned the goose session, so a `zoder loop`
+    // author timeout found no id to cancel with and `author_phase_with_cancel`
+    // surfaced "author cancellation unconfirmed: no session id available for
+    // cancellation" — which the loop treats as fatal, aborting the whole loop
+    // on the FIRST author timeout instead of cancelling and continuing.
+    // `record_active_session` is a no-op when no tracker scope is installed
+    // (e.g. a bare `run_goose_agent` call), so this is non-breaking.
+    record_active_session(&session_id);
 
     // 3+4. Combined `session/prompt` send + notification/read loop.
     //
@@ -7565,6 +7576,69 @@ mod tests {
         // one. (Goose ignores the resume hint and mints fresh; the
         // driver records whatever the server actually returned.)
         assert_eq!(run.session_id, "goose-test-session-1");
+    }
+
+    #[tokio::test]
+    async fn goose_drive_records_active_session_for_watchdog() {
+        // A10 regression: the goose driver MUST publish the returned session
+        // id to the task-local watchdog tracker BEFORE `session/prompt`, so a
+        // `zoder loop` author timeout can issue `session/cancel` instead of
+        // aborting the whole loop with "no session id available for
+        // cancellation" on the first timeout.
+        let tracker = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = tracker.clone();
+        let (client_io, engine_io) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(engine_io);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            // initialize
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}),
+            )
+            .await
+            .unwrap();
+            // session/new -> mint a fresh id
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let new: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(new["method"], "session/new");
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"new","result":{"sessionId":"goose-observed-1"}}),
+            )
+            .await
+            .unwrap();
+            // session/prompt: the tracker must ALREADY hold the fresh id.
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let prompt: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt["method"], "session/prompt");
+            assert_eq!(
+                observed.lock().unwrap().as_deref(),
+                Some("goose-observed-1"),
+                "goose session id must reach the watchdog tracker before session/prompt"
+            );
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"prompt","result":{"stopReason":"end_turn"}}),
+            )
+            .await
+            .unwrap();
+        });
+        let (mut r, mut w) = tokio::io::split(client_io);
+        let mut r = tokio::io::BufReader::new(&mut r);
+        let opts = goose_opts(Some("gpt-4o-mini"));
+        let run = track_session_id(
+            tracker.clone(),
+            drive_goose_io(&opts, &mut r, &mut w, &mut |_| {}),
+        )
+        .await
+        .expect("goose drive should succeed against the mock");
+        assert_eq!(run.session_id, "goose-observed-1");
+        server.await.unwrap();
     }
 
     #[tokio::test]
