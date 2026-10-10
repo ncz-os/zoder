@@ -5366,6 +5366,16 @@ mod sop_tests {
 /// the agentic engine owns the model-selection telemetry and would
 /// need its own exit-code bridge to surface substitution the same way.
 async fn cmd_exec(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+    let res = cmd_exec_inner(cli, prompt).await;
+    if let Err(e) = &res {
+        if cli.json && e.downcast_ref::<ReportedTurnError>().is_none() {
+            println!("{}", exec_error_json(cli.model.as_deref(), e));
+        }
+    }
+    res
+}
+
+async fn cmd_exec_inner(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     if cli.oneshot {
         return cmd_exec_oneshot(cli, prompt).await;
     }
@@ -5625,6 +5635,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let mut outcome: Option<ChatResult> = None;
     let mut winning_reservation: Option<BillableReservation> = None;
     let mut last_err: Option<ProviderError> = None;
+    // Every failed attempt, named by model and provider, so the terminal
+    // error says WHICH route failed and how (B12).
+    let mut attempt_failures: Vec<String> = Vec::new();
 
     for (i, model_id) in chain.iter().enumerate() {
         // Respect the free guard for every link, not just the primary.
@@ -5772,6 +5785,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 break;
             }
             Err((e, fatal)) => {
+                attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
                 // Y-8: route the failure through the same classify + record
                 // path the `--probe --all` sweep uses, so a 401/403 from
                 // the API key OR a 429/503/529 capacity signal do NOT trip
@@ -5799,10 +5813,10 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     let Some(res) = outcome else {
         save_health(&health);
-        let msg = last_err
+        let fallback = last_err
             .map(|e| e.message)
             .unwrap_or_else(|| "all models in the chain failed".into());
-        anyhow::bail!("{msg}");
+        anyhow::bail!("{}", oneshot_failure_summary(&attempt_failures, &fallback));
     };
 
     let known_paid_model = eng
@@ -9386,6 +9400,10 @@ pub(crate) async fn cmd_exec_agentic(
                 "tool_calls": t.run.tool_calls,
                 "cwd": agentic_cwd(cli)?.to_string_lossy(),
                 "duration_ms": t.elapsed_ms,
+                "succeeded": t.run.succeeded(),
+                "failure_detail": t.run.failure_detail,
+                "error": (!t.run.succeeded())
+                    .then(|| turn_failure_summary(&t.run.outcome, t.run.failure_detail.as_deref())),
             })
         );
     } else {
@@ -9409,22 +9427,25 @@ pub(crate) async fn cmd_exec_agentic(
     // MR !1 finding: a violating run that returned Ok(turn) was previously
     // silently swallowed; this is the explicit enforcement.
     if let Some(v) = &t.policy_violation {
-        anyhow::bail!("agentic turn violated free policy (use --allow-paid to permit): {v}");
+        return Err(anyhow::Error::new(ReportedTurnError(format!(
+            "agentic turn violated free policy (use --allow-paid to permit): {v}"
+        ))));
     }
 
     if !t.run.succeeded() {
-        // Partial work is preserved: on-disk edits stay, and the streamed text
-        // above is whatever the turn produced. Point the user at a clean resume.
-        if !cli.quiet && !cli.json {
-            // When the engine explained the failure only in its terminal
-            // frame, nothing was streamed, so the block above printed
-            // NOTHING and the character count below is the sole output.
-            // Print the engine's reason first — it names the model, the HTTP
-            // status and the provider hint, which is what actually tells the
-            // operator whether this is config, credentials or the model.
+        // When the engine explained the failure only in its terminal frame,
+        // nothing was streamed, so the engine's reason (model, HTTP status,
+        // provider hint) is the only diagnosis. Print it on stderr in every
+        // output mode -- including --json, where stdout carries the JSON
+        // object (which also has it under `failure_detail` / `error`).
+        if !cli.quiet {
             if let Some(detail) = t.run.failure_detail.as_deref() {
                 eprintln!("[zoder] {}", detail.trim());
             }
+        }
+        // Partial work is preserved: on-disk edits stay, and the streamed text
+        // above is whatever the turn produced. Point the user at a clean resume.
+        if !cli.quiet && !cli.json {
             let timed_out = t.run.outcome == "timeout";
             eprintln!(
                 "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
@@ -9434,9 +9455,76 @@ pub(crate) async fn cmd_exec_agentic(
                 if timed_out { "  (or raise --agent-timeout <secs>, default 900)" } else { "" },
             );
         }
-        anyhow::bail!("agentic turn ended: {}", t.run.outcome);
+        return Err(anyhow::Error::new(ReportedTurnError(turn_failure_summary(
+            &t.run.outcome,
+            t.run.failure_detail.as_deref(),
+        ))));
     }
     Ok(())
+}
+
+/// A turn failure whose result (including `--json` output) was already
+/// printed, so `cmd_exec` must not print a second JSON error object for it.
+#[derive(Debug)]
+struct ReportedTurnError(String);
+
+impl std::fmt::Display for ReportedTurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReportedTurnError {}
+
+/// Longest engine detail carried into a one-line terminal error.
+const TURN_DETAIL_MAX_CHARS: usize = 400;
+
+/// One-line terminal error for a non-completed agentic turn: the outcome plus
+/// the first non-empty line of the engine's own explanation (bounded), so the
+/// process error names the model / HTTP status / provider hint instead of only
+/// "agentic turn ended: failed" (B12).
+fn turn_failure_summary(outcome: &str, detail: Option<&str>) -> String {
+    let line = detail
+        .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(|l| {
+            if l.chars().count() > TURN_DETAIL_MAX_CHARS {
+                let cut: String = l.chars().take(TURN_DETAIL_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                l.to_string()
+            }
+        });
+    match line {
+        Some(l) => format!("agentic turn ended: {outcome}: {l}"),
+        None => format!("agentic turn ended: {outcome}"),
+    }
+}
+
+/// Terminal error for a oneshot chain where every attempt failed: each failed
+/// attempt is named by model and provider (B12). Falls back to the last error
+/// text when no attempt was recorded (e.g. every link was gated off).
+fn oneshot_failure_summary(attempts: &[String], fallback: &str) -> String {
+    match attempts {
+        [] => fallback.to_string(),
+        [one] => one.clone(),
+        many => format!(
+            "all {} models in the chain failed: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// `--json` error object for an exec that failed before it could print its
+/// normal result, so a JSON consumer always gets a parseable object with the
+/// error text instead of an empty stdout (B12).
+fn exec_error_json(cli_model: Option<&str>, error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "error",
+        "succeeded": false,
+        "model": cli_model,
+        "error": format!("{error:#}"),
+    })
 }
 
 /// Parse `--engine` and bail early on Goose (which would otherwise start the
@@ -17667,5 +17755,67 @@ mod events_file_tests {
             "error must mention the ledger lock, got: {}",
             err_str
         );
+    }
+}
+
+#[cfg(test)]
+mod exec_error_detail_tests {
+    use super::*;
+
+    /// B12: the terminal error carries the engine's own reason (model, HTTP
+    /// status, provider hint), not just the outcome word.
+    #[test]
+    fn turn_failure_summary_names_the_engine_reason() {
+        let detail = "\n  turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider tydeus-coder)\nmore";
+        assert_eq!(
+            turn_failure_summary("failed", Some(detail)),
+            "agentic turn ended: failed: turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider tydeus-coder)"
+        );
+        assert_eq!(
+            turn_failure_summary("timeout", None),
+            "agentic turn ended: timeout"
+        );
+        assert_eq!(
+            turn_failure_summary("failed", Some("  \n ")),
+            "agentic turn ended: failed"
+        );
+        let long = "x".repeat(TURN_DETAIL_MAX_CHARS + 50);
+        let s = turn_failure_summary("failed", Some(&long));
+        assert!(s.ends_with('…'));
+        assert!(s.chars().count() < TURN_DETAIL_MAX_CHARS + 40);
+    }
+
+    /// B12: a oneshot chain failure names every failed route.
+    #[test]
+    fn oneshot_failure_summary_names_model_and_provider() {
+        assert_eq!(oneshot_failure_summary(&[], "boom"), "boom");
+        let one = vec![
+            "gemma4-31b via cerberus-reviewer: provider HTTP 503 Service Unavailable: busy"
+                .to_string(),
+        ];
+        assert_eq!(oneshot_failure_summary(&one, "x"), one[0]);
+        let two = vec![
+            "a via p1: provider HTTP 401 Unauthorized: bad key".to_string(),
+            "b via p2: request timeout after 120s".to_string(),
+        ];
+        let s = oneshot_failure_summary(&two, "x");
+        assert!(s.starts_with("all 2 models in the chain failed: "));
+        assert!(s.contains("a via p1: provider HTTP 401"));
+        assert!(s.contains("b via p2: request timeout"));
+    }
+
+    /// B12: `--json` consumers get a parseable error object, and an already
+    /// reported turn failure is not printed twice.
+    #[test]
+    fn exec_error_json_is_structured_and_reported_errors_are_marked() {
+        let e = anyhow::anyhow!("no real provider is configured for model 'x'");
+        let v = exec_error_json(Some("x"), &e);
+        assert_eq!(v["outcome"], "error");
+        assert_eq!(v["succeeded"], false);
+        assert_eq!(v["model"], "x");
+        assert!(v["error"].as_str().unwrap().contains("no real provider"));
+        let reported = anyhow::Error::new(ReportedTurnError("agentic turn ended: failed".into()));
+        assert!(reported.downcast_ref::<ReportedTurnError>().is_some());
+        assert!(e.downcast_ref::<ReportedTurnError>().is_none());
     }
 }
