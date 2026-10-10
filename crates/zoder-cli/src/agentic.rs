@@ -12679,11 +12679,10 @@ mod reviewer_chain_dispatch_tests {
         let cli =
             Cli::try_parse_from(["zoder", "review", "--retries", "0", "--no-fallback"]).unwrap();
         let _ = crate::eih_health::take_skipped();
-        // The HomeGuard holds the process-wide env lock for this test.
-        std::env::set_var("ZODER_EIH_PROBE_TIMEOUT_MS", "200");
+        crate::eih_health::PROBE_TIMEOUT_OVERRIDE_MS.store(200, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let result = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048).await;
-        std::env::remove_var("ZODER_EIH_PROBE_TIMEOUT_MS");
+        crate::eih_health::PROBE_TIMEOUT_OVERRIDE_MS.store(0, Ordering::SeqCst);
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("skipped unhealthy EIH model eih-model/nemo"),
