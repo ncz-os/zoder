@@ -213,6 +213,33 @@ mod reliability_deadline_tests {
         task.await.unwrap();
     }
 
+    /// Non-streaming calls (the reviewer path) wait inside `send()`; with
+    /// notices on, the same request keeps going past several notice slices
+    /// and still succeeds, and the request budget still bounds it.
+    #[tokio::test]
+    async fn non_streaming_wait_with_notices_succeeds_and_stays_bounded() {
+        let body = r#"{"model":"model","choices":[{"message":{"content":"hello"}}]}"#;
+        let (uri, task) = delayed_server(300, 0, "", body).await;
+        let (mut p, mut request) = fixture(&uri, 5000, 100);
+        request.stream = false;
+        p.wait_notice_interval = Some(Duration::from_millis(50));
+        let result = p.stream_chat(&request, None).await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert!(result.telemetry.headers_ms.expect("headers_ms") >= 250);
+        task.await.unwrap();
+
+        let (uri, task) = delayed_server(5000, 0, "", body).await;
+        let (mut p, mut request) = fixture(&uri, 300, 100);
+        request.stream = false;
+        p.wait_notice_interval = Some(Duration::from_millis(50));
+        let started = Instant::now();
+        let error = p.stream_chat(&request, None).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(2000));
+        task.abort();
+        let _ = task.await;
+    }
+
     /// Notices never turn a dead stream into an endless wait: the request
     /// budget still ends it.
     #[tokio::test]
@@ -1318,10 +1345,39 @@ impl OpenAiProvider {
         }
     }
 
+    /// Send the request, bounded by the request budget. With wait notices on,
+    /// the SAME in-flight request is polled in slices and a notice is printed
+    /// at each slice, so a non-streaming call (reviewers use one) that waits
+    /// on a busy server is visible instead of silent. Never re-sends.
+    async fn send_with_wait_notices(
+        &self,
+        req: &ChatRequest,
+        sent: Instant,
+    ) -> Result<Result<reqwest::Response, reqwest::Error>, tokio::time::error::Elapsed> {
+        let Some(every) = self.wait_notice_interval else {
+            return timeout(self.request_timeout, self.request(req).send()).await;
+        };
+        let deadline = sent + self.request_timeout;
+        let send = self.request(req).send();
+        tokio::pin!(send);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(every.min(remaining), &mut send).await {
+                Ok(result) => return Ok(result),
+                Err(elapsed) => {
+                    if Instant::now() >= deadline {
+                        return Err(elapsed);
+                    }
+                    self.wait_notice(sent.elapsed());
+                }
+            }
+        }
+    }
+
     fn wait_notice(&self, waited: Duration) {
         eprintln!(
-            "[zoder] still waiting for the first token from {} after {}s (server busy, \
-             queueing or prefilling; request budget {}s)",
+            "[zoder] still waiting for {} after {}s (server busy, queueing, prefilling or \
+             generating; request budget {}s)",
             self.provider_id,
             waited.as_secs(),
             self.request_timeout.as_secs()
@@ -1739,7 +1795,7 @@ impl OpenAiProvider {
     ) -> Result<ChatResult, ProviderError> {
         tracing::debug!(model = %req.model, stream = req.stream, max_tokens = req.max_tokens, "chat call");
         let sent = Instant::now();
-        let resp = match timeout(self.request_timeout, self.request(req).send()).await {
+        let resp = match self.send_with_wait_notices(req, sent).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(classify_reqwest(e)),
             Err(_) => {
