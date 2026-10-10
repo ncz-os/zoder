@@ -3899,6 +3899,29 @@ fn exclusion_payload(report: &crate::review_diff::ExclusionReport) -> serde_json
     })
 }
 
+/// True when any reviewer receipt reports a served model that differs from the
+/// model requested for that call.
+///
+/// The strict reviewer dispatch already fails a review on an explicit
+/// `served != model` mismatch, so this is normally `false`; it is surfaced in
+/// the review JSON as `substituted` because a consumer that asserts
+/// "substituted must be false" cannot read an **absent** field as false (a
+/// sibling campaign could not satisfy its substitution check — see F2 in the
+/// 2026-10-10 saver run log). A receipt without a reported response model
+/// (provider omitted it) is treated as not-substituted, matching the dispatch
+/// rule that only an explicit different id is a substitution.
+fn receipts_show_substitution(receipts: &[serde_json::Value]) -> bool {
+    receipts.iter().any(|r| {
+        match (
+            r.get("requested_model").and_then(serde_json::Value::as_str),
+            r.get("response_model").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(req), Some(resp)) => req != resp,
+            _ => false,
+        }
+    })
+}
+
 /// Render the aggregated review(s) as JSON (machine) or text (human), and write
 /// `result.json` when running as a background job. `aggregate.ok_models == 0`
 /// is reflected in the payload as `complete: false` so downstream consumers
@@ -3913,6 +3936,9 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
         aggregate.failed_models,
     );
     payload["provenance"] = json!(aggregate.receipts);
+    // Always present, so a consumer can read `substituted == false` rather than
+    // having to treat an absent field as success.
+    payload["substituted"] = json!(receipts_show_substitution(aggregate.receipts));
     if let Some(rep) = aggregate.exclusions {
         payload["exclusions"] = exclusion_payload(rep);
     }
@@ -8479,6 +8505,27 @@ must reap the direct shell on the timeout branch)"
         let raw = "<THINK>analysis</THINK>\n\
 {\"verdict\":\"approve\",\"summary\":\"Sound.\",\"findings\":[],\"next_steps\":[]}";
         assert_eq!(parse_review(raw).verdict, "approve");
+    }
+
+    /// Regression for F2 (2026-10-10 saver run log): `zoder review --json` did
+    /// not surface `substituted`, so a campaign asserting "substituted must be
+    /// false" could not distinguish an absent field from false. The value is
+    /// derived from the reviewer receipts' requested/response model pair.
+    #[test]
+    fn receipts_show_substitution_detects_a_mismatch() {
+        let matching = vec![json!({
+            "requested_model": "gemma4-31b",
+            "response_model": "gemma4-31b",
+        })];
+        let substituted = vec![json!({
+            "requested_model": "gemma4-31b",
+            "response_model": "some-dated-gemma-snapshot",
+        })];
+        let omitted = vec![json!({"requested_model": "gemma4-31b"})];
+        assert!(!receipts_show_substitution(&matching));
+        assert!(receipts_show_substitution(&substituted));
+        assert!(!receipts_show_substitution(&omitted));
+        assert!(!receipts_show_substitution(&[]));
     }
 
     /// Z-8 REGRESSION GUARD (diff-capture ordering): `build_diff` in
