@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-10-09",
+  "generated": "2026-10-10",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "ai21.j2-mid-v1": {
@@ -4604,10 +4604,10 @@
       }
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.0046,
+      "input_usd_per_mtok": 0.007899999999999999,
       "output_usd_per_mtok": 1.28,
       "off_peak": {
-        "input_usd_per_mtok": 0.0023,
+        "input_usd_per_mtok": 0.00395,
         "output_usd_per_mtok": 0.64,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -4634,11 +4634,11 @@
       }
     },
     "deepseek/deepseek-v4-pro-0813": {
-      "input_usd_per_mtok": 1.32,
-      "output_usd_per_mtok": 3.9600000000000004,
+      "input_usd_per_mtok": 0.66,
+      "output_usd_per_mtok": 1.9800000000000002,
       "off_peak": {
-        "input_usd_per_mtok": 0.66,
-        "output_usd_per_mtok": 1.98,
+        "input_usd_per_mtok": 0.33,
+        "output_usd_per_mtok": 0.99,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -6545,21 +6545,13 @@
       "input_usd_per_mtok": 1.0,
       "output_usd_per_mtok": 5.0
     },
-    "github_copilot/claude-sonnet-4": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
+    "github_copilot/claude-haiku-5.5": {
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.5
     },
     "github_copilot/gpt-5-mini": {
       "input_usd_per_mtok": 0.25,
       "output_usd_per_mtok": 2.0
-    },
-    "github_copilot/mai-code-1-flash": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 4.5
-    },
-    "github_copilot/mai-code-1-flash-internal": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 4.5
     },
     "glm-4-7-251222": {
       "input_usd_per_mtok": 0.0,
@@ -6918,8 +6910,8 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.3
+      "input_usd_per_mtok": 0.0675,
+      "output_usd_per_mtok": 0.22499999999999998
     },
     "google/gemma-4-26b-a4b-it:free": {
       "input_usd_per_mtok": 0.0,
@@ -7204,6 +7196,10 @@
     "gpt-audio-mini-2025-12-15": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 2.4
+    },
+    "gpt-rosalind-discovery": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0
     },
     "gpt-rosalind-research": {
       "input_usd_per_mtok": 5.0,
@@ -7877,6 +7873,10 @@
       "input_usd_per_mtok": 0.62,
       "output_usd_per_mtok": 0.62
     },
+    "microsoft_365_copilot/chat": {
+      "input_usd_per_mtok": 0.0,
+      "output_usd_per_mtok": 0.0
+    },
     "minimax.minimax-m2": {
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 1.2
@@ -8370,8 +8370,8 @@
       "output_usd_per_mtok": 2.5
     },
     "moonshotai/kimi-k2.5": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 2.25
+      "input_usd_per_mtok": 0.5,
+      "output_usd_per_mtok": 2.5
     },
     "moonshotai/kimi-k2.6": {
       "input_usd_per_mtok": 0.46499999999999997,
@@ -8382,8 +8382,8 @@
       "output_usd_per_mtok": 3.35
     },
     "moonshotai/kimi-k3": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 12.0
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 13.5
     },
     "moonshotai/kimi-k3:batch": {
       "input_usd_per_mtok": 2.2800000000000002,
@@ -9486,8 +9486,8 @@
       "output_usd_per_mtok": 0.0
     },
     "nvidia/nemotron-3.5-lightning": {
-      "input_usd_per_mtok": 0.046900000000000004,
-      "output_usd_per_mtok": 0.134
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.19999999999999998
     },
     "nvidia/nemotron-3.5-lightning:free": {
       "input_usd_per_mtok": 0.0,
@@ -10193,198 +10193,6 @@
       "input_usd_per_mtok": 0.55,
       "output_usd_per_mtok": 2.2
     },
-    "openrouter/aion-labs/aion-2.0": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 1.5999999999999999
-    },
-    "openrouter/aion-labs/aion-3.0": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/aion-labs/aion-3.0-mini": {
-      "input_usd_per_mtok": 0.7,
-      "output_usd_per_mtok": 1.4
-    },
-    "openrouter/aion-labs/aion-3.5": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/aion-labs/aion-3.5-mini": {
-      "input_usd_per_mtok": 0.7,
-      "output_usd_per_mtok": 1.4
-    },
-    "openrouter/aion-labs/aion-rp-llama-3.1-8b": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 1.5999999999999999
-    },
-    "openrouter/amazon/nova-2-lite-v1": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/amazon/nova-lite-v1": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.24
-    },
-    "openrouter/amazon/nova-micro-v1": {
-      "input_usd_per_mtok": 0.035,
-      "output_usd_per_mtok": 0.14
-    },
-    "openrouter/amazon/nova-premier-v1": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/amazon/nova-pro-v1": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 3.1999999999999997
-    },
-    "openrouter/anthracite-org/magnum-v4-72b": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/anthropic/claude-3-haiku": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/anthropic/claude-3.5-sonnet": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/anthropic/claude-3.7-sonnet": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/anthropic/claude-fable-5": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/anthropic/claude-fable-5.1": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/anthropic/claude-fable-5.1:batch": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-fable-5:batch": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-haiku-4.5": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/anthropic/claude-haiku-4.5:batch": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/anthropic/claude-haiku-5.5": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/anthropic/claude-haiku-5.5:batch": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/anthropic/claude-opus-4.1": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 75.0
-    },
-    "openrouter/anthropic/claude-opus-4.1:batch": {
-      "input_usd_per_mtok": 7.5,
-      "output_usd_per_mtok": 37.5
-    },
-    "openrouter/anthropic/claude-opus-4.5": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-opus-4.5:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/anthropic/claude-opus-4.6": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-opus-4.6:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/anthropic/claude-opus-4.7": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-opus-4.7:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/anthropic/claude-opus-4.8": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-opus-4.8:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/anthropic/claude-opus-5": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/anthropic/claude-opus-5.5": {
-      "input_usd_per_mtok": 4.0,
-      "output_usd_per_mtok": 20.0
-    },
-    "openrouter/anthropic/claude-opus-5.5:batch": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/anthropic/claude-opus-5:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 12.5
-    },
-    "openrouter/anthropic/claude-sonnet-4": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/anthropic/claude-sonnet-4.5": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/anthropic/claude-sonnet-4.5:batch": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/anthropic/claude-sonnet-4.6": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/anthropic/claude-sonnet-4.6:batch": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/anthropic/claude-sonnet-5": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/anthropic/claude-sonnet-5.5": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/anthropic/claude-sonnet-5.5:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/anthropic/claude-sonnet-5:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/apodex/apodex-1.1-mini:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/arcee-ai/trinity-large-thinking": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 0.7999999999999999
-    },
     "openrouter/auto": {
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
@@ -10393,237 +10201,9 @@
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
     },
-    "openrouter/baidu/ernie-4.5-vl-424b-a47b": {
-      "input_usd_per_mtok": 0.42,
-      "output_usd_per_mtok": 1.25
-    },
     "openrouter/bodybuilder": {
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
-    },
-    "openrouter/bytedance-seed/seed-1.6": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/bytedance-seed/seed-1.6-flash": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/bytedance-seed/seed-2-1-turbo": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/bytedance-seed/seed-2.0-code": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/bytedance-seed/seed-2.0-lite": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/bytedance-seed/seed-2.0-mini": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/bytedance/ui-tars-1.5-7b": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/cognitivecomputations/dolphin-mistral-24b-venice-edition": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.8999999999999999
-    },
-    "openrouter/cohere/command-a": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/cohere/command-a-plus": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/cohere/command-r-08-2024": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/cohere/command-r-plus-08-2024": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/cohere/command-r7b-12-2024": {
-      "input_usd_per_mtok": 0.0375,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/cohere/north-mini-code:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/deepseek/deepseek-chat": {
-      "input_usd_per_mtok": 0.2574,
-      "output_usd_per_mtok": 1.0287,
-      "off_peak": {
-        "input_usd_per_mtok": 0.1287,
-        "output_usd_per_mtok": 0.51435,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-chat-v3-0324": {
-      "input_usd_per_mtok": 0.29,
-      "output_usd_per_mtok": 1.1400000000000001,
-      "off_peak": {
-        "input_usd_per_mtok": 0.145,
-        "output_usd_per_mtok": 0.57,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-chat-v3.1": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 0.95,
-      "off_peak": {
-        "input_usd_per_mtok": 0.125,
-        "output_usd_per_mtok": 0.475,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-r1": {
-      "input_usd_per_mtok": 0.7,
-      "output_usd_per_mtok": 2.5,
-      "off_peak": {
-        "input_usd_per_mtok": 0.175,
-        "output_usd_per_mtok": 0.625,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-r1-0528": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 2.1500000000000004,
-      "off_peak": {
-        "input_usd_per_mtok": 0.125,
-        "output_usd_per_mtok": 0.5375,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-r1-distill-llama-70b": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 0.7999999999999999,
-      "off_peak": {
-        "input_usd_per_mtok": 0.2,
-        "output_usd_per_mtok": 0.2,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v3.1-terminus": {
-      "input_usd_per_mtok": 0.27,
-      "output_usd_per_mtok": 1.0,
-      "off_peak": {
-        "input_usd_per_mtok": 0.135,
-        "output_usd_per_mtok": 0.5,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v3.2": {
-      "input_usd_per_mtok": 0.25899999999999995,
-      "output_usd_per_mtok": 0.42,
-      "off_peak": {
-        "input_usd_per_mtok": 0.1295,
-        "output_usd_per_mtok": 0.21,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v3.2-exp": {
-      "input_usd_per_mtok": 0.27,
-      "output_usd_per_mtok": 0.41,
-      "off_peak": {
-        "input_usd_per_mtok": 0.135,
-        "output_usd_per_mtok": 0.205,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4-flash": {
-      "input_usd_per_mtok": 0.0075,
-      "output_usd_per_mtok": 1.28,
-      "off_peak": {
-        "input_usd_per_mtok": 0.00375,
-        "output_usd_per_mtok": 0.64,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.006,
-      "output_usd_per_mtok": 1.28,
-      "off_peak": {
-        "input_usd_per_mtok": 0.003,
-        "output_usd_per_mtok": 0.64,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4-flash-vision-exp": {
-      "input_usd_per_mtok": 0.21559999999999999,
-      "output_usd_per_mtok": 0.6468,
-      "off_peak": {
-        "input_usd_per_mtok": 0.1078,
-        "output_usd_per_mtok": 0.3234,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4-pro": {
-      "input_usd_per_mtok": 0.28727400000000003,
-      "output_usd_per_mtok": 0.5745480000000001,
-      "off_peak": {
-        "input_usd_per_mtok": 0.143637,
-        "output_usd_per_mtok": 0.287274,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4-pro-0813": {
-      "input_usd_per_mtok": 1.32,
-      "output_usd_per_mtok": 3.9600000000000004,
-      "off_peak": {
-        "input_usd_per_mtok": 0.66,
-        "output_usd_per_mtok": 1.98,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4.1-flash": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2,
-      "off_peak": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 0.6,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/deepseek/deepseek-v4.1-flash:batch": {
-      "input_usd_per_mtok": 0.112,
-      "output_usd_per_mtok": 0.33599999999999997,
-      "off_peak": {
-        "input_usd_per_mtok": 0.056,
-        "output_usd_per_mtok": 0.168,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/dots-studio/dots-3-note-preview:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/fireworks/ember-1": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
     },
     "openrouter/free": {
       "input_usd_per_mtok": 0.0,
@@ -10633,1659 +10213,9 @@
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
     },
-    "openrouter/google/gemini-2.5-flash": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/google/gemini-2.5-flash-image": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/google/gemini-2.5-flash-lite": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/google/gemini-2.5-flash-lite:batch": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/google/gemini-2.5-flash:batch": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/google/gemini-2.5-pro": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/google/gemini-2.5-pro-preview": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/google/gemini-2.5-pro-preview-05-06": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/google/gemini-2.5-pro:batch": {
-      "input_usd_per_mtok": 0.625,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/google/gemini-3-flash-preview": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/google/gemini-3-flash-preview:batch": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/google/gemini-3-pro-image": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/google/gemini-3-pro-image-preview": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/google/gemini-3-pro-preview": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/google/gemini-3.1-flash-image": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/google/gemini-3.1-flash-image-preview": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/google/gemini-3.1-flash-lite": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/google/gemini-3.1-flash-lite-image": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/google/gemini-3.1-flash-lite-preview": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/google/gemini-3.1-flash-lite:batch": {
-      "input_usd_per_mtok": 0.125,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/google/gemini-3.1-pro-preview": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/google/gemini-3.1-pro-preview-customtools": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/google/gemini-3.1-pro-preview:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/google/gemini-3.5-flash": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 9.0
-    },
-    "openrouter/google/gemini-3.5-flash-lite": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/google/gemini-3.5-flash-lite:batch": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/google/gemini-3.5-flash:batch": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 4.5
-    },
-    "openrouter/google/gemini-3.6-flash": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 3.75
-    },
-    "openrouter/google/gemini-3.6-flash:batch": {
-      "input_usd_per_mtok": 0.375,
-      "output_usd_per_mtok": 1.875
-    },
-    "openrouter/google/gemini-3.7-flash": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 3.75
-    },
-    "openrouter/google/gemini-3.7-flash:batch": {
-      "input_usd_per_mtok": 0.375,
-      "output_usd_per_mtok": 1.875
-    },
-    "openrouter/google/gemini-3.8-flash": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 3.75
-    },
-    "openrouter/google/gemini-3.8-flash:batch": {
-      "input_usd_per_mtok": 0.375,
-      "output_usd_per_mtok": 1.875
-    },
-    "openrouter/google/gemini-nano-banana-2.1": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/google/gemma-2-27b-it": {
-      "input_usd_per_mtok": 0.65,
-      "output_usd_per_mtok": 0.65
-    },
-    "openrouter/google/gemma-3-12b-it": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/google/gemma-3-27b-it": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.44999999999999996
-    },
-    "openrouter/google/gemma-3-4b-it": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.09999999999999999
-    },
-    "openrouter/google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.0765,
-      "output_usd_per_mtok": 0.255
-    },
-    "openrouter/google/gemma-4-26b-a4b-it:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/google/gemma-4-31b-it": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.33999999999999997
-    },
-    "openrouter/google/gemma-4-31b-it:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/gryphe/mythomax-l2-13b": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.11
-    },
-    "openrouter/ibm-granite/granite-4.0-h-micro": {
-      "input_usd_per_mtok": 0.017,
-      "output_usd_per_mtok": 0.112
-    },
-    "openrouter/ibm-granite/granite-4.2-8b": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/inception/mercury-2": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/inception/mercury-2.5": {
-      "input_usd_per_mtok": 0.04,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/inclusionai/ling-3.0-flash": {
-      "input_usd_per_mtok": 0.020999999999999998,
-      "output_usd_per_mtok": 0.063
-    },
-    "openrouter/inclusionai/ling-3.0-flash-fin": {
-      "input_usd_per_mtok": 0.041999999999999996,
-      "output_usd_per_mtok": 0.12319999999999999
-    },
-    "openrouter/inclusionai/ling-3.0-flash-fin:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/inclusionai/ling-3.0-flash-sante": {
-      "input_usd_per_mtok": 0.041999999999999996,
-      "output_usd_per_mtok": 0.12319999999999999
-    },
-    "openrouter/inclusionai/ling-3.0-flash-sante:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/inclusionai/ling-3.0-flash-vl": {
-      "input_usd_per_mtok": 0.020999999999999998,
-      "output_usd_per_mtok": 0.061599999999999995
-    },
-    "openrouter/inclusionai/ling-3.0-flash-vl:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/inclusionai/ling-3.1-flash": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/inference-net/schematron-v2-small": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.22999999999999998
-    },
-    "openrouter/inference-net/schematron-v2-turbo": {
-      "input_usd_per_mtok": 0.03,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/kwaipilot/kat-coder-pro-v2.5": {
-      "input_usd_per_mtok": 0.74,
-      "output_usd_per_mtok": 2.96
-    },
-    "openrouter/liquid/lfm-2.5-2.6b:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/mancer/weaver": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/meituan/longcat-2.0": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/meta-llama/llama-3-70b-instruct": {
-      "input_usd_per_mtok": 0.59,
-      "output_usd_per_mtok": 0.7899999999999999
-    },
-    "openrouter/meta-llama/llama-3.1-70b-instruct": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/meta-llama/llama-3.1-8b-instruct": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.08
-    },
-    "openrouter/meta-llama/llama-3.2-1b-instruct": {
-      "input_usd_per_mtok": 0.027,
-      "output_usd_per_mtok": 0.201
-    },
-    "openrouter/meta-llama/llama-3.2-3b-instruct": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.33
-    },
-    "openrouter/meta-llama/llama-3.3-70b-instruct": {
-      "input_usd_per_mtok": 0.22,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/meta-llama/llama-4-maverick": {
-      "input_usd_per_mtok": 0.1875,
-      "output_usd_per_mtok": 0.6525
-    },
-    "openrouter/meta-llama/llama-4-scout": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/meta-llama/llama-guard-4-12b": {
-      "input_usd_per_mtok": 0.18,
-      "output_usd_per_mtok": 0.18
-    },
-    "openrouter/meta/muse-glimmer-30b": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/meta/muse-spark-1.1": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 4.25
-    },
-    "openrouter/meta/muse-spark-1.2": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 4.25
-    },
-    "openrouter/meta/muse-spark-1.2-contributor": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/meta/muse-spark-1.3": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 4.25
-    },
-    "openrouter/meta/muse-spark-1.3-contributor": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/microsoft/phi-4": {
-      "input_usd_per_mtok": 0.07,
-      "output_usd_per_mtok": 0.14
-    },
-    "openrouter/microsoft/wizardlm-2-8x22b": {
-      "input_usd_per_mtok": 0.62,
-      "output_usd_per_mtok": 0.62
-    },
-    "openrouter/minimax/minimax-01": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.1
-    },
-    "openrouter/minimax/minimax-m1": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/minimax/minimax-m2": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/minimax/minimax-m2-her": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/minimax/minimax-m2.1": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/minimax/minimax-m2.5": {
-      "input_usd_per_mtok": 0.27,
-      "output_usd_per_mtok": 1.08
-    },
-    "openrouter/minimax/minimax-m2.7": {
-      "input_usd_per_mtok": 0.21,
-      "output_usd_per_mtok": 0.84
-    },
-    "openrouter/minimax/minimax-m2.7:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/minimax/minimax-m3": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/minimax/minimax-m3:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/mistralai/codestral-2508": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 0.8999999999999999
-    },
-    "openrouter/mistralai/codestral-2508:batch": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.44999999999999996
-    },
-    "openrouter/mistralai/devstral-2512": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/mistralai/ministral-14b-2512": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/mistralai/ministral-3b-2512": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.09999999999999999
-    },
-    "openrouter/mistralai/ministral-8b-2512": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/mistralai/ministral-8b-2512:batch": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.075
-    },
-    "openrouter/mistralai/mistral-7b-instruct": {
-      "input_usd_per_mtok": 0.13,
-      "output_usd_per_mtok": 0.13
-    },
-    "openrouter/mistralai/mistral-large": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/mistralai/mistral-large-2407": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/mistralai/mistral-large-2512": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/mistralai/mistral-large-2512:batch": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/mistralai/mistral-large-4-0": {
-      "input_usd_per_mtok": 0.6799999999999999,
-      "output_usd_per_mtok": 2.09
-    },
-    "openrouter/mistralai/mistral-medium-3": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/mistralai/mistral-medium-3-5": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/mistralai/mistral-medium-3-5:batch": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 3.75
-    },
-    "openrouter/mistralai/mistral-medium-3.1": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/mistralai/mistral-medium-3.1:batch": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/mistralai/mistral-nemo": {
-      "input_usd_per_mtok": 0.029,
-      "output_usd_per_mtok": 0.03
-    },
-    "openrouter/mistralai/mistral-saba": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/mistralai/mistral-small-24b-instruct-2501": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.08
-    },
-    "openrouter/mistralai/mistral-small-2603": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/mistralai/mistral-small-2603:batch": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/mistralai/mistral-small-3.1-24b-instruct": {
-      "input_usd_per_mtok": 0.351,
-      "output_usd_per_mtok": 0.5549999999999999
-    },
-    "openrouter/mistralai/mistral-small-3.2-24b-instruct": {
-      "input_usd_per_mtok": 0.09375,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/mistralai/mixtral-8x22b-instruct": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/mistralai/voxtral-small-24b-2507": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/moonshotai/kimi-k2": {
-      "input_usd_per_mtok": 0.5700000000000001,
-      "output_usd_per_mtok": 2.3
-    },
-    "openrouter/moonshotai/kimi-k2-0905": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/moonshotai/kimi-k2-thinking": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/moonshotai/kimi-k2.5": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 2.25
-    },
-    "openrouter/moonshotai/kimi-k2.6": {
-      "input_usd_per_mtok": 0.46499999999999997,
-      "output_usd_per_mtok": 2.4499999999999997
-    },
-    "openrouter/moonshotai/kimi-k2.7-code": {
-      "input_usd_per_mtok": 0.6712,
-      "output_usd_per_mtok": 3.35
-    },
-    "openrouter/moonshotai/kimi-k3": {
-      "input_usd_per_mtok": 0.76,
-      "output_usd_per_mtok": 13.0
-    },
-    "openrouter/moonshotai/kimi-k3:batch": {
-      "input_usd_per_mtok": 2.2800000000000002,
-      "output_usd_per_mtok": 11.399999999999999
-    },
-    "openrouter/morph/morph-v3-fast": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/morph/morph-v3-large": {
-      "input_usd_per_mtok": 0.8999999999999999,
-      "output_usd_per_mtok": 1.9
-    },
-    "openrouter/nex-agi/nex-n2.5-mini": {
-      "input_usd_per_mtok": 0.024999999999999998,
-      "output_usd_per_mtok": 0.09999999999999999
-    },
-    "openrouter/nex-agi/nex-n2.5-mini:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nex-agi/nex-n2.5-pro": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/nex-agi/nex-n2.5-pro:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nousresearch/hermes-3-llama-3.1-405b": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/nousresearch/hermes-3-llama-3.1-70b": {
-      "input_usd_per_mtok": 0.7,
-      "output_usd_per_mtok": 0.7
-    },
-    "openrouter/nousresearch/hermes-4-405b": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/nvidia/nemotron-3-nano-30b-a3b": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.24
-    },
-    "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nvidia/nemotron-3-super-120b-a12b": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.44999999999999996
-    },
-    "openrouter/nvidia/nemotron-3-super-120b-a12b:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nvidia/nemotron-3-ultra-550b-a55b": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nvidia/nemotron-3.5-content-safety": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/nvidia/nemotron-3.5-content-safety:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/nvidia/nemotron-3.5-lightning": {
-      "input_usd_per_mtok": 0.049,
-      "output_usd_per_mtok": 0.14
-    },
-    "openrouter/nvidia/nemotron-3.5-lightning:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/openai/gpt-3.5-turbo": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/openai/gpt-3.5-turbo-0613": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/openai/gpt-3.5-turbo-16k": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/openai/gpt-3.5-turbo-instruct": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/openai/gpt-3.5-turbo:batch": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/openai/gpt-4": {
-      "input_usd_per_mtok": 30.0,
-      "output_usd_per_mtok": 60.0
-    },
-    "openrouter/openai/gpt-4-turbo": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/openai/gpt-4-turbo-preview": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/openai/gpt-4-turbo:batch": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/openai/gpt-4.1": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 8.0
-    },
-    "openrouter/openai/gpt-4.1-mini": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 1.5999999999999999
-    },
-    "openrouter/openai/gpt-4.1-mini:batch": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.7999999999999999
-    },
-    "openrouter/openai/gpt-4.1-nano": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/openai/gpt-4.1-nano:batch": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/openai/gpt-4.1:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/openai/gpt-4o": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-4o-2024-05-13": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/openai/gpt-4o-2024-08-06": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-4o-2024-11-20": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-4o-mini": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/openai/gpt-4o-mini-2024-07-18": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/openai/gpt-4o-mini:batch": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/openai/gpt-4o:batch": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-5": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5-chat": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5-codex": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5-image": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5-image-mini": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/openai/gpt-5-mini": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/openai/gpt-5-mini:batch": {
-      "input_usd_per_mtok": 0.125,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/openai/gpt-5-nano": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/openai/gpt-5-nano:batch": {
-      "input_usd_per_mtok": 0.024999999999999998,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/openai/gpt-5-pro": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 120.0
-    },
-    "openrouter/openai/gpt-5-pro:batch": {
-      "input_usd_per_mtok": 7.5,
-      "output_usd_per_mtok": 60.0
-    },
-    "openrouter/openai/gpt-5.1": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5.1-codex": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5.1-codex-max": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5.1-codex-mini": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/openai/gpt-5.1:batch": {
-      "input_usd_per_mtok": 0.625,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-5.2": {
-      "input_usd_per_mtok": 1.75,
-      "output_usd_per_mtok": 14.0
-    },
-    "openrouter/openai/gpt-5.2-chat": {
-      "input_usd_per_mtok": 1.75,
-      "output_usd_per_mtok": 14.0
-    },
-    "openrouter/openai/gpt-5.2-codex": {
-      "input_usd_per_mtok": 1.75,
-      "output_usd_per_mtok": 14.0
-    },
-    "openrouter/openai/gpt-5.2-pro": {
-      "input_usd_per_mtok": 21.0,
-      "output_usd_per_mtok": 168.0
-    },
-    "openrouter/openai/gpt-5.2-pro:batch": {
-      "input_usd_per_mtok": 10.5,
-      "output_usd_per_mtok": 84.0
-    },
-    "openrouter/openai/gpt-5.2:batch": {
-      "input_usd_per_mtok": 0.875,
-      "output_usd_per_mtok": 7.0
-    },
-    "openrouter/openai/gpt-5.3-codex": {
-      "input_usd_per_mtok": 1.75,
-      "output_usd_per_mtok": 14.0
-    },
-    "openrouter/openai/gpt-5.4": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/openai/gpt-5.4-image-2": {
-      "input_usd_per_mtok": 8.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/openai/gpt-5.4-mini": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 4.5
-    },
-    "openrouter/openai/gpt-5.4-mini:batch": {
-      "input_usd_per_mtok": 0.375,
-      "output_usd_per_mtok": 2.25
-    },
-    "openrouter/openai/gpt-5.4-nano": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/openai/gpt-5.4-nano:batch": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.625
-    },
-    "openrouter/openai/gpt-5.4-pro": {
-      "input_usd_per_mtok": 30.0,
-      "output_usd_per_mtok": 180.0
-    },
-    "openrouter/openai/gpt-5.4-pro:batch": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 90.0
-    },
-    "openrouter/openai/gpt-5.4:batch": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/openai/gpt-5.5": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/openai/gpt-5.5-pro": {
-      "input_usd_per_mtok": 30.0,
-      "output_usd_per_mtok": 180.0
-    },
-    "openrouter/openai/gpt-5.5-pro:batch": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 90.0
-    },
-    "openrouter/openai/gpt-5.5:batch": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/openai/gpt-5.6-luna": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/openai/gpt-5.6-luna-pro": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/openai/gpt-5.6-luna-pro:batch": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/openai/gpt-5.6-luna:batch": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/openai/gpt-5.6-sol": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5.6-sol-pro": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-5.6-sol-pro:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-5.6-sol:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-5.6-terra": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/openai/gpt-5.6-terra-pro": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/openai/gpt-5.6-terra-pro:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/openai/gpt-5.6-terra:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/openai/gpt-5:batch": {
-      "input_usd_per_mtok": 0.625,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-6-astra": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/openai/gpt-6-astra-pro": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/openai/gpt-6-astra-pro:batch": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/openai/gpt-6-astra:batch": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 25.0
-    },
-    "openrouter/openai/gpt-6-luna": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/openai/gpt-6-luna-pro": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/openai/gpt-6-luna-pro:batch": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/openai/gpt-6-luna:batch": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.25
-    },
-    "openrouter/openai/gpt-6-sol": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-6-sol-pro": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-6-sol-pro:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-6-sol:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-6.1-sol": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-6.1-sol-pro": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-6.1-sol-pro:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-6.1-sol:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 5.0
-    },
-    "openrouter/openai/gpt-audio": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/openai/gpt-audio-mini": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 2.4
-    },
-    "openrouter/openai/gpt-chat-latest": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/openai/gpt-oss-120b": {
-      "input_usd_per_mtok": 0.037,
-      "output_usd_per_mtok": 0.16999999999999998
-    },
-    "openrouter/openai/gpt-oss-120b:batch": {
-      "input_usd_per_mtok": 0.0296,
-      "output_usd_per_mtok": 0.136
-    },
-    "openrouter/openai/gpt-oss-20b": {
-      "input_usd_per_mtok": 0.018,
-      "output_usd_per_mtok": 0.09
-    },
-    "openrouter/openai/gpt-oss-20b:batch": {
-      "input_usd_per_mtok": 0.024,
-      "output_usd_per_mtok": 0.112
-    },
-    "openrouter/openai/gpt-oss-safeguard-20b": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/openai/o1": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 60.0
-    },
-    "openrouter/openai/o1-pro": {
-      "input_usd_per_mtok": 150.0,
-      "output_usd_per_mtok": 600.0
-    },
-    "openrouter/openai/o3": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 8.0
-    },
-    "openrouter/openai/o3-mini": {
-      "input_usd_per_mtok": 1.1,
-      "output_usd_per_mtok": 4.4
-    },
-    "openrouter/openai/o3-mini-high": {
-      "input_usd_per_mtok": 1.1,
-      "output_usd_per_mtok": 4.4
-    },
-    "openrouter/openai/o3-mini:batch": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/openai/o3-pro": {
-      "input_usd_per_mtok": 20.0,
-      "output_usd_per_mtok": 80.0
-    },
-    "openrouter/openai/o3:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/openai/o4-mini": {
-      "input_usd_per_mtok": 1.1,
-      "output_usd_per_mtok": 4.4
-    },
-    "openrouter/openai/o4-mini-high": {
-      "input_usd_per_mtok": 1.1,
-      "output_usd_per_mtok": 4.4
-    },
-    "openrouter/openai/o4-mini:batch": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/openrouter/auto": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/openrouter/bodybuilder": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/openrouter/free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
     "openrouter/pareto-code": {
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
-    },
-    "openrouter/perceptron/perceptron-mk1": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/perceptron/perceptron-mk1.5": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.5
-    },
-    "openrouter/perplexity/sonar": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/perplexity/sonar-deep-research": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 8.0
-    },
-    "openrouter/perplexity/sonar-pro": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/perplexity/sonar-pro-search": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/perplexity/sonar-reasoning-pro": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 8.0
-    },
-    "openrouter/poolside/laguna-s-2.1": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.18
-    },
-    "openrouter/poolside/laguna-s-2.1:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/poolside/laguna-xs-2.1": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.12
-    },
-    "openrouter/poolside/laguna-xs-2.1:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/prism-ml/ternary-bonsai-2-27b": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/qwen/qwen-2.5-72b-instruct": {
-      "input_usd_per_mtok": 0.36,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/qwen/qwen-2.5-7b-instruct": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/qwen/qwen-2.5-coder-32b-instruct": {
-      "input_usd_per_mtok": 0.66,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/qwen/qwen-plus": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 0.78
-    },
-    "openrouter/qwen/qwen-plus-2025-07-28": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 0.78
-    },
-    "openrouter/qwen/qwen-vl-plus": {
-      "input_usd_per_mtok": 0.21,
-      "output_usd_per_mtok": 0.63
-    },
-    "openrouter/qwen/qwen2.5-vl-72b-instruct": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/qwen/qwen3-14b": {
-      "input_usd_per_mtok": 0.12,
-      "output_usd_per_mtok": 0.24
-    },
-    "openrouter/qwen/qwen3-235b-a22b": {
-      "input_usd_per_mtok": 0.45499999999999996,
-      "output_usd_per_mtok": 1.8199999999999998
-    },
-    "openrouter/qwen/qwen3-235b-a22b-2507": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.55
-    },
-    "openrouter/qwen/qwen3-235b-a22b-thinking-2507": {
-      "input_usd_per_mtok": 0.22999999999999998,
-      "output_usd_per_mtok": 2.3
-    },
-    "openrouter/qwen/qwen3-30b-a3b": {
-      "input_usd_per_mtok": 0.12,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/qwen/qwen3-30b-a3b-instruct-2507": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/qwen/qwen3-30b-a3b-thinking-2507": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 2.4
-    },
-    "openrouter/qwen/qwen3-32b": {
-      "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.28
-    },
-    "openrouter/qwen/qwen3-8b": {
-      "input_usd_per_mtok": 0.117,
-      "output_usd_per_mtok": 0.45499999999999996
-    },
-    "openrouter/qwen/qwen3-coder": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {
-      "input_usd_per_mtok": 0.07,
-      "output_usd_per_mtok": 0.28
-    },
-    "openrouter/qwen/qwen3-coder-flash": {
-      "input_usd_per_mtok": 0.195,
-      "output_usd_per_mtok": 0.975
-    },
-    "openrouter/qwen/qwen3-coder-next": {
-      "input_usd_per_mtok": 0.12,
-      "output_usd_per_mtok": 0.7999999999999999
-    },
-    "openrouter/qwen/qwen3-coder-plus": {
-      "input_usd_per_mtok": 0.65,
-      "output_usd_per_mtok": 3.25
-    },
-    "openrouter/qwen/qwen3-max": {
-      "input_usd_per_mtok": 0.78,
-      "output_usd_per_mtok": 3.9
-    },
-    "openrouter/qwen/qwen3-max-thinking": {
-      "input_usd_per_mtok": 0.78,
-      "output_usd_per_mtok": 3.9
-    },
-    "openrouter/qwen/qwen3-next-80b-a3b-instruct": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 1.1
-    },
-    "openrouter/qwen/qwen3-next-80b-a3b-thinking": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/qwen/qwen3-vl-235b-a22b-instruct": {
-      "input_usd_per_mtok": 0.21,
-      "output_usd_per_mtok": 1.9
-    },
-    "openrouter/qwen/qwen3-vl-235b-a22b-thinking": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/qwen/qwen3-vl-30b-a3b-instruct": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/qwen/qwen3-vl-30b-a3b-thinking": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 2.4
-    },
-    "openrouter/qwen/qwen3-vl-32b-instruct": {
-      "input_usd_per_mtok": 0.10400000000000001,
-      "output_usd_per_mtok": 0.41600000000000004
-    },
-    "openrouter/qwen/qwen3-vl-8b-instruct": {
-      "input_usd_per_mtok": 0.117,
-      "output_usd_per_mtok": 0.45499999999999996
-    },
-    "openrouter/qwen/qwen3-vl-8b-thinking": {
-      "input_usd_per_mtok": 0.18,
-      "output_usd_per_mtok": 2.0999999999999996
-    },
-    "openrouter/qwen/qwen3.5-122b-a10b": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 2.08
-    },
-    "openrouter/qwen/qwen3.5-27b": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 2.6
-    },
-    "openrouter/qwen/qwen3.5-35b-a3b": {
-      "input_usd_per_mtok": 0.1625,
-      "output_usd_per_mtok": 1.3
-    },
-    "openrouter/qwen/qwen3.5-397b-a17b": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 3.5
-    },
-    "openrouter/qwen/qwen3.5-9b": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.15
-    },
-    "openrouter/qwen/qwen3.5-flash-02-23": {
-      "input_usd_per_mtok": 0.065,
-      "output_usd_per_mtok": 0.26
-    },
-    "openrouter/qwen/qwen3.5-plus-02-15": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 1.56
-    },
-    "openrouter/qwen/qwen3.5-plus-20260420": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.7999999999999998
-    },
-    "openrouter/qwen/qwen3.6-27b": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 2.7
-    },
-    "openrouter/qwen/qwen3.6-35b-a3b": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 1.0
-    },
-    "openrouter/qwen/qwen3.6-flash": {
-      "input_usd_per_mtok": 0.1875,
-      "output_usd_per_mtok": 1.125
-    },
-    "openrouter/qwen/qwen3.6-max-preview": {
-      "input_usd_per_mtok": 1.0270000000000001,
-      "output_usd_per_mtok": 6.162
-    },
-    "openrouter/qwen/qwen3.6-plus": {
-      "input_usd_per_mtok": 0.325,
-      "output_usd_per_mtok": 1.95
-    },
-    "openrouter/qwen/qwen3.7-flash": {
-      "input_usd_per_mtok": 0.03,
-      "output_usd_per_mtok": 0.13
-    },
-    "openrouter/qwen/qwen3.7-max": {
-      "input_usd_per_mtok": 1.475,
-      "output_usd_per_mtok": 4.425
-    },
-    "openrouter/qwen/qwen3.7-plus": {
-      "input_usd_per_mtok": 0.32,
-      "output_usd_per_mtok": 1.28
-    },
-    "openrouter/qwen/qwen3.8-2.4t-a95b": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/qwen/qwen3.8-27b": {
-      "input_usd_per_mtok": 0.425,
-      "output_usd_per_mtok": 2.5500000000000003
-    },
-    "openrouter/qwen/qwen3.8-27b:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/qwen/qwen3.8-flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.47
-    },
-    "openrouter/qwen/qwen3.8-max": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/qwen/qwen3.8-max-0902": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/qwen/qwen3.8-max-prime": {
-      "input_usd_per_mtok": 4.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/qwen/qwen3.8-omni-flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.47
-    },
-    "openrouter/rekaai/reka-edge": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.09999999999999999
-    },
-    "openrouter/rekaai/reka-flash-3": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/relace/relace-apply-3": {
-      "input_usd_per_mtok": 0.85,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/relace/relace-search": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 3.0
-    },
-    "openrouter/sakana/fugu-max": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/sakana/fugu-ultra": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/sakana/fugu-ultra-v2": {
-      "input_usd_per_mtok": 5.0,
-      "output_usd_per_mtok": 30.0
-    },
-    "openrouter/sakana/sakana-namazu": {
-      "input_usd_per_mtok": 0.95,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/sao10k/l3-lunaris-8b": {
-      "input_usd_per_mtok": 0.04,
-      "output_usd_per_mtok": 0.049999999999999996
-    },
-    "openrouter/sao10k/l3.1-euryale-70b": {
-      "input_usd_per_mtok": 0.85,
-      "output_usd_per_mtok": 0.85
-    },
-    "openrouter/sao10k/l3.3-euryale-70b": {
-      "input_usd_per_mtok": 0.65,
-      "output_usd_per_mtok": 0.75
-    },
-    "openrouter/stealth/space-bunny-alpha": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/stepfun/step-3.5-flash": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/stepfun/step-3.7-flash": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.15
-    },
-    "openrouter/stepfun/step-5-preview": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 2.7
-    },
-    "openrouter/switchpoint/router": {
-      "input_usd_per_mtok": 0.85,
-      "output_usd_per_mtok": 3.4
-    },
-    "openrouter/tencent/hunyuan-a13b-instruct": {
-      "input_usd_per_mtok": 0.14,
-      "output_usd_per_mtok": 0.5700000000000001
-    },
-    "openrouter/tencent/hy-mt2-1.8b": {
-      "input_usd_per_mtok": 0.044,
-      "output_usd_per_mtok": 0.17700000000000002
-    },
-    "openrouter/tencent/hy-mt2-30b-a3b": {
-      "input_usd_per_mtok": 0.074,
-      "output_usd_per_mtok": 0.295
-    },
-    "openrouter/tencent/hy-mt2-7b": {
-      "input_usd_per_mtok": 0.074,
-      "output_usd_per_mtok": 0.295
-    },
-    "openrouter/tencent/hy3": {
-      "input_usd_per_mtok": 0.13199999999999998,
-      "output_usd_per_mtok": 0.5279999999999999
-    },
-    "openrouter/tencent/hy3-preview": {
-      "input_usd_per_mtok": 0.18,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/tencent/hy4-preview": {
-      "input_usd_per_mtok": 0.834,
-      "output_usd_per_mtok": 2.501
-    },
-    "openrouter/thedrummer/cydonia-24b-v4.1": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/thedrummer/skyfall-36b-v2": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 0.7999999999999999
-    },
-    "openrouter/thedrummer/unslopnemo-12b": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/thinkingmachines/inkling": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 4.05
-    },
-    "openrouter/thinkingmachines/inkling-small": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/thinkingmachines/inkling-small:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/thinkingmachines/inkling:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/typesafe/jev-router": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/unbiased/pareto": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 7.5
-    },
-    "openrouter/unbiased/pareto-26.10-preview": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 3.1999999999999997
-    },
-    "openrouter/undi95/remm-slerp-l2-13b": {
-      "input_usd_per_mtok": 0.35,
-      "output_usd_per_mtok": 0.65
-    },
-    "openrouter/upstage/solar-mini4": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/upstage/solar-pro-3": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
-    },
-    "openrouter/upstage/solar-pro4": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.36
-    },
-    "openrouter/writer/palmyra-x5": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/x-ai/grok-4": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/x-ai/grok-4.20": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/x-ai/grok-4.20-multi-agent": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/x-ai/grok-4.3": {
-      "input_usd_per_mtok": 1.25,
-      "output_usd_per_mtok": 2.5
-    },
-    "openrouter/x-ai/grok-4.3:batch": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/x-ai/grok-4.5": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/x-ai/grok-4.6": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/x-ai/grok-4.7": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/x-ai/grok-build-0.1": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/xiaomi/mimo-v2-flash": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
-    "openrouter/xiaomi/mimo-v2.5": {
-      "input_usd_per_mtok": 0.14,
-      "output_usd_per_mtok": 0.28
-    },
-    "openrouter/xiaomi/mimo-v2.5-pro": {
-      "input_usd_per_mtok": 0.435,
-      "output_usd_per_mtok": 0.87
-    },
-    "openrouter/xiaomi/mimo-v2.6-flash": {
-      "input_usd_per_mtok": 0.14,
-      "output_usd_per_mtok": 0.28
-    },
-    "openrouter/xiaomi/mimo-v2.6-pro": {
-      "input_usd_per_mtok": 0.435,
-      "output_usd_per_mtok": 0.87
-    },
-    "openrouter/xiaomi/mimo-v2.6-pro-ultraspeed": {
-      "input_usd_per_mtok": 4.35,
-      "output_usd_per_mtok": 8.7
-    },
-    "openrouter/z-ai/glm-4.5": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/z-ai/glm-4.5-air": {
-      "input_usd_per_mtok": 0.13,
-      "output_usd_per_mtok": 0.85
-    },
-    "openrouter/z-ai/glm-4.5v": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 1.7999999999999998
-    },
-    "openrouter/z-ai/glm-4.6": {
-      "input_usd_per_mtok": 0.43,
-      "output_usd_per_mtok": 1.75
-    },
-    "openrouter/z-ai/glm-4.6:exacto": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 1.9
-    },
-    "openrouter/z-ai/glm-4.6v": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 0.8999999999999999
-    },
-    "openrouter/z-ai/glm-4.7": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 2.2
-    },
-    "openrouter/z-ai/glm-4.7-flash": {
-      "input_usd_per_mtok": 0.060500000000000005,
-      "output_usd_per_mtok": 0.39999999999999997
-    },
-    "openrouter/z-ai/glm-5": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 1.92
-    },
-    "openrouter/z-ai/glm-5-turbo": {
-      "input_usd_per_mtok": 1.2,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/z-ai/glm-5.1": {
-      "input_usd_per_mtok": 0.966,
-      "output_usd_per_mtok": 3.036
-    },
-    "openrouter/z-ai/glm-5.2": {
-      "input_usd_per_mtok": 0.06899999999999999,
-      "output_usd_per_mtok": 4.300000000000001
-    },
-    "openrouter/z-ai/glm-5.2:free": {
-      "input_usd_per_mtok": 0.0,
-      "output_usd_per_mtok": 0.0
-    },
-    "openrouter/z-ai/glm-5.3": {
-      "input_usd_per_mtok": 0.039,
-      "output_usd_per_mtok": 3.39
-    },
-    "openrouter/z-ai/glm-5.3-flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/z-ai/glm-5.3-flash:batch": {
-      "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
-    "openrouter/z-ai/glm-5.3-flashx": {
-      "input_usd_per_mtok": 0.37,
-      "output_usd_per_mtok": 1.25
-    },
-    "openrouter/z-ai/glm-5.3-prime": {
-      "input_usd_per_mtok": 2.8,
-      "output_usd_per_mtok": 8.8
-    },
-    "openrouter/z-ai/glm-5.3:batch": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 2.0
-    },
-    "openrouter/z-ai/glm-5v-turbo": {
-      "input_usd_per_mtok": 1.2,
-      "output_usd_per_mtok": 4.0
-    },
-    "openrouter/~anthropic/claude-fable-latest": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/~anthropic/claude-haiku-latest": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/~anthropic/claude-opus-latest": {
-      "input_usd_per_mtok": 4.0,
-      "output_usd_per_mtok": 20.0
-    },
-    "openrouter/~anthropic/claude-sonnet-latest": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/~deepseek/deepseek-flash-latest": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2
-    },
-    "openrouter/~deepseek/deepseek-pro-latest": {
-      "input_usd_per_mtok": 1.32,
-      "output_usd_per_mtok": 3.9600000000000004
-    },
-    "openrouter/~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.04,
-      "output_usd_per_mtok": 0.64,
-      "off_peak": {
-        "input_usd_per_mtok": 0.02,
-        "output_usd_per_mtok": 0.32,
-        "window_start_utc_min": 990,
-        "window_end_utc_min": 30
-      }
-    },
-    "openrouter/~google/gemini-flash-latest": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 3.75
-    },
-    "openrouter/~google/gemini-pro-latest": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/~moonshotai/kimi-latest": {
-      "input_usd_per_mtok": 3.0,
-      "output_usd_per_mtok": 15.0
-    },
-    "openrouter/~openai/gpt-astra-latest": {
-      "input_usd_per_mtok": 10.0,
-      "output_usd_per_mtok": 50.0
-    },
-    "openrouter/~openai/gpt-luna-latest": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/~openai/gpt-mini-latest": {
-      "input_usd_per_mtok": 0.75,
-      "output_usd_per_mtok": 4.5
-    },
-    "openrouter/~openai/gpt-sol-latest": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 10.0
-    },
-    "openrouter/~openai/gpt-terra-latest": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 12.0
-    },
-    "openrouter/~x-ai/grok-latest": {
-      "input_usd_per_mtok": 2.0,
-      "output_usd_per_mtok": 6.0
-    },
-    "openrouter/~z-ai/glm-flash-latest": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.5
-    },
-    "openrouter/~z-ai/glm-latest": {
-      "input_usd_per_mtok": 0.6537999999999999,
-      "output_usd_per_mtok": 2.0547999999999997
     },
     "ovhcloud/DeepSeek-R1-Distill-Llama-70B": {
       "input_usd_per_mtok": 0.67,
@@ -12595,29 +10525,21 @@
       "input_usd_per_mtok": 0.26,
       "output_usd_per_mtok": 0.78
     },
-    "qwen/qwen-plus-2025-07-28": {
-      "input_usd_per_mtok": 0.26,
-      "output_usd_per_mtok": 0.78
-    },
     "qwen/qwen2.5-vl-72b-instruct": {
       "input_usd_per_mtok": 0.7999999999999999,
       "output_usd_per_mtok": 1.0
     },
     "qwen/qwen3-14b": {
-      "input_usd_per_mtok": 0.12,
-      "output_usd_per_mtok": 0.24
-    },
-    "qwen/qwen3-235b-a22b": {
-      "input_usd_per_mtok": 0.45499999999999996,
-      "output_usd_per_mtok": 1.8199999999999998
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.22
     },
     "qwen/qwen3-235b-a22b-2507": {
       "input_usd_per_mtok": 0.09,
       "output_usd_per_mtok": 0.55
     },
     "qwen/qwen3-235b-a22b-thinking-2507": {
-      "input_usd_per_mtok": 0.22999999999999998,
-      "output_usd_per_mtok": 2.3
+      "input_usd_per_mtok": 0.44999999999999996,
+      "output_usd_per_mtok": 3.5
     },
     "qwen/qwen3-30b-a3b": {
       "input_usd_per_mtok": 0.12,
@@ -12627,17 +10549,9 @@
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.3
     },
-    "qwen/qwen3-30b-a3b-thinking-2507": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 2.4
-    },
     "qwen/qwen3-32b": {
       "input_usd_per_mtok": 0.08,
       "output_usd_per_mtok": 0.28
-    },
-    "qwen/qwen3-8b": {
-      "input_usd_per_mtok": 0.117,
-      "output_usd_per_mtok": 0.45499999999999996
     },
     "qwen/qwen3-coder": {
       "input_usd_per_mtok": 0.3,
@@ -12655,18 +10569,6 @@
       "input_usd_per_mtok": 0.12,
       "output_usd_per_mtok": 0.7999999999999999
     },
-    "qwen/qwen3-coder-plus": {
-      "input_usd_per_mtok": 0.65,
-      "output_usd_per_mtok": 3.25
-    },
-    "qwen/qwen3-max": {
-      "input_usd_per_mtok": 0.78,
-      "output_usd_per_mtok": 3.9
-    },
-    "qwen/qwen3-max-thinking": {
-      "input_usd_per_mtok": 0.78,
-      "output_usd_per_mtok": 3.9
-    },
     "qwen/qwen3-next-80b-a3b-instruct": {
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 1.1
@@ -12679,29 +10581,17 @@
       "input_usd_per_mtok": 0.21,
       "output_usd_per_mtok": 1.9
     },
-    "qwen/qwen3-vl-235b-a22b-thinking": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 4.0
-    },
     "qwen/qwen3-vl-30b-a3b-instruct": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.6
     },
     "qwen/qwen3-vl-30b-a3b-thinking": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 2.4
-    },
-    "qwen/qwen3-vl-32b-instruct": {
-      "input_usd_per_mtok": 0.10400000000000001,
-      "output_usd_per_mtok": 0.41600000000000004
+      "input_usd_per_mtok": 0.29,
+      "output_usd_per_mtok": 1.0
     },
     "qwen/qwen3-vl-8b-instruct": {
-      "input_usd_per_mtok": 0.117,
-      "output_usd_per_mtok": 0.45499999999999996
-    },
-    "qwen/qwen3-vl-8b-thinking": {
-      "input_usd_per_mtok": 0.18,
-      "output_usd_per_mtok": 2.0999999999999996
+      "input_usd_per_mtok": 0.25,
+      "output_usd_per_mtok": 0.75
     },
     "qwen/qwen3.5-122b-a10b": {
       "input_usd_per_mtok": 0.26,
@@ -12736,8 +10626,8 @@
       "output_usd_per_mtok": 1.7999999999999998
     },
     "qwen/qwen3.6-27b": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 2.7
+      "input_usd_per_mtok": 0.32,
+      "output_usd_per_mtok": 3.1999999999999997
     },
     "qwen/qwen3.6-35b-a3b": {
       "input_usd_per_mtok": 0.15,
@@ -12746,10 +10636,6 @@
     "qwen/qwen3.6-flash": {
       "input_usd_per_mtok": 0.1875,
       "output_usd_per_mtok": 1.125
-    },
-    "qwen/qwen3.6-max-preview": {
-      "input_usd_per_mtok": 1.0270000000000001,
-      "output_usd_per_mtok": 6.162
     },
     "qwen/qwen3.6-plus": {
       "input_usd_per_mtok": 0.325,
@@ -13788,8 +11674,8 @@
       "output_usd_per_mtok": 3.0
     },
     "together_ai/Qwen/Qwen3.7-Max": {
-      "input_usd_per_mtok": 1.5,
-      "output_usd_per_mtok": 4.5
+      "input_usd_per_mtok": 2.5,
+      "output_usd_per_mtok": 7.5
     },
     "together_ai/Qwen/Qwen3.7-Plus": {
       "input_usd_per_mtok": 0.32,
@@ -15770,8 +13656,8 @@
       "output_usd_per_mtok": 1.7999999999999998
     },
     "z-ai/glm-4.6": {
-      "input_usd_per_mtok": 0.43,
-      "output_usd_per_mtok": 1.75
+      "input_usd_per_mtok": 0.5,
+      "output_usd_per_mtok": 2.0
     },
     "z-ai/glm-4.6v": {
       "input_usd_per_mtok": 0.3,
@@ -15799,7 +13685,7 @@
     },
     "z-ai/glm-5.2": {
       "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 4.199999999999999
+      "output_usd_per_mtok": 7.0
     },
     "z-ai/glm-5.3": {
       "input_usd_per_mtok": 0.039,
@@ -15922,19 +13808,19 @@
       "output_usd_per_mtok": 10.0
     },
     "~deepseek/deepseek-flash-latest": {
-      "input_usd_per_mtok": 0.016,
-      "output_usd_per_mtok": 1.2
+      "input_usd_per_mtok": 0.0005,
+      "output_usd_per_mtok": 0.6
     },
     "~deepseek/deepseek-pro-latest": {
-      "input_usd_per_mtok": 0.198,
-      "output_usd_per_mtok": 8.0
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 5.0
     },
     "~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.00368,
-      "output_usd_per_mtok": 0.09774,
+      "input_usd_per_mtok": 0.007899999999999999,
+      "output_usd_per_mtok": 1.28,
       "off_peak": {
-        "input_usd_per_mtok": 0.00184,
-        "output_usd_per_mtok": 0.04887,
+        "input_usd_per_mtok": 0.00395,
+        "output_usd_per_mtok": 0.64,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -15948,8 +13834,8 @@
       "output_usd_per_mtok": 12.0
     },
     "~moonshotai/kimi-latest": {
-      "input_usd_per_mtok": 0.49,
-      "output_usd_per_mtok": 13.0
+      "input_usd_per_mtok": 0.37,
+      "output_usd_per_mtok": 14.89
     },
     "~openai/gpt-astra-latest": {
       "input_usd_per_mtok": 10.0,
@@ -15976,12 +13862,12 @@
       "output_usd_per_mtok": 6.0
     },
     "~z-ai/glm-flash-latest": {
-      "input_usd_per_mtok": 0.032,
-      "output_usd_per_mtok": 1.041434
+      "input_usd_per_mtok": 0.04,
+      "output_usd_per_mtok": 0.5
     },
     "~z-ai/glm-latest": {
-      "input_usd_per_mtok": 0.031200000000000002,
-      "output_usd_per_mtok": 4.4
+      "input_usd_per_mtok": 0.039,
+      "output_usd_per_mtok": 4.8
     }
   }
 }
