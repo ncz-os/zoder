@@ -464,6 +464,11 @@ enum ReviewerError {
     /// failure, etc.). The chain MUST stop — the next call site must report
     /// the error instead of fabricating success.
     Fatal { message: String },
+    /// The pre-query health gate refused to query this model (EIH breaker
+    /// open, or its health probe failed). Already recorded in the health
+    /// store and in `skipped_unhealthy`; the chain moves to the next
+    /// candidate without recording another failure.
+    Skipped { message: String },
 }
 
 impl ReviewerError {
@@ -683,6 +688,12 @@ async fn complete_once(
                 // whatever the provider returned) intact preserves the
                 // diagnostic a CI maintainer needs to triage a chain-
                 // wide failure.
+                last_err_msg = Some(format!("reviewer {model}: {message}"));
+            }
+            Err(ReviewerError::Skipped { message }) => {
+                if !cli.quiet {
+                    eprintln!("[zoder] {message}");
+                }
                 last_err_msg = Some(format!("reviewer {model}: {message}"));
             }
             Err(ReviewerError::Fatal { message }) => {
@@ -1384,6 +1395,19 @@ async fn dispatch_reviewer_for_model(
         Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
     };
 
+    // EIH models are never queried blindly: a cached or freshly probed health
+    // check gates the first query, and an open breaker skips the model so the
+    // chain falls to the next configured route (crate::eih_health).
+    let gated = crate::eih_health::is_gated(provider_cfg);
+    let health_note = if gated {
+        match crate::eih_health::admit(&eng.cfg.health_path, provider_cfg, &provider, model).await {
+            Ok(note) => Some(note),
+            Err(message) => return Err(ReviewerError::Skipped { message }),
+        }
+    } else {
+        None
+    };
+
     // Optional host-wide cap on concurrent reviewer calls per provider
     // (ZODER_PROVIDER_CONCURRENCY); unlimited by default. A queue timeout is
     // a capacity signal, so the next reviewer candidate may take over.
@@ -1457,6 +1481,18 @@ async fn dispatch_reviewer_for_model(
                         message: format!("reviewer {model}: {}", e.message),
                     });
                 }
+                // A gated (EIH) model answering 429 is rate-limited
+                // fleet-wide: retrying in-process only hammers it. Open the
+                // breaker (honoring Retry-After) and let the chain fall back.
+                if gated && e.kind == zoder_core::ErrKind::RateLimit {
+                    crate::eih_health::record_call_error(
+                        &eng.cfg.health_path,
+                        &provider_cfg.id,
+                        model,
+                        &e,
+                    );
+                    return Err(ReviewerError::fallback_worthy_from(e));
+                }
                 if e.retryable() && attempt < cli.retries {
                     let delay = zoder_core::backoff_delay(attempt, e.retry_after);
                     if !cli.quiet {
@@ -1477,6 +1513,17 @@ async fn dispatch_reviewer_for_model(
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
+                }
+                // A gated model that is still failing after the bounded
+                // retries opens its breaker and hands over to the next route.
+                if gated && e.retryable() {
+                    crate::eih_health::record_call_error(
+                        &eng.cfg.health_path,
+                        &provider_cfg.id,
+                        model,
+                        &e,
+                    );
+                    return Err(ReviewerError::fallback_worthy_from(e));
                 }
                 // An explicit reviewer pool permits bounded failover after
                 // same-model retries are exhausted. The next candidate is
@@ -1508,6 +1555,9 @@ async fn dispatch_reviewer_for_model(
         }
     };
 
+    if gated {
+        crate::eih_health::record_success(&eng.cfg.health_path, &provider_cfg.id, model);
+    }
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
@@ -1640,6 +1690,7 @@ async fn dispatch_reviewer_for_model(
             "proxy_deployment_id": res.telemetry.served_model,
             "attempted_fallbacks": res.telemetry.attempted_fallbacks,
             "latency_ms": elapsed_ms,
+            "health": health_note,
             // Where the wall time went: waiting for a local provider slot,
             // for the ledger reservation (host-wide lock), for response
             // headers, and for the first generated token (server queue +
@@ -4319,6 +4370,10 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
         aggregate.failed_models,
     );
     payload["provenance"] = json!(aggregate.receipts);
+    // Reviewers the pre-query health gate refused to query. Never a pass:
+    // the slot that needed one either fell back (its receipt names the
+    // serving model) or failed, which keeps the review incomplete.
+    payload["skipped_unhealthy"] = json!(crate::eih_health::take_skipped());
     // Always present, so a consumer can read `substituted == false` rather than
     // having to treat an absent field as success.
     payload["substituted"] = json!(receipts_show_substitution(aggregate.receipts));
@@ -12350,6 +12405,260 @@ mod reviewer_chain_dispatch_tests {
         .unwrap();
         assert_eq!(result.model, "working-model/glm-5.1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Config with a gated EIH provider (id `nvidia-eih`) and a working
+    /// fallback, reviewer chain EIH first.
+    fn write_eih_config(home: &Path, mock_uri: &str, reviewer_model: &str) {
+        let body = serde_json::json!({
+            "providers": [
+                {
+                    "id": "nvidia-eih",
+                    "base_url": format!("{mock_uri}/eih"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["eih-model/"],
+                },
+                {
+                    "id": "wiremock-working",
+                    "base_url": format!("{mock_uri}/working"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["working-model/"],
+                },
+            ],
+            "default_provider": "wiremock-working",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "reviewer_model": reviewer_model,
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    const APPROVE_VERDICT: &str = r#"{"verdict":"approve","summary":"No defects in the supplied diff.","findings":[],"next_steps":[]}"#;
+
+    fn approve_response() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"content":APPROVE_VERDICT},"finish_reason":"stop"}]
+        }))
+    }
+
+    async fn mount_working(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(approve_response())
+            .mount(server)
+            .await;
+    }
+
+    fn gate_of(home: &Path, model: &str) -> Option<zoder_core::health::PreQueryGate> {
+        HealthStore::load(&home.join("health.json"))
+            .models
+            .get(model)
+            .and_then(|m| m.gate.clone())
+    }
+
+    /// EIH health gate: a probe precedes the first query, a fresh check is
+    /// cached, a 429 is not retried in-process but opens the breaker (with
+    /// Retry-After) and falls back, and the next run skips EIH without
+    /// touching it and reports `skipped_unhealthy`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eih_gate_probes_caches_backs_off_on_429_and_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        let model_hits = Arc::new(AtomicUsize::new(0));
+        let mh = model_hits.clone();
+        Mock::given(method("GET"))
+            .and(path("/eih/v1/models"))
+            .respond_with(move |_: &wiremock::Request| {
+                mh.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":[{"id":"eih-model/nemo"},{"id":"other"}]}))
+            })
+            .mount(&server)
+            .await;
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let ch = chat_hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/eih/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                if ch.fetch_add(1, Ordering::SeqCst) < 2 {
+                    approve_response()
+                } else {
+                    ResponseTemplate::new(429)
+                        .insert_header("retry-after", "45")
+                        .set_body_string("rate limited")
+                }
+            })
+            .mount(&server)
+            .await;
+        mount_working(&server).await;
+        write_corpus(home, &["eih-model/nemo", "working-model/reviewer"]);
+        write_eih_config(home, &server.uri(), "eih-model/nemo,working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "review", "--retries", "2"]).unwrap();
+        let _ = crate::eih_health::take_skipped();
+
+        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(first.model, "eih-model/nemo");
+        assert_eq!(first.receipts[0]["health"]["source"], "probe");
+        assert_eq!(model_hits.load(Ordering::SeqCst), 1);
+
+        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(second.receipts[0]["health"]["source"], "cache");
+        assert_eq!(
+            model_hits.load(Ordering::SeqCst),
+            1,
+            "fresh check is cached"
+        );
+
+        // 429: exactly one chat attempt (no in-process retry), breaker open
+        // for at least Retry-After, review served by the fallback.
+        let before = chat_hits.load(Ordering::SeqCst);
+        let third = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(third.model, "working-model/reviewer");
+        assert_eq!(
+            chat_hits.load(Ordering::SeqCst),
+            before + 1,
+            "no retry into a 429"
+        );
+        let gate = gate_of(home, "eih-model/nemo").expect("breaker opened");
+        assert_eq!(gate.open_count, 1);
+        assert!(gate.retry_not_before_unix.unwrap() >= chrono::Utc::now().timestamp() + 40);
+
+        // Next run: skipped without any EIH request, reported, never a pass.
+        let (m0, c0) = (
+            model_hits.load(Ordering::SeqCst),
+            chat_hits.load(Ordering::SeqCst),
+        );
+        let fourth = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(fourth.model, "working-model/reviewer");
+        assert_eq!(model_hits.load(Ordering::SeqCst), m0);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), c0);
+        let skipped = crate::eih_health::take_skipped();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0]["model"], "eih-model/nemo");
+        assert_eq!(skipped[0]["provider"], "nvidia-eih");
+        assert!(skipped[0]["reason"].as_str().unwrap().contains("429"));
+    }
+
+    /// A failing probe (503) skips EIH with backoff; once the backoff has
+    /// elapsed a single half-open probe runs, succeeds, and closes the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eih_gate_backs_off_on_503_probe_then_recovers_half_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        let model_hits = Arc::new(AtomicUsize::new(0));
+        let mh = model_hits.clone();
+        Mock::given(method("GET"))
+            .and(path("/eih/v1/models"))
+            .respond_with(move |_: &wiremock::Request| {
+                if mh.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_string("unavailable")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data":[{"id":"eih-model/nemo"}]}))
+                }
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eih/v1/chat/completions"))
+            .respond_with(approve_response())
+            .mount(&server)
+            .await;
+        mount_working(&server).await;
+        write_corpus(home, &["eih-model/nemo", "working-model/reviewer"]);
+        write_eih_config(home, &server.uri(), "eih-model/nemo,working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "review", "--retries", "0"]).unwrap();
+        let _ = crate::eih_health::take_skipped();
+
+        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(first.model, "working-model/reviewer");
+        let gate = gate_of(home, "eih-model/nemo").expect("probe failure opens the gate");
+        assert_eq!(gate.open_count, 1);
+        assert_eq!(crate::eih_health::take_skipped().len(), 1);
+
+        // Simulate the backoff elapsing.
+        HealthStore::mutate_locked(&home.join("health.json"), |h| {
+            let g = h
+                .models
+                .get_mut("eih-model/nemo")
+                .unwrap()
+                .gate
+                .as_mut()
+                .unwrap();
+            g.retry_not_before_unix = Some(chrono::Utc::now().timestamp() - 1);
+        })
+        .unwrap();
+        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .unwrap();
+        assert_eq!(second.model, "eih-model/nemo");
+        assert_eq!(second.receipts[0]["health"]["source"], "half_open_probe");
+        assert!(
+            gate_of(home, "eih-model/nemo").is_none(),
+            "success closes the gate"
+        );
+        assert_eq!(model_hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A slow probe is bounded and treated as unhealthy; with no fallback the
+    /// review fails (a skipped reviewer is never a pass).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eih_gate_bounds_a_slow_probe_and_never_passes_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eih/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(3))
+                    .set_body_json(json!({"data":[{"id":"eih-model/nemo"}]})),
+            )
+            .mount(&server)
+            .await;
+        write_corpus(home, &["eih-model/nemo"]);
+        write_eih_config(home, &server.uri(), "eih-model/nemo");
+        let cli =
+            Cli::try_parse_from(["zoder", "review", "--retries", "0", "--no-fallback"]).unwrap();
+        let _ = crate::eih_health::take_skipped();
+        // The HomeGuard holds the process-wide env lock for this test.
+        std::env::set_var("ZODER_EIH_PROBE_TIMEOUT_MS", "200");
+        let started = std::time::Instant::now();
+        let result = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048).await;
+        std::env::remove_var("ZODER_EIH_PROBE_TIMEOUT_MS");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("skipped unhealthy EIH model eih-model/nemo"),
+            "{err}"
+        );
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(gate_of(home, "eih-model/nemo").is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
