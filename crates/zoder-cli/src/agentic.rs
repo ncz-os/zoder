@@ -1766,7 +1766,8 @@ fn parse_review_json_only(raw: &str) -> Option<ReviewOutput> {
 }
 
 fn parse_review(raw: &str) -> ReviewOutput {
-    let trimmed = raw.trim();
+    let stripped = strip_leading_reasoning_block(raw);
+    let trimmed = stripped.trim();
     if let Some(r) = parse_review_json_only(trimmed) {
         return r;
     }
@@ -1788,11 +1789,45 @@ fn parse_review(raw: &str) -> ReviewOutput {
         findings: vec![Finding {
             severity: "info".into(),
             title: "unparseable review (fail-closed)".into(),
-            body: trimmed.to_string(),
+            body: raw.trim().to_string(),
             location: None,
         }],
         next_steps: vec![],
     }
+}
+
+/// Strip a leading reasoning wrapper that a thinking model prepends to its
+/// answer, so the JSON verdict that follows it can reach the strict gate.
+///
+/// MiniMax-M3 emits `<think>…</think>` as ordinary `content` (not the separate
+/// `reasoning_content` field), immediately followed by the fenced JSON verdict.
+/// [`strip_single_code_fence`] requires the answer to *start* with the fence, so
+/// without this the standalone and loop reviewer paths failed closed with
+/// "returned invalid JSON twice" on every M3 review (reproduced on a real
+/// 9 KB diff). Only a wrapper that both opens at the very start and closes is
+/// removed; the answer after it must still be a complete verdict object, so a
+/// thinking model's prose cannot be turned into an approval.
+fn strip_leading_reasoning_block(s: &str) -> &str {
+    const TAGS: &[(&str, &str)] = &[
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("<reasoning>", "</reasoning>"),
+    ];
+    let t = s.trim_start();
+    for (open, close) in TAGS {
+        if t.len() >= open.len()
+            && t.is_char_boundary(open.len())
+            && t[..open.len()].eq_ignore_ascii_case(open)
+        {
+            let rest = &t[open.len()..];
+            // `to_ascii_lowercase` preserves byte length, so the found offset
+            // stays valid against `rest`.
+            if let Some(end) = rest.to_ascii_lowercase().find(close) {
+                return rest[end + close.len()..].trim_start();
+            }
+        }
+    }
+    s
 }
 
 /// Unwrap an answer that is *exactly one* markdown code fence (optionally with
@@ -1843,7 +1878,7 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
 
 /// A complete object, never a schema fragment extracted from reasoning prose.
 fn strict_review(raw: &str) -> Option<ReviewOutput> {
-    let trimmed = raw.trim();
+    let trimmed = strip_leading_reasoning_block(raw).trim();
     let parsed = serde_json::from_str::<serde_json::Value>(strip_single_code_fence(trimmed)).ok();
     if let Some(value) = parsed.as_ref().and_then(serde_json::Value::as_object) {
         let has_shape = ["verdict", "summary", "findings", "next_steps"]
@@ -8359,6 +8394,43 @@ must reap the direct shell on the timeout branch)"
             r#"{"verdict":"approve","summary":"Sound change.","findings":[],"next_steps":[]}"#
         )
         .is_some());
+    }
+
+    /// Regression: a real MiniMax-M3 reviewer reply (captured 2026-10-10) is a
+    /// `<think>…</think>` block in the `content` field followed by a fenced JSON
+    /// verdict. The strict gate required the answer to *start* with the fence,
+    /// so every M3 review failed closed with "returned invalid JSON twice".
+    #[test]
+    fn strict_review_parses_a_leading_think_block_then_fenced_verdict() {
+        let raw = "<think>Let me analyze this diff carefully for concrete defects.\n\n\
+1. **src/db.py** - string concatenation is a SQL injection.\n\
+2. **src/uaf.c** - free(buf) before return is a use-after-free.</think>\n\n\
+```json\n{\"verdict\":\"request_changes\",\"summary\":\"Four distinct defects.\",\
+\"findings\":[{\"severity\":\"critical\",\"title\":\"SQL injection\",\"body\":\"string concatenation\",\
+\"location\":\"src/db.py:4\"}],\"next_steps\":[\"parameterize the query\"]}\n```";
+        let review = strict_review(raw).expect("think-prefixed fenced verdict must parse");
+        assert_eq!(review.verdict, "request_changes");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].severity, "critical");
+    }
+
+    /// The stripping must not turn a thinking model's prose into a verdict: a
+    /// think block with no JSON object after it still fails closed.
+    #[test]
+    fn strict_review_still_rejects_think_prose_without_a_verdict() {
+        assert!(
+            strict_review("<think>I would approve this change.</think>\nLooks fine to me.")
+                .is_none()
+        );
+        assert!(strict_review("<think>unclosed reasoning").is_none());
+    }
+
+    /// The panel/prose path strips the same wrapper before its JSON-first parse.
+    #[test]
+    fn parse_review_strips_a_leading_think_block() {
+        let raw = "<THINK>analysis</THINK>\n\
+{\"verdict\":\"approve\",\"summary\":\"Sound.\",\"findings\":[],\"next_steps\":[]}";
+        assert_eq!(parse_review(raw).verdict, "approve");
     }
 
     /// Z-8 REGRESSION GUARD (diff-capture ordering): `build_diff` in
