@@ -1262,12 +1262,39 @@ async fn dispatch_reviewer_for_model(
         provider_cfg,
         Some(crate::provider_request_timeout_s(cli, &eng.cfg)),
     ) {
-        Ok(p) => p,
+        Ok(p) => p.with_wait_notices(!cli.quiet),
         Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
+    };
+
+    // Optional host-wide cap on concurrent reviewer calls per provider
+    // (ZODER_PROVIDER_CONCURRENCY); unlimited by default. A queue timeout is
+    // a capacity signal, so the next reviewer candidate may take over.
+    let slot_limit = crate::provider_slots::limit_for(
+        std::env::var("ZODER_PROVIDER_CONCURRENCY").ok().as_deref(),
+        &provider_cfg.id,
+    );
+    let slot = match crate::provider_slots::acquire(
+        &Config::home(),
+        &provider_cfg.id,
+        slot_limit,
+        crate::provider_slots::queue_timeout_from_env(),
+        cli.quiet,
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err(e) => {
+            return Err(ReviewerError::FallbackWorthy {
+                message: format!("reviewer {model}: {e}"),
+                kind: zoder_core::ErrKind::RateLimit,
+                status: None,
+            })
+        }
     };
 
     let mut attempt = 0u32;
     let mut server_failures = 0u32;
+    let mut ledger_wait = std::time::Duration::ZERO;
     let (res, ledger_reservation) = loop {
         // Reserve and lock accounting before each reviewer attempt. Panel
         // calls may run concurrently, so this also serializes their
@@ -1275,11 +1302,12 @@ async fn dispatch_reviewer_for_model(
         // provider, so dropping an armed reservation intentionally retains
         // its unknown-cost row before the retry proceeds.
         let reservation_path = ledger_path.clone();
-        let mut ledger_reservation = match tokio::task::spawn_blocking(move || {
-            Ledger::new(&reservation_path).reserve_billable()
-        })
-        .await
-        {
+        let reserve_started = std::time::Instant::now();
+        let reserved =
+            tokio::task::spawn_blocking(move || Ledger::new(&reservation_path).reserve_billable())
+                .await;
+        ledger_wait += reserve_started.elapsed();
+        let mut ledger_reservation = match reserved {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(ReviewerError::fatal(format!(
@@ -1494,6 +1522,16 @@ async fn dispatch_reviewer_for_model(
             "proxy_deployment_id": res.telemetry.served_model,
             "attempted_fallbacks": res.telemetry.attempted_fallbacks,
             "latency_ms": elapsed_ms,
+            // Where the wall time went: waiting for a local provider slot,
+            // for the ledger reservation (host-wide lock), for response
+            // headers, and for the first generated token (server queue +
+            // prefill).
+            "slot_wait_ms": slot.waited.as_millis() as u64,
+            "slot_limit": slot.limit,
+            "slot_held": slot.is_held(),
+            "ledger_wait_ms": ledger_wait.as_millis() as u64,
+            "headers_ms": res.telemetry.headers_ms,
+            "first_token_ms": res.telemetry.first_token_ms,
         })],
     })
 }
