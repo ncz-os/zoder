@@ -34,14 +34,20 @@ Every reviewer receipt in `zoder review --json` (`provenance[]`) reports:
 | `slot_limit`, `slot_held` | the configured limit (0 = unlimited) and whether a slot was taken |
 | `ledger_wait_ms` | time to reserve the spend-ledger row (host-wide lock + scan) |
 | `headers_ms` | request sent to response headers |
-| `first_token_ms` | request sent to the first generated token (server queue + prefill) |
+| `first_token_ms` | request sent to the first generated token (streamed calls only) |
 | `latency_ms` | total wall time for this reviewer, including retries |
+
+Reviewer calls are non-streaming, so for them `headers_ms` is the server's
+whole queue + prefill + generation time and `first_token_ms` is empty;
+`zoder exec --oneshot` streams and reports both.
 
 `zoder exec --oneshot --json` reports `headers_ms` and `first_token_ms`.
 
-While a streamed call has produced no token yet, zoder prints
-`[zoder] still waiting for the first token from <provider> after Ns ...`
-every 30 seconds (`ZODER_WAIT_NOTICE_S`) unless `--quiet`. The overall request
+While a call is waiting on the server (a non-streaming reviewer call that has
+no response yet, or a streamed call with no token yet), zoder prints
+`[zoder] still waiting for <provider> after Ns ...` every 30 seconds
+(`ZODER_WAIT_NOTICE_S`) unless `--quiet`. The same request keeps running; it
+is never re-sent. The overall request
 budget (`--request-timeout`, default 120s) still bounds the wait; once tokens
 start, the idle guard (`ZODER_IDLE_S`, default 25s) applies, including while a
 model is only streaming reasoning.
