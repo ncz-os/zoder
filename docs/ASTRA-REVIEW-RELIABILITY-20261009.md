@@ -85,3 +85,24 @@ Source delivery does not update installed fleet binaries. The prior mechanical
 log specifically found ULTRA running a stale binary despite fixed source on
 other hosts. Deployment must identify the built source SHA and binary digest;
 the old `zoder 0.2.1` version string alone cannot prove this repair is installed.
+
+## Known limits
+
+The 2026-10-10 follow-up (branch `fix/astra-review-followup-20261010`) reviewed
+the following items and deliberately left them unchanged. They are not defects
+in the code paths changed by that follow-up; each needs its own change with
+independent evidence.
+
+* **A strict served-model name match can reject a provider that echoes a
+  resolved or dated model id.** The check fails closed. Confirm what CERBERUS
+  `gemma4-31b` and EIH `nemotron` actually return before deploying any change.
+* **`cancel_session` does not validate `session_id` on `turn_complete`.** A
+  completion for a different session can be attributed to the cancelled one.
+* **Goose loops abort on the first author timeout.** `record_active_session` is
+  not recorded at the goose `session/new`, so the watchdog cannot cancel that
+  session.
+* **No idle-stall guard while only reasoning tokens stream.** A stream that
+  emits reasoning tokens but no answer tokens never trips the idle timeout.
+* **`drain_after_cancel` returning `timeout` lets `cmd_loop` proceed to review
+  after an unacknowledged agent-timeout cancel.** Pre-existing; the fix is a
+  separate change.
