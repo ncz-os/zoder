@@ -211,40 +211,47 @@ fn clean_git_path(raw: &str) -> Option<String> {
 }
 
 /// Minimal git C-style path unquoting: surrounding quotes plus `\"`, `\\`,
-/// `\t`, `\n`, and octal escapes. Non-quoted paths are returned verbatim.
+/// `\t`, `\n`, `\r`, and octal escapes. Non-quoted paths are returned
+/// verbatim.
+///
+/// Git quotes every non-ASCII byte of a path as a separate octal escape
+/// (`caf\303\251.txt` is `café.txt`), so the escapes are decoded into BYTES
+/// and the result is decoded as UTF-8 once at the end. Pushing each escape as
+/// its own `char` produced Latin-1 mojibake (`cafÃ©.txt`), which then failed
+/// to match `--exclude` / `.zoderignore` globs and mislabelled split parts.
 fn unquote_git_path(raw: &str) -> String {
     let inner = raw
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(raw);
     let bytes = inner.as_bytes();
-    let mut out = String::with_capacity(inner.len());
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'"' => {
-                    out.push('"');
+                    out.push(b'"');
                     i += 2;
                 }
                 b'\\' => {
-                    out.push('\\');
+                    out.push(b'\\');
                     i += 2;
                 }
                 b't' => {
-                    out.push('\t');
+                    out.push(b'\t');
                     i += 2;
                 }
                 b'n' => {
-                    out.push('\n');
+                    out.push(b'\n');
                     i += 2;
                 }
                 b'r' => {
-                    out.push('\r');
+                    out.push(b'\r');
                     i += 2;
                 }
                 b'0'..=b'7' => {
-                    // Up to three octal digits.
+                    // Up to three octal digits encode one byte (<= 0o377).
                     let mut val = 0u32;
                     let mut n = 0;
                     while n < 3
@@ -254,22 +261,25 @@ fn unquote_git_path(raw: &str) -> String {
                         val = val * 8 + u32::from(bytes[i + 1 + n] - b'0');
                         n += 1;
                     }
-                    if let Some(c) = char::from_u32(val) {
-                        out.push(c);
+                    if let Ok(b) = u8::try_from(val) {
+                        out.push(b);
                     }
                     i += 1 + n;
                 }
                 other => {
-                    out.push(other as char);
+                    out.push(other);
                     i += 2;
                 }
             }
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
-    out
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1032,27 @@ mod tests {
         assert_eq!(resolve_limit(Some(7), Some(9), 3), 7);
         assert_eq!(resolve_limit(None, Some(9), 3), 9);
         assert_eq!(resolve_limit(None, None, 3), 3);
+    }
+
+    /// Integration-review finding: git octal-quotes each UTF-8 byte of a
+    /// non-ASCII path; the bytes must be reassembled, not cast to chars.
+    #[test]
+    fn quoted_utf8_path_is_decoded_as_utf8() {
+        assert_eq!(unquote_git_path("\"caf\\303\\251.txt\""), "café.txt");
+        assert_eq!(
+            unquote_git_path("\"docs/\\346\\227\\245\\346\\234\\254.md\""),
+            "docs/日本.md"
+        );
+        assert_eq!(unquote_git_path("café.txt"), "café.txt");
+        assert_eq!(unquote_git_path("\"a\\tb\\\"c\\\\d\""), "a\tb\"c\\d");
+        let diff = "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\251.txt\"\n+++ \"b/caf\\303\\251.txt\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let (kept, report) = filter_diff(diff, &["café.txt".to_string()]);
+        assert!(
+            kept.trim().is_empty(),
+            "non-ASCII path must match its glob: {kept}"
+        );
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].path, "café.txt");
     }
 
     #[test]
