@@ -61,7 +61,8 @@ pub use catalog_models::{
 pub use config::{
     AliasedAgentConfig, Auth, BillingMode, Config, EngineModelRegistry, EngineProviderRoute,
     ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions,
-    Provider, QuotaUnit, QuotaWindow, SeatbeltProfileOptions, SubscriptionPlan, Theme,
+    Provider, QuotaUnit, QuotaWindow, ReviewConfig, SeatbeltProfileOptions, SubscriptionPlan,
+    Theme,
 };
 pub use corpus::{Corpus, ModelEntry, RefreshReport};
 pub use engine_cost::{

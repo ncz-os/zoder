@@ -25,6 +25,17 @@ use zoder_core::{
 
 use crate::{Engine, ReviewScope};
 
+/// Size/exclusion knobs for `zoder review` / `adversarial-review`, resolved
+/// from CLI flags, the `[review]` config block, and built-in defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewSizeOptions {
+    pub excludes: Vec<String>,
+    pub max_diff_bytes: Option<usize>,
+    pub max_hunk_bytes: Option<usize>,
+    pub split_hunks: bool,
+    pub dry_run: bool,
+}
+
 #[cfg(test)]
 static TEST_BACKGROUND_WORKER_COMMAND: std::sync::Mutex<Option<(PathBuf, Vec<String>)>> =
     std::sync::Mutex::new(None);
@@ -425,6 +436,7 @@ struct Completion {
     model: String,
     content: String,
     cost_usd: f64,
+    receipts: Vec<serde_json::Value>,
 }
 
 /// Internal reviewer chain dispatch result. Carries enough information to
@@ -769,7 +781,7 @@ Every finding MUST cite a concrete location (path:line). No markdown or prose ou
             Ok(c) => {
                 cost += c.cost_usd;
                 last_model = Some(c.model.clone());
-                if let Some(r) = parse_review_json_only(&c.content) {
+                if let Some(r) = strict_review(&c.content) {
                     return (r, last_model, cost, prose);
                 }
                 prose.push_str(&format!("[{model} primary]\n{}\n---\n", c.content));
@@ -792,7 +804,7 @@ Every finding MUST cite a concrete location (path:line). No markdown or prose ou
             Ok(c) => {
                 cost += c.cost_usd;
                 last_model = Some(c.model.clone());
-                if let Some(r) = parse_review_json_only(&c.content) {
+                if let Some(r) = strict_review(&c.content) {
                     return (r, last_model, cost, prose);
                 }
                 prose.push_str(&format!("[{model} retry]\n{}\n---\n", c.content));
@@ -1374,12 +1386,25 @@ async fn dispatch_reviewer_for_model(
         known_paid_model,
         (!unknown_cost).then_some(cost),
     );
-    let policy_failure = match (&verify_failure, &paid_failure) {
+    let mut policy_failure = match (&verify_failure, &paid_failure) {
         (Some(verify), Some(paid)) => Some(format!("{verify}; {paid}")),
         (Some(verify), None) => Some(verify.clone()),
         (None, Some(paid)) => Some(paid.clone()),
         (None, None) => None,
     };
+    // The body model is a literal served model, unlike a proxy deployment
+    // hash in x-litellm-model-id. Reject a reported substitution even when
+    // both providers are free: an exact reviewer pin is an identity promise.
+    if let Some(served) = res.telemetry.response_model.as_deref() {
+        if served != model {
+            let mismatch =
+                format!("reviewer provenance mismatch: requested {model}, response model {served}");
+            policy_failure = Some(match policy_failure {
+                Some(prior) => format!("{prior}; {mismatch}"),
+                None => mismatch,
+            });
+        }
+    }
     let mut violation = policy_failure.clone();
     // Only add cost-unknown as a violation when the call is genuinely
     // at-risk: not allow-paid, and not served from a cost-neutral
@@ -1461,6 +1486,15 @@ async fn dispatch_reviewer_for_model(
         model: model.to_string(),
         content: res.content,
         cost_usd: cost,
+        receipts: vec![json!({
+            "requested_model": model,
+            "response_model": res.telemetry.response_model,
+            "provider": provider_cfg.id,
+            "served_by": res.telemetry.api_base,
+            "proxy_deployment_id": res.telemetry.served_model,
+            "attempted_fallbacks": res.telemetry.attempted_fallbacks,
+            "latency_ms": elapsed_ms,
+        })],
     })
 }
 
@@ -1791,7 +1825,24 @@ fn strip_single_code_fence(s: &str) -> &str {
 /// verdict object. `parse_review` deliberately supports prose for older loop
 /// workflows, but that recovery can misread a thinking model's explanation
 /// of the schema ("approve or request_changes") as an actual approval.
+#[cfg(test)]
 fn parse_standalone_review(raw: &str) -> ReviewOutput {
+    strict_review(raw).unwrap_or_else(|| ReviewOutput {
+        verdict: "request_changes".into(),
+        summary: "Reviewer did not return one complete structured JSON verdict; failing closed."
+            .into(),
+        findings: vec![Finding {
+            severity: "info".into(),
+            title: "unparseable review (fail-closed)".into(),
+            body: raw.trim().chars().take(8_000).collect(),
+            location: None,
+        }],
+        next_steps: vec![],
+    })
+}
+
+/// A complete object, never a schema fragment extracted from reasoning prose.
+fn strict_review(raw: &str) -> Option<ReviewOutput> {
     let trimmed = raw.trim();
     let parsed = serde_json::from_str::<serde_json::Value>(strip_single_code_fence(trimmed)).ok();
     if let Some(value) = parsed.as_ref().and_then(serde_json::Value::as_object) {
@@ -1807,24 +1858,25 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
                     "approve" | "request_changes" | "comment"
                 ) && !review.summary.trim().is_empty()
                     && review.summary.trim() != "..."
+                    && review.findings.iter().all(|f| {
+                        matches!(
+                            f.severity.as_str(),
+                            "critical" | "high" | "medium" | "low" | "info"
+                        ) && !f.title.trim().is_empty()
+                            && !f.body.trim().is_empty()
+                    })
+                    && !(review.verdict == "approve"
+                        && review
+                            .findings
+                            .iter()
+                            .any(|f| matches!(f.severity.as_str(), "critical" | "high")))
                 {
-                    return review;
+                    return Some(review);
                 }
             }
         }
     }
-    ReviewOutput {
-        verdict: "request_changes".into(),
-        summary: "Reviewer did not return one complete structured JSON verdict; failing closed."
-            .into(),
-        findings: vec![Finding {
-            severity: "info".into(),
-            title: "unparseable review (fail-closed)".into(),
-            body: trimmed.chars().take(8_000).collect(),
-            location: None,
-        }],
-        next_steps: vec![],
-    }
+    None
 }
 
 /// Known verdict keywords (case-insensitive) that `verdict_rank` recognizes.
@@ -3196,58 +3248,6 @@ Findings MUST be an array of objects, never an array of strings. Each finding ob
 next_steps MUST be a top-level array of strings. Use empty arrays when there are no findings or next steps. Write an actual review of this diff. \
 Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
-const REVIEW_CHUNK_BYTES: usize = 9_000;
-const MAX_REVIEW_CHUNKS: usize = 24;
-
-/// Split at file and hunk boundaries so a reviewer never sees a line cut in
-/// half. Each hunk carries its file header; this also keeps locations useful
-/// when one file spans several requests. Oversized individual hunks fail
-/// closed instead of silently clipping code the reviewer needs to inspect.
-fn review_diff_chunks(diff: &str) -> anyhow::Result<Vec<String>> {
-    let mut starts = vec![0usize];
-    starts.extend(diff.match_indices("\ndiff --git ").map(|(i, _)| i + 1));
-    let mut units = Vec::new();
-    for (idx, start) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).copied().unwrap_or(diff.len());
-        let file = &diff[*start..end];
-        let Some(first_hunk) = file.find("\n@@").map(|i| i + 1) else {
-            units.push(file.to_owned());
-            continue;
-        };
-        let header = &file[..first_hunk];
-        let body = &file[first_hunk..];
-        let mut hunk_starts = vec![0usize];
-        hunk_starts.extend(body.match_indices("\n@@").map(|(i, _)| i + 1));
-        for (hidx, hstart) in hunk_starts.iter().enumerate() {
-            let hend = hunk_starts.get(hidx + 1).copied().unwrap_or(body.len());
-            units.push(format!("{header}{}", &body[*hstart..hend]));
-        }
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    for unit in units {
-        if unit.len() > REVIEW_CHUNK_BYTES {
-            anyhow::bail!(
-                "one diff hunk is {} bytes, above the {}-byte review limit; split the change into smaller commits",
-                unit.len(), REVIEW_CHUNK_BYTES
-            );
-        }
-        if chunks
-            .last()
-            .is_none_or(|chunk| chunk.len() + unit.len() > REVIEW_CHUNK_BYTES)
-        {
-            chunks.push(String::new());
-        }
-        chunks
-            .last_mut()
-            .expect("chunk was just created")
-            .push_str(&unit);
-        if chunks.len() > MAX_REVIEW_CHUNKS {
-            anyhow::bail!("diff needs more than {MAX_REVIEW_CHUNKS} review chunks; narrow the branch or review its commits separately");
-        }
-    }
-    Ok(chunks)
-}
-
 fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usize, count: usize) {
     if verdict_rank(&review.verdict) > verdict_rank(&merged.verdict) {
         merged.verdict = review.verdict;
@@ -3276,6 +3276,7 @@ async fn complete_review_chunks(
 ) -> anyhow::Result<Completion> {
     let mut selected_model: Option<String> = None;
     let mut cost_usd = 0.0;
+    let mut receipts = Vec::new();
     let mut merged = ReviewOutput {
         verdict: "approve".into(),
         ..ReviewOutput::default()
@@ -3288,9 +3289,9 @@ is not evidence of a defect. Report only defects established by the supplied cod
 invent missing integration or compiler failures from omitted context.\n\n{}",
             idx + 1, users.len(), user
         );
-        let completion = complete_once(
+        let mut completion = complete_once(
             cli,
-            model_override,
+            selected_model.as_deref().or(model_override),
             reviewer_chain,
             system,
             &user,
@@ -3298,6 +3299,31 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         )
         .await
         .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
+        cost_usd += completion.cost_usd;
+        receipts.extend(completion.receipts.clone());
+        let review = match strict_review(&completion.content) {
+            Some(review) => review,
+            None => {
+                // One fresh JSON-only retry of the same code on the same
+                // model. Never extract a convenient object from prose.
+                let repair_user = format!("{user}\n\nReturn ONLY the complete JSON verdict object; your previous response did not satisfy the review schema.");
+                completion = complete_once(
+                    cli,
+                    Some(&completion.model),
+                    &[],
+                    system,
+                    &repair_user,
+                    max_tokens,
+                )
+                .await?;
+                cost_usd += completion.cost_usd;
+                receipts.extend(completion.receipts.clone());
+                strict_review(&completion.content).ok_or_else(|| anyhow!(
+                    "review chunk {}/{}: reviewer {} returned invalid JSON twice; review incomplete",
+                    idx + 1, users.len(), completion.model
+                ))?
+            }
+        };
         if let Some(first) = &selected_model {
             if first != &completion.model {
                 anyhow::bail!(
@@ -3311,21 +3337,69 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         } else {
             selected_model = Some(completion.model);
         }
-        cost_usd += completion.cost_usd;
-        append_chunk_review(
-            &mut merged,
-            parse_standalone_review(&completion.content),
-            idx,
-            users.len(),
-        );
+        append_chunk_review(&mut merged, review, idx, users.len());
     }
     Ok(Completion {
         model: selected_model.ok_or_else(|| anyhow!("no review chunks were generated"))?,
         content: serde_json::to_string(&merged)?,
         cost_usd,
+        receipts,
     })
 }
 
+/// Print exactly what `review` would send, without calling any model. Used by
+/// `--dry-run` and by the size/exclusion acceptance checks.
+fn print_review_dry_run(
+    label: &str,
+    raw_diff: &str,
+    prepared: &crate::review_diff::PreparedDiff,
+    prompts: &[String],
+    max_diff_bytes: usize,
+    max_hunk_bytes: usize,
+) {
+    println!("[zoder] dry-run: {label}");
+    println!(
+        "[zoder] diff bytes: {} raw, {} after exclusions",
+        raw_diff.len(),
+        prepared.filtered.len()
+    );
+    println!("[zoder] caps: max-diff-bytes={max_diff_bytes} max-hunk-bytes={max_hunk_bytes}");
+    if prepared.excluded.is_empty() {
+        println!("[zoder] excluded: none");
+    } else {
+        println!("[zoder] excluded: {}", prepared.excluded.render());
+    }
+    println!(
+        "[zoder] chunks: {} (diff map: {})",
+        prepared.chunks.len(),
+        prepared
+            .diff_map
+            .as_ref()
+            .map(|m| format!("{} bytes", m.len()))
+            .unwrap_or_else(|| "not needed (single chunk)".to_string())
+    );
+    if let Some(map) = &prepared.diff_map {
+        println!("[zoder] diff map:\n{map}");
+    }
+    // Print the assembled per-chunk prompts (map included), not the raw diff
+    // slices, so a dry-run shows exactly what each reviewer would receive.
+    for (i, prompt) in prompts.iter().enumerate() {
+        println!(
+            "[zoder] ---- prompt chunk {}/{} ({} bytes) ----",
+            i + 1,
+            prompts.len(),
+            prompt.len()
+        );
+        print!("{prompt}");
+        if !prompt.ends_with('\n') {
+            println!();
+        }
+    }
+}
+
+// Signature grows with review options; the size/exclusion knobs are bundled
+// into `ReviewSizeOptions`, so the arg count stays close to the historical one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
     base: Option<String>,
@@ -3334,6 +3408,7 @@ pub(crate) async fn cmd_review(
     background: bool,
     adversarial: bool,
     focus: &[String],
+    opts: ReviewSizeOptions,
 ) -> anyhow::Result<()> {
     let cwd = crate::agentic_cwd(cli)?;
 
@@ -3373,6 +3448,7 @@ pub(crate) async fn cmd_review(
                 requested: 1,
                 ok_models: 1,
                 failed_models: 0,
+                receipts: &[],
             },
         );
         return Ok(());
@@ -3383,28 +3459,81 @@ pub(crate) async fn cmd_review(
     } else {
         REVIEW_SYSTEM
     };
-    let focus_txt = focus.join(" ");
-    if diff.len() > 120_000 {
-        anyhow::bail!("review diff is {} bytes, above the 120000-byte limit; narrow the branch or review its commits separately", diff.len());
+
+    // Resolve the review caps and exclusions. Loading the engine here (not
+    // just below for the reviewer chain) lets `[review]` config participate;
+    // a config problem degrades to the built-in defaults rather than blocking
+    // a review.
+    let eng = Engine::load().ok();
+    let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
+    let max_diff_bytes = crate::review_diff::resolve_limit(
+        opts.max_diff_bytes,
+        review_cfg.as_ref().and_then(|r| r.max_diff_bytes),
+        crate::review_diff::DEFAULT_MAX_DIFF_BYTES,
+    );
+    let max_hunk_bytes = crate::review_diff::resolve_limit(
+        opts.max_hunk_bytes,
+        review_cfg.as_ref().and_then(|r| r.max_hunk_bytes),
+        crate::review_diff::DEFAULT_MAX_HUNK_BYTES,
+    );
+    let config_excludes = review_cfg.map(|r| r.exclude).unwrap_or_default();
+    let root = crate::review_diff::repo_root(&cwd);
+    let prepared = crate::review_diff::prepare_review_diff(
+        &root,
+        &diff,
+        &opts.excludes,
+        &config_excludes,
+        max_diff_bytes,
+        max_hunk_bytes,
+        opts.split_hunks,
+    )?;
+    if !prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
+        eprintln!("[zoder] {}", prepared.excluded.render());
     }
-    let chunks = review_diff_chunks(&diff)?;
-    let users: Vec<String> = chunks
+
+    let focus_txt = focus.join(" ");
+    let chunk_count = prepared.chunks.len();
+    let users: Vec<String> = prepared
+        .chunks
         .iter()
         .enumerate()
         .map(|(idx, chunk)| {
-            let portion = if chunks.len() == 1 {
+            let portion = if chunk_count == 1 {
                 format!("{label} diff")
             } else {
-                format!("{label} diff, chunk {}/{}", idx + 1, chunks.len())
+                format!("{label} diff, chunk {}/{}", idx + 1, chunk_count)
             };
             let focus = if focus_txt.trim().is_empty() {
                 String::new()
             } else {
                 format!(" Focus especially on: {focus_txt}.")
             };
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.\n\n```diff\n{chunk}\n```")
+            // A multi-chunk review gets the cross-chunk map prepended so a
+            // symbol defined in another chunk is never reported as missing.
+            let map = prepared.diff_map.as_ref().map_or(String::new(), |map| {
+                format!(
+                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; \
+the chunk under review is {}/{}). Before reporting a symbol as undefined, \
+redefined, or recursively calling a missing function, check it against this map:\n{}",
+                    idx + 1,
+                    chunk_count,
+                    map
+                )
+            });
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
         })
         .collect();
+    if opts.dry_run {
+        print_review_dry_run(
+            &label,
+            &diff,
+            &prepared,
+            &users,
+            max_diff_bytes,
+            max_hunk_bytes,
+        );
+        return Ok(());
+    }
 
     // Standalone review has no author turn: `-m` pins its primary reviewer.
     // Without it, use the configured reviewer/scenario route. Additional
@@ -3420,7 +3549,6 @@ pub(crate) async fn cmd_review(
     // pin, then profile-level `Config::reviewer_model`), then the
     // scenario-eligible reviewer as a tail fallback, then the cross-family
     // legacy default. Scenario auto-routing never shadows a configured pin.
-    let eng = Engine::load().ok();
     let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
@@ -3459,11 +3587,13 @@ pub(crate) async fn cmd_review(
     let mut reviews: Vec<ReviewerSlot> = Vec::new();
     let mut total_cost = 0.0;
     let mut ok_models: usize = 0;
+    let mut receipts = Vec::new();
     for r in results {
         match r {
             Ok(c) => {
                 ok_models += 1;
                 total_cost += c.cost_usd;
+                receipts.extend(c.receipts);
                 reviews.push(ReviewerSlot::Ok {
                     model: c.model,
                     review: parse_review(&c.content),
@@ -3489,6 +3619,7 @@ pub(crate) async fn cmd_review(
         requested,
         ok_models,
         failed_models: failed_count,
+        receipts: &receipts,
     };
 
     let agg = emit_reviews(cli, &aggregate);
@@ -3518,6 +3649,9 @@ A review that no model produced must not be reported as success.",
             "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
         );
     }
+    if failed_count > 0 {
+        anyhow::bail!("review incomplete: {failed_count}/{requested} reviewers failed");
+    }
     // SC1 [CRITICAL]: a blocking aggregate verdict MUST break the process
     // exit code. `cmd_review` used to `Ok(())` unconditionally after
     // emitting the payload, so a `request_changes` / `reject` / `block`
@@ -3542,6 +3676,7 @@ A review that no model produced must not be reported as success.",
 /// instead of leaving the CI to guess whether the synthetic "comment" came
 /// from every reviewer failing or from a real reviewer rating the diff.
 struct ReviewAggregate<'a> {
+    receipts: &'a [serde_json::Value],
     reviewers: &'a [ReviewerSlot],
     cost_usd: f64,
     /// Number of reviewer slots the caller asked for (1 + `--panel` entries).
@@ -3588,7 +3723,7 @@ fn aggregate_review(
         // also sees the failure. The bail() in `cmd_review` remains the
         // authoritative signal: a total-failure review exits nonzero.
         "request_changes"
-    } else if worst_rank >= 1 {
+    } else if failed_models > 0 || worst_rank >= 1 {
         "comment"
     } else {
         "approve"
@@ -3597,7 +3732,7 @@ fn aggregate_review(
 
     let payload = json!({
         "verdict": agg,
-        "complete": !all_failed,
+        "complete": !all_failed && failed_models == 0 && ok_models == requested,
         "requested": requested,
         "ok_models": ok_models,
         "failed_models": failed_models,
@@ -3621,13 +3756,14 @@ fn aggregate_review(
 /// (CI gates, dashboards) can distinguish a real "comment" verdict from a
 /// total-failure no-reviewer-actually-ran episode.
 fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
-    let (agg, all_failed, payload) = aggregate_review(
+    let (agg, all_failed, mut payload) = aggregate_review(
         aggregate.reviewers,
         aggregate.cost_usd,
         aggregate.requested,
         aggregate.ok_models,
         aggregate.failed_models,
     );
+    payload["provenance"] = json!(aggregate.receipts);
 
     if let Some(dir) = active_job_dir() {
         let _ = std::fs::write(
@@ -3930,15 +4066,13 @@ where
 ///   return: `build_diff` is captured AFTER `settled` resolves, so the
 ///   loop never reviews a torn mid-edit tree. In production `settled`
 ///   is the bounded wait inside `cancel_session` itself (it returns
-///   only after the daemon acknowledges the cancel or the settle
-///   budget elapses, which is "settled enough"). In tests `settled`
+///   only after the daemon acknowledges the cancel). In tests `settled`
 ///   is a channel/tokio task the test drives explicitly.
 ///
 /// On timeout the function logs the standard "timed out, killing"
 /// marker, awaits `cancel`, awaits `settled`, and returns `Err`. On
-/// success it forwards the inner result verbatim. Non-timeout errors
-/// from `cancel` / `settled` are swallowed (we're already on the
-/// timeout path and the loop wants to RECOVER, not bubble IO errors).
+/// success it forwards the inner result verbatim. A failed or timed-out
+/// cancellation stops the loop before any diff capture or further edits.
 ///
 /// NON-BREAKING on success: when the inner future completes within
 /// budget, `cancel` and `settled` are never invoked.
@@ -3961,11 +4095,15 @@ where
             if !quiet {
                 eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
             }
-            // Issue the cancel. Best-effort: a failure here means we
-            // couldn't reach the daemon, but the caller's loop still
-            // wants to recover (not bubble IO). The settle wait below
-            // gives the daemon a bounded grace to wind down regardless.
-            let _ = cancel.await;
+            // An acknowledgement is required before reviewing this tree.
+            let cancelled =
+                tokio::time::timeout(std::time::Duration::from_secs(SETTLE_BUDGET_SECS), cancel)
+                    .await
+                    .map_err(|_| anyhow!("cancellation deadline expired"))
+                    .and_then(|r| r);
+            if let Err(error) = cancelled {
+                return Err(format!("author cancellation unconfirmed: {error}; refusing to review a potentially active tree"));
+            }
             // Gate `build_diff` on the daemon having settled (or its
             // settle budget having elapsed). Without this, the loop
             // would race the daemon's last few tool-call writes against
@@ -5018,65 +5156,41 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         let engine_kind = crate::resolve_engine_kind(cli)?;
-        // The cancel future needs the session id to address the right turn on
-        // the daemon. For iterations 2+ (`session == Some(sid)`) we resume the
-        // same session, so the cancel has a known target. For the very first
-        // iteration without `--session`/`--continue`/`--persist-session`,
-        // `session` is `None` — the inner engine mints a new session id we
-        // cannot observe from outside the in-flight future. We still open a
-        // daemon connection and wait for the settle budget; if the daemon
-        // happens to expose the freshly-minted session via a notification
-        // before the budget elapses, the cancel will land; if not, the bounded
-        // wait is the best we can do without invasive plumbing. (The first
-        // iteration is also the one most likely to succeed — a wedged
-        // mid-session is much rarer than a wedged mid-prompt on a resumed
-        // session.) The settle signal is implicit: `cancel_session` itself
-        // awaits `session/update {type: "turn_complete"}` (or the settle
-        // budget) before returning, so `build_diff` is gated on the daemon
-        // having actually wound down.
-        let session_id_for_cancel = session.clone();
+        // Capture the daemon's actual session/new result before prompt
+        // dispatch, including first turns and rejected-resume replacements.
+        // The tracker survives dropping the author future on timeout.
+        let active_session = std::sync::Arc::new(std::sync::Mutex::new(session.clone()));
+        let session_id_for_cancel = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
-            crate::agentic_turn(
-                cli,
-                engine_kind,
-                author_prompt,
-                session.clone(),
-                false,
-                None,
+            zoder_core::engine_rpc::track_session_id(
+                active_session,
+                crate::agentic_turn(
+                    cli,
+                    engine_kind,
+                    author_prompt,
+                    session.clone(),
+                    false,
+                    None,
+                ),
             ),
             async move {
-                // Cancel the daemon turn for `session_id_for_cancel` (best-
-                // effort). If `None`, the daemon may have a freshly-minted
-                // session we can't address from outside — we still wait for
-                // the settle budget so the daemon has a chance to wind down
-                // any in-flight tool calls before we capture the diff.
+                // Require cancellation acknowledgement before diff capture.
                 let socket = crate::engine_socket_path();
+                let session_id_for_cancel = session_id_for_cancel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 if let Some(sid) = session_id_for_cancel.as_deref() {
-                    match zoder_core::cancel_session(
+                    zoder_core::cancel_session(
                         &socket,
                         sid,
                         std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
                     )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            // Best-effort: don't fail the loop on a settle
-                            // error, but DO emit a warning so operators can
-                            // see when the daemon failed to acknowledge a
-                            // cancel — that often means the daemon crashed
-                            // mid-edit and the diff we'd capture next is a
-                            // torn tree.
-                            if !cli.quiet {
-                                eprintln!("[loop] cancel_session for {sid} did not settle: {e}");
-                            }
-                        }
-                    }
+                    .await?;
                 } else {
-                    // No known session id — best-effort settle wait.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    anyhow::bail!("no session id available for cancellation");
                 }
                 Ok::<(), anyhow::Error>(())
             },
@@ -5113,6 +5227,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 Some(t)
             }
             Err(msg) => {
+                if msg.starts_with("author cancellation unconfirmed:") {
+                    anyhow::bail!("{msg}");
+                }
                 let timed_out = msg.contains("timed out") || msg.contains("timeout");
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: author turn did not finish: {msg}");
@@ -5514,6 +5631,16 @@ or comment.\n"
             }),
         )
         .await;
+
+        // Formatting/provider failures have already exhausted the bounded
+        // reviewer retry. They are not author defects; another edit/review
+        // round cannot repair them. Preserve the iteration and stop unresolved.
+        if review.verdict == REVIEWER_UNAVAILABLE_VERDICT || review_unlocated_no_evidence {
+            if !cli.quiet {
+                eprintln!("[loop] reviewer produced no actionable verdict after retry; stopping unresolved");
+            }
+            break;
+        }
 
         // 6. Decide: review gate AND objective gate AND anti-gaming substance gate.
         //    `review_ok` is now AUTHORITATIVE on the explicit verdict — see
@@ -6547,10 +6674,10 @@ mod tests {
             diff.push_str(&format!("@@ -{n},1 +{n},1 @@\n"));
             diff.push_str(&format!("+changed_{n}_{}\n", "x".repeat(350)));
         }
-        let chunks = review_diff_chunks(&diff).unwrap();
+        let chunks = crate::review_diff::review_diff_chunks(&diff, 9_000, true, 64).unwrap();
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= REVIEW_CHUNK_BYTES);
+            assert!(chunk.len() <= 9_000);
             assert!(chunk.starts_with(header));
         }
         for n in 0..32 {
@@ -6566,15 +6693,27 @@ mod tests {
     }
 
     #[test]
-    fn review_chunks_reject_oversized_single_hunk() {
+    fn review_chunks_split_oversized_hunk_when_enabled() {
+        let body: String = (0..1200).map(|i| format!("+line_{i}\n")).collect();
+        let diff = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n{body}");
+        let chunks = crate::review_diff::review_diff_chunks(&diff, 9_000, true, 64).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 9_000));
+        assert!(chunks.join("").contains("part 1/"));
+    }
+
+    #[test]
+    fn review_chunks_reject_oversized_hunk_when_splitting_disabled() {
         let diff = format!(
             "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+{}\n",
-            "x".repeat(REVIEW_CHUNK_BYTES)
+            "x".repeat(9_000)
         );
-        assert!(review_diff_chunks(&diff)
-            .unwrap_err()
-            .to_string()
-            .contains("one diff hunk"));
+        assert!(
+            crate::review_diff::review_diff_chunks(&diff, 9_000, false, 64)
+                .unwrap_err()
+                .to_string()
+                .contains("--max-hunk-bytes")
+        );
     }
 
     #[test]
@@ -8100,6 +8239,37 @@ must reap the direct shell on the timeout branch)"
         );
     }
 
+    #[tokio::test]
+    async fn failed_cancellation_never_reaches_settled_or_review() {
+        let result = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { anyhow::bail!("daemon did not acknowledge cancellation") },
+            async { panic!("must not proceed after unconfirmed cancellation") },
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .starts_with("author cancellation unconfirmed:"));
+    }
+
+    #[test]
+    fn strict_verdict_rejects_fragments_prose_and_contradictions() {
+        for raw in [
+            r#"{"verdict":"approve"}"#,
+            r#"Example: {"verdict":"approve","summary":"OK","findings":[],"next_steps":[]}"#,
+            r#"{"verdict":"approve","summary":"OK","findings":[{}],"next_steps":[]}"#,
+            r#"{"verdict":"approve","summary":"OK","findings":[{"severity":"high","title":"Crash","body":"Null dereference"}],"next_steps":[]}"#,
+        ] {
+            assert!(strict_review(raw).is_none(), "accepted {raw}");
+        }
+        assert!(strict_review(
+            r#"{"verdict":"approve","summary":"Sound change.","findings":[],"next_steps":[]}"#
+        )
+        .is_some());
+    }
+
     /// Z-8 REGRESSION GUARD (diff-capture ordering): `build_diff` in
     /// `cmd_loop` is called AFTER `author_phase_with_cancel` returns,
     /// and on the timeout path the watchdog must not return UNTIL the
@@ -9028,10 +9198,10 @@ not run to max_iters"
         let (agg, all_failed, payload) = aggregate_review(&reviews, 0.01, 2, 1, 1);
         assert!(!all_failed, "one successful reviewer -> not all-failed");
         assert_eq!(
-            agg, "approve",
-            "the 'error' record must NOT lift the aggregate out of approve"
+            agg, "comment",
+            "an incomplete panel must not advertise aggregate approval"
         );
-        assert_eq!(payload["complete"].as_bool(), Some(true));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
         assert_eq!(payload["requested"].as_u64(), Some(2));
         assert_eq!(payload["ok_models"].as_u64(), Some(1));
         assert_eq!(payload["failed_models"].as_u64(), Some(1));
@@ -9094,8 +9264,8 @@ not run to max_iters"
         let mixed = vec![ok_slot("real-approver", "approve"), failed_slot("timeout")];
         let (agg2, _, payload2) = aggregate_review(&mixed, 0.0, 2, 1, 1);
         assert_eq!(
-            agg2, "approve",
-            "a Failed slot casts no vote -> aggregate stays approve"
+            agg2, "comment",
+            "a failed slot does not approve the incomplete panel"
         );
         assert_eq!(payload2["ok_models"].as_u64(), Some(1));
         assert_eq!(payload2["failed_models"].as_u64(), Some(1));
@@ -11346,6 +11516,72 @@ mod reviewer_chain_dispatch_tests {
             0,
             "tail should not be tried for a single transient 503: paths={paths:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunk_json_retry_is_bounded_and_never_accepts_schema_echo() {
+        for repaired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let _guard = HomeGuard::new(dir.path());
+            let server = MockServer::start().await;
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            Mock::given(method("POST"))
+                .and(path("/working/v1/chat/completions"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let answer = if repaired && n == 1 {
+                        r#"{"verdict":"approve","summary":"No defects in the supplied diff.","findings":[],"next_steps":[]}"#
+                    } else { r#"Example schema: {"verdict":"approve"}"# };
+                    ResponseTemplate::new(200).set_body_json(json!({"choices":[{"message":{"content":answer},"finish_reason":"stop"}]}))
+                }).mount(&server).await;
+            write_corpus(dir.path(), &["working-model/glm-5.1"]);
+            write_config(dir.path(), &server.uri(), "working-model/glm-5.1");
+            let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+            let result = complete_review_chunks(
+                &cli,
+                Some("working-model/glm-5.1"),
+                &[],
+                REVIEW_SYSTEM,
+                &["diff".into()],
+                2048,
+            )
+            .await;
+            assert_eq!(result.is_ok(), repaired, "{result:?}");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            if let Ok(c) = result {
+                assert_eq!(strict_review(&c.content).unwrap().verdict, "approve");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_rejects_reported_model_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model":"unexpected-model", "choices":[{"message":{"content":"approve"},"finish_reason":"stop"}]
+            }))).mount(&server).await;
+        write_corpus(dir.path(), &["working-model/glm-5.1"]);
+        write_config(dir.path(), &server.uri(), "working-model/glm-5.1");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let result = complete_once(
+            &cli,
+            Some("working-model/glm-5.1"),
+            &[],
+            REVIEW_SYSTEM,
+            "diff",
+            2048,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("provenance mismatch"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
