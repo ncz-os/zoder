@@ -50,8 +50,21 @@ fn ttl_secs() -> i64 {
         .unwrap_or(DEFAULT_TTL_SECS)
 }
 
+/// Test-only probe bound override (milliseconds; 0 = unset), so tests do not
+/// mutate the process environment from a multi-threaded runtime.
+#[cfg(test)]
+pub(crate) static PROBE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Health-probe bound (`ZODER_EIH_PROBE_TIMEOUT_MS`, default 5000).
 fn probe_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = PROBE_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
     Duration::from_millis(
         std::env::var("ZODER_EIH_PROBE_TIMEOUT_MS")
             .ok()
