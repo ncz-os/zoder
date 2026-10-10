@@ -68,6 +68,18 @@ const COMPACT_MIN_BYTES: u64 = 4 * 1024 * 1024;
 /// marker and never block.
 const LEGACY_INFLIGHT_GRACE_S: i64 = 3600;
 
+/// An armed reservation row older than this can no longer be reconciled by
+/// its owner (every dispatch is bounded far below it), so compaction may trim
+/// it to its JSON. It stays in the ledger as unknown-cost spend: trimming
+/// only drops the slot padding that let the owner write its final entry.
+const STALE_RESERVATION_TRIM_S: i64 = 6 * 3600;
+
+fn is_stale_armed_reservation(entry: &Entry, now: DateTime<Utc>) -> bool {
+    entry.provider == RESERVATION_PROVIDER
+        && entry.model == ARMED_RESERVATION_MODEL
+        && (now - entry.ts_utc).num_seconds() >= STALE_RESERVATION_TRIM_S
+}
+
 /// What the recovery scan learned about compaction.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanStats {
@@ -679,9 +691,12 @@ impl Ledger {
                 {
                     legacy_inflight = true;
                 }
-                if !is_reservation {
-                    // Finished or blank slot: everything past the payload
-                    // and its newline is compactable padding.
+                let stale_armed = parsed
+                    .as_ref()
+                    .is_some_and(|entry| is_stale_armed_reservation(entry, now));
+                if !is_reservation || stale_armed {
+                    // Finished, blank or stale-armed slot: everything past
+                    // the payload and its newline is compactable padding.
                     waste = waste.saturating_add(
                         u64::try_from(bytes.saturating_sub(payload.len() + 1)).unwrap_or(0),
                     );
@@ -751,6 +766,7 @@ impl Ledger {
     /// them. The new file replaces the old one by an atomic rename. Returns
     /// true when the file was replaced (the caller must reopen it).
     fn compact_if_wasteful(&self, file: &mut File, stats: ScanStats) -> anyhow::Result<bool> {
+        let now = Utc::now();
         let len = file.metadata()?.len();
         if len < COMPACT_MIN_BYTES || stats.waste.saturating_mul(2) <= len || stats.legacy_inflight
         {
@@ -796,11 +812,15 @@ impl Ledger {
                     continue;
                 }
                 match serde_json::from_slice::<Entry>(payload) {
-                    Ok(entry) if entry.provider != RESERVATION_PROVIDER => {
+                    Ok(entry)
+                        if entry.provider != RESERVATION_PROVIDER
+                            || is_stale_armed_reservation(&entry, now) =>
+                    {
                         out.write_all(payload)?;
                         out.write_all(b"\n")?;
                     }
-                    // Reservation rows and anything unparseable: unchanged.
+                    // Live reservation rows and anything unparseable:
+                    // unchanged.
                     _ => {
                         out.write_all(&line)?;
                         if line.last() != Some(&b'\n') {
@@ -1747,6 +1767,73 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.cost_unknown));
+    }
+
+    /// Measured on ACHILLES: 4,337 of 7,746 rows were stale armed
+    /// reservations (failed/abandoned calls, days old) kept at 64 KiB each,
+    /// so compaction never reached its threshold. Stale armed rows are
+    /// trimmed (still unknown-cost spend); fresh ones keep their slot.
+    #[test]
+    fn stale_armed_reservations_are_trimmed_but_kept_as_unknown_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let armed_row = |ts: DateTime<Utc>, n: u128, slot: usize| {
+            let row = Entry {
+                ts_utc: ts,
+                provider: RESERVATION_PROVIDER.into(),
+                model: ARMED_RESERVATION_MODEL.into(),
+                host: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                cost_unknown: true,
+                calls: 1,
+                violation: Some(format!(
+                    "billable call reserved but not reconciled (zoder-reservation-{n:032x})"
+                )),
+                tags: FinOpsTags::default(),
+            };
+            let json = serde_json::to_vec(&row).unwrap();
+            let mut line = vec![b' '; slot];
+            line[..json.len()].copy_from_slice(&json);
+            line[slot - 1] = b'\n';
+            line
+        };
+        let old = Utc::now() - chrono::Duration::hours(7);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for n in 0..70 {
+            f.write_all(&armed_row(old, n, LEGACY_RESERVATION_BYTES))
+                .unwrap();
+        }
+        // A fresh armed row (this build, mid-dispatch) must keep its slot.
+        f.write_all(&armed_row(Utc::now(), 999, BILLABLE_RESERVATION_BYTES))
+            .unwrap();
+        drop(f);
+        let ledger = Ledger::new(&path);
+        let before = ledger.entries_strict().unwrap();
+        assert_eq!(before.iter().filter(|e| e.cost_unknown).count(), 71);
+        ledger
+            .record(&entry("2026-07-02 10:00:00", "x", 0.5, 1, 1, 1))
+            .unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len < 70 * 400 + 2 * BILLABLE_RESERVATION_BYTES as u64,
+            "{len}"
+        );
+        let after = ledger.entries_strict().unwrap();
+        assert_eq!(
+            after.iter().filter(|e| e.cost_unknown).count(),
+            71,
+            "spend kept"
+        );
+        let fresh = format!("zoder-reservation-{:032x}", 999_u128);
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(
+            find_reservation_slot(&mut file, BILLABLE_RESERVATION_BYTES, &fresh)
+                .unwrap()
+                .is_some(),
+            "fresh reservation keeps a full slot"
+        );
     }
 
     /// A prepared (unarmed) reservation moved by compaction is still cancelled
