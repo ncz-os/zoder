@@ -96,6 +96,8 @@ mod reliability_deadline_tests {
 
     const DELTA: &str =
         "data: {\"model\":\"model\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+    const REASONING_DELTA: &str =
+        "data: {\"model\":\"model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n";
     const DONE: &str = "data: [DONE]\n\n";
 
     #[tokio::test]
@@ -145,6 +147,26 @@ mod reliability_deadline_tests {
         assert_eq!(error.kind, ErrKind::Timeout);
         assert!(error.message.contains("stream stalled"));
         assert!(error.emitted);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_stream_still_has_idle_stall_guard() {
+        // A reasoning model that emits only `reasoning_content` (never answer
+        // content) and then goes silent must trip the *idle* guard, not ride
+        // the much longer overall request budget. `first` is a reasoning-only
+        // delta; the terminal frame is delayed far past the idle budget while
+        // the overall budget stays generous.
+        let (uri, task) = delayed_server(0, 1000, REASONING_DELTA, DONE).await;
+        let (p, request) = fixture(&uri, 5000, 100);
+        let mut sink = Vec::new();
+        let error = p.stream_chat(&request, Some(&mut sink)).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Timeout);
+        assert!(error.message.contains("stream stalled"));
+        // No answer bytes reached the sink: the stall fired on reasoning alone.
+        assert!(!error.emitted);
+        assert!(sink.is_empty());
         task.abort();
         let _ = task.await;
     }
@@ -1906,6 +1928,18 @@ impl OpenAiProvider {
         // function, with `emitted` unchanged so the caller knows nothing
         // was written to the sink.
         let mut saw_content = false;
+        // True once the model has emitted *any* non-empty generation delta —
+        // answer text OR private reasoning. A reasoning model can spend its
+        // whole stream emitting `reasoning_content` (dropped from `content`
+        // unless `show_reasoning`) before it ever produces answer text; the
+        // idle guard must arm on that first reasoning delta, otherwise a
+        // provider that thinks for a while and then silently hangs is only
+        // bounded by the much longer overall request budget instead of the
+        // idle budget (the reported "no idle-stall guard while only reasoning
+        // tokens stream" gap). Distinct from `saw_content`, which keeps its
+        // Z-9 terminal meaning (a non-empty *answer* delta is required for
+        // success).
+        let mut saw_generation = false;
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -1919,8 +1953,9 @@ impl OpenAiProvider {
                 ));
             }
             // Prompt prefill/queue latency is covered by the overall request
-            // budget. The idle guard applies once answer generation begins.
-            let step = if saw_content {
+            // budget. The idle guard applies once generation begins — which
+            // includes a stream that has so far emitted only reasoning.
+            let step = if saw_generation {
                 self.idle_timeout.min(remaining)
             } else {
                 remaining
@@ -2067,10 +2102,24 @@ impl OpenAiProvider {
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     saw_choice = true;
+                    let StreamChoice { delta, .. } = choice;
+                    // Arm the idle guard on the first non-empty delta of any
+                    // kind — answer content or reasoning. See
+                    // `saw_generation`; this is what closes the
+                    // reasoning-only stall gap.
+                    if delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                        || delta
+                            .reasoning_content
+                            .as_deref()
+                            .is_some_and(|s| !s.is_empty())
+                        || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
+                    {
+                        saw_generation = true;
+                    }
                     let piece = pick_text(
-                        choice.delta.content,
-                        choice.delta.reasoning_content,
-                        choice.delta.reasoning,
+                        delta.content,
+                        delta.reasoning_content,
+                        delta.reasoning,
                         req.show_reasoning,
                     );
                     if !piece.is_empty() {
