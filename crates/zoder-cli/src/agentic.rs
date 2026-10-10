@@ -3541,6 +3541,11 @@ fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usi
     merged.next_steps.extend(review.next_steps);
 }
 
+/// Re-plans review chunks for a fallback reviewer: returns that reviewer's
+/// chunk prompts and output budget, or `None` to keep the current chunks.
+type ReplanFn<'a> = dyn Fn(&str) -> Option<(Vec<String>, u32)> + 'a;
+
+#[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
     model_override: Option<&str>,
@@ -3548,7 +3553,16 @@ async fn complete_review_chunks(
     system: &str,
     users: &[String],
     max_tokens: u32,
+    planned_model: Option<String>,
+    replan: &ReplanFn<'_>,
 ) -> anyhow::Result<Completion> {
+    // Chunks are sized for `planned_model`. When the first chunk is served by
+    // a different model (the chain fell back), the remaining review must be
+    // sized for THAT model; mixing models across chunks is refused below, so
+    // the switch can only happen on the first chunk and happens at most once.
+    let mut users: Vec<String> = users.to_vec();
+    let mut max_tokens = max_tokens;
+    let mut replanned = false;
     let mut selected_model: Option<String> = None;
     let mut cost_usd = 0.0;
     let mut receipts = Vec::new();
@@ -3556,13 +3570,14 @@ async fn complete_review_chunks(
         verdict: "approve".into(),
         ..ReviewOutput::default()
     };
-    for (idx, user) in users.iter().enumerate() {
+    let mut idx = 0usize;
+    while idx < users.len() {
         let user = format!(
             "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
 Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
 is not evidence of a defect. Report only defects established by the supplied code; do not \
 invent missing integration or compiler failures from omitted context.\n\n{}",
-            idx + 1, users.len(), user
+            idx + 1, users.len(), users[idx]
         );
         let mut completion = complete_once(
             cli,
@@ -3576,6 +3591,30 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
         cost_usd += completion.cost_usd;
         receipts.extend(completion.receipts.clone());
+        if idx == 0 && !replanned && selected_model.is_none() {
+            if let Some(planned) = planned_model.as_deref() {
+                if completion.model != planned {
+                    if let Some((new_users, new_tokens)) = replan(&completion.model) {
+                        if new_users != users || new_tokens != max_tokens {
+                            if !cli.quiet {
+                                eprintln!(
+                                    "[zoder] reviewer {} served the first chunk instead of {planned}; \
+                                     re-planning chunks for it ({} -> {} chunk(s))",
+                                    completion.model,
+                                    users.len(),
+                                    new_users.len()
+                                );
+                            }
+                            users = new_users;
+                            max_tokens = new_tokens;
+                            replanned = true;
+                            selected_model = Some(completion.model);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         let review = match strict_review(&completion.content) {
             Some(review) => review,
             None => {
@@ -3613,6 +3652,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
             selected_model = Some(completion.model);
         }
         append_chunk_review(&mut merged, review, idx, users.len());
+        idx += 1;
     }
     Ok(Completion {
         model: selected_model.ok_or_else(|| anyhow!("no review chunks were generated"))?,
@@ -3620,6 +3660,80 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         cost_usd,
         receipts,
     })
+}
+
+/// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
+#[derive(Clone)]
+struct ReviewPlan {
+    caps: crate::review_diff::ReviewCaps,
+    prepared: crate::review_diff::PreparedDiff,
+    users: Vec<String>,
+}
+
+/// Build the per-chunk reviewer prompts for a prepared diff.
+fn build_review_users(
+    label: &str,
+    focus_txt: &str,
+    prepared: &crate::review_diff::PreparedDiff,
+) -> Vec<String> {
+    let chunk_count = prepared.chunks.len();
+    prepared
+        .chunks
+        .iter()
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let portion = if chunk_count == 1 {
+                format!("{label} diff")
+            } else {
+                format!("{label} diff, chunk {}/{}", idx + 1, chunk_count)
+            };
+            let focus = if focus_txt.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" Focus especially on: {focus_txt}.")
+            };
+            // A multi-chunk review gets the cross-chunk map prepended so a
+            // symbol defined in another chunk is never reported as missing.
+            let map = prepared.diff_map.as_ref().map_or(String::new(), |map| {
+                format!(
+                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; \
+the chunk under review is {}/{}). Before reporting a symbol as undefined, \
+redefined, or recursively calling a missing function, check it against this map:\n{}",
+                    idx + 1,
+                    chunk_count,
+                    map
+                )
+            });
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
+        })
+        .collect()
+}
+
+/// `--dry-run`: one line per reviewer slot with the chunk plan it would use.
+fn print_chunk_plans(slots: &[(String, &ReviewPlan, u32)]) {
+    println!("[zoder] chunk plan per reviewer:");
+    for (who, plan, tokens) in slots {
+        let sizes: Vec<String> = plan
+            .prepared
+            .chunks
+            .iter()
+            .map(|c| c.len().to_string())
+            .collect();
+        println!(
+            "[zoder]   {who}: {} chunk(s) [{}] max-hunk-bytes={} max-diff-bytes={} max-chunks={} max-tokens={} ({})",
+            plan.prepared.chunks.len(),
+            sizes.join(", "),
+            plan.caps.max_hunk_bytes,
+            plan.caps.max_diff_bytes,
+            plan.caps.max_chunks,
+            tokens,
+            if plan.caps.from_route {
+                "route default"
+            } else {
+                "general default"
+            }
+        );
+    }
 }
 
 /// Print exactly what `review` would send, without calling any model. Used by
@@ -3778,30 +3892,17 @@ pub(crate) async fn cmd_review(
     let reviewer_for_caps: Option<String> = cli
         .model
         .clone()
-        .or_else(|| eng.as_ref().and_then(|e| e.cfg.reviewer_model.clone()))
+        // `reviewer_model` is a comma-separated chain; size for its head.
+        .or_else(|| {
+            eng.as_ref().and_then(|e| {
+                e.cfg
+                    .reviewer_models_for(cli.agent.as_deref())
+                    .into_iter()
+                    .next()
+            })
+        })
         .or_else(|| reviewer_chain.first().cloned());
 
-    let empty_route_defaults = std::collections::BTreeMap::new();
-    let route_defaults = review_cfg
-        .as_ref()
-        .map(|r| &r.route_defaults)
-        .unwrap_or(&empty_route_defaults);
-    let route_entry = reviewer_for_caps
-        .as_deref()
-        .and_then(|m| crate::review_diff::route_default_for(route_defaults, m));
-
-    let max_diff_bytes = crate::review_diff::resolve_limit_for_route(
-        opts.max_diff_bytes,
-        route_entry.and_then(|d| d.max_diff_bytes),
-        review_cfg.as_ref().and_then(|r| r.max_diff_bytes),
-        crate::review_diff::DEFAULT_MAX_DIFF_BYTES,
-    );
-    let max_hunk_bytes = crate::review_diff::resolve_limit_for_route(
-        opts.max_hunk_bytes,
-        route_entry.and_then(|d| d.max_hunk_bytes),
-        review_cfg.as_ref().and_then(|r| r.max_hunk_bytes),
-        crate::review_diff::DEFAULT_MAX_HUNK_BYTES,
-    );
     let config_excludes = review_cfg
         .as_ref()
         .map(|r| r.exclude.clone())
@@ -3811,60 +3912,99 @@ pub(crate) async fn cmd_review(
     // under review cannot exempt itself; only working-tree scope reads the
     // working tree, where uncommitted edits are legitimately in scope.
     let zoderignore = review_zoderignore_patterns(&cwd, &root, scope, base.as_deref());
-    let prepared = crate::review_diff::prepare_review_diff(
-        &zoderignore,
-        &diff,
-        &opts.excludes,
-        &config_excludes,
-        max_diff_bytes,
-        max_hunk_bytes,
-        opts.split_hunks,
-    )?;
-    if !prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
-        eprintln!("[zoder] {}", prepared.excluded.render());
+    let focus_txt = focus.join(" ");
+
+    // Per-reviewer sizing: every reviewer slot gets chunks sized for ITS
+    // model (`[review.route_defaults.<model>]`), so a panel may chunk
+    // differently per member. Agent aliases resolve to their configured model
+    // before the lookup.
+    let sizing_model = |m: &str| -> String {
+        eng.as_ref()
+            .and_then(|e| crate::configured_model_for_agent(e, Some(m)))
+            .unwrap_or_else(|| m.to_string())
+    };
+    let caps_for = |model: Option<&str>| {
+        let resolved = model.map(&sizing_model);
+        crate::review_diff::resolve_review_caps(
+            opts.max_hunk_bytes,
+            opts.max_diff_bytes,
+            review_cfg.as_ref(),
+            resolved.as_deref(),
+        )
+    };
+    let build_plan = |caps: crate::review_diff::ReviewCaps| -> anyhow::Result<ReviewPlan> {
+        let prepared = crate::review_diff::prepare_review_diff_with_chunks(
+            &zoderignore,
+            &diff,
+            &opts.excludes,
+            &config_excludes,
+            caps.max_diff_bytes,
+            caps.max_hunk_bytes,
+            caps.max_chunks,
+            opts.split_hunks,
+        )?;
+        let users = build_review_users(&label, &focus_txt, &prepared);
+        Ok(ReviewPlan {
+            caps,
+            prepared,
+            users,
+        })
+    };
+    let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
+    let tokens_for = |caps: &crate::review_diff::ReviewCaps| {
+        caps.max_tokens_floor.map_or(base_tokens, |floor| {
+            base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
+        })
+    };
+
+    let head_caps = caps_for(reviewer_for_caps.as_deref());
+    let head_plan = build_plan(head_caps)?;
+    if !head_plan.prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
+        eprintln!("[zoder] {}", head_plan.prepared.excluded.render());
     }
 
-    let focus_txt = focus.join(" ");
-    let chunk_count = prepared.chunks.len();
-    let users: Vec<String> = prepared
-        .chunks
-        .iter()
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let portion = if chunk_count == 1 {
-                format!("{label} diff")
-            } else {
-                format!("{label} diff, chunk {}/{}", idx + 1, chunk_count)
-            };
-            let focus = if focus_txt.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" Focus especially on: {focus_txt}.")
-            };
-            // A multi-chunk review gets the cross-chunk map prepended so a
-            // symbol defined in another chunk is never reported as missing.
-            let map = prepared.diff_map.as_ref().map_or(String::new(), |map| {
-                format!(
-                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; \
-the chunk under review is {}/{}). Before reporting a symbol as undefined, \
-redefined, or recursively calling a missing function, check it against this map:\n{}",
-                    idx + 1,
-                    chunk_count,
-                    map
-                )
-            });
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
-        })
-        .collect();
+    // Standalone review has no author turn: `-m` pins its primary reviewer.
+    // Without it, use the configured reviewer/scenario route. Additional
+    // `--panel` entries remain independent reviewer slots.
+    let models = review_roster(cli.model.as_deref(), panel.as_deref());
+    let mut plans: Vec<ReviewPlan> = vec![head_plan.clone()];
+    let mut slot_plan_idx: Vec<usize> = Vec::with_capacity(models.len());
+    for m in &models {
+        let caps = match m.as_deref() {
+            None => head_caps,
+            Some(m) => caps_for(Some(m)),
+        };
+        let idx = match plans.iter().position(|p| p.caps == caps) {
+            Some(i) => i,
+            None => {
+                plans.push(build_plan(caps)?);
+                plans.len() - 1
+            }
+        };
+        slot_plan_idx.push(idx);
+    }
+    let prepared = &head_plan.prepared;
     if opts.dry_run {
         print_review_dry_run(
             &label,
             &diff,
-            &prepared,
-            &users,
-            max_diff_bytes,
-            max_hunk_bytes,
+            prepared,
+            &head_plan.users,
+            head_caps.max_diff_bytes,
+            head_caps.max_hunk_bytes,
         );
+        let slots: Vec<(String, &ReviewPlan, u32)> = models
+            .iter()
+            .zip(&slot_plan_idx)
+            .map(|(m, &i)| {
+                let who = m
+                    .clone()
+                    .or_else(|| reviewer_for_caps.clone())
+                    .unwrap_or_else(|| "(default reviewer)".into());
+                (who, &plans[i], tokens_for(&plans[i].caps))
+            })
+            .collect();
+        print_chunk_plans(&slots);
         return Ok(());
     }
 
@@ -3900,11 +4040,6 @@ redefined, or recursively calling a missing function, check it against this map:
         );
     }
 
-    // Standalone review has no author turn: `-m` pins its primary reviewer.
-    // Without it, use the configured reviewer/scenario route. Additional
-    // `--panel` entries remain independent reviewer slots.
-    let models = review_roster(cli.model.as_deref(), panel.as_deref());
-
     // Scenario-routed reviewer chain: resolved once above (before chunking, so
     // per-route caps could use it) and reused here. It is passed to every
     // `complete_once` call so the default reviewer (the "head" of the roster,
@@ -3918,15 +4053,33 @@ redefined, or recursively calling a missing function, check it against this map:
 
     // Fan out concurrently on this task (no spawn: the completion future borrows
     // a non-Send sink type, so we poll them together via join_all instead).
-    let max_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
-    let futs = models.iter().map(|m| {
+    let replan = |model: &str| -> Option<(Vec<String>, u32)> {
+        let caps = caps_for(Some(model));
+        match build_plan(caps) {
+            Ok(plan) => Some((plan.users, tokens_for(&caps))),
+            Err(e) => {
+                if !cli.quiet {
+                    eprintln!(
+                        "[zoder] could not re-plan chunks for fallback reviewer {model}: {e:#}; \
+                         keeping the current chunks"
+                    );
+                }
+                None
+            }
+        }
+    };
+    let futs = models.iter().zip(&slot_plan_idx).map(|(m, &i)| {
+        let plan = &plans[i];
+        let planned = m.clone().or_else(|| reviewer_for_caps.clone());
         complete_review_chunks(
             cli,
             m.as_deref(),
             &reviewer_chain,
             system,
-            &users,
-            max_tokens,
+            &plan.users,
+            tokens_for(&plan.caps),
+            planned,
+            &replan,
         )
     });
     let results = futures_util::future::join_all(futs).await;
@@ -12135,6 +12288,70 @@ mod reviewer_chain_dispatch_tests {
         );
     }
 
+    /// Per-route chunking: when the first chunk is served by a different
+    /// model than the plan was sized for, the review re-plans for the serving
+    /// model (once) and reviews every one of ITS chunks with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_on_first_chunk_replans_chunks_for_the_serving_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({"choices":[{"message":{"content":
+                    r#"{"verdict":"approve","summary":"No defects in the supplied diff.","findings":[],"next_steps":[]}"#
+                },"finish_reason":"stop"}]}))
+            })
+            .mount(&server)
+            .await;
+        write_corpus(dir.path(), &["working-model/glm-5.1"]);
+        write_config(dir.path(), &server.uri(), "working-model/glm-5.1");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let replans = AtomicUsize::new(0);
+        let replan = |model: &str| -> Option<(Vec<String>, u32)> {
+            assert_eq!(model, "working-model/glm-5.1");
+            replans.fetch_add(1, Ordering::SeqCst);
+            Some((vec!["part a".into(), "part b".into()], 4096))
+        };
+        let result = complete_review_chunks(
+            &cli,
+            Some("working-model/glm-5.1"),
+            &[],
+            REVIEW_SYSTEM,
+            &["one big chunk sized for another reviewer".into()],
+            2048,
+            Some("planned-model/large-chunks".into()),
+            &replan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.model, "working-model/glm-5.1");
+        assert_eq!(replans.load(Ordering::SeqCst), 1, "re-plans exactly once");
+        // 1 call for the original first chunk + 2 for the re-planned chunks.
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        // No re-plan when the planned model served the chunk.
+        hits.store(0, Ordering::SeqCst);
+        let result = complete_review_chunks(
+            &cli,
+            Some("working-model/glm-5.1"),
+            &[],
+            REVIEW_SYSTEM,
+            &["x".into(), "y".into()],
+            2048,
+            Some("working-model/glm-5.1".into()),
+            &|_| panic!("must not re-plan when the planned reviewer served"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.model, "working-model/glm-5.1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chunk_json_retry_is_bounded_and_never_accepts_schema_echo() {
         for repaired in [false, true] {
@@ -12162,6 +12379,8 @@ mod reviewer_chain_dispatch_tests {
                 REVIEW_SYSTEM,
                 &["diff".into()],
                 2048,
+                None,
+                &|_| None,
             )
             .await;
             assert_eq!(result.is_ok(), repaired, "{result:?}");
