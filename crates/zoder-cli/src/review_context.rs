@@ -208,21 +208,86 @@ fn params_of(def_line: &str) -> Vec<String> {
 /// definition at a smaller indentation than the hunk's first line.
 fn enclosing_def(lines: &[&str], at: usize) -> Option<usize> {
     let idx = at.saturating_sub(1).min(lines.len().saturating_sub(1));
+    // Indentation of the hunk's code: the first non-blank line at or after
+    // the hunk start that is not just a closing bracket.
     let target_indent = lines
-        .get(idx)
-        .map(|l| {
-            if l.trim().is_empty() {
-                usize::MAX
-            } else {
-                indent_of(l)
-            }
+        .iter()
+        .skip(idx)
+        .take(8)
+        .find(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with(['}', ')', ']'])
         })
+        .map(|l| indent_of(l))
         .unwrap_or(usize::MAX);
     let floor = idx.saturating_sub(MAX_SCOPE_LOOKBACK);
     (floor..idx).rev().find(|&i| {
         let l = lines[i];
-        !l.trim().is_empty() && indent_of(l) < target_indent && !extract_defs(l).is_empty()
+        !l.trim().is_empty() && indent_of(l) < target_indent && is_def_line(l)
     })
+}
+
+/// A line that opens a definition scope: a keyword definition (`fn`, `def`,
+/// `class`, `impl`, ...) after optional qualifiers, or a C-style function
+/// signature at column 0. Deliberately stricter than the diff map's
+/// extractor, which also matches calls such as `return Ok(())`.
+fn is_def_line(line: &str) -> bool {
+    let mut t = line.trim_start();
+    if t.starts_with(['/', '*', '#', '"', '\'', '}']) {
+        return false;
+    }
+    loop {
+        let before = t;
+        for q in [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "async ",
+            "unsafe ",
+            "const ",
+            "extern \"C\" ",
+            "export ",
+            "static ",
+            "inline ",
+            "default ",
+        ] {
+            if let Some(rest) = t.strip_prefix(q) {
+                t = rest;
+            }
+        }
+        if t == before {
+            break;
+        }
+    }
+    let keyword = [
+        "fn ",
+        "def ",
+        "class ",
+        "impl ",
+        "impl<",
+        "trait ",
+        "mod ",
+        "function ",
+        "func ",
+        "struct ",
+        "enum ",
+        "interface ",
+        "sub ",
+    ]
+    .iter()
+    .any(|k| t.starts_with(k));
+    if keyword {
+        return true;
+    }
+    // C/C++: `int name(args)` / `static void *name(` at column 0, not a
+    // statement.
+    indent_of(line) == 0
+        && line.contains('(')
+        && !line.trim_end().ends_with(';')
+        && crate::review_diff::extract_defs(line)
+            .first()
+            .is_some_and(|name| !name.is_empty())
+        && !line.trim_start().starts_with("return")
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -235,43 +300,36 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Context lines for one file of a chunk.
-fn file_context(path: &str, text: &str, hunk_starts: &[usize]) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
+/// Source files the header is built for; prose and data files are skipped.
+fn is_code_path(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    !matches!(
+        ext.as_deref(),
+        Some(
+            "md" | "txt"
+                | "rst"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "lock"
+                | "csv"
+                | "tsv"
+                | "svg"
+                | "html"
+                | "xml"
+                | "patch"
+                | "diff"
+        )
+    )
+}
 
-    let imports: Vec<String> = lines
-        .iter()
-        .map(|l| l.trim())
-        .filter(|t| is_import(t))
-        .take(MAX_IMPORTS_PER_FILE)
-        .map(|t| clip(t, 80))
-        .collect();
-    let mut defs: Vec<String> = Vec::new();
-    for l in &lines {
-        if indent_of(l) > 4 {
-            continue;
-        }
-        for name in extract_defs(l).into_iter().chain(const_name(l)) {
-            if !defs.contains(&name) {
-                defs.push(name);
-            }
-        }
-        if defs.len() >= MAX_DEFS_PER_FILE {
-            break;
-        }
-    }
-    if !imports.is_empty() {
-        out.push(format!("- {path}: imports: {}", imports.join("; ")));
-    }
-    if !defs.is_empty() {
-        out.push(format!(
-            "- {path}: top-level definitions/constants: {}",
-            defs.join(", ")
-        ));
-    }
+/// Per-hunk scope lines for one file: enclosing definition plus the names
+/// bound earlier in it.
+fn hunk_scopes(path: &str, lines: &[&str], hunk_starts: &[usize]) -> Vec<String> {
+    let mut out = Vec::new();
     for &start in hunk_starts {
-        let Some(def_idx) = enclosing_def(&lines, start) else {
+        let Some(def_idx) = enclosing_def(lines, start) else {
             continue;
         };
         let mut names: Vec<String> = Vec::new();
@@ -309,6 +367,43 @@ fn file_context(path: &str, text: &str, hunk_starts: &[usize]) -> Vec<String> {
     out
 }
 
+/// File-wide lines for one file: imports, then column-0 definitions and
+/// constants.
+fn file_wide(path: &str, lines: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let imports: Vec<String> = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|t| is_import(t))
+        .take(MAX_IMPORTS_PER_FILE)
+        .map(|t| clip(t.trim_end_matches(';'), 80))
+        .collect();
+    if !imports.is_empty() {
+        out.push(format!("- {path}: imports: {}", imports.join("; ")));
+    }
+    let mut defs: Vec<String> = Vec::new();
+    for l in lines {
+        if indent_of(l) > 0 {
+            continue;
+        }
+        for name in extract_defs(l).into_iter().chain(const_name(l)) {
+            if !defs.contains(&name) {
+                defs.push(name);
+            }
+        }
+        if defs.len() >= MAX_DEFS_PER_FILE {
+            break;
+        }
+    }
+    if !defs.is_empty() {
+        out.push(format!(
+            "- {path}: top-level definitions/constants: {}",
+            defs.join(", ")
+        ));
+    }
+    out
+}
+
 /// Build the context header for one chunk. `read` returns the post-change
 /// text of a path (None when unavailable, e.g. a deleted file). Returns an
 /// empty string when there is nothing useful to say.
@@ -317,12 +412,29 @@ pub(crate) fn chunk_context(
     read: &dyn Fn(&str) -> Option<String>,
     budget: usize,
 ) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    // Merge repeated sections of the same file (split hunk parts).
+    let mut files: Vec<(String, Vec<usize>)> = Vec::new();
     for (path, starts) in chunk_files(chunk) {
-        if let Some(text) = read(&path) {
-            lines.extend(file_context(&path, &text, &starts));
+        if !is_code_path(&path) {
+            continue;
+        }
+        match files.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, s)) => s.extend(starts),
+            None => files.push((path, starts)),
         }
     }
+    // Most specific first: every file's per-hunk scope lines, then the
+    // file-wide lists. Truncation drops the least specific information.
+    let mut scope: Vec<String> = Vec::new();
+    let mut wide: Vec<String> = Vec::new();
+    for (path, starts) in &files {
+        if let Some(text) = read(path) {
+            let lines: Vec<&str> = text.lines().collect();
+            scope.extend(hunk_scopes(path, &lines, starts));
+            wide.extend(file_wide(path, &lines));
+        }
+    }
+    let lines: Vec<String> = scope.into_iter().chain(wide).collect();
     if lines.is_empty() {
         return String::new();
     }
@@ -375,7 +487,7 @@ mod tests {
             header.contains("names bound earlier in it: cli, scope, label, diff"),
             "{header}"
         );
-        assert!(header.contains("imports: use anyhow::Context;"), "{header}");
+        assert!(header.contains("imports: use anyhow::Context"), "{header}");
         assert!(header.contains("cmd_review"), "{header}");
         assert!(header.contains("LIMIT"), "{header}");
     }
@@ -407,6 +519,29 @@ mod tests {
         assert!(header.contains("(context truncated)"));
         assert!(!header.contains("gone.rs"));
         assert_eq!(chunk_context(chunk, &|_| None, 400), "");
+    }
+
+    /// Measured regression: in a large file the file-wide lists filled the
+    /// budget and the hunk scope line (the one naming `label`) was truncated.
+    #[test]
+    fn hunk_scope_survives_a_tight_budget_and_docs_are_skipped() {
+        let mut src = String::new();
+        for i in 0..300 {
+            src.push_str(&format!(
+                "use crate::module_number_{i};\nfn function_number_{i}() {{}}\n"
+            ));
+        }
+        src.push_str("fn cmd_review(cli: &Cli) {\n    let (label, diff) = build();\n    work();\n    bail!(\"{label}\");\n}\n");
+        let n = src.lines().count();
+        let chunk = format!(
+            "+++ b/a.rs\n@@ -{0},1 +{0},1 @@\n+    bail!(\"{{label}}\");\n+++ b/README.md\n@@ -1 +1 @@\n+x\n",
+            n - 1
+        );
+        let read = |p: &str| (p == "a.rs" || p == "README.md").then(|| src.clone());
+        let header = chunk_context(&chunk, &read, 600);
+        assert!(header.starts_with("- a.rs hunk at line"), "{header}");
+        assert!(header.contains("label, diff"), "{header}");
+        assert!(!header.contains("README.md"), "{header}");
     }
 
     #[test]
