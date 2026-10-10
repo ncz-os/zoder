@@ -126,6 +126,92 @@ mod watchdog_session_tests {
             .unwrap();
         server.await.unwrap();
     }
+
+    /// Z-18 regression: a `turn_complete` frame for a DIFFERENT session must
+    /// not acknowledge this cancel. The daemon sends the ack for a racing
+    /// other turn first, then the real ack; cancellation must settle only on
+    /// the real one (and thus still succeed).
+    #[tokio::test]
+    async fn cancel_session_ignores_a_turn_complete_for_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"init","result":{}}),
+            )
+            .await
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let cancel: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(cancel["params"]["session_id"], "want");
+            // Wrong session first, then the matching one.
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","method":"session/update","params":{"session_id":"other","type":"turn_complete","outcome":"cancelled"}}),
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","method":"session/update","params":{"session_id":"want","type":"turn_complete","outcome":"cancelled"}}),
+            )
+            .await
+            .unwrap();
+        });
+        cancel_session(&socket, "want", Duration::from_secs(2))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    /// Z-18 regression: an ack for another session alone must NOT settle the
+    /// cancel. Without the session-id check the mismatched frame was accepted
+    /// and this returned `Ok`, letting the loop review a possibly-active tree.
+    #[tokio::test]
+    async fn cancel_session_rejects_a_turn_complete_for_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","id":"init","result":{}}),
+            )
+            .await
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            write_frame(
+                &mut write,
+                &json!({"jsonrpc":"2.0","method":"session/update","params":{"session_id":"other","type":"turn_complete","outcome":"cancelled"}}),
+            )
+            .await
+            .unwrap();
+            // Drop the write half -> the client sees EOF before any ack for
+            // "want"; it must fail closed rather than accept "other"'s ack.
+        });
+        let result = cancel_session(&socket, "want", Duration::from_millis(500)).await;
+        assert!(
+            result.is_err(),
+            "a turn_complete for another session must not acknowledge this cancel"
+        );
+        server.await.unwrap();
+    }
 }
 
 /// Maximum bytes the wire layer will buffer for a single JSON-RPC
@@ -1658,18 +1744,36 @@ pub async fn cancel_session(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     if kind == "turn_complete" {
-                        // Defensive `let _ =` for the EOF arm: if the daemon
-                        // ever sent `turn_complete` and THEN closed the
-                        // socket, we'd still accept the EOF as "settled".
-                        // (In practice the daemon keeps the socket open
-                        // until after the final session/update, so EOF
-                        // arrives *after* turn_complete, but we don't rely
-                        // on that ordering.)
-                        #[allow(unused_assignments)]
-                        {
-                            turn_complete_seen = true;
+                        // Z-18: attribute the completion to THIS session. A
+                        // `turn_complete` for a different session (another
+                        // turn that raced this cancel) must NOT acknowledge
+                        // this cancel and let the watchdog believe a possibly
+                        // still-active tree is safe to review. The engine
+                        // includes `params.session_id`; when it is present and
+                        // differs we keep draining for our own ack. An absent
+                        // id preserves the pre-fix legacy behaviour so a daemon
+                        // that omits it does not regress to a hard cancel
+                        // failure.
+                        let ack_session = frame
+                            .pointer("/params/session_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str));
+                        if ack_session.is_none_or(|sid| sid == session_id) {
+                            // Defensive `let _ =` for the EOF arm: if the daemon
+                            // ever sent `turn_complete` and THEN closed the
+                            // socket, we'd still accept the EOF as "settled".
+                            // (In practice the daemon keeps the socket open
+                            // until after the final session/update, so EOF
+                            // arrives *after* turn_complete, but we don't rely
+                            // on that ordering.)
+                            #[allow(unused_assignments)]
+                            {
+                                turn_complete_seen = true;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
+                        // A completion for another session: not our ack.
+                        continue;
                     }
                 }
                 // keep draining — the daemon may send a few more session/update
