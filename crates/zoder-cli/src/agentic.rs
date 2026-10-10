@@ -2265,6 +2265,37 @@ fn detect_base(cwd: &Path, base: Option<&str>) -> String {
     "HEAD".to_string()
 }
 
+/// Resolve the `.zoderignore` glob list for a review.
+///
+/// Branch/base scopes read the file from the BASE revision so a change under
+/// review cannot exempt itself (e.g. a branch that adds `.zoderignore` with
+/// `*`). Only working-tree scope reads the working tree, where uncommitted
+/// edits — including a just-edited `.zoderignore` — are legitimately in scope.
+/// `Auto` follows the same dirty/clean rule `build_diff` uses to pick a scope.
+fn review_zoderignore_patterns(
+    cwd: &Path,
+    root: &Path,
+    scope: ReviewScope,
+    base: Option<&str>,
+) -> Vec<String> {
+    let use_base = match scope {
+        ReviewScope::WorkingTree => false,
+        ReviewScope::Branch => true,
+        ReviewScope::Auto => {
+            let dirty = run_git(cwd, &["status", "--porcelain"])
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            !dirty
+        }
+    };
+    if use_base {
+        let rev = detect_base(cwd, base);
+        crate::review_diff::load_zoderignore_at(cwd, &rev)
+    } else {
+        crate::review_diff::load_zoderignore(root)
+    }
+}
+
 /// Baseline state of a repository at the start of a loop iteration.
 /// Captures enough metadata to detect whether the agent or the human
 /// made a given change. Captured fresh each iteration so that user
@@ -3449,6 +3480,7 @@ pub(crate) async fn cmd_review(
                 ok_models: 1,
                 failed_models: 0,
                 receipts: &[],
+                exclusions: None,
             },
         );
         return Ok(());
@@ -3478,8 +3510,12 @@ pub(crate) async fn cmd_review(
     );
     let config_excludes = review_cfg.map(|r| r.exclude).unwrap_or_default();
     let root = crate::review_diff::repo_root(&cwd);
+    // Base/branch scopes read `.zoderignore` from the BASE revision so a change
+    // under review cannot exempt itself; only working-tree scope reads the
+    // working tree, where uncommitted edits are legitimately in scope.
+    let zoderignore = review_zoderignore_patterns(&cwd, &root, scope, base.as_deref());
     let prepared = crate::review_diff::prepare_review_diff(
-        &root,
+        &zoderignore,
         &diff,
         &opts.excludes,
         &config_excludes,
@@ -3533,6 +3569,38 @@ redefined, or recursively calling a missing function, check it against this map:
             max_hunk_bytes,
         );
         return Ok(());
+    }
+
+    // Fail closed: a raw diff that exclusions reduce to nothing must NOT be
+    // sent to a reviewer as an empty chunk (which typically draws an APPROVE).
+    // Emit a structured non-approve payload that carries the exclusion report
+    // (counts + paths) to stdout / result.json, then exit nonzero so a CI gate
+    // cannot read this as a clean review.
+    if prepared.emptied_by_exclusion {
+        let report = prepared.excluded.render();
+        let failed = ReviewerSlot::Failed {
+            model: "(exclusions)".into(),
+            err: format!(
+                "exclusions removed every changed file from a non-empty {label} diff; refusing to review an empty diff. {report}"
+            ),
+        };
+        let agg = emit_reviews(
+            cli,
+            &ReviewAggregate {
+                reviewers: &[failed],
+                cost_usd: 0.0,
+                requested: 1,
+                ok_models: 0,
+                failed_models: 1,
+                receipts: &[],
+                exclusions: Some(&prepared.excluded),
+            },
+        );
+        anyhow::bail!(
+            "review refused: exclusions left nothing to review while the raw {label} diff was non-empty \
+             ({} byte(s) raw -> 0; aggregate verdict `{agg}`); {report}",
+            diff.len()
+        );
     }
 
     // Standalone review has no author turn: `-m` pins its primary reviewer.
@@ -3620,6 +3688,7 @@ redefined, or recursively calling a missing function, check it against this map:
         ok_models,
         failed_models: failed_count,
         receipts: &receipts,
+        exclusions: Some(&prepared.excluded),
     };
 
     let agg = emit_reviews(cli, &aggregate);
@@ -3685,6 +3754,10 @@ struct ReviewAggregate<'a> {
     ok_models: usize,
     /// How many produced only an error record.
     failed_models: usize,
+    /// Files/bytes/patterns dropped by review exclusions, when any apply.
+    /// Rendered into the JSON payload / result.json so a consumer can see
+    /// exactly what was NOT reviewed.
+    exclusions: Option<&'a crate::review_diff::ExclusionReport>,
 }
 
 /// Compute the aggregate verdict + per-reviewer view out of a list of
@@ -3750,6 +3823,21 @@ fn aggregate_review(
     (agg, all_failed, payload)
 }
 
+/// Machine-readable view of the review exclusion report, embedded in the JSON
+/// payload / `result.json` as `exclusions` (counts + per-file path/bytes/pattern)
+/// so a consumer can see exactly which files were NOT reviewed.
+fn exclusion_payload(report: &crate::review_diff::ExclusionReport) -> serde_json::Value {
+    json!({
+        "count": report.files.len(),
+        "bytes": report.bytes,
+        "files": report.files.iter().map(|f| json!({
+            "path": f.path,
+            "bytes": f.bytes,
+            "pattern": f.pattern,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Render the aggregated review(s) as JSON (machine) or text (human), and write
 /// `result.json` when running as a background job. `aggregate.ok_models == 0`
 /// is reflected in the payload as `complete: false` so downstream consumers
@@ -3764,6 +3852,9 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
         aggregate.failed_models,
     );
     payload["provenance"] = json!(aggregate.receipts);
+    if let Some(rep) = aggregate.exclusions {
+        payload["exclusions"] = exclusion_payload(rep);
+    }
 
     if let Some(dir) = active_job_dir() {
         let _ = std::fs::write(
@@ -10434,6 +10525,26 @@ mod review_diff_soundness_tests {
         run(&["add", "README.md"]);
         run(&["commit", "-q", "-m", "init"]);
         (dir, repo)
+    }
+
+    /// Defect 3 (part 3): the exclusion report must appear in the JSON payload /
+    /// `result.json` as counts plus per-file paths and the matching pattern.
+    #[test]
+    fn exclusion_report_payload_lists_counts_and_paths() {
+        let rep = crate::review_diff::ExclusionReport {
+            files: vec![crate::review_diff::ExcludedFile {
+                path: "assets/big.tsv".into(),
+                bytes: 1234,
+                pattern: "*.tsv".into(),
+            }],
+            bytes: 1234,
+        };
+        let v = exclusion_payload(&rep);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["bytes"], 1234);
+        assert_eq!(v["files"][0]["path"], "assets/big.tsv");
+        assert_eq!(v["files"][0]["pattern"], "*.tsv");
+        assert_eq!(v["files"][0]["bytes"], 1234);
     }
 
     /// REGRESSION: a working tree whose ONLY work is brand-new, not-yet-added
