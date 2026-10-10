@@ -976,11 +976,24 @@ pub(crate) fn build_reviewer_candidates(
                     in_global && in_reviewer
                 })
         };
-        if resolved_override
-            .as_deref()
-            .is_some_and(|model| !permitted(model))
-        {
-            anyhow::bail!("explicit reviewer route is outside {restriction}");
+        if let Some(model) = resolved_override.as_deref() {
+            // A model no provider serves can never be inside an allowlist, so
+            // say THAT (with the configured routes and a suggestion) instead
+            // of the misleading "outside the allowlist" (blackhole2 F1).
+            let Some(provider) = routing.real_provider_for_model(&eng.cfg, model) else {
+                anyhow::bail!(no_reviewer_provider_message(cli, &eng, &routing, model));
+            };
+            if !permitted(model) {
+                let allowed = reviewer_allowed.as_ref().or(global_allowed.as_ref());
+                anyhow::bail!(
+                    "explicit reviewer route is outside {restriction}: {}={model} is not listed \
+                     (allowed: {})",
+                    provider.id,
+                    allowed
+                        .map(|pairs| crate::format_allowed_pairs(pairs))
+                        .unwrap_or_default()
+                );
+            }
         }
         out.retain(|model| permitted(model));
         if out.is_empty() {
@@ -1118,6 +1131,112 @@ fn review_roster(cli_model: Option<&str>, panel: Option<&str>) -> Vec<Option<Str
     models
 }
 
+/// `provider=model` pairs for every configured reviewer model that is backed
+/// by a real provider, in configured order. Used to make reviewer-route
+/// errors actionable (the `-m google/gemma-4-31b-it` model-name trap).
+fn configured_reviewer_routes(
+    cli: &crate::Cli,
+    eng: &Engine,
+    routing: &crate::RoutingContext,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for raw in eng.cfg.reviewer_models_for(cli.agent.as_deref()) {
+        let model = crate::configured_model_for_agent(eng, Some(&raw)).unwrap_or(raw);
+        if let Some(provider) = routing.real_provider_for_model(&eng.cfg, &model) {
+            let pair = (provider.id.clone(), model);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// Lowercased model id with any vendor path (`google/`) dropped and only
+/// ASCII alphanumerics kept, so `google/gemma-4-31b-it` and `gemma4-31b`
+/// compare as `gemma431bit` / `gemma431b`.
+fn normalize_model_id(id: &str) -> String {
+    id.rsplit('/')
+        .next()
+        .unwrap_or(id)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Suggest a configured model id for a requested id that no provider serves:
+/// the candidate whose normalized id contains, or is contained in, the
+/// requested one (longest wins). Suggestion only -- never an alias: a
+/// different provider's deployment of "the same" model is a different route
+/// and must be chosen explicitly.
+fn suggest_model_id<'a>(
+    requested: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let want = normalize_model_id(requested);
+    if want.len() < 4 {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .filter(|c| *c != requested)
+        .filter_map(|c| {
+            let n = normalize_model_id(c);
+            (n.len() >= 4 && (want.contains(&n) || n.contains(&want))).then_some((n.len(), c))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, c)| c.to_string())
+}
+
+fn no_reviewer_provider_message(
+    cli: &crate::Cli,
+    eng: &Engine,
+    routing: &crate::RoutingContext,
+    model: &str,
+) -> String {
+    let routes = configured_reviewer_routes(cli, eng, routing);
+    let served: Vec<&str> = eng
+        .cfg
+        .providers
+        .iter()
+        .filter(|p| {
+            !p.base_url
+                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        })
+        .flat_map(|p| p.serves.iter().map(String::as_str))
+        .collect();
+    no_reviewer_provider_text(model, &routes, &served)
+}
+
+/// Pure text builder for [`no_reviewer_provider_message`] (unit-tested).
+fn no_reviewer_provider_text(model: &str, routes: &[(String, String)], served: &[&str]) -> String {
+    let mut msg = format!(
+        "no real provider is configured for reviewer model '{model}': no provider in the zoder \
+         config serves that id, so it would fall through to the {} placeholder and fail \
+         (a model listed by `zoder models` is routable only when a provider's `serves` list \
+         covers it).",
+        zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+    );
+    if routes.is_empty() {
+        msg.push_str(" No configured reviewer route is backed by a real provider.");
+    } else {
+        msg.push_str(&format!(
+            " Configured reviewer routes: {}.",
+            crate::format_allowed_pairs(routes)
+        ));
+    }
+    let candidates = routes
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .chain(served.iter().copied());
+    match suggest_model_id(model, candidates) {
+        Some(s) => msg.push_str(&format!(" Did you mean `-m {s}`?")),
+        None => msg.push_str(" Pass `-m <model>` with one of the configured reviewer models."),
+    }
+    msg
+}
+
 /// Run the single-model reviewer dispatch for an explicit model id. The
 /// caller is responsible for selecting the model (this helper just runs
 /// it). The return type mirrors `try_model` in the author path: success
@@ -1164,13 +1283,12 @@ async fn dispatch_reviewer_for_model(
     let provider_cfg = match routing.real_provider_for_model(&eng.cfg, model) {
         Some(p) => p,
         None => {
-            // Treat a missing provider config as FALLBACK-WORTHY: the
-            // next candidate in the chain might have a real provider
-            // configured (it would be a regression to shadow that with a
-            // hard error when the next link in the chain can answer).
-            return Err(ReviewerError::fatal(format!(
-                "no real provider is configured for reviewer model '{model}' — it would fall through to the {} placeholder and fail. Configure a provider that serves it, or pass a backed reviewer via `--reviewer <model>`.",
-                zoder_core::config::PLACEHOLDER_PROVIDER_HOST
+            // Fatal: an unbacked reviewer id is a configuration/typo problem
+            // the operator must see, not something to mask by silently
+            // reviewing with a different model. The message names the
+            // configured reviewer routes and suggests the closest id.
+            return Err(ReviewerError::fatal(no_reviewer_provider_message(
+                cli, &eng, &routing, model,
             )));
         }
     };
@@ -11584,6 +11702,83 @@ mod reviewer_chain_dispatch_tests {
                 .unwrap()
                 .to_string()
                 .contains("explicit reviewer route is outside")
+        );
+    }
+
+    /// blackhole2 F1: `-m <id no provider serves>` plus an allowlist that
+    /// lists it must report the missing provider (with the configured routes),
+    /// not "outside the allowlist"; a served-but-unlisted route names the pair
+    /// and the allowlist.
+    #[test]
+    fn unbacked_explicit_reviewer_reports_missing_provider_not_allowlist() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
+        write_config(home, "http://127.0.0.1:9", "working-model/reviewer");
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "--reviewer-allowed-routes",
+            "wiremock-working=vendor/working-model-reviewer-it",
+        ])
+        .unwrap();
+        let err = build_reviewer_candidates(&cli, Some("vendor/working-model-reviewer-it"), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no real provider is configured"), "{err}");
+        assert!(!err.contains("outside"), "{err}");
+        assert!(
+            err.contains("Configured reviewer routes: wiremock-working=working-model/reviewer"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Did you mean `-m working-model/reviewer`?"),
+            "{err}"
+        );
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "--reviewer-allowed-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        let err = build_reviewer_candidates(&cli, Some("broken-model/head"), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("explicit reviewer route is outside --reviewer-allowed-routes: wiremock-broken=broken-model/head is not listed (allowed: wiremock-working=working-model/reviewer)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reviewer_model_suggestion_matches_vendor_and_suffix_variants() {
+        let routes = vec![
+            ("cerberus-reviewer".to_string(), "gemma4-31b".to_string()),
+            (
+                "nvidia-eih".to_string(),
+                "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+            ),
+        ];
+        let text = no_reviewer_provider_text("google/gemma-4-31b-it", &routes, &["qwen38"]);
+        assert!(text.contains("Configured reviewer routes: cerberus-reviewer=gemma4-31b, nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b."), "{text}");
+        assert!(text.contains("Did you mean `-m gemma4-31b`?"), "{text}");
+        assert!(text.contains("api.example.com"), "{text}");
+        assert_eq!(
+            suggest_model_id(
+                "nemotron-3-ultra-550b-a55b",
+                routes.iter().map(|(_, m)| m.as_str())
+            ),
+            Some("nvidia/nemotron-3-ultra-550b-a55b".to_string())
+        );
+        assert_eq!(suggest_model_id("totally-unknown", ["gemma4-31b"]), None);
+        assert_eq!(suggest_model_id("ab", ["abc"]), None);
+        let none = no_reviewer_provider_text("x-model", &[], &[]);
+        assert!(
+            none.contains("No configured reviewer route is backed"),
+            "{none}"
         );
     }
 
