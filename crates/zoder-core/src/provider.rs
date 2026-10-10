@@ -210,7 +210,11 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,
         let started = Instant::now();
         let error = p.stream_chat(&request, None).await.unwrap_err();
         assert_eq!(error.kind, ErrKind::Timeout, "{}", error.message);
-        assert!(error.message.contains("still reasoning"), "{}", error.message);
+        assert!(
+            error.message.contains("still reasoning"),
+            "{}",
+            error.message
+        );
         assert!(started.elapsed() < Duration::from_millis(1200));
         task.abort();
         let _ = task.await;
@@ -227,7 +231,11 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,
         let started = Instant::now();
         let error = p.stream_chat(&request, None).await.unwrap_err();
         assert_eq!(error.kind, ErrKind::Timeout, "{}", error.message);
-        assert!(error.message.contains("still reasoning"), "{}", error.message);
+        assert!(
+            error.message.contains("still reasoning"),
+            "{}",
+            error.message
+        );
         assert!(started.elapsed() < Duration::from_millis(1200));
         task.abort();
         let _ = task.await;
