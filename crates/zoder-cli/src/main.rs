@@ -3784,6 +3784,14 @@ fn parsed_reviewer_allowed_routes(cli: &Cli) -> anyhow::Result<Option<Vec<(Strin
     Ok(Some(parse_route_list(raw, "--reviewer-allowed-routes")?))
 }
 
+pub(crate) fn format_allowed_pairs(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(p, m)| format!("{p}={m}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn require_allowed_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Result<()> {
     if let Some(allowed) = parsed_allowed_routes(cli)? {
         if !allowed
@@ -3791,7 +3799,8 @@ fn require_allowed_route(cli: &Cli, provider: &str, model: &str) -> anyhow::Resu
             .any(|pair| pair.0 == provider && pair.1 == model)
         {
             anyhow::bail!(
-                "effective route {provider}={model} is outside --allowed-routes; refusing dispatch"
+                "effective route {provider}={model} is outside --allowed-routes (allowed: {}); refusing dispatch",
+                format_allowed_pairs(&allowed)
             );
         }
     }
@@ -3807,7 +3816,8 @@ fn require_allowed_reviewer_route(cli: &Cli, provider: &str, model: &str) -> any
             .any(|pair| pair.0 == provider && pair.1 == model)
         {
             anyhow::bail!(
-                "effective route {provider}={model} is outside --reviewer-allowed-routes; refusing dispatch"
+                "effective route {provider}={model} is outside --reviewer-allowed-routes (allowed: {}); refusing dispatch",
+                format_allowed_pairs(&reviewer_allowed)
             );
         }
     }
