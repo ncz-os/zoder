@@ -3498,17 +3498,51 @@ pub(crate) async fn cmd_review(
     // a review.
     let eng = Engine::load().ok();
     let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
-    let max_diff_bytes = crate::review_diff::resolve_limit(
+
+    // Resolve which reviewer will serve the default slot *before* chunking, so
+    // per-route size caps (`[review.route_defaults.<model>]`) can shape the
+    // chunks. The route identity mirrors the call path: an explicit `-m`, then
+    // the configured reviewer pin, then the head of the scenario reviewer
+    // chain. When none is resolvable (no engine, or a fully dynamic route) the
+    // per-route lookup is skipped and the general caps/default apply.
+    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let reviewer_chain: Vec<String> = match (&eng, &health) {
+        (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
+            .map(|r| r.reviewer)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let reviewer_for_caps: Option<String> = cli
+        .model
+        .clone()
+        .or_else(|| eng.as_ref().and_then(|e| e.cfg.reviewer_model.clone()))
+        .or_else(|| reviewer_chain.first().cloned());
+
+    let empty_route_defaults = std::collections::BTreeMap::new();
+    let route_defaults = review_cfg
+        .as_ref()
+        .map(|r| &r.route_defaults)
+        .unwrap_or(&empty_route_defaults);
+    let route_entry = reviewer_for_caps
+        .as_deref()
+        .and_then(|m| crate::review_diff::route_default_for(route_defaults, m));
+
+    let max_diff_bytes = crate::review_diff::resolve_limit_for_route(
         opts.max_diff_bytes,
+        route_entry.and_then(|d| d.max_diff_bytes),
         review_cfg.as_ref().and_then(|r| r.max_diff_bytes),
         crate::review_diff::DEFAULT_MAX_DIFF_BYTES,
     );
-    let max_hunk_bytes = crate::review_diff::resolve_limit(
+    let max_hunk_bytes = crate::review_diff::resolve_limit_for_route(
         opts.max_hunk_bytes,
+        route_entry.and_then(|d| d.max_hunk_bytes),
         review_cfg.as_ref().and_then(|r| r.max_hunk_bytes),
         crate::review_diff::DEFAULT_MAX_HUNK_BYTES,
     );
-    let config_excludes = review_cfg.map(|r| r.exclude).unwrap_or_default();
+    let config_excludes = review_cfg
+        .as_ref()
+        .map(|r| r.exclude.clone())
+        .unwrap_or_default();
     let root = crate::review_diff::repo_root(&cwd);
     // Base/branch scopes read `.zoderignore` from the BASE revision so a change
     // under review cannot exempt itself; only working-tree scope reads the
@@ -3608,22 +3642,16 @@ redefined, or recursively calling a missing function, check it against this map:
     // `--panel` entries remain independent reviewer slots.
     let models = review_roster(cli.model.as_deref(), panel.as_deref());
 
-    // Scenario-routed reviewer chain: loaded once and passed to every
-    // `complete_once` call so the default reviewer (the "head" of the
-    // roster, before any `--panel` entries) honors the active scenario
-    // and KNEMON gating. Pin precedence inside `complete_once` is
-    // unchanged: explicit `model_override` (per `--panel`) wins, then the
-    // operator-CONFIGURED reviewer (per-agent `[agents.<alias>].reviewer_model`
-    // pin, then profile-level `Config::reviewer_model`), then the
-    // scenario-eligible reviewer as a tail fallback, then the cross-family
-    // legacy default. Scenario auto-routing never shadows a configured pin.
-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
-    let reviewer_chain: Vec<String> = match (&eng, &health) {
-        (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
-            .map(|r| r.reviewer)
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    // Scenario-routed reviewer chain: resolved once above (before chunking, so
+    // per-route caps could use it) and reused here. It is passed to every
+    // `complete_once` call so the default reviewer (the "head" of the roster,
+    // before any `--panel` entries) honors the active scenario and KNEMON
+    // gating. Pin precedence inside `complete_once` is unchanged: explicit
+    // `model_override` (per `--panel`) wins, then the operator-CONFIGURED
+    // reviewer (per-agent `[agents.<alias>].reviewer_model` pin, then
+    // profile-level `Config::reviewer_model`), then the scenario-eligible
+    // reviewer as a tail fallback, then the cross-family legacy default.
+    // Scenario auto-routing never shadows a configured pin.
 
     // Fan out concurrently on this task (no spawn: the completion future borrows
     // a non-Send sink type, so we poll them together via join_all instead).

@@ -1893,11 +1893,40 @@ pub struct ReviewConfig {
     /// `--exclude` on the command line. CLI: `--exclude`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Per-reviewer-route size caps. The map key is a reviewer model id (the
+    /// exact id as configured/served, e.g. `qwen38`, or its basename after the
+    /// last `/` for namespaced ids such as
+    /// `nvidia/nemotron-3-ultra-550b-a55b`). A route entry beats the general
+    /// `max_diff_bytes` / `max_hunk_bytes` above; an explicit CLI flag beats
+    /// both; a reviewer whose id has no entry falls back to the general value
+    /// and then the historical 9000-byte default. See
+    /// [`crate::config::RouteReviewDefaults`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub route_defaults: BTreeMap<String, RouteReviewDefaults>,
+}
+
+/// Per-reviewer size caps inside `[review.route_defaults.<model>]`. Both fields
+/// are optional; an absent entry leaves the general `[review]` value (and then
+/// the built-in default) in force for that reviewer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteReviewDefaults {
+    /// Per-hunk / per-chunk byte cap for this reviewer. CLI `--max-hunk-bytes`
+    /// still wins. Falls back to `[review].max_hunk_bytes` then 9000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hunk_bytes: Option<usize>,
+    /// Total-diff byte cap for this reviewer. CLI `--max-diff-bytes` still
+    /// wins. Falls back to `[review].max_diff_bytes` then 120000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<usize>,
 }
 
 impl ReviewConfig {
     fn is_empty(&self) -> bool {
-        self.max_diff_bytes.is_none() && self.max_hunk_bytes.is_none() && self.exclude.is_empty()
+        self.max_diff_bytes.is_none()
+            && self.max_hunk_bytes.is_none()
+            && self.exclude.is_empty()
+            && self.route_defaults.is_empty()
     }
 }
 
@@ -6663,5 +6692,33 @@ auth = { type = "env", var = "GUARD_KEY" }
             Instant::now() + Duration::from_secs(300),
         );
         assert_eq!(exit, SwapExit::IterationCap);
+    }
+
+    #[test]
+    fn review_route_defaults_parse_and_are_optional() {
+        let raw = r#"
+            max_hunk_bytes = 16000
+            [route_defaults.qwen38]
+            max_hunk_bytes = 64000
+            [route_defaults."nvidia/nemotron-3-ultra-550b-a55b"]
+            max_hunk_bytes = 24000
+            max_diff_bytes = 400000
+        "#;
+        let rc: ReviewConfig = toml::from_str(raw).expect("route_defaults must parse");
+        assert_eq!(rc.max_hunk_bytes, Some(16_000));
+        assert_eq!(rc.route_defaults["qwen38"].max_hunk_bytes, Some(64_000));
+        assert_eq!(
+            rc.route_defaults["nvidia/nemotron-3-ultra-550b-a55b"].max_diff_bytes,
+            Some(400_000)
+        );
+        // A route block with only one cap leaves the other None.
+        assert!(
+            rc.route_defaults["qwen38"].max_diff_bytes.is_none(),
+            "unset field stays None"
+        );
+
+        let empty: ReviewConfig = toml::from_str("").expect("empty review block is valid");
+        assert!(empty.route_defaults.is_empty());
+        assert!(empty.is_empty(), "empty block must round-trip as empty");
     }
 }
