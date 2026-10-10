@@ -15,6 +15,7 @@ mod goose;
 mod jobs;
 mod mnemos;
 mod provider_slots;
+mod review_context;
 mod review_diff;
 mod reviewer_pool;
 mod sop;
