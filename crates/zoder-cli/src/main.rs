@@ -708,14 +708,22 @@ enum Cmd {
         panel: Option<String>,
         #[arg(long)]
         background: bool,
+        /// Exclude diff sections whose path matches GLOB (repeatable). Same
+        /// semantics as `review --exclude`, including `.zoderignore`.
         #[arg(long, value_name = "GLOB")]
         exclude: Vec<String>,
+        /// Raise the total-diff byte cap (default 120000; config key
+        /// `[review].max_diff_bytes`).
         #[arg(long, value_name = "N")]
         max_diff_bytes: Option<usize>,
+        /// Raise the per-hunk byte cap (default 9000; config key
+        /// `[review].max_hunk_bytes`).
         #[arg(long, value_name = "N")]
         max_hunk_bytes: Option<usize>,
+        /// Fail instead of deterministically splitting an oversized hunk.
         #[arg(long)]
         no_split_hunks: bool,
+        /// Print the review chunks and diff map without calling any model.
         #[arg(long)]
         dry_run: bool,
         /// Extra focus for the reviewer (free text).
