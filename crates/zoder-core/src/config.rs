@@ -3414,9 +3414,11 @@ pub struct VendorOverlay {
     /// Optional `[review]` overrides contributed by this overlay (size caps and
     /// per-route `route_defaults`). Merged field-wise onto the base config's
     /// `[review]`: a field set here wins, `exclude` globs union, and
-    /// `route_defaults` entries merge per key (overlay wins). This is how a
-    /// fleet `config.<vendor>.toml` — the overlay zoder actually reads on the
-    /// hosts, which has no `config.json` — can carry per-route chunk caps.
+    /// `route_defaults` entries merge field-wise per model (an overlay that
+    /// sets only `max_hunk_bytes` keeps the base entry's `max_diff_bytes`).
+    /// This is how a fleet `config.<vendor>.toml` — the overlay zoder actually
+    /// reads on the hosts, which has no `config.json` — can carry per-route
+    /// chunk caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
 }
@@ -3723,7 +3725,13 @@ fn merge_review_config(base: &mut ReviewConfig, overlay: &ReviewConfig) {
         }
     }
     for (model, route) in &overlay.route_defaults {
-        base.route_defaults.insert(model.clone(), route.clone());
+        let entry = base.route_defaults.entry(model.clone()).or_default();
+        if route.max_hunk_bytes.is_some() {
+            entry.max_hunk_bytes = route.max_hunk_bytes;
+        }
+        if route.max_diff_bytes.is_some() {
+            entry.max_diff_bytes = route.max_diff_bytes;
+        }
     }
 }
 
@@ -4809,6 +4817,46 @@ auth = { type = "env", var = "K" }
         assert_eq!(
             cfg.review.route_defaults["nvidia/nemotron-3-ultra-550b-a55b"].max_diff_bytes,
             Some(400_000)
+        );
+    }
+
+    #[test]
+    fn merge_review_route_defaults_is_field_wise_per_model() {
+        let mut base = ReviewConfig::default();
+        base.route_defaults.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(1_000),
+                max_diff_bytes: Some(2_000),
+            },
+        );
+        let mut overlay = ReviewConfig::default();
+        overlay.route_defaults.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(64_000),
+                max_diff_bytes: None,
+            },
+        );
+        overlay.route_defaults.insert(
+            "MiniMax-M3".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(48_000),
+                max_diff_bytes: None,
+            },
+        );
+        merge_review_config(&mut base, &overlay);
+        // Overlay field wins, but the base's unset-field value survives.
+        assert_eq!(base.route_defaults["qwen38"].max_hunk_bytes, Some(64_000));
+        assert_eq!(
+            base.route_defaults["qwen38"].max_diff_bytes,
+            Some(2_000),
+            "a partial overlay entry must not drop the base field"
+        );
+        // A model only in the overlay is added.
+        assert_eq!(
+            base.route_defaults["MiniMax-M3"].max_hunk_bytes,
+            Some(48_000)
         );
     }
 
