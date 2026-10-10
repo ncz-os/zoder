@@ -13,6 +13,7 @@ mod exec_safety;
 mod goose;
 mod jobs;
 mod mnemos;
+mod review_context;
 mod review_diff;
 mod reviewer_pool;
 mod sop;

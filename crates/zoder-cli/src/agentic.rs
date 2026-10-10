@@ -3590,6 +3590,18 @@ pub(crate) async fn cmd_review(
 
     let focus_txt = focus.join(" ");
     let chunk_count = prepared.chunks.len();
+    // Cross-chunk context: names that exist in the post-change files but
+    // outside the chunk (bindings earlier in the enclosing function, imports,
+    // top-level definitions). Working-tree reviews read the files on disk;
+    // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
+    let read_post_image = |path: &str| -> Option<String> {
+        if label.starts_with("working-tree") {
+            std::fs::read_to_string(root.join(path)).ok()
+        } else {
+            run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
+        }
+    };
+    let context_on = crate::review_context::enabled();
     let users: Vec<String> = prepared
         .chunks
         .iter()
@@ -3617,7 +3629,25 @@ redefined, or recursively calling a missing function, check it against this map:
                     map
                 )
             });
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
+            let context = if context_on {
+                crate::review_context::chunk_context(
+                    chunk,
+                    &read_post_image,
+                    crate::review_context::CONTEXT_BUDGET_BYTES,
+                )
+            } else {
+                String::new()
+            };
+            let context = if context.is_empty() {
+                context
+            } else {
+                format!(
+                    "\n\nContext from the full post-change files (NOT part of the diff; do not \
+review it). These names exist outside the lines shown, so do not report them as undefined, \
+unbound, or missing imports:\n{context}"
+                )
+            };
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}{context}\n\n```diff\n{chunk}\n```")
         })
         .collect();
     if opts.dry_run {
