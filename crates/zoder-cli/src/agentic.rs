@@ -3726,6 +3726,7 @@ fn build_review_users(
     label: &str,
     focus_txt: &str,
     prepared: &crate::review_diff::PreparedDiff,
+    context_for: &dyn Fn(&str) -> String,
 ) -> Vec<String> {
     let chunk_count = prepared.chunks.len();
     prepared
@@ -3755,7 +3756,8 @@ redefined, or recursively calling a missing function, check it against this map:
                     map
                 )
             });
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}\n\n```diff\n{chunk}\n```")
+            let context = context_for(chunk);
+            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}{context}\n\n```diff\n{chunk}\n```")
         })
         .collect()
 }
@@ -3983,6 +3985,37 @@ pub(crate) async fn cmd_review(
             resolved.as_deref(),
         )
     };
+    // Cross-chunk context: names that exist in the post-change files but
+    // outside the chunk (bindings earlier in the enclosing function, imports,
+    // top-level definitions). Working-tree reviews read the files on disk;
+    // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
+    let read_post_image = |path: &str| -> Option<String> {
+        if label.starts_with("working-tree") {
+            std::fs::read_to_string(root.join(path)).ok()
+        } else {
+            run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
+        }
+    };
+    let context_on = crate::review_context::enabled();
+    let context_for = |chunk: &str| -> String {
+        if !context_on {
+            return String::new();
+        }
+        let context = crate::review_context::chunk_context(
+            chunk,
+            &read_post_image,
+            crate::review_context::CONTEXT_BUDGET_BYTES,
+        );
+        if context.is_empty() {
+            context
+        } else {
+            format!(
+                "\n\nContext from the full post-change files (NOT part of the diff; do not \
+review it). These names exist outside the lines shown, so do not report them as undefined, \
+unbound, or missing imports:\n{context}"
+            )
+        }
+    };
     let build_plan = |caps: crate::review_diff::ReviewCaps| -> anyhow::Result<ReviewPlan> {
         let prepared = crate::review_diff::prepare_review_diff_with_chunks(
             &zoderignore,
@@ -3994,7 +4027,7 @@ pub(crate) async fn cmd_review(
             caps.max_chunks,
             opts.split_hunks,
         )?;
-        let users = build_review_users(&label, &focus_txt, &prepared);
+        let users = build_review_users(&label, &focus_txt, &prepared, &context_for);
         Ok(ReviewPlan {
             caps,
             prepared,
