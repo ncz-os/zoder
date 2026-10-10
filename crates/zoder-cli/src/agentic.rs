@@ -4881,22 +4881,54 @@ fn explicit_loop_approval(review: &ReviewOutput, blocking: usize) -> bool {
     review.verdict.trim().eq_ignore_ascii_case("approve") && blocking == 0
 }
 
-/// Auto uses a stable task baseline; explicit review scopes keep their contract.
+/// Auto uses a stable task baseline; explicit review scopes keep their contract,
+/// with one exception (B10): `--scope working-tree` reviews uncommitted work,
+/// so an author that commits mid-turn empties the working-tree diff even
+/// though the task produced real changes. The loop then reported a false
+/// "empty diff" and rejected the iteration. When the working-tree diff has no
+/// content but the task baseline shows changes, review the task delta instead
+/// and say so in the label. `--scope branch` already includes commits.
 fn loop_task_diff(
     cwd: &Path,
     scope: ReviewScope,
     base: Option<&str>,
     task_journal: &PatchJournal,
 ) -> anyhow::Result<(String, String)> {
-    if matches!(scope, ReviewScope::Auto) {
-        anyhow::ensure!(
-            task_journal.baseline_tree.is_some(),
-            "task baseline snapshot unavailable"
-        );
-        Ok(("task".into(), task_journal.agent_diff(cwd)))
-    } else {
-        build_diff(cwd, scope, base)
+    match scope {
+        ReviewScope::Auto => {
+            anyhow::ensure!(
+                task_journal.baseline_tree.is_some(),
+                "task baseline snapshot unavailable"
+            );
+            Ok(("task".into(), task_journal.agent_diff(cwd)))
+        }
+        ReviewScope::WorkingTree => {
+            let (label, diff) = build_diff(cwd, scope, base)?;
+            if diff_has_content(&diff) || task_journal.baseline_tree.is_none() {
+                return Ok((label, diff));
+            }
+            let task = task_journal.agent_diff(cwd);
+            if diff_has_content(&task) {
+                eprintln!(
+                    "[loop] working-tree diff is empty but the task changed files since the \
+                     loop began (the author committed mid-turn); reviewing the task delta"
+                );
+                Ok((
+                    "task (working tree empty: author committed mid-turn)".into(),
+                    task,
+                ))
+            } else {
+                Ok((label, diff))
+            }
+        }
+        ReviewScope::Branch => build_diff(cwd, scope, base),
     }
+}
+
+/// True when a unified diff carries at least one added or removed content
+/// line (not just `diff --git` / `---` / `+++` headers or whitespace).
+fn diff_has_content(diff: &str) -> bool {
+    !matches!(classify_diff_substance(diff), DiffSubstance::Empty)
 }
 
 /// All signals needed by [`decide_loop_resolution`] for one iteration.
@@ -13832,5 +13864,54 @@ mod completion_integrity_tests {
                 .unwrap()
                 .1
         );
+    }
+
+    /// B10 regression: with `--scope working-tree`, an author that commits its
+    /// edit mid-turn leaves a clean working tree. The loop must review the task
+    /// delta instead of reporting a false "empty diff" and rejecting the turn.
+    #[test]
+    fn working_tree_scope_survives_mid_turn_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| run_git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("old.rs"), "fn old_branch_work() {}\n").unwrap();
+        git(&["add", "old.rs"]);
+        git(&["commit", "-qm", "old branch work"]);
+        let mut journal = PatchJournal::new();
+        journal.record_baseline(repo);
+        // Nothing done yet: working-tree scope is honestly empty.
+        let (_, before) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        assert!(!diff_has_content(&before));
+        // Author edits and commits inside the turn.
+        std::fs::write(repo.join("new.rs"), "fn job_work() {}\n").unwrap();
+        git(&["add", "new.rs"]);
+        git(&["commit", "-qm", "task change"]);
+        let (label, diff) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        assert!(
+            diff.contains("job_work"),
+            "task delta must survive the commit"
+        );
+        assert!(!diff.contains("old_branch_work"));
+        assert!(
+            label.starts_with("task"),
+            "label must say the task delta was used: {label}"
+        );
+        // Uncommitted work keeps the plain working-tree contract.
+        std::fs::write(repo.join("new.rs"), "fn job_work() { let _x = 1; }\n").unwrap();
+        let (label, diff) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        assert_eq!(label, "working-tree");
+        assert!(diff.contains("_x"));
+    }
+
+    #[test]
+    fn diff_has_content_ignores_headers() {
+        assert!(!diff_has_content(""));
+        assert!(!diff_has_content(
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n"
+        ));
+        assert!(diff_has_content("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"));
     }
 }
