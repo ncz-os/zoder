@@ -20,10 +20,11 @@
 //! Everything in here is pure except [`load_zoderignore`],
 //! [`load_zoderignore_at`] and [`repo_root`], which read the repository.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::bail;
+use zoder_core::config::RouteReviewDefaults;
 
 /// Historical total-diff cap, kept as the default so behavior is unchanged
 /// when neither the flag nor the config key is set.
@@ -46,6 +47,45 @@ const MAX_DEFS_PER_FILE: usize = 40;
 /// Resolve a size cap with flag-over-config-over-default precedence.
 pub fn resolve_limit(flag: Option<usize>, config: Option<usize>, default: usize) -> usize {
     flag.or(config).unwrap_or(default)
+}
+
+/// Resolve a size cap with full per-route precedence:
+/// CLI flag > `[review.route_defaults.<model>].*` > `[review].*` > default.
+///
+/// `route` is the reviewer-specific value (already looked up for the resolved
+/// reviewer model), so a caller only has to pass the three `Option`s it holds.
+pub fn resolve_limit_for_route(
+    flag: Option<usize>,
+    route: Option<usize>,
+    config: Option<usize>,
+    default: usize,
+) -> usize {
+    resolve_limit(flag.or(route), config, default)
+}
+
+/// Look up the per-route review defaults for a reviewer model id.
+///
+/// Matching is exact first, then by the basename after the last `/`, so a
+/// `[review.route_defaults.nemotron-3-ultra-550b-a55b]` entry matches the
+/// served id `nvidia/nemotron-3-ultra-550b-a55b` without the operator having to
+/// spell the provider prefix. The exact key always wins over a basename match.
+pub fn route_default_for<'a>(
+    route_defaults: &'a BTreeMap<String, RouteReviewDefaults>,
+    model: &str,
+) -> Option<&'a RouteReviewDefaults> {
+    if model.is_empty() {
+        return None;
+    }
+    if let Some(d) = route_defaults.get(model) {
+        return Some(d);
+    }
+    let base = model.rsplit('/').next().unwrap_or(model);
+    if base != model {
+        if let Some(d) = route_defaults.get(base) {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// Derive how many reviewer chunks a total cap implies (with slack), never
@@ -1503,5 +1543,82 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(parts[1].contains("@@ -2,0 +3,2 @@"), "{}", parts[1]);
         assert!(!parts[1].contains(&"c".repeat(48)));
+    }
+
+    #[test]
+    fn resolve_limit_prefers_flag_then_route_then_config_then_default() {
+        use super::{resolve_limit_for_route, DEFAULT_MAX_HUNK_BYTES};
+        assert_eq!(resolve_limit_for_route(Some(1), Some(2), Some(3), 9), 1);
+        assert_eq!(resolve_limit_for_route(None, Some(2), Some(3), 9), 2);
+        assert_eq!(resolve_limit_for_route(None, None, Some(3), 9), 3);
+        assert_eq!(
+            resolve_limit_for_route(None, None, None, DEFAULT_MAX_HUNK_BYTES),
+            9_000
+        );
+    }
+
+    #[test]
+    fn route_default_lookup_is_exact_then_basename() {
+        use super::route_default_for;
+        use zoder_core::config::RouteReviewDefaults;
+        let mut m: BTreeMap<String, RouteReviewDefaults> = BTreeMap::new();
+        m.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(64_000),
+                max_diff_bytes: None,
+            },
+        );
+        m.insert(
+            "nemotron-3-ultra-550b-a55b".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(24_000),
+                max_diff_bytes: Some(400_000),
+            },
+        );
+        // exact hit
+        let d = route_default_for(&m, "qwen38").expect("exact");
+        assert_eq!(d.max_hunk_bytes, Some(64_000));
+        // basename hit for a namespaced served id
+        let d = route_default_for(&m, "nvidia/nemotron-3-ultra-550b-a55b").expect("basename");
+        assert_eq!(d.max_hunk_bytes, Some(24_000));
+        assert_eq!(d.max_diff_bytes, Some(400_000));
+        // unknown route -> None (caller falls back to 9000)
+        assert!(route_default_for(&m, "gemma4-31b").is_none());
+        assert!(route_default_for(&m, "").is_none());
+    }
+
+    fn synth_multi_hunk_diff(files: usize, added_lines: usize) -> String {
+        let mut out = String::new();
+        for f in 0..files {
+            out.push_str(&format!(
+                "diff --git a/f{f} b/f{f}\n--- a/f{f}\n+++ b/f{f}\n"
+            ));
+            out.push_str(&format!("@@ -1,1 +1,{} @@\n", added_lines + 1));
+            out.push_str("-old line\n");
+            for i in 0..added_lines {
+                out.push_str(&format!("+added line {f}/{i}\n"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn raised_cap_yields_fewer_chunks_and_all_fit() {
+        let diff = synth_multi_hunk_diff(60, 200); // ~100 KB of added lines
+        assert!(diff.len() > 90_000, "fixture must exceed the 9000 cap");
+        let c9 = review_diff_chunks(&diff, 9_000, true, 10_000).unwrap();
+        let c24 = review_diff_chunks(&diff, 24_000, true, 10_000).unwrap();
+        let c64 = review_diff_chunks(&diff, 64_000, true, 10_000).unwrap();
+        assert!(
+            c9.len() > c24.len() && c24.len() > c64.len(),
+            "chunk counts must fall as the cap rises: {} {} {}",
+            c9.len(),
+            c24.len(),
+            c64.len()
+        );
+        assert!(c9.iter().all(|c| c.len() <= 9_000));
+        assert!(c24.iter().all(|c| c.len() <= 24_000));
+        assert!(c64.iter().all(|c| c.len() <= 64_000));
     }
 }

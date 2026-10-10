@@ -1893,11 +1893,40 @@ pub struct ReviewConfig {
     /// `--exclude` on the command line. CLI: `--exclude`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Per-reviewer-route size caps. The map key is a reviewer model id (the
+    /// exact id as configured/served, e.g. `qwen38`, or its basename after the
+    /// last `/` for namespaced ids such as
+    /// `nvidia/nemotron-3-ultra-550b-a55b`). A route entry beats the general
+    /// `max_diff_bytes` / `max_hunk_bytes` above; an explicit CLI flag beats
+    /// both; a reviewer whose id has no entry falls back to the general value
+    /// and then the historical 9000-byte default. See
+    /// [`crate::config::RouteReviewDefaults`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub route_defaults: BTreeMap<String, RouteReviewDefaults>,
+}
+
+/// Per-reviewer size caps inside `[review.route_defaults.<model>]`. Both fields
+/// are optional; an absent entry leaves the general `[review]` value (and then
+/// the built-in default) in force for that reviewer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteReviewDefaults {
+    /// Per-hunk / per-chunk byte cap for this reviewer. CLI `--max-hunk-bytes`
+    /// still wins. Falls back to `[review].max_hunk_bytes` then 9000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hunk_bytes: Option<usize>,
+    /// Total-diff byte cap for this reviewer. CLI `--max-diff-bytes` still
+    /// wins. Falls back to `[review].max_diff_bytes` then 120000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<usize>,
 }
 
 impl ReviewConfig {
     fn is_empty(&self) -> bool {
-        self.max_diff_bytes.is_none() && self.max_hunk_bytes.is_none() && self.exclude.is_empty()
+        self.max_diff_bytes.is_none()
+            && self.max_hunk_bytes.is_none()
+            && self.exclude.is_empty()
+            && self.route_defaults.is_empty()
     }
 }
 
@@ -3382,6 +3411,16 @@ pub struct VendorOverlay {
     /// back to the built-in default palette.
     #[serde(default)]
     pub theme: Option<Theme>,
+    /// Optional `[review]` overrides contributed by this overlay (size caps and
+    /// per-route `route_defaults`). Merged field-wise onto the base config's
+    /// `[review]`: a field set here wins, `exclude` globs union, and
+    /// `route_defaults` entries merge field-wise per model (an overlay that
+    /// sets only `max_hunk_bytes` keeps the base entry's `max_diff_bytes`).
+    /// This is how a fleet `config.<vendor>.toml` — the overlay zoder actually
+    /// reads on the hosts, which has no `config.json` — can carry per-route
+    /// chunk caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3590,6 +3629,9 @@ fn apply_overlays_filtered(
                 .push(p.id.clone());
             cfg.providers.push(p.clone());
         }
+        if let Some(review) = &overlay.review {
+            merge_review_config(&mut cfg.review, review);
+        }
         if overlay.theme.is_some() {
             fallback_theme = overlay.theme.clone();
         }
@@ -3663,6 +3705,34 @@ fn apply_overlays_filtered(
         cfg.request_timeout_s = Some(request_timeout_s);
     }
     Ok(())
+}
+
+/// Field-wise merge of an overlay's `[review]` block onto the base review
+/// config. A field the overlay sets wins; `exclude` globs are unioned (order
+/// preserved, deduped); `route_defaults` entries are merged per key with the
+/// overlay winning. Absent fields leave the base value (and then the built-in
+/// default) untouched.
+fn merge_review_config(base: &mut ReviewConfig, overlay: &ReviewConfig) {
+    if overlay.max_diff_bytes.is_some() {
+        base.max_diff_bytes = overlay.max_diff_bytes;
+    }
+    if overlay.max_hunk_bytes.is_some() {
+        base.max_hunk_bytes = overlay.max_hunk_bytes;
+    }
+    for glob in &overlay.exclude {
+        if !base.exclude.contains(glob) {
+            base.exclude.push(glob.clone());
+        }
+    }
+    for (model, route) in &overlay.route_defaults {
+        let entry = base.route_defaults.entry(model.clone()).or_default();
+        if route.max_hunk_bytes.is_some() {
+            entry.max_hunk_bytes = route.max_hunk_bytes;
+        }
+        if route.max_diff_bytes.is_some() {
+            entry.max_diff_bytes = route.max_diff_bytes;
+        }
+    }
 }
 
 fn collect_overlays(
@@ -4709,6 +4779,85 @@ header = "1;38;2;10;20;30"
         assert_eq!(cfg.theme.warn, Theme::default().warn);
         // And the default-claiming overlay also set the active default provider.
         assert_eq!(cfg.default_provider, "acme-gw");
+    }
+
+    #[test]
+    fn overlay_review_block_merges_per_route_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.fleet.toml"),
+            r#"
+[review]
+max_hunk_bytes = 12345
+exclude = ["**/*.min.js"]
+
+[review.route_defaults.qwen38]
+max_hunk_bytes = 64000
+
+[review.route_defaults."nvidia/nemotron-3-ultra-550b-a55b"]
+max_hunk_bytes = 24000
+max_diff_bytes = 400000
+
+[[providers]]
+id = "gw"
+base_url = "https://gw.example/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "K" }
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        apply_overlays(&mut cfg, dir.path()).unwrap();
+        assert_eq!(cfg.review.max_hunk_bytes, Some(12_345));
+        assert_eq!(cfg.review.exclude, vec!["**/*.min.js".to_string()]);
+        assert_eq!(
+            cfg.review.route_defaults["qwen38"].max_hunk_bytes,
+            Some(64_000)
+        );
+        assert_eq!(
+            cfg.review.route_defaults["nvidia/nemotron-3-ultra-550b-a55b"].max_diff_bytes,
+            Some(400_000)
+        );
+    }
+
+    #[test]
+    fn merge_review_route_defaults_is_field_wise_per_model() {
+        let mut base = ReviewConfig::default();
+        base.route_defaults.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(1_000),
+                max_diff_bytes: Some(2_000),
+            },
+        );
+        let mut overlay = ReviewConfig::default();
+        overlay.route_defaults.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(64_000),
+                max_diff_bytes: None,
+            },
+        );
+        overlay.route_defaults.insert(
+            "MiniMax-M3".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(48_000),
+                max_diff_bytes: None,
+            },
+        );
+        merge_review_config(&mut base, &overlay);
+        // Overlay field wins, but the base's unset-field value survives.
+        assert_eq!(base.route_defaults["qwen38"].max_hunk_bytes, Some(64_000));
+        assert_eq!(
+            base.route_defaults["qwen38"].max_diff_bytes,
+            Some(2_000),
+            "a partial overlay entry must not drop the base field"
+        );
+        // A model only in the overlay is added.
+        assert_eq!(
+            base.route_defaults["MiniMax-M3"].max_hunk_bytes,
+            Some(48_000)
+        );
     }
 
     #[test]
@@ -6663,5 +6812,33 @@ auth = { type = "env", var = "GUARD_KEY" }
             Instant::now() + Duration::from_secs(300),
         );
         assert_eq!(exit, SwapExit::IterationCap);
+    }
+
+    #[test]
+    fn review_route_defaults_parse_and_are_optional() {
+        let raw = r#"
+            max_hunk_bytes = 16000
+            [route_defaults.qwen38]
+            max_hunk_bytes = 64000
+            [route_defaults."nvidia/nemotron-3-ultra-550b-a55b"]
+            max_hunk_bytes = 24000
+            max_diff_bytes = 400000
+        "#;
+        let rc: ReviewConfig = toml::from_str(raw).expect("route_defaults must parse");
+        assert_eq!(rc.max_hunk_bytes, Some(16_000));
+        assert_eq!(rc.route_defaults["qwen38"].max_hunk_bytes, Some(64_000));
+        assert_eq!(
+            rc.route_defaults["nvidia/nemotron-3-ultra-550b-a55b"].max_diff_bytes,
+            Some(400_000)
+        );
+        // A route block with only one cap leaves the other None.
+        assert!(
+            rc.route_defaults["qwen38"].max_diff_bytes.is_none(),
+            "unset field stays None"
+        );
+
+        let empty: ReviewConfig = toml::from_str("").expect("empty review block is valid");
+        assert!(empty.route_defaults.is_empty());
+        assert!(empty.is_empty(), "empty block must round-trip as empty");
     }
 }
