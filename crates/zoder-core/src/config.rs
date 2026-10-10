@@ -1919,6 +1919,16 @@ pub struct RouteReviewDefaults {
     /// wins. Falls back to `[review].max_diff_bytes` then 120000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_diff_bytes: Option<usize>,
+    /// Upper bound on review chunks for this reviewer (default: derived from
+    /// the two byte caps). A diff needing more chunks fails naming the caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chunks: Option<usize>,
+    /// Output-token floor for this reviewer's verdict calls. Reasoning models
+    /// spend tokens before the JSON verdict and truncate below their floor
+    /// (measured: MiniMax-M3 needed 32768 on real diffs). Raises, never
+    /// lowers, the global review floor; bounded by the review ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl ReviewConfig {
@@ -3563,7 +3573,44 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<Stri
 /// the report. On any duplicate-id collision or ambiguous `default = true`,
 /// returns an error.
 fn apply_overlays(cfg: &mut Config, home: &Path) -> anyhow::Result<()> {
-    apply_overlays_filtered(cfg, home, None)
+    apply_overlays_filtered(cfg, home, None)?;
+    apply_review_file(cfg, home);
+    Ok(())
+}
+
+/// Dedicated review-sizing file: `<home>/review.toml`, holding only a
+/// `[review]` table (`max_diff_bytes`, `max_hunk_bytes`, `exclude`,
+/// `[review.route_defaults.<model>]`).
+///
+/// Why a separate file: a build that predates `[review]` support in vendor
+/// overlays ignores the WHOLE `config.<vendor>.toml` when it meets an unknown
+/// `[review]` table -- every provider in it disappears while
+/// `config --validate` still reports VALID. Builds that do not know this
+/// file never open it, so review sizing can be deployed to a host before or
+/// after its binary is upgraded without breaking routing. Merged after the
+/// overlays, so it wins over an overlay `[review]`.
+pub const REVIEW_CONFIG_FILE: &str = "review.toml";
+
+fn apply_review_file(cfg: &mut Config, home: &Path) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReviewFile {
+        #[serde(default)]
+        review: ReviewConfig,
+    }
+    let path = home.join(REVIEW_CONFIG_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("[zoder] warning: ignoring {}: {e}", path.display());
+            return;
+        }
+    };
+    match toml::from_str::<ReviewFile>(&raw) {
+        Ok(file) => merge_review_config(&mut cfg.review, &file.review),
+        Err(e) => eprintln!("[zoder] warning: ignoring {}: {e}", path.display()),
+    }
 }
 
 fn apply_overlays_filtered(
@@ -3731,6 +3778,12 @@ fn merge_review_config(base: &mut ReviewConfig, overlay: &ReviewConfig) {
         }
         if route.max_diff_bytes.is_some() {
             entry.max_diff_bytes = route.max_diff_bytes;
+        }
+        if route.max_chunks.is_some() {
+            entry.max_chunks = route.max_chunks;
+        }
+        if route.max_tokens.is_some() {
+            entry.max_tokens = route.max_tokens;
         }
     }
 }
@@ -4820,6 +4873,32 @@ auth = { type = "env", var = "K" }
         );
     }
 
+    /// `review.toml` carries route defaults without touching the vendor
+    /// overlay (which older builds would drop wholesale), and wins over an
+    /// overlay `[review]`; a malformed file is ignored, not fatal.
+    #[test]
+    fn review_file_is_merged_after_overlays_and_bad_files_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(REVIEW_CONFIG_FILE),
+            "[review]\nmax_diff_bytes = 400000\n[review.route_defaults.qwen38]\nmax_hunk_bytes = 64000\nmax_tokens = 16384\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        apply_overlays(&mut cfg, dir.path()).unwrap();
+        assert_eq!(cfg.review.max_diff_bytes, Some(400_000));
+        assert_eq!(
+            cfg.review.route_defaults["qwen38"].max_hunk_bytes,
+            Some(64_000)
+        );
+        assert_eq!(cfg.review.route_defaults["qwen38"].max_tokens, Some(16_384));
+
+        std::fs::write(dir.path().join(REVIEW_CONFIG_FILE), "[review]\nbogus = 1\n").unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        apply_overlays(&mut cfg, dir.path()).unwrap();
+        assert!(cfg.review.route_defaults.is_empty());
+    }
+
     #[test]
     fn merge_review_route_defaults_is_field_wise_per_model() {
         let mut base = ReviewConfig::default();
@@ -4828,6 +4907,7 @@ auth = { type = "env", var = "K" }
             RouteReviewDefaults {
                 max_hunk_bytes: Some(1_000),
                 max_diff_bytes: Some(2_000),
+                ..Default::default()
             },
         );
         let mut overlay = ReviewConfig::default();
@@ -4836,6 +4916,7 @@ auth = { type = "env", var = "K" }
             RouteReviewDefaults {
                 max_hunk_bytes: Some(64_000),
                 max_diff_bytes: None,
+                ..Default::default()
             },
         );
         overlay.route_defaults.insert(
@@ -4843,6 +4924,7 @@ auth = { type = "env", var = "K" }
             RouteReviewDefaults {
                 max_hunk_bytes: Some(48_000),
                 max_diff_bytes: None,
+                ..Default::default()
             },
         );
         merge_review_config(&mut base, &overlay);
