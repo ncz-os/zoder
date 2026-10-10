@@ -88,6 +88,56 @@ pub fn route_default_for<'a>(
     None
 }
 
+/// Effective review sizing for one reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewCaps {
+    pub max_hunk_bytes: usize,
+    pub max_diff_bytes: usize,
+    pub max_chunks: usize,
+    /// Per-route output-token floor, when configured.
+    pub max_tokens_floor: Option<u32>,
+    /// True when a `[review.route_defaults]` entry matched this reviewer.
+    pub from_route: bool,
+}
+
+/// Resolve the sizing for `model` with precedence
+/// CLI flag > `[review.route_defaults.<model>]` > `[review]` > built-in
+/// default (9000 / 120000; chunks derived from the two caps).
+pub fn resolve_review_caps(
+    flag_hunk: Option<usize>,
+    flag_diff: Option<usize>,
+    cfg: Option<&zoder_core::config::ReviewConfig>,
+    model: Option<&str>,
+) -> ReviewCaps {
+    let route = match (cfg, model) {
+        (Some(c), Some(m)) => route_default_for(&c.route_defaults, m),
+        _ => None,
+    };
+    let max_hunk_bytes = resolve_limit_for_route(
+        flag_hunk,
+        route.and_then(|r| r.max_hunk_bytes),
+        cfg.and_then(|c| c.max_hunk_bytes),
+        DEFAULT_MAX_HUNK_BYTES,
+    );
+    let max_diff_bytes = resolve_limit_for_route(
+        flag_diff,
+        route.and_then(|r| r.max_diff_bytes),
+        cfg.and_then(|c| c.max_diff_bytes),
+        DEFAULT_MAX_DIFF_BYTES,
+    );
+    let max_chunks = route
+        .and_then(|r| r.max_chunks)
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| derived_max_chunks(max_diff_bytes, max_hunk_bytes));
+    ReviewCaps {
+        max_hunk_bytes,
+        max_diff_bytes,
+        max_chunks,
+        max_tokens_floor: route.and_then(|r| r.max_tokens),
+        from_route: route.is_some(),
+    }
+}
+
 /// Derive how many reviewer chunks a total cap implies (with slack), never
 /// below the historical floor so the default path is unchanged.
 pub fn derived_max_chunks(max_diff_bytes: usize, max_hunk_bytes: usize) -> usize {
@@ -759,7 +809,11 @@ pub fn review_diff_chunks(
     if diff.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let mut units: Vec<String> = Vec::new();
+    // Each unit is (file header, body). Consecutive units of the same file
+    // that land in one chunk share a single header, so a fragment-heavy diff
+    // is not inflated by repeating `diff --git`/`index`/`---`/`+++` for every
+    // hunk (measured ~40% inflation on a 391-hunk diff).
+    let mut units: Vec<(String, String)> = Vec::new();
     for section in sections(diff) {
         let path = section_path(section).unwrap_or_default();
         let Some(first_hunk) = section.find("\n@@").map(|i| i + 1) else {
@@ -770,7 +824,7 @@ pub fn review_diff_chunks(
                     cap
                 );
             }
-            units.push(section.to_owned());
+            units.push((String::new(), section.to_owned()));
             continue;
         };
         let header = &section[..first_hunk];
@@ -779,16 +833,19 @@ pub fn review_diff_chunks(
         hunk_starts.extend(body.match_indices("\n@@").map(|(i, _)| i + 1));
         for (hidx, hstart) in hunk_starts.iter().enumerate() {
             let hend = hunk_starts.get(hidx + 1).copied().unwrap_or(body.len());
-            let unit = format!("{header}{}", &body[*hstart..hend]);
-            if unit.len() <= cap {
-                units.push(unit);
+            let hunk = &body[*hstart..hend];
+            if header.len() + hunk.len() <= cap {
+                units.push((header.to_owned(), hunk.to_owned()));
             } else if split_hunks {
-                let parts = split_oversized_hunk(header, &body[*hstart..hend], &path, cap)?;
-                units.extend(parts);
+                let parts = split_oversized_hunk(header, hunk, &path, cap)?;
+                for part in parts {
+                    let rest = part.strip_prefix(header).unwrap_or(&part).to_owned();
+                    units.push((header.to_owned(), rest));
+                }
             } else {
                 bail!(
                     "one diff hunk is {} bytes, above the {}-byte review limit; pass --max-hunk-bytes N to raise it, or omit --no-split-hunks to split it automatically",
-                    unit.len(),
+                    header.len() + hunk.len(),
                     cap
                 );
             }
@@ -796,17 +853,25 @@ pub fn review_diff_chunks(
     }
 
     let mut chunks: Vec<String> = Vec::new();
-    for unit in units {
-        if chunks
-            .last()
-            .is_none_or(|chunk| chunk.len() + unit.len() > cap)
-        {
+    // Header of the last unit placed in the current chunk.
+    let mut last_header: Option<String> = None;
+    for (header, body) in units {
+        let continues_file = !header.is_empty() && last_header.as_deref() == Some(header.as_str());
+        let cost = if continues_file {
+            body.len()
+        } else {
+            header.len() + body.len()
+        };
+        let needs_new = chunks.last().is_none_or(|chunk| chunk.len() + cost > cap);
+        if needs_new {
             chunks.push(String::new());
         }
-        chunks
-            .last_mut()
-            .expect("chunk was just created")
-            .push_str(&unit);
+        let chunk = chunks.last_mut().expect("chunk was just created");
+        if needs_new || !continues_file {
+            chunk.push_str(&header);
+        }
+        chunk.push_str(&body);
+        last_header = Some(header);
         if chunks.len() > max_chunks {
             bail!(
                 "diff needs more than {max_chunks} review chunks at {cap} bytes each; raise --max-hunk-bytes (or --max-diff-bytes) or --exclude generated files"
@@ -1010,6 +1075,7 @@ pub struct PreparedDiff {
 /// (`zoderignore`, then configured `[review].exclude`, then `--exclude`). The
 /// total cap is checked *after* exclusion; a diff over it fails naming
 /// `--max-diff-bytes`.
+#[cfg(test)]
 pub fn prepare_review_diff(
     zoderignore: &[String],
     raw_diff: &str,
@@ -1017,6 +1083,31 @@ pub fn prepare_review_diff(
     config_excludes: &[String],
     max_diff_bytes: usize,
     max_hunk_bytes: usize,
+    split_hunks: bool,
+) -> anyhow::Result<PreparedDiff> {
+    prepare_review_diff_with_chunks(
+        zoderignore,
+        raw_diff,
+        cli_excludes,
+        config_excludes,
+        max_diff_bytes,
+        max_hunk_bytes,
+        derived_max_chunks(max_diff_bytes, max_hunk_bytes),
+        split_hunks,
+    )
+}
+
+/// [`prepare_review_diff`] with an explicit chunk-count bound (per-route
+/// `max_chunks`).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_review_diff_with_chunks(
+    zoderignore: &[String],
+    raw_diff: &str,
+    cli_excludes: &[String],
+    config_excludes: &[String],
+    max_diff_bytes: usize,
+    max_hunk_bytes: usize,
+    max_chunks: usize,
     split_hunks: bool,
 ) -> anyhow::Result<PreparedDiff> {
     let mut patterns = zoderignore.to_vec();
@@ -1034,7 +1125,6 @@ pub fn prepare_review_diff(
             max_diff_bytes
         );
     }
-    let max_chunks = derived_max_chunks(max_diff_bytes, max_hunk_bytes);
     let chunks = review_diff_chunks(&filtered, max_hunk_bytes, split_hunks, max_chunks)?;
     let diff_map = if chunks.len() > 1 {
         Some(build_diff_map(&filtered))
@@ -1545,6 +1635,82 @@ mod tests {
         assert!(!parts[1].contains(&"c".repeat(48)));
     }
 
+    /// Chunkstudy finding: every hunk unit repeated its file header, so a
+    /// fragment-heavy diff grew ~40% when packed. Hunks of one file in one
+    /// chunk now share one header, and the chunk is still a valid diff.
+    #[test]
+    fn hunks_of_one_file_in_one_chunk_share_a_single_header() {
+        let mut diff = String::from(
+            "diff --git a/f.rs b/f.rs\nindex 1111111..2222222 100644\n--- a/f.rs\n+++ b/f.rs\n",
+        );
+        for h in 0..50 {
+            diff.push_str(&format!(
+                "@@ -{0},1 +{0},1 @@\n-old {h}\n+new {h}\n",
+                h * 10 + 1
+            ));
+        }
+        let chunks = review_diff_chunks(&diff, 200_000, true, 64).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].matches("diff --git").count(), 1);
+        assert_eq!(chunks[0].matches("\n@@ ").count(), 50);
+        assert!(chunks[0].len() <= diff.len());
+        // At a small cap every chunk still starts with the file header.
+        let small = review_diff_chunks(&diff, 300, true, 64).unwrap();
+        assert!(small.len() > 1);
+        assert!(small
+            .iter()
+            .all(|c| c.starts_with("diff --git a/f.rs") && c.len() <= 300));
+        let total: usize = small.iter().map(|c| c.matches("\n@@ ").count()).sum();
+        assert_eq!(total, 50);
+    }
+
+    /// Per-route sizing: each reviewer gets its own caps, CLI flags win, an
+    /// unknown reviewer keeps the historical 9000, and the output floor and
+    /// chunk bound come from the route entry.
+    #[test]
+    fn review_caps_are_resolved_per_reviewer() {
+        use zoder_core::config::{ReviewConfig, RouteReviewDefaults};
+        let mut cfg = ReviewConfig {
+            max_diff_bytes: Some(400_000),
+            ..Default::default()
+        };
+        cfg.route_defaults.insert(
+            "qwen38".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(64_000),
+                max_tokens: Some(16_384),
+                ..Default::default()
+            },
+        );
+        cfg.route_defaults.insert(
+            "MiniMax-M3".into(),
+            RouteReviewDefaults {
+                max_hunk_bytes: Some(48_000),
+                max_chunks: Some(3),
+                max_tokens: Some(32_768),
+                ..Default::default()
+            },
+        );
+        let q = resolve_review_caps(None, None, Some(&cfg), Some("qwen38"));
+        assert_eq!((q.max_hunk_bytes, q.max_diff_bytes), (64_000, 400_000));
+        assert_eq!(q.max_tokens_floor, Some(16_384));
+        assert!(q.from_route);
+        let g = resolve_review_caps(None, None, Some(&cfg), Some("gemma4-31b"));
+        assert_eq!(g.max_hunk_bytes, DEFAULT_MAX_HUNK_BYTES);
+        assert_eq!(g.max_diff_bytes, 400_000);
+        assert!(!g.from_route && g.max_tokens_floor.is_none());
+        let m = resolve_review_caps(None, None, Some(&cfg), Some("MiniMax-M3"));
+        assert_eq!(m.max_chunks, 3);
+        let flagged = resolve_review_caps(Some(9_000), Some(50_000), Some(&cfg), Some("qwen38"));
+        assert_eq!(
+            (flagged.max_hunk_bytes, flagged.max_diff_bytes),
+            (9_000, 50_000)
+        );
+        let none = resolve_review_caps(None, None, None, None);
+        assert_eq!(none.max_hunk_bytes, DEFAULT_MAX_HUNK_BYTES);
+        assert_eq!(none.max_diff_bytes, DEFAULT_MAX_DIFF_BYTES);
+    }
+
     #[test]
     fn resolve_limit_prefers_flag_then_route_then_config_then_default() {
         use super::{resolve_limit_for_route, DEFAULT_MAX_HUNK_BYTES};
@@ -1567,6 +1733,7 @@ mod tests {
             RouteReviewDefaults {
                 max_hunk_bytes: Some(64_000),
                 max_diff_bytes: None,
+                ..Default::default()
             },
         );
         m.insert(
@@ -1574,6 +1741,7 @@ mod tests {
             RouteReviewDefaults {
                 max_hunk_bytes: Some(24_000),
                 max_diff_bytes: Some(400_000),
+                ..Default::default()
             },
         );
         // exact hit
