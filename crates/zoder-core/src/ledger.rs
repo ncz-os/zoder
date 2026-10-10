@@ -47,9 +47,40 @@ pub struct FinOpsTags {
 const MAX_LEDGER_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 /// Space allocated before a billable call. The completed entry is written into
 /// this already-allocated region, so a full filesystem cannot strand spend
-/// after dispatch. Ledger entries contain metadata, not prompts/responses; 64
-/// KiB leaves ample reconciliation headroom while keeping the bound explicit.
-const BILLABLE_RESERVATION_BYTES: usize = 64 * 1024;
+/// after dispatch. Ledger entries contain metadata, not prompts/responses
+/// (a final row is ~300-400 bytes); 4 KiB leaves ample reconciliation
+/// headroom, and an oversized `violation` note is truncated to fit.
+///
+/// Was 64 KiB. Every slot stayed in the file forever, so the ledger grew by
+/// 64 KiB per call (506 MB after 7,725 calls on one fleet host) and every
+/// reservation re-read the whole file under the exclusive ledger lock --
+/// concurrent sessions on one host serialized behind multi-second scans.
+const BILLABLE_RESERVATION_BYTES: usize = 4 * 1024;
+/// Slot size written by older zoder builds; still recognized so abandoned
+/// legacy reservations are recovered and legacy rows are compacted.
+const LEGACY_RESERVATION_BYTES: usize = 64 * 1024;
+/// Compact the ledger (drop slot padding and blank rows) once it is at least
+/// this large AND more than half of it is padding.
+const COMPACT_MIN_BYTES: u64 = 4 * 1024 * 1024;
+/// Older builds cannot find a reservation row that a compaction moved, so a
+/// legacy-size reservation row younger than this postpones compaction (its
+/// owner may still be mid-dispatch). Rows written by this build relocate by
+/// marker and never block.
+const LEGACY_INFLIGHT_GRACE_S: i64 = 3600;
+
+/// What the recovery scan learned about compaction.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanStats {
+    /// Padding bytes held by finished rows and blank slots.
+    waste: u64,
+    /// A recent legacy-size reservation row exists (an older build may be
+    /// mid-dispatch on it), so compaction must wait.
+    legacy_inflight: bool,
+}
+
+fn is_reservation_slot_len(bytes: usize) -> bool {
+    bytes == BILLABLE_RESERVATION_BYTES || bytes == LEGACY_RESERVATION_BYTES
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -224,6 +255,31 @@ impl BillableReservation {
             .map_err(|message| anyhow::anyhow!(message.clone()))
     }
 
+    /// Confirm this reservation's slot is still at `offset`; if a compaction
+    /// moved it, find it again by its unique marker and update `offset`.
+    /// Fails closed (as before) when the marker is nowhere in the ledger, e.g.
+    /// the canonical file was replaced. Caller holds the ledger lock.
+    fn relocate(&mut self, file: &mut File) -> anyhow::Result<()> {
+        if verify_reservation_slot(file, self.offset, self.slot_bytes, &self.marker, &self.path)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        match find_reservation_slot(file, self.slot_bytes, &self.marker)? {
+            Some(offset) => {
+                self.offset = offset;
+                Ok(())
+            }
+            None => verify_reservation_slot(
+                file,
+                self.offset,
+                self.slot_bytes,
+                &self.marker,
+                &self.path,
+            ),
+        }
+    }
+
     /// Mark the reservation as immediately preceding dispatch. Before this is
     /// called, dropping the guard cancels the slot (for example when a user
     /// declines a budget prompt); afterward, an unreconciled slot is retained
@@ -241,6 +297,7 @@ impl BillableReservation {
             .with_context(|| {
                 format!("opening ledger at {} before dispatch", self.path.display())
             })?;
+        self.relocate(&mut file)?;
         transition_reservation_to_armed(
             &mut file,
             self.offset,
@@ -261,7 +318,7 @@ impl BillableReservation {
         if !entry_numbers_valid(entry) {
             anyhow::bail!("ledger entry contains invalid cost, calls, or cache-hit telemetry");
         }
-        let json = serde_json::to_vec(entry)?;
+        let json = fit_entry_json(entry, self.slot_bytes)?;
         if json.len() + 1 > self.slot_bytes {
             anyhow::bail!(
                 "ledger entry is {} bytes, exceeding the {}-byte preallocated reconciliation slot",
@@ -284,13 +341,7 @@ impl BillableReservation {
                     self.path.display()
                 )
             })?;
-        verify_reservation_slot(
-            &mut file,
-            self.offset,
-            self.slot_bytes,
-            &self.marker,
-            &self.path,
-        )?;
+        self.relocate(&mut file)?;
         file.seek(SeekFrom::Start(self.offset))?;
         file.write_all(&line)?;
         file.sync_data()?;
@@ -311,15 +362,7 @@ impl Drop for BillableReservation {
                         .write(true)
                         .open(&self.path)
                     {
-                        if verify_reservation_slot(
-                            &mut file,
-                            self.offset,
-                            self.slot_bytes,
-                            &self.marker,
-                            &self.path,
-                        )
-                        .is_ok()
-                        {
+                        if self.relocate(&mut file).is_ok() {
                             let mut blank = vec![b' '; self.slot_bytes];
                             blank[self.slot_bytes - 1] = b'\n';
                             let _ = file.seek(SeekFrom::Start(self.offset));
@@ -343,6 +386,58 @@ fn open_lock_file(path: &Path) -> anyhow::Result<File> {
         .write(true)
         .open(path)
         .with_context(|| format!("opening ledger lock at {}", path.display()))
+}
+
+/// Serialize a final entry so it fits a `slot_bytes` slot (with its newline):
+/// an over-long `violation` note is truncated rather than failing the
+/// reconciliation and leaving the call recorded as unknown spend.
+fn fit_entry_json(entry: &Entry, slot_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let json = serde_json::to_vec(entry)?;
+    if json.len() < slot_bytes {
+        return Ok(json);
+    }
+    let Some(violation) = entry.violation.as_deref() else {
+        return Ok(json);
+    };
+    let over = json.len() + 1 - slot_bytes;
+    let suffix = " [truncated]";
+    let keep = violation.len().saturating_sub(over + suffix.len() + 8);
+    let mut cut = keep;
+    while cut > 0 && !violation.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut trimmed = entry.clone();
+    trimmed.violation = Some(format!("{}{suffix}", &violation[..cut]));
+    Ok(serde_json::to_vec(&trimmed)?)
+}
+
+/// Scan for the line of exactly `slot_bytes` bytes that carries `marker`.
+fn find_reservation_slot(
+    file: &mut File,
+    slot_bytes: usize,
+    marker: &str,
+) -> anyhow::Result<Option<u64>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut offset = 0_u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes = (&mut reader)
+            .take((MAX_LEDGER_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if bytes == slot_bytes
+            && line
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        {
+            return Ok(Some(offset));
+        }
+        offset = offset.saturating_add(u64::try_from(bytes)?);
+    }
 }
 
 fn verify_reservation_slot(
@@ -435,13 +530,7 @@ impl Ledger {
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
         lock.lock_exclusive()?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
-        self.recover_abandoned_prepared(&mut f)?;
+        let mut f = self.open_locked_rw("recording")?;
         self.entries_strict_from_file(&mut f)?;
         f.seek(SeekFrom::End(0))?;
         f.write_all(line.as_bytes())?;
@@ -462,16 +551,7 @@ impl Ledger {
         let lock = open_lock_file(&lock_path)?;
         lock.lock_exclusive()
             .with_context(|| format!("locking ledger at {}", self.path.display()))?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .with_context(|| {
-                format!("opening ledger for reservation at {}", self.path.display())
-            })?;
-        self.recover_abandoned_prepared(&mut file)?;
+        let mut file = self.open_locked_rw("reservation")?;
         let entries = self.entries_strict_from_file(&mut file)?;
         let month_to_date = month_to_date_from_entries(&entries).map_err(|error| error.to_string());
 
@@ -555,13 +635,19 @@ impl Ledger {
         PathBuf::from(lock)
     }
 
-    fn recover_abandoned_prepared(&self, file: &mut File) -> anyhow::Result<()> {
+    /// Recover abandoned prepared reservations and return the number of
+    /// padding bytes held by finished (non-reservation) rows and blank rows,
+    /// which [`Self::compact_if_wasteful`] uses to decide on compaction.
+    fn recover_abandoned_prepared(&self, file: &mut File) -> anyhow::Result<ScanStats> {
         file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::new(&mut *file);
         let mut offset = 0_u64;
         let mut line_no = 0_usize;
         let mut line = Vec::new();
         let mut abandoned = Vec::new();
+        let mut waste = 0_u64;
+        let mut legacy_inflight = false;
+        let now = Utc::now();
         loop {
             line_no += 1;
             line.clear();
@@ -576,12 +662,31 @@ impl Ledger {
                     "ledger line {line_no} exceeds {MAX_LEDGER_LINE_BYTES} bytes; truncating early"
                 );
             }
-            if bytes == BILLABLE_RESERVATION_BYTES {
+            if is_reservation_slot_len(bytes) {
                 let mut payload = line.as_slice();
                 while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
                     payload = &payload[..payload.len() - 1];
                 }
-                if let Ok(entry) = serde_json::from_slice::<Entry>(payload) {
+                let parsed = serde_json::from_slice::<Entry>(payload).ok();
+                let is_reservation = parsed
+                    .as_ref()
+                    .is_some_and(|entry| entry.provider == RESERVATION_PROVIDER);
+                if is_reservation
+                    && bytes == LEGACY_RESERVATION_BYTES
+                    && parsed.as_ref().is_some_and(|entry| {
+                        (now - entry.ts_utc).num_seconds() < LEGACY_INFLIGHT_GRACE_S
+                    })
+                {
+                    legacy_inflight = true;
+                }
+                if !is_reservation {
+                    // Finished or blank slot: everything past the payload
+                    // and its newline is compactable padding.
+                    waste = waste.saturating_add(
+                        u64::try_from(bytes.saturating_sub(payload.len() + 1)).unwrap_or(0),
+                    );
+                }
+                if let Some(entry) = parsed {
                     if entry.provider == RESERVATION_PROVIDER
                         && entry.model == PREPARED_RESERVATION_MODEL
                     {
@@ -593,7 +698,7 @@ impl Ledger {
                         let owner_path = reservation_owner_lock_path(&self.path, marker);
                         let owner = open_lock_file(&owner_path)?;
                         match owner.try_lock_exclusive() {
-                            Ok(()) => abandoned.push((offset, owner_path, owner)),
+                            Ok(()) => abandoned.push((offset, bytes, owner_path, owner)),
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(error) => return Err(error.into()),
                         }
@@ -604,7 +709,10 @@ impl Ledger {
         }
         drop(reader);
         if abandoned.is_empty() {
-            return Ok(());
+            return Ok(ScanStats {
+                waste,
+                legacy_inflight,
+            });
         }
         let mut writable = std::fs::OpenOptions::new()
             .read(true)
@@ -616,16 +724,129 @@ impl Ledger {
                     self.path.display()
                 )
             })?;
-        let mut blank = vec![b' '; BILLABLE_RESERVATION_BYTES];
-        blank[BILLABLE_RESERVATION_BYTES - 1] = b'\n';
-        for (offset, owner_path, owner) in abandoned {
+        for (offset, bytes, owner_path, owner) in abandoned {
+            let mut blank = vec![b' '; bytes];
+            blank[bytes - 1] = b'\n';
             writable.seek(SeekFrom::Start(offset))?;
             writable.write_all(&blank)?;
+            waste = waste.saturating_add(u64::try_from(bytes).unwrap_or(0));
             drop(owner);
             let _ = std::fs::remove_file(owner_path);
         }
         writable.sync_data()?;
-        Ok(())
+        Ok(ScanStats {
+            waste,
+            legacy_inflight,
+        })
+    }
+
+    /// Rewrite the ledger without slot padding and blank rows when it is at
+    /// least [`COMPACT_MIN_BYTES`] and more than half padding, and no recent
+    /// legacy-size reservation row exists (see [`LEGACY_INFLIGHT_GRACE_S`]).
+    /// Caller holds the
+    /// exclusive ledger lock. Reservation rows (prepared or armed, possibly
+    /// owned by a live process mid-dispatch) are copied byte-for-byte so their
+    /// owners can find them again by marker; finished rows keep their exact
+    /// JSON; malformed rows are copied unchanged so strict reads still see
+    /// them. The new file replaces the old one by an atomic rename. Returns
+    /// true when the file was replaced (the caller must reopen it).
+    fn compact_if_wasteful(&self, file: &mut File, stats: ScanStats) -> anyhow::Result<bool> {
+        let len = file.metadata()?.len();
+        if len < COMPACT_MIN_BYTES || stats.waste.saturating_mul(2) <= len || stats.legacy_inflight
+        {
+            return Ok(false);
+        }
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut tmp_name = self.path.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(format!(".compact-{:016x}", rand::random::<u64>()));
+        let tmp_path = dir.join(tmp_name);
+        let result = (|| -> anyhow::Result<()> {
+            let mut out = std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&tmp_path)
+                    .with_context(|| format!("creating {}", tmp_path.display()))?,
+            );
+            file.seek(SeekFrom::Start(0))?;
+            let mut reader = BufReader::new(&mut *file);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let bytes = (&mut reader)
+                    .take((MAX_LEDGER_LINE_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line)?;
+                if bytes == 0 {
+                    break;
+                }
+                if bytes > MAX_LEDGER_LINE_BYTES {
+                    anyhow::bail!(
+                        "ledger line exceeds {MAX_LEDGER_LINE_BYTES} bytes; not compacting"
+                    );
+                }
+                let mut payload = line.as_slice();
+                while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
+                    payload = &payload[..payload.len() - 1];
+                }
+                if payload.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                match serde_json::from_slice::<Entry>(payload) {
+                    Ok(entry) if entry.provider != RESERVATION_PROVIDER => {
+                        out.write_all(payload)?;
+                        out.write_all(b"\n")?;
+                    }
+                    // Reservation rows and anything unparseable: unchanged.
+                    _ => {
+                        out.write_all(&line)?;
+                        if line.last() != Some(&b'\n') {
+                            out.write_all(b"\n")?;
+                        }
+                    }
+                }
+            }
+            let out = out.into_inner().map_err(|e| e.into_error())?;
+            if let Ok(meta) = file.metadata() {
+                let _ = out.set_permissions(meta.permissions());
+            }
+            out.sync_all()?;
+            std::fs::rename(&tmp_path, &self.path).with_context(|| {
+                format!("replacing {} with its compacted copy", self.path.display())
+            })?;
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Open the ledger for a locked read/write, recover abandoned reservations
+    /// and compact it if it is mostly padding. Caller holds the ledger lock.
+    fn open_locked_rw(&self, what: &str) -> anyhow::Result<File> {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .with_context(|| format!("opening ledger for {what} at {}", self.path.display()))
+        };
+        let mut file = open()?;
+        let stats = self.recover_abandoned_prepared(&mut file)?;
+        if self.compact_if_wasteful(&mut file, stats)? {
+            file = open()?;
+        }
+        Ok(file)
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -1353,6 +1574,252 @@ mod tests {
         let entries = ledger.entries_strict().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].model, "newer");
+    }
+
+    /// Write `n` finished rows padded to `slot` bytes (what older builds left
+    /// behind: every reconciled call kept its whole preallocated slot).
+    fn write_padded_rows(path: &Path, n: usize, slot: usize) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for i in 0..n {
+            let json = serde_json::to_vec(&entry(
+                "2026-07-01 10:00:00",
+                &format!("m{i}"),
+                0.01,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+            let mut line = vec![b' '; slot];
+            line[..json.len()].copy_from_slice(&json);
+            line[slot - 1] = b'\n';
+            f.write_all(&line).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_reservation_slots_are_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        ledger
+            .reserve_billable()
+            .unwrap()
+            .reconcile(&entry("2026-07-01 10:00:00", "m", 0.25, 10, 5, 1))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            BILLABLE_RESERVATION_BYTES as u64
+        );
+    }
+
+    /// Throughput regression: a ledger of legacy 64 KiB padded rows is
+    /// compacted on the next locked write, with every entry preserved.
+    #[test]
+    fn legacy_padded_ledger_is_compacted_without_losing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        write_padded_rows(&path, 80, LEGACY_RESERVATION_BYTES);
+        let before_len = std::fs::metadata(&path).unwrap().len();
+        assert!(before_len >= COMPACT_MIN_BYTES);
+        let ledger = Ledger::new(&path);
+        let before = ledger.entries_strict().unwrap();
+        ledger
+            .record(&entry("2026-07-02 10:00:00", "after", 0.5, 1, 1, 1))
+            .unwrap();
+        let after_len = std::fs::metadata(&path).unwrap().len();
+        assert!(after_len < before_len / 20, "{after_len} vs {before_len}");
+        let after = ledger.entries_strict().unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert_eq!(a.model, b.model);
+            assert_eq!(a.cost_usd, b.cost_usd);
+        }
+        assert_eq!(after.last().unwrap().model, "after");
+        // Below the threshold nothing is rewritten.
+        let small_len = std::fs::metadata(&path).unwrap().len();
+        ledger
+            .record(&entry("2026-07-02 11:00:00", "again", 0.5, 1, 1, 1))
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > small_len);
+    }
+
+    /// An armed reservation whose row a compaction moved still reconciles in
+    /// place (found again by its marker) -- in-flight calls survive.
+    #[test]
+    fn armed_reservation_survives_compaction_and_reconciles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        write_padded_rows(&path, 5, LEGACY_RESERVATION_BYTES);
+        let ledger = Ledger::new(&path);
+        // Reserved while the ledger is still below the compaction threshold
+        // (its slot sits after 5 legacy rows) ...
+        let mut inflight = ledger.reserve_billable().unwrap();
+        let reserved_at = inflight.offset;
+        assert_eq!(reserved_at, 5 * LEGACY_RESERVATION_BYTES as u64);
+        inflight.arm().unwrap();
+        // ... older writers keep appending padded rows after it ...
+        write_padded_rows(&path, 65, LEGACY_RESERVATION_BYTES);
+        // ... then another process's write compacts the ledger.
+        ledger
+            .record(&entry("2026-07-02 10:00:00", "other", 0.5, 1, 1, 1))
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < reserved_at);
+        inflight
+            .reconcile(&entry("2026-07-02 10:01:00", "inflight", 0.25, 1, 1, 1))
+            .unwrap();
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 72);
+        assert!(entries.iter().all(|e| !e.cost_unknown));
+        assert!(entries.iter().any(|e| e.model == "inflight"));
+    }
+
+    /// Mixed-version safety: a recent reservation row written by an older
+    /// build (legacy 64 KiB slot, cannot relocate by marker) postpones
+    /// compaction; an old one does not.
+    #[test]
+    fn recent_legacy_reservation_postpones_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        write_padded_rows(&path, 70, LEGACY_RESERVATION_BYTES);
+        let legacy_armed = |ts: DateTime<Utc>| {
+            let row = Entry {
+                ts_utc: ts,
+                provider: RESERVATION_PROVIDER.into(),
+                model: ARMED_RESERVATION_MODEL.into(),
+                host: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                cost_unknown: true,
+                calls: 1,
+                violation: Some(format!(
+                    "billable call reserved but not reconciled (zoder-reservation-{:032x})",
+                    9_u128
+                )),
+                tags: FinOpsTags::default(),
+            };
+            let json = serde_json::to_vec(&row).unwrap();
+            let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
+            line[..json.len()].copy_from_slice(&json);
+            line[LEGACY_RESERVATION_BYTES - 1] = b'\n';
+            line
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&legacy_armed(Utc::now())).unwrap();
+        drop(f);
+        let ledger = Ledger::new(&path);
+        let before = std::fs::metadata(&path).unwrap().len();
+        ledger
+            .record(&entry("2026-07-02 10:00:00", "x", 0.5, 1, 1, 1))
+            .unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > before,
+            "must not compact"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("ledger.jsonl");
+        write_padded_rows(&path2, 70, LEGACY_RESERVATION_BYTES);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path2)
+            .unwrap();
+        f.write_all(&legacy_armed(Utc::now() - chrono::Duration::hours(3)))
+            .unwrap();
+        drop(f);
+        let ledger2 = Ledger::new(&path2);
+        let before2 = std::fs::metadata(&path2).unwrap().len();
+        ledger2
+            .record(&entry("2026-07-02 10:00:00", "x", 0.5, 1, 1, 1))
+            .unwrap();
+        assert!(std::fs::metadata(&path2).unwrap().len() < before2 / 10);
+        // The stale armed row survives compaction as unknown spend.
+        assert!(ledger2
+            .entries_strict()
+            .unwrap()
+            .iter()
+            .any(|e| e.cost_unknown));
+    }
+
+    /// A prepared (unarmed) reservation moved by compaction is still cancelled
+    /// cleanly when dropped.
+    #[test]
+    fn prepared_reservation_moved_by_compaction_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        write_padded_rows(&path, 5, LEGACY_RESERVATION_BYTES);
+        let ledger = Ledger::new(&path);
+        let pending = ledger.reserve_billable().unwrap();
+        assert_eq!(pending.offset, 5 * LEGACY_RESERVATION_BYTES as u64);
+        write_padded_rows(&path, 65, LEGACY_RESERVATION_BYTES);
+        ledger
+            .record(&entry("2026-07-02 10:00:00", "other", 0.5, 1, 1, 1))
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < 5 * LEGACY_RESERVATION_BYTES as u64);
+        drop(pending);
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 71);
+        assert!(entries.iter().all(|e| !e.cost_unknown));
+    }
+
+    /// Abandoned prepared reservations written by older builds (64 KiB slots)
+    /// are still recovered.
+    #[test]
+    fn abandoned_legacy_size_prepared_slot_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let marker = format!("zoder-reservation-{:032x}", 7_u128);
+        let pending = Entry {
+            ts_utc: Utc::now(),
+            provider: RESERVATION_PROVIDER.into(),
+            model: PREPARED_RESERVATION_MODEL.into(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: Some(format!(
+                "billable call reserved but not reconciled ({marker})"
+            )),
+            tags: FinOpsTags::default(),
+        };
+        let json = serde_json::to_vec(&pending).unwrap();
+        let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
+        line[..json.len()].copy_from_slice(&json);
+        line[LEGACY_RESERVATION_BYTES - 1] = b'\n';
+        std::fs::write(&path, &line).unwrap();
+        assert!(Ledger::new(&path).entries_strict().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_violation_is_truncated_to_fit_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut final_entry = entry("2026-07-01 10:00:00", "m", 0.25, 10, 5, 1);
+        final_entry.violation = Some("é".repeat(BILLABLE_RESERVATION_BYTES));
+        ledger
+            .reserve_billable()
+            .unwrap()
+            .reconcile(&final_entry)
+            .unwrap();
+        let entries = ledger.entries_strict().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .violation
+            .as_deref()
+            .unwrap()
+            .ends_with("[truncated]"));
+        assert_eq!(entries[0].cost_usd, 0.25);
     }
 
     #[test]
