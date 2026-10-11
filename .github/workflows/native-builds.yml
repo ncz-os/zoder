@@ -72,7 +72,12 @@ jobs:
             [[ "$OLDEST" =~ ^[0-9]+$ ]] || { echo "::error::Could not date the upstream commits missing from the engine; run ZeroClaw source sync first."; exit 1; }
             AGE_H=$(( ( $(date +%s) - OLDEST ) / 3600 ))
             if [ "$AGE_H" -ge "${ENGINE_SYNC_GRACE_HOURS:-36}" ]; then
-              echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA: $MISSING upstream commit(s) missing, oldest ${AGE_H}h old (grace ${ENGINE_SYNC_GRACE_HOURS:-36}h); run ZeroClaw source sync first."
+              # Not silent by design: this run fails, and buildwatch_github
+              # files it to MNEMOS. The fork is normally kept current by
+              # ncz-os/zoder's scheduled GitLab 'zeroclaw-fork-sync' job (and
+              # the fork's own daily-master-sync) -- a trip here means that job
+              # did not run or hit a conflict, so say exactly that.
+              echo "::error::Canonical engine has not incorporated upstream $UPSTREAM_SHA: $MISSING upstream commit(s) missing, oldest ${AGE_H}h old (grace ${ENGINE_SYNC_GRACE_HOURS:-36}h). The fork is reconciled by ncz-os/zoder's scheduled GitLab 'zeroclaw-fork-sync' job; it did not run or hit a conflict. Re-run that pipeline (or sync gitlab.com/ncz-os/zeroclaw master from github.com/zeroclaw-labs/zeroclaw) then re-dispatch this build."
               exit 1
             fi
             echo "::warning::Engine lags upstream by $MISSING commit(s), oldest ${AGE_H}h old -- within the ${ENGINE_SYNC_GRACE_HOURS:-36}h sync grace window."

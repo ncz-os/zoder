@@ -5,7 +5,8 @@ The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/
 ## Source and acceptance
 
 - Scheduled/default-branch runs resolve the latest canonical GitLab `ncz-os/zoder` **master** at start. The build fetches that exact revision directly from GitLab, so mirror delay does not select old source or block checkout.
-- The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The source gate also resolves upstream master once and requires it to be an ancestor of that fork commit. A delayed or failed source sync makes the nightly fail clearly rather than silently shipping a stale engine; cron times alone do not establish ordering. The separate ZeroClaw CI performs the source sync.
+- The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The source gate also resolves upstream master once and requires it to be an ancestor of that fork commit. A delayed or failed source sync makes the nightly fail clearly rather than silently shipping a stale engine; cron times alone do not establish ordering.
+- The fork is reconciled by the scheduled GitLab job [`zeroclaw-fork-sync`](../.gitlab-ci.yml) (`scripts/ci/zeroclaw-fork-sync.sh`), which merges upstream into the fork on the reliable 09:00 UTC GitLab schedule — an hour before this build. The fork's own GitHub `daily-master-sync` is a second, best-effort driver; GitHub silently auto-disables scheduled workflows on forks/inactive repositories, so it is not the guarantee. A sync conflict fails that GitLab pipeline without pushing, and `buildwatch_gitlab` files it to MNEMOS.
 - Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
 - Every archive contains `manifest.json`: exact repository/commit pairs, target, run URL, immutable channel, and SHA-256 hashes of all three binaries. The raw package channel also contains `manifest.json-<target>` plus its checksum.
 - Each run publishes `run-<run-id>-<source-job-attempt>` alongside the legacy date/master binary paths. After every target and both publishers succeed, `master/release.json` activates that complete immutable snapshot. Fleet pullers read this pointer once, verify its target manifest hash and source identity, then verify the three binary hashes from the immutable channel. A partial publish never activates the new snapshot.
@@ -25,7 +26,7 @@ Require completed success for all three build jobs and publication, and read the
 
 ## Other automation
 
-GitLab's active `nightly master-of-the-day` schedule runs at **09:00 UTC**. It refreshes the model corpus and runs scheduled advisory/upstream checks. Per-push Rust gates remain in GitLab. Tagged/dispatch CLI builds are in `release.yml`; the weekly stack image is in `container-weekly.yml`.
+GitLab's active `nightly master-of-the-day` schedule runs at **09:00 UTC**. It refreshes the model corpus, syncs the `ncz-os/zeroclaw` engine fork from upstream (`zeroclaw-fork-sync`), and runs scheduled advisory/upstream checks. Per-push Rust gates remain in GitLab. Tagged/dispatch CLI builds are in `release.yml`; the weekly stack image is in `container-weekly.yml`.
 
 `scripts/daily-build.sh` is a retired host-local fallback, not the nightly source of truth. HYDRA's former 04:00 cron is explicitly retired. Do not re-enable stale host cron instructions or assume a local build updates fleet installations. Current fleet pullers consume the canonical rolling channel independently.
 
