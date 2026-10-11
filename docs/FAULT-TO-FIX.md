@@ -44,6 +44,7 @@ route or fallback in the fleet configuration points at goose.
 | gemma4-31b reported names bound outside the chunk as undefined (`{label}`, imports of a new file) | the chunk shows no unchanged context | `d8f80ee`, `c704047` (measured: 3/3 -> 1/3 and 3/3 -> 0/3 runs with the FP; seeded 5/5 kept) | `binding_far_above_the_hunk_is_listed`, `hunk_scope_survives_a_tight_budget_and_docs_are_skipped` |
 | goose loops aborted on the first author timeout (A10; goose is the explicit fallback engine) | goose path never recorded the session id for the watchdog | `7290b9f` | `goose_drive_records_active_session_for_watchdog` |
 | Saver F1: review refused a single hunk over 9000 bytes | stale installed binary predating hunk splitting | `129f47e` (splitting), deploy | `review_chunks_split_oversized_hunk_when_enabled` |
+| Nightly native build aborted at `sources` and published nothing for two nights; the fleet went stale (2026-10-09/10) | The engine fork's only sync driver was a GitHub Actions schedule, which GitHub silently auto-disables on forks/inactive repositories; it stopped firing, the fork crossed the 36h grace, and the build's hard gate aborted the run | `e451961` (`scripts/ci/zeroclaw-fork-sync.sh`, scheduled GitLab `zeroclaw-fork-sync` job; `native-builds.yml` now names it in the error) | `scripts/tests/zeroclaw-fork-sync-tests.sh`, `nightly-publish-tests.py::test_source_gate_rejects_stale_engine` |
 
 ## Not fixed in zoder, and why
 
