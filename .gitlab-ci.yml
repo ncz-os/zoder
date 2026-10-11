@@ -164,6 +164,23 @@ cli-smoke:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
 
+# Engine-fork sync contract test: proves scripts/ci/zeroclaw-fork-sync.sh
+# no-ops on a current fork, merges a behind fork while preserving the overlay,
+# and refuses to advance on a conflict or an invalid manifest. Cheap (local git
+# repositories, no compile), so it runs on every push and merge request.
+engine-sync-tests:
+  stage: check
+  image: python:3.12
+  needs: []
+  cache: {}
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+  script:
+    - bash scripts/tests/zeroclaw-fork-sync-tests.sh
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\""
+
 # Continuous build of UPSTREAM zeroclaw master.
 #
 # Why this exists: as of 2026-09-26 nothing anywhere tracked upstream
@@ -236,3 +253,36 @@ upstream-zeroclaw:
   # it block turns someone else's commit into a red pipeline on our master
   # (and a buildwatch alert). It reports; it does not gate.
   allow_failure: true
+
+# Engine-fork sync: keep gitlab.com/ncz-os/zeroclaw within the native nightly's
+# 36h sync grace window, on a RELIABLE scheduler we control.
+#
+# The fork's `master` is upstream PLUS a local overlay, so it advances by merge
+# only. That merge used to be driven solely by the fork's own GitHub Actions
+# schedule, and GitHub silently auto-disables scheduled workflows on
+# forks/inactive repositories -- on 2026-10-09 it stopped firing, the fork
+# crossed the grace window, and ncz-os/zoder's nightly aborted at `sources`
+# with no binaries published. This job runs on the same daily 09:00 UTC
+# pipeline schedule as the rest, an hour before the 09:15 native build, so the
+# fork the build reads is always fresh.
+#
+# Needs the masked ZEROCLAW_SYNC_TOKEN CI/CD variable (write_repository on
+# ncz-os/zeroclaw). A merge conflict fails the job WITHOUT pushing -> the red
+# pipeline is filed to MNEMOS by buildwatch_gitlab. It never force-pushes.
+zeroclaw-fork-sync:
+  stage: upstream
+  image: python:3.12
+  needs: []
+  cache: {}
+  variables:
+    UPSTREAM_URL: "https://github.com/zeroclaw-labs/zeroclaw.git"
+    FORK_URL: "https://gitlab.com/ncz-os/zeroclaw.git"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+  script:
+    - export FORK_PUSH_URL="https://oauth2:${ZEROCLAW_SYNC_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
+    - bash scripts/ci/zeroclaw-fork-sync.sh
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
+    - if: "$CI_PIPELINE_SOURCE == \"web\""
+      when: manual
