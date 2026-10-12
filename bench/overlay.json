@@ -57,7 +57,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 14,
+    "rank": 15,
     "score": 0.0579,
     "source": "arena.ai"
    },
@@ -76,7 +76,7 @@
   "arena_webdev_elo": 1743.7,
   "preference": {
    "arena_agent": {
-    "rank": 1,
+    "rank": 2,
     "score": 0.1619,
     "source": "arena.ai"
    },
@@ -230,7 +230,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 21,
+    "rank": 22,
     "score": 0.0468,
     "source": "arena.ai"
    },
@@ -257,7 +257,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 7,
+    "rank": 8,
     "score": 0.1042,
     "source": "arena.ai"
    },
@@ -271,13 +271,13 @@
   "w_swe": 0.993
  },
  "claude-opus-5-5": {
-  "agentic_score": 0.935,
+  "agentic_score": 0.989,
   "arena_coding_elo": 1813.0,
   "arena_webdev_elo": 1813.0,
   "preference": {
    "arena_agent": {
-    "rank": 5,
-    "score": 0.1393,
+    "rank": 1,
+    "score": 0.1729,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -358,7 +358,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 27,
+    "rank": 28,
     "score": 0.0222,
     "source": "arena.ai"
    },
@@ -377,7 +377,7 @@
   "arena_webdev_elo": 1774.3,
   "preference": {
    "arena_agent": {
-    "rank": 2,
+    "rank": 3,
     "score": 0.1583,
     "source": "arena.ai"
    },
@@ -541,7 +541,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 35,
+    "rank": 36,
     "score": -0.02,
     "source": "arena.ai"
    },
@@ -560,7 +560,7 @@
   "arena_webdev_elo": 1618.6,
   "preference": {
    "arena_agent": {
-    "rank": 10,
+    "rank": 11,
     "score": 0.0744,
     "source": "arena.ai"
    },
@@ -812,7 +812,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 46,
+    "rank": 47,
     "score": -0.1009,
     "source": "arena.ai"
    },
@@ -905,7 +905,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 41,
+    "rank": 42,
     "score": -0.0579,
     "source": "arena.ai"
    },
@@ -932,7 +932,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 32,
+    "rank": 33,
     "score": -0.0021,
     "source": "arena.ai"
    },
@@ -963,7 +963,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 18,
+    "rank": 19,
     "score": 0.053,
     "source": "arena.ai"
    },
@@ -1008,7 +1008,7 @@
   "arena_webdev_elo": 1677.8,
   "preference": {
    "arena_agent": {
-    "rank": 3,
+    "rank": 4,
     "score": 0.1564,
     "source": "arena.ai"
    },
@@ -1162,7 +1162,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 22,
+    "rank": 23,
     "score": 0.0411,
     "source": "arena.ai"
    },
@@ -1189,7 +1189,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 20,
+    "rank": 21,
     "score": 0.0478,
     "source": "arena.ai"
    },
@@ -1216,7 +1216,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 25,
+    "rank": 26,
     "score": 0.0346,
     "source": "arena.ai"
    },
@@ -1440,7 +1440,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 36,
+    "rank": 37,
     "score": -0.0276,
     "source": "arena.ai"
    },
@@ -1507,7 +1507,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 34,
+    "rank": 35,
     "score": -0.0088,
     "source": "arena.ai"
    },
@@ -1546,7 +1546,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 39,
+    "rank": 40,
     "score": -0.0425,
     "source": "arena.ai"
    },
@@ -1577,7 +1577,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 16,
+    "rank": 17,
     "score": 0.0534,
     "source": "arena.ai"
    },
@@ -1604,7 +1604,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 37,
+    "rank": 38,
     "score": -0.0315,
     "source": "arena.ai"
    },
@@ -1635,7 +1635,7 @@
   "arena_webdev_elo": 1755.4,
   "preference": {
    "arena_agent": {
-    "rank": 4,
+    "rank": 5,
     "score": 0.1474,
     "source": "arena.ai"
    },
@@ -1660,7 +1660,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 6,
+    "rank": 7,
     "score": 0.1213,
     "source": "arena.ai"
    },
@@ -1679,7 +1679,7 @@
   "arena_webdev_elo": 1580.9,
   "preference": {
    "arena_agent": {
-    "rank": 30,
+    "rank": 31,
     "score": 0.0091,
     "source": "arena.ai"
    },
@@ -1698,7 +1698,7 @@
   "arena_webdev_elo": 1688.2,
   "preference": {
    "arena_agent": {
-    "rank": 11,
+    "rank": 12,
     "score": 0.0697,
     "source": "arena.ai"
    },
@@ -1868,7 +1868,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 29,
+    "rank": 30,
     "score": 0.01,
     "source": "arena.ai"
    },
@@ -1895,7 +1895,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 33,
+    "rank": 34,
     "score": -0.0078,
     "source": "arena.ai"
    },
@@ -1914,7 +1914,7 @@
   "arena_webdev_elo": 1639.1,
   "preference": {
    "arena_agent": {
-    "rank": 23,
+    "rank": 24,
     "score": 0.0393,
     "source": "arena.ai"
    },
@@ -1983,7 +1983,7 @@
   "arena_webdev_elo": 1508.4,
   "preference": {
    "arena_agent": {
-    "rank": 47,
+    "rank": 48,
     "score": -0.1169,
     "source": "arena.ai"
    },
@@ -2002,7 +2002,7 @@
   "arena_webdev_elo": 1631.8,
   "preference": {
    "arena_agent": {
-    "rank": 13,
+    "rank": 14,
     "score": 0.0596,
     "source": "arena.ai"
    },
@@ -2029,7 +2029,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 51,
+    "rank": 52,
     "score": -0.2171,
     "source": "arena.ai"
    },
@@ -2056,7 +2056,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 50,
+    "rank": 51,
     "score": -0.2022,
     "source": "arena.ai"
    },
@@ -2208,7 +2208,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 12,
+    "rank": 13,
     "score": 0.0646,
     "source": "arena.ai"
    },
@@ -2330,7 +2330,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 43,
+    "rank": 44,
     "score": -0.0903,
     "source": "arena.ai"
    },
@@ -2349,7 +2349,7 @@
   "arena_webdev_elo": 1629.0,
   "preference": {
    "arena_agent": {
-    "rank": 9,
+    "rank": 10,
     "score": 0.0803,
     "source": "arena.ai"
    },
@@ -2368,7 +2368,7 @@
   "arena_webdev_elo": 1636.8,
   "preference": {
    "arena_agent": {
-    "rank": 15,
+    "rank": 16,
     "score": 0.0536,
     "source": "arena.ai"
    },
@@ -2493,7 +2493,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 49,
+    "rank": 50,
     "score": -0.1466,
     "source": "arena.ai"
    },
@@ -2538,7 +2538,7 @@
   "arena_webdev_elo": 1541.3,
   "preference": {
    "arena_agent": {
-    "rank": 28,
+    "rank": 29,
     "score": 0.0167,
     "source": "arena.ai"
    },
@@ -2565,7 +2565,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 48,
+    "rank": 49,
     "score": -0.1438,
     "source": "arena.ai"
    },
@@ -2626,7 +2626,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 38,
+    "rank": 39,
     "score": -0.0424,
     "source": "arena.ai"
    },
@@ -2653,7 +2653,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 42,
+    "rank": 43,
     "score": -0.0668,
     "source": "arena.ai"
    },
@@ -2672,7 +2672,7 @@
   "arena_webdev_elo": 1656.9,
   "preference": {
    "arena_agent": {
-    "rank": 17,
+    "rank": 18,
     "score": 0.0532,
     "source": "arena.ai"
    },
@@ -2840,7 +2840,7 @@
   "agentic_score": 0.044,
   "preference": {
    "arena_agent": {
-    "rank": 31,
+    "rank": 32,
     "score": 0.008,
     "source": "arena.ai"
    }
@@ -3051,7 +3051,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 45,
+    "rank": 46,
     "score": -0.1004,
     "source": "arena.ai"
    },
@@ -3068,7 +3068,7 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 44,
+    "rank": 45,
     "score": -0.0907,
     "source": "arena.ai"
    }
@@ -3089,7 +3089,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 19,
+    "rank": 20,
     "score": 0.0509,
     "source": "arena.ai"
    },
@@ -3130,7 +3130,7 @@
   "arena_webdev_elo": 1632.6,
   "preference": {
    "arena_agent": {
-    "rank": 24,
+    "rank": 25,
     "score": 0.0378,
     "source": "arena.ai"
    },
@@ -3197,7 +3197,7 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 52,
+    "rank": 53,
     "score": -0.23,
     "source": "arena.ai"
    }
@@ -3234,7 +3234,7 @@
   "arena_webdev_elo": 1563.5,
   "preference": {
    "arena_agent": {
-    "rank": 26,
+    "rank": 27,
     "score": 0.0243,
     "source": "arena.ai"
    },
