@@ -29,7 +29,8 @@ ZC_URL="https://oauth2:${ZODER_PAT}@gitlab.com/ncz-os/zeroclaw.git"
 
 # ARGONAS publish target (root-owned NFS git/release store).
 PUB_HOST="root@192.168.207.101"
-PUB_PW="changeme"
+PUB_PW="${ZODER_PUB_PW:-$(cat "${ZODER_PUB_PW_FILE:-$HOME/.config/zoder/publish-pw}" 2>/dev/null)}"  # from the environment or a mode-600 file; never commit it
+[ -n "$PUB_PW" ] || { echo "daily-build: set ZODER_PUB_PW or ZODER_PUB_PW_FILE" >&2; exit 2; }
 PUB_ROOT="/mnt/datapool/zoder-releases"
 
 # GitHub rolling-nightly prerelease (optional; gated on GH_TOKEN in the env).
