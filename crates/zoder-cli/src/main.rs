@@ -3978,8 +3978,10 @@ pub(crate) fn resolve_effective_primary(cli: &Cli, eng: &Engine) -> Option<Strin
 /// post-turn check that refuses when the model that actually ran is not the one
 /// that was requested, would otherwise read an alias as a model SUBSTITUTION.
 ///
-/// Returns a borrowed clone when nothing changes (the common case — no alias,
-/// or no `-m` at all), so the hot path stays allocation-free.
+/// Returns the input borrowed when no resolution is needed (the common case —
+/// no `-m` at all, or a `-m` that is already a corpus id), so the no-alias path
+/// allocates nothing. The alias path clones the `Cli` once per invocation to
+/// rewrite `model`.
 fn with_resolved_model_alias<'a>(cli: &'a Cli, corpus: &Corpus) -> std::borrow::Cow<'a, Cli> {
     let Some(model) = cli.model.as_deref() else {
         return std::borrow::Cow::Borrowed(cli);
