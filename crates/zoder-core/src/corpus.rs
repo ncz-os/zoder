@@ -1026,11 +1026,18 @@ impl Corpus {
 
     /// Resolve an operator-supplied model id through the alias overlay.
     ///
+    /// The returned id either names a corpus row or is `id` unchanged. An
+    /// overlay map entry whose target names no row is rejected at ingest, so
+    /// resolution cannot hand back a phantom id; an id that is neither a model
+    /// nor an alias is returned verbatim.
+    ///
     /// Returns the canonical model id for an exact alias hit, and `id`
     /// unchanged in every other case — including when the corpus already knows
     /// a model by exactly that name (an exact id always wins over an alias) and
-    /// when nothing matches at all. Callers that then need the entry can chain
-    /// [`Self::get`], which applies the same rule.
+    /// when nothing matches at all. Resolution is a SINGLE exact-match hop with
+    /// no chained aliases, which makes it idempotent:
+    /// `resolve_alias(resolve_alias(x)) == resolve_alias(x)`. Callers that then
+    /// need the entry can chain [`Self::get`], which applies the same rule.
     ///
     /// The fast path is the alias lookup itself: an id that is not an alias
     /// needs no scan of the model list at all.
@@ -1297,10 +1304,21 @@ impl Corpus {
             ));
         }
 
-        // Alias map first: per-model `aliases` are the common case, and the
-        // generator's explicit map is the resolution authority, so it is
-        // applied last and overrides any collision.
-        let mut aliases = std::mem::take(&mut self.aliases);
+        // Snapshot the names each EXISTING row already answered to before the
+        // overlay touches it, so `report.aliased` can report the NET gain after
+        // the explicit map has potentially moved a name from one row to
+        // another. Rows the overlay adds are reported in `added`, never here.
+        let before_aliases: Vec<std::collections::HashSet<String>> = self
+            .models
+            .iter()
+            .map(|m| {
+                m.aliases
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            })
+            .collect();
 
         for om in &overlay.models {
             let id = om.id.trim();
@@ -1310,25 +1328,16 @@ impl Corpus {
                 .map(|a| a.trim())
                 .filter(|a| !a.is_empty() && *a != id)
                 .collect();
-            for alias in &row_aliases {
-                aliases
-                    .entry((*alias).to_string())
-                    .or_insert_with(|| id.to_string());
-            }
 
             match self.models.iter_mut().find(|m| m.id == id) {
                 Some(entry) => {
                     // Known model: the corpus keeps EVERY field it has (scores,
                     // economics, classification, routing flags). The overlay
                     // only teaches this row the extra names it answers to.
-                    let before = entry.aliases.len();
                     for alias in &row_aliases {
-                        if !entry.aliases.iter().any(|a| a.as_str() == *alias) {
+                        if !entry.aliases.iter().any(|a| a.trim() == *alias) {
                             entry.aliases.push((*alias).to_string());
                         }
-                    }
-                    if entry.aliases.len() > before {
-                        report.aliased.push(id.to_string());
                     }
                 }
                 None => {
@@ -1361,6 +1370,13 @@ impl Corpus {
             }
         }
 
+        // The explicit map is the resolution authority, but a map entry alone
+        // is ephemeral: every corpus construction path rebuilds `self.aliases`
+        // from the model rows. Fold each accepted entry onto its TARGET row and
+        // take that name away from every other row, so
+        // `rebuild_aliases_from_models` reproduces the override after a
+        // save/reload — an operator's `-m codex:sol` keeps working after the
+        // overlay file is gone.
         for (alias, target) in &overlay.aliases {
             let (alias, target) = (alias.trim(), target.trim());
             if alias.is_empty() || target.is_empty() {
@@ -1370,11 +1386,50 @@ impl Corpus {
                 ));
                 continue;
             }
-            aliases.insert(alias.to_string(), target.to_string());
+            // Accept only a target that names a row after the per-model rows
+            // were merged. A dangling target would make `resolve_alias` hand
+            // back a phantom id that no corpus row backs (and that no lookup
+            // could classify), so the entry is refused rather than half-applied.
+            let Some(target_idx) = self.models.iter().position(|m| m.id == target) else {
+                warn_overlay_once(format_args!(
+                    "model alias overlay {} maps `{alias}` to `{target}`, which names no model \
+                     row; skipping that entry",
+                    path.display(),
+                ));
+                continue;
+            };
+            for (idx, model) in self.models.iter_mut().enumerate() {
+                if idx != target_idx {
+                    model.aliases.retain(|a| a.trim() != alias);
+                }
+            }
+            let entry = &mut self.models[target_idx];
+            if !entry.aliases.iter().any(|a| a.trim() == alias) {
+                entry.aliases.push(alias.to_string());
+            }
         }
 
-        report.alias_count = aliases.len();
-        self.aliases = aliases;
+        for (idx, model) in self.models.iter().enumerate() {
+            if idx >= before_aliases.len() {
+                // Added by this overlay pass: `report.added` already names it.
+                continue;
+            }
+            let gained = model
+                .aliases
+                .iter()
+                .map(|a| a.trim())
+                .any(|a| !a.is_empty() && !before_aliases[idx].contains(a));
+            if gained && !report.aliased.iter().any(|id| id == &model.id) {
+                report.aliased.push(model.id.clone());
+            }
+        }
+
+        // The map is a CACHE derived from the rows. Rebuilding here, rather
+        // than patching it entry by entry, makes the in-memory map exactly what
+        // every load path reconstructs from the persisted rows: a save/reload
+        // can neither lose nor move an override.
+        self.rebuild_aliases_from_models();
+        report.alias_count = self.aliases.len();
         self.count = self.models.len();
         report
     }
@@ -2574,6 +2629,195 @@ mod corpus_io_tests {
             Corpus::alias_overlay_path(),
             crate::config::Config::home().join(MODEL_ALIASES_FILE)
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (9) An alias that appears ONLY in the explicit top-level map is folded
+    // onto its target ROW, so a save -> load round trip with no overlay
+    // deployed still resolves it. Before the fix the entry lived only in the
+    // in-memory map and every construction path dropped it on reload.
+    #[test]
+    fn explicit_map_alias_survives_a_save_load_round_trip() {
+        let dir = tmpdir();
+        let p = write_file(
+            &dir,
+            "corpus.json",
+            r#"{"models": [{"id": "vendor/target", "agentic_score": 0.9}]}"#,
+        );
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [], "aliases": {"short:target": "vendor/target"}}"#,
+        );
+        let saved = dir.join("saved-corpus.json");
+
+        {
+            let _env = AliasEnvGuard::none();
+            let mut c = Corpus::load(&p).unwrap();
+            let report = c.apply_alias_overlay_from(&overlay);
+            assert_eq!(report.added, Vec::<String>::new());
+            assert_eq!(report.aliased, vec!["vendor/target".to_string()]);
+            assert_eq!(report.alias_count, 1);
+            assert_eq!(c.resolve_alias("short:target"), "vendor/target");
+            assert!(
+                c.get("vendor/target")
+                    .unwrap()
+                    .aliases
+                    .iter()
+                    .any(|a| a == "short:target"),
+                "the explicit-map alias must be folded onto the target row"
+            );
+            c.save(&saved).unwrap();
+        }
+
+        // No overlay deployed: the persisted row alone must resolve the name.
+        let _env = AliasEnvGuard::none();
+        let reloaded = Corpus::load(&saved).unwrap();
+        assert_eq!(reloaded.models.len(), 1);
+        assert_eq!(reloaded.resolve_alias("short:target"), "vendor/target");
+        assert_eq!(
+            reloaded.get("short:target").map(|m| m.id.as_str()),
+            Some("vendor/target"),
+            "the alias must still name its target row after reload"
+        );
+        assert_eq!(
+            reloaded.aliases.get("short:target").unwrap(),
+            "vendor/target"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (10) An explicit-map entry overrides a collision a per-model list created
+    // on a DIFFERENT row: the name moves to the explicit target and stays there
+    // through a save -> load round trip. The map is the override authority, and
+    // the rows are made to agree with it so the rebuild cannot resurrect A.
+    #[test]
+    fn explicit_map_override_moves_an_alias_between_rows_and_survives_a_round_trip() {
+        let dir = tmpdir();
+        let p = write_file(
+            &dir,
+            "corpus.json",
+            r#"{"models": [{"id": "vendor/a", "agentic_score": 0.5},
+                            {"id": "vendor/b", "agentic_score": 0.7}]}"#,
+        );
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [{"id": "vendor/a", "aliases": ["shared:name"]}],
+                "aliases": {"shared:name": "vendor/b"}}"#,
+        );
+        let saved = dir.join("saved-corpus.json");
+
+        {
+            let _env = AliasEnvGuard::none();
+            let mut c = Corpus::load(&p).unwrap();
+            let report = c.apply_alias_overlay_from(&overlay);
+            assert_eq!(report.added, Vec::<String>::new());
+            assert_eq!(
+                report.aliased,
+                vec!["vendor/b".to_string()],
+                "the row that NET-gained the name is the explicit target"
+            );
+            assert_eq!(c.resolve_alias("shared:name"), "vendor/b");
+
+            let a = c.get("vendor/a").unwrap();
+            assert!(
+                !a.aliases.iter().any(|x| x.trim() == "shared:name"),
+                "the override must take the name away from the per-model row"
+            );
+            let b = c.get("vendor/b").unwrap();
+            assert!(
+                b.aliases.iter().any(|x| x.trim() == "shared:name"),
+                "the override must teach the explicit target row the name"
+            );
+
+            c.save(&saved).unwrap();
+        }
+
+        let _env = AliasEnvGuard::none();
+        let reloaded = Corpus::load(&saved).unwrap();
+        assert_eq!(
+            reloaded.resolve_alias("shared:name"),
+            "vendor/b",
+            "after reload the alias must still resolve to the override target"
+        );
+        assert!(
+            !reloaded
+                .get("vendor/a")
+                .unwrap()
+                .aliases
+                .iter()
+                .any(|x| x.trim() == "shared:name"),
+            "the losing row must not regain the alias on reload"
+        );
+        assert_eq!(
+            reloaded.get("shared:name").map(|m| m.id.as_str()),
+            Some("vendor/b")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (11) An explicit-map target that names no row is refused: it must not be
+    // inserted, and `resolve_alias` must return the input unchanged rather than
+    // a phantom id that no corpus row backs.
+    #[test]
+    fn explicit_map_dangling_target_is_skipped() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [], "aliases": {"ghost:name": "vendor/not-in-corpus"}}"#,
+        );
+
+        let _env = AliasEnvGuard::none();
+        let mut c = Corpus::load(&p).unwrap();
+        let report = c.apply_alias_overlay_from(&overlay);
+
+        assert!(report.added.is_empty(), "{report:?}");
+        assert!(report.aliased.is_empty(), "{report:?}");
+        assert_eq!(report.alias_count, 0, "{report:?}");
+        assert!(
+            !c.aliases.contains_key("ghost:name"),
+            "a dangling target must not enter the alias map: {report:?}"
+        );
+        assert_eq!(c.resolve_alias("ghost:name"), "ghost:name");
+        assert_eq!(
+            c.resolve_alias("vendor/not-in-corpus"),
+            "vendor/not-in-corpus"
+        );
+        assert!(c.get("ghost:name").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (12) `resolve_alias` is one exact-match hop, so it is idempotent for an
+    // alias, a canonical id and an unknown id. This is what lets
+    // `agentic_turn` pre-resolve and `resolve_chain` resolve again.
+    #[test]
+    fn resolve_alias_is_idempotent() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let overlay = write_file(&dir, "model-aliases.json", OVERLAY);
+
+        let _env = AliasEnvGuard::new(&overlay);
+        let c = Corpus::load(&p).unwrap();
+
+        for id in ["codex:sol", "gpt-6-sol", "vendor/benched", "no-such-model"] {
+            let once = c.resolve_alias(id);
+            let twice = c.resolve_alias(once);
+            assert_eq!(
+                twice, once,
+                "resolve_alias must be idempotent for {id:?} (once={once:?})"
+            );
+        }
+        // The resolved names of real inputs still name corpus rows.
+        for id in ["codex:sol", "gpt-6-sol", "vendor/benched"] {
+            assert!(c.get(id).is_some(), "{id:?} must resolve to a corpus row");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

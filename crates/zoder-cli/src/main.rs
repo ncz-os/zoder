@@ -4192,6 +4192,12 @@ fn restrict_resolved_routes(
 /// reviewer's KNEMON gating and class preference are honored. It is
 /// returned alongside the primary chain; `complete_once` consumes it as
 /// its candidate fallback pool (Fix #19: no process-global cache).
+///
+/// This function must accept an ALREADY-RESOLVED model id: callers such as
+/// `agentic_turn` pre-resolve through `with_resolved_model_alias` before
+/// calling here, and the per-pin `resolve_alias` calls below are idempotent
+/// (one exact-match hop, no chained aliases), so a canonical id passes
+/// through unchanged.
 fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Result<ResolvedRoutes> {
     // Compute the scenario-derived primary + reviewer chains once. The
     // reviewer chain is unconditional — even an explicit `-m` keeps the
