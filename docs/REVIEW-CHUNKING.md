@@ -66,16 +66,20 @@ A malformed `review.toml` is ignored with a warning.
 The loop's review phase sends one prompt and is not chunked; these settings
 apply to `zoder review` and `zoder adversarial-review`.
 
-## Measured recommendations (fleet routes, 2026-10-10)
+## Measured recommendations (2026-10-10)
 
 From the chunk-size study (seeded 96,835-byte diff with 8 known defects;
-recall / false positives per cap):
+recall / false positives per cap). Routes are by capability, not by a fixed
+provider: qwen38 is served by the TYDEUS :8010 nemotron35 route (a valid
+backup under test); DeepSeek is direct-only (`api.deepseek.com`), never via a
+local proxy; EIH carries Nemotron / open-weight models; the gemma4-31b route is
+a local single-GPU endpoint.
 
 | Reviewer | Recommended | Evidence |
 |---|---|---|
-| qwen38 (TYDEUS) | `max_hunk_bytes = 64000` | 0 false positives at every cap 9k-131k; 7/8 recall |
-| deepseek-flash | `max_hunk_bytes = 48000` | 8/8 at 32k and 96k, 7/8 at 48-64k; FP 6 -> 0-2 as cap rises; half the wall time of 9k |
+| qwen38 (TYDEUS :8010 nemotron35) | `max_hunk_bytes = 64000` | 0 false positives at every cap 9k-131k; 7/8 recall |
+| deepseek-flash (direct, api.deepseek.com) | `max_hunk_bytes = 48000` | 8/8 at 32k and 96k, 7/8 at 48-64k; FP 6 -> 0-2 as cap rises; half the wall time of 9k |
 | nvidia/nemotron-3-ultra-550b-a55b (EIH) | `max_hunk_bytes = 48000`, `max_tokens = 16384` | FP 12 (9k) -> 2 (48k); reasoning-heavy |
 | MiniMax-M3 | `max_hunk_bytes = 48000`, `max_tokens = 32768` | FP 21 (9k) -> 4 (48k); truncates below 32768 on real diffs |
 | MiniMax-M3.1-Flash-Preview | `max_hunk_bytes = 64000` | 7/8, 0 FP |
-| gemma4-31b (CERBERUS) | leave at 9000 | 8/8 and FP-free at 9000; 16k lost a defect |
+| gemma4-31b (local single-GPU route) | leave at 9000 | 8/8 and FP-free at 9000; 16k lost a defect |

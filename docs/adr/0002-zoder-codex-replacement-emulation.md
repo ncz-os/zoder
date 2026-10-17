@@ -37,8 +37,9 @@ Interface / functions:
 - **Sessions**: `resume` / `fork`, `--ephemeral` (no session persistence).
 - **Hooks**: hook system with per-source trust (`--dangerously-bypass-hook-trust`).
 - Subcommands: `exec`, `review`, `apply`, `sandbox`.
-  `mcp-server` is a currently-open gap: zoder does not expose that subcommand
-  yet (it does expose `mcp` for listing/testing configured servers).
+  `mcp-server` was a gap and has since been closed: zoder exposes `zoder
+  mcp-server` (same server as the standalone `zoder-mcp-server` binary) and
+  `zoder mcp` for listing/testing engine-configured servers.
 
 ## Gap analysis (codex behavior → zoder today)
 
@@ -48,7 +49,7 @@ Interface / functions:
 | Diff-based change + explicit apply (no git add -A) | loop `git add -A` sweeps everything | **MISSING (P0)** — junk root cause |
 | Writable-dir scoping (--add-dir, -C) | none | **MISSING (P0)** |
 | Fail-closed validate before "done" | `check=None` counts as RESOLVED (syntax-only) | **MISSING (P0)** — recreates the "green on broken" bug |
-| Approval policy (untrusted/on-request/never) | auto-approve allowlist only | PARTIAL (P1) |
+| Approval policy (untrusted/on-request/never) | `--approve all\|allowlist\|none` | PARTIAL (P1) — flag landed; codex's per-command escalation model remains open |
 | Config + dotted overrides + profiles | config.toml + vendor overlays | PARTIAL (P1) |
 | Output --json / --output-schema | text + some json | PARTIAL (P1) |
 | Sessions resume/fork/ephemeral | background jobs; engine session continuity | PARTIAL (P2) |

@@ -45,8 +45,7 @@ It routes work to **free / open-weight models first**, refuses to silently fall
 back to a paid backend, tracks every call in a local spend ledger, and produces
 FinOps-style chargeback reports that show — in dollars — what the free path saved.
 
-zoder is **vendor-neutral**: it works against any OpenAI-compatible / LiteLLM
-endpoint. Free, open-weight providers are first-class; enterprise gateways are
+zoder is **vendor-neutral**: it works against any OpenAI-compatible endpoint. Free, open-weight providers are first-class; enterprise gateways are
 added via config overlays, never hardcoded.
 
 ### Relationship to ZeroClaw (a friendly fork)
@@ -113,6 +112,25 @@ zoder report
 | `zoder sessions` | List saved multi-turn sessions. |
 | `zoder config` | Show / validate configuration + corpus. |
 | `zoder completions` | Shell completions (bash/zsh/fish/powershell/elvish). |
+| `zoder consult` | Rank models for a human to pick from: the router's own signals (health, coding capability, SWE Elo). |
+| `zoder finops` | FinOps observability rollup (`report \| advisor \| forecast`), reports only. |
+| `zoder providers` | List configured providers. |
+| `zoder pricing` | Pricing catalog: `refresh` (sync from public price lists) and `show <model>`. |
+| `zoder reconcile` | Reconcile ledger spend against a provider's billed-cost API (OpenAI / Anthropic, admin key). |
+| `zoder agents` | List zeroclaw agent aliases and their availability/session status. |
+| `zoder tui` | Launch the zerocode TUI wired to the local zeroclaw engine. |
+| `zoder session` / `zoder run` | Interactive agentic session / headless agentic run through the engine. |
+| `zoder recipe` | Saved prompt/agent templates (`list` / `show` / `run`). |
+| `zoder mcp` / `zoder mcp-server` | List/test engine MCP servers / run zoder's own MCP server over stdio. |
+| `zoder sop` | Drive a structured SOP runbook against the engine (`list` / `run` / `status` / `decide` / `graph`). |
+| `zoder configure` | Show/validate/edit configuration. |
+| `zoder update` | Check for (or install) a newer zoder release. |
+| `zoder status` / `zoder result` / `zoder cancel` / `zoder jobs` | Background-job management (list / stored output / cancel / `list` + `prune`). |
+| `zoder perf` | Work-performance history by model, from the local loop records. |
+| `zoder eval` | Run a behavioural eval suite across two or more configurations. |
+| `zoder transfer` | Print a resumable engine session id for the current working dir. |
+| `zoder gate` | Run the CI-parity gate against the current repo (see [CI-parity gate](#the-ci-parity-gate--compliance-first)). |
+| `zoder mnemos` | Search or record work history in MNEMOS (`MNEMOS_URL` / `MNEMOS_TOKEN`). |
 
 Everything is **local-first**: routing, the ledger, health, and reports work on
 your workstation with no service to stand up.
@@ -143,7 +161,7 @@ path the default path:
 A single `zoder` run is a short, auditable pipeline:
 
 1. **Classify.** zoder maintains a *corpus* of the models your endpoint serves,
-   each tagged free or paid (from live pricing) and scored for capability
+   each tagged free or paid (from the pricing catalog) and scored for capability
    (LMArena Elo + SWE-bench) and measured latency/throughput.
 2. **Route.** For your task it picks the **best free model** for the tier,
    skipping any model whose health circuit-breaker is open, and prepares a
@@ -324,7 +342,8 @@ hive of workers run coding tasks unattended. It is the part that turns
 ZeroClaw into a *distribution*.
 
 **Pricing engine + FinOps reporting.** A deterministic, conformance-tested
-pricing engine (with an optional live LiteLLM/OpenRouter cache) prices every call
+pricing engine (with an optional live price-list cache — the same LiteLLM +
+OpenRouter sources as the corpus) prices every call
 so the savings headline and chargeback numbers are real, not estimated.
 
 **Cost accounting + reporting (ledger-backed).** This is what makes the savings
@@ -685,7 +704,7 @@ Rules the loader enforces (fail loud, don't silently merge):
 
 Adding a new vendor is a copy-paste exercise:
 
-1. `cp config.ibm.toml config.<name>.toml` (the IBM/Microsoft templates are
+1. `cp config.ibm.toml config.<name>.toml` (the committed vendor templates are
    fully commented out as starters).
 2. Fill in `id`, `base_url`, `kind`, and `auth` for each provider. Use the
    matching `ENTERPRISE_API_KEY` / `AZURE_OPENAI_API_KEY` / etc. env var name.
@@ -703,7 +722,9 @@ extend that list. This is intentional: free-tier policy is a security knob,
 not a vendor knob.
 
 **Keep enterprise specifics out of the public tree.** The public zoder source
-refers only to a generic **`enterprise`** profile. A real organization's gateway
+carries commented-out templates only (`config.enterprise.toml`,
+`config.ibm.toml`, `config.microsoft.toml`, `config.oracle.toml`); no live
+org-specific gateway config is committed here. A real organization's gateway
 URLs, auth header names, and report color scheme belong in *its own* private
 config repo (e.g. an internal `zoder-config`), kept out of this repository and
 synced into `$ZODER_HOME` at deploy time — `scripts/package.sh` honors a
@@ -720,11 +741,11 @@ code change.
 
 ## Corpus & pricing sync
 
-zoder routes off two data files in `$ZODER_HOME` (`~/.zoder`):
+zoder routes off data files in `$ZODER_HOME` (`~/.zoder`):
 
 - **`model_corpus.json`** — the classified routing corpus (which models exist,
   which are free/paid, capability/latency signals).
-- **`data/pricing.json`** — per-token rates, the cost source for `zoder report`
+- **`pricing.json`** — per-token rates, the cost source for `zoder report`
   / `spend` / `finops`.
 
 Both are **public, self-serve, and rebuilt daily from public price data** — they
@@ -744,12 +765,12 @@ do **not** depend on any private/internal build process:
 | You want… | Run |
 |---|---|
 | Seed on first install | the installer does it automatically (`--no-corpus` to skip) |
-| Refresh rates from public price lists | `zoder pricing sync` |
+| Refresh rates from public price lists | `zoder pricing refresh` |
 | Re-pull the latest public corpus | `curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/corpus/model_corpus.json -o ~/.zoder/model_corpus.json` |
 | Reconcile the corpus against **your own** endpoint's served models | `zoder refresh` |
 
 The installer seeds both files and leaves any existing copy untouched, so your
-own `zoder refresh` / `zoder pricing sync` edits are never clobbered. The same
+own `zoder refresh` / `zoder pricing refresh` edits are never clobbered. The same
 public artifacts back the tokenomics plugins' pricing, so they stay current on
 the same cadence without any shared private dependency. (A built-in TTL
 self-heal — auto re-pull when the file is missing or stale — is on the roadmap;

@@ -93,10 +93,10 @@ reviews all go to the same two reviewer routes.
 
 - Deploy a zoder build that contains the ledger fix first; it removes the
   dominant serialization.
-- `ZODER_PROVIDER_CONCURRENCY="cerberus-reviewer=2,nvidia-eih=4"`: CERBERUS
-  serves gemma4-31b from one GPU, so more than two concurrent chunks from one
-  host only lengthens everyone's queue; EIH rate-limits (HTTP 429) under
-  bursts.
+- `ZODER_PROVIDER_CONCURRENCY="cerberus-reviewer=2,nvidia-eih=4"`: the local
+  gemma4-31b route is served from one GPU, so more than two concurrent chunks
+  from one host only lengthens everyone's queue; EIH rate-limits (HTTP 429)
+  under bursts.
 - `ZODER_QUEUE_TIMEOUT_S=900` (the default).
 - Keep `--request-timeout` at 300 for gemma reviews of large chunks.
 - Watch `first_token_ms` in review receipts: values of tens of seconds mean

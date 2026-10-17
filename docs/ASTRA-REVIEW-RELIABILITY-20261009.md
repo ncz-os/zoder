@@ -70,10 +70,11 @@ Branch: `fix/astra-review-reliability-20261009`.
 
 ## Verification and scope
 
-Rust compilation/tests run on idle ULTRA `192.168.207.88`, using btrfs under
-`/home/jasonperlow/Projects`. HYDRA and all NCZ worktrees/boot settings are
-excluded. The initial test scratch path exceeded Unix-domain socket pathname
-limits; the final run uses the shorter disk-backed `Projects/za1009-tmp`.
+Rust compilation/tests ran on an idle Linux fleet host (LAN IP deliberately
+omitted from the public repo), using a disk-backed scratch tree. HYDRA and all
+NCZ worktrees/boot settings are excluded. The initial test scratch path exceeded
+Unix-domain socket pathname limits; the final run used a shorter disk-backed
+scratch dir.
 
 Before the final session-tracking addition, 591 CLI tests and all four new
 provider deadline regressions passed. Final workspace, Clippy and CLI dry-run
@@ -82,8 +83,8 @@ used to approve these changes; verification uses source inspection, controlled
 HTTP/socket peers and the Rust test suite.
 
 Source delivery does not update installed fleet binaries. The prior mechanical
-log specifically found ULTRA running a stale binary despite fixed source on
-other hosts. Deployment must identify the built source SHA and binary digest;
+log specifically found a fleet host running a stale binary despite fixed source
+on other hosts. Deployment must identify the built source SHA and binary digest;
 the old `zoder 0.2.1` version string alone cannot prove this repair is installed.
 
 ## Known limits
