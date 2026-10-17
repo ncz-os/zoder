@@ -663,6 +663,13 @@ pub struct OverlayReport {
     pub added: Vec<String>,
     /// Models the corpus already knew that gained at least one alias.
     pub aliased: Vec<String>,
+    /// Names the explicit `aliases` map MOVED off another row, one entry per
+    /// `(alias, from_id, to_id)` removed by the override. A name can be carried
+    /// by a corpus row before the overlay or taught to a row by the overlay's
+    /// own `models` entry; either way the map is the resolution authority, so
+    /// this records what the operator's map changed instead of leaving it
+    /// visible only by diffing the rows.
+    pub reassigned: Vec<(String, String, String)>,
     /// Size of the alias map after ingest (existing entries plus overlay ones).
     pub alias_count: usize,
 }
@@ -777,11 +784,12 @@ impl Corpus {
     /// stays driven by the flat corpus file alone.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let mut corpus = Self::load_with_cap(path, Self::MAX_CORPUS_BYTES)?;
-        // The overlay is optional, so a corpus saved while one was deployed
-        // must still resolve its names from the persisted rows alone. Rebuild
-        // before the overlay is folded in: a deployed overlay can then add or
-        // override, never erase, what the corpus file already carries.
-        corpus.rebuild_aliases_from_models();
+        // No rebuild is needed here: every success path through
+        // `load_with_cap` ends in `parse_raw`, which rebuilds the alias map
+        // from the persisted rows. So a corpus saved while an overlay was
+        // deployed already resolves its names from the rows alone, and folding
+        // the overlay in afterwards can add or override, never erase, what the
+        // corpus file carries.
         corpus.apply_alias_overlay();
         Ok(corpus)
     }
@@ -1041,8 +1049,10 @@ impl Corpus {
     /// `resolve_alias(resolve_alias(x)) == resolve_alias(x)`. Callers that then
     /// need the entry can chain [`Self::get`], which applies the same rule.
     ///
-    /// The fast path is the alias lookup itself: an id that is not an alias
-    /// needs no scan of the model list at all.
+    /// Cost: an id that is not an alias costs one map lookup and no scan of
+    /// the model list; an alias hit scans the model list at most twice (once
+    /// to prove no real row shadows the name, once to prove the target still
+    /// names a live row).
     pub fn resolve_alias<'a>(&'a self, id: &'a str) -> &'a str {
         let Some(target) = self.aliases.get(id) else {
             return id;
@@ -1409,8 +1419,26 @@ impl Corpus {
                 continue;
             };
             for (idx, model) in self.models.iter_mut().enumerate() {
-                if idx != target_idx {
-                    model.aliases.retain(|a| a.trim() != alias);
+                if idx == target_idx {
+                    continue;
+                }
+                let had_alias = model.aliases.iter().any(|a| a.trim() == alias);
+                model.aliases.retain(|a| a.trim() != alias);
+                if had_alias {
+                    // The map moved this name off `model`. Record it (and warn
+                    // once) so an operator can see the override instead of
+                    // discovering that `-m` silently changed meaning.
+                    report.reassigned.push((
+                        alias.to_string(),
+                        model.id.clone(),
+                        target.to_string(),
+                    ));
+                    warn_overlay_once(format_args!(
+                        "model alias overlay {} moves alias `{alias}` from `{}` to `{target}`; \
+                         the explicit map wins over the row that carried it",
+                        path.display(),
+                        model.id,
+                    ));
                 }
             }
             let entry = &mut self.models[target_idx];
@@ -1718,6 +1746,14 @@ mod corpus_io_tests {
         fn retarget(&mut self, path: &Path) {
             std::env::set_var(MODEL_ALIASES_ENV, path);
         }
+
+        /// Remove `$ZODER_MODEL_ALIASES` WITHOUT releasing the lock, so a test
+        /// can exercise the "unset, fall back to the zoder home" branch without
+        /// a raw `remove_var` that could race a sibling. Drop still restores the
+        /// value captured when the guard was created.
+        fn clear(&mut self) {
+            std::env::remove_var(MODEL_ALIASES_ENV);
+        }
     }
 
     impl Drop for AliasEnvGuard {
@@ -1725,6 +1761,30 @@ mod corpus_io_tests {
             match &self.prev {
                 Some(v) => std::env::set_var(MODEL_ALIASES_ENV, v),
                 None => std::env::remove_var(MODEL_ALIASES_ENV),
+            }
+        }
+    }
+
+    /// RAII override of `$ZODER_HOME`, the exact variable `Config::home` reads.
+    /// Restoring the previous value (or removing it when it was unset) on drop
+    /// keeps a relocated home from leaking into sibling tests in this binary.
+    struct ZoderHomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ZoderHomeGuard {
+        fn new(path: &Path) -> Self {
+            let prev = std::env::var_os("ZODER_HOME");
+            std::env::set_var("ZODER_HOME", path);
+            Self { prev }
+        }
+    }
+
+    impl Drop for ZoderHomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("ZODER_HOME", v),
+                None => std::env::remove_var("ZODER_HOME"),
             }
         }
     }
@@ -2654,21 +2714,29 @@ mod corpus_io_tests {
     fn overlay_path_prefers_the_env_var_then_the_zoder_home() {
         let dir = tmpdir();
         let pinned = dir.join("pinned-aliases.json");
+        let zoder_home = dir.join("zoder-home");
+        std::fs::create_dir_all(&zoder_home).unwrap();
 
-        let _env = AliasEnvGuard::new(&pinned);
+        let mut env = AliasEnvGuard::new(&pinned);
+        // `Config::home` reads `ZODER_HOME`. Point it at a temp dir while the
+        // overlay lock is held, so the fallback is asserted against a LITERAL
+        // path instead of the same env read on both sides (which would pass
+        // even if the fallback ignored the variable entirely).
+        let _home = ZoderHomeGuard::new(&zoder_home);
+
         assert_eq!(Corpus::alias_overlay_path(), pinned);
 
         // Empty is treated as unset, not as "the current directory".
-        std::env::set_var(MODEL_ALIASES_ENV, "");
+        env.retarget(Path::new(""));
         assert_eq!(
             Corpus::alias_overlay_path(),
-            crate::config::Config::home().join(MODEL_ALIASES_FILE)
+            zoder_home.join(MODEL_ALIASES_FILE)
         );
 
-        std::env::remove_var(MODEL_ALIASES_ENV);
+        env.clear();
         assert_eq!(
             Corpus::alias_overlay_path(),
-            crate::config::Config::home().join(MODEL_ALIASES_FILE)
+            zoder_home.join(MODEL_ALIASES_FILE)
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2796,6 +2864,44 @@ mod corpus_io_tests {
         assert_eq!(
             reloaded.get("shared:name").map(|m| m.id.as_str()),
             Some("vendor/b")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (10b) A name taught to row A by the overlay's own `models` entry and then
+    // taken by the explicit map for row B is REPORTED (alias, from, to), not
+    // silently moved, and resolution follows the map.
+    #[test]
+    fn explicit_map_reassignment_is_reported() {
+        let _env = AliasEnvGuard::none();
+        let dir = tmpdir();
+        let p = write_file(
+            &dir,
+            "corpus.json",
+            r#"{"models": [{"id": "A", "agentic_score": 0.5},
+                            {"id": "B", "agentic_score": 0.7}]}"#,
+        );
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [{"id": "A", "aliases": ["X"]}],
+                "aliases": {"X": "B"}}"#,
+        );
+
+        let mut c = Corpus::load(&p).unwrap();
+        let report = c.apply_alias_overlay_from(&overlay);
+
+        assert_eq!(
+            report.reassigned,
+            vec![("X".to_string(), "A".to_string(), "B".to_string())],
+            "{report:?}"
+        );
+        assert_eq!(c.resolve_alias("X"), "B");
+        assert_eq!(c.get("X").map(|m| m.id.as_str()), Some("B"));
+        assert!(
+            !c.get("A").unwrap().aliases.iter().any(|a| a == "X"),
+            "the row the map took the name from must no longer carry it"
         );
 
         std::fs::remove_dir_all(&dir).ok();
