@@ -1026,10 +1026,12 @@ impl Corpus {
 
     /// Resolve an operator-supplied model id through the alias overlay.
     ///
-    /// The returned id either names a corpus row or is `id` unchanged. An
-    /// overlay map entry whose target names no row is rejected at ingest, so
-    /// resolution cannot hand back a phantom id; an id that is neither a model
-    /// nor an alias is returned verbatim.
+    /// The returned id either names a corpus row or is `id` unchanged. Ingest
+    /// rejects an overlay entry whose target names no row, but [`Corpus::models`]
+    /// is a public field: a caller can remove a row without rebuilding the
+    /// alias index, so resolution ALSO re-checks that the target still names a
+    /// live row instead of handing back a phantom id. An id that is neither a
+    /// model nor an alias is returned verbatim.
     ///
     /// Returns the canonical model id for an exact alias hit, and `id`
     /// unchanged in every other case — including when the corpus already knows
@@ -1049,7 +1051,15 @@ impl Corpus {
             // A real model id shadows an alias of the same name.
             return id;
         }
-        target.as_str()
+        // The alias map is derived from the rows, but `models` is public and a
+        // caller may remove a row without rebuilding it. Never hand back a
+        // target that names no live row — the documented contract is that the
+        // returned id names a corpus row, or it is `id` unchanged.
+        if self.models.iter().any(|m| m.id == *target) {
+            target.as_str()
+        } else {
+            id
+        }
     }
 
     /// Rebuild the alias index from the `aliases` list persisted on each model
@@ -1663,10 +1673,12 @@ mod corpus_io_tests {
 
     /// Process-wide mutex around `$ZODER_MODEL_ALIASES`, which `Corpus::load`
     /// reads. EVERY test in this binary that mutates that variable — or that
-    /// calls `Corpus::load` and then asserts exact model counts — must hold it,
-    /// otherwise a developer's real `~/.zoder/model-aliases.json` (or a sibling
-    /// test's overlay) can change what `load` returns. Same contract as
-    /// `zoder-cli`'s `test_env::ENV_LOCK` for `ZODER_HOME`.
+    /// calls `Corpus::load`/`Corpus::load_with_cap` and then asserts model
+    /// counts, alias resolution, or `OverlayReport` contents — must hold it
+    /// for its whole body, otherwise a developer's real
+    /// `~/.zoder/model-aliases.json` (or a sibling test's overlay) can change
+    /// what `load` returns. Same contract as `zoder-cli`'s
+    /// `test_env::ENV_LOCK` for `ZODER_HOME`.
     static OVERLAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII override of `$ZODER_MODEL_ALIASES`. Holds [`OVERLAY_ENV_LOCK`] for
@@ -1697,6 +1709,14 @@ mod corpus_io_tests {
                 SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
             ));
             Self::new(&missing)
+        }
+
+        /// Re-point an existing guard at `path` WITHOUT releasing the lock.
+        /// Tests that load several overlay fixtures hold one guard for their
+        /// whole body and move the env var between fixtures instead of
+        /// re-acquiring it (which would also drop the protection in between).
+        fn retarget(&mut self, path: &Path) {
+            std::env::set_var(MODEL_ALIASES_ENV, path);
         }
     }
 
@@ -1732,6 +1752,9 @@ mod corpus_io_tests {
     // returns the surviving (last) one.
     #[test]
     fn duplicate_ids_collapse_last_wins() {
+        // `load` also folds in the optional alias overlay; pin it to "absent"
+        // for the whole test so this test measures the corpus file alone.
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         // Two rows for "vendor/dup": the first is stale (low score), the second
         // is fresh (high score). Last-wins must keep the fresh one. A distinct
@@ -1745,9 +1768,6 @@ mod corpus_io_tests {
             ]
         }"#;
         let p = write_file(&dir, "corpus.json", body);
-        // `load` also folds in the optional alias overlay; pin it to "absent"
-        // so this test measures the corpus file alone.
-        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&p).unwrap();
 
         // Exactly one entry for the duplicated id.
@@ -1771,6 +1791,7 @@ mod corpus_io_tests {
     // C5-3: a non-empty file where every entry is unusable -> load() returns Err.
     #[test]
     fn all_invalid_entries_is_err() {
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         // Two entries, both unusable: one has an empty id, one is missing `id`
         // entirely (fails ModelEntry deser). Input was non-empty, usable == 0.
@@ -1781,7 +1802,6 @@ mod corpus_io_tests {
             ]
         }"#;
         let p = write_file(&dir, "corpus.json", body);
-        let _env = AliasEnvGuard::none();
         let err = Corpus::load(&p).expect_err("all-invalid corpus must be an error");
         assert!(
             err.to_string().contains("0 usable entries"),
@@ -1794,9 +1814,9 @@ mod corpus_io_tests {
     // C5-3: a legitimately-empty `{"models":[]}` still loads Ok as an empty corpus.
     #[test]
     fn legitimately_empty_models_is_ok() {
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let p = write_file(&dir, "corpus.json", r#"{"models": []}"#);
-        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&p).expect("empty models array must load Ok");
         assert_eq!(c.models.len(), 0);
         assert_eq!(c.count, 0);
@@ -1807,6 +1827,7 @@ mod corpus_io_tests {
     // C5-4: save() uses a unique temp filename and leaves no stray `.json.tmp`.
     #[test]
     fn save_uses_unique_temp_and_leaves_no_stray_tmp() {
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let path = dir.join("corpus.json");
         let c = Corpus {
@@ -1821,7 +1842,6 @@ mod corpus_io_tests {
 
         // The corpus is present and reloads.
         assert!(path.exists());
-        let _env = AliasEnvGuard::none();
         let reloaded = Corpus::load(&path).unwrap();
         assert_eq!(reloaded.models.len(), 1);
 
@@ -1850,6 +1870,10 @@ mod corpus_io_tests {
     // operator can diagnose a runaway corpus without re-running with --debug.
     #[test]
     fn load_rejects_oversized_under_test_cap_and_accepts_under_production_cap() {
+        // `load`/`load_with_cap` consult the optional alias overlay: hold the
+        // env lock for the whole test so neither a sibling test nor the
+        // developer's real overlay can change the count asserted below.
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         // Build a fixture with many small entries so the body is ~9 KiB -- well
         // under MAX_CORPUS_BYTES (8 MiB) so production `load` accepts it, but
@@ -1896,7 +1920,6 @@ mod corpus_io_tests {
         );
 
         // 2) Same fixture, production cap -> Ok with all 200 entries.
-        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&on_disk).expect("fixture under 8 MiB must load Ok");
         assert_eq!(c.models.len(), 200);
         assert_eq!(c.count, 200);
@@ -1911,12 +1934,12 @@ mod corpus_io_tests {
     // defect calls out.
     #[test]
     fn load_rejects_non_regular_path_with_clear_error() {
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         // Point the loader at the directory itself. `read_to_string` on a
         // directory would either error with EISDIR or, on some platforms,
         // read the directory's raw bytes -- neither is what we want. The
         // guard must trip on is_file() and bail with a clear message.
-        let _env = AliasEnvGuard::none();
         let err = Corpus::load(&dir).expect_err("loading a directory as a corpus must fail");
         let msg = err.to_string();
         assert!(
@@ -1971,6 +1994,11 @@ mod corpus_io_tests {
 
         let dir = tmpdir();
         let target_path: PathBuf = dir.join("corpus.json");
+
+        // `load_with_cap` is the base of `Corpus::load`, which folds in the
+        // optional alias overlay. Hold the env lock for the whole test so a
+        // sibling test cannot redirect the overlay mid-run.
+        let _env = AliasEnvGuard::none();
 
         // ---------- (a) DETERMINISTIC BOUNDARY ----------
         // File is exactly `cap + 1` bytes long. `metadata().len()` returns
@@ -2143,6 +2171,10 @@ mod corpus_io_tests {
 
         let dir = tmpdir();
         let fifo_path = dir.join("corpus.fifo");
+        // `Corpus::load` consults the optional alias overlay after reading the
+        // corpus; hold the env lock for the whole test so the loader thread
+        // never races a sibling test's overlay redirect.
+        let _env = AliasEnvGuard::none();
         // mkfifo via libc -- std doesn't expose it directly.
         use std::os::unix::ffi::OsStrExt;
         let cstr = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
@@ -2413,9 +2445,13 @@ mod corpus_io_tests {
                 r#"{"models": [{"id": "gpt-6-sol", "aliases": ["codex:sol"]}"#,
             ),
         ];
+        // One guard for the whole test: the env var is moved between fixtures
+        // without dropping the lock, so no sibling test can observe or change
+        // the overlay selection while these loads run.
+        let mut env = AliasEnvGuard::none();
         for (name, body) in broken {
             let overlay = write_file(&dir, name, body);
-            let _env = AliasEnvGuard::new(&overlay);
+            env.retarget(&overlay);
 
             let c = Corpus::load(&p)
                 .unwrap_or_else(|e| panic!("{name}: a bad overlay must not fail startup: {e}"));
@@ -2461,11 +2497,15 @@ mod corpus_io_tests {
     fn structurally_unusable_overlay_is_ignored() {
         let dir = tmpdir();
         let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        // One guard for the whole test: each fixture re-points the env var
+        // without releasing the lock, so every load below sees only its own
+        // overlay path.
+        let mut env = AliasEnvGuard::none();
 
         // A directory at the overlay path: refused by the is_file() guard, and
         // it must not hang the loader either.
         {
-            let _env = AliasEnvGuard::new(&dir);
+            env.retarget(&dir);
             let c = Corpus::load(&p).expect("a directory overlay must not fail the load");
             assert_eq!(c.models.len(), 1);
             assert!(c.aliases.is_empty());
@@ -2480,7 +2520,7 @@ mod corpus_io_tests {
         std::fs::write(&big, &big_body).unwrap();
         assert!(std::fs::metadata(&big).unwrap().len() > Corpus::MAX_ALIAS_OVERLAY_BYTES);
         {
-            let _env = AliasEnvGuard::new(&big);
+            env.retarget(&big);
             let c = Corpus::load(&p).expect("an oversized overlay must not fail the load");
             assert_eq!(c.models.len(), 1);
             assert!(c.aliases.is_empty());
@@ -2494,7 +2534,7 @@ mod corpus_io_tests {
             let cstr = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(cstr.as_ptr(), 0o644) }, 0);
 
-            let _env = AliasEnvGuard::new(&fifo);
+            env.retarget(&fifo);
             let c = Corpus::load(&p).expect("a FIFO overlay must not fail the load");
             assert_eq!(c.models.len(), 1);
             assert!(c.aliases.is_empty());
@@ -2562,6 +2602,9 @@ mod corpus_io_tests {
     // save/load round trip so a refresh cannot lose the names a pin uses.
     #[test]
     fn overlay_ingest_is_idempotent_and_survives_a_save_round_trip() {
+        // Both loads below must see "no overlay deployed"; hold the lock for
+        // the whole test, including the explicit ingest in between.
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
         let overlay = write_file(&dir, "model-aliases.json", OVERLAY);
@@ -2571,7 +2614,6 @@ mod corpus_io_tests {
             // Load with NO overlay and ingest explicitly, so the report asserted
             // here is this call's own: a load-time ingest would already have
             // consumed the first application.
-            let _env = AliasEnvGuard::none();
             let mut c = Corpus::load(&p).unwrap();
             assert!(
                 c.get("gpt-6-sol").is_none(),
@@ -2597,7 +2639,6 @@ mod corpus_io_tests {
         // Reload with NO overlay deployed: the persisted rows and alias map
         // must still resolve, which is what keeps an existing `-m codex:sol`
         // working across a corpus refresh.
-        let _env = AliasEnvGuard::none();
         let reloaded = Corpus::load(&saved).unwrap();
         assert_eq!(reloaded.models.len(), 2);
         assert_eq!(reloaded.resolve_alias("codex:sol"), "gpt-6-sol");
@@ -2639,6 +2680,8 @@ mod corpus_io_tests {
     // in-memory map and every construction path dropped it on reload.
     #[test]
     fn explicit_map_alias_survives_a_save_load_round_trip() {
+        // Both loads must see "no overlay deployed"; hold the lock throughout.
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let p = write_file(
             &dir,
@@ -2653,7 +2696,6 @@ mod corpus_io_tests {
         let saved = dir.join("saved-corpus.json");
 
         {
-            let _env = AliasEnvGuard::none();
             let mut c = Corpus::load(&p).unwrap();
             let report = c.apply_alias_overlay_from(&overlay);
             assert_eq!(report.added, Vec::<String>::new());
@@ -2672,7 +2714,6 @@ mod corpus_io_tests {
         }
 
         // No overlay deployed: the persisted row alone must resolve the name.
-        let _env = AliasEnvGuard::none();
         let reloaded = Corpus::load(&saved).unwrap();
         assert_eq!(reloaded.models.len(), 1);
         assert_eq!(reloaded.resolve_alias("short:target"), "vendor/target");
@@ -2695,6 +2736,8 @@ mod corpus_io_tests {
     // the rows are made to agree with it so the rebuild cannot resurrect A.
     #[test]
     fn explicit_map_override_moves_an_alias_between_rows_and_survives_a_round_trip() {
+        // Both loads must see "no overlay deployed"; hold the lock throughout.
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let p = write_file(
             &dir,
@@ -2711,7 +2754,6 @@ mod corpus_io_tests {
         let saved = dir.join("saved-corpus.json");
 
         {
-            let _env = AliasEnvGuard::none();
             let mut c = Corpus::load(&p).unwrap();
             let report = c.apply_alias_overlay_from(&overlay);
             assert_eq!(report.added, Vec::<String>::new());
@@ -2736,7 +2778,6 @@ mod corpus_io_tests {
             c.save(&saved).unwrap();
         }
 
-        let _env = AliasEnvGuard::none();
         let reloaded = Corpus::load(&saved).unwrap();
         assert_eq!(
             reloaded.resolve_alias("shared:name"),
@@ -2765,6 +2806,7 @@ mod corpus_io_tests {
     // a phantom id that no corpus row backs.
     #[test]
     fn explicit_map_dangling_target_is_skipped() {
+        let _env = AliasEnvGuard::none();
         let dir = tmpdir();
         let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
         let overlay = write_file(
@@ -2773,7 +2815,6 @@ mod corpus_io_tests {
             r#"{"models": [], "aliases": {"ghost:name": "vendor/not-in-corpus"}}"#,
         );
 
-        let _env = AliasEnvGuard::none();
         let mut c = Corpus::load(&p).unwrap();
         let report = c.apply_alias_overlay_from(&overlay);
 
@@ -2820,5 +2861,36 @@ mod corpus_io_tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (13) The alias map is derived state, but `Corpus::models` is public: a
+    // caller can drop a row without rebuilding the index, leaving a stale map
+    // entry. `resolve_alias` must still honor its contract and refuse to hand
+    // back a target that names no live row.
+    #[test]
+    fn stale_alias_to_a_removed_row_resolves_to_the_input() {
+        let mut corpus = Corpus {
+            source: "test".into(),
+            models: vec![ModelEntry {
+                id: "vendor/gone".into(),
+                aliases: vec!["short:gone".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        corpus.rebuild_aliases_from_models();
+        assert_eq!(corpus.resolve_alias("short:gone"), "vendor/gone");
+        assert!(corpus.get("short:gone").is_some());
+
+        // Remove the target row directly through the public field — and do NOT
+        // rebuild, so the alias map still points at the now-absent id.
+        corpus.models.retain(|m| m.id != "vendor/gone");
+        assert!(
+            corpus.aliases.contains_key("short:gone"),
+            "precondition: the alias map must be stale"
+        );
+
+        assert_eq!(corpus.resolve_alias("short:gone"), "short:gone");
+        assert!(corpus.get("short:gone").is_none());
     }
 }
