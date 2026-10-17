@@ -931,6 +931,16 @@ zoder routes off two data files in `$ZODER_HOME` (`~/.zoder`):
 - **`data/pricing.json`** — per-token rates, the cost source for `zoder report`
   / `spend` / `finops`.
 
+An **optional third** file, **`model-aliases.json`**, closes the window between
+a vendor shipping a new model id and the next corpus refresh. It is
+provider-neutral and generated outside zoder; when present, `Corpus::load` folds
+it in so `zoder models` lists the current ids (marked `overlay` in the `via`
+column) and an exact alias resolves everywhere an explicit id does
+(`-m codex:sol` → `gpt-6-sol`). An overlay row is **metadata only**: never a
+route candidate, never auto-ranked, never priced — the corpus builder still
+decides what can route. Missing file = no-op; malformed file = one warning on
+stderr, ignored. Override the location with `$ZODER_MODEL_ALIASES`.
+
 Both are **public, self-serve, and rebuilt daily from public price data** — they
 do **not** depend on any private/internal build process:
 

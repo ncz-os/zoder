@@ -3,15 +3,73 @@
 //! Each [`ModelEntry`] carries free/paid classification, LMArena-derived
 //! capability weights (overall + coding/SWE), and benched latency/throughput,
 //! combined into a single `agentic_score` the router can sort on.
+//!
+//! # Alias overlay
+//!
+//! The builder's corpus is refreshed on a bench cadence, so ids that a vendor
+//! ships *faster than the bench* (`gpt-6-sol`, `claude-opus-5-5`, ...) are
+//! unknown to `zoder models`, `-m` pinning and pricing/health lookups until the
+//! next refresh. An optional, provider-neutral alias overlay
+//! (`$ZODER_MODEL_ALIASES`, default `~/.zoder/model-aliases.json`) closes that
+//! window: it names current model ids and the short aliases an operator
+//! actually types, and [`Corpus::load`] folds both into the corpus.
+//!
+//! Two invariants keep the overlay from becoming a back door into routing:
+//!
+//!   * an overlay-added row is METADATA ONLY — `route_candidate = false` and
+//!     no invented pricing/Elo, so it can never be auto-selected or priced;
+//!   * a model the corpus already knows keeps every corpus field and merely
+//!     gains its aliases, so an overlay can never demote or re-score a
+//!     benched model.
+//!
+//! Aliases translate only an EXPLICIT id an operator typed (exact match, exact
+//! ids win over aliases) — they never feed the ranking or the fallback chain.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Monotonic per-writer nonce so two overlapping corpus saves in the same
 /// process never collide on the temp path. Combined with `std::process::id()`
 /// it makes the temp filename unique per writer (C5-4 / S19).
 static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Provenance tag stamped on rows the corpus builder never classified: entries
+/// created from the alias overlay. Permanent — it records where an id came
+/// from, not whether it is currently routable (a row promoted later by
+/// `ingest_free_chat` keeps the tag).
+pub const OVERLAY_SOURCE: &str = "overlay";
+
+/// Env var that overrides where the alias overlay is read from. Unset (or
+/// empty) falls back to `<zoder home>/model-aliases.json`.
+pub const MODEL_ALIASES_ENV: &str = "ZODER_MODEL_ALIASES";
+
+/// File name of the alias overlay inside the zoder home.
+pub const MODEL_ALIASES_FILE: &str = "model-aliases.json";
+
+/// Process-wide latch so a bad overlay warns ONCE per process: `Corpus::load`
+/// runs in several commands (`config`, `models`, `route`, every dispatch), and
+/// a per-call warning would repeat the same line on every invocation.
+static OVERLAY_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit `args` on stderr at most once per process. Returns whether THIS call
+/// was the one that printed, which is what makes "warn once" testable.
+fn warn_overlay_once(args: fmt::Arguments<'_>) -> bool {
+    warn_overlay_once_flagged(&OVERLAY_WARNED, args)
+}
+
+/// The latch logic of [`warn_overlay_once`], with the flag passed in so a test
+/// can prove the "exactly one of N" contract on its own fresh latch instead of
+/// racing whatever the process-global one has already emitted.
+fn warn_overlay_once_flagged(latch: &AtomicBool, args: fmt::Arguments<'_>) -> bool {
+    if latch.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!("zoder: warning: {args}");
+    true
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -32,6 +90,19 @@ pub struct ModelEntry {
     pub paid: bool,
     #[serde(default)]
     pub gated_reason: Option<String>,
+
+    /// Operator-facing aliases this id also answers to (e.g. `codex:sol` ->
+    /// `gpt-6-sol`), ingested from the optional alias overlay. Purely a
+    /// name-translation layer for an EXPLICIT id: it is never a ranking,
+    /// eligibility or pricing input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Provenance of a row the corpus builder did not classify — `overlay`
+    /// for alias-overlay entries ([`OVERLAY_SOURCE`]), `None` for a normal
+    /// corpus row. Surfaced by `zoder models` so an operator can tell a
+    /// metadata-only row from a benched one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 
     #[serde(default)]
     pub arena_overall_elo: Option<f64>,
@@ -296,6 +367,12 @@ impl ModelEntry {
     pub fn routable(&self) -> bool {
         self.free && self.route_candidate && self.kind == "chat"
     }
+    /// True when the row came from the alias overlay rather than the corpus
+    /// builder, i.e. it carries NO benchmark, pricing or routing evidence and
+    /// exists so a current model id resolves. Display provenance only.
+    pub fn is_overlay(&self) -> bool {
+        self.source.as_deref() == Some(OVERLAY_SOURCE)
+    }
 
     /// Unified coding-capability score: the straight mean of whatever benchmark
     /// scores are present (0..100). Missing sources are skipped, not penalized,
@@ -540,7 +617,69 @@ pub struct RefreshReport {
     pub kept: usize,
 }
 
+/// One model row in the provider-neutral alias overlay: a current model id,
+/// the provider that serves it, and the short aliases an operator types for
+/// it. Any other key the generator emits (`display_name`, `created_at`, ...) is
+/// accepted and ignored — serde's default is to skip unknown fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OverlayModel {
+    /// Canonical model id, e.g. `gpt-6-sol`.
+    pub id: String,
+    /// Provider that serves this id (e.g. `openai-codex`). Recorded as the
+    /// entry's `family` for display; it decides neither routing nor billing.
+    #[serde(default)]
+    pub provider: String,
+    /// Aliases that resolve to `id`, e.g. `["codex:sol"]`.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// The optional provider-neutral alias overlay, generated outside zoder and
+/// deployed to `<zoder home>/model-aliases.json`.
+///
+/// zoder reads exactly two things from it: the `models` rows (so an id a vendor
+/// shipped after the last corpus refresh is at least *known*) and the `aliases`
+/// map (so `-m codex:sol` reaches `gpt-6-sol`). The generator's
+/// `codex_ladder`/`source`/`generated_at` fields are accepted and ignored on
+/// purpose: zoder ranks on benched corpus data plus live provider health, never
+/// on a static ladder, and never derives pricing from an alias file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AliasOverlay {
+    #[serde(default)]
+    pub models: Vec<OverlayModel>,
+    /// alias -> model id. Resolved on EXACT match only.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+}
+
+/// What [`Corpus::apply_alias_overlay`] ingested. Reported so an operator (or
+/// a test) can see what the overlay contributed without diffing the corpus.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OverlayReport {
+    /// The overlay file that was read. `None` when no overlay is deployed —
+    /// the common case, since the overlay is optional.
+    pub path: Option<PathBuf>,
+    /// Overlay ids absent from the corpus, added as metadata-only rows.
+    pub added: Vec<String>,
+    /// Models the corpus already knew that gained at least one alias.
+    pub aliased: Vec<String>,
+    /// Size of the alias map after ingest (existing entries plus overlay ones).
+    pub alias_count: usize,
+}
+
+/// Bounded read of the overlay file. Split out from [`AliasOverlay`]'s
+/// consumer so "not deployed" stays distinguishable from "deployed but
+/// broken": only the latter may warn.
+enum OverlayRead {
+    /// No overlay at this path (or it vanished between resolution and read).
+    Missing,
+    /// Deployed but not usable as a plain bounded JSON file.
+    Broken(String),
+    Body(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "CorpusWire")]
 pub struct Corpus {
     #[serde(default)]
     pub source: String,
@@ -549,6 +688,56 @@ pub struct Corpus {
     #[serde(default)]
     pub count: usize,
     pub models: Vec<ModelEntry>,
+    /// Alias -> canonical model id, ingested from the optional alias overlay
+    /// and consulted by [`Corpus::resolve_alias`] / [`Corpus::get`]. Persisted
+    /// with the corpus so a refresh never loses the names an operator's config
+    /// pins; omitted from the serialized form when empty so a corpus written by
+    /// a build with no overlay is byte-identical to one written before.
+    ///
+    /// The persisted map is a CACHE: every construction path rebuilds it from
+    /// the `aliases` list on the model rows, so a corpus saved while an overlay
+    /// was deployed keeps resolving those names after the overlay file is gone.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+}
+
+/// Wire shape for [`Corpus`] deserialization. Separated from `Corpus` so
+/// [`From<CorpusWire>`] can run [`Corpus::rebuild_aliases_from_models`] on
+/// EVERY deserialization path, not just the file loader. Any top-level
+/// `aliases` map in the JSON is deliberately not read: it is derived state and
+/// would otherwise let a stale map disagree with the rows it was written from.
+#[derive(Debug, Default, Deserialize)]
+struct CorpusWire {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    arena_date: String,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    models: Vec<ModelEntry>,
+}
+
+impl From<CorpusWire> for Corpus {
+    fn from(wire: CorpusWire) -> Self {
+        let mut corpus = Corpus {
+            source: wire.source,
+            arena_date: wire.arena_date,
+            count: wire.count,
+            models: wire.models,
+            aliases: BTreeMap::new(),
+        };
+        corpus.rebuild_aliases_from_models();
+        corpus
+    }
+}
+
+impl Default for Corpus {
+    fn default() -> Self {
+        // Route the empty/default path through the same constructor so it has
+        // exactly the same alias invariant as a loaded corpus.
+        CorpusWire::default().into()
+    }
 }
 
 impl Corpus {
@@ -559,6 +748,13 @@ impl Corpus {
     /// order of magnitude above real usage while staying bounded -- a typo'd
     /// 64-bit `len()` would land in the `Err` path, not as an allocation.
     const MAX_CORPUS_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
+
+    /// Maximum trusted alias-overlay size. The overlay is a small generated
+    /// artifact (tens of models plus an alias map), so 1 MiB sits an order of
+    /// magnitude above real usage while keeping a misconfigured
+    /// `$ZODER_MODEL_ALIASES` pointing at some large file from being read into
+    /// memory at all. Enforced at the stat and at the read, as above.
+    const MAX_ALIAS_OVERLAY_BYTES: u64 = 1024 * 1024; // 1 MiB
 
     /// Load a corpus from `path`, rejecting non-regular files (FIFO, socket,
     /// device, directory) and any file larger than [`Self::MAX_CORPUS_BYTES`].
@@ -572,8 +768,22 @@ impl Corpus {
     /// the original hang symptom the defect calls out. Mirrors the
     /// TOCTOU-safe `File::open` + `f.metadata()` pattern established in
     /// `crates/zoder-core/src/pricing.rs` (`PricingCatalog::load`).
+    ///
+    /// The optional alias overlay (`$ZODER_MODEL_ALIASES`, default
+    /// `<zoder home>/model-aliases.json`) is folded in afterwards via
+    /// [`Self::apply_alias_overlay`]. It can only ever ADD rows and alias
+    /// names, and it is never fatal: a missing file is a no-op and a malformed
+    /// one warns once and is ignored, so the `Err` contract of this function
+    /// stays driven by the flat corpus file alone.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        Self::load_with_cap(path, Self::MAX_CORPUS_BYTES)
+        let mut corpus = Self::load_with_cap(path, Self::MAX_CORPUS_BYTES)?;
+        // The overlay is optional, so a corpus saved while one was deployed
+        // must still resolve its names from the persisted rows alone. Rebuild
+        // before the overlay is folded in: a deployed overlay can then add or
+        // override, never erase, what the corpus file already carries.
+        corpus.rebuild_aliases_from_models();
+        corpus.apply_alias_overlay();
+        Ok(corpus)
     }
 
     /// Internal loader that takes the byte cap as a parameter so tests can
@@ -760,24 +970,30 @@ impl Corpus {
         // the FIRST (stale) row and a doubly-listed id could appear twice in the
         // fallback chain. Keeping the last occurrence lets a later (fresher) row win
         // while preserving the original relative order of the survivors.
-        Self::dedup_by_id_last_wins(&mut models);
+        Self::dedup_by_id_last_wins(&mut models, |m: &ModelEntry| m.id.as_str());
 
-        Ok(Corpus {
+        let mut corpus = Corpus {
             source: str_field("source"),
             arena_date: str_field("arena_date"),
             count: models.len(),
             models,
-        })
+            aliases: BTreeMap::new(),
+        };
+        // Includes the legitimately-empty `{"models":[]}` path: rebuilding an
+        // empty set is a no-op, but every Corpus that leaves this parser has
+        // been through the same invariant.
+        corpus.rebuild_aliases_from_models();
+        Ok(corpus)
     }
 
     /// De-duplicate `models` by `id`, keeping the LAST occurrence of each id and
     /// preserving the relative order of the surviving entries. Used by `load()`
     /// so a corpus file with duplicate ids collapses to one entry per id.
-    fn dedup_by_id_last_wins(models: &mut Vec<ModelEntry>) {
+    fn dedup_by_id_last_wins<T>(models: &mut Vec<T>, id_of: fn(&T) -> &str) {
         // Index of the last occurrence of each id.
         let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (i, m) in models.iter().enumerate() {
-            last.insert(m.id.as_str(), i);
+            last.insert(id_of(m), i);
         }
         if last.len() == models.len() {
             return; // no duplicates, avoid the allocation/rebuild
@@ -794,8 +1010,69 @@ impl Corpus {
         });
     }
 
+    /// Look up a model by id, accepting an overlay alias for the id.
+    ///
+    /// An EXACT corpus id always wins; only when nothing in the corpus matches
+    /// is the alias map consulted, and then only on an exact key match — never
+    /// a prefix, substring, case-folded or fuzzy match, so `codex` never
+    /// resolves to `codex:sol` and a typo never silently routes somewhere else.
     pub fn get(&self, id: &str) -> Option<&ModelEntry> {
-        self.models.iter().find(|m| m.id == id)
+        if let Some(m) = self.models.iter().find(|m| m.id == id) {
+            return Some(m);
+        }
+        let target = self.aliases.get(id)?;
+        self.models.iter().find(|m| &m.id == target)
+    }
+
+    /// Resolve an operator-supplied model id through the alias overlay.
+    ///
+    /// Returns the canonical model id for an exact alias hit, and `id`
+    /// unchanged in every other case — including when the corpus already knows
+    /// a model by exactly that name (an exact id always wins over an alias) and
+    /// when nothing matches at all. Callers that then need the entry can chain
+    /// [`Self::get`], which applies the same rule.
+    ///
+    /// The fast path is the alias lookup itself: an id that is not an alias
+    /// needs no scan of the model list at all.
+    pub fn resolve_alias<'a>(&'a self, id: &'a str) -> &'a str {
+        let Some(target) = self.aliases.get(id) else {
+            return id;
+        };
+        if self.models.iter().any(|m| m.id == id) {
+            // A real model id shadows an alias of the same name.
+            return id;
+        }
+        target.as_str()
+    }
+
+    /// Rebuild the alias index from the `aliases` list persisted on each model
+    /// row.
+    ///
+    /// The overlay file is optional, but the names it taught a row are not: a
+    /// corpus saved while an overlay was deployed must keep resolving them
+    /// after a refresh with no overlay present. Deriving the map from the rows
+    /// (rather than trusting the serialized map) means the rows are the single
+    /// source of truth and a hand-edited/older corpus works the same way.
+    ///
+    /// Names are taken verbatim after trimming: exact matches only, with no
+    /// prefix, substring, case-fold or namespace stripping. On a collision the
+    /// FIRST row that declares the alias wins, so a reload is deterministic.
+    /// [`Self::resolve_alias`] and [`Self::get`] still give an exact model id
+    /// precedence over an alias spelled the same way.
+    fn rebuild_aliases_from_models(&mut self) {
+        let mut aliases = BTreeMap::new();
+        for model in &self.models {
+            for alias in &model.aliases {
+                let alias = alias.trim();
+                if alias.is_empty() || alias == model.id {
+                    continue;
+                }
+                aliases
+                    .entry(alias.to_string())
+                    .or_insert_with(|| model.id.clone());
+            }
+        }
+        self.aliases = aliases;
     }
 
     pub fn free_chat(&self) -> impl Iterator<Item = &ModelEntry> {
@@ -926,6 +1203,223 @@ impl Corpus {
         }
         self.count = self.models.len();
         promoted
+    }
+
+    /// `id` accessor for [`Self::dedup_by_id_last_wins`], which is generic over
+    /// the row type so the same last-wins rule serves the corpus file and the
+    /// overlay file.
+    fn overlay_id_of(m: &OverlayModel) -> &str {
+        m.id.as_str()
+    }
+
+    /// Where the optional alias overlay lives: `$ZODER_MODEL_ALIASES` when set
+    /// to a non-empty value, else `<zoder home>/model-aliases.json`. Reading
+    /// the zoder home (not `dirs::home_dir()` directly) keeps a relocated
+    /// `ZODER_HOME` authoritative for the overlay too.
+    pub fn alias_overlay_path() -> PathBuf {
+        match std::env::var_os(MODEL_ALIASES_ENV) {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => crate::config::Config::home().join(MODEL_ALIASES_FILE),
+        }
+    }
+
+    /// Fold the optional alias overlay into this corpus.
+    ///
+    /// Never fails and never panics: no overlay deployed is a silent no-op, and
+    /// a malformed/oversized/unreadable one warns once on stderr and is
+    /// ignored, so a bad generator run can never take startup down. See the
+    /// module docs for the two invariants (metadata-only additions, corpus
+    /// data always wins).
+    pub fn apply_alias_overlay(&mut self) -> OverlayReport {
+        self.apply_alias_overlay_from(&Self::alias_overlay_path())
+    }
+
+    /// [`Self::apply_alias_overlay`] against an explicit `path`, so a caller
+    /// (or a test) can point at a specific overlay without touching the process
+    /// environment. Ingest is additive and idempotent: applying the same
+    /// overlay twice adds nothing the second time.
+    pub fn apply_alias_overlay_from(&mut self, path: &Path) -> OverlayReport {
+        let mut report = OverlayReport::default();
+
+        let body = match Self::read_overlay_body(path) {
+            OverlayRead::Missing => return report,
+            OverlayRead::Broken(why) => {
+                warn_overlay_once(format_args!(
+                    "model alias overlay {} is unusable ({why}); ignoring it — the corpus is \
+                     unchanged and no alias resolves",
+                    path.display()
+                ));
+                return report;
+            }
+            OverlayRead::Body(body) => body,
+        };
+
+        let mut overlay = match serde_json::from_str::<AliasOverlay>(&body) {
+            Ok(overlay) => overlay,
+            Err(e) => {
+                warn_overlay_once(format_args!(
+                    "model alias overlay {} is malformed ({e}); ignoring it — the corpus is \
+                     unchanged and no alias resolves",
+                    path.display()
+                ));
+                return report;
+            }
+        };
+        report.path = Some(path.to_path_buf());
+
+        // Lenient per-row handling, mirroring the corpus loader: one unusable
+        // overlay row must not discard the whole file. A non-empty `models`
+        // array that yields zero usable rows is a BROKEN file rather than a
+        // legitimately empty one (same C5-3 reasoning as `parse_raw`).
+        let input_rows = overlay.models.len();
+        overlay.models.retain(|m| !m.id.trim().is_empty());
+        Self::dedup_by_id_last_wins(&mut overlay.models, Self::overlay_id_of);
+        if overlay.models.is_empty() && input_rows > 0 {
+            warn_overlay_once(format_args!(
+                "model alias overlay {} has {input_rows} model row{} but none carried a usable \
+                 `id`; ignoring it — the corpus is unchanged",
+                path.display(),
+                if input_rows == 1 { "" } else { "s" },
+            ));
+            return OverlayReport::default();
+        }
+        if overlay.models.len() < input_rows {
+            warn_overlay_once(format_args!(
+                "model alias overlay {} skipped {} model row{} with a missing/empty `id`; the \
+                 remaining rows were still ingested",
+                path.display(),
+                input_rows - overlay.models.len(),
+                if input_rows - overlay.models.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        }
+
+        // Alias map first: per-model `aliases` are the common case, and the
+        // generator's explicit map is the resolution authority, so it is
+        // applied last and overrides any collision.
+        let mut aliases = std::mem::take(&mut self.aliases);
+
+        for om in &overlay.models {
+            let id = om.id.trim();
+            let row_aliases: Vec<&str> = om
+                .aliases
+                .iter()
+                .map(|a| a.trim())
+                .filter(|a| !a.is_empty() && *a != id)
+                .collect();
+            for alias in &row_aliases {
+                aliases
+                    .entry((*alias).to_string())
+                    .or_insert_with(|| id.to_string());
+            }
+
+            match self.models.iter_mut().find(|m| m.id == id) {
+                Some(entry) => {
+                    // Known model: the corpus keeps EVERY field it has (scores,
+                    // economics, classification, routing flags). The overlay
+                    // only teaches this row the extra names it answers to.
+                    let before = entry.aliases.len();
+                    for alias in &row_aliases {
+                        if !entry.aliases.iter().any(|a| a.as_str() == *alias) {
+                            entry.aliases.push((*alias).to_string());
+                        }
+                    }
+                    if entry.aliases.len() > before {
+                        report.aliased.push(id.to_string());
+                    }
+                }
+                None => {
+                    // Unknown id: add it as METADATA ONLY. `route_candidate`
+                    // stays false, free/paid stay false and no score, Elo or
+                    // price is invented, so the row is visible to `zoder
+                    // models`, `-m`, and health/pricing lookups but can never be
+                    // auto-selected, ranked or billed from an alias file.
+                    let mut entry = ModelEntry::from_served_id(id);
+                    entry.route_candidate = false;
+                    entry.free = false;
+                    entry.paid = false;
+                    entry.aliases = row_aliases.iter().map(|a| (*a).to_string()).collect();
+                    entry.source = Some(OVERLAY_SOURCE.into());
+                    entry.gated_reason = Some(
+                        "overlay: known id only — needs classification + bench + pricing before \
+                         it can route (run corpus builder)"
+                            .into(),
+                    );
+                    // The generator's provider id is the only provenance the
+                    // overlay carries; surface it as the family for display.
+                    // It is metadata, not a routing or billing decision.
+                    let provider = om.provider.trim();
+                    if !provider.is_empty() {
+                        entry.family = provider.to_string();
+                    }
+                    self.models.push(entry);
+                    report.added.push(id.to_string());
+                }
+            }
+        }
+
+        for (alias, target) in &overlay.aliases {
+            let (alias, target) = (alias.trim(), target.trim());
+            if alias.is_empty() || target.is_empty() {
+                warn_overlay_once(format_args!(
+                    "model alias overlay {} maps an empty name to an empty id; skipping that entry",
+                    path.display(),
+                ));
+                continue;
+            }
+            aliases.insert(alias.to_string(), target.to_string());
+        }
+
+        report.alias_count = aliases.len();
+        self.aliases = aliases;
+        self.count = self.models.len();
+        report
+    }
+
+    /// Bounded, non-blocking read of the overlay body, on the same posture as
+    /// the corpus loader: regular files only (a FIFO must fail fast, not hang),
+    /// capped at [`Self::MAX_ALIAS_OVERLAY_BYTES`] at BOTH the metadata layer
+    /// and the `Read::take(cap + 1)` layer so a swap between stat and read
+    /// cannot produce an unbounded allocation. `Missing` is deliberately a
+    /// distinct outcome from `Broken`: no overlay deployed is the normal case
+    /// and must stay silent.
+    fn read_overlay_body(path: &Path) -> OverlayRead {
+        use std::io::Read;
+
+        let mut f = match Self::open_corpus_file(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OverlayRead::Missing,
+            Err(e) => return OverlayRead::Broken(e.to_string()),
+        };
+        let meta = match f.metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OverlayRead::Missing,
+            Err(e) => return OverlayRead::Broken(e.to_string()),
+        };
+        if !meta.is_file() {
+            return OverlayRead::Broken("not a regular file".into());
+        }
+        if meta.len() > Self::MAX_ALIAS_OVERLAY_BYTES {
+            return OverlayRead::Broken(format!(
+                "{} bytes exceeds the {} byte cap",
+                meta.len(),
+                Self::MAX_ALIAS_OVERLAY_BYTES
+            ));
+        }
+        let mut buf = String::new();
+        match (&mut f)
+            .take(Self::MAX_ALIAS_OVERLAY_BYTES + 1)
+            .read_to_string(&mut buf)
+        {
+            Ok(_) if buf.len() as u64 > Self::MAX_ALIAS_OVERLAY_BYTES => OverlayRead::Broken(
+                format!("grew past the {} byte cap", Self::MAX_ALIAS_OVERLAY_BYTES),
+            ),
+            Ok(_) => OverlayRead::Body(buf),
+            Err(e) => OverlayRead::Broken(e.to_string()),
+        }
     }
 
     /// Persist atomically (unique temp file + rename).
@@ -1112,6 +1606,54 @@ mod corpus_io_tests {
     use super::*;
     use std::io::Write;
 
+    /// Process-wide mutex around `$ZODER_MODEL_ALIASES`, which `Corpus::load`
+    /// reads. EVERY test in this binary that mutates that variable — or that
+    /// calls `Corpus::load` and then asserts exact model counts — must hold it,
+    /// otherwise a developer's real `~/.zoder/model-aliases.json` (or a sibling
+    /// test's overlay) can change what `load` returns. Same contract as
+    /// `zoder-cli`'s `test_env::ENV_LOCK` for `ZODER_HOME`.
+    static OVERLAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII override of `$ZODER_MODEL_ALIASES`. Holds [`OVERLAY_ENV_LOCK`] for
+    /// its lifetime and restores the previous value on drop, so the env is only
+    /// redirected for the duration of one test.
+    struct AliasEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl AliasEnvGuard {
+        /// Point the overlay lookup at `path`.
+        fn new(path: &Path) -> Self {
+            let lock = OVERLAY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var_os(MODEL_ALIASES_ENV);
+            std::env::set_var(MODEL_ALIASES_ENV, path);
+            Self { _lock: lock, prev }
+        }
+
+        /// Pin the overlay to a path that does not exist — the "no overlay
+        /// deployed" state, made explicit so a test asserting on the corpus
+        /// shape can never pick up the machine's real overlay.
+        fn none() -> Self {
+            let mut missing = std::env::temp_dir();
+            missing.push(format!(
+                "zoder-absent-overlay-{}-{}",
+                std::process::id(),
+                SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            Self::new(&missing)
+        }
+    }
+
+    impl Drop for AliasEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(MODEL_ALIASES_ENV, v),
+                None => std::env::remove_var(MODEL_ALIASES_ENV),
+            }
+        }
+    }
+
     fn tmpdir() -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
         let uniq = format!(
@@ -1148,6 +1690,9 @@ mod corpus_io_tests {
             ]
         }"#;
         let p = write_file(&dir, "corpus.json", body);
+        // `load` also folds in the optional alias overlay; pin it to "absent"
+        // so this test measures the corpus file alone.
+        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&p).unwrap();
 
         // Exactly one entry for the duplicated id.
@@ -1181,6 +1726,7 @@ mod corpus_io_tests {
             ]
         }"#;
         let p = write_file(&dir, "corpus.json", body);
+        let _env = AliasEnvGuard::none();
         let err = Corpus::load(&p).expect_err("all-invalid corpus must be an error");
         assert!(
             err.to_string().contains("0 usable entries"),
@@ -1195,6 +1741,7 @@ mod corpus_io_tests {
     fn legitimately_empty_models_is_ok() {
         let dir = tmpdir();
         let p = write_file(&dir, "corpus.json", r#"{"models": []}"#);
+        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&p).expect("empty models array must load Ok");
         assert_eq!(c.models.len(), 0);
         assert_eq!(c.count, 0);
@@ -1219,6 +1766,7 @@ mod corpus_io_tests {
 
         // The corpus is present and reloads.
         assert!(path.exists());
+        let _env = AliasEnvGuard::none();
         let reloaded = Corpus::load(&path).unwrap();
         assert_eq!(reloaded.models.len(), 1);
 
@@ -1293,6 +1841,7 @@ mod corpus_io_tests {
         );
 
         // 2) Same fixture, production cap -> Ok with all 200 entries.
+        let _env = AliasEnvGuard::none();
         let c = Corpus::load(&on_disk).expect("fixture under 8 MiB must load Ok");
         assert_eq!(c.models.len(), 200);
         assert_eq!(c.count, 200);
@@ -1312,6 +1861,7 @@ mod corpus_io_tests {
         // directory would either error with EISDIR or, on some platforms,
         // read the directory's raw bytes -- neither is what we want. The
         // guard must trip on is_file() and bail with a clear message.
+        let _env = AliasEnvGuard::none();
         let err = Corpus::load(&dir).expect_err("loading a directory as a corpus must fail");
         let msg = err.to_string();
         assert!(
@@ -1595,6 +2145,436 @@ mod corpus_io_tests {
         unsafe {
             libc::unlink(cstr.as_ptr());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // Provider-neutral alias overlay (see the module docs).
+    //
+    // The fixture deliberately carries every field the external generator
+    // emits — `generated_at`, `source`, `display_name`, `created_at`,
+    // `codex_ladder` — to pin that zoder tolerates (and ignores) the full
+    // documented shape instead of only the subset it consumes.
+    // ---------------------------------------------------------------------
+
+    const OVERLAY: &str = r#"{
+        "generated_at": "2026-10-17T00:00:00Z",
+        "source": {"generator": "fleetops"},
+        "models": [
+            {
+                "id": "gpt-6-sol",
+                "provider": "openai-codex",
+                "display_name": "GPT-6 Sol",
+                "created_at": "2026-10-01",
+                "aliases": ["codex:sol"]
+            },
+            {
+                "id": "vendor/benched",
+                "provider": "vendor-cloud",
+                "display_name": "Benched",
+                "aliases": ["vendor:benched"]
+            }
+        ],
+        "aliases": {
+            "codex:sol": "gpt-6-sol",
+            "vendor:benched": "vendor/benched"
+        },
+        "codex_ladder": ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]
+    }"#;
+
+    const CORPUS_WITH_ONE_BENCHED_ROW: &str =
+        r#"{"source": "test", "models": [{"id": "vendor/benched", "agentic_score": 0.81}]}"#;
+
+    // (1) No overlay deployed is a silent no-op: the flat corpus is the whole
+    // model database, and nothing resolves through an alias.
+    #[test]
+    fn absent_overlay_leaves_the_corpus_untouched() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let missing = dir.join("no-such-overlay.json");
+
+        let _env = AliasEnvGuard::new(&missing);
+        // The env var is what selects the overlay; the default is only used
+        // when it is unset.
+        assert_eq!(Corpus::alias_overlay_path(), missing);
+
+        let c = Corpus::load(&p).expect("a missing overlay must not fail the load");
+        assert_eq!(c.models.len(), 1);
+        assert_eq!(c.count, 1);
+        assert!(c.aliases.is_empty());
+        assert_eq!(c.resolve_alias("codex:sol"), "codex:sol");
+        assert!(c.get("codex:sol").is_none());
+        // The one known id still resolves to itself.
+        assert_eq!(c.resolve_alias("vendor/benched"), "vendor/benched");
+        assert_eq!(c.get("vendor/benched").unwrap().agentic_score, Some(0.81));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (2) An overlay id the corpus has never seen becomes a KNOWN model, but
+    // a metadata-only one: nothing about it may be invented, so it can never
+    // be auto-routed, ranked or priced from an alias file.
+    #[test]
+    fn overlay_adds_an_unknown_model_as_metadata_only() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let overlay = write_file(&dir, "model-aliases.json", OVERLAY);
+
+        let _env = AliasEnvGuard::new(&overlay);
+        let c = Corpus::load(&p).unwrap();
+
+        let sol = c.get("gpt-6-sol").expect("overlay id must become known");
+        assert!(sol.is_overlay(), "the row must be marked overlay-sourced");
+        assert_eq!(sol.leaf, "gpt-6-sol");
+        assert_eq!(sol.kind, "chat");
+        // The generator's provider is recorded as provenance for display.
+        assert_eq!(sol.family, "openai-codex");
+        assert_eq!(sol.aliases, vec!["codex:sol".to_string()]);
+        assert!(sol
+            .gated_reason
+            .as_deref()
+            .is_some_and(|g| g.starts_with("overlay:")));
+
+        // Metadata only: no routing eligibility, and no invented evidence.
+        assert!(!sol.route_candidate && !sol.routable() && !sol.free && !sol.paid);
+        assert_eq!(sol.agentic_score, None);
+        assert_eq!(sol.swe_elo(), None);
+        assert_eq!(sol.code_capability(), None);
+        assert_eq!(sol.value_score(), None);
+        assert!(sol.economics.is_none());
+        assert!(c.free_chat().all(|m| m.id != "gpt-6-sol"));
+        assert_eq!(c.count, 2, "the overlay row must be counted");
+
+        // A model the corpus already knew keeps EVERY corpus field and only
+        // gains the names it answers to.
+        let benched = c.get("vendor/benched").unwrap();
+        assert!(!benched.is_overlay(), "a corpus row is not overlay-sourced");
+        assert_eq!(benched.agentic_score, Some(0.81));
+        assert_eq!(benched.aliases, vec!["vendor:benched".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (3) An alias resolves to the canonical model id — exactly, never
+    // approximately.
+    #[test]
+    fn overlay_alias_resolves_to_the_model_id() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let overlay = write_file(&dir, "model-aliases.json", OVERLAY);
+
+        let _env = AliasEnvGuard::new(&overlay);
+        let c = Corpus::load(&p).unwrap();
+
+        assert_eq!(c.resolve_alias("codex:sol"), "gpt-6-sol");
+        assert_eq!(
+            c.get("codex:sol").map(|m| m.id.as_str()),
+            Some("gpt-6-sol"),
+            "an alias must find the entry it names"
+        );
+        // An alias listed only inside a model's own `aliases` (not in the
+        // overlay's map) resolves the same way — the two spellings agree.
+        assert_eq!(c.resolve_alias("vendor:benched"), "vendor/benched");
+        assert_eq!(c.get("vendor:benched").unwrap().id, "vendor/benched");
+
+        // Never fuzzy: a prefix, a superstring, a case-fold or a
+        // namespace-stripped form must all resolve to themselves.
+        for typo in [
+            "codex",
+            "codex:",
+            "codex:sol ",
+            "codex:sol:extra",
+            "gpt-6-sol ",
+            "GPT-6-SOL",
+            "sol",
+        ] {
+            assert_eq!(
+                c.resolve_alias(typo),
+                typo,
+                "alias resolution must be exact, never fuzzy: {typo:?}"
+            );
+            assert!(c.get(typo).is_none(), "{typo:?} must not match anything");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (4) An exact corpus id always beats an alias of the same name, so an
+    // overlay can never shadow a model zoder already knows.
+    #[test]
+    fn exact_model_id_always_beats_an_alias() {
+        let dir = tmpdir();
+        let p = write_file(
+            &dir,
+            "corpus.json",
+            r#"{"models": [{"id": "vendor/real", "agentic_score": 0.9,
+                             "free": true, "route_candidate": true, "kind": "chat"}]}"#,
+        );
+        // A deliberately ambiguous overlay: it claims `vendor/real` as an
+        // ALIAS of a different model.
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [{"id": "gpt-6-sol", "provider": "openai-codex", "aliases": ["codex:sol"]}],
+                "aliases": {"vendor/real": "gpt-6-sol", "codex:sol": "gpt-6-sol"}}"#,
+        );
+
+        let _env = AliasEnvGuard::new(&overlay);
+        let c = Corpus::load(&p).unwrap();
+
+        // The real id resolves to itself, not to the aliased model.
+        assert_eq!(c.resolve_alias("vendor/real"), "vendor/real");
+        assert_eq!(
+            c.get("vendor/real").map(|m| m.agentic_score),
+            Some(Some(0.9)),
+            "the corpus row must win the lookup, not the alias"
+        );
+        // A genuine alias still resolves, and resolution is not transitive
+        // through the shadowed name.
+        assert_eq!(c.resolve_alias("codex:sol"), "gpt-6-sol");
+        assert_eq!(c.get("codex:sol").unwrap().id, "gpt-6-sol");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (5) A malformed overlay is warned about (once) and IGNORED. It must
+    // never fail startup and must never half-apply.
+    #[test]
+    fn malformed_overlay_is_ignored_and_never_fails_the_load() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+
+        // Four flavours of broken overlay: not JSON, JSON of the wrong shape,
+        // rows that carry no usable `id`, and a truncated body.
+        let broken = [
+            ("not-json.json", "this is not json at all"),
+            ("wrong-shape.json", r#"{"models": "not-an-array"}"#),
+            (
+                "no-usable-rows.json",
+                r#"{"models": [{"provider": "x"}, {"id": "  "}]}"#,
+            ),
+            (
+                "truncated.json",
+                r#"{"models": [{"id": "gpt-6-sol", "aliases": ["codex:sol"]}"#,
+            ),
+        ];
+        for (name, body) in broken {
+            let overlay = write_file(&dir, name, body);
+            let _env = AliasEnvGuard::new(&overlay);
+
+            let c = Corpus::load(&p)
+                .unwrap_or_else(|e| panic!("{name}: a bad overlay must not fail startup: {e}"));
+            assert_eq!(
+                c.models.len(),
+                1,
+                "{name}: the corpus must be left exactly as it was"
+            );
+            assert_eq!(
+                c.get("vendor/benched").map(|m| m.agentic_score),
+                Some(Some(0.81)),
+                "{name}"
+            );
+            assert!(c.aliases.is_empty(), "{name}: no alias may resolve");
+            assert!(c.get("gpt-6-sol").is_none(), "{name}: no row may be added");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (5b) The warning is latched per process, so a bad overlay produces one
+    // stderr line no matter how many commands load the corpus.
+    #[test]
+    fn overlay_warning_is_emitted_once() {
+        let latch = AtomicBool::new(false);
+        assert!(
+            warn_overlay_once_flagged(&latch, format_args!("first")),
+            "the first warning must be printed"
+        );
+        assert!(
+            !warn_overlay_once_flagged(&latch, format_args!("second")),
+            "later warnings must be suppressed"
+        );
+        assert!(
+            !warn_overlay_once_flagged(&latch, format_args!("third")),
+            "the latch stays closed"
+        );
+    }
+
+    // (5c) An overlay that is unreadable for a structural reason (a directory,
+    // a FIFO, a file past the byte cap) is also warned about and ignored.
+    #[test]
+    fn structurally_unusable_overlay_is_ignored() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+
+        // A directory at the overlay path: refused by the is_file() guard, and
+        // it must not hang the loader either.
+        {
+            let _env = AliasEnvGuard::new(&dir);
+            let c = Corpus::load(&p).expect("a directory overlay must not fail the load");
+            assert_eq!(c.models.len(), 1);
+            assert!(c.aliases.is_empty());
+        }
+
+        // Past the overlay byte cap: refused at the stat layer, so an
+        // over-large file is never buffered into memory at all.
+        let big = dir.join("big-overlay.json");
+        let mut big_body = String::from(r#"{"models":[{"id":"gpt-6-sol"}],"aliases":{"pad":"#);
+        big_body.push_str(&"x".repeat(Corpus::MAX_ALIAS_OVERLAY_BYTES as usize));
+        big_body.push_str(":gpt-6-sol\"}}\n");
+        std::fs::write(&big, &big_body).unwrap();
+        assert!(std::fs::metadata(&big).unwrap().len() > Corpus::MAX_ALIAS_OVERLAY_BYTES);
+        {
+            let _env = AliasEnvGuard::new(&big);
+            let c = Corpus::load(&p).expect("an oversized overlay must not fail the load");
+            assert_eq!(c.models.len(), 1);
+            assert!(c.aliases.is_empty());
+            assert!(c.get("gpt-6-sol").is_none());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.join("overlay.fifo");
+            let cstr = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(cstr.as_ptr(), 0o644) }, 0);
+
+            let _env = AliasEnvGuard::new(&fifo);
+            let c = Corpus::load(&p).expect("a FIFO overlay must not fail the load");
+            assert_eq!(c.models.len(), 1);
+            assert!(c.aliases.is_empty());
+            unsafe {
+                libc::unlink(cstr.as_ptr());
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (6) Loading an overlay never changes routing eligibility in either
+    // direction: an overlay row stays a non-candidate through a refresh, and a
+    // corpus row the overlay also names keeps its scores and its routing flags.
+    #[test]
+    fn overlay_rows_never_become_route_candidates_and_corpus_rows_are_never_demoted() {
+        let dir = tmpdir();
+        let p = write_file(
+            &dir,
+            "corpus.json",
+            r#"{"models": [{"id": "vendor/free", "agentic_score": 0.7, "free": true,
+                             "route_candidate": true, "kind": "chat"}]}"#,
+        );
+        let overlay = write_file(
+            &dir,
+            "model-aliases.json",
+            r#"{"models": [{"id": "gpt-6-sol", "provider": "openai-codex", "aliases": ["codex:sol"]},
+                           {"id": "vendor/free", "aliases": ["vendor:free"]}],
+                "aliases": {"codex:sol": "gpt-6-sol"}}"#,
+        );
+
+        let _env = AliasEnvGuard::new(&overlay);
+        let mut c = Corpus::load(&p).unwrap();
+
+        let sol = c.get("gpt-6-sol").unwrap();
+        assert!(
+            !sol.route_candidate,
+            "an overlay-added model must never be a route candidate"
+        );
+        assert!(!sol.routable());
+        assert_eq!(
+            c.free_chat().count(),
+            1,
+            "only the pre-existing corpus row may route"
+        );
+
+        // A refresh that does not serve the overlay id must neither promote it
+        // nor retire it — it is a known id, just not a route candidate.
+        let report = c.reconcile(&["vendor/free".to_string()]);
+        assert!(report.added.is_empty(), "{report:?}");
+        assert!(report.retired.is_empty(), "{report:?}");
+        assert_eq!(report.kept, 1, "{report:?}");
+        assert!(!c.get("gpt-6-sol").unwrap().route_candidate);
+
+        // The corpus row the overlay also named keeps its corpus data.
+        let free = c.get("vendor/free").unwrap();
+        assert!(free.free && free.route_candidate && free.routable());
+        assert_eq!(free.agentic_score, Some(0.7));
+        assert_eq!(free.aliases, vec!["vendor:free".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (7) Ingest is idempotent, and the aliases it added persist through a
+    // save/load round trip so a refresh cannot lose the names a pin uses.
+    #[test]
+    fn overlay_ingest_is_idempotent_and_survives_a_save_round_trip() {
+        let dir = tmpdir();
+        let p = write_file(&dir, "corpus.json", CORPUS_WITH_ONE_BENCHED_ROW);
+        let overlay = write_file(&dir, "model-aliases.json", OVERLAY);
+
+        let saved = dir.join("saved-corpus.json");
+        {
+            // Load with NO overlay and ingest explicitly, so the report asserted
+            // here is this call's own: a load-time ingest would already have
+            // consumed the first application.
+            let _env = AliasEnvGuard::none();
+            let mut c = Corpus::load(&p).unwrap();
+            assert!(
+                c.get("gpt-6-sol").is_none(),
+                "precondition: nothing is known before the overlay is applied"
+            );
+
+            let first = c.apply_alias_overlay_from(&overlay);
+            assert_eq!(first.added, vec!["gpt-6-sol".to_string()]);
+            assert_eq!(first.aliased, vec!["vendor/benched".to_string()]);
+            assert_eq!(first.alias_count, 2);
+            assert_eq!(first.path.as_deref(), Some(overlay.as_path()));
+
+            // Re-applying adds nothing and duplicates no alias.
+            let second = c.apply_alias_overlay_from(&overlay);
+            assert!(second.added.is_empty() && second.aliased.is_empty());
+            assert_eq!(c.models.len(), 2);
+            assert_eq!(c.count, 2);
+            assert_eq!(c.get("gpt-6-sol").unwrap().aliases, ["codex:sol"]);
+
+            c.save(&saved).unwrap();
+        }
+
+        // Reload with NO overlay deployed: the persisted rows and alias map
+        // must still resolve, which is what keeps an existing `-m codex:sol`
+        // working across a corpus refresh.
+        let _env = AliasEnvGuard::none();
+        let reloaded = Corpus::load(&saved).unwrap();
+        assert_eq!(reloaded.models.len(), 2);
+        assert_eq!(reloaded.resolve_alias("codex:sol"), "gpt-6-sol");
+        assert!(reloaded.get("codex:sol").is_some());
+        assert!(!reloaded.get("gpt-6-sol").unwrap().route_candidate);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (8) Overlay location: the env var wins; unset falls back to the zoder
+    // home, so a relocated `ZODER_HOME` carries the overlay with it.
+    #[test]
+    fn overlay_path_prefers_the_env_var_then_the_zoder_home() {
+        let dir = tmpdir();
+        let pinned = dir.join("pinned-aliases.json");
+
+        let _env = AliasEnvGuard::new(&pinned);
+        assert_eq!(Corpus::alias_overlay_path(), pinned);
+
+        // Empty is treated as unset, not as "the current directory".
+        std::env::set_var(MODEL_ALIASES_ENV, "");
+        assert_eq!(
+            Corpus::alias_overlay_path(),
+            crate::config::Config::home().join(MODEL_ALIASES_FILE)
+        );
+
+        std::env::remove_var(MODEL_ALIASES_ENV);
+        assert_eq!(
+            Corpus::alias_overlay_path(),
+            crate::config::Config::home().join(MODEL_ALIASES_FILE)
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

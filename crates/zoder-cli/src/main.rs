@@ -50,7 +50,8 @@ use zoder_core::{
     EnrichmentOutcome, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
     OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
     ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
-    SubscriptionPlan, Theme, Tier, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
+    SubscriptionPlan, Theme, Tier, OVERLAY_SOURCE, PROBE_MAX_MODELS_PER_PROVIDER,
+    PROBE_PING_TIMEOUT_SECS,
 };
 use zoder_mcp_server::{run_server, RoutingContext as McpRoutingContext};
 
@@ -3408,6 +3409,27 @@ async fn cmd_models(
             None => Cell::dim("—"),
         }
     };
+    // Provenance + alias column. A row ingested from the provider-neutral
+    // alias overlay (`~/.zoder/model-aliases.json`) is marked `overlay` so an
+    // operator can tell a metadata-only row — no bench, no price, never
+    // auto-routed — from a benched corpus row, and the short names an operator
+    // may pass to `-m` (`codex:sol`) are listed beside the id. A corpus row
+    // that merely GAINED an alias from the overlay shows the alias alone;
+    // every other row is a dim dash.
+    let via_cell = |m: &ModelEntry| -> Cell {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.is_overlay() {
+            parts.push(OVERLAY_SOURCE);
+        }
+        parts.extend(m.aliases.iter().map(String::as_str));
+        if parts.is_empty() {
+            Cell::dim("—")
+        } else if m.is_overlay() {
+            Cell::amber(parts.join(" "))
+        } else {
+            Cell::new(parts.join(" "))
+        }
+    };
 
     if show_free {
         let mut free_m: Vec<_> = eng.corpus.models.iter().filter(|m| !m.paid).collect();
@@ -3427,6 +3449,7 @@ async fn cmd_models(
             vec![
                 ("model", Al::L),
                 ("family", Al::L),
+                ("via", Al::L),
                 ("health", Al::L),
                 ("resp", Al::R),
                 ("ovr", Al::R),
@@ -3441,6 +3464,7 @@ async fn cmd_models(
             t.row(vec![
                 Cell::green(m.id.clone()),
                 Cell::new(m.family.clone()),
+                via_cell(m),
                 health_cell(&m.id),
                 resp_cell(&m.id),
                 elo(m.arena_overall_elo),
@@ -3475,6 +3499,7 @@ async fn cmd_models(
             vec![
                 ("model", Al::L),
                 ("family", Al::L),
+                ("via", Al::L),
                 ("in $/Mtok", Al::R),
                 ("out $/Mtok", Al::R),
                 ("health", Al::L),
@@ -3498,6 +3523,7 @@ async fn cmd_models(
             t.row(vec![
                 Cell::amber(m.id.clone()),
                 Cell::new(m.family.clone()),
+                via_cell(m),
                 in_c,
                 out_c,
                 health_cell(&m.id),
@@ -3921,17 +3947,50 @@ pub(crate) fn configured_model_for_agent(eng: &Engine, alias: Option<&str>) -> O
 ///      a per-invocation or per-agent pin),
 ///   4. capability/health-ranked auto routing (no pin anywhere).
 ///
+/// Every pin that resolves is then passed through the corpus alias overlay
+/// (`zoder -m codex:sol` -> `gpt-6-sol`), so what the rest of the pipeline
+/// sees is always the canonical model id. Exact corpus ids are returned
+/// untouched, and an alias is only ever an exact-match translation of a name
+/// the operator typed — it never reorders or rewrites a configured model.
+///
 /// Returning owned `String` (rather than `&str`) keeps the call site
 /// `let m: Option<String>`-friendly without a clone on the success path
 /// and lets the resolver short-circuit cleanly on each step.
 pub(crate) fn resolve_effective_primary(cli: &Cli, eng: &Engine) -> Option<String> {
     if let Some(m) = &cli.model {
-        return Some(m.clone());
+        return Some(eng.corpus.resolve_alias(m).to_string());
     }
     if let Some(m) = configured_model_for_agent(eng, cli.agent.as_deref()) {
-        return Some(m);
+        return Some(eng.corpus.resolve_alias(&m).to_string());
     }
-    eng.cfg.primary_model.clone()
+    eng.cfg
+        .primary_model
+        .as_deref()
+        .map(|m| eng.corpus.resolve_alias(m).to_string())
+}
+
+/// `cli` with `-m` translated through the corpus alias overlay.
+///
+/// `-m` names an EXPLICIT model id, which may be a short overlay alias
+/// (`-m codex:sol` for `gpt-6-sol`). Resolving it once, at the top of a
+/// command, keeps every later comparison honest: the daemon preflight that
+/// refuses to dispatch when `-m` disagrees with the live agent routes, and the
+/// post-turn check that refuses when the model that actually ran is not the one
+/// that was requested, would otherwise read an alias as a model SUBSTITUTION.
+///
+/// Returns a borrowed clone when nothing changes (the common case — no alias,
+/// or no `-m` at all), so the hot path stays allocation-free.
+fn with_resolved_model_alias<'a>(cli: &'a Cli, corpus: &Corpus) -> std::borrow::Cow<'a, Cli> {
+    let Some(model) = cli.model.as_deref() else {
+        return std::borrow::Cow::Borrowed(cli);
+    };
+    let resolved = corpus.resolve_alias(model);
+    if resolved == model {
+        return std::borrow::Cow::Borrowed(cli);
+    }
+    let mut next = cli.clone();
+    next.model = Some(resolved.to_string());
+    std::borrow::Cow::Owned(next)
 }
 
 /// Resolved routing for one CLI invocation. `primary` is the order in
@@ -4157,11 +4216,21 @@ fn resolve_chain(cli: &Cli, eng: &Engine, health: &HealthStore) -> anyhow::Resul
     // When `--agent` is set but no model resolves, we error out
     // before the precedence block so that `--agent` cannot silently fall
     // through to scenario routing.
-    let cli_model = cli.model.clone();
+    //
+    // Both pins are resolved through the corpus alias overlay exactly once,
+    // here: `-m codex:sol` becomes `gpt-6-sol` before the chain, the
+    // provider lookup and the `--require-free` filter ever see it, so a
+    // `Some`/`None` decision below is unchanged and every downstream
+    // consumer works with the canonical id.
+    let cli_model = cli
+        .model
+        .as_deref()
+        .map(|m| eng.corpus.resolve_alias(m).to_string());
     let agent_pin = cli_model
         .is_none()
         .then(|| configured_model_for_agent(eng, cli.agent.as_deref()))
-        .flatten();
+        .flatten()
+        .map(|m| eng.corpus.resolve_alias(&m).to_string());
     let agent_provider_ref = if cli_model.is_none() && agent_pin.is_some() {
         configured_provider_ref_for_agent(eng, cli.agent.as_deref())
     } else {
@@ -10021,6 +10090,15 @@ pub(crate) async fn agentic_turn(
     let eng = Engine::load()?;
     let mut health = HealthStore::load(&eng.cfg.health_path);
 
+    // `-m` may be an overlay alias (`-m codex:sol`). The chain below resolves
+    // it, but so must every later check that compares the REQUESTED model
+    // against what the daemon serves and what the turn reported — otherwise an
+    // alias reads as a model substitution and refuses a legitimate dispatch.
+    // Rebind `cli` once, here; the type stays `&Cli`, so nothing downstream
+    // needs to know this happened.
+    let resolved_cli = with_resolved_model_alias(cli, &eng.corpus);
+    let cli: &Cli = &resolved_cli;
+
     // Resolve the model (routing or -m) for alias selection + paid gate.
     let ResolvedRoutes {
         primary: chain,
@@ -12743,7 +12821,7 @@ async fn run_probe_all(
                 // mirroring `health_probe::probe_all`'s prober-unavailable
                 // arm — so the skip filter has something to skip.
                 let targets = if let Some(model) = cli.model.as_deref() {
-                    vec![model.to_string()]
+                    vec![eng.corpus.resolve_alias(model).to_string()]
                 } else {
                     probe_targets_for_unbuilt_provider(p, &eng.corpus)
                 };
@@ -12783,7 +12861,10 @@ async fn run_probe_all(
         // path emits a "(capped: probing X of Y models)" note alongside
         // the provider header.
         let (targets, dropped) = if let Some(model) = cli.model.as_deref() {
-            (vec![model.to_string()], 0)
+            // Resolve an overlay alias (`zoder health -m codex:sol`) to the
+            // canonical id BEFORE probing: the health store, the provider
+            // `serves` match and the corpus lookup all key on the real id.
+            (vec![eng.corpus.resolve_alias(model).to_string()], 0)
         } else {
             cap_targets(
                 live.unwrap_or_else(|| vec![p.id.clone()]),
@@ -14831,6 +14912,7 @@ mod probe_skip_class_tests {
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -14904,6 +14986,7 @@ mod probe_skip_class_tests {
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         };
         let p = mk_provider("enterprise-gateway", &["enterprise/"]);
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);

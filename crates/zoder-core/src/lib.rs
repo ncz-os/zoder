@@ -99,7 +99,10 @@ pub use config::{
     Provider, QuotaUnit, QuotaWindow, ReviewConfig, SeatbeltProfileOptions, SubscriptionPlan,
     Theme,
 };
-pub use corpus::{Corpus, ModelEntry, RefreshReport};
+pub use corpus::{
+    AliasOverlay, Corpus, ModelEntry, OverlayModel, OverlayReport, RefreshReport,
+    MODEL_ALIASES_ENV, MODEL_ALIASES_FILE, OVERLAY_SOURCE,
+};
 pub use engine_cost::{
     fetch_engine_cost, AgentStats as EngineAgentStats, CostSummary as EngineCostSummary,
     ModelStats as EngineModelStats,

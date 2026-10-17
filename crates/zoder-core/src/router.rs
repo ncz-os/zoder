@@ -69,9 +69,14 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Pin a primary model (from `Config.primary_model`) to lead the chain.
+    /// Pin a primary model (from `Config.primary_model` or an operator `-m`
+    /// pin) to lead the chain. An alias-overlay alias (`codex:sol`) is
+    /// resolved to its canonical model id here, so `Route.primary` — and every
+    /// later `backends` lookup of it — always names a real model id. An exact
+    /// corpus id that happens to collide with an alias name is left alone.
     pub fn with_primary(mut self, primary: Option<String>) -> Self {
-        self.pinned_primary = primary.filter(|s| !s.trim().is_empty());
+        let pinned = primary.filter(|s| !s.trim().is_empty());
+        self.pinned_primary = pinned.map(|s| self.corpus.resolve_alias(&s).to_string());
         self
     }
 
@@ -413,6 +418,50 @@ mod tests {
         // `hi` (higher SWE) leads the fallbacks, proving the rest stay ranked.
         assert_eq!(route.fallbacks.first().map(String::as_str), Some("hi"));
         assert!(!route.fallbacks.contains(&"MiniMax-M3".to_string()));
+    }
+
+    #[test]
+    fn pinned_alias_resolves_to_the_canonical_model_id() {
+        // A pin written with an overlay alias (`-m codex:sol`, or
+        // `primary_model = "codex:sol"` in config) must lead the chain as the
+        // REAL model id: every downstream consumer — provider resolution, the
+        // fallback builder, the ledger — keys on the id the daemon serves.
+        let health = HealthStore::default();
+        let mut corpus = Corpus {
+            models: vec![ModelEntry {
+                family: "openai-codex".into(),
+                ..benched("gpt-6-sol", 60.0)
+            }]
+            .into_iter()
+            .map(|mut m| {
+                m.free = true;
+                m.route_candidate = true;
+                m.kind = "chat".into();
+                m
+            })
+            .collect(),
+            ..Default::default()
+        };
+        corpus
+            .aliases
+            .insert("codex:sol".into(), "gpt-6-sol".into());
+
+        let route = Router::new(&corpus, &health)
+            .with_primary(Some("codex:sol".to_string()))
+            .select(Tier::Auto)
+            .unwrap();
+        assert_eq!(route.primary, "gpt-6-sol");
+        assert!(!route.fallbacks.contains(&"gpt-6-sol".to_string()));
+
+        // An exact id that COLLIDES with an alias name still wins: a corpus row
+        // named `codex:sol` must pin as itself, not as `gpt-6-sol`.
+        let mut shadowed = corpus.clone();
+        shadowed.models[0].id = "codex:sol".into();
+        let route = Router::new(&shadowed, &health)
+            .with_primary(Some("codex:sol".to_string()))
+            .select(Tier::Auto)
+            .unwrap();
+        assert_eq!(route.primary, "codex:sol");
     }
 
     #[test]
