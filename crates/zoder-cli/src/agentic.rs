@@ -1048,7 +1048,13 @@ pub(crate) fn build_reviewer_candidates(
     // alias must dispatch as the literal id, not be redirected to
     // whatever that alias currently runs.
     let resolve = |s: &str| -> String {
-        crate::configured_model_for_agent(&eng, Some(s)).unwrap_or_else(|| s.to_string())
+        // Two exact translations, applied in order, never fuzzy: an engine
+        // AGENT alias (`reviewer`, `coder`) first, then a provider-neutral
+        // MODEL alias from the corpus overlay (`codex:sol` -> `gpt-6-sol`).
+        // A string that is neither passes through unchanged.
+        crate::configured_model_for_agent(&eng, Some(s))
+            .map(|m| eng.corpus.resolve_alias(&m).to_string())
+            .unwrap_or_else(|| eng.corpus.resolve_alias(s).to_string())
     };
     let resolved_override = model_override.map(resolve);
     let resolved_agent_pin = agent_pin.as_deref().map(resolve);
