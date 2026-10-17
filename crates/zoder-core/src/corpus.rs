@@ -747,6 +747,21 @@ impl Default for Corpus {
     }
 }
 
+/// Pure, env-free core of [`Corpus::alias_overlay_path`], so the resolution
+/// rules can be tested hermetically without mutating the process environment
+/// (mirrors [`crate::config::Config::resolve_home_from`]).
+///
+/// `env_override` is the value of `$ZODER_MODEL_ALIASES`: a non-empty value
+/// wins verbatim, while an empty value is treated exactly like an unset one.
+/// Otherwise the overlay sits next to the rest of the zoder state at
+/// `<home>/model-aliases.json`.
+fn alias_overlay_path_from(env_override: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    match env_override {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => home.join(MODEL_ALIASES_FILE),
+    }
+}
+
 impl Corpus {
     /// Maximum trusted model-corpus size. Larger files are rejected before the
     /// body is read so a misconfigured `corpus_path` pointing at a multi-GB JSON
@@ -792,6 +807,19 @@ impl Corpus {
         // corpus file carries.
         corpus.apply_alias_overlay();
         Ok(corpus)
+    }
+
+    /// Load a corpus from `path` WITHOUT folding in the optional alias overlay:
+    /// the returned rows are exactly what the corpus file declares.
+    ///
+    /// This is for callers (and tests) that must see the corpus file alone and
+    /// therefore cannot use [`Self::load`], which consults
+    /// `$ZODER_MODEL_ALIASES` / `<zoder home>/model-aliases.json`. It has the
+    /// same byte cap and the same `Err` contract as [`Self::load`]; only the
+    /// final [`Self::apply_alias_overlay`] step is skipped. Production routing
+    /// should keep using [`Self::load`] so a deployed overlay is honored.
+    pub fn load_without_overlay(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with_cap(path, Self::MAX_CORPUS_BYTES)
     }
 
     /// Internal loader that takes the byte cap as a parameter so tests can
@@ -1243,11 +1271,15 @@ impl Corpus {
     /// to a non-empty value, else `<zoder home>/model-aliases.json`. Reading
     /// the zoder home (not `dirs::home_dir()` directly) keeps a relocated
     /// `ZODER_HOME` authoritative for the overlay too.
+    ///
+    /// Thin wrapper over [`alias_overlay_path_from`] that supplies the real
+    /// environment; the resolution rules themselves are pure so tests can
+    /// cover every branch without mutating the process environment.
     pub fn alias_overlay_path() -> PathBuf {
-        match std::env::var_os(MODEL_ALIASES_ENV) {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => crate::config::Config::home().join(MODEL_ALIASES_FILE),
-        }
+        alias_overlay_path_from(
+            std::env::var_os(MODEL_ALIASES_ENV),
+            &crate::config::Config::home(),
+        )
     }
 
     /// Fold the optional alias overlay into this corpus.
@@ -1746,14 +1778,6 @@ mod corpus_io_tests {
         fn retarget(&mut self, path: &Path) {
             std::env::set_var(MODEL_ALIASES_ENV, path);
         }
-
-        /// Remove `$ZODER_MODEL_ALIASES` WITHOUT releasing the lock, so a test
-        /// can exercise the "unset, fall back to the zoder home" branch without
-        /// a raw `remove_var` that could race a sibling. Drop still restores the
-        /// value captured when the guard was created.
-        fn clear(&mut self) {
-            std::env::remove_var(MODEL_ALIASES_ENV);
-        }
     }
 
     impl Drop for AliasEnvGuard {
@@ -1761,30 +1785,6 @@ mod corpus_io_tests {
             match &self.prev {
                 Some(v) => std::env::set_var(MODEL_ALIASES_ENV, v),
                 None => std::env::remove_var(MODEL_ALIASES_ENV),
-            }
-        }
-    }
-
-    /// RAII override of `$ZODER_HOME`, the exact variable `Config::home` reads.
-    /// Restoring the previous value (or removing it when it was unset) on drop
-    /// keeps a relocated home from leaking into sibling tests in this binary.
-    struct ZoderHomeGuard {
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl ZoderHomeGuard {
-        fn new(path: &Path) -> Self {
-            let prev = std::env::var_os("ZODER_HOME");
-            std::env::set_var("ZODER_HOME", path);
-            Self { prev }
-        }
-    }
-
-    impl Drop for ZoderHomeGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("ZODER_HOME", v),
-                None => std::env::remove_var("ZODER_HOME"),
             }
         }
     }
@@ -2709,37 +2709,29 @@ mod corpus_io_tests {
     }
 
     // (8) Overlay location: the env var wins; unset falls back to the zoder
-    // home, so a relocated `ZODER_HOME` carries the overlay with it.
+    // home, so a relocated `ZODER_HOME` carries the overlay with it. Pure test
+    // of `alias_overlay_path_from`, so no process environment is touched and
+    // no lock or guard is needed.
     #[test]
     fn overlay_path_prefers_the_env_var_then_the_zoder_home() {
-        let dir = tmpdir();
-        let pinned = dir.join("pinned-aliases.json");
-        let zoder_home = dir.join("zoder-home");
-        std::fs::create_dir_all(&zoder_home).unwrap();
+        let zoder_home = Path::new("/tmp/zoder-home-under-test");
+        let pinned = PathBuf::from("/tmp/pinned-aliases.json");
 
-        let mut env = AliasEnvGuard::new(&pinned);
-        // `Config::home` reads `ZODER_HOME`. Point it at a temp dir while the
-        // overlay lock is held, so the fallback is asserted against a LITERAL
-        // path instead of the same env read on both sides (which would pass
-        // even if the fallback ignored the variable entirely).
-        let _home = ZoderHomeGuard::new(&zoder_home);
-
-        assert_eq!(Corpus::alias_overlay_path(), pinned);
+        assert_eq!(
+            alias_overlay_path_from(Some(pinned.clone().into_os_string()), zoder_home),
+            pinned
+        );
 
         // Empty is treated as unset, not as "the current directory".
-        env.retarget(Path::new(""));
         assert_eq!(
-            Corpus::alias_overlay_path(),
+            alias_overlay_path_from(Some(std::ffi::OsString::new()), zoder_home),
             zoder_home.join(MODEL_ALIASES_FILE)
         );
 
-        env.clear();
         assert_eq!(
-            Corpus::alias_overlay_path(),
+            alias_overlay_path_from(None, zoder_home),
             zoder_home.join(MODEL_ALIASES_FILE)
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // (9) An alias that appears ONLY in the explicit top-level map is folded
