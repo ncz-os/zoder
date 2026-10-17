@@ -17,14 +17,14 @@ fn lenient_load_skips_invalid_entries() {
             {"id":""}
         ]}"#,
     );
-    let c = Corpus::load(&p).unwrap();
-    // Assert on the entries the fixture declares rather than the total count:
-    // `Corpus::load` also folds in the OPTIONAL alias overlay, so on a host
-    // that has one deployed this corpus legitimately gains extra known ids.
-    // What this test pins is that the two malformed rows were skipped.
-    assert_eq!(c.models.iter().filter(|m| m.id == "good/model").count(), 1);
-    assert!(c.get("good/model").is_some());
-    assert!(c.models.iter().all(|m| !m.id.is_empty()));
+    // Load the corpus file alone: this test pins the lenient parse of the
+    // fixture, and the optional alias overlay (which `Corpus::load` folds in
+    // from a host-deployed file) can legitimately add known ids. Reading the
+    // file without the overlay keeps the assertion exact without mutating the
+    // process environment.
+    let c = Corpus::load_without_overlay(&p).unwrap();
+    assert_eq!(c.models.len(), 1);
+    assert_eq!(c.models[0].id, "good/model");
     assert_eq!(c.free_chat().count(), 1);
 }
 
