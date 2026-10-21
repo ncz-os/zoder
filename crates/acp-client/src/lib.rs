@@ -807,6 +807,19 @@ pub struct AgentOptions {
     pub zeroclaw_config_snapshot: Option<Value>,
     /// Resume an existing session id (None = new session).
     pub session_id: Option<String>,
+    /// When `true`, [`Self::session_id`] is a best-effort CONTINUITY hint
+    /// (e.g. `zoder loop` carrying its previous author turn's id into the
+    /// next iteration) rather than an explicit operator resume. A
+    /// continuity hint may be replaced with a freshly-minted session when
+    /// the engine rejects it — including the `-32602 "ACP session belongs
+    /// to a different agent"` reply produced when a turn routes to a
+    /// different agent (model fallback or re-route). Explicit
+    /// `--session` / `--continue` ids leave this `false` so a bad id is
+    /// still reported to the operator instead of being silently dropped.
+    ///
+    /// Default `false` (NON-BREAKING): every existing call site keeps the
+    /// strict "an explicit resume failure is fatal" contract.
+    pub session_id_is_continuity_hint: bool,
     /// Stream `agent_thought_chunk` (reasoning) too.
     pub show_reasoning: bool,
     /// Tool-approval policy.
@@ -963,6 +976,7 @@ impl AgentOptions {
             // the default OFF every existing call site produces the
             // same JSON-RPC frames as before this slice.
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         }
     }
@@ -2331,7 +2345,13 @@ async fn drive<F: FnMut(AgentEvent)>(
     // path as the OFF case — the wire shape is identical, so a
     // first-run-after-enable still produces a session/new without
     // `session_id` in the params.
-    let scope = session_store::make_scope(engine_kind_scope(EngineKind::Zeroclaw), &opts.cwd);
+    // Keyed by agent as well as engine+cwd: a session id is only valid
+    // under the alias that minted it (see `make_agent_scope`).
+    let scope = session_store::make_agent_scope(
+        engine_kind_scope(EngineKind::Zeroclaw),
+        &opts.cwd,
+        &opts.agent_alias,
+    );
     let mut effective_session_id: Option<String> = opts.session_id.clone();
     if effective_session_id.is_none() && opts.persist_session_id {
         if let Some(store_path) = opts.session_store_path.as_ref() {
@@ -2369,9 +2389,10 @@ async fn drive<F: FnMut(AgentEvent)>(
     // PERSISTENT-SESSIONS SLICE: when `effective_session_id` is
     // `Some`, the params include a `session_id` field per the
     // existing wire contract (~L805-807). If the engine returns a
-    // JSON-RPC error reply — meaning the persisted id is unknown /
-    // expired on the server side — we retry `session/new` with no
-    // `session_id` to mint a fresh one. The previous code also
+    // JSON-RPC error reply — meaning the persisted/continuity id is
+    // unknown, expired, or bound to a DIFFERENT agent on the server
+    // side — we retry `session/new` with no `session_id` to mint a
+    // fresh one. The previous code also
     // cleared the on-disk record on the reject path; that was
     // Z-24-unsafe (a transient failure on the fresh-create retry
     // would leave the operator with an empty store AND no
@@ -2401,6 +2422,13 @@ async fn drive<F: FnMut(AgentEvent)>(
             if !may_replace_rejected_session(opts, &err) {
                 anyhow::bail!("session/new resume failed: {err}");
             }
+            // Recoverable reject: an evicted session, or one owned by a
+            // different agent (the model-fallback case). Do not surface
+            // this to the caller's fallback chain as a model failure —
+            // a fresh session on THIS agent is the correct next step.
+            eprintln!(
+                "zoder: engine rejected the resumed session ({err}); starting a fresh engine session"
+            );
             // Engine rejected the resume. The previous behavior
             // was to clear the on-disk record here so the next
             // run wouldn't keep tripping the same error — but
@@ -2427,8 +2455,9 @@ async fn drive<F: FnMut(AgentEvent)>(
                 }),
             )
             .await?;
-            // A retry failure is fatal: only SESSION_NOT_FOUND is eligible
-            // for this fresh-create recovery path.
+            // A retry failure is fatal: only an eligible rejection (a
+            // missing session or a different-agent owner, for a
+            // replaceable resume) reaches this fresh-create path.
             tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "new"))
                 .await
                 .map_err(|_| anyhow!("session/new retry timed out after {SETUP_RPC_TIMEOUT:?}"))?
@@ -5047,9 +5076,42 @@ impl std::fmt::Display for RpcError {
 }
 
 const SESSION_NOT_FOUND: i64 = -32000;
+/// JSON-RPC "invalid params", the code Zeroclaw uses for a `session/new`
+/// resume whose session is bound to a DIFFERENT agent alias.
+const INVALID_PARAMS: i64 = -32602;
 
+/// The engine's ownership rejection: a session id exists but belongs to
+/// another agent, so it can never be resumed under the alias in this
+/// request. The only recovery is a fresh session on THIS agent — which is
+/// exactly what the fresh-create retry at each driver's resume-reject
+/// branch does.
+fn is_agent_ownership_rejection(error: &RpcError) -> bool {
+    error.code == INVALID_PARAMS
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("belongs to a different agent")
+}
+
+/// Whether a rejected `session/new` may be retried as a fresh session.
+///
+/// Two classes of resume are replaceable:
+///   * a CONTINUITY hint (the loop's previous turn id) — always, because
+///     the session is an optimisation, not an operator request; and
+///   * a persisted store record — when the engine says it is gone or
+///     owned by another agent (both mean the record cannot be used under
+///     this alias/engine).
+///
+/// An explicit `--session` / `--continue` id is never replaced: the
+/// operator asked for that exact session and a silent fresh one would
+/// hide the problem.
 fn may_replace_rejected_session(opts: &AgentOptions, error: &RpcError) -> bool {
-    opts.session_id.is_none() && opts.persist_session_id && error.code == SESSION_NOT_FOUND
+    let replaceable = if opts.session_id.is_some() {
+        opts.session_id_is_continuity_hint
+    } else {
+        opts.persist_session_id
+    };
+    replaceable && (error.code == SESSION_NOT_FOUND || is_agent_ownership_rejection(error))
 }
 
 /// Lower-level variant that returns the engine-error message as `Err`
@@ -5527,6 +5589,164 @@ mod tests {
         assert_eq!(prompt["params"]["session_id"], "aba-session");
         assert_eq!(prompt["params"]["prompt"], "ABA-visible prompt");
     }
+    /// Minimal zeroclaw daemon that mints a session for agent A and then
+    /// rejects a resume under agent B with the engine's real ownership
+    /// error. Serves the fresh-create retry (if the client asks for one)
+    /// and one completed turn. Returns the frames the client sent.
+    async fn ownership_rejecting_daemon(
+        socket: std::path::PathBuf,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        use tokio::net::UnixListener;
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut frames: Vec<Value> = Vec::new();
+            let mut line = String::new();
+
+            // initialize
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // resume of agent A's session under agent B -> ownership error
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "error": {
+                        "code": -32602,
+                        "message": "ACP session belongs to a different agent",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // fresh-create retry (absent when the client treats the
+            // rejection as fatal). EOF here ends the mock cleanly.
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                return frames;
+            }
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "fresh-on-agent-b" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // session/prompt -> terminal result + turn_complete
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({ "jsonrpc": "2.0", "id": "prompt", "result": {} }),
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "turn_complete", "outcome": "completed" },
+                }),
+            )
+            .await
+            .unwrap();
+            frames
+        })
+    }
+
+    /// REGRESSION (ACP session-per-agent, 2026-10-21): a loop author turn
+    /// carried agent A's session id into an iteration whose chain started
+    /// on agent B. `session/new` answered -32602 "ACP session belongs to a
+    /// different agent"; the driver treated it as a model failure, every
+    /// fallback candidate failed the same way, and the loop stopped with
+    /// "author produced no edits". A continuity hint MUST instead start a
+    /// fresh session on B and finish the turn.
+    #[tokio::test]
+    async fn continuity_resume_ownership_rejection_starts_fresh_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ownership.sock");
+        let server = ownership_rejecting_daemon(socket.clone()).await;
+
+        let mut opts = AgentOptions::new(&socket, "agent-b", "/tmp", "continue the fix");
+        opts.session_id = Some("session-owned-by-agent-a".into());
+        opts.session_id_is_continuity_hint = true;
+        opts.timeout = Duration::from_secs(5);
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a different-agent resume must recover with a fresh session");
+        let frames = server.await.unwrap();
+
+        assert_eq!(frames[1]["method"], "session/new");
+        assert_eq!(
+            frames[1]["params"]["session_id"], "session-owned-by-agent-a",
+            "the continuity id is offered once, under its recorded agent"
+        );
+        assert_eq!(frames[2]["method"], "session/new");
+        assert!(
+            frames[2]["params"].get("session_id").is_none(),
+            "the retry must mint a fresh session instead of resending the rejected id"
+        );
+        assert_eq!(frames[2]["params"]["agent_alias"], "agent-b");
+        assert_eq!(run.session_id, "fresh-on-agent-b");
+        assert_eq!(run.outcome, "completed");
+        assert_eq!(frames[3]["params"]["session_id"], "fresh-on-agent-b");
+    }
+
+    /// The same wire rejection stays fatal for an EXPLICIT `--session`
+    /// id: the operator asked for that session and a silent replacement
+    /// would hide why it is unusable.
+    #[tokio::test]
+    async fn explicit_resume_ownership_rejection_remains_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ownership-explicit.sock");
+        let server = ownership_rejecting_daemon(socket.clone()).await;
+
+        let mut opts = AgentOptions::new(&socket, "agent-b", "/tmp", "resume it");
+        opts.session_id = Some("session-owned-by-agent-a".into());
+        opts.timeout = Duration::from_secs(5);
+        let err = run_agent(&opts, |_| {})
+            .await
+            .expect_err("an explicit cross-agent resume must be reported, not replaced");
+        let frames = server.await.unwrap();
+
+        assert!(
+            err.to_string().contains("session/new resume failed")
+                && err.to_string().contains("different agent"),
+            "the error must name the ownership rejection; got: {err}"
+        );
+        assert_eq!(
+            frames.len(),
+            2,
+            "no fresh-create retry may be sent for an explicit session"
+        );
+    }
+
     // `AsyncBufReadExt` is brought in by `use super::*` (it lives in the
     // parent module's `use` lines). The alias is no longer needed.
 
@@ -6526,6 +6746,10 @@ mod tests {
         assert_eq!(opts.writable_roots, vec![PathBuf::from("/tmp/repo")]);
         assert!(!opts.enforce_writable_roots);
         assert!(!opts.trust_engine);
+        assert!(
+            !opts.session_id_is_continuity_hint,
+            "an explicit resume must stay non-replaceable by default"
+        );
     }
 
     #[test]
@@ -6547,6 +6771,52 @@ mod tests {
             !may_replace_rejected_session(&opts, &missing_error),
             "even a missing explicit session must be reported to its caller"
         );
+    }
+
+    /// REGRESSION (ACP session-per-agent): a CONTINUITY hint (the loop's
+    /// previous turn) is replaceable on exactly the two rejections that
+    /// mean "this id cannot be used here": the session is gone, or it is
+    /// owned by a different agent. Anything else keeps the old fatal
+    /// behaviour, and an explicit operator id is never replaced.
+    #[test]
+    fn continuity_session_rejections_are_replaceable() {
+        let mut opts = AgentOptions::new("/tmp/daemon.sock", "agent-b", "/tmp", "task");
+        opts.session_id = Some("session-owned-by-agent-a".into());
+        opts.session_id_is_continuity_hint = true;
+        let ownership = RpcError {
+            code: -32602,
+            message: "ACP session belongs to a different agent".into(),
+        };
+        assert!(
+            may_replace_rejected_session(&opts, &ownership),
+            "the different-agent rejection must mint a fresh session, not fail the turn"
+        );
+        let missing = RpcError {
+            code: SESSION_NOT_FOUND,
+            message: "Session not found".into(),
+        };
+        assert!(may_replace_rejected_session(&opts, &missing));
+        // A different -32602 (not an ownership rejection) is not a
+        // session problem and must not be papered over.
+        let unrelated = RpcError {
+            code: -32602,
+            message: "invalid chat_mode".into(),
+        };
+        assert!(!may_replace_rejected_session(&opts, &unrelated));
+        // An unclassified failure (IO / engine error) is never replaced.
+        let engine_error = RpcError {
+            code: -32050,
+            message: "engine exploded".into(),
+        };
+        assert!(!may_replace_rejected_session(&opts, &engine_error));
+        // Explicit operator sessions keep the strict contract.
+        opts.session_id_is_continuity_hint = false;
+        assert!(!may_replace_rejected_session(&opts, &ownership));
+        // A persisted record (no opts.session_id) is replaceable.
+        let mut persisted = AgentOptions::new("/tmp/daemon.sock", "agent-b", "/tmp", "task");
+        persisted.persist_session_id = true;
+        assert!(may_replace_rejected_session(&persisted, &ownership));
+        assert!(may_replace_rejected_session(&persisted, &missing));
     }
 
     #[test]
@@ -6666,6 +6936,7 @@ mod tests {
             // always-create-new) keep passing byte-for-byte. Tests
             // that exercise persistence set this explicitly.
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         }
     }
@@ -10942,6 +11213,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -11066,6 +11338,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -11220,6 +11493,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -11509,6 +11783,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -11707,6 +11982,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -11864,6 +12140,7 @@ mod tests {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -12484,6 +12761,7 @@ mod goose_acp_real_turn {
             // oracle is gated behind `#[ignore]` and only validates
             // parity with the pre-this-slice fresh-create path.
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
         let mut conn = connect_transport(&transport)
@@ -12777,6 +13055,7 @@ mod goose_acp_real_turn {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
@@ -12920,6 +13199,7 @@ mod goose_acp_real_turn {
             mcp_servers: Vec::new(),
             project_instructions: None,
             persist_session_id: false,
+            session_id_is_continuity_hint: false,
             session_store_path: None,
         };
 
