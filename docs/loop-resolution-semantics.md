@@ -69,3 +69,25 @@ iteration on an identical diff.
 list of the iteration's located findings — severity, title, and location only,
 no code bodies — plus the reviewer model. A resumed job can start from the last
 findings.
+
+## E. Review base and completeness (2026-10-21)
+
+The reviewer must see the loop's OWN work and ALL of it.
+
+* **Base.** Branch scope diffs from the HEAD sha captured when the loop started
+  (`loop_review_base`), two-dot against the working tree so uncommitted author
+  edits are included. An explicit `--base` still wins. The old default was
+  `detect_base` (upstream/default-branch merge-base), which on 2026-10-21
+  reported 5994 / 28388 diff lines for changes of ~880 / ~430.
+* **Chunking.** The loop review now uses the same per-route chunk planner as
+  `zoder review` (`plan_loop_review`). Every changed line is in exactly one
+  chunk; a chunk over `max_hunk_bytes` is split. Nothing is truncated.
+* **Fail closed.** A diff over `max_diff_bytes`, an exclusion that removes
+  every changed file, a provider error, a chunk with no structured JSON after
+  one repair, a mixed-model chunk sequence, or a review-phase timeout makes
+  `run_loop_review` return an error. The iteration is recorded
+  `reviewer_unavailable` with `review_error` set and stops unresolved. An
+  unfinished review is never an approval, even when every finding heuristic
+  would return zero blockers.
+* **Evidence.** Each iteration records `review_base`, `review_chunks`, and
+  `review_error`; the human summary prints chunks and the error.

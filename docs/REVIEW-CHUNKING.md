@@ -63,8 +63,13 @@ never opened by older builds, so it can be deployed independently of the
 binary. It is merged after the overlays and wins over an overlay `[review]`.
 A malformed `review.toml` is ignored with a warning.
 
-The loop's review phase sends one prompt and is not chunked; these settings
-apply to `zoder review` and `zoder adversarial-review`.
+`zoder loop` uses the same planner for its review phase (per-route caps are
+resolved for the reviewer that will serve the head slot), so a loop review is
+chunked too. Unlike the standalone command, the loop has no
+`--max-hunk-bytes` / `--max-diff-bytes` flags yet: it reads `[review]` and
+`[review.route_defaults.<model>]` from the config. An over-cap loop diff is an
+error — the iteration is recorded `reviewer_unavailable` and stays unresolved —
+never a truncated prompt that a reviewer can approve.
 
 ## Measured recommendations (fleet routes, 2026-10-10)
 
