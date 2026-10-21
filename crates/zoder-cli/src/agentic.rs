@@ -722,135 +722,183 @@ async fn complete_once(
     Err(anyhow!(msg))
 }
 
-/// Loop reviewer dispatch that insists on a structured JSON verdict (A).
-///
-/// `complete_once` accepts any non-empty completion and leaves parsing to the
-/// caller; the loop used to then run `parse_review`, whose prose keyword
-/// recovery could turn free-form analysis into a verdict. This helper walks
-/// the configured reviewer pool and, for each candidate:
-///
-///   1. asks once with `primary_system` (the loop's adversarial prompt);
-///   2. if the answer is not a JSON verdict object, re-asks that SAME candidate
-///      ONCE with [`REVIEW_SYSTEM`] (the neutral prompt) plus a directive to
-///      return only JSON. `provider_extra.response_format` is applied by
-///      [`dispatch_reviewer_for_model`] from the engine profile, so a
-///      configured `json_object` hint rides along on that retry;
-///   3. if that is also prose, advances to the next candidate in the pool.
-///
-/// Returns the first structured verdict, or
-/// [`synthesize_reviewer_unavailable`] when no candidate produced one. `cost`
-/// accumulates every attempt; `prose` preserves the raw text of every rejected
-/// answer for the human-facing finding body.
-async fn complete_review_json_verdict(
-    cli: &crate::Cli,
-    reviewer_override: Option<&str>,
-    reviewer_chain: &[String],
-    primary_system: &str,
-    user: &str,
+/// A prepared `zoder loop` review: one prompt per chunk plus the sizing it was
+/// planned for.
+#[derive(Debug)]
+struct LoopReviewPlan {
+    users: Vec<String>,
     max_tokens: u32,
-) -> (ReviewOutput, Option<String>, f64, String) {
-    let mut candidates = match build_reviewer_candidates(cli, reviewer_override, reviewer_chain) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                synthesize_reviewer_unavailable(&format!("no reviewer chain: {e}")),
-                None,
-                0.0,
-                String::new(),
-            );
-        }
-    };
-    candidates = enforce_exact_model_pin(candidates, cli.model.as_deref(), reviewer_override);
-    if candidates.is_empty() {
-        return (
-            synthesize_reviewer_unavailable("no reviewer model resolved"),
-            None,
-            0.0,
-            String::new(),
-        );
-    }
-    let retry_user = format!(
-        "{user}\n\nYour previous answer was prose, not the required structured verdict. \
-Return ONLY one JSON object with keys verdict, summary, findings, next_steps. \
-Set verdict to exactly one of approve, request_changes, or comment. \
-Every finding MUST cite a concrete location (path:line). No markdown or prose outside the JSON object.\n"
-    );
-    let mut cost = 0.0f64;
-    let mut prose = String::new();
-    let mut last_model: Option<String> = None;
-    for model in &candidates {
-        match complete_once(
-            cli,
-            Some(model.as_str()),
-            &[],
-            primary_system,
-            user,
-            max_tokens,
-        )
-        .await
-        {
-            Ok(c) => {
-                cost += c.cost_usd;
-                last_model = Some(c.model.clone());
-                if let Some(r) = strict_review(&c.content) {
-                    return (r, last_model, cost, prose);
-                }
-                prose.push_str(&format!("[{model} primary]\n{}\n---\n", c.content));
-            }
-            Err(e) => {
-                prose.push_str(&format!("[{model} primary error] {e}\n---\n"));
-                continue;
-            }
-        }
-        match complete_once(
-            cli,
-            Some(model.as_str()),
-            &[],
-            REVIEW_SYSTEM,
-            &retry_user,
-            reviewer_retry_budget(max_tokens),
-        )
-        .await
-        {
-            Ok(c) => {
-                cost += c.cost_usd;
-                last_model = Some(c.model.clone());
-                if let Some(r) = strict_review(&c.content) {
-                    return (r, last_model, cost, prose);
-                }
-                prose.push_str(&format!("[{model} retry]\n{}\n---\n", c.content));
-            }
-            Err(e) => prose.push_str(&format!("[{model} retry error] {e}\n---\n")),
-        }
-    }
-    (
-        synthesize_reviewer_unavailable(&prose),
-        last_model,
-        cost,
-        prose,
-    )
+    chunks: usize,
 }
 
-/// `phase_watchdog` wrapper around [`complete_review_json_verdict`]: the
-/// watchdog requires an `anyhow::Result` inner future, and this dispatch never
-/// fails (it synthesizes `reviewer_unavailable` instead).
-async fn review_phase_verdict(
+/// Build the loop reviewer prompts for `diff`.
+///
+/// The loop used to hand the reviewer ONE prompt built from
+/// [`cap_diff`]-truncated text: anything past the cap was silently dropped, so
+/// the reviewer could approve hunks it never saw (and, on small-context
+/// reviewers, the whole prompt could draw `Context size has been exceeded`).
+/// This uses the same chunk planner as `zoder review`, so:
+///
+///   * every changed line is inside exactly one chunk (never truncated);
+///   * a chunk larger than the reviewer's per-chunk cap is split, not dropped;
+///   * a diff above the total cap is an ERROR (fail closed), never an
+///     approve-on-what-I-could-fit.
+#[allow(clippy::too_many_arguments)]
+fn plan_loop_review(
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps: crate::review_diff::ReviewCaps,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    context_for: &dyn Fn(&str) -> String,
+    base_tokens: u32,
+) -> anyhow::Result<LoopReviewPlan> {
+    // `run_git_diff` caps acquisition at 1 MiB and marks the tail. Reviewing
+    // that marker would still be an approve on a partial view, so refuse it
+    // even when `max_diff_bytes` was raised above the acquisition cap.
+    anyhow::ensure!(
+        !diff.contains("[git diff truncated during acquisition"),
+        "review diff was truncated during acquisition; refusing to approve an incomplete view"
+    );
+    let prepared = crate::review_diff::prepare_review_diff_with_chunks(
+        zoderignore,
+        diff,
+        &[],
+        config_excludes,
+        caps.max_diff_bytes,
+        caps.max_hunk_bytes,
+        caps.max_chunks,
+        true,
+    )?;
+    // An exclusion rule that removes every changed file must not turn into an
+    // empty prompt the reviewer approves.
+    anyhow::ensure!(
+        !prepared.emptied_by_exclusion,
+        "review diff is non-empty but exclusions removed every file; refusing to approve an unreviewed diff"
+    );
+    let mut users = build_review_users(label, "", &prepared, context_for);
+    for u in &mut users {
+        *u = format!("{preamble}{u}");
+    }
+    let max_tokens = caps.max_tokens_floor.map_or(base_tokens, |floor| {
+        base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
+    });
+    Ok(LoopReviewPlan {
+        chunks: users.len(),
+        users,
+        max_tokens,
+    })
+}
+
+/// Run one complete loop review of `diff`, chunked to fit the reviewer.
+///
+/// Returns `Err` when the review is INCOMPLETE for any reason: the diff is
+/// above the total cap, a chunk is too large to split, a reviewer call fails,
+/// a chunk returns no structured JSON after one repair, or chunks are served
+/// by different models. Callers MUST map that to an unresolved iteration
+/// (`reviewer_unavailable`), never to approve — a review that did not finish
+/// is not evidence that the change is correct.
+///
+/// Successful reviews keep the structured-JSON-only contract from the
+/// standalone review path: [`strict_review`] on every chunk, and the aggregate
+/// verdict is the most blocking chunk verdict (see [`append_chunk_review`]).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review(
     cli: &crate::Cli,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
-    primary_system: &str,
-    user: &str,
-    max_tokens: u32,
-) -> anyhow::Result<(ReviewOutput, Option<String>, f64, String)> {
-    Ok(complete_review_json_verdict(
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    root: &Path,
+) -> anyhow::Result<(ReviewOutput, Option<String>, f64, usize)> {
+    let caps_for =
+        |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
+    let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
+    // Chunked reviews have the same cross-chunk blindness as `zoder review`;
+    // feed the post-change file context so a name defined in another chunk is
+    // not reported as missing. Loop work lives in the working tree.
+    let context_on = crate::review_context::enabled();
+    let context_for = |chunk: &str| -> String {
+        if !context_on {
+            return String::new();
+        }
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+        let context = crate::review_context::chunk_context(
+            chunk,
+            &read,
+            crate::review_context::CONTEXT_BUDGET_BYTES,
+        );
+        if context.is_empty() {
+            context
+        } else {
+            format!(
+                "\n\nContext from the full post-change files (NOT part of the diff; do not \
+review it). These names exist outside the lines shown, so do not report them as undefined, \
+unbound, or missing imports:\n{context}"
+            )
+        }
+    };
+    let plan = plan_loop_review(
+        diff,
+        label,
+        preamble,
+        caps_for(caps_model),
+        zoderignore,
+        config_excludes,
+        &context_for,
+        base_tokens,
+    )?;
+    // A reviewer fallback on the first chunk may be serving a model with a
+    // different context size; re-plan for it once (the same contract as
+    // `zoder review`).
+    let replan = |served: &str| -> Option<(Vec<String>, u32)> {
+        plan_loop_review(
+            diff,
+            label,
+            preamble,
+            caps_for(Some(served)),
+            zoderignore,
+            config_excludes,
+            &context_for,
+            base_tokens,
+        )
+        .ok()
+        .map(|p| (p.users, p.max_tokens))
+    };
+    let completion = complete_review_chunks(
         cli,
         reviewer_override,
         reviewer_chain,
-        primary_system,
-        user,
-        max_tokens,
+        system,
+        &plan.users,
+        plan.max_tokens,
+        caps_model.map(str::to_string),
+        &replan,
     )
-    .await)
+    .await
+    // Flatten the context chain (`review chunk 2/3: reviewer X: provider HTTP
+    // 500 ...`) into one message: the loop's per-iteration `review_error` and
+    // summary must name the provider failure, not just the chunk wrapper.
+    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let review = strict_review(&completion.content).ok_or_else(|| {
+        anyhow::anyhow!(
+            "review incomplete: aggregated verdict from {} was not a structured JSON review",
+            completion.model
+        )
+    })?;
+    Ok((
+        review,
+        Some(completion.model),
+        completion.cost_usd,
+        plan.chunks,
+    ))
 }
 
 /// Build the ordered reviewer candidate list `complete_once` walks.
@@ -3121,6 +3169,11 @@ fn render_untracked_dir_hunk(rel: &Path, abs: &Path) -> String {
 /// not a char boundary". The cap is interpreted as the maximum number of
 /// bytes in the returned string; the head and tail slices are the largest
 /// char-boundary-prefix and char-boundary-suffix that each fit the budget.
+///
+/// The loop no longer uses this: truncating a diff silently hides hunks from
+/// the reviewer (see `plan_loop_review`), so loop reviews are chunked and an
+/// over-cap diff fails closed. Kept for the byte-boundary regression tests.
+#[cfg(test)]
 fn cap_diff(diff: &str, max: usize) -> String {
     if diff.len() <= max {
         return diff.to_string();
@@ -3138,6 +3191,7 @@ fn cap_diff(diff: &str, max: usize) -> String {
 /// Largest `i <= n` such that `s.is_char_boundary(i)` is true (so `&s[..i]`
 /// is a valid UTF-8 slice). `n = s.len()` and `n = 0` are always safe and
 /// returned unchanged.
+#[cfg(test)]
 fn floor_char_boundary(s: &str, n: usize) -> usize {
     if n >= s.len() {
         return s.len();
@@ -3152,6 +3206,7 @@ fn floor_char_boundary(s: &str, n: usize) -> usize {
 /// Smallest `i` such that `s.len() - i <= n` AND `s.is_char_boundary(i)` is
 /// true (so `&s[i..]` is a valid UTF-8 slice and is no longer than `n`
 /// bytes). Returns `0` when the requested tail would cover the whole string.
+#[cfg(test)]
 fn ceil_char_boundary_from_end(s: &str, n: usize) -> usize {
     if n >= s.len() {
         return 0;
@@ -5306,6 +5361,9 @@ fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
 /// Centralizing this here (vs. an inline `ReviewOutput { ... }` literal
 /// at the call site) lets `cmd_loop` and the test matrix share a single
 /// source of truth for what an unreviewed iteration looks like.
+/// The loop now stops on any incomplete review (`reviewer_unavailable`, see
+/// `run_loop_review`), so this remains the test-visible fail-closed shape.
+#[cfg(test)]
 fn synthesize_review_phase_failure(msg: &str) -> ReviewOutput {
     ReviewOutput {
         verdict: "request_changes".into(),
@@ -5352,17 +5410,52 @@ fn explicit_loop_approval(review: &ReviewOutput, blocking: usize) -> bool {
     review.verdict.trim().eq_ignore_ascii_case("approve") && blocking == 0
 }
 
+/// Resolve the base a loop reviews against.
+///
+/// The loop's review base is the HEAD sha it started from: the diff (and the
+/// reviewer's view) then covers exactly the loop's own work. An explicit
+/// `--base` wins. Falling back to `detect_base` (upstream merge-base, else
+/// `master`) is what inflated `diff_lines` to 5994 / 28388 on 2026-10-21 for
+/// changes of ~880 / ~430 lines: the merge-base was far behind the loop's
+/// starting commit, so every intervening commit was "reviewed" as if the
+/// author had written it.
+fn loop_review_base(explicit: Option<&str>, start_head: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| start_head.map(str::to_string))
+}
+
+/// Diff the working tree against the loop's starting commit.
+///
+/// Two-dot (`git diff <sha>`) rather than `<sha>...HEAD` so uncommitted author
+/// edits AND commits made during the loop are both in scope. Untracked files
+/// are appended as synthetic new-file hunks, matching working-tree scope.
+fn loop_start_diff(cwd: &Path, start_head: &str) -> anyhow::Result<String> {
+    let mut d = run_git_diff(cwd, &["diff", start_head])?;
+    let untracked = untracked_not_ignored_diff(cwd);
+    if !untracked.is_empty() {
+        if !d.is_empty() && !d.ends_with('\n') {
+            d.push('\n');
+        }
+        d.push_str(&untracked);
+    }
+    Ok(d)
+}
+
 /// Auto uses a stable task baseline; explicit review scopes keep their contract,
 /// with one exception (B10): `--scope working-tree` reviews uncommitted work,
 /// so an author that commits mid-turn empties the working-tree diff even
 /// though the task produced real changes. The loop then reported a false
 /// "empty diff" and rejected the iteration. When the working-tree diff has no
 /// content but the task baseline shows changes, review the task delta instead
-/// and say so in the label. `--scope branch` already includes commits.
+/// and say so in the label. `--scope branch` reviews from the loop's starting
+/// HEAD (`loop_start_head`) unless `--base` was given, so unrelated history is
+/// never attributed to the author.
 fn loop_task_diff(
     cwd: &Path,
     scope: ReviewScope,
     base: Option<&str>,
+    loop_start_head: Option<&str>,
     task_journal: &PatchJournal,
 ) -> anyhow::Result<(String, String)> {
     match scope {
@@ -5392,7 +5485,14 @@ fn loop_task_diff(
                 Ok((label, diff))
             }
         }
-        ReviewScope::Branch => build_diff(cwd, scope, base),
+        ReviewScope::Branch => match (base, loop_start_head) {
+            (Some(b), _) => build_diff(cwd, scope, Some(b)),
+            (None, Some(start)) => Ok((
+                format!("branch (base {start} = loop start)"),
+                loop_start_diff(cwd, start)?,
+            )),
+            (None, None) => build_diff(cwd, scope, None),
+        },
     }
 }
 
@@ -5783,6 +5883,21 @@ pub(crate) async fn cmd_loop(
     // no commits yet; the transition `None -> Some(sha)` then triggers a
     // correction on the first author-made commit.
     let mut prev_head: Option<String> = rev_parse_head(&cwd);
+    // The review base is the HEAD the loop started from. `prev_head` mutates
+    // every iteration; this one must not. An explicit `--base` still wins.
+    let loop_start_head: Option<String> = prev_head.clone();
+    let loop_base: Option<String> = loop_review_base(base.as_deref(), loop_start_head.as_deref());
+    let review_root = crate::review_diff::repo_root(&cwd);
+    if !cli.quiet {
+        match (&loop_base, base.as_deref()) {
+            (Some(b), None) => eprintln!("[loop] review base: {b} (loop start; --base overrides)"),
+            (Some(b), Some(_)) => eprintln!("[loop] review base: {b} (explicit --base)"),
+            (None, _) => eprintln!(
+                "[loop] review base: unresolved (repository has no commits); \
+                 branch scope falls back to its default merge-base"
+            ),
+        }
+    }
     const STALL_LIMIT: usize = 3;
 
     // Patch journal: tracks agent changes turn by turn for transactional
@@ -5969,7 +6084,13 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = loop_task_diff(&cwd, scope, base.as_deref(), &task_journal)?;
+        let (label, diff) = loop_task_diff(
+            &cwd,
+            scope,
+            base.as_deref(),
+            loop_start_head.as_deref(),
+            &task_journal,
+        )?;
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -6084,106 +6205,111 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // reviewer sees EXACTLY what the agent changed — not the full
         // working-tree diff which may contain pre-existing user edits.
         let review_diff = diff.clone();
-        let review_user = {
-            let mut u = format!(
-                "Review this {label} diff for the task:\n{task_txt}\n\n```diff\n{}\n```\n",
-                cap_diff(&review_diff, 100_000)
-            );
-            if let Some(p) = check_passed {
-                u.push_str(&format!(
-                    "\nValidation command `{}` currently {}.\n",
-                    check.as_deref().unwrap_or(""),
-                    if p { "PASSES" } else { "FAILS" }
-                ));
-                if p {
-                    // A configured check may validate delivery or lint only.
-                    // Do not turn its success into evidence for untested behavior.
-                    u.push_str(
-                        "\nThe configured validation command passed. This proves only what that \
+        let mut review_preamble =
+            format!("Task under review (context, not part of the diff):\n{task_txt}\n");
+        if let Some(p) = check_passed {
+            review_preamble.push_str(&format!(
+                "\nValidation command `{}` currently {}.\n",
+                check.as_deref().unwrap_or(""),
+                if p { "PASSES" } else { "FAILS" }
+            ));
+            if p {
+                // A configured check may validate delivery or lint only.
+                // Do not turn its success into evidence for untested behavior.
+                review_preamble.push_str(
+                    "\nThe configured validation command passed. This proves only what that \
 command actually checks; it may not build or test the code and does not establish functional \
 correctness. Review the diff independently for concrete correctness or security defects, \
 including behavior outside the command's coverage. Do not manufacture blockers for style \
 or hypothetical concerns. Assign findings their appropriate severity and cite an exact \
 `location` (path:line) for each blocking finding. Approve only when no blocking defects remain.\n",
-                    );
-                } else {
-                    u.push_str(&format!(
-                        "\nValidation output (tail):\n```\n{check_tail}\n```\n"
-                    ));
-                }
+                );
+            } else {
+                review_preamble.push_str(&format!(
+                    "\nValidation output (tail):\n```\n{check_tail}\n```\n"
+                ));
             }
-            u
-        };
+        }
         if !cli.quiet {
             eprintln!("[loop] iter {i}: adversarial review…");
         }
-        let max_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
         // Resolve a fresh scenario-routed reviewer chain per review
         // pass so KNEMON's "most-idle sub first" view reflects the
         // current cycle's actual readings (not the chain as it stood at
         // iteration 1). The chain is plumbed into `complete_once` via
         // its new `reviewer_chain` argument.
-        let reviewer_chain: Vec<String> = match Engine::load() {
+        //
+        // `review_cfg` supplies `[review]` exclusions and per-route chunk
+        // caps; the caps model is the reviewer that will serve the head slot
+        // (explicit `--reviewer`, then the configured reviewer pin, then the
+        // routed chain head). `cli.model` is the AUTHOR pin and must not size
+        // the reviewer's chunks.
+        let (reviewer_chain, review_cfg, caps_model) = match Engine::load() {
             Ok(eng) => {
                 let health = HealthStore::load(&eng.cfg.health_path);
-                crate::resolve_chain(cli, &eng, &health)
+                let chain = crate::resolve_chain(cli, &eng, &health)
                     .map(|r| r.reviewer)
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let caps_model = reviewer
+                    .clone()
+                    .or_else(|| {
+                        eng.cfg
+                            .reviewer_models_for(cli.agent.as_deref())
+                            .into_iter()
+                            .next()
+                    })
+                    .or_else(|| chain.first().cloned());
+                (chain, Some(eng.cfg.review), caps_model)
             }
-            Err(_) => Vec::new(),
+            Err(_) => (Vec::new(), None, reviewer.clone()),
         };
-        // WHICH reviewer actually answered. `complete_once` walks a chain and
-        // may land on a fallback candidate, so the model that reviewed is not
-        // necessarily the one that was asked for. The per-iteration record
-        // carried `author_model` and nothing about the reviewer, which makes a
-        // run uninterpretable the moment reviewers are rotated or a fallback
-        // fires: two runs with different reviewers are indistinguishable in the
-        // artifact. `None` means no reviewer completed -- also a real outcome,
-        // and distinct from "some reviewer approved".
-        // A. The loop reviewer path accepts ONLY a structured JSON verdict.
-        // Free-form prose is not a verdict: `complete_review_json_verdict`
-        // re-asks ONCE through the direct reviewer path (with
-        // `provider_extra.response_format` applied from the engine profile
-        // when configured) and then walks the rest of the reviewer pool. If
-        // no candidate returns JSON the outcome is `reviewer_unavailable`
-        // and the loop stays unresolved with that reason.
-        let (mut review, mut reviewer_model, review_cost, _prose) = match phase_watchdog(
+        let config_excludes = review_cfg
+            .as_ref()
+            .map(|r| r.exclude.clone())
+            .unwrap_or_default();
+        // Read `.zoderignore` from the loop's base revision so a change under
+        // review cannot exempt itself.
+        let zoderignore = match loop_base.as_deref() {
+            Some(rev) => crate::review_diff::load_zoderignore_at(&cwd, rev),
+            None => crate::review_diff::load_zoderignore(&review_root),
+        };
+        let mut review_error: Option<String> = None;
+        // A. The loop reviewer path accepts ONLY a structured JSON verdict per
+        // chunk (see `run_loop_review`), and an INCOMPLETE review — provider
+        // error, timeout, unparseable chunk, oversized diff — is
+        // `reviewer_unavailable`, which can never resolve the loop. On
+        // 2026-10-21 a reviewer that returned `Context size has been
+        // exceeded` (and a diff whose middle was silently truncated) still
+        // recorded verdict=approve; that is the fail-open this closes.
+        let (mut review, mut reviewer_model, review_cost, mut review_chunks) = match phase_watchdog(
             LoopPhase::Review,
             loop_timeout_secs,
             cli.quiet,
-            review_phase_verdict(
+            run_loop_review(
                 cli,
                 reviewer.as_deref(),
                 &reviewer_chain,
                 ADVERSARIAL_SYSTEM,
-                &review_user,
-                max_tokens,
+                &review_diff,
+                &label,
+                &review_preamble,
+                caps_model.as_deref(),
+                review_cfg.as_ref(),
+                &zoderignore,
+                &config_excludes,
+                &review_root,
             ),
         )
         .await
         {
             Ok(t) => t,
             Err(msg) => {
-                // The reviewer phase hung. `complete_review_json_verdict`
-                // already has its own HTTP client timeout, so surfacing an
-                // Elapsed here means the entire provider request hung (TCP
-                // never returned) — record as a timeout-error review so the
-                // next author turn sees the wall-clock context.
-                //
-                // Z-1 REGRESSION GUARD: the synthesized ReviewOutput MUST be
-                // fail-closed. With a non-blocking `"comment"` verdict, the
-                // downstream `loop_review_ok` / `decide_loop_resolution`
-                // treated the iteration as "approved" on a green check and
-                // reported RESOLVED — even though no reviewer had actually
-                // run. The synthesizer (above) emits `"request_changes"` for
-                // exactly this reason; see its doc comment and the
-                // `review_phase_failure_synthesis_is_request_changes` test.
-                (
-                    synthesize_review_phase_failure(&msg),
-                    None,
-                    0.0,
-                    String::new(),
-                )
+                let detail = format!("review incomplete: {msg}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; failing closed (iteration unresolved)");
+                }
+                review_error = Some(detail.clone());
+                (synthesize_reviewer_unavailable(&detail), None, 0.0, 0)
             }
         };
         total_cost += review_cost;
@@ -6206,36 +6332,42 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // finding keeps today's semantics.
         let mut review_unlocated_no_evidence = false;
         if is_unlocated_block(&review) {
-            let located_user = format!(
-                "{review_user}\n\nThe reviewer returned request_changes with no located finding. \
+            let located_preamble = format!(
+                "{review_preamble}\n\nThe reviewer returned request_changes with no located finding. \
 A blocking defect MUST cite a concrete location (path:line). Re-review this diff; if you still \
 request changes, include at least one finding with an exact location. Otherwise return approve \
 or comment.\n"
             );
-            let (r2, m2, c2, _p2) = match phase_watchdog(
+            let (r2, m2, c2, ch2) = match phase_watchdog(
                 LoopPhase::Review,
                 loop_timeout_secs,
                 cli.quiet,
-                review_phase_verdict(
+                run_loop_review(
                     cli,
                     reviewer.as_deref(),
                     &reviewer_chain,
                     ADVERSARIAL_SYSTEM,
-                    &located_user,
-                    max_tokens,
+                    &review_diff,
+                    &label,
+                    &located_preamble,
+                    caps_model.as_deref(),
+                    review_cfg.as_ref(),
+                    &zoderignore,
+                    &config_excludes,
+                    &review_root,
                 ),
             )
             .await
             {
                 Ok(t) => t,
-                Err(msg) => (
-                    synthesize_review_phase_failure(&msg),
-                    None,
-                    0.0,
-                    String::new(),
-                ),
+                Err(msg) => {
+                    let detail = format!("review incomplete: {msg}");
+                    review_error = Some(detail.clone());
+                    (synthesize_reviewer_unavailable(&detail), None, 0.0, 0)
+                }
             };
             total_cost += c2;
+            review_chunks = ch2;
             if m2.is_some() {
                 reviewer_model = m2;
             }
@@ -6298,6 +6430,9 @@ or comment.\n"
             "check_passed": check_passed,
             "check_phase_timed_out": check_timed_out,
             "loop_timeout_secs": loop_timeout_secs,
+            "review_base": loop_base,
+            "review_chunks": review_chunks,
+            "review_error": review_error,
             "verdict": review.verdict,
             "blocking_findings": blocking,
             "review_unlocated_no_evidence": review_unlocated_no_evidence,
@@ -6331,9 +6466,20 @@ or comment.\n"
         // Formatting/provider failures have already exhausted the bounded
         // reviewer retry. They are not author defects; another edit/review
         // round cannot repair them. Preserve the iteration and stop unresolved.
+        // An INCOMPLETE review (provider error, timeout, unparseable chunk,
+        // oversized diff) lands here too: it is never an approve.
         if review.verdict == REVIEWER_UNAVAILABLE_VERDICT || review_unlocated_no_evidence {
             if !cli.quiet {
-                eprintln!("[loop] reviewer produced no actionable verdict after retry; stopping unresolved");
+                match &review_error {
+                    Some(e) => eprintln!(
+                        "[loop] review incomplete ({e}); stopping unresolved — \
+                         an unfinished review is not an approval"
+                    ),
+                    None => eprintln!(
+                        "[loop] reviewer produced no actionable verdict after retry; \
+                         stopping unresolved"
+                    ),
+                }
             }
             break;
         }
@@ -6510,27 +6656,33 @@ approve)…"
                 }
                 let mut fresh: Vec<ReviewOutput> = Vec::with_capacity(2);
                 for _ in 0..2 {
-                    let (r, m, c, _p) = match phase_watchdog(
+                    let (r, m, c, _ch) = match phase_watchdog(
                         LoopPhase::Review,
                         loop_timeout_secs,
                         cli.quiet,
-                        review_phase_verdict(
+                        run_loop_review(
                             cli,
                             reviewer.as_deref(),
                             &reviewer_chain,
                             ADVERSARIAL_SYSTEM,
-                            &review_user,
-                            max_tokens,
+                            &review_diff,
+                            &label,
+                            &review_preamble,
+                            caps_model.as_deref(),
+                            review_cfg.as_ref(),
+                            &zoderignore,
+                            &config_excludes,
+                            &review_root,
                         ),
                     )
                     .await
                     {
                         Ok(t) => t,
                         Err(msg) => (
-                            synthesize_review_phase_failure(&msg),
+                            synthesize_reviewer_unavailable(&format!("review incomplete: {msg}")),
                             None,
                             0.0,
-                            String::new(),
+                            0,
                         ),
                     };
                     total_cost += c;
@@ -6693,9 +6845,22 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
             iterations.len()
         );
         for it in &iterations {
+            // Surface an incomplete review in the summary, not only in the
+            // JSON: "verdict=reviewer_unavailable" alone does not say whether
+            // the provider errored, timed out, or the diff was too large.
+            let err = it["review_error"]
+                .as_str()
+                .map(|e| format!(" review_error={e:?}"))
+                .unwrap_or_default();
             println!(
-                "  iter {} : tools={} diff_lines={} check={} verdict={}",
-                it["iter"], it["tool_calls"], it["diff_lines"], it["check_passed"], it["verdict"]
+                "  iter {} : tools={} diff_lines={} chunks={} check={} verdict={}{}",
+                it["iter"],
+                it["tool_calls"],
+                it["diff_lines"],
+                it["review_chunks"],
+                it["check_passed"],
+                it["verdict"],
+                err
             );
         }
     }
@@ -13429,6 +13594,211 @@ model_provider = "custom.nemotron35"
             "reviewer success MUST record ewma_latency_ms (a non-zero latency was measured); got entry={entry:?}"
         );
     }
+
+    // ---- loop review base / chunking / fail-closed (2026-10-21) ----
+
+    fn review_caps(hunk: usize, diff: usize) -> crate::review_diff::ReviewCaps {
+        crate::review_diff::ReviewCaps {
+            max_hunk_bytes: hunk,
+            max_diff_bytes: diff,
+            max_chunks: 64,
+            max_tokens_floor: None,
+            from_route: false,
+        }
+    }
+
+    fn synthetic_loop_diff(files: usize, filler_lines: usize) -> String {
+        let mut out = String::new();
+        for n in 0..files {
+            out.push_str(&format!(
+                "diff --git a/f{n}.txt b/f{n}.txt\n--- a/f{n}.txt\n+++ b/f{n}.txt\n@@ -1 +1,{} @@\n-old-{n}\n+new-{n}\n",
+                filler_lines + 1
+            ));
+            for line in 0..filler_lines {
+                out.push_str(&format!("+filler {n}/{line} ....................\n"));
+            }
+        }
+        out
+    }
+
+    /// REGRESSION: the loop used to build ONE prompt from `cap_diff(diff,
+    /// 100_000)`, which keeps only the head and tail of an oversized diff. A
+    /// reviewer could then approve hunks it never saw. Every changed line must
+    /// now appear in exactly one chunk.
+    #[test]
+    fn loop_review_chunks_every_hunk_instead_of_truncating() {
+        let diff = synthetic_loop_diff(12, 12);
+        let plan = plan_loop_review(
+            &diff,
+            "branch",
+            "task\n",
+            review_caps(400, 100_000),
+            &[],
+            &[],
+            &|_| String::new(),
+            8192,
+        )
+        .expect("a diff under the total cap must chunk");
+        assert!(plan.chunks > 1, "a 12-file diff must span chunks");
+        for n in 0..12 {
+            assert!(
+                plan.users.iter().any(|u| u.contains(&format!("+new-{n}"))),
+                "file {n} was dropped instead of chunked"
+            );
+        }
+        assert!(plan.users.iter().all(|u| u.len() < 400 * 3 + 2_000));
+    }
+
+    /// REGRESSION: a diff above the total cap must FAIL CLOSED. Silently
+    /// truncating it (the old `cap_diff` path) let the reviewer approve an
+    /// incomplete view; an unattempted review is not a review.
+    #[test]
+    fn loop_review_over_total_cap_fails_closed() {
+        let diff = synthetic_loop_diff(4, 40);
+        let err = plan_loop_review(
+            &diff,
+            "branch",
+            "task\n",
+            review_caps(500, 200),
+            &[],
+            &[],
+            &|_| String::new(),
+            8192,
+        )
+        .expect_err("over-cap diff must be refused, not truncated");
+        assert!(
+            err.to_string().contains("above the") && err.to_string().contains("limit"),
+            "error must name the cap: {err}"
+        );
+        // An exclusion set that removes every changed file must also refuse.
+        let err = plan_loop_review(
+            &synthetic_loop_diff(1, 1),
+            "branch",
+            "task\n",
+            review_caps(9_000, 120_000),
+            &[],
+            &["*.txt".to_string()],
+            &|_| String::new(),
+            8192,
+        )
+        .expect_err("an exclusion-emptied diff must not become an empty approve");
+        assert!(err.to_string().contains("exclusions removed every file"));
+        // An acquisition-truncated diff must be refused even if the configured
+        // total cap would accept its (partial) byte length.
+        let truncated = format!(
+            "{}\n...[git diff truncated during acquisition at 1048576 bytes]...\n",
+            synthetic_loop_diff(1, 1)
+        );
+        let err = plan_loop_review(
+            &truncated,
+            "branch",
+            "task\n",
+            review_caps(9_000, 120_000),
+            &[],
+            &[],
+            &|_| String::new(),
+            8192,
+        )
+        .expect_err("a truncated diff must not be approved");
+        assert!(err.to_string().contains("truncated during acquisition"));
+    }
+
+    /// REGRESSION: a reviewer error (the observed `provider HTTP 500 ...
+    /// Context size has been exceeded`) must return Err from the review step so
+    /// the loop records `reviewer_unavailable` and an UNRESOLVED iteration. It
+    /// must never synthesize an approve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_provider_error_is_incomplete_and_never_approves() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                r#"{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = dummy_cli();
+        let err = run_loop_review(
+            &cli,
+            None,
+            &[],
+            ADVERSARIAL_SYSTEM,
+            &synthetic_loop_diff(1, 1),
+            "branch",
+            "task\n",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect_err("a failed reviewer call is an incomplete review");
+        assert!(
+            err.to_string().contains("500") || err.to_string().contains("Context size"),
+            "the provider error must survive into the loop diagnostic: {err}"
+        );
+        let synthesized = synthesize_reviewer_unavailable(&format!("review incomplete: {err}"));
+        assert_eq!(synthesized.verdict, REVIEWER_UNAVAILABLE_VERDICT);
+        assert!(!loop_review_ok(&synthesized, 0));
+        assert!(!explicit_loop_approval(&synthesized, 0));
+    }
+
+    /// A multi-chunk loop review must actually SEND every chunk (one request
+    /// per chunk) and merge the verdicts — no chunk is silently skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_sends_every_chunk_to_the_reviewer() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = dummy_cli();
+        let diff = synthetic_loop_diff(20, 20);
+        let (review, model, _cost, chunks) = run_loop_review(
+            &cli,
+            None,
+            &[],
+            ADVERSARIAL_SYSTEM,
+            &diff,
+            "branch",
+            "task\n",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect("every chunk approves");
+        assert!(chunks > 1, "20 file sections must span more than one chunk");
+        assert_eq!(review.verdict, "approve");
+        assert_eq!(model.as_deref(), Some("working-model/reviewer"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            chunks,
+            "exactly one reviewer request per chunk, no skipped chunk"
+        );
+        let joined: String = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for n in 0..20 {
+            assert!(
+                joined.contains(&format!("+new-{n}")),
+                "chunk for file {n} was never sent to the reviewer"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14761,14 +15131,16 @@ mod completion_integrity_tests {
         git(&["commit", "-qm", "old branch work"]);
         let mut journal = PatchJournal::new();
         journal.record_baseline(repo);
-        assert!(loop_task_diff(repo, ReviewScope::Auto, None, &journal)
-            .unwrap()
-            .1
-            .is_empty());
+        assert!(
+            loop_task_diff(repo, ReviewScope::Auto, None, None, &journal)
+                .unwrap()
+                .1
+                .is_empty()
+        );
         std::fs::write(repo.join("new.rs"), "fn job_work() {}\n").unwrap();
         git(&["add", "new.rs"]);
         git(&["commit", "-qm", "task change"]);
-        let diff = loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+        let diff = loop_task_diff(repo, ReviewScope::Auto, None, None, &journal)
             .unwrap()
             .1;
         assert!(diff.contains("job_work"));
@@ -14776,7 +15148,7 @@ mod completion_integrity_tests {
         // A subsequent author turn with no changes must review the same task delta.
         assert_eq!(
             diff,
-            loop_task_diff(repo, ReviewScope::Auto, None, &journal)
+            loop_task_diff(repo, ReviewScope::Auto, None, None, &journal)
                 .unwrap()
                 .1
         );
@@ -14799,13 +15171,15 @@ mod completion_integrity_tests {
         let mut journal = PatchJournal::new();
         journal.record_baseline(repo);
         // Nothing done yet: working-tree scope is honestly empty.
-        let (_, before) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        let (_, before) =
+            loop_task_diff(repo, ReviewScope::WorkingTree, None, None, &journal).unwrap();
         assert!(!diff_has_content(&before));
         // Author edits and commits inside the turn.
         std::fs::write(repo.join("new.rs"), "fn job_work() {}\n").unwrap();
         git(&["add", "new.rs"]);
         git(&["commit", "-qm", "task change"]);
-        let (label, diff) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        let (label, diff) =
+            loop_task_diff(repo, ReviewScope::WorkingTree, None, None, &journal).unwrap();
         assert!(
             diff.contains("job_work"),
             "task delta must survive the commit"
@@ -14817,7 +15191,8 @@ mod completion_integrity_tests {
         );
         // Uncommitted work keeps the plain working-tree contract.
         std::fs::write(repo.join("new.rs"), "fn job_work() { let _x = 1; }\n").unwrap();
-        let (label, diff) = loop_task_diff(repo, ReviewScope::WorkingTree, None, &journal).unwrap();
+        let (label, diff) =
+            loop_task_diff(repo, ReviewScope::WorkingTree, None, None, &journal).unwrap();
         assert_eq!(label, "working-tree");
         assert!(diff.contains("_x"));
     }
@@ -14829,5 +15204,146 @@ mod completion_integrity_tests {
             "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n"
         ));
         assert!(diff_has_content("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop review base — the diff the reviewer sees is the loop's own work.
+//
+// Regression for 2026-10-21: `zoder loop` iteration 1 reported
+// diff_lines=5994 / 28388 for changes of ~880 / ~430 lines because branch
+// scope fell back to `detect_base` (merge-base with the default branch),
+// which was far behind the loop's starting commit. The base is now the HEAD
+// sha captured when the loop starts; `--base` still overrides.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod loop_review_base_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// master is left at the seed commit; the fix branch carries 300 lines of
+    /// unrelated history, then the loop starts, then makes its own change.
+    fn repo_with_diverged_history() -> (tempfile::TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-q", "-b", "master"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "loop-base-test"]);
+        std::fs::write(repo.join("app.txt"), "base\n").unwrap();
+        git(&repo, &["add", "app.txt"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        git(&repo, &["checkout", "-q", "-b", "fix"]);
+        let bulk: String = (0..300)
+            .map(|n| format!("unrelated history line {n}\n"))
+            .collect();
+        std::fs::write(repo.join("bulk.txt"), bulk).unwrap();
+        git(&repo, &["add", "bulk.txt"]);
+        git(&repo, &["commit", "-q", "-m", "unrelated history"]);
+        let loop_start = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("app.txt"), "base\nloop fix\n").unwrap();
+        git(&repo, &["add", "app.txt"]);
+        git(&repo, &["commit", "-q", "-m", "loop change"]);
+        (dir, repo, loop_start)
+    }
+
+    #[test]
+    fn loop_review_base_defaults_to_start_head_and_explicit_base_wins() {
+        assert_eq!(
+            loop_review_base(None, Some("start-sha")).as_deref(),
+            Some("start-sha"),
+            "no --base must review from the loop's starting HEAD"
+        );
+        assert_eq!(
+            loop_review_base(Some("master"), Some("start-sha")).as_deref(),
+            Some("master"),
+            "--base must stay overridable"
+        );
+        assert_eq!(loop_review_base(None, None), None);
+    }
+
+    #[test]
+    fn branch_scope_reviews_the_loop_delta_not_the_merge_base() {
+        let (_dir, repo, loop_start) = repo_with_diverged_history();
+        let journal = PatchJournal::new();
+
+        // The pre-fix default: merge-base with master includes all 300 lines
+        // of unrelated history (the 5994-line complaint, scaled down).
+        let (_, old) = build_diff(&repo, ReviewScope::Branch, None).unwrap();
+        assert!(
+            old.contains("unrelated history line 0"),
+            "merge-base diff includes unrelated history: {} lines",
+            old.lines().count()
+        );
+
+        // Fixed: only the loop's own change is in the diff.
+        let (label, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&loop_start),
+            &journal,
+        )
+        .unwrap();
+        assert!(
+            !diff.contains("unrelated history line 0"),
+            "loop diff must not include pre-loop history: {diff}"
+        );
+        assert!(
+            diff.contains("+loop fix"),
+            "loop work must be reviewed: {diff}"
+        );
+        assert!(
+            diff.lines().count() < 20,
+            "{} lines for a one-line change is the inflated-base defect",
+            diff.lines().count()
+        );
+        assert!(
+            label.contains("loop start"),
+            "label must name the base: {label}"
+        );
+
+        // Uncommitted loop work (the common case) is in scope too: the diff
+        // is two-dot (`git diff <start>`), not `<start>...HEAD`.
+        std::fs::write(repo.join("app.txt"), "base\nloop fix\nuncommitted\n").unwrap();
+        let (_, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&loop_start),
+            &journal,
+        )
+        .unwrap();
+        assert!(diff.contains("+uncommitted"), "{diff}");
+
+        // Explicit --base keeps the standalone three-dot contract.
+        let (_, explicit) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            Some("master"),
+            Some(&loop_start),
+            &journal,
+        )
+        .unwrap();
+        assert!(
+            explicit.contains("unrelated history line 0"),
+            "--base master must keep its branch-vs-master meaning"
+        );
     }
 }
