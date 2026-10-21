@@ -437,6 +437,10 @@ struct Completion {
     content: String,
     cost_usd: f64,
     receipts: Vec<serde_json::Value>,
+    /// Number of review chunks actually completed. A chunked review may
+    /// re-plan for a fallback model, so this is NOT always the initial plan's
+    /// length; the loop records this value as evidence of what was reviewed.
+    chunks: usize,
 }
 
 /// Internal reviewer chain dispatch result. Carries enough information to
@@ -728,7 +732,6 @@ async fn complete_once(
 struct LoopReviewPlan {
     users: Vec<String>,
     max_tokens: u32,
-    chunks: usize,
 }
 
 /// Build the loop reviewer prompts for `diff`.
@@ -784,11 +787,7 @@ fn plan_loop_review(
     let max_tokens = caps.max_tokens_floor.map_or(base_tokens, |floor| {
         base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
     });
-    Ok(LoopReviewPlan {
-        chunks: users.len(),
-        users,
-        max_tokens,
-    })
+    Ok(LoopReviewPlan { users, max_tokens })
 }
 
 /// Run one complete loop review of `diff`, chunked to fit the reviewer.
@@ -893,12 +892,10 @@ unbound, or missing imports:\n{context}"
             completion.model
         )
     })?;
-    Ok((
-        review,
-        Some(completion.model),
-        completion.cost_usd,
-        plan.chunks,
-    ))
+    // `completion.chunks` is the final plan after a possible fallback re-plan;
+    // `plan.chunks` would under-report what the reviewer actually saw.
+    let chunks = completion.chunks;
+    Ok((review, Some(completion.model), completion.cost_usd, chunks))
 }
 
 /// Build the ordered reviewer candidate list `complete_once` walks.
@@ -1730,6 +1727,7 @@ async fn dispatch_reviewer_for_model(
         model: model.to_string(),
         content: res.content,
         cost_usd: cost,
+        chunks: 1,
         receipts: vec![json!({
             "requested_model": model,
             "response_model": res.telemetry.response_model,
@@ -3765,6 +3763,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         content: serde_json::to_string(&merged)?,
         cost_usd,
         receipts,
+        chunks: users.len(),
     })
 }
 
@@ -12598,6 +12597,10 @@ mod reviewer_chain_dispatch_tests {
         .await
         .unwrap();
         assert_eq!(result.model, "working-model/glm-5.1");
+        assert_eq!(
+            result.chunks, 2,
+            "the completion must report the RE-PLANNED chunk count, not the initial 1"
+        );
         assert_eq!(replans.load(Ordering::SeqCst), 1, "re-plans exactly once");
         // 1 call for the original first chunk + 2 for the re-planned chunks.
         assert_eq!(hits.load(Ordering::SeqCst), 3);
@@ -12617,6 +12620,7 @@ mod reviewer_chain_dispatch_tests {
         .await
         .unwrap();
         assert_eq!(result.model, "working-model/glm-5.1");
+        assert_eq!(result.chunks, 2, "no re-plan: the plan's chunk count");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -13639,7 +13643,7 @@ model_provider = "custom.nemotron35"
             8192,
         )
         .expect("a diff under the total cap must chunk");
-        assert!(plan.chunks > 1, "a 12-file diff must span chunks");
+        assert!(plan.users.len() > 1, "a 12-file diff must span chunks");
         for n in 0..12 {
             assert!(
                 plan.users.iter().any(|u| u.contains(&format!("+new-{n}"))),
