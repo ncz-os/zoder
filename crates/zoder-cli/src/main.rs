@@ -7760,11 +7760,12 @@ impl std::fmt::Debug for TurnResult {
 
 /// Drive a single agentic turn against the engine: resolve the model (routing or
 /// `-m`), enforce the free/paid gate, run the loop in `cwd`, harvest cost/tokens,
-/// and write one ledger record. `session_override` (when `Some`) continues an
-/// existing engine session for conversational continuity across turns; otherwise
-/// `cli.session` is used. Set `stream_output` to mirror text/tool events to the
-/// terminal (off for `--json` and for the inner turns of `loop`). This function
-/// does NOT print the final summary — the caller owns presentation.
+/// and write one ledger record. `continuity` (when `Some`) continues an
+/// existing engine session for conversational continuity across turns, keyed
+/// to the agent that minted it; otherwise `cli.session` is used. Set
+/// `stream_output` to mirror text/tool events to the terminal (off for
+/// `--json` and for the inner turns of `loop`). This function does NOT print
+/// the final summary — the caller owns presentation.
 fn evaluate_default_exec_budget(
     cfg: &Config,
     pricing: &PricingCatalog,
@@ -8079,12 +8080,17 @@ mod cli_switch_regression_tests {
         saved.save(&sessions).unwrap();
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
-        let got =
-            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
-                .expect("--continue with a prior session must resolve")
-                .expect("--continue must yield a session id");
+        let got = resolve_engine_session_id(
+            &cli,
+            &sessions,
+            zoder_core::EngineKind::Zeroclaw,
+            None,
+            "coder",
+        )
+        .expect("--continue with a prior session must resolve");
         assert_eq!(
-            got, original.id,
+            got,
+            EngineSessionChoice::Explicit(original.id),
             "--continue must attach to the prior session, not mint a fresh one"
         );
     }
@@ -8099,9 +8105,14 @@ mod cli_switch_regression_tests {
         std::fs::create_dir_all(&sessions).unwrap();
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue"]).unwrap();
-        let err =
-            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
-                .expect_err("--continue with no prior session must be a hard error");
+        let err = resolve_engine_session_id(
+            &cli,
+            &sessions,
+            zoder_core::EngineKind::Zeroclaw,
+            None,
+            "coder",
+        )
+        .expect_err("--continue with no prior session must be a hard error");
         let msg = err.to_string();
         assert!(
             msg.contains("--continue") && msg.contains("no prior session"),
@@ -8110,20 +8121,26 @@ mod cli_switch_regression_tests {
         );
     }
 
-    /// Without --continue, --session, or a session_override, the resolver
-    /// returns None so the engine mints a fresh session. Old behavior
-    /// returned Some(empty-default) on a mistaken continue_; this guards
-    /// against that regression coming back.
+    /// Without --continue, --session, or continuity from a caller, the
+    /// resolver defers to the driver (fresh session or its persisted
+    /// record). Old behavior returned Some(empty-default) on a mistaken
+    /// continue_; this guards against that regression coming back.
     #[test]
-    fn no_session_hint_yields_none() {
+    fn no_session_hint_yields_stored_or_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
-        let got =
-            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
-                .expect("no --session/--continue must not error");
-        assert!(got.is_none(), "fresh invocation must yield None");
+        let got = resolve_engine_session_id(
+            &cli,
+            &sessions,
+            zoder_core::EngineKind::Zeroclaw,
+            None,
+            "coder",
+        )
+        .expect("no --session/--continue must not error");
+        assert_eq!(got, EngineSessionChoice::StoredOrFresh);
+        assert_eq!(got.session_id(), None, "fresh invocation must yield no id");
     }
 
     /// An explicit --session id always wins over --continue (continuation
@@ -8140,36 +8157,92 @@ mod cli_switch_regression_tests {
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "explicit-id"])
             .unwrap();
-        let got =
-            resolve_engine_session_id(&cli, &sessions, zoder_core::EngineKind::Zeroclaw, None)
-                .expect("explicit --session must succeed")
-                .expect("explicit --session must yield Some");
+        let got = resolve_engine_session_id(
+            &cli,
+            &sessions,
+            zoder_core::EngineKind::Zeroclaw,
+            None,
+            "coder",
+        )
+        .expect("explicit --session must succeed");
         assert_eq!(
-            got, "explicit-id",
+            got,
+            EngineSessionChoice::Explicit("explicit-id".into()),
             "--session <id> must beat --continue regardless of what's in the sessions dir"
         );
     }
 
-    /// A programmatic session_override (used by the loop's continuation
-    /// turns) beats both --session and --continue. This matches the
-    /// precedence documented at resolve_engine_session_id.
+    /// Loop continuity (the previous author turn's session + its agent)
+    /// beats both --session and --continue, and stays keyed to its agent.
     #[test]
-    fn session_override_wins_over_explicit_and_continue() {
+    fn loop_continuity_wins_over_explicit_and_continue() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
 
         let cli =
             Cli::try_parse_from(["zoder", "exec", "--continue", "--session", "from-cli"]).unwrap();
+        let continuity = AgentSession {
+            agent_alias: "minimax".into(),
+            session_id: "from-loop".into(),
+        };
         let got = resolve_engine_session_id(
             &cli,
             &sessions,
             zoder_core::EngineKind::Zeroclaw,
-            Some("from-loop"),
+            Some(&continuity),
+            "coder",
         )
-        .expect("override must succeed")
-        .expect("override must yield Some");
-        assert_eq!(got, "from-loop");
+        .expect("continuity must succeed");
+        assert_eq!(
+            got,
+            EngineSessionChoice::Continuity(continuity.clone()),
+            "the loop's own continuation turn must win"
+        );
+        assert!(got.is_continuity_hint());
+        assert_eq!(
+            got.session_for_agent("minimax").as_deref(),
+            Some("from-loop")
+        );
+        assert_eq!(
+            got.session_for_agent("coder"),
+            None,
+            "a session minted by agent 'minimax' must never be resumed by 'coder'"
+        );
+    }
+
+    /// REGRESSION (ACP session-per-agent): the loop carries ONE session
+    /// id from the previous author turn. When that turn ran on a fallback
+    /// agent and the next iteration starts at a different head agent, the
+    /// old id must NOT be sent to the head (the engine answers -32602
+    /// "ACP session belongs to a different agent", which used to burn
+    /// every fallback candidate and stop the loop).
+    #[test]
+    fn continuity_session_is_never_reused_by_another_agent() {
+        let continuity = EngineSessionChoice::Continuity(AgentSession {
+            agent_alias: "MiniMax-M3".into(),
+            session_id: "session-owned-by-minimax".into(),
+        });
+        assert_eq!(
+            continuity.session_for_agent("MiniMax-M3"),
+            Some("session-owned-by-minimax".to_string())
+        );
+        for other in ["qwen38", "gemma4-31b", "MiniMax-M3.1-Flash-Preview"] {
+            assert_eq!(
+                continuity.session_for_agent(other),
+                None,
+                "{other} must start a fresh session instead of resuming another agent's id"
+            );
+        }
+        // Explicit operator ids are not agent-scoped by zoder: they are
+        // passed through unchanged (and reported, not replaced, if the
+        // engine rejects them).
+        let explicit = EngineSessionChoice::Explicit("operator-pick".into());
+        assert_eq!(
+            explicit.session_for_agent("any-agent").as_deref(),
+            Some("operator-pick")
+        );
+        assert!(!explicit.is_continuity_hint());
     }
 }
 
@@ -8456,40 +8529,107 @@ mod ledger_integrity_tests {
     }
 }
 
-/// Resolve the engine session id to attach this agentic turn to.
+/// An engine session carried between agentic turns, together with the
+/// agent alias that minted it.
+///
+/// Zeroclaw binds a session to its agent: resuming it under a different
+/// alias (which every model fallback resolves to) is rejected with
+/// `-32602 "ACP session belongs to a different agent"`. Carrying the
+/// owning alias alongside the id is what lets the loop resume it on the
+/// same agent and start fresh on any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentSession {
+    pub agent_alias: String,
+    pub session_id: String,
+}
+
+/// How an agentic turn should obtain its engine session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EngineSessionChoice {
+    /// Operator-supplied (`--session` / `--continue`): resume exactly
+    /// this id and report a rejection instead of replacing it.
+    Explicit(String),
+    /// Loop continuity for ONE agent: resume only on that alias, and let
+    /// the driver replace the id with a fresh session if the engine
+    /// rejects it (e.g. a daemon restart).
+    Continuity(AgentSession),
+    /// A record loaded from the engine-session store for the head agent.
+    /// Replaceable like continuity, and never sent to another agent.
+    Persisted(AgentSession),
+    /// Nothing selected on the command line: the driver may load a
+    /// persisted store record for the executing agent, otherwise it
+    /// starts fresh.
+    StoredOrFresh,
+}
+
+impl EngineSessionChoice {
+    /// The id to hand the driver before per-candidate filtering.
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Explicit(id) => Some(id),
+            Self::Continuity(session) | Self::Persisted(session) => Some(&session.session_id),
+            Self::StoredOrFresh => None,
+        }
+    }
+
+    /// Whether this turn's id is a replaceable (non-operator) hint.
+    fn is_continuity_hint(&self) -> bool {
+        matches!(self, Self::Continuity(_) | Self::Persisted(_))
+    }
+
+    /// The resume id for ONE chain candidate (`agent_alias`).
+    ///
+    /// Continuity is keyed per agent: an id minted by a different agent
+    /// is NEVER sent to this candidate — the engine would reject it and
+    /// burn the fallback candidate. Continuity travels through the
+    /// prompt/transcript the loop already feeds the next turn instead.
+    fn session_for_agent(&self, agent_alias: &str) -> Option<String> {
+        match self {
+            Self::Explicit(id) => Some(id.clone()),
+            Self::Continuity(session) | Self::Persisted(session)
+                if session.agent_alias == agent_alias =>
+            {
+                Some(session.session_id.clone())
+            }
+            Self::Continuity(_) | Self::Persisted(_) | Self::StoredOrFresh => None,
+        }
+    }
+}
+
+/// Resolve the engine session to attach this agentic turn to.
 ///
 /// Precedence (most explicit to least):
-///   1. `session_override` from a programmatic caller (used by the `loop`'s
-///      own follow-up turns).
+///   1. `continuity` from a programmatic caller: the `loop`'s previous
+///      author turn's session, still keyed to the agent that minted it.
 ///   2. `--session <id>` from the CLI (explicit id).
 ///   3. `--continue` from the CLI: load the most-recently-updated session
-///      from the sessions dir and use ITS id. This is the previously-missing
-///      wiring — `--continue` used to be silently accepted-and-ignored on the
-///      agentic path, leaving the engine to mint a fresh empty session
-///      every time. With this helper, an `--continue` without a prior
-///      session is rejected with a clear error (instead of fabricating an
-///      empty context) and the engine continues the real prior thread.
+///      from the sessions dir and use ITS id. An `--continue` without a
+///      prior session is a clear error (instead of fabricating an empty
+///      context) so the engine continues the real prior thread.
 ///   4. `--persist-session` engine-side session record (the
-///      persistent-goose-sessions slice): if the operator opted in
-///      via the flag and the engine-session store has a fresh record
-///      for this `(engine_kind, cwd)`, return that id. Returns `None`
-///      (= "mint a fresh session") when the flag is off, when no
-///      record is on disk, or when the only record is stale (older
-///      than the freshness window or scoped to a different cwd).
+///      persistent-sessions slice): if the operator opted in via the
+///      flag and the store has a fresh record for this `(engine, cwd,
+///      agent)`, return that id. Otherwise the driver loads the record
+///      for whichever agent ends up executing the turn.
 ///
 /// Both Zeroclaw and Goose accept a session id through the same
 /// `AgentOptions.session_id` field, so this lookup is engine-agnostic.
+/// `head_alias` is the agent the head of the execution chain will run
+/// as; the persisted store is keyed per agent (see
+/// `session_store::make_agent_scope`) so a record minted by a different
+/// agent is never resumed.
 fn resolve_engine_session_id(
     cli: &Cli,
     sessions_dir: &Path,
     engine_kind: EngineKind,
-    session_override: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    if let Some(id) = session_override {
-        return Ok(Some(id.to_string()));
+    continuity: Option<&AgentSession>,
+    head_alias: &str,
+) -> anyhow::Result<EngineSessionChoice> {
+    if let Some(session) = continuity {
+        return Ok(EngineSessionChoice::Continuity(session.clone()));
     }
     if let Some(id) = cli.session.as_deref() {
-        return Ok(Some(id.to_string()));
+        return Ok(EngineSessionChoice::Explicit(id.to_string()));
     }
     if cli.continue_ {
         let session = Session::latest(sessions_dir)?.ok_or_else(|| {
@@ -8499,34 +8639,48 @@ fn resolve_engine_session_id(
                 sessions_dir.display()
             )
         })?;
-        return Ok(Some(session.id));
+        return Ok(EngineSessionChoice::Explicit(session.id));
     }
     if cli.persist_session {
         // PERSISTENT-SESSIONS SLICE: with `--persist-session` set, look
         // up the engine-side store. The lookup is best-effort: a
         // corrupt file or IO error must NOT fail the run (the
         // engine fallback would mint a fresh session anyway), so we
-        // collapse any non-`Ok(Some)` into `Ok(None)`.
+        // collapse any non-`Ok(Some)` into the fresh-session choice.
         let store_path = sessions_dir.join("engine_sessions.json");
         let cfg = zoder_core::engine_rpc::session_store::StoreConfig::new(&store_path);
-        let scope = zoder_core::engine_rpc::session_store::make_scope(
-            zoder_core::engine_rpc::engine_kind_scope(engine_kind),
-            &agentic_cwd(cli)?,
-        );
+        let scope = if matches!(engine_kind, EngineKind::Zeroclaw) {
+            // Zeroclaw sessions are agent-bound (see make_agent_scope).
+            zoder_core::engine_rpc::session_store::make_agent_scope(
+                zoder_core::engine_rpc::engine_kind_scope(engine_kind),
+                &agentic_cwd(cli)?,
+                head_alias,
+            )
+        } else {
+            // Goose has no agent concept; keep the historical engine+cwd
+            // scope so `--persist-session` round-trips exactly as before.
+            zoder_core::engine_rpc::session_store::make_scope(
+                zoder_core::engine_rpc::engine_kind_scope(engine_kind),
+                &agentic_cwd(cli)?,
+            )
+        };
         if let Ok(Some(rec)) =
             zoder_core::engine_rpc::session_store::EngineSessionStore::load(&cfg, &scope)
         {
-            return Ok(Some(rec.session_id));
+            return Ok(EngineSessionChoice::Persisted(AgentSession {
+                agent_alias: head_alias.to_string(),
+                session_id: rec.session_id,
+            }));
         }
     }
-    Ok(None)
+    Ok(EngineSessionChoice::StoredOrFresh)
 }
 
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
     prompt: String,
-    session_override: Option<String>,
+    continuity: Option<AgentSession>,
     stream_output: bool,
     events_file: Option<String>,
 ) -> anyhow::Result<TurnResult> {
@@ -8729,15 +8883,17 @@ pub(crate) async fn agentic_turn(
         );
     }
 
-    // Resolve the engine session id once for the helper above. Doing it on the
+    // Resolve the engine session once for the helper above. Doing it on the
     // same path as the model/routing resolution keeps `--continue` errors
     // co-located with the other early-validation steps, before we commit to
-    // an engine dispatch.
-    let engine_session_id = resolve_engine_session_id(
+    // an engine dispatch. The choice keeps whether the id is an operator
+    // request or a replaceable continuity hint, and which agent owns it.
+    let session_choice = resolve_engine_session_id(
         cli,
         &eng.cfg.sessions_dir(),
         engine_kind,
-        session_override.as_deref(),
+        continuity.as_ref(),
+        &head_alias,
     )?;
 
     // The Goose path SPAWNS its own engine process (`goose acp` over stdio)
@@ -8862,7 +9018,13 @@ pub(crate) async fn agentic_turn(
         // value whose routes passed the live preflight. The ACP client checks
         // it again immediately before releasing the prompt.
         zeroclaw_config_snapshot: None,
-        session_id: engine_session_id,
+        // The chain loop re-keys this per candidate (see
+        // `EngineSessionChoice::session_for_agent`); the head's id is the
+        // starting point and is also what the Goose single-shot path uses.
+        session_id: session_choice.session_id().map(str::to_string),
+        // Continuity/persisted ids are replaceable; an explicit
+        // `--session` / `--continue` id is not.
+        session_id_is_continuity_hint: session_choice.is_continuity_hint(),
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
@@ -9115,6 +9277,14 @@ pub(crate) async fn agentic_turn(
         };
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
+        // SESSION CONTINUITY IS KEYED PER AGENT. Zeroclaw binds a session
+        // to the agent that minted it, so a model fallback (which resolves
+        // to a different alias) must NOT be handed the head agent's id —
+        // the engine rejects it with -32602 and every candidate in the
+        // chain dies, killing the loop. A different agent starts a fresh
+        // session; the loop's next-turn prompt already carries the fix
+        // context, so continuity is preserved without the session id.
+        chain_opts.session_id = session_choice.session_for_agent(&alias);
         chain_opts.zeroclaw_config_snapshot = if matches!(engine_kind, EngineKind::Zeroclaw) {
             live_engine_config.clone()
         } else {

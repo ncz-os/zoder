@@ -20,13 +20,18 @@
 //!
 //! Picking the smallest scope that avoids accidental cross-talk keeps
 //! the on-disk format trivial and makes the records safe to inspect
-//! with a JSON viewer. We deliberately do NOT key by routed `model`,
-//! alias, or provider: switching the routed model mid-session is
-//! normal (the operator may reroute the free tier at any time), and
-//! the engine is the layer that knows whether a (cwd, engine, model)
-//! triple still maps to a live session. The store only needs to bring
-//! back the last id the engine issued for THIS scope; the engine
-//! decides whether it can still use it.
+//! with a JSON viewer.
+//!
+//! Zeroclaw ALSO keys a session by the agent alias that minted it: a
+//! resume under a different alias is rejected with `-32602 "ACP
+//! session belongs to a different agent"`. The zeroclaw driver
+//! therefore uses [`make_agent_scope`] (scope + `#agent:<alias>`) so a
+//! model fallback — which resolves to a different agent — starts a
+//! fresh session instead of resurrecting an unusable id. The bare
+//! [`make_scope`] remains the engine+cwd key for goose, which has no
+//! agent concept. The engine still decides whether a record's id is
+//! live; scoping only prevents ids that are provably unusable under
+//! the requested agent.
 //!
 //! ## Staleness
 //!
@@ -145,6 +150,31 @@ pub struct EngineSessionRecord {
 pub fn make_scope(engine_kind: &str, cwd: &Path) -> String {
     let canonical = canonicalize_path(cwd);
     format!("{engine_kind}:{canonical}")
+}
+
+/// Build a scope that is additionally keyed by the AGENT that owns the
+/// session (`<engine_kind>:<canonical-cwd>#agent:<alias>`).
+///
+/// Zeroclaw binds a session to the agent alias it was created under: a
+/// `session/new` resume carrying that id under a DIFFERENT alias fails
+/// with `-32602 "ACP session belongs to a different agent"`. A store
+/// keyed only by `(engine, cwd)` therefore hands a model fallback (which
+/// resolves to a different alias) an id it can never use, and every
+/// subsequent turn repeats the failure. Per-agent scoping makes a
+/// different agent start fresh instead — which is what the engine
+/// requires and what the loop's prompt-carried continuity already
+/// supports.
+///
+/// An empty alias falls back to [`make_scope`] so callers that have no
+/// agent identity (and the pre-existing `<engine>:<cwd>` records) keep
+/// working exactly as before.
+pub fn make_agent_scope(engine_kind: &str, cwd: &Path, agent_alias: &str) -> String {
+    let base = make_scope(engine_kind, cwd);
+    if agent_alias.is_empty() {
+        base
+    } else {
+        format!("{base}#agent:{agent_alias}")
+    }
 }
 
 /// Best-effort canonicalization. Falls back to the lossy string
@@ -756,6 +786,41 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("goose:"));
         assert!(b.starts_with("zeroclaw:"));
+    }
+
+    /// REGRESSION (ACP session-per-agent): a record minted by one agent
+    /// must be invisible to any other agent, so a model fallback starts a
+    /// fresh session instead of handing the engine an id it will reject
+    /// with -32602 "ACP session belongs to a different agent".
+    #[test]
+    fn agent_scopes_isolate_sessions_by_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path().join("engine_sessions.json"));
+        let repo = PathBuf::from("/tmp/acp-store-test/repo");
+        let agent_a = make_agent_scope("zeroclaw", &repo, "minimax");
+        let agent_b = make_agent_scope("zeroclaw", &repo, "coder");
+        assert_ne!(agent_a, agent_b);
+        assert!(agent_a.ends_with("#agent:minimax"));
+        assert!(agent_b.ends_with("#agent:coder"));
+
+        EngineSessionStore::save_with_scope(&cfg, &agent_a, "session-minimax").unwrap();
+        assert_eq!(
+            EngineSessionStore::load(&cfg, &agent_a)
+                .unwrap()
+                .expect("owner agent keeps its record")
+                .session_id,
+            "session-minimax"
+        );
+        assert!(
+            EngineSessionStore::load(&cfg, &agent_b).unwrap().is_none(),
+            "a different agent must not see another agent's session"
+        );
+        // An empty alias keeps the historical engine+cwd scope (callers
+        // without an agent identity are unaffected).
+        assert_eq!(
+            make_agent_scope("zeroclaw", &repo, ""),
+            make_scope("zeroclaw", &repo)
+        );
     }
 
     #[test]

@@ -5748,7 +5748,13 @@ pub(crate) async fn cmd_loop(
     }
 
     let max_iters = max_iters.max(1);
-    let mut session: Option<String> = None;
+    // The author's engine session for the NEXT iteration, together with the
+    // agent alias that minted it. Zeroclaw binds a session to its agent, so
+    // the id alone is not enough: a model fallback resolves to a different
+    // agent and must start a fresh session rather than resume this one
+    // (which the engine rejects with -32602, once per candidate, killing
+    // the loop). Continuity is carried by the prompt/feedback text instead.
+    let mut continuity: Option<crate::AgentSession> = None;
     let mut prev_diff = String::new();
     let mut iterations: Vec<Value> = Vec::new();
     let mut total_cost = 0.0;
@@ -5796,7 +5802,8 @@ pub(crate) async fn cmd_loop(
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
         journal.record_baseline(&cwd);
-        // 1. Author turn — continue the SAME engine session for memory.
+        // 1. Author turn — continue the SAME engine session for memory when
+        //    the same agent is still serving the turn (see `continuity`).
         let author_prompt = if i == 1 {
             let mut p = format!(
                 "You are the AUTHOR in an autonomous fix loop. Implement a COMPLETE, correct fix \
@@ -5840,7 +5847,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // Capture the daemon's actual session/new result before prompt
         // dispatch, including first turns and rejected-resume replacements.
         // The tracker survives dropping the author future on timeout.
-        let active_session = std::sync::Arc::new(std::sync::Mutex::new(session.clone()));
+        let active_session = std::sync::Arc::new(std::sync::Mutex::new(
+            continuity.as_ref().map(|c| c.session_id.clone()),
+        ));
         let session_id_for_cancel = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
@@ -5851,7 +5860,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     cli,
                     engine_kind,
                     author_prompt,
-                    session.clone(),
+                    continuity.clone(),
                     false,
                     None,
                 ),
@@ -5903,7 +5912,13 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         "loop author turn violated free policy (use --allow-paid to permit): {v}"
                     );
                 }
-                session = Some(t.run.session_id.clone());
+                // `t.alias` is the alias of the candidate that actually
+                // produced this turn (the head or a fallback), so the next
+                // iteration resumes the id only on that same agent.
+                continuity = Some(crate::AgentSession {
+                    agent_alias: t.alias.clone(),
+                    session_id: t.run.session_id.clone(),
+                });
                 total_cost += t.cost_usd;
                 Some(t)
             }
