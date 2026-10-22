@@ -90,6 +90,38 @@
 //! re-check. Linux-only via `/proc`; a no-op elsewhere.
 //!
 //! `--no-reap` turns the whole thing off.
+//!
+//! ## An unreachable engine is not a busy agent
+//!
+//! 2026-10-22 (MINOS, hive job `01a163c9`): at the end of a `zoder loop` every
+//! `session/cancel` failed with `connecting to engine at
+//! ~/.zoder/data/daemon.sock: No such file or directory (os error 2)`, the same
+//! "cancel not confirmed" line repeated for one session across the cancel
+//! passes and all four teardown rounds, and teardown then printed `WARNING:
+//! teardown stopped after 4 rounds with the agent still producing work;
+//! leftovers may remain`. Nothing was producing work. The engine socket path
+//! had ceased to exist — zeroclaw's `EndpointGuard` owns that directory entry
+//! and unlinks it when the daemon that bound it stops, and `--ephemeral` (which
+//! is how zoder spawns it) stops one second after its last client disconnects,
+//! so on a host where a second daemon had also bound that path the entry can be
+//! gone while a live daemon keeps listening on an inode no `connect(2)` can
+//! name. The reap was correct the whole time; only the CANCEL was talking to
+//! something that no longer existed.
+//!
+//! So the two failures are kept apart. A cancel that fails because the socket
+//! does not exist (ENOENT) or nothing is listening on it (ECONNREFUSED) is
+//! "engine unreachable": the session died with its daemon, there is nothing to
+//! cancel, and it is certainly not work still being produced. It is said once
+//! per session, the session is retired from the teardown instead of retried,
+//! and it is never counted as evidence that the agent is still going. Every
+//! other cancel failure is what "cancel not confirmed" has always meant: the
+//! engine was reached and did not acknowledge.
+//!
+//! For the same reason the "still producing work" warning is now gated on the
+//! final round's reap pass having actually found and signalled new processes.
+//! Before this, a teardown that converged perfectly but could not reach the
+//! engine still printed it, because the warning fired on "the round counter ran
+//! out", not on "the reap found work".
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -351,6 +383,105 @@ fn same_file(a: &Path, b: &Path) -> bool {
 static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Sessions this process has already found the engine UNREACHABLE for, i.e.
+/// whose cancel failed with ENOENT/ECONNREFUSED rather than going unconfirmed.
+///
+/// Membership is what makes the teardown converge. Retrying such a session is
+/// not "being thorough", it is re-asking a socket that is not there: the 01a163c9
+/// run burned eight cancel passes and four teardown rounds proving the engine
+/// was gone, and then reported the agent as still working. The set is also what
+/// keeps the operator's log to one line per session instead of one per attempt.
+///
+/// Not persisted and never cleared: an engine socket that is absent does not
+/// reappear during a teardown, and a session id is unique per engine session.
+static UNREACHABLE: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Why a cancel could not be delivered. These are different facts about the
+/// world and must never be logged, retried, or counted alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelFailure {
+    /// The socket path does not exist, or nothing is listening on it. There is
+    /// no engine to cancel against, so the session is not running: it died with
+    /// the daemon that owned it.
+    EngineUnreachable,
+    /// The engine was reached and did not confirm the cancel — the ordinary
+    /// "a turn that already settled does not acknowledge a cancel" case, which
+    /// may still be a live turn and is therefore retried.
+    NotConfirmed,
+}
+
+/// Does this connect error prove there is no listener, as opposed to merely
+/// failing to reach one we can see?
+///
+/// Only ENOENT (the path is gone — zeroclaw's `EndpointGuard` unlinks it when
+/// the daemon that bound it stops) and ECONNREFUSED (the entry is there but
+/// nobody is bound) do. Everything else — EACCES on somebody else's socket, a
+/// transport wrapper's own error, a connect timeout — leaves the engine
+/// unproven, and the conservative answer is to keep treating the session as
+/// possibly live.
+fn io_error_proves_no_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Classify a `cancel_session` failure. The `io::Error` is inside the anyhow
+/// chain (the transport adds "connecting to engine at <path>" as context), so
+/// the chain is walked rather than the top-level message pattern-matched: a
+/// message that merely mentions a missing path is not proof, while the errno is.
+fn classify_cancel_error(error: &anyhow::Error) -> CancelFailure {
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return if io_error_proves_no_listener(io) {
+                CancelFailure::EngineUnreachable
+            } else {
+                CancelFailure::NotConfirmed
+            };
+        }
+    }
+    CancelFailure::NotConfirmed
+}
+
+/// Retire a session whose cancel could not be delivered because the engine was
+/// unreachable. Returns true the FIRST time, which is the only time the caller
+/// prints: "the engine is gone" is a fact about the run, not about the attempt.
+fn mark_unreachable(id: &str) -> bool {
+    UNREACHABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string())
+}
+
+/// How many of this run's sessions the engine was found unreachable for,
+/// whichever cancel phase (async or blocking) found it first. Read from the
+/// process-wide set, not from one phase's report, so the teardown's answer
+/// does not depend on which phase happened to hit the missing socket.
+fn unreachable_session_count() -> usize {
+    let unreachable: HashSet<String> = UNREACHABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|id| unreachable.contains(*id))
+        .count()
+}
+
+/// Membership test, for the tests that assert a session was retired. The
+/// production readers iterate the set inside a lock rather than pay for a
+/// lookup per id.
+#[cfg(test)]
+fn engine_unreachable(id: &str) -> bool {
+    UNREACHABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
 /// Record a session id the agent is driving. Fed by the acp-client session
 /// observer the moment the engine mints it; the exit path and the signal
 /// handler read it back.
@@ -603,7 +734,7 @@ impl ReapGuard {
         if self.plan.is_none() || self.finished {
             return;
         }
-        cancel_recorded_sessions(budget).await;
+        cancel_recorded_sessions(&crate::engine_socket_path(), budget).await;
         self.finish();
     }
 
@@ -617,7 +748,7 @@ impl ReapGuard {
         let Some(plan) = self.plan.clone() else {
             return;
         };
-        teardown_rounds(&plan, REAP_GRACE);
+        teardown_rounds(&plan, REAP_GRACE, &crate::engine_socket_path());
     }
 }
 
@@ -681,8 +812,10 @@ impl Drop for ReapGuard {
 /// turn stops editing before we start killing. Best-effort: a turn that
 /// already completed never acknowledges a cancel, and that is fine — we reap
 /// either way.
-async fn cancel_recorded_sessions(budget: Duration) {
-    let socket = crate::engine_socket_path();
+///
+/// `socket` is passed in rather than resolved from the environment so a test
+/// can point this at a path that does not exist, which is the 01a163c9 case.
+async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
     // The budget covers the WHOLE phase, not each session: a loop that drove
     // nine sessions must not spend nine budgets before the first kill.
     let deadline = Instant::now() + budget;
@@ -696,10 +829,11 @@ async fn cancel_recorded_sessions(budget: Duration) {
         // the last one.
         let (pending, still_pending) = {
             let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+            let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
             let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             let pending: Vec<String> = sessions
                 .iter()
-                .filter(|id| !cancelled.contains(*id))
+                .filter(|id| !cancelled.contains(*id) && !unreachable.contains(*id))
                 .cloned()
                 .collect();
             (pending.clone(), pending.len())
@@ -718,7 +852,7 @@ async fn cancel_recorded_sessions(budget: Duration) {
                 }
                 return;
             }
-            match zoder_core::cancel_session(&socket, &id, remaining).await {
+            match zoder_core::cancel_session(socket, &id, remaining).await {
                 Ok(()) => {
                     eprintln!("[zoder] cancelled agent session {id}");
                     // Only a cancel that actually went out is marked. Marking a
@@ -727,26 +861,48 @@ async fn cancel_recorded_sessions(budget: Duration) {
                     // session still editing the tree.
                     mark_cancelled(&id);
                 }
-                Err(e) => eprintln!(
-                    "[zoder] session {id} cancel not confirmed ({e:#}); \
-                     a turn that already settled does not acknowledge a cancel"
-                ),
+                Err(e) => match classify_cancel_error(&e) {
+                    CancelFailure::EngineUnreachable => {
+                        // No engine, no cancel, and above all no live turn: the
+                        // session died with the daemon that owned it. Retire it
+                        // so no later pass or teardown round asks again, and so
+                        // the reap is free to conclude the workspace is quiet.
+                        // Said once — an absent socket is a fact about the run,
+                        // not about the attempt.
+                        if mark_unreachable(&id) {
+                            eprintln!(
+                                "[zoder] session {id} not cancelled: the engine at {} is \
+                                 unreachable ({e:#}); it cannot be cancelled from here and may \
+                                 still run in a daemon that lost its socket; whatever it \
+                                 leaves in the workspace is still reaped",
+                                socket.display()
+                            );
+                        }
+                    }
+                    CancelFailure::NotConfirmed => eprintln!(
+                        "[zoder] session {id} cancel not confirmed ({e:#}); \
+                         a turn that already settled does not acknowledge a cancel"
+                    ),
+                },
             }
         }
     }
 }
 
-/// Session ids that were never cancelled — used for the final sweep and for
-/// the report, so "we cancelled everything" is never claimed when it is not
-/// true. Newest first: the session minted last is the one still editing.
+/// Session ids that were never cancelled AND are not already known to be
+/// unreachable — used for the final sweep and for the report, so "we cancelled
+/// everything" is never claimed when it is not true, and so an unreachable
+/// engine cannot keep the teardown spinning. Newest first: the session minted
+/// last is the one still editing.
 fn pending_sessions() -> Vec<String> {
     let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+    let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
     SESSIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .rev()
-        .filter(|id| !cancelled.contains(*id))
+        .filter(|id| !cancelled.contains(*id) && !unreachable.contains(*id))
         .cloned()
         .collect()
 }
@@ -767,21 +923,51 @@ fn mark_cancelled(id: &str) {
 /// This is deliberately a thinner operation than [`zoder_core::cancel_session`]:
 /// on a panicking path the goal is to make the daemon stop editing, not to
 /// prove it acknowledged.
-fn cancel_sessions_blocking(socket: &Path, ids: &[String]) {
+///
+/// Returns the sessions this call found the engine unreachable for, so the
+/// teardown can report "the engine was gone" from data instead of from the log.
+/// A missing socket is no longer a silent `continue`: it is the 01a163c9
+/// condition, and the operator needs to see it stated once rather than inferred
+/// from an absence. A session that was already retired is not even attempted,
+/// so this list holds each id at most once per process.
+fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
+    let mut unreachable: Vec<String> = Vec::new();
     #[cfg(unix)]
     {
         use std::io::Read;
         use std::os::unix::net::UnixStream;
         for id in ids {
             {
+                // A session already cancelled OR already retired as
+                // unreachable is settled: asking again can only re-print a
+                // verdict this process has already reached. `pending_sessions`
+                // filters both out; this is the backstop for a caller holding a
+                // stale list, and it is what keeps a second report impossible.
                 let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
-                if cancelled.contains(id) {
+                let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+                if cancelled.contains(id) || unreachable.contains(id) {
                     continue;
                 }
             }
-            let Ok(mut stream) = UnixStream::connect(socket) else {
-                // No daemon, no cancel: nothing left editing.
-                continue;
+            let mut stream = match UnixStream::connect(socket) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // No daemon, no cancel: nothing is left editing. ENOENT /
+                    // ECONNREFUSED PROVE that and retire the session, so no
+                    // later round asks again; anything else leaves the engine
+                    // unproven and the session stays pending.
+                    if io_error_proves_no_listener(&error) && mark_unreachable(id) {
+                        eprintln!(
+                            "[zoder] session {id} not cancelled: the engine at {} is \
+                             unreachable ({error}); it cannot be cancelled from here and may \
+                             still run in a daemon that lost its socket; whatever it \
+                             leaves in the workspace is still reaped",
+                            socket.display()
+                        );
+                        unreachable.push(id.clone());
+                    }
+                    continue;
+                }
             };
             let _ = stream.set_read_timeout(Some(BLOCKING_ACK_WAIT));
             let _ = stream.set_write_timeout(Some(BLOCKING_ACK_WAIT));
@@ -827,6 +1013,7 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) {
     {
         let _ = (socket, ids);
     }
+    unreachable
 }
 
 /// Write one NDJSON frame. Used by the blocking cancel only.
@@ -863,6 +1050,33 @@ impl ReapOutcome {
     fn quiet(&self) -> bool {
         self.reaped.is_empty() && self.skipped.is_empty() && self.survivors.is_empty()
     }
+
+    /// This pass found new processes AND signalled them. That is the only
+    /// evidence the reap has that the agent is still producing work: a pass
+    /// that selected nothing found nothing, no matter what the cancel phase
+    /// was doing. `skipped` alone does not count — those processes were gone
+    /// before any signal, so they are not work being produced.
+    fn signalled_new_work(&self) -> bool {
+        !self.reaped.is_empty() || !self.survivors.is_empty()
+    }
+}
+
+/// What a teardown concluded, kept as data so the log and the tests read the
+/// same thing instead of the tests scraping stderr.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TeardownReport {
+    /// How many cancel/reap rounds actually ran. The 01a163c9 bug cost four of
+    /// them proving an absent socket was absent.
+    rounds: usize,
+    /// Sessions whose cancel could not be delivered because the engine socket
+    /// was not there. Deduplicated by the callers, so this is one entry per
+    /// session and never per attempt.
+    unreachable_sessions: Vec<String>,
+    /// The final round's reap pass found and signalled new processes, i.e. the
+    /// agent really was still producing work when teardown ran out of rounds.
+    /// False for a teardown whose only unfinished business was a cancel the
+    /// engine could not receive.
+    producing_work: bool,
 }
 
 /// Cancel and reap, alternating, until a round does neither.
@@ -873,24 +1087,62 @@ impl ReapOutcome {
 /// seconds: the engine can mint a session during it and that session can fork
 /// children after the last scan, so one cancel followed by one reap is not a
 /// teardown.
-fn teardown_rounds(plan: &ReapPlan, grace: Duration) {
+///
+/// `socket` is a parameter for the same reason [`cancel_sessions_blocking`]'s
+/// is: the absent-socket path (01a163c9) is only reachable by pointing a test
+/// at a path that does not exist, and a test must not mutate `ZEROCLAW_SOCKET`
+/// to arrange that.
+fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownReport {
+    let mut report = TeardownReport::default();
     for round in 0..MAX_TEARDOWN_ROUNDS {
         let cancelled = pending_sessions();
-        cancel_sessions_blocking(&crate::engine_socket_path(), &cancelled);
+        let unreachable = cancel_sessions_blocking(socket, &cancelled);
         let outcome = reap(plan, grace);
         log_outcome(&outcome);
-        if cancelled.is_empty() && outcome.quiet() {
+        report.rounds += 1;
+        report.unreachable_sessions.extend(unreachable);
+        // Convergence is "nothing left to cancel AND nothing left to kill",
+        // and both halves are read AFTER this round's work rather than from the
+        // snapshot taken before it: a cancel this round delivered and a session
+        // the engine minted during the reap both have to count, or the loop
+        // either runs a pointless round or exits without seeing a new session.
+        // An unreachable session is retired from the CANCEL (01a163c9 kept
+        // re-sending a cancel no socket could carry), but it is not proof the
+        // session stopped: its daemon may still run on a socket inode nothing
+        // can name. So it also blocks early convergence, and the loop keeps
+        // reaping for every remaining round instead of declaring the run quiet.
+        if pending_sessions().is_empty() && outcome.quiet() && unreachable_session_count() == 0 {
             plan.cleanup_owned_roots();
-            return;
+            return report;
         }
+        // The warning is about WORK, so it is gated on work: the final round's
+        // reap pass having found and signalled something new. Running out of
+        // rounds while the cancel was talking to a dead socket is not evidence
+        // of anything, and saying so was the second half of the 01a163c9
+        // mis-report.
         if round + 1 == MAX_TEARDOWN_ROUNDS {
-            eprintln!(
-                "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
-                 with the agent still producing work; leftovers may remain"
-            );
+            report.producing_work = outcome.signalled_new_work();
+            if report.producing_work {
+                eprintln!(
+                    "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
+                     with the agent still producing work; leftovers may remain"
+                );
+            }
         }
     }
+    let unreachable = unreachable_session_count();
+    if unreachable > 0 {
+        eprintln!(
+            "[zoder] WARNING: {} session(s) could not be cancelled because the engine socket \
+             at {} is gone; they may still run in a daemon that lost its socket. The \
+             workspace was reaped for all {MAX_TEARDOWN_ROUNDS} rounds, but work started \
+             after this teardown is not covered",
+            unreachable,
+            socket.display()
+        );
+    }
     plan.cleanup_owned_roots();
+    report
 }
 
 /// A pidfd pins ONE process identity. Once it is open, every signal sent
@@ -1215,8 +1467,8 @@ fn install_signal_handler(plan: ReapPlan) {
         // Same teardown as every other exit path, with the shorter budgets a
         // signalled run can afford. One cancel followed by one scan is not a
         // teardown: the engine can mint a session while the reap is running.
-        cancel_recorded_sessions(SIGNAL_CANCEL_BUDGET).await;
-        teardown_rounds(&plan, SIGNAL_REAP_GRACE);
+        cancel_recorded_sessions(&crate::engine_socket_path(), SIGNAL_CANCEL_BUDGET).await;
+        teardown_rounds(&plan, SIGNAL_REAP_GRACE, &crate::engine_socket_path());
         std::process::exit(code);
     });
 }
@@ -2215,6 +2467,7 @@ mod tests {
     /// nothing left in the budget it stops and lets the reap run.
     #[tokio::test]
     async fn the_cancel_budget_covers_every_session_not_each_one() {
+        let socket = PathBuf::from("/nonexistent/zoder-cancel-budget-probe.sock");
         {
             let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             note_session("budget-probe-a");
@@ -2224,7 +2477,7 @@ mod tests {
         let started = Instant::now();
         // A zero budget must send nothing at all: not even a connect attempt
         // to a daemon that happens to be running on this host.
-        cancel_recorded_sessions(Duration::ZERO).await;
+        cancel_recorded_sessions(&socket, Duration::ZERO).await;
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "an exhausted budget must stop immediately, not cancel session by session"
@@ -2526,6 +2779,298 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove("blocking-probe");
+    }
+
+    /// A socket path under a tempdir that was never created. The 01a163c9
+    /// failure had no listener AND no entry, so both "no engine" branches of
+    /// the classifier have to be exercised; this is the ENOENT one.
+    fn absent_socket(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
+    }
+
+    /// Forget everything a test told the global registries, so one test's
+    /// unreachable session cannot leak into the next one's teardown.
+    fn forget_session(id: &str) {
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| s != id);
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// Only a "no listener exists" errno proves the engine is gone. Every
+    /// other failure leaves the engine unproven and the session live.
+    #[test]
+    fn only_no_listener_errnos_count_as_engine_unreachable() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        for (error, expected) in [
+            (missing, CancelFailure::EngineUnreachable),
+            (refused, CancelFailure::EngineUnreachable),
+            (
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                CancelFailure::NotConfirmed,
+            ),
+            (
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
+                CancelFailure::NotConfirmed,
+            ),
+        ] {
+            assert_eq!(classify_cancel_error(&anyhow::Error::new(error)), expected);
+        }
+        // The `io::Error` is wrapped by transport context in production, so
+        // the classifier must read the CHAIN, not the top-level message.
+        let wrapped = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("connecting to engine at /nowhere/daemon.sock");
+        assert_eq!(
+            classify_cancel_error(&wrapped),
+            CancelFailure::EngineUnreachable,
+            "a transport-wrapped ENOENT must still read as an unreachable engine"
+        );
+        assert_eq!(
+            classify_cancel_error(&anyhow::anyhow!("daemon did not acknowledge")),
+            CancelFailure::NotConfirmed,
+            "a handshake failure is the ordinary unconfirmed cancel"
+        );
+    }
+
+    /// The async cancel phase can be the one that meets the missing socket:
+    /// it retires the session before the blocking phase runs, so the blocking
+    /// phase reports nothing. The teardown must still treat that session as
+    /// possibly running, whichever phase found it.
+    #[test]
+    fn a_session_the_async_phase_retired_still_keeps_the_reap_running() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        let id = "unreachable-async-first-probe";
+        note_session(id);
+        assert!(mark_unreachable(id), "the async phase retires it first");
+
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.daemon_binary(),
+        )
+        .expect("a reap plan for a real workspace");
+        let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
+
+        assert!(
+            report.unreachable_sessions.is_empty(),
+            "the blocking phase had nothing left to report"
+        );
+        assert_eq!(
+            report.rounds, MAX_TEARDOWN_ROUNDS,
+            "a session retired by the async phase may still be running too"
+        );
+        forget_session(id);
+    }
+
+    /// 2026-10-22 (MINOS, hive job `01a163c9`): the engine socket path no
+    /// longer existed, yet the teardown ran all four rounds, repeated the same
+    /// "cancel not confirmed" line for one session, and then reported the agent
+    /// as still producing work. The cancel is not retried (one unreachable
+    /// line per session) and the producing-work warning does not fire; the
+    /// reap still runs every round, because an unreachable session may still
+    /// be running in a daemon that lost its socket.
+    #[test]
+    fn a_missing_engine_socket_is_not_retried_but_keeps_the_reap_running() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        assert!(
+            !socket.exists(),
+            "the fixture must be a path that does not exist"
+        );
+        let ids = ["unreachable-probe-a", "unreachable-probe-b"];
+        for id in ids {
+            note_session(id);
+        }
+
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.daemon_binary(),
+        )
+        .expect("a reap plan for a real workspace");
+        let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
+
+        assert_eq!(
+            report.rounds, MAX_TEARDOWN_ROUNDS,
+            "an unreachable session may still be running, so the reap must not stop early"
+        );
+        for id in ids {
+            assert!(
+                report.unreachable_sessions.contains(&id.to_string()),
+                "session {id} must be reported as engine-unreachable, not as a live turn"
+            );
+            assert!(
+                !pending_sessions().contains(&id.to_string()),
+                "session {id} must not be offered to a later round"
+            );
+        }
+        assert!(
+            !report.producing_work,
+            "an absent engine socket is not the agent still producing work"
+        );
+        for id in ids {
+            forget_session(id);
+        }
+    }
+
+    /// The unreachable verdict is a fact about the run, not about the attempt:
+    /// one line per session however many rounds, passes or paths ask. (The
+    /// 01a163c9 log carried the same session line once per round.)
+    #[test]
+    fn an_unreachable_session_is_said_once_no_matter_how_often_it_is_asked() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        note_session("unreachable-once-probe");
+
+        assert!(
+            mark_unreachable("unreachable-once-probe"),
+            "the first unreachable failure is the one worth reporting"
+        );
+        for _ in 0..5 {
+            assert!(
+                !mark_unreachable("unreachable-once-probe"),
+                "a second report of the same absent socket is noise, not news"
+            );
+        }
+        // Handed the id DIRECTLY, not through `pending_sessions()`: the point
+        // is that even a caller which still holds a stale id gets no second
+        // report out of it.
+        let reported = cancel_sessions_blocking(&socket, &["unreachable-once-probe".to_string()]);
+        assert!(
+            !reported.contains(&"unreachable-once-probe".to_string()),
+            "a session already reported must not be reported again"
+        );
+        forget_session("unreachable-once-probe");
+    }
+
+    /// The async cancel phase retires an unreachable session too, or the signal
+    /// path and the panic path would still ask it once each.
+    ///
+    /// The lock is deliberately held across the await, against the usual lint:
+    /// `cancel_recorded_sessions` reads the PROCESS-WIDE session list, so
+    /// without the lock this test could pick up a concurrent reaper test's
+    /// session and retire it, failing that test at random. `#[tokio::test]` is
+    /// a current-thread runtime and this guard never moves between threads, so
+    /// holding a `std::sync::Mutex` across an await is sound here; the lint
+    /// exists for `Send` futures on multi-threaded runtimes, which this is not.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_async_cancel_phase_retires_an_unreachable_session() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        note_session("async-unreachable-probe");
+
+        cancel_recorded_sessions(&socket, REAP_CANCEL_BUDGET).await;
+
+        assert!(
+            engine_unreachable("async-unreachable-probe"),
+            "an ENOENT cancel must retire the session"
+        );
+        assert!(
+            !pending_sessions().contains(&"async-unreachable-probe".to_string()),
+            "a retired session must not be offered to the blocking path or a later round"
+        );
+        forget_session("async-unreachable-probe");
+    }
+
+    /// The warning still fires when it is true, and only for what a signal
+    /// proves. A pass that killed something, or signalled something that
+    /// outlived the grace, is work the agent was still producing; a pass that
+    /// selected nothing found nothing, and a pass whose targets were already
+    /// gone signalled nothing. The fix removes a false positive; it does not
+    /// disarm the alarm.
+    #[test]
+    fn only_a_pass_that_signalled_new_processes_counts_as_producing_work() {
+        let entry = Reaped {
+            pid: 4242,
+            comm: "sleep".to_string(),
+            cwd: PathBuf::from("/tmp/nowhere-in-particular"),
+            signal: ReapSignal::Term,
+        };
+        let killed = ReapOutcome {
+            reaped: vec![entry.clone()],
+            ..Default::default()
+        };
+        assert!(
+            killed.signalled_new_work(),
+            "a pass that killed the agent's leftover IS the agent producing work"
+        );
+        let survived = ReapOutcome {
+            survivors: vec![entry.clone()],
+            ..Default::default()
+        };
+        assert!(
+            survived.signalled_new_work(),
+            "a process we signalled and could not kill is still producing work"
+        );
+        assert!(
+            !ReapOutcome::default().signalled_new_work(),
+            "an empty pass found nothing"
+        );
+        let vanished = ReapOutcome {
+            skipped: vec![entry],
+            ..Default::default()
+        };
+        assert!(
+            !vanished.signalled_new_work(),
+            "a target that was gone before any signal is not work being produced"
+        );
+    }
+
+    /// A converged teardown that really did kill something must still reap it,
+    /// and must not dress the kill up as an unfinished teardown. This is the
+    /// positive control for the missing-socket test above: the reap half of the
+    /// teardown is untouched by the change.
+    #[test]
+    fn a_teardown_with_a_leftover_still_reaps_it_and_converges_in_one_round() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        // The plan FIRST: a fixture that existed when the scope opened is not
+        // ours, which is the whole ownership test.
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.daemon_binary(),
+        )
+        .expect("a reap plan for a real workspace");
+        let leftover = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(leftover), "the fixture to be running");
+
+        let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
+
+        assert_eq!(
+            report.rounds, 2,
+            "kill, then a confirming round that finds nothing: the normal two rounds"
+        );
+        assert!(
+            !report.producing_work,
+            "a teardown that converged did not run out of rounds while working"
+        );
+        assert!(
+            !alive(leftover),
+            "the leftover must actually be reaped on the way past"
+        );
     }
 
     /// `--no-reap` really means off, including on the `Drop` path: no cancel,
