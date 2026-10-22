@@ -268,6 +268,18 @@ fn daemon_exemption(
     None
 }
 
+/// `(pid, start_ticks)` for a live process, for the CLI to record as the
+/// daemon's identity.
+///
+/// This is the crate's ONLY `/proc/<pid>/stat` reader: the CLI used to keep a
+/// second, simpler one, which parsed from the last `)` and would have read the
+/// wrong field on a kernel that renders a parenthesized symbol later in the
+/// line. One parser means the daemon record and the reap agree on what an
+/// identity is, and it inherits the tests that pin the tricky ones.
+pub(crate) fn live_identity(pid: u32) -> Option<crate::DaemonIdentity> {
+    live_start_ticks(pid).map(|start_ticks| (pid, start_ticks))
+}
+
 /// The live process's start time, or `None` if it is gone or unreadable. A
 /// single `/proc` read: this is what turns "the record says 1234 started at
 /// tick T" into "the process at 1234 still is that one".
