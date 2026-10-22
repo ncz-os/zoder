@@ -2949,9 +2949,15 @@ mod tests {
             .expect("spawn the fake daemon");
         let daemon_pid = daemon.id();
         let other_sessions_leftover = read_pidfile(&pidfile);
+        // …and one ordinary leftover of OUR OWN, so the run proves both halves
+        // at once: the reap still works (this one dies) and it stops at the
+        // boundary of this run's workspace (the other session's survives).
+        // Without it, an implementation that blanket-spared the daemon's whole
+        // subtree would pass this test.
+        let ours = spawn_sleeper(&ws.cd);
         wait_until(
-            || alive(daemon_pid) && alive(other_sessions_leftover),
-            "the daemon and the other session's leftover to be running",
+            || alive(daemon_pid) && alive(other_sessions_leftover) && alive(ours),
+            "the daemon, the other session's leftover and our own to be running",
         );
 
         let selected: Vec<u32> = scan(&plan).iter().map(|c| c.pid).collect();
@@ -2959,15 +2965,21 @@ mod tests {
             !selected.contains(&daemon_pid) && !selected.contains(&other_sessions_leftover),
             "neither the daemon nor another session's leftover is in this run's scope"
         );
+        assert!(
+            selected.contains(&ours),
+            "precondition: our own leftover in -C is a candidate, so the reap is armed"
+        );
 
         guard.finish();
         assert!(
             alive(other_sessions_leftover),
             "a concurrent session's agent must not be killed by our teardown"
         );
+        assert!(!alive(ours), "and our own workspace is still reaped");
 
         kill_exact(daemon_pid);
         kill_exact(other_sessions_leftover);
+        kill_exact(ours);
         let _ = daemon.wait();
     }
 
