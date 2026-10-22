@@ -1082,10 +1082,14 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         log_outcome(&outcome);
         report.rounds += 1;
         report.unreachable_sessions.extend(unreachable);
-        // Convergence is "nothing left to cancel AND nothing left to kill". The
-        // first half is what 01a163c9 got wrong: an engine that is not there is
-        // not a session still running, and treating it as one is what kept this
-        // loop going for four rounds.
+        // Convergence is "nothing left to cancel AND nothing left to kill",
+        // and both halves are read AFTER this round's work rather than from the
+        // snapshot taken before it: a cancel this round delivered and a session
+        // the engine minted during the reap both have to count, or the loop
+        // either runs a pointless round or exits without seeing a new session.
+        // The first half is what 01a163c9 got wrong: an engine that is not there
+        // is not a session still running, and treating it as one is what kept
+        // this loop going for four rounds.
         if pending_sessions().is_empty() && outcome.quiet() {
             plan.cleanup_owned_roots();
             return report;
@@ -2890,32 +2894,33 @@ mod tests {
 
     /// The async cancel phase retires an unreachable session too, or the signal
     /// path and the panic path would still ask it once each.
+    ///
+    /// The lock is deliberately held across the await, against the usual lint:
+    /// `cancel_recorded_sessions` reads the PROCESS-WIDE session list, so
+    /// without the lock this test could pick up a concurrent reaper test's
+    /// session and retire it, failing that test at random. `#[tokio::test]` is
+    /// a current-thread runtime and this guard never moves between threads, so
+    /// holding a `std::sync::Mutex` across an await is sound here; the lint
+    /// exists for `Send` futures on multi-threaded runtimes, which this is not.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn the_async_cancel_phase_retires_an_unreachable_session() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
-        // The lock is taken and released around the registry writes, never held
-        // across the await: the async tests cannot serialize against the sync
-        // ones with a plain Mutex, and this one touches only its own session id.
-        {
-            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            note_session("async-unreachable-probe");
-        }
+        note_session("async-unreachable-probe");
 
         cancel_recorded_sessions(&socket, REAP_CANCEL_BUDGET).await;
 
-        {
-            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(
-                engine_unreachable("async-unreachable-probe"),
-                "an ENOENT cancel must retire the session"
-            );
-            assert!(
-                !pending_sessions().contains(&"async-unreachable-probe".to_string()),
-                "a retired session must not be offered to the blocking path or a later round"
-            );
-            forget_session("async-unreachable-probe");
-        }
+        assert!(
+            engine_unreachable("async-unreachable-probe"),
+            "an ENOENT cancel must retire the session"
+        );
+        assert!(
+            !pending_sessions().contains(&"async-unreachable-probe".to_string()),
+            "a retired session must not be offered to the blocking path or a later round"
+        );
+        forget_session("async-unreachable-probe");
     }
 
     /// The warning still fires when it is true, and only for what a signal
