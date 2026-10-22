@@ -63,6 +63,8 @@ const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
 /// child may fork the next one a moment later. Without this, the reap converges
 /// on "nothing is alive right now" instead of "nothing more is coming".
 const PASS_SETTLE: Duration = Duration::from_millis(250);
+/// How many session ids to remember for teardown.
+const MAX_REMEMBERED_SESSIONS: usize = 64;
 /// `TASK_COMM_LEN` from the kernel: 16 bytes, NUL included.
 const TASK_COMM_LEN: usize = 16;
 /// How many cancel/reap rounds the teardown may take before giving up. Two is
@@ -101,8 +103,16 @@ pub(crate) fn note_session(session_id: &str) {
         return;
     }
     let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.iter().any(|s| s == session_id) {
-        seen.push(session_id.to_string());
+    if seen.iter().any(|s| s == session_id) {
+        return;
+    }
+    seen.push(session_id.to_string());
+    // Bounded: a loop that drives hundreds of sessions keeps the most recent
+    // ones (the teardown cancels newest-first, and the newest is the one still
+    // editing). The oldest are exactly the ones a settled turn cannot need.
+    if seen.len() > MAX_REMEMBERED_SESSIONS {
+        let excess = seen.len() - MAX_REMEMBERED_SESSIONS;
+        seen.drain(..excess);
     }
 }
 
