@@ -6949,37 +6949,21 @@ fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
 /// and `rename(2)` it over the target: same directory, so the same
 /// filesystem, and the replacement is atomic.
 fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let tmp = parent.join(format!(".daemon.pid.{}.{}", std::process::id(), nanos));
-    let body = format!("{} {}\n", identity.0, identity.1);
-    let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
-}
-
-/// Drop the record of a daemon that failed to start, and ONLY that record.
-///
-/// `identity` is what `record_daemon_pid` published, captured at spawn time:
-/// by the time a startup failure is handled the child has already been
-/// `wait`ed, so its `/proc` entry is gone and re-deriving the identity from
-/// the pid would find nothing. Comparing against the recorded pair (rather
-/// than deleting unconditionally) means a daemon that has since been
-/// replaced keeps its own record.
-fn forget_daemon_record(identity: Option<DaemonIdentity>) {
-    let Some(identity) = identity else {
-        return;
-    };
-    crate::reaper::forget_daemon_identity(identity);
-    if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
-        let _ = std::fs::remove_file(daemon_pid_file_path());
-    }
+    with_daemon_record_lock(path, || {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp = parent.join(format!(".daemon.pid.{}.{}", std::process::id(), nanos));
+        let body = format!("{} {}\n", identity.0, identity.1);
+        let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
+    })
 }
 
 /// Parse the daemon identity recorded at `path`, if it is a plausible one.
@@ -7005,6 +6989,58 @@ pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
         return None;
     }
     Some((pid, start_ticks))
+}
+
+/// Run `f` while holding an exclusive lock on the daemon record, across every
+/// zoder process on the host.
+///
+/// Publishing the record is atomic (`rename`), but "read it, decide it is
+/// ours, unlink it" is not: between the read and the unlink another zoder can
+/// publish a NEW daemon's record, and this process would delete the live
+/// daemon's cross-process exemption — handing the next reap in another
+/// process the shared daemon. The lock is what makes the compare and the
+/// removal one step.
+///
+/// Advisory, best-effort, and never a reason to fail a daemon: if the lock
+/// file cannot be opened the work still runs. Losing the race is then
+/// possible, which is strictly better than refusing to record a daemon at all.
+fn with_daemon_record_lock<T>(record: &Path, f: impl FnOnce() -> T) -> T {
+    let lock_path = record.with_extension("pid.lock");
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        return f();
+    };
+    let _ = lock.lock_exclusive();
+    // Dropping the handle releases the lock; naming `unlock` here would pick
+    // up std's inherent method, which the crate's MSRV does not have.
+    let out = f();
+    drop(lock);
+    out
+}
+
+/// Drop the record of a daemon that failed to start, and ONLY that record.
+///
+/// `identity` is what `record_daemon_pid` published, captured at spawn time:
+/// by the time a startup failure is handled the child has already been
+/// `wait`ed, so its `/proc` entry is gone and re-deriving the identity from
+/// the pid would find nothing. Comparing against the recorded pair (rather
+/// than deleting unconditionally) means a daemon that has since been
+/// replaced keeps its own record, and the lock means it cannot be replaced
+/// between the compare and the unlink.
+fn forget_daemon_record(identity: Option<DaemonIdentity>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    crate::reaper::forget_daemon_identity(identity);
+    with_daemon_record_lock(&daemon_pid_file_path(), || {
+        if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
+            let _ = std::fs::remove_file(daemon_pid_file_path());
+        }
+    });
 }
 
 /// `(pid, start_ticks)` for a live process, retried briefly so a pid that was
@@ -7039,46 +7075,19 @@ fn read_daemon_identity_once(pid: u32) -> Option<DaemonIdentity> {
     Some((pid, start_ticks))
 }
 
-/// Where a zeroclaw daemon binary may legitimately live.
+/// The daemon executable zoder would spawn, for the reap exemption to match
+/// against.
 ///
-/// The executable arm of the reap exemption checks `/proc/<pid>/exe`, and a
-/// bare name check would exempt anything called `zeroclaw` — including a
-/// binary an agent copied into its own workspace, which is exactly the
-/// "process that must be reaped" this whole mechanism exists for. Pairing
-/// the name with a trusted DIRECTORY keeps the real daemon spared (it runs
-/// from where zoder was installed, or next to zoder itself) while a
-/// workspace copy is not.
-///
-/// Injected rather than read from the environment so the reaper tests can
-/// point the arm at a fixture directory instead of this developer's real
-/// `~/.local/bin`. `home` and `exe_dir` are the two places zoder actually
-/// installs to (see `locate_sibling`); the two system dirs cover a
-/// distribution package.
-pub(crate) fn daemon_exe_dirs(exe_dir: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = exe_dir {
-        dirs.push(dir.to_path_buf());
-    }
-    if let Some(home) = home {
-        for relative in [".local/bin", ".cargo/bin", ".zeroclaw/bin", ".zoder/bin"] {
-            dirs.push(home.join(relative));
-        }
-    }
-    dirs.push(PathBuf::from("/usr/local/bin"));
-    dirs.push(PathBuf::from("/usr/bin"));
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
-/// [`daemon_exe_dirs`] for this process: zoder's own directory and the real
-/// home.
-pub(crate) fn daemon_exe_dirs_for_this_process() -> Vec<PathBuf> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let home = dirs::home_dir();
-    daemon_exe_dirs(exe_dir.as_deref(), home.as_deref())
+/// `locate_sibling("zeroclaw")` is the same resolver the spawn itself uses,
+/// so the two cannot drift: if this returns a path, that is the file the
+/// daemon is started from, and `/proc/<pid>/exe` for a daemon this zoder
+/// spawned names the same file. When it resolves nothing there is no daemon
+/// binary on this host and the executable arm simply does not fire — the
+/// other two arms (the pid this process spawned, and the record beside the
+/// socket) are identity-based and still spare a running daemon.
+pub(crate) fn daemon_binary_path() -> PathBuf {
+    locate_sibling("zeroclaw")
+        .unwrap_or_else(|| PathBuf::from("zeroclaw").join("unresolved-daemon-binary"))
 }
 
 /// The working directory for the spawned daemon: a stable, NEUTRAL
@@ -7477,34 +7486,22 @@ mod daemon_cwd_tests {
         );
     }
 
-    /// The executable exemption is scoped to directories an install actually
-    /// writes to. A name check alone would spare anything called
-    /// `zeroclaw`, including a copy an agent dropped in the workspace being
-    /// reaped.
+    /// The executable exemption matches the daemon binary zoder itself would
+    /// spawn, resolved by the same `locate_sibling` the spawn uses. A name
+    /// check would spare anything called `zeroclaw`, including a copy an
+    /// agent dropped in the workspace being reaped.
     #[test]
-    fn trusted_daemon_dirs_cover_zoder_and_the_install_dirs() {
-        let dirs = super::daemon_exe_dirs(
-            Some(Path::new("/opt/zoder/bin")),
-            Some(Path::new("/home/jasonperlow")),
+    fn the_exempted_binary_is_the_one_the_spawn_resolves() {
+        let resolved = super::daemon_binary_path();
+        assert!(
+            resolved.ends_with("zeroclaw"),
+            "the exemption must target the binary the spawn runs: {}",
+            resolved.display()
         );
-        assert!(dirs.contains(&PathBuf::from("/opt/zoder/bin")));
-        for relative in [".local/bin", ".cargo/bin", ".zeroclaw/bin", ".zoder/bin"] {
-            assert!(
-                dirs.contains(&PathBuf::from("/home/jasonperlow").join(relative)),
-                "{relative} is where zoder installs the daemon, so the exemption must trust it"
-            );
-        }
-        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
-        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
-        assert_eq!(
-            dirs.len(),
-            dirs.iter().collect::<std::collections::HashSet<_>>().len(),
-            "a duplicated directory would let the same path be trusted twice"
+        assert!(
+            super::locate_sibling("zeroclaw").is_some(),
+            "precondition: this host has a zeroclaw binary to resolve"
         );
-        // No home and no exe dir still leaves the system dirs; an empty
-        // trusted set would silently switch the executable exemption off.
-        let bare = super::daemon_exe_dirs(None, None);
-        assert!(bare.contains(&PathBuf::from("/usr/bin")));
     }
 
     /// The cross-process record is published atomically. `fs::write` on the
@@ -7559,7 +7556,7 @@ mod daemon_cwd_tests {
             .expect("read the data dir")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "daemon.pid")
+            .filter(|name| name.starts_with(".daemon.pid."))
             .collect();
         assert!(
             leftovers.is_empty(),
