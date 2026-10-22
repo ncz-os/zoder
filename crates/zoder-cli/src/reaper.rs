@@ -506,8 +506,13 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) {
                 let mut ack = [0u8; 4096];
                 let _ = stream.read(&mut ack);
                 eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+                // Only a cancel that reached the socket counts. A session we
+                // failed to tell about stays pending, so a later round tries
+                // again rather than pretending the agent was stopped.
+                mark_cancelled(id);
+            } else {
+                eprintln!("[zoder] could not deliver a cancel for session {id}");
             }
-            mark_cancelled(id);
         }
     }
     #[cfg(not(unix))]
