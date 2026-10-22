@@ -163,7 +163,10 @@ outlives the run that happened to start it. It is spared when this zoder
 spawned it (`spawn()`'s pid and its start time, recorded the instant the child
 exists), when it is the process recorded for that socket (`<pid> <start_ticks>`
 in `<data dir>/daemon.pid`, so another zoder's reap scope can spare it too), or
-when `/proc/<pid>/exe` is the zeroclaw binary. Every arm re-checks the live
+when `/proc/<pid>/exe` is the zeroclaw binary — the exact install name in a
+directory an install writes to (zoder's own, or a trusted install dir), so a
+copy an agent dropped in the workspace is not spared under its name. Every arm
+re-checks the live
 process's start time before it spares anything — a pid on its own is not an
 identity, so a record the kernel has outgrown spares nobody — and the record is
 published with a temp file plus `rename`, so a reaper scanning concurrently

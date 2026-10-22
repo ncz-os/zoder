@@ -6796,7 +6796,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
     // Record the daemon's identity the moment it exists — not after the
     // handshake — so no reap scope can ever select it (see
     // `reaper::note_daemon_identity` and `record_daemon_pid`).
-    record_daemon_pid(child.id());
+    let daemon_identity = record_daemon_pid(child.id());
 
     // Poll readiness with the initialize handshake. Bail early if the child
     // exits during startup; on timeout, kill and reap it before returning.
@@ -6805,7 +6805,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = child.wait();
-                forget_daemon_pid(child.id());
+                forget_daemon_record(daemon_identity);
                 return Err(EngineUnavailableError::new(format!(
                     "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6815,7 +6815,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                forget_daemon_pid(child.id());
+                forget_daemon_record(daemon_identity);
                 return Err(EngineUnavailableError::new(format!(
                     "failed to poll zeroclaw daemon during startup: {e}; log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6836,7 +6836,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            forget_daemon_pid(child.id());
+            forget_daemon_record(daemon_identity);
             return Err(EngineUnavailableError::new(format!(
                 "zeroclaw daemon not ready within 20s ({last_probe}); log tail:\n{}",
                 read_log_tail(&stderr_log)
@@ -6919,15 +6919,11 @@ pub(crate) type DaemonIdentity = (u32, u64);
 /// a daemon with no record is merely harder for a reaper to recognise, and
 /// the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
 /// zeroclaw binary, so the exemption never rests on this file alone.
-fn record_daemon_pid(pid: u32) {
+fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
     if pid == 0 {
-        return;
+        return None;
     }
-    let Some(identity) = read_daemon_identity(pid) else {
-        // The child died before /proc could be read. There is no daemon to
-        // spare any more, so there is nothing to record.
-        return;
-    };
+    let identity = read_daemon_identity(pid)?;
     // In-process first: it needs no filesystem and it is the arm that covers
     // the window between spawn and the first reap scan.
     crate::reaper::note_daemon_identity(identity);
@@ -6940,6 +6936,7 @@ fn record_daemon_pid(pid: u32) {
             path.display()
         );
     }
+    Some(identity)
 }
 
 /// Publish the daemon record ATOMICALLY.
@@ -6966,17 +6963,19 @@ fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result
     written
 }
 
-/// Drop the record of `pid`, and only when the live process IS the daemon the
-/// record names: a daemon that died during startup must not leave a record
-/// behind that the kernel will later hand to somebody else. Removing a
-/// DIFFERENT daemon's record would be a race we can win nothing by — the
-/// newer record is the truthful one.
-fn forget_daemon_pid(pid: u32) {
-    if pid == 0 {
+/// Drop the record of a daemon that failed to start, and ONLY that record.
+///
+/// `identity` is what `record_daemon_pid` published, captured at spawn time:
+/// by the time a startup failure is handled the child has already been
+/// `wait`ed, so its `/proc` entry is gone and re-deriving the identity from
+/// the pid would find nothing. Comparing against the recorded pair (rather
+/// than deleting unconditionally) means a daemon that has since been
+/// replaced keeps its own record.
+fn forget_daemon_record(identity: Option<DaemonIdentity>) {
+    let Some(identity) = identity else {
         return;
-    }
-    let live = read_daemon_identity(pid);
-    if live.is_some() && read_daemon_record(&daemon_pid_file_path()) == live {
+    };
+    if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
         let _ = std::fs::remove_file(daemon_pid_file_path());
     }
 }
@@ -7036,6 +7035,48 @@ fn read_daemon_identity_once(pid: u32) -> Option<DaemonIdentity> {
     let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
     let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
     Some((pid, start_ticks))
+}
+
+/// Where a zeroclaw daemon binary may legitimately live.
+///
+/// The executable arm of the reap exemption checks `/proc/<pid>/exe`, and a
+/// bare name check would exempt anything called `zeroclaw` — including a
+/// binary an agent copied into its own workspace, which is exactly the
+/// "process that must be reaped" this whole mechanism exists for. Pairing
+/// the name with a trusted DIRECTORY keeps the real daemon spared (it runs
+/// from where zoder was installed, or next to zoder itself) while a
+/// workspace copy is not.
+///
+/// Injected rather than read from the environment so the reaper tests can
+/// point the arm at a fixture directory instead of this developer's real
+/// `~/.local/bin`. `home` and `exe_dir` are the two places zoder actually
+/// installs to (see `locate_sibling`); the two system dirs cover a
+/// distribution package.
+pub(crate) fn daemon_exe_dirs(exe_dir: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir {
+        dirs.push(dir.to_path_buf());
+    }
+    if let Some(home) = home {
+        for relative in [".local/bin", ".cargo/bin", ".zeroclaw/bin", ".zoder/bin"] {
+            dirs.push(home.join(relative));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/usr/bin"));
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// [`daemon_exe_dirs`] for this process: zoder's own directory and the real
+/// home.
+pub(crate) fn daemon_exe_dirs_for_this_process() -> Vec<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let home = dirs::home_dir();
+    daemon_exe_dirs(exe_dir.as_deref(), home.as_deref())
 }
 
 /// The working directory for the spawned daemon: a stable, NEUTRAL
@@ -7423,6 +7464,36 @@ mod daemon_cwd_tests {
             config_dir,
             "the daemon's own state directory is the neutral home for it"
         );
+    }
+
+    /// The executable exemption is scoped to directories an install actually
+    /// writes to. A name check alone would spare anything called
+    /// `zeroclaw`, including a copy an agent dropped in the workspace being
+    /// reaped.
+    #[test]
+    fn trusted_daemon_dirs_cover_zoder_and_the_install_dirs() {
+        let dirs = super::daemon_exe_dirs(
+            Some(Path::new("/opt/zoder/bin")),
+            Some(Path::new("/home/jasonperlow")),
+        );
+        assert!(dirs.contains(&PathBuf::from("/opt/zoder/bin")));
+        for relative in [".local/bin", ".cargo/bin", ".zeroclaw/bin", ".zoder/bin"] {
+            assert!(
+                dirs.contains(&PathBuf::from("/home/jasonperlow").join(relative)),
+                "{relative} is where zoder installs the daemon, so the exemption must trust it"
+            );
+        }
+        assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        assert_eq!(
+            dirs.len(),
+            dirs.iter().collect::<std::collections::HashSet<_>>().len(),
+            "a duplicated directory would let the same path be trusted twice"
+        );
+        // No home and no exe dir still leaves the system dirs; an empty
+        // trusted set would silently switch the executable exemption off.
+        let bare = super::daemon_exe_dirs(None, None);
+        assert!(bare.contains(&PathBuf::from("/usr/bin")));
     }
 
     /// The cross-process record is published atomically. `fs::write` on the
