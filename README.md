@@ -138,8 +138,9 @@ under `/tmp`, and `-C /tmp` is refused outright rather than honoured), started
 after the run began, never zoder itself or one of its
 ancestors, absent from the pid snapshot taken when the run started, and with a
 `starttime` no earlier than the run's first tick — the pid's `starttime` is
-re-checked immediately before each signal, so a recycled pid is skipped rather
-than killed. This is because the reaper
+re-checked immediately before each signal — and where the kernel supports
+pidfd, pinned before it is signalled, so a pid recycled mid-teardown cannot put
+a stranger in front of the signal. This is because the reaper
 runs on shared hosts where another session's processes look identical from the
 outside. There is no `pkill`-style pattern anywhere in the path. Linux only; a
 no-op elsewhere. A process that survives SIGKILL is reported as a warning, not
