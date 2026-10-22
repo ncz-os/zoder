@@ -338,25 +338,23 @@ async fn cancel_recorded_sessions(budget: Duration) {
     // one still editing the tree. One snapshot would leave it uncancelled.
     let mut cancelled: HashSet<String> = HashSet::new();
     loop {
-        let pending: Vec<String> = SESSIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|id| !cancelled.contains(*id))
-            .cloned()
-            .collect();
+        // One lock per pass; a pass covers every session that appeared since
+        // the last one.
+        let (pending, still_pending) = {
+            let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            let pending: Vec<String> = sessions
+                .iter()
+                .filter(|id| !cancelled.contains(*id))
+                .cloned()
+                .collect();
+            (pending.clone(), pending.len())
+        };
         if pending.is_empty() {
             return;
         }
         for id in pending {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let still_pending = SESSIONS
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .filter(|id| !cancelled.contains(*id))
-                    .count();
                 if still_pending > 0 {
                     eprintln!(
                         "[zoder] cancel budget exhausted with {still_pending} session(s) \
@@ -492,7 +490,10 @@ impl Target {
 fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     let uid = current_uid();
     let mut outcome = ReapOutcome::default();
-    let mut seen: HashSet<u32> = HashSet::new();
+    // Keyed by pid AND start time: a pid recycled onto a process that appeared
+    // during this reap is a different process and must not be written off as
+    // "already handled".
+    let mut seen: HashSet<(u32, u64)> = HashSet::new();
     // Keep scanning until a pass finds nothing new: a parent can fork again
     // while the previous pass is still signalling, and a fixed two-pass loop
     // leaves the last descendants behind. Bounded so an agent that forks
@@ -501,7 +502,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     for _ in 0..MAX_REAP_PASSES {
         let candidates: Vec<Candidate> = scan(plan)
             .into_iter()
-            .filter(|c| seen.insert(c.pid))
+            .filter(|c| seen.insert((c.pid, c.start_ticks)))
             .collect();
         if candidates.is_empty() {
             break;
@@ -543,7 +544,11 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             // thing here: the process we selected is no longer running, and it
             // died because we asked it to. A process that obeyed SIGTERM is
             // gone from /proc, which must NOT be reported as skipped.
-            if !target.alive() {
+            if !target.alive() || confirm_identity(&target.candidate, uid) != Identity::Same {
+                // "Gone" includes "the pid was recycled while we waited": either
+                // way the process we selected is no longer running. Without a
+                // pidfd, this identity check is what stops the SIGKILL below
+                // from landing on the replacement.
                 outcome.reaped.push(record);
                 continue;
             }
@@ -562,7 +567,9 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
                 outcome.reaped.push(record);
             }
         }
-        bounded_out = !scan(plan).iter().all(|c| seen.contains(&c.pid));
+        bounded_out = !scan(plan)
+            .iter()
+            .all(|c| seen.contains(&(c.pid, c.start_ticks)));
     }
     if bounded_out {
         // Say so rather than pretending the workspace is clean: something is
@@ -705,11 +712,6 @@ fn parse_stat(raw: &str) -> Option<ProcStat> {
         .char_indices()
         .rev()
         .find(|(i, c)| *c == ')' && valid_stat_tail(&after_open[i + 1..]))
-        .or_else(|| {
-            after_open
-                .char_indices()
-                .find(|(i, c)| *c == ')' && valid_stat_tail(&after_open[i + 1..]))
-        })
         .map(|(i, _)| i)?;
     let comm = after_open.get(..close)?.to_string();
     let rest = after_open.get(close + 1..)?;
@@ -1613,24 +1615,22 @@ mod tests {
             .spawn()
             .expect("run the forking fixture");
         let forker_pid = forker.id();
+        // Read the pid file inside the poll and keep the parse that satisfied
+        // it, so there is no second read left to race the shell's append.
+        let mut pids: Vec<u32> = Vec::new();
         wait_until(
             || {
-                std::fs::read_to_string(&pidfile)
-                    .map(|t| {
-                        t.lines()
-                            .filter(|l| l.trim().parse::<u32>().is_ok())
-                            .count()
-                            >= 2
+                pids = std::fs::read_to_string(&pidfile)
+                    .map(|text| {
+                        text.lines()
+                            .filter_map(|line| line.trim().parse().ok())
+                            .collect::<Vec<u32>>()
                     })
-                    .unwrap_or(false)
+                    .unwrap_or_default();
+                pids.len() >= 2
             },
             "the fixture to fork its second child",
         );
-        let pids: Vec<u32> = std::fs::read_to_string(&pidfile)
-            .expect("forker pid file")
-            .lines()
-            .filter_map(|l| l.trim().parse().ok())
-            .collect();
         assert_eq!(pids.len(), 2, "the fixture forked two children");
 
         let outcome = reap(&plan, Duration::from_millis(50));
