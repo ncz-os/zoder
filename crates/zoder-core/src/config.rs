@@ -796,7 +796,8 @@ impl EngineModelRegistry {
     /// Return the per-model provider request budget declared on the engine
     /// profile that serves this model, with the same precedence as
     /// [`Self::reasoning_effort_for_model`]: the selected agent's profile,
-    /// then the reviewer's, then any other profile serving the id.
+    /// then the reviewer's, then the first profile in alias order serving the
+    /// id (that last fallback is deterministic, not per-call).
     ///
     /// `None` means "no per-model override" — the caller keeps the global
     /// `--request-timeout` / config / `ZODER_TIMEOUT_S` / default budget.
@@ -3158,6 +3159,11 @@ impl Config {
     /// applies whichever alias resolved the route. Single definition of that
     /// match so the per-model sampling knobs and the per-model request
     /// budget can never disagree about which entry a model uses.
+    ///
+    /// When several aliases serve one model id the first entry in alias order
+    /// wins. That is the pre-existing rule for the sampling knobs; for
+    /// `request_timeout_s` it cannot be allowed to silently pick a budget, so
+    /// [`Self::validate`] rejects conflicting duplicates up front.
     pub fn model_entry_for(&self, model: &str) -> Option<&ModelEntry> {
         self.models
             .values()
@@ -3417,6 +3423,35 @@ impl Config {
             if entry.request_timeout_s == Some(0) {
                 errs.push(format!(
                     "models.{alias}.request_timeout_s must be greater than zero"
+                ));
+            }
+        }
+        // Two aliases serving one model id cannot both own that model's
+        // budget: the lookup matches on the model id, so one of them would
+        // silently win. Fail at load instead of letting an operator's slow
+        // model be cut at whichever budget happened to sort first.
+        let mut budgets_by_model: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+        for (alias, entry) in &self.models {
+            let (Some(model), Some(secs)) = (entry.model.as_deref(), entry.request_timeout_s)
+            else {
+                continue;
+            };
+            budgets_by_model
+                .entry(model)
+                .or_default()
+                .push((alias.as_str(), secs));
+        }
+        for (model, budgets) in budgets_by_model {
+            let first = budgets[0].1;
+            if budgets.iter().any(|(_, secs)| *secs != first) {
+                let declared = budgets
+                    .iter()
+                    .map(|(alias, secs)| format!("{alias}={secs}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                errs.push(format!(
+                    "model {model:?} has conflicting request_timeout_s values ({declared}); \
+                     one model id can carry only one per-model budget"
                 ));
             }
         }
@@ -4198,6 +4233,41 @@ request_timeout_s = 0
                 .and_then(|e| e.temperature),
             Some(0.1),
             "the shared model-entry lookup must still see the sampling knobs"
+        );
+    }
+
+    #[test]
+    fn conflicting_per_model_budgets_for_one_model_id_are_rejected() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/nonexistent-zoder-home"));
+        for (alias, secs) in [("custom.a", 600), ("custom.b", 300)] {
+            cfg.models.insert(
+                alias.to_string(),
+                ModelEntry {
+                    model: Some("MiniMax-M3".to_string()),
+                    request_timeout_s: Some(secs),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(
+            cfg.validate().iter().any(|p| {
+                p.contains("MiniMax-M3") && p.contains("conflicting request_timeout_s")
+            }),
+            "two aliases cannot own one model's budget: {:?}",
+            cfg.validate()
+        );
+
+        // Agreeing duplicates are unambiguous and stay valid.
+        cfg.models
+            .get_mut("custom.b")
+            .expect("custom.b exists")
+            .request_timeout_s = Some(600);
+        assert!(
+            !cfg.validate()
+                .iter()
+                .any(|p| p.contains("conflicting request_timeout_s")),
+            "identical budgets are not a conflict: {:?}",
+            cfg.validate()
         );
     }
 
