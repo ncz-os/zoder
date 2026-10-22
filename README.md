@@ -128,8 +128,9 @@ them: on 2026-10-21 a loop's leftovers ran for two hours past both the end of
 the loop and the job runner's own timeout.
 
 So every `loop`/`rescue` exit path — resolved, unresolved, author/check/review
-timeout, SIGTERM, SIGINT — first cancels the agent session, then reaps what the
-agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
+timeout, SIGTERM, SIGINT — first cancels the agent session (recorded the moment
+the engine mints it, so a turn that is still running when the signal arrives is
+the one that gets cancelled), then reaps what the agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
 `pid` + `comm` it kills. Selection is deliberately narrow — same uid, cwd
 inside the `-C` directory or inside this run's own scratch directory under the
 temp root (never the temp root itself — on a shared host everybody's cwd is

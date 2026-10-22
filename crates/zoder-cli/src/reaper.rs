@@ -48,21 +48,15 @@ const POLL: Duration = Duration::from_millis(20);
 /// How long to wait for a SIGKILLed process to leave the table. SIGKILL is not
 /// catchable, so this only covers reaping.
 const KILL_WAIT: Duration = Duration::from_millis(500);
-/// Slack, in `/proc` clock ticks, subtracted from the loop-start boundary.
-/// `starttime` has `USER_HZ` (normally 100 Hz = 10 ms) granularity, so the
-/// boundary has to be rounded DOWN: a process the agent started 3 ms after
-/// the loop began must still be caught. Erring the other way (reaping
-/// something that predates the loop) needs a 10 ms overlap, which cannot
-/// matter for a process whose cwd is the agent's own workspace.
-const START_TICK_SLACK: u64 = 2;
 
 /// Session ids this process drove, so the exit path can cancel them even when
 /// the loop never reached its own author-timeout cancel. A ghost turn from
 /// iteration 1 keeps editing the tree just as hard as one from iteration 9.
 static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Record a session id the agent is driving. Called from the turn paths; the
-/// exit path and the signal handler read it back.
+/// Record a session id the agent is driving. Fed by the acp-client session
+/// observer the moment the engine mints it; the exit path and the signal
+/// handler read it back.
 pub(crate) fn note_session(session_id: &str) {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -221,6 +215,11 @@ impl ReapGuard {
     pub(crate) fn begin(cwd: &Path, tmp: &Path, enabled: bool) -> Self {
         let plan = enabled.then(|| ReapPlan::new(cwd, tmp)).flatten();
         if let Some(plan) = plan.as_ref() {
+            // Every session the engine mints is recorded the moment it exists,
+            // not when its turn returns: a SIGTERM in the middle of a 900 s
+            // author turn must be able to cancel THAT turn, and it has not
+            // returned yet.
+            zoder_core::engine_rpc::set_session_observer(note_session);
             install_signal_handler(plan.clone());
         }
         ReapGuard {
@@ -315,8 +314,20 @@ async fn cancel_recorded_sessions(budget: Duration) {
         return;
     }
     let socket = crate::engine_socket_path();
+    // The budget covers the WHOLE phase, not each session: a loop that drove
+    // nine sessions must not spend nine budgets before the first kill.
+    let deadline = Instant::now() + budget;
     for id in ids {
-        match zoder_core::cancel_session(&socket, &id, budget).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "[zoder] cancel budget exhausted after {} session(s); remaining \
+                 session(s) are left to the reap",
+                SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len()
+            );
+            break;
+        }
+        match zoder_core::cancel_session(&socket, &id, remaining).await {
             Ok(()) => eprintln!("[zoder] cancelled agent session {id}"),
             Err(e) => eprintln!(
                 "[zoder] session {id} cancel not confirmed ({e:#}); \
@@ -461,26 +472,33 @@ fn current_uid() -> u32 {
 /// incident.
 fn install_signal_handler(plan: ReapPlan) {
     use std::sync::Arc;
+    use tokio::signal::unix::{signal, SignalKind};
     let plan = Arc::new(plan);
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
+    // Register the streams HERE, not inside the spawned task: a task that has
+    // not been polled yet has not installed the handler, and a SIGTERM landing
+    // in that window would take the default disposition — die immediately, no
+    // cancel, no reap, children reparented to init. That window is exactly the
+    // failure this change exists to close.
+    let term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[zoder] SIGTERM handler unavailable ({e}); reaping is signal-blind");
+            return;
+        }
+    };
+    let intr = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[zoder] SIGINT handler unavailable ({e}); reaping is signal-blind");
+            return;
+        }
+    };
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[zoder] SIGTERM handler unavailable ({e}); reaping is signal-blind");
-                return;
-            }
-        };
-        let mut intr = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[zoder] SIGINT handler unavailable ({e}); reaping is signal-blind");
-                return;
-            }
-        };
+        let mut term = term;
+        let mut intr = intr;
         let (name, code) = tokio::select! {
             _ = term.recv() => ("SIGTERM", 143),
             _ = intr.recv() => ("SIGINT", 130),
@@ -659,8 +677,12 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
             continue;
         }
         // Started before the loop did: not ours to kill, however it got a cwd
-        // inside the workspace.
-        if stat.start_ticks.saturating_add(START_TICK_SLACK) < plan.started_ticks {
+        // inside the workspace. `starttime` is truncated to USER_HZ, and
+        // truncation is monotonic, so a process that started AT or after the
+        // loop instant can never land below this boundary — no slack is
+        // needed to catch one, and adding slack would only widen the window
+        // onto processes that predate the run.
+        if stat.start_ticks < plan.started_ticks {
             continue;
         }
         if proc_uid(pid) != Some(uid) {
@@ -1243,6 +1265,31 @@ mod tests {
         assert!(alive(bystander), "the bystander survives");
 
         kill_exact(bystander);
+    }
+
+    /// The cancel budget is for the PHASE, not per session. A loop that drove
+    /// nine sessions must not spend nine budgets before the first kill; with
+    /// nothing left in the budget it stops and lets the reap run.
+    #[tokio::test]
+    async fn the_cancel_budget_covers_every_session_not_each_one() {
+        {
+            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            note_session("budget-probe-a");
+            note_session("budget-probe-b");
+            note_session("budget-probe-c");
+        }
+        let started = Instant::now();
+        // A zero budget must send nothing at all: not even a connect attempt
+        // to a daemon that happens to be running on this host.
+        cancel_recorded_sessions(Duration::ZERO).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an exhausted budget must stop immediately, not cancel session by session"
+        );
+        for id in ["budget-probe-a", "budget-probe-b", "budget-probe-c"] {
+            let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            seen.retain(|s| s != id);
+        }
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
