@@ -8,8 +8,12 @@
 //! the zeroclaw daemon's tool shells — a different tree entirely.
 //!
 //! So the loop must own its blast radius: on EVERY exit path (success,
-//! failure, `--loop-timeout`/`--agent-timeout`, SIGTERM, SIGINT) cancel the
-//! agent session first, then kill what the agent left behind.
+//! failure, `--loop-timeout`/`--agent-timeout`, SIGTERM, SIGINT, panic
+//! unwind) cancel the agent session first, then kill what the agent left
+//! behind, then sweep once more for anything the engine minted while we were
+//! killing. `Drop` cannot await, so the panic path sends the cancel over a
+//! blocking socket — thinner than the async path, but it lands before the
+//! reap, which is the order that matters.
 //!
 //! Selection is deliberately narrow, because "kill stuff on exit" on a shared
 //! host is how you take down somebody else's session:
@@ -47,6 +51,10 @@ const SIGNAL_REAP_GRACE: Duration = Duration::from_millis(750);
 pub(crate) const REAP_CANCEL_BUDGET: Duration = Duration::from_millis(750);
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
 const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
+/// How many drain passes the cancel phase may make before giving up.
+const MAX_CANCEL_PASSES: usize = 8;
+/// Read timeout for the blocking cancel used on the `Drop` path.
+const BLOCKING_ACK_WAIT: Duration = Duration::from_millis(200);
 /// How many scan/signall passes one reap may make before giving up. Each pass
 /// only runs when it found something new, so a well-behaved agent converges in
 /// two; the bound exists for an agent that forks in a loop.
@@ -61,6 +69,10 @@ const KILL_WAIT: Duration = Duration::from_millis(500);
 /// the loop never reached its own author-timeout cancel. A ghost turn from
 /// iteration 1 keeps editing the tree just as hard as one from iteration 9.
 static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Sessions a cancel has already been sent for, so the async phase, the
+/// blocking path and the final sweep never send the same one twice.
+static CANCELLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Record a session id the agent is driving. Fed by the acp-client session
 /// observer the moment the engine mints it; the exit path and the signal
@@ -277,6 +289,10 @@ impl ReapGuard {
         };
         log_outcome(&reap(plan, REAP_GRACE));
         plan.cleanup_owned_roots();
+        // Reaping takes seconds. A session minted in that window can still
+        // spawn children after we are done, so sweep for anything recorded
+        // since the cancel phase and stop it before we return.
+        cancel_sessions_blocking(&pending_sessions());
     }
 }
 
@@ -320,6 +336,12 @@ fn log_outcome(outcome: &ReapOutcome) {
 
 impl Drop for ReapGuard {
     fn drop(&mut self) {
+        // `Drop` cannot await, so the cancel is sent the blocking way. The
+        // ordering the module promises — stop the agent, then kill what it
+        // left — holds on this path too, which matters because `Drop` is the
+        // path a panic takes and a panic is exactly when a half-finished turn
+        // is most likely to still be editing.
+        cancel_sessions_blocking(&pending_sessions());
         self.finish();
     }
 }
@@ -336,11 +358,13 @@ async fn cancel_recorded_sessions(budget: Duration) {
     // Drain repeatedly: the engine can mint a session while we are cancelling
     // (a fallback transition, a fresh turn), and that session is exactly the
     // one still editing the tree. One snapshot would leave it uncancelled.
-    let mut cancelled: HashSet<String> = HashSet::new();
-    loop {
+    // Bounded as well as time-bounded: a deadline alone does not stop a loop
+    // whose cancels all fail instantly while the engine keeps minting.
+    for _ in 0..MAX_CANCEL_PASSES {
         // One lock per pass; a pass covers every session that appeared since
         // the last one.
         let (pending, still_pending) = {
+            let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
             let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             let pending: Vec<String> = sessions
                 .iter()
@@ -370,9 +394,110 @@ async fn cancel_recorded_sessions(budget: Duration) {
                      a turn that already settled does not acknowledge a cancel"
                 ),
             }
-            cancelled.insert(id);
+            mark_cancelled(&id);
         }
     }
+}
+
+/// Session ids that were never cancelled — used for the final sweep and for
+/// the report, so "we cancelled everything" is never claimed when it is not
+/// true. Newest first: the session minted last is the one still editing.
+fn pending_sessions() -> Vec<String> {
+    let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .filter(|id| !cancelled.contains(*id))
+        .take(MAX_CANCEL_PASSES)
+        .cloned()
+        .collect()
+}
+
+fn mark_cancelled(id: &str) {
+    let mut cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+    if !cancelled.iter().any(|seen| seen == id) {
+        cancelled.push(id.to_string());
+    }
+}
+
+/// Fire-and-forget `session/cancel` over a blocking socket, for the one exit
+/// path that cannot await: `Drop` during a panic unwind. It sends the cancel
+/// notification for every session this run drove, reads briefly for the ack,
+/// and returns. Ordering (cancel, then reap) is preserved because both happen
+/// here, in order, on the same thread.
+///
+/// This is deliberately a thinner operation than [`zoder_core::cancel_session`]:
+/// on a panicking path the goal is to make the daemon stop editing, not to
+/// prove it acknowledged.
+fn cancel_sessions_blocking(ids: &[String]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        for id in ids {
+            {
+                let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+                if cancelled.iter().any(|seen| seen == id) {
+                    continue;
+                }
+            }
+            let Ok(mut stream) = UnixStream::connect(crate::engine_socket_path()) else {
+                // No daemon, no cancel: nothing left editing.
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(BLOCKING_ACK_WAIT));
+            let _ = stream.set_write_timeout(Some(BLOCKING_ACK_WAIT));
+            let initialized = send_frame(
+                &mut stream,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "method": "initialize",
+                    "params": { "protocol_version": zoder_core::engine_rpc::ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .is_ok();
+            if !initialized {
+                continue;
+            }
+            // The daemon wants an initialize round trip before anything else.
+            let mut handshake = [0u8; 4096];
+            let _ = stream.read(&mut handshake);
+            let sent = send_frame(
+                &mut stream,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": { "session_id": id },
+                }),
+            )
+            .is_ok();
+            if sent {
+                let mut ack = [0u8; 4096];
+                let _ = stream.read(&mut ack);
+                eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+            }
+            mark_cancelled(id);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ids;
+    }
+}
+
+/// Write one NDJSON frame. Used by the blocking cancel only.
+#[cfg(unix)]
+fn send_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+    frame: serde_json::Value,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut line = serde_json::to_string(&frame).unwrap_or_default();
+    line.push('\n');
+    stream.write_all(line.as_bytes())
 }
 
 /// What one reap pass did. `survivors` and `skipped` exist so the log tells
@@ -1647,6 +1772,83 @@ mod tests {
                 kill_exact(pid);
             }
         }
+    }
+
+    /// The `Drop` path cannot await, so it sends the cancel over a blocking
+    /// socket. Prove the frame that lands on the wire is a real
+    /// `session/cancel` for the session we drove — a broken hand-rolled
+    /// handshake would silently cancel nothing.
+    #[test]
+    fn the_blocking_cancel_sends_a_real_cancel_frame() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let server = std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut writer = stream.try_clone().expect("clone stream");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            // initialize -> reply; session/cancel -> record.
+            for _ in 0..2 {
+                line.clear();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    return;
+                }
+                let frame: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                if method == "initialize" {
+                    let _ =
+                        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n");
+                } else {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(frame);
+                    let _ = writer.write_all(
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\",\"session_id\":\"blocking-probe\"}}\n",
+                    );
+                }
+            }
+        });
+
+        let previous = std::env::var("ZEROCLAW_SOCKET").ok();
+        // SAFETY: single-threaded at this point in the test (the lock is held).
+        unsafe { std::env::set_var("ZEROCLAW_SOCKET", &socket) };
+        note_session("blocking-probe");
+        cancel_sessions_blocking(&pending_sessions());
+        if let Some(prev) = previous {
+            unsafe { std::env::set_var("ZEROCLAW_SOCKET", prev) };
+        } else {
+            unsafe { std::env::remove_var("ZEROCLAW_SOCKET") };
+        }
+        server.join().expect("fake daemon thread");
+
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let cancel = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|m| m.as_str()) == Some("session/cancel"))
+            .expect("a session/cancel frame must reach the daemon");
+        assert_eq!(
+            cancel
+                .pointer("/params/session_id")
+                .and_then(|v| v.as_str()),
+            Some("blocking-probe"),
+            "the cancel must name the session this run drove"
+        );
+        // Leave the shared session list clean for the other tests.
+        let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|id| id != "blocking-probe");
+        let mut cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+        cancelled.retain(|id| id != "blocking-probe");
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
