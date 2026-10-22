@@ -52,6 +52,67 @@ budget (`--request-timeout`, default 120s) still bounds the wait; once tokens
 start, the idle guard (`ZODER_IDLE_S`, default 25s) applies, including while a
 model is only streaming reasoning.
 
+## Per-model request budget
+
+The request budget is a property of the **model**, not only of the host. One
+provider routinely serves a fast local reviewer and a slow frontier model, and
+the two need opposite budgets: measured 2026-10-21 (HYDRA),
+`zoder review --panel MiniMax-M3 ...` on a ~650-line diff was cut twice at the
+120s default ("[zoder] still waiting for minimax-m3 after 90s ... request budget
+120s" -> "review incomplete") while `gemma4-31b` and
+`MiniMax-M3.1-Flash-Preview` answered the same diff. Raising the budget
+globally instead would have delayed failure detection for every fast model.
+
+`request_timeout_s` can therefore be set per model. Highest precedence first:
+
+1. `--request-timeout` (per invocation)
+2. `request_timeout_s` on the zoder `models` entry serving the model
+   (`config.json`)
+3. `request_timeout_s` on the engine provider profile serving the model
+   (`[providers.models.<family>.<alias>]` in the engine's `config.toml`)
+4. the global `request_timeout_s` (`config.json`, or `[profile]` in a
+   `config.<vendor>.toml` overlay)
+5. `ZODER_TIMEOUT_S`
+6. the built-in default, 120s
+
+```toml
+# engine config.toml — a real operator knob, per model.
+[providers.models.custom.minimax]
+model = "MiniMax-M3"
+request_timeout_s = 600      # this model alone gets 10 minutes
+
+[providers.models.custom.reviewer]
+model = "gemma4-31b"         # no key: keeps the global budget
+```
+
+```json
+// config.json — the same knob for the zoder-side models map.
+{
+  "models": {
+    "custom.minimax": { "model": "MiniMax-M3", "request_timeout_s": 600 }
+  }
+}
+```
+
+It applies to every model-scoped call: the `zoder review` panel (including the
+loop's review phase) and the `zoder exec` / `zoder exec --oneshot` author
+chain. A model with no per-model value is completely unaffected, which is the
+point — the fast routes keep failing fast.
+
+Two things deliberately keep the global budget: provider catalog fetches
+(`list_models`, `zoder refresh`) carry no model, and health probes
+(`zoder probe`) are `max_tokens = 1` liveness pings already bounded by
+`PROBE_PING_TIMEOUT_S` (20s), which a larger per-model budget could not extend.
+
+A `request_timeout_s` of `0` is rejected at load — on a vendor overlay /
+`config.json` as a validation error, on an engine profile as a config parse
+error — because a zero budget can never complete a call and silently replacing
+it would hide the mistake until the next slow review.
+
+The zoder-side `models` map matches on the model id, so an alias that carries a
+budget for a model id another alias also serves is a load-time error — neither
+a coin flip between two budgets nor one alias silently hiding the other's.
+
 ## The ledger (fixed 2026-10-10)
 
 Before this fix every billable call left a 64 KiB slot in
@@ -99,6 +160,10 @@ reviews all go to the same two reviewer routes.
   bursts.
 - `ZODER_QUEUE_TIMEOUT_S=900` (the default).
 - Keep `--request-timeout` at 300 for gemma reviews of large chunks.
+- Pin `request_timeout_s = 600` on the `MiniMax-M3` profile (see "Per-model
+  request budget" above) instead of raising the budget host-wide: MiniMax-M3 is
+  the one route measured past 120s on a large chunk, and a host-wide bump would
+  also delay failure detection for gemma and the local coder.
 - Watch `first_token_ms` in review receipts: values of tens of seconds mean
   the reviewer server is saturated; spread sessions across routes rather than
   raising timeouts.

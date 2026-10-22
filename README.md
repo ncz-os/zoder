@@ -642,6 +642,38 @@ Omit the `budget` block (or any field) for no cap. The estimate is a ballpark
 (token counts are approximate until the call's real telemetry lands in the
 ledger); it is a guard rail, not a hard meter.
 
+### Request timeout, per model
+
+Every provider call is bounded by an overall request budget (default 120s;
+`--request-timeout`, `request_timeout_s`, `ZODER_TIMEOUT_S`). One provider can
+serve models with very different latency — measured 2026-10-21, `MiniMax-M3`
+ran past 120s on a ~650-line review chunk while `gemma4-31b` and
+`MiniMax-M3.1-Flash-Preview` answered the same diff — so `request_timeout_s`
+can be pinned per model. A model with no per-model value keeps the host-wide
+budget, so raising it for one slow model never delays failure detection for the
+fast ones.
+
+```toml
+# engine config.toml
+[providers.models.custom.minimax]
+model = "MiniMax-M3"
+request_timeout_s = 600      # this model alone
+```
+
+```json
+// config.json — the zoder-side models map, same key
+{
+  "models": {
+    "custom.minimax": { "model": "MiniMax-M3", "request_timeout_s": 600 }
+  }
+}
+```
+
+Precedence: `--request-timeout` > per-model `models` entry > per-model engine
+profile > global `request_timeout_s` > `ZODER_TIMEOUT_S` > default. Health
+probes and provider catalog fetches keep the global budget. Full details in
+[docs/CONCURRENCY.md](docs/CONCURRENCY.md#per-model-request-budget).
+
 ### Vendor overlays: `config.<name>.toml`
 
 `Config::load()` reads `config.json` (or the default free-tier config) and

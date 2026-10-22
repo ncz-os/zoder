@@ -468,6 +468,20 @@ pub struct ModelEntry {
     /// ("requires adaptive thinking") and accepts `minimal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-model provider request timeout in seconds. The same budget as
+    /// [`Config::request_timeout_s`], but pinned to one model instead of every
+    /// call, so a slow reviewer can be given a large budget without slowing
+    /// failure detection for the fast local models beside it.
+    ///
+    /// Measured 2026-10-21 (HYDRA): `MiniMax-M3` on a ~650-line review chunk
+    /// ran past the 120s default twice ("still waiting for minimax-m3 after
+    /// 90s ... request budget 120s" -> "review incomplete") while
+    /// gemma4-31b and MiniMax-M3.1-Flash-Preview answered the same diff.
+    ///
+    /// Precedence: `--request-timeout` > this key > the global
+    /// `request_timeout_s` > `ZODER_TIMEOUT_S` > the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_s: Option<u64>,
 }
 
 /// Read-only projection of the zeroclaw engine's `config.toml` model routing.
@@ -509,6 +523,11 @@ struct EngineProviderModel {
     chat_template_kwargs: Option<serde_json::Value>,
     reasoning_effort: Option<String>,
     response_format: Option<serde_json::Value>,
+    /// Per-model provider request budget in seconds declared on the engine
+    /// profile (`[providers.models.<family>.<alias>] request_timeout_s`).
+    /// `None` leaves the call on the global `--request-timeout` / config /
+    /// env budget.
+    request_timeout_s: Option<u64>,
     kind: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
@@ -772,6 +791,35 @@ impl EngineModelRegistry {
             .values()
             .find(|profile| profile.model == model && profile.response_format.is_some())
             .and_then(|profile| profile.response_format.as_ref())
+    }
+
+    /// Return the per-model provider request budget declared on the engine
+    /// profile that serves this model, with the same precedence as
+    /// [`Self::reasoning_effort_for_model`]: the selected agent's profile,
+    /// then the reviewer's, then the first profile in alias order serving the
+    /// id (that last fallback is deterministic, not per-call).
+    ///
+    /// `None` means "no per-model override" — the caller keeps the global
+    /// `--request-timeout` / config / `ZODER_TIMEOUT_S` / default budget.
+    pub fn request_timeout_s_for_model(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+    ) -> Option<u64> {
+        for alias in agent_alias.into_iter().chain(std::iter::once("reviewer")) {
+            if let Some(profile) = self
+                .model_provider_ref_for_agent(alias)
+                .and_then(|reference| self.models.get(reference))
+            {
+                if profile.model == model && profile.request_timeout_s.is_some() {
+                    return profile.request_timeout_s;
+                }
+            }
+        }
+        self.models
+            .values()
+            .find(|profile| profile.model == model && profile.request_timeout_s.is_some())
+            .and_then(|profile| profile.request_timeout_s)
     }
 
     /// Return the exact provider-profile reference configured on an agent,
@@ -1545,6 +1593,7 @@ fn collect_engine_models(
                         .or_else(|| child.get("response_format"))
                         .and_then(|value| serde_json::to_value(value).ok())
                         .filter(serde_json::Value::is_object),
+                    request_timeout_s: toml_request_timeout_s(child, &alias)?,
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1625,6 +1674,7 @@ fn collect_engine_models_json(
                         .or_else(|| child.get("response_format"))
                         .filter(|value| value.is_object())
                         .cloned(),
+                    request_timeout_s: json_request_timeout_s(child, &alias)?,
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1722,6 +1772,52 @@ fn json_string_array(
 
 fn default_kind() -> String {
     "openai-chat".into()
+}
+
+/// Read `request_timeout_s` from an engine provider profile. A zero (or
+/// negative) budget is a load-time error rather than a silently clamped
+/// default: the same shape as the global `request_timeout_s` check, so an
+/// operator who meant "no limit" gets told instead of a call that can never
+/// complete.
+fn toml_request_timeout_s(
+    table: &toml::Table,
+    provider_alias: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = table.get("request_timeout_s") else {
+        return Ok(None);
+    };
+    let secs = value.as_integer().filter(|secs| *secs > 0).ok_or_else(|| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field \"request_timeout_s\" must be a positive \
+             number of seconds"
+        )
+    })?;
+    Ok(Some(u64::try_from(secs).map_err(|_| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field \"request_timeout_s\" exceeds the \
+             representable request budget"
+        )
+    })?))
+}
+
+/// [`toml_request_timeout_s`] for the daemon's masked `config/get` JSON.
+fn json_request_timeout_s(
+    object: &serde_json::Map<String, serde_json::Value>,
+    provider_alias: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = object.get("request_timeout_s") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .filter(|secs| *secs > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine provider {provider_alias:?} field \"request_timeout_s\" must be a \
+                 positive number of seconds"
+            )
+        })
 }
 
 /// Named report colour palette. Each field is an ANSI SGR parameter string
@@ -3058,6 +3154,42 @@ impl Config {
         self.models.get(mp).and_then(|m| m.model.clone())
     }
 
+    /// The zoder-side `[providers.models.*]`-shaped entry that serves
+    /// `model`, matched on the model id rather than the alias key so it
+    /// applies whichever alias resolved the route. Single definition of that
+    /// match so the per-model sampling knobs and the per-model request
+    /// budget can never disagree about which entry a model uses.
+    ///
+    /// When several aliases serve one model id the first entry in alias order
+    /// wins. That is the pre-existing rule for the sampling knobs; for
+    /// `request_timeout_s` it cannot be allowed to silently pick a budget, so
+    /// [`Self::validate`] rejects ambiguous duplicates up front and
+    /// [`Self::model_request_timeout_s`] prefers whichever alias declares a
+    /// budget.
+    pub fn model_entry_for(&self, model: &str) -> Option<&ModelEntry> {
+        self.models
+            .values()
+            .find(|entry| entry.model.as_deref() == Some(model))
+    }
+
+    /// Per-model request budget from zoder's own `models` map (a
+    /// `request_timeout_s` on the entry that serves `model`). `None` means
+    /// "not set here" — the caller falls through to the engine profile's
+    /// per-model value, then the global budget.
+    ///
+    /// When several aliases declare a budget for one model id, the first
+    /// DECLARING entry in alias order wins rather than the first matching
+    /// entry: an alias that simply has no budget of its own must never hide a
+    /// budget another alias declared for the same model. [`Self::validate`]
+    /// rejects that ambiguity at load anyway, so this is the belt to that
+    /// braces.
+    pub fn model_request_timeout_s(&self, model: &str) -> Option<u64> {
+        self.models
+            .values()
+            .filter(|entry| entry.model.as_deref() == Some(model))
+            .find_map(|entry| entry.request_timeout_s)
+    }
+
     /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
     /// reviewer candidates (head first). The legacy single-string form is
     /// preserved: a `Config::reviewer_model` containing a single model id is
@@ -3297,6 +3429,51 @@ impl Config {
         }
         if self.request_timeout_s.is_some_and(|secs| secs == 0) {
             errs.push("request_timeout_s must be greater than zero".into());
+        }
+        for (alias, entry) in &self.models {
+            if entry.request_timeout_s == Some(0) {
+                errs.push(format!(
+                    "models.{alias}.request_timeout_s must be greater than zero"
+                ));
+            }
+        }
+        // Two aliases serving one model id cannot both own that model's
+        // budget: the lookup matches on the model id, so one of them would
+        // silently win — or, worse, an alias with no budget of its own would
+        // hide the budget another alias declared for the same model. Fail at
+        // load instead of letting an operator's slow model be cut at whichever
+        // budget happened to sort first.
+        let mut budgets_by_model: BTreeMap<&str, Vec<(&str, Option<u64>)>> = BTreeMap::new();
+        for (alias, entry) in &self.models {
+            let Some(model) = entry.model.as_deref() else {
+                continue;
+            };
+            budgets_by_model
+                .entry(model)
+                .or_default()
+                .push((alias.as_str(), entry.request_timeout_s));
+        }
+        for (model, budgets) in budgets_by_model {
+            // Unambiguous when the model has a single alias, or when every
+            // alias serving it agrees on the budget (including "no alias sets
+            // one"). Anything else leaves the model id without one answer.
+            let distinct: std::collections::BTreeSet<Option<u64>> =
+                budgets.iter().map(|(_, secs)| *secs).collect();
+            if budgets.len() < 2 || distinct.len() < 2 {
+                continue;
+            }
+            let declared = budgets
+                .iter()
+                .map(|(alias, secs)| match secs {
+                    Some(secs) => format!("{alias}={secs}"),
+                    None => format!("{alias}=<unset>"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            errs.push(format!(
+                "model {model:?} has an ambiguous per-model request budget ({declared}); \
+                 one model id can be served by only one alias carrying request_timeout_s"
+            ));
         }
         for (name, cap) in [
             ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
@@ -3962,6 +4139,194 @@ provider_extra = { reasoning_effort = "none" }
             registry.reasoning_effort_for_model("model-c", None),
             Some("none")
         );
+    }
+
+    #[test]
+    fn per_model_request_timeout_comes_from_the_selected_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "model-a"
+request_timeout_s = 900
+[providers.models.custom.reviewer]
+model = "model-a"
+request_timeout_s = 600
+[providers.models.custom.fast]
+model = "model-b"
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.request_timeout_s_for_model("model-a", None),
+            Some(600),
+            "the reviewer route's profile wins over another profile serving the same model"
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("model-b", None),
+            None,
+            "a profile that sets no budget must not invent one"
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("different", None),
+            None
+        );
+    }
+
+    #[test]
+    fn per_model_request_timeout_projects_from_the_daemon_json_projection() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "slow": { "model": "MiniMax-M3", "request_timeout_s": 600 },
+                        "fast": { "model": "gemma4-31b" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            registry.request_timeout_s_for_model("MiniMax-M3", None),
+            Some(600)
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("gemma4-31b", None),
+            None
+        );
+    }
+
+    #[test]
+    fn per_model_request_timeout_must_be_a_positive_number_of_seconds() {
+        let zero = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.slow]
+model = "MiniMax-M3"
+request_timeout_s = 0
+"#,
+        )
+        .expect_err("a zero per-model budget can never complete a call");
+        assert!(
+            zero.to_string().contains("request_timeout_s"),
+            "the error must name the offending field: {zero}"
+        );
+
+        let negative = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": { "slow": { "model": "MiniMax-M3", "request_timeout_s": -1 } }
+                }
+            }
+        }))
+        .expect_err("a negative per-model budget must be rejected, not clamped");
+        assert!(
+            negative.to_string().contains("request_timeout_s"),
+            "the error must name the offending field: {negative}"
+        );
+    }
+
+    #[test]
+    fn zoder_model_entry_supplies_the_per_model_request_timeout() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/nonexistent-zoder-home"));
+        let mut slow = ModelEntry {
+            model: Some("MiniMax-M3".to_string()),
+            ..Default::default()
+        };
+        slow.request_timeout_s = Some(600);
+        let mut fast = ModelEntry {
+            model: Some("gemma4-31b".to_string()),
+            ..Default::default()
+        };
+        fast.temperature = Some(0.1);
+        cfg.models.insert("custom.slow".to_string(), slow);
+        cfg.models.insert("custom.fast".to_string(), fast);
+
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), Some(600));
+        assert_eq!(
+            cfg.model_request_timeout_s("gemma4-31b"),
+            None,
+            "an entry with sampling config but no budget must not pin a timeout"
+        );
+        assert_eq!(
+            cfg.model_entry_for("gemma4-31b")
+                .and_then(|e| e.temperature),
+            Some(0.1),
+            "the shared model-entry lookup must still see the sampling knobs"
+        );
+    }
+
+    #[test]
+    fn ambiguous_per_model_budgets_for_one_model_id_are_rejected() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/nonexistent-zoder-home"));
+        let entry = |secs: Option<u64>| ModelEntry {
+            model: Some("MiniMax-M3".to_string()),
+            request_timeout_s: secs,
+            ..Default::default()
+        };
+        for (alias, secs) in [
+            ("custom.a", Some(600)),
+            ("custom.b", Some(300)),
+            ("custom.c", None),
+        ] {
+            cfg.models.insert(alias.to_string(), entry(secs));
+        }
+        let ambiguous = |cfg: &Config| {
+            cfg.validate().iter().any(|p| {
+                p.contains("MiniMax-M3") && p.contains("ambiguous per-model request budget")
+            })
+        };
+        assert!(
+            ambiguous(&cfg),
+            "differing budgets for one model id must be rejected: {:?}",
+            cfg.validate()
+        );
+
+        // Agreeing duplicates are unambiguous and stay valid.
+        cfg.models
+            .get_mut("custom.b")
+            .expect("custom.b exists")
+            .request_timeout_s = Some(600);
+        cfg.models
+            .get_mut("custom.c")
+            .expect("custom.c exists")
+            .request_timeout_s = Some(600);
+        assert!(
+            !ambiguous(&cfg),
+            "identical budgets on every alias are not a conflict: {:?}",
+            cfg.validate()
+        );
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), Some(600));
+
+        // An alias with no budget of its own must not be able to hide the
+        // budget another alias declares for the same model (review finding,
+        // 2026-10-21): that would silently leave the slow model on the global
+        // budget, which is the failure this whole feature exists to fix.
+        cfg.models
+            .get_mut("custom.c")
+            .expect("custom.c exists")
+            .request_timeout_s = None;
+        assert!(
+            ambiguous(&cfg),
+            "one alias declaring a budget while another is unset is ambiguous: {:?}",
+            cfg.validate()
+        );
+        assert_eq!(
+            cfg.model_request_timeout_s("MiniMax-M3"),
+            Some(600),
+            "even an unvalidated config must not let the unset alias hide a declared budget"
+        );
+
+        // Several aliases that all declare nothing stay valid: no budget is
+        // declared for that model, which is unambiguous.
+        for alias in ["custom.a", "custom.b"] {
+            cfg.models
+                .get_mut(alias)
+                .expect("alias exists")
+                .request_timeout_s = None;
+        }
+        assert!(!ambiguous(&cfg), "{:?}", cfg.validate());
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), None);
     }
 
     #[test]

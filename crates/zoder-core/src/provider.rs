@@ -109,6 +109,35 @@ mod reliability_deadline_tests {
         "data: {\"model\":\"model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n";
     const DONE: &str = "data: [DONE]\n\n";
 
+    /// A per-model budget must move THIS call's deadline and nothing else: the
+    /// cached client another model on the same provider uses keeps its own
+    /// budget. Measured 2026-10-21: MiniMax-M3 needed more than the 120s
+    /// default on a ~650-line review chunk, and its fast panel neighbours must
+    /// not have inherited that budget.
+    #[test]
+    fn per_model_budget_retimes_a_copy_and_leaves_the_shared_client_alone() {
+        let (shared, _request) = fixture("http://127.0.0.1:1/v1", 1000, 50);
+        let slow = shared
+            .with_request_timeout_s(600)
+            .expect("a positive per-model budget must be accepted");
+        assert_eq!(
+            slow.request_timeout(),
+            Duration::from_secs(600),
+            "the per-model copy must carry the model's own budget"
+        );
+        assert_eq!(
+            shared.request_timeout(),
+            Duration::from_millis(1000),
+            "the shared client other models on this provider use must be untouched"
+        );
+        assert!(shared
+            .with_request_timeout_s(0)
+            .err()
+            .expect("a zero budget must be rejected")
+            .to_string()
+            .contains("greater than zero"));
+    }
+
     #[tokio::test]
     async fn slow_prefill_gets_request_budget_not_stream_idle_budget() {
         let body = format!("{DELTA}{DONE}");
@@ -1161,6 +1190,11 @@ impl ResponsesResponse {
     }
 }
 
+/// A configured provider client. `Clone` is cheap and shares the underlying
+/// [`reqwest::Client`] connection pool, which is what makes a per-call
+/// request budget ([`Self::with_request_timeout_s`]) practical on routes that
+/// serve several models from one provider.
+#[derive(Clone)]
 pub struct OpenAiProvider {
     base_url: String,
     /// Provider wire kind: `openai-chat` | `openai-responses` | `azure-openai`
@@ -1330,6 +1364,34 @@ impl OpenAiProvider {
             Duration::from_secs(env_secs("ZODER_WAIT_NOTICE_S", DEFAULT_WAIT_NOTICE_S).max(1))
         });
         self
+    }
+
+    /// Copy of this client carrying a different overall request budget.
+    ///
+    /// One provider can serve models with completely different latency
+    /// profiles (a local 8B reviewer answers a review chunk in seconds;
+    /// MiniMax-M3 needed over 120s on the same chunk, measured 2026-10-21), so
+    /// the budget that bounds a call is a property of the MODEL, not only of
+    /// the provider. Sharing the connection pool makes this cheap enough to
+    /// apply per call: the route identity, auth, kind and endpoint are
+    /// unchanged, only the deadline moves.
+    ///
+    /// Zero is rejected exactly as in [`Self::new_with_request_timeout_s`]: a
+    /// zero budget is a configuration mistake, and silently substituting a
+    /// default would hide it until a slow model failed again.
+    pub fn with_request_timeout_s(&self, request_timeout_s: u64) -> anyhow::Result<Self> {
+        if request_timeout_s == 0 {
+            anyhow::bail!("request_timeout_s must be greater than zero");
+        }
+        let mut retimed = self.clone();
+        retimed.request_timeout = Duration::from_secs(request_timeout_s);
+        Ok(retimed)
+    }
+
+    /// The overall request budget currently applied to calls on this client.
+    /// Exposed for tests and for diagnostics that report the budget in use.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     /// Read step for a stream loop: the idle budget once generation began;
