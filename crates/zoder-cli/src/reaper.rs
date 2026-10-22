@@ -1775,7 +1775,7 @@ mod tests {
     fn spawn_sigterm_ignoring(cwd: &Path) -> u32 {
         let child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("trap '' TERM; sleep 600")
+            .arg("trap '' TERM; exec sleep 600")
             .current_dir(cwd)
             .spawn()
             .expect("spawn SIGTERM-ignoring fixture");
@@ -1977,8 +1977,13 @@ mod tests {
         .expect("plan");
         let stubborn = spawn_sigterm_ignoring(&ws.cd);
         wait_until(
-            || alive(stubborn),
-            "the SIGTERM-ignoring fixture to be running",
+            || read_stat(stubborn).is_some_and(|stat| stat.comm == "sleep"),
+            "the SIGTERM-ignoring fixture to exec sleep",
+        );
+        assert_eq!(
+            read_stat(stubborn).map(|stat| stat.comm),
+            Some("sleep".to_string()),
+            "the fixture must have no child that can outlive a killed shell"
         );
 
         let outcome = reap(&plan, Duration::from_millis(200));
