@@ -1089,10 +1089,15 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // snapshot taken before it: a cancel this round delivered and a session
         // the engine minted during the reap both have to count, or the loop
         // either runs a pointless round or exits without seeing a new session.
-        // The first half is what 01a163c9 got wrong: an engine that is not there
-        // is not a session still running, and treating it as one is what kept
-        // this loop going for four rounds.
-        if pending_sessions().is_empty() && outcome.quiet() {
+        // An unreachable session is retired from the CANCEL (01a163c9 kept
+        // re-sending a cancel no socket could carry), but it is not proof the
+        // session stopped: its daemon may still run on a socket inode nothing
+        // can name. So it also blocks early convergence, and the loop keeps
+        // reaping for every remaining round instead of declaring the run quiet.
+        if pending_sessions().is_empty()
+            && outcome.quiet()
+            && report.unreachable_sessions.is_empty()
+        {
             plan.cleanup_owned_roots();
             return report;
         }
@@ -1110,6 +1115,16 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
                 );
             }
         }
+    }
+    if !report.unreachable_sessions.is_empty() {
+        eprintln!(
+            "[zoder] WARNING: {} session(s) could not be cancelled because the engine socket \
+             at {} is gone; they may still run in a daemon that lost its socket. The \
+             workspace was reaped for all {MAX_TEARDOWN_ROUNDS} rounds, but work started \
+             after this teardown is not covered",
+            report.unreachable_sessions.len(),
+            socket.display()
+        );
     }
     plan.cleanup_owned_roots();
     report
@@ -2814,10 +2829,12 @@ mod tests {
     /// 2026-10-22 (MINOS, hive job `01a163c9`): the engine socket path no
     /// longer existed, yet the teardown ran all four rounds, repeated the same
     /// "cancel not confirmed" line for one session, and then reported the agent
-    /// as still producing work. Three separate failures, three assertions:
-    /// one round, one unreachable line per session, no producing-work warning.
+    /// as still producing work. The cancel is not retried (one unreachable
+    /// line per session) and the producing-work warning does not fire; the
+    /// reap still runs every round, because an unreachable session may still
+    /// be running in a daemon that lost its socket.
     #[test]
-    fn a_missing_engine_socket_ends_the_teardown_in_one_round_without_a_work_warning() {
+    fn a_missing_engine_socket_is_not_retried_but_keeps_the_reap_running() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2841,8 +2858,8 @@ mod tests {
         let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
 
         assert_eq!(
-            report.rounds, 1,
-            "an engine that is not there must not cost four teardown rounds"
+            report.rounds, MAX_TEARDOWN_ROUNDS,
+            "an unreachable session may still be running, so the reap must not stop early"
         );
         for id in ids {
             assert!(
