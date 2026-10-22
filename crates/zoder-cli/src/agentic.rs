@@ -4587,9 +4587,8 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // nothing to show for it.
     let engine_kind = crate::resolve_engine_kind(cli)?;
     let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json, None).await?;
-    // Remember the session so the exit path can cancel it: a turn that
-    // returns "completed" to us may still have tool children running.
-    crate::reaper::note_session(&t.run.session_id);
+    // The session was already recorded when the engine minted it (see
+    // `reaper::note_session`), which is what lets a SIGTERM mid-turn cancel it.
 
     let ok = t.run.succeeded();
     let timed_out = t.run.outcome == "timeout";
@@ -6102,10 +6101,6 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     agent_alias: t.alias.clone(),
                     session_id: t.run.session_id.clone(),
                 });
-                // Remember every iteration's session, not just the last one: a
-                // ghost turn from iteration 1 keeps editing just as hard as
-                // one from iteration 9, and only the exit path cancels them.
-                crate::reaper::note_session(&t.run.session_id);
                 total_cost += t.cost_usd;
                 Some(t)
             }
