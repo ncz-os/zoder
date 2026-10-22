@@ -164,6 +164,19 @@ pub(crate) fn note_daemon_identity(identity: crate::DaemonIdentity) {
     }
 }
 
+/// Retract an in-process daemon record, the counterpart of
+/// [`note_daemon_identity`]. Correctness does not depend on it — the live
+/// check rejects a process that is gone — but a failed spawn should not leave
+/// the in-process map and the pid file disagreeing about what exists.
+pub(crate) fn forget_daemon_identity(identity: crate::DaemonIdentity) {
+    let (pid, start_ticks) = identity;
+    DAEMON_PIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&pid)
+        .filter(|recorded| *recorded == start_ticks);
+}
+
 /// Is `pid` exempt as "a daemon this process spawned", right now? Test-only
 /// seam for the in-process arm of [`daemon_exemption`], which the scan calls
 /// directly.
@@ -2697,13 +2710,22 @@ mod tests {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
-        // Scope FIRST, daemon second. A fixture that predates the scope is
-        // excluded by the start-time rule whatever the record says, so the
-        // assertion below would pass without the record doing anything.
+        // Scope FIRST, daemon second — twice over: `plan` reads the record
+        // that will name the daemon, `without_record` reads a pid file that
+        // does not exist. A fixture that predates a scope is excluded by the
+        // start-time rule whatever the record says, so both scopes have to be
+        // open before the fixture is spawned or the assertions prove nothing.
         let plan = ReapPlan::new(
             &ws.cd,
             &ws.tmp_root,
             pidfile.clone(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
+        let without_record = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
             ws.trusted_daemon_dirs(),
         )
         .expect("plan");
@@ -2722,18 +2744,11 @@ mod tests {
             "the daemon recorded for the socket must be spared by another process's reap"
         );
         // …and the fixture is genuinely eligible, so the assertion above is
-        // about the record and not about a process nobody would have reaped.
+        // about the record and not about a process nobody would have reaped:
+        // a scope that never saw a record treats it as an ordinary candidate.
         assert!(
-            ReapPlan::new(
-                &ws.cd,
-                &ws.tmp_root,
-                ws.daemon_pid_file(),
-                ws.trusted_daemon_dirs()
-            )
-            .expect("plan")
-            .daemon_pid_file
-                != plan.daemon_pid_file,
-            "the comparison plan must read a pid file that does not exist"
+            scan(&without_record).iter().any(|c| c.pid == daemon),
+            "precondition: with no record at all this fixture is an ordinary reap candidate"
         );
 
         kill_exact(daemon);
