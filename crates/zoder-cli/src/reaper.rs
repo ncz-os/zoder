@@ -394,13 +394,19 @@ async fn cancel_recorded_sessions(budget: Duration) {
                 return;
             }
             match zoder_core::cancel_session(&socket, &id, remaining).await {
-                Ok(()) => eprintln!("[zoder] cancelled agent session {id}"),
+                Ok(()) => {
+                    eprintln!("[zoder] cancelled agent session {id}");
+                    // Only a cancel that actually went out is marked. Marking a
+                    // failed one hides it from the blocking path and the later
+                    // teardown rounds, and a session nobody cancelled is a
+                    // session still editing the tree.
+                    mark_cancelled(&id);
+                }
                 Err(e) => eprintln!(
                     "[zoder] session {id} cancel not confirmed ({e:#}); \
                      a turn that already settled does not acknowledge a cancel"
                 ),
             }
-            mark_cancelled(&id);
         }
     }
 }
@@ -846,9 +852,11 @@ fn install_signal_handler(plan: ReapPlan) {
             "[zoder] {name} received: cancelling the agent session and reaping \
              workspace processes before exit"
         );
+        // Same teardown as every other exit path, with the shorter budgets a
+        // signalled run can afford. One cancel followed by one scan is not a
+        // teardown: the engine can mint a session while the reap is running.
         cancel_recorded_sessions(SIGNAL_CANCEL_BUDGET).await;
-        log_outcome(&reap(&plan, SIGNAL_REAP_GRACE));
-        plan.cleanup_owned_roots();
+        teardown_rounds(&plan, SIGNAL_REAP_GRACE);
         std::process::exit(code);
     });
 }
@@ -1787,8 +1795,12 @@ mod tests {
         // before it forks; its children run inside -C, which is what makes
         // them candidates. Child two appears 150 ms in, i.e. while the reap's
         // grace window is open.
+        // The second child is forked only AFTER the first one is gone, i.e.
+        // after the reap has killed it: "forked during the reap" becomes a
+        // fact rather than a hope about poll timing.
         let script = format!(
-            "(cd {ws}; exec sleep 600) & echo $! >> {f}; sleep 0.08; \
+            "(cd {ws}; exec sleep 600) & echo $! >> {f}; first=$!; \
+             while kill -0 $first 2>/dev/null; do sleep 0.02; done; \
              (cd {ws}; exec sleep 600) & echo $! >> {f}; wait",
             ws = ws.cd.display(),
             f = pidfile.display()
