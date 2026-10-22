@@ -122,10 +122,25 @@ impl ReapPlan {
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut owned_roots: Vec<PathBuf> = Vec::new();
         let workspace = absolute(cwd);
-        // A workspace of `/` (or an empty path) matches every process on the
-        // host, so it is refused rather than honoured.
-        if !workspace.as_os_str().is_empty() && workspace.parent().is_some() {
+        let temp_abs = absolute(temp_base);
+        // Refuse a workspace that IS the shared temp root or an ancestor of
+        // it: `zoder loop -C /tmp` would otherwise make every same-uid process
+        // on the host with a cwd under /tmp — every other build, every other
+        // editor — a kill candidate. `/` and an empty path are refused for the
+        // same reason. The run's own scratch dir stays in scope either way.
+        let workspace_is_shared_temp = temp_abs.starts_with(&workspace);
+        if !workspace.as_os_str().is_empty()
+            && workspace.parent().is_some()
+            && !workspace_is_shared_temp
+        {
             roots.push(workspace);
+        } else {
+            eprintln!(
+                "[zoder] not reaping -C {}: it is the shared temp root (or an ancestor of \
+                 it), so a cwd there proves nothing about ownership; only this run's \
+                 scratch directory is in scope. Pass --no-reap to silence this.",
+                cwd.display()
+            );
         }
         if let Some(scratch) = scratch_root(temp_base) {
             roots.push(scratch.clone());
@@ -1063,10 +1078,9 @@ mod tests {
     /// would end the parse early and every later field would be garbage —
     /// including `starttime`, which is what decides what gets reaped.
     ///
-    /// The expected comm is built at runtime instead of being a `&'static str`
-    /// literal: this toolchain (1.96.1) mis-asserts the literal form of this
-    /// comparison inside this crate, and a parse test must fail only when the
-    /// parse is wrong.
+    /// `od d) dxx (yy` is deliberately not a fixture reused anywhere else in
+    /// the crate: an expected value that appears once makes a failing assert
+    /// unambiguous.
     #[test]
     fn stat_parser_handles_a_comm_with_spaces_and_parens() {
         // Fields 3..22 of a real line: state ppid pgrp session tty_nr tpgid
@@ -1074,7 +1088,7 @@ mod tests {
         // priority nice num_threads itrealvalue starttime.
         let raw = "42 (od d) dxx (yy) S 7 7 7 0 -1 4194304 100 0 0 0 1 2 3 4 20 0 1 0 424242 1 2 3";
         let stat = parse_stat(raw).expect("parse");
-        let expected = format!("od d{}dxx (yy", ") ");
+        let expected = "od d) dxx (yy";
         assert_eq!(stat.comm, expected, "comm keeps its embedded parens");
         assert_eq!(stat.state, "S", "state is field 3");
         assert_eq!(stat.ppid, 7, "ppid is field 4");
@@ -1083,7 +1097,7 @@ mod tests {
         // truncate the line.
         let plain = parse_stat("77 (sleep) S 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20")
             .expect("parse plain");
-        assert_eq!(plain.comm, format!("sle{}", "ep"));
+        assert_eq!(plain.comm, "sleep");
         assert_eq!(plain.start_ticks, 20, "starttime still lines up");
     }
 
@@ -1158,6 +1172,36 @@ mod tests {
             !scratch.exists(),
             "zoder's own scratch dir must not outlive the run"
         );
+    }
+
+    /// `zoder loop -C /tmp` must not turn every other process on the host with
+    /// a cwd in /tmp into a kill candidate: the shared temp root is refused as
+    /// a workspace root, and only this run's scratch dir remains in scope.
+    #[test]
+    fn a_workspace_that_is_the_shared_temp_root_is_refused() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let bystander = spawn_sleeper(&ws.tmp_root);
+        wait_until(|| alive(bystander), "the bystander fixture to be running");
+
+        // Same directory passed as both the workspace and the temp base.
+        let plan = ReapPlan::new(&ws.tmp_root, &ws.tmp_root).expect("plan");
+        assert!(
+            !plan.owns_cwd(&ws.tmp_root),
+            "-C <temp root> must not make the shared temp root a reap root"
+        );
+        assert!(
+            plan.roots.len() == 1 && plan.owned_roots.len() == 1,
+            "only the run's own scratch dir may remain in scope"
+        );
+        let outcome = reap(&plan, Duration::from_millis(50));
+        assert!(
+            !outcome.reaped.iter().any(|r| r.pid == bystander),
+            "an unrelated process in /tmp must not be reaped"
+        );
+        assert!(alive(bystander), "the bystander survives");
+
+        kill_exact(bystander);
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
