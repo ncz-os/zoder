@@ -458,9 +458,10 @@ struct Cli {
     /// Do not reap processes the agent left behind in the workspace when
     /// `loop`/`rescue` ends. By default a loop or rescue cancels its agent
     /// session and then SIGTERM/SIGKILLs any same-uid process whose cwd is
-    /// the `-C` directory (or zoder's temp dir) and that started while the
-    /// run was going. Only pass this when something else owns the workspace
-    /// and you expect its processes to outlive the run.
+    /// the `-C` directory (or this run's own scratch directory under the temp
+    /// root) and that started while the run was going. Only pass this when
+    /// something else owns the workspace and you expect its processes to
+    /// outlive the run.
     #[arg(long, global = true)]
     no_reap: bool,
 

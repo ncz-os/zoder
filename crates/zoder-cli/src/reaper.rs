@@ -15,8 +15,9 @@
 //! host is how you take down somebody else's session:
 //!
 //! * same uid (`getuid()`) — never another user's processes,
-//! * cwd inside the `-C` directory or zoder's temp dir — the workspace the
-//!   agent was given,
+//! * cwd inside the `-C` directory or zoder's own per-run scratch directory
+//!   under the temp root — the workspace the agent was given. Never the temp
+//!   root itself: on a shared host `/tmp` is everybody's cwd,
 //! * started after the loop began (`/proc/<pid>/stat` `starttime`, which no
 //!   pre-existing process can fake),
 //! * not zoder and not one of zoder's ancestors — never our own tree.
@@ -103,29 +104,39 @@ pub(crate) struct Reaped {
 #[derive(Debug, Clone)]
 struct ReapPlan {
     roots: Vec<PathBuf>,
+    /// The subset of `roots` zoder created, so it can be removed on the way
+    /// out. `remove_dir` (not `remove_dir_all`) only ever succeeds on an
+    /// empty directory.
+    owned_roots: Vec<PathBuf>,
     started_ticks: u64,
 }
 
 impl ReapPlan {
-    fn new(cwd: &Path, tmp: &Path) -> Option<Self> {
+    /// `temp_base` is the system temp root (`TMPDIR`, usually `/tmp`). It is
+    /// NOT itself a reap root: on a shared host every unrelated process has a
+    /// cwd somewhere under `/tmp`, and "same uid + cwd in /tmp + started
+    /// recently" describes all of them. Instead this run gets its own scratch
+    /// directory inside it, and that directory is the boundary.
+    fn new(cwd: &Path, temp_base: &Path) -> Option<Self> {
         let started_ticks = boot_ticks()?;
         let mut roots: Vec<PathBuf> = Vec::new();
-        for root in [cwd, tmp] {
-            let abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-            let root = abs.canonicalize().unwrap_or(abs);
-            // `/` (or an empty path) would match every process on the host.
-            if root.as_os_str().is_empty() || root.parent().is_none() {
-                continue;
-            }
-            if !roots.contains(&root) {
-                roots.push(root);
-            }
+        let mut owned_roots: Vec<PathBuf> = Vec::new();
+        let workspace = absolute(cwd);
+        // A workspace of `/` (or an empty path) matches every process on the
+        // host, so it is refused rather than honoured.
+        if !workspace.as_os_str().is_empty() && workspace.parent().is_some() {
+            roots.push(workspace);
+        }
+        if let Some(scratch) = scratch_root(temp_base) {
+            roots.push(scratch.clone());
+            owned_roots.push(scratch);
         }
         if roots.is_empty() {
             return None;
         }
         Some(ReapPlan {
             roots,
+            owned_roots,
             started_ticks,
         })
     }
@@ -133,6 +144,38 @@ impl ReapPlan {
     fn owns_cwd(&self, cwd: &Path) -> bool {
         self.roots.iter().any(|root| cwd.starts_with(root))
     }
+
+    /// Best-effort cleanup of the per-run scratch directory. Non-recursive, so
+    /// this can never delete agent output: if anything is in there the call
+    /// simply fails and the directory stays.
+    fn cleanup_owned_roots(&self) {
+        for dir in &self.owned_roots {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    abs.canonicalize().unwrap_or(abs)
+}
+
+/// A directory this run owns, inside the system temp root. Refuses a temp base
+/// that is the filesystem root or has no parent: creating `//zoder-reap-...`
+/// (or writing anywhere at all) is not an acceptable side effect of a reap
+/// scope.
+fn scratch_root(temp_base: &Path) -> Option<PathBuf> {
+    let base = absolute(temp_base);
+    if base.as_os_str().is_empty() || base.parent().is_none() {
+        return None;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let dir = base.join(format!("zoder-reap-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(absolute(&dir))
 }
 
 /// A process selected for reaping.
@@ -141,6 +184,11 @@ struct Candidate {
     pid: u32,
     comm: String,
     cwd: PathBuf,
+    /// The `starttime` the selection was made on. Re-checked immediately
+    /// before every signal: a pid on its own is not an identity, because the
+    /// kernel recycles pids and the grace window is exactly long enough for a
+    /// busy host to recycle one.
+    start_ticks: u64,
 }
 
 /// The loop's reaping scope. Created by `loop`/`rescue` right after the
@@ -193,14 +241,17 @@ impl ReapGuard {
         let Some(plan) = self.plan.as_ref() else {
             return;
         };
-        log_reaped(&reap(plan, REAP_GRACE));
+        log_outcome(&reap(plan, REAP_GRACE));
+        plan.cleanup_owned_roots();
     }
 }
 
 /// Log every process we killed, by exact pid and command name, so an operator
-/// can tell an agent's leftovers apart from anything else on the box.
-fn log_reaped(reaped: &[Reaped]) {
-    for entry in reaped {
+/// can tell an agent's leftovers apart from anything else on the box. Failures
+/// get their own lines: a cleanup that silently did not happen is the failure
+/// this whole change exists to stop repeating.
+fn log_outcome(outcome: &ReapOutcome) {
+    for entry in &outcome.reaped {
         eprintln!(
             "[zoder] reaped orphan pid={} comm={} cwd={} via {}",
             entry.pid,
@@ -209,10 +260,26 @@ fn log_reaped(reaped: &[Reaped]) {
             entry.signal.name()
         );
     }
-    if !reaped.is_empty() {
+    for entry in &outcome.skipped {
+        eprintln!(
+            "[zoder] skipped pid={} comm={}: it exited or the pid was recycled before \
+             the signal, so no signal was sent",
+            entry.pid, entry.comm
+        );
+    }
+    for entry in &outcome.survivors {
+        eprintln!(
+            "[zoder] WARNING pid={} comm={} cwd={} survived SIGKILL (uninterruptible \
+             sleep?); it was NOT reaped",
+            entry.pid,
+            entry.comm,
+            entry.cwd.display()
+        );
+    }
+    if !outcome.reaped.is_empty() {
         eprintln!(
             "[zoder] reaped {} process(es) left in the workspace by the agent",
-            reaped.len()
+            outcome.reaped.len()
         );
     }
 }
@@ -244,14 +311,27 @@ async fn cancel_recorded_sessions(budget: Duration) {
     }
 }
 
+/// What one reap pass did. `survivors` and `skipped` exist so the log tells
+/// the truth: a process we failed to kill, or one whose pid was recycled under
+/// us, is reported as such instead of being counted as reaped.
+#[derive(Debug, Default)]
+struct ReapOutcome {
+    reaped: Vec<Reaped>,
+    /// Signalled and still running when the pass ended.
+    survivors: Vec<Reaped>,
+    /// Selected, then found gone (or replaced) before we could signal.
+    skipped: Vec<Reaped>,
+}
+
 /// SIGTERM, grace, SIGKILL — by exact PID, never by name or pattern.
-fn reap(plan: &ReapPlan, grace: Duration) -> Vec<Reaped> {
-    let mut reaped: Vec<Reaped> = Vec::new();
+fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
+    let uid = current_uid();
+    let mut outcome = ReapOutcome::default();
     let mut seen: HashSet<u32> = HashSet::new();
     // Two passes: the second catches anything the agent spawned while the
     // first pass was still signalling (a parent that forks again before it
     // dies). `seen` keeps a pid from being reported twice.
-    for pass in 0..2 {
+    for _ in 0..2 {
         let targets: Vec<Candidate> = scan(plan)
             .into_iter()
             .filter(|c| seen.insert(c.pid))
@@ -260,35 +340,104 @@ fn reap(plan: &ReapPlan, grace: Duration) -> Vec<Reaped> {
             break;
         }
         for target in &targets {
+            if confirm_identity(target, uid) != Identity::Same {
+                // Gone, or the pid now belongs to somebody else.
+                outcome.skipped.push(entry(target, ReapSignal::Term));
+                continue;
+            }
             signal(target.pid, libc_sigterm());
         }
         let deadline = Instant::now() + grace;
-        while targets.iter().any(|c| alive(c.pid)) && Instant::now() < deadline {
+        while targets
+            .iter()
+            .any(|c| alive(c.pid) && confirm_identity(c, uid) == Identity::Same)
+            && Instant::now() < deadline
+        {
             std::thread::sleep(POLL);
         }
         for target in &targets {
-            let used = if alive(target.pid) {
-                signal(target.pid, libc_sigkill());
-                let kill_deadline = Instant::now() + KILL_WAIT;
-                while alive(target.pid) && Instant::now() < kill_deadline {
-                    std::thread::sleep(POLL);
-                }
-                ReapSignal::Kill
-            } else {
-                ReapSignal::Term
-            };
-            // Logging happens in `log_reaped` so the exit path and the signal
-            // path report identically.
-            reaped.push(Reaped {
+            if outcome.skipped.iter().any(|s| s.pid == target.pid) {
+                continue;
+            }
+            if confirm_identity(target, uid) != Identity::Same {
+                outcome.skipped.push(entry(target, ReapSignal::Term));
+                continue;
+            }
+            let entry = Reaped {
                 pid: target.pid,
                 comm: target.comm.clone(),
                 cwd: target.cwd.clone(),
-                signal: used,
-            });
+                signal: ReapSignal::Term,
+            };
+            if !alive(target.pid) {
+                outcome.reaped.push(entry);
+                continue;
+            }
+            signal(target.pid, libc_sigkill());
+            let kill_deadline = Instant::now() + KILL_WAIT;
+            while alive(target.pid) && Instant::now() < kill_deadline {
+                std::thread::sleep(POLL);
+            }
+            let mut killed = entry;
+            killed.signal = ReapSignal::Kill;
+            // SIGKILL is uncatchable, so "still here" means the kernel is
+            // holding it (uninterruptible sleep, a wedged D-state task) — a
+            // real, visible failure rather than a silent success claim.
+            if alive(target.pid) && confirm_identity(target, uid) == Identity::Same {
+                outcome.survivors.push(killed);
+            } else {
+                outcome.reaped.push(killed);
+            }
         }
-        let _ = pass;
     }
-    reaped
+    outcome
+}
+
+fn entry(target: &Candidate, signal: ReapSignal) -> Reaped {
+    Reaped {
+        pid: target.pid,
+        comm: target.comm.clone(),
+        cwd: target.cwd.clone(),
+        signal,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The process we selected is still the process at this pid.
+    Same,
+    /// It exited (nothing to signal) or the pid was recycled onto another
+    /// process, which is NOT ours to kill.
+    Recycled,
+}
+
+/// Re-check, immediately before signalling, that the pid still belongs to the
+/// process the scan selected. `starttime` is the identity: no process can
+/// inherit another one's start time, so a mismatch means the pid was reused
+/// and the new tenant must not be signalled on the old one's behalf.
+fn confirm_identity(target: &Candidate, uid: u32) -> Identity {
+    match read_stat(target.pid) {
+        Some(stat) if stat.start_ticks == target.start_ticks => {
+            if stat.state == "Z" || stat.state == "X" || proc_uid(target.pid) != Some(uid) {
+                Identity::Recycled
+            } else {
+                Identity::Same
+            }
+        }
+        // No stat at all: it exited. Signalling a pid that may since have been
+        // recycled is exactly the mistake this check exists to prevent.
+        _ => Identity::Recycled,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_uid() -> u32 {
+    0
 }
 
 /// SIGTERM/SIGINT while a loop is running: cancel the session, reap, exit.
@@ -326,8 +475,8 @@ fn install_signal_handler(plan: ReapPlan) {
              workspace processes before exit"
         );
         cancel_recorded_sessions(SIGNAL_CANCEL_BUDGET).await;
-        let reaped = reap(&plan, SIGNAL_REAP_GRACE);
-        log_reaped(&reaped);
+        log_outcome(&reap(&plan, SIGNAL_REAP_GRACE));
+        plan.cleanup_owned_roots();
         std::process::exit(code);
     });
 }
@@ -445,7 +594,7 @@ fn boot_ticks() -> Option<u64> {
 /// Every process the loop may kill. Ordered by pid so the log is stable.
 #[cfg(target_os = "linux")]
 fn scan(plan: &ReapPlan) -> Vec<Candidate> {
-    let uid = unsafe { libc::getuid() };
+    let uid = current_uid();
     let protected = protected_pids();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -491,6 +640,7 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
             pid,
             comm: stat.comm,
             cwd,
+            start_ticks: stat.start_ticks,
         });
     }
     found.sort_by_key(|c| c.pid);
@@ -762,22 +912,53 @@ mod tests {
         kill_exact(predates);
     }
 
-    /// zoder's temp dir IS in scope: an agent that writes scratch into it
-    /// leaves processes there too.
+    /// The run's OWN scratch directory under the temp root is in scope: an
+    /// agent that scatters work into zoder's scratch area leaves processes
+    /// there too.
     #[test]
-    fn process_in_the_temp_root_is_reaped() {
+    fn process_in_this_runs_scratch_dir_is_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
-        let in_tmp = spawn_sleeper(&ws.tmp_root);
-        wait_until(|| alive(in_tmp), "the temp-root fixture to be running");
+        let scratch = guard
+            .plan
+            .as_ref()
+            .and_then(|p| p.owned_roots.first().cloned())
+            .expect("the plan owns a scratch dir");
+        let in_scratch = spawn_sleeper(&scratch);
+        wait_until(|| alive(in_scratch), "the scratch fixture to be running");
 
         guard.finish();
-        assert!(!alive(in_tmp), "a temp-root process from this run is ours");
+        assert!(
+            !alive(in_scratch),
+            "a scratch-dir process from this run is ours"
+        );
 
-        if alive(in_tmp) {
-            kill_exact(in_tmp);
+        if alive(in_scratch) {
+            kill_exact(in_scratch);
         }
+    }
+
+    /// The SYSTEM temp root is NOT a reap root. On a shared host every
+    /// unrelated process has a cwd somewhere under `/tmp`; selecting on that
+    /// would make "someone else's build" a kill candidate.
+    #[test]
+    fn a_process_in_the_shared_temp_root_is_not_reaped() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let bystander = spawn_sleeper(&ws.tmp_root);
+        wait_until(|| alive(bystander), "the bystander fixture to be running");
+
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+        assert!(
+            !scan(&plan).iter().any(|c| c.pid == bystander),
+            "a cwd in the shared temp root is not evidence of ownership"
+        );
+        guard.finish();
+        assert!(alive(bystander), "a temp-root bystander must survive");
+
+        kill_exact(bystander);
     }
 
     /// SIGTERM is a request. A process that traps it must still die.
@@ -792,8 +973,9 @@ mod tests {
             "the SIGTERM-ignoring fixture to be running",
         );
 
-        let reaped = reap(&plan, Duration::from_millis(200));
-        let entry = reaped
+        let outcome = reap(&plan, Duration::from_millis(200));
+        let entry = outcome
+            .reaped
             .iter()
             .find(|r| r.pid == stubborn)
             .expect("stubborn process is reported as reaped");
@@ -904,6 +1086,80 @@ mod tests {
         assert_eq!(plain.comm, format!("sle{}", "ep"));
         assert_eq!(plain.start_ticks, 20, "starttime still lines up");
     }
+
+    /// A pid is not an identity: the kernel recycles them. Selection records
+    /// `starttime`, and every signal re-checks it, so a pid that changed hands
+    /// between the scan and the signal is SKIPPED, never signalled.
+    #[test]
+    fn a_recycled_pid_is_skipped_instead_of_signalled() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let bystander = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(bystander), "the fixture to be running");
+
+        // A candidate that claims this pid but a DIFFERENT start time is what
+        // a recycled pid looks like from the reaper's side.
+        let real = read_stat(bystander).expect("stat");
+        let impostor = Candidate {
+            pid: bystander,
+            comm: real.comm.clone(),
+            cwd: ws.cd.clone(),
+            start_ticks: real.start_ticks.wrapping_add(1),
+        };
+        assert_eq!(
+            confirm_identity(&impostor, current_uid()),
+            Identity::Recycled,
+            "a pid whose start time changed is NOT the process we selected"
+        );
+        let genuine = Candidate {
+            start_ticks: real.start_ticks,
+            ..impostor.clone()
+        };
+        assert_eq!(
+            confirm_identity(&genuine, current_uid()),
+            Identity::Same,
+            "the same start time is the same process"
+        );
+        // A wrong uid must not pass either: uid is re-read, not remembered.
+        assert_eq!(
+            confirm_identity(&genuine, current_uid().wrapping_add(1)),
+            Identity::Recycled,
+            "the uid is re-validated from /proc, not trusted from the scan"
+        );
+
+        assert!(
+            alive(bystander),
+            "no signal may be sent to a mismatched pid"
+        );
+        kill_exact(bystander);
+    }
+
+    /// The per-run scratch dir zoder created must not be left behind in the
+    /// system temp root.
+    #[test]
+    fn the_scratch_dir_is_removed_when_the_scope_closes() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let scratch = {
+            let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+            let scratch = guard
+                .plan
+                .as_ref()
+                .and_then(|p| p.owned_roots.first().cloned())
+                .expect("a scratch dir");
+            assert!(
+                scratch.is_dir(),
+                "the scratch dir exists while the run does"
+            );
+            guard.finish();
+            scratch
+        };
+        assert!(
+            !scratch.exists(),
+            "zoder's own scratch dir must not outlive the run"
+        );
+    }
+
     /// A root of `/` would select every process on the host. Refuse it.
     #[test]
     fn a_root_of_slash_arms_nothing() {
@@ -913,14 +1169,29 @@ mod tests {
         );
     }
 
-    /// Both roots are in scope, so an agent that scatters work between the
-    /// workspace and the scratch dir is fully covered.
+    /// The workspace and this run's scratch dir are in scope; the shared temp
+    /// root, anything else, and `/` are not.
     #[test]
-    fn plan_covers_both_the_cd_directory_and_the_temp_root() {
+    fn plan_covers_the_cd_directory_and_this_runs_scratch_dir_only() {
         let ws = Workspace::new();
         let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
         assert!(plan.owns_cwd(&ws.cd.join("src/lib.rs")));
-        assert!(plan.owns_cwd(&ws.tmp_root.join("scratch.index")));
+        let scratch = plan
+            .owned_roots
+            .first()
+            .expect("a dedicated scratch dir under the temp root");
+        assert!(
+            scratch.starts_with(&ws.tmp_root),
+            "the scratch dir belongs inside the temp base"
+        );
+        assert!(
+            plan.owns_cwd(&scratch.join("scratch.index")),
+            "the run's own scratch dir is in scope"
+        );
+        assert!(
+            !plan.owns_cwd(&ws.tmp_root),
+            "the shared temp root itself must NOT be a reap root"
+        );
         assert!(!plan.owns_cwd(&ws.outside()));
         assert!(!plan.owns_cwd(Path::new("/")));
     }
@@ -947,9 +1218,10 @@ mod tests {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        let outcome = reap(&plan, Duration::from_millis(50));
         assert!(
-            reap(&plan, Duration::from_millis(50)).is_empty(),
-            "an empty workspace must produce no reaped processes"
+            outcome.reaped.is_empty() && outcome.skipped.is_empty() && outcome.survivors.is_empty(),
+            "an empty workspace must produce no reaped, skipped or surviving processes"
         );
     }
 }
