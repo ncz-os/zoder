@@ -51,6 +51,14 @@ const SIGNAL_REAP_GRACE: Duration = Duration::from_millis(750);
 pub(crate) const REAP_CANCEL_BUDGET: Duration = Duration::from_millis(750);
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
 const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
+/// Settle time between productive reap passes. A pass that killed something
+/// has no reason to believe the work is finished: a shell that backgrounded a
+/// child may fork the next one a moment later. Without this, the reap converges
+/// on "nothing is alive right now" instead of "nothing more is coming".
+const PASS_SETTLE: Duration = Duration::from_millis(250);
+/// How many cancel/reap rounds the teardown may take before giving up. Two is
+/// the normal case (something to clean, then confirmation there is nothing).
+const MAX_TEARDOWN_ROUNDS: usize = 4;
 /// How many drain passes the cancel phase may make before giving up.
 const MAX_CANCEL_PASSES: usize = 8;
 /// Read timeout for the blocking cancel used on the `Drop` path.
@@ -140,10 +148,13 @@ impl ReapPlan {
     /// recently" describes all of them. Instead this run gets its own scratch
     /// directory inside it, and that directory is the boundary.
     fn new(cwd: &Path, temp_base: &Path) -> Option<Self> {
-        // Take the pid snapshot and the boot-tick boundary together, before
-        // anything can be spawned on this run's behalf.
-        let preexisting = live_pids();
+        // Order matters: the boot-tick boundary is read FIRST and the pid
+        // snapshot second, so every process that existed before the boundary
+        // is in the snapshot. (The other order leaves a window in which a
+        // process started between the two reads is absent from the snapshot
+        // AND newer than the boundary — i.e. looks like ours.)
         let started_ticks = boot_ticks()?;
+        let preexisting = live_pids();
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut owned_roots: Vec<PathBuf> = Vec::new();
         let workspace = absolute(cwd);
@@ -279,20 +290,41 @@ impl ReapGuard {
 
     /// Reap now. Idempotent, and called from `Drop` so an unwinding panic
     /// still cleans up.
+    ///
+    /// Cancel and reap alternate to a fixed point: reaping takes seconds, the
+    /// engine can mint a session during it, and that session can fork children
+    /// after the last scan. So each round cancels whatever appeared since the
+    /// last round, then reaps, and a round that neither cancels nor kills
+    /// anything ends the loop.
     pub(crate) fn finish(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
-        let Some(plan) = self.plan.as_ref() else {
+        let Some(plan) = self.plan.clone() else {
             return;
         };
-        log_outcome(&reap(plan, REAP_GRACE));
+        for round in 0..MAX_TEARDOWN_ROUNDS {
+            let cancelled = pending_sessions();
+            cancel_sessions_blocking(&cancelled);
+            let outcome = reap(&plan, REAP_GRACE);
+            log_outcome(&outcome);
+            if cancelled.is_empty()
+                && outcome.reaped.is_empty()
+                && outcome.skipped.is_empty()
+                && outcome.survivors.is_empty()
+            {
+                plan.cleanup_owned_roots();
+                return;
+            }
+            if round + 1 == MAX_TEARDOWN_ROUNDS {
+                eprintln!(
+                    "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
+                     with the agent still producing work; leftovers may remain"
+                );
+            }
+        }
         plan.cleanup_owned_roots();
-        // Reaping takes seconds. A session minted in that window can still
-        // spawn children after we are done, so sweep for anything recorded
-        // since the cancel phase and stop it before we return.
-        cancel_sessions_blocking(&pending_sessions());
     }
 }
 
@@ -659,6 +691,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
         for target in &targets {
             target.deliver(libc_sigterm());
         }
+        let mut reaped_this_pass = 0usize;
         let deadline = Instant::now() + grace;
         while targets.iter().any(Target::alive) && Instant::now() < deadline {
             std::thread::sleep(POLL);
@@ -669,6 +702,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             // thing here: the process we selected is no longer running, and it
             // died because we asked it to. A process that obeyed SIGTERM is
             // gone from /proc, which must NOT be reported as skipped.
+            reaped_this_pass += 1;
             if !target.alive() || confirm_identity(&target.candidate, uid) != Identity::Same {
                 // "Gone" includes "the pid was recycled while we waited": either
                 // way the process we selected is no longer running. Without a
@@ -691,6 +725,11 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             } else {
                 outcome.reaped.push(record);
             }
+        }
+        if reaped_this_pass > 0 {
+            // Let whatever the agent forks next appear before we decide the
+            // workspace is clean.
+            std::thread::sleep(PASS_SETTLE);
         }
         bounded_out = !scan(plan)
             .iter()
@@ -1729,20 +1768,44 @@ mod tests {
         // A parent that forks one child, then forks another ~200ms later —
         // after the first child has been signalled, i.e. mid-pass.
         let pidfile = ws.cd.join("forker-pids");
+        // The parent runs OUTSIDE the reap roots so the reap cannot kill it
+        // before it forks; its children run inside -C, which is what makes
+        // them candidates. Child two appears 150 ms in, i.e. while the reap's
+        // grace window is open.
         let script = format!(
-            "sleep 600 & echo $! >> {f}; sleep 0.2; sleep 600 & echo $! >> {f}; wait",
+            "(cd {ws}; exec sleep 600) & echo $! >> {f}; sleep 0.08; \
+             (cd {ws}; exec sleep 600) & echo $! >> {f}; wait",
+            ws = ws.cd.display(),
             f = pidfile.display()
         );
         let forker = Command::new("/bin/sh")
             .arg("-c")
             .arg(&script)
-            .current_dir(&ws.cd)
+            .current_dir(ws.outside())
             .spawn()
             .expect("run the forking fixture");
         let forker_pid = forker.id();
-        // Read the pid file inside the poll and keep the parse that satisfied
-        // it, so there is no second read left to race the shell's append.
-        let mut pids: Vec<u32> = Vec::new();
+        // Wait for the FIRST child only: the fixture forks its second child
+        // 150 ms later, which lands inside the reap's grace window below. A
+        // test that waited for both children up front would pass even if the
+        // reaper only ever scanned once.
+        let mut first_pids: Vec<u32> = Vec::new();
+        wait_until(
+            || {
+                first_pids = std::fs::read_to_string(&pidfile)
+                    .map(|text| {
+                        text.lines()
+                            .filter_map(|line| line.trim().parse().ok())
+                            .collect::<Vec<u32>>()
+                    })
+                    .unwrap_or_default();
+                !first_pids.is_empty()
+            },
+            "the fixture to fork its first child",
+        );
+        let outcome = reap(&plan, Duration::from_millis(400));
+        // Both generations, including the one forked mid-reap.
+        let mut pids = first_pids;
         wait_until(
             || {
                 pids = std::fs::read_to_string(&pidfile)
@@ -1757,8 +1820,6 @@ mod tests {
             "the fixture to fork its second child",
         );
         assert_eq!(pids.len(), 2, "the fixture forked two children");
-
-        let outcome = reap(&plan, Duration::from_millis(50));
         let reaped: Vec<u32> = outcome.reaped.iter().map(|r| r.pid).collect();
         for pid in &pids {
             assert!(
