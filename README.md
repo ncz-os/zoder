@@ -156,6 +156,21 @@ On pre-5.3 kernels, which have no pidfd, the check-then-kill window is narrowed
 but cannot be closed. A process that survives SIGKILL is reported as a
 warning, not as a reaped pid. Linux only; a no-op elsewhere.
 
+One process is exempt from all of it, by identity and never by command line:
+the shared zeroclaw daemon. It is not the agent's — it is one daemon per host
+that every zoder drives through `<data dir>/daemon.sock`, and it deliberately
+outlives the run that happened to start it. It is spared when this zoder
+spawned it (the pid `spawn()` returned, recorded the instant the child exists),
+when it is the pid recorded for that socket (`<data dir>/daemon.pid`, so
+another zoder's reap scope can spare it too), or when `/proc/<pid>/exe` is the
+zeroclaw binary. The daemon is also started with a neutral cwd of its own — its
+config directory, falling back to `$HOME` then `/` — so it never sits inside a
+job workspace in the first place; on 2026-10-21 a loop spawned it with no
+`current_dir`, it inherited that job's directory, and it matched every rule in
+the list above while serving everybody else on the host. The daemon's children
+are not exempt (they are the agent's tool shells, which is the whole reason the
+reap exists), and another session's leftovers remain protected by the `-C` rule.
+
 Pass `--no-reap` to turn it off when something else owns the workspace and you
 expect its processes to outlive the run.
 

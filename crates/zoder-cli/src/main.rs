@@ -6776,13 +6776,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         .open(&stderr_log)
         .ok();
 
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("daemon")
-        .arg("--ephemeral")
-        .arg("--config-dir")
-        .arg(&config_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
+    let mut cmd = daemon_command(&bin, &config_dir);
     if let Some(file) = stderr_file {
         cmd.stderr(std::process::Stdio::from(file));
     } else {
@@ -6799,6 +6793,10 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
             bin.display()
         ))
     })?;
+    // Record the daemon's identity the moment it exists — not after the
+    // handshake — so no reap scope can ever select it (see
+    // `reaper::note_daemon_pid` and `record_daemon_pid`).
+    record_daemon_pid(child.id());
 
     // Poll readiness with the initialize handshake. Bail early if the child
     // exits during startup; on timeout, kill and reap it before returning.
@@ -6807,6 +6805,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = child.wait();
+                forget_daemon_pid(child.id());
                 return Err(EngineUnavailableError::new(format!(
                     "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6816,6 +6815,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                forget_daemon_pid(child.id());
                 return Err(EngineUnavailableError::new(format!(
                     "failed to poll zeroclaw daemon during startup: {e}; log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6836,6 +6836,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            forget_daemon_pid(child.id());
             return Err(EngineUnavailableError::new(format!(
                 "zeroclaw daemon not ready within 20s ({last_probe}); log tail:\n{}",
                 read_log_tail(&stderr_log)
@@ -6885,6 +6886,132 @@ fn remove_stale_socket(socket: &std::path::Path) {
 /// log — operators know exactly where to look.
 fn daemon_stderr_log_path() -> std::path::PathBuf {
     Config::home().join("logs").join("zeroclaw-daemon.log")
+}
+
+/// Where the ephemeral daemon's pid is recorded, next to the socket that
+/// daemon serves (`<data dir>/daemon.sock` by default, so the two live
+/// together). Zeroclaw itself writes no pid file, so zoder writes one for
+/// the daemon IT spawned: the orphan reaper needs a durable, cross-process
+/// record of "which pid is the shared daemon", because the reaper that has
+/// to spare it is frequently a *different* zoder process than the one that
+/// spawned it (job 01a16164's loop reaping while 01a1619b's agent is mid
+/// turn).
+pub(crate) fn daemon_pid_file_path() -> PathBuf {
+    zeroclaw_data_dir().join("daemon.pid")
+}
+
+/// Record `pid` as the shared zeroclaw daemon: tell the in-process reaper
+/// (exact pid identity — see [`crate::reaper::note_daemon_pid`]) and write
+/// the pid file other zoder processes read.
+///
+/// Best-effort by design. Neither half is allowed to break daemon startup:
+/// a daemon with no pid file is merely harder for a reaper to recognise,
+/// and the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
+/// zeroclaw binary, so the exemption never rests on this file alone.
+fn record_daemon_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    crate::reaper::note_daemon_pid(pid);
+    let path = daemon_pid_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, format!("{pid}\n")) {
+        eprintln!(
+            "[zoder] could not record the daemon pid at {} ({e}); the reap scope will \
+             still spare this daemon by executable identity, and any other zoder \
+             process may not",
+            path.display()
+        );
+    }
+}
+
+/// Drop the pid-file record of `pid`, and only of `pid`: a daemon that
+/// died during startup must not leave a pid file behind that names a pid the
+/// kernel will later hand to somebody else. Removing the file when a
+/// DIFFERENT pid is recorded would be a race we can win nothing by — the
+/// newer record is the truthful one.
+fn forget_daemon_pid(pid: u32) {
+    if pid != 0 && crate::reaper::recorded_daemon_pid(&daemon_pid_file_path()) == Some(pid) {
+        let _ = std::fs::remove_file(daemon_pid_file_path());
+    }
+}
+
+/// The working directory for the spawned daemon: a stable, NEUTRAL
+/// directory, never the caller's cwd.
+///
+/// 2026-10-21 (ACHILLES): `zeroclaw daemon --ephemeral` inherited the cwd
+/// of whichever zoder happened to spawn it first — job `01a16164`'s
+/// `zoder loop`, so the daemon sat in `/home/jasonperlow/hive-workspaces/
+/// 01a16164-…` while every OTHER zoder on the host talked to it over
+/// `~/.zoder/data/daemon.sock`. That made the daemon a child of one job's
+/// directory in two separate ways: the orphan reaper could select it (same
+/// uid, cwd inside `-C`, started after the loop began) and SIGTERM the
+/// agent of every other concurrent zoder on the host, and the Hive cleanup
+/// could delete a directory a live shared daemon was sitting in.
+///
+/// The config dir is the right home for it: it is where the daemon keeps
+/// its own state (`--config-dir`), it exists for the life of the install,
+/// and no job cleanup removes it. `$HOME` then `/` are fallbacks for the
+/// case where it cannot be used — both are equally neutral, and `/` always
+/// exists.
+///
+/// The directory is created on demand: `Command::current_dir` fails the
+/// spawn outright if the path does not exist, which would turn a first-ever
+/// run into "engine unavailable".
+fn daemon_working_dir(config_dir: &Path) -> PathBuf {
+    neutral_daemon_dir(config_dir, dirs::home_dir())
+}
+
+/// The pure selection core of [`daemon_working_dir`], with the home directory
+/// passed in so the fallbacks are testable without mutating the process
+/// environment (`$HOME` cannot be unset safely in a parallel test binary).
+fn neutral_daemon_dir(config_dir: &Path, home: Option<PathBuf>) -> PathBuf {
+    if !config_dir.as_os_str().is_empty() && usable_or_creatable(config_dir) {
+        return config_dir.to_path_buf();
+    }
+    // Never CREATE a home directory out of an environment variable: an unset
+    // or bogus `$HOME` would create junk at whatever absolute path it names.
+    // It only has to be usable, not creatable.
+    if let Some(home) = home {
+        if !home.as_os_str().is_empty() && home.is_dir() {
+            return home;
+        }
+    }
+    // The filesystem root: always exists, is never a job directory, and is
+    // never removed by job cleanup. The last resort, and never the caller's
+    // cwd (which is the entire bug).
+    PathBuf::from("/")
+}
+
+fn usable_or_creatable(dir: &Path) -> bool {
+    dir.is_dir() || (std::fs::create_dir_all(dir).is_ok() && dir.is_dir())
+}
+
+/// The exact argv and working directory used for the ephemeral daemon.
+///
+/// Split out of [`ensure_engine_daemon`] so the spawn's cwd is a testable
+/// seam: the regression test drives a fixture binary through THIS builder,
+/// so "the daemon never inherits the caller's cwd" is pinned by the same
+/// code path production uses. stderr is the caller's business (a log file
+/// when one could be opened, inherited otherwise).
+fn daemon_command(bin: &Path, config_dir: &Path) -> std::process::Command {
+    let working_dir = daemon_working_dir(config_dir);
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("daemon")
+        .arg("--ephemeral")
+        .arg("--config-dir")
+        .arg(config_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .current_dir(&working_dir);
+    eprintln!(
+        "[zoder] starting the shared zeroclaw daemon (pid recorded at {}, cwd {})",
+        daemon_pid_file_path().display(),
+        working_dir.display()
+    );
+    cmd
 }
 
 /// In-process registry of ephemeral daemon children spawned by
@@ -7062,6 +7189,173 @@ mod ephemeral_daemon_reap_tests {
         assert!(
             reaped >= 1,
             "a finished child must be reaped on the next sweep; got {reaped}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_cwd_tests {
+    //! The shared daemon must not live in a job directory.
+    //!
+    //! 2026-10-21 (ACHILLES): `zoder loop` for hive job `01a16164` spawned
+    //! `zeroclaw daemon --ephemeral` with no `current_dir`, so the daemon
+    //! inherited that job's workspace and served `~/.zoder/data/daemon.sock`
+    //! to every other zoder on the host while sitting in one job's directory.
+    //! It then matched every rule of the orphan reaper's ownership test and
+    //! could be SIGTERM'd, killing another session's agent.
+    //!
+    //! These tests drive the PRODUCTION spawn builder ([`daemon_command`])
+    //! with a fixture binary and then read `/proc/<pid>/cwd` — the exact
+    //! thing the reaper looks at, and the exact thing the Hive cleanup looks
+    //! at when it deletes a workspace.
+    //!
+    //! The test process itself is never `chdir`ed into a workspace: it is one
+    //! process shared with every other test in this binary, so mutating its
+    //! cwd would be a global side effect. Asserting that the child's cwd is
+    //! the config dir AND differs from the caller's pins the defect just as
+    //! tightly, because pre-fix the two were the same value.
+
+    use super::{daemon_command, daemon_working_dir, neutral_daemon_dir};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Kill a fixture by exact pid and collect it. Never by name.
+    fn kill_exact(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn install_fixture(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nsleep 600\n").expect("write the fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat the fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("make the fixture executable");
+        path
+    }
+
+    /// `/proc/<pid>/cwd` as the reaper sees it, retried briefly because the
+    /// child needs a moment to reach `execve`.
+    fn proc_cwd(pid: u32) -> Option<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(cwd) => return Some(cwd),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The incident: the daemon is spawned from inside a job workspace and
+    /// must still end up in a neutral directory.
+    #[test]
+    fn the_daemon_is_spawned_in_the_config_dir_not_the_callers_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("zoder-config");
+        let fixture = install_fixture(dir.path(), "fake-zeroclaw");
+        let caller_cwd = std::env::current_dir().expect("caller cwd");
+
+        let child = daemon_command(&fixture, &config_dir)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the fixture through the production builder");
+        let pid = child.id();
+        let observed = proc_cwd(pid);
+        kill_exact(child);
+
+        let observed = observed.expect("the spawned daemon must have a readable cwd");
+        let expected = std::fs::canonicalize(&config_dir).expect("config dir was created");
+        assert_eq!(
+            observed, expected,
+            "the shared daemon must run in the config dir it was pointed at"
+        );
+        assert_ne!(
+            observed,
+            caller_cwd.canonicalize().unwrap_or(caller_cwd),
+            "the daemon must not inherit the caller's cwd; that is what put a shared \
+             daemon inside one job's workspace"
+        );
+    }
+
+    /// The config dir is created on demand: `Command::current_dir` fails the
+    /// spawn outright on a missing path, so a first-ever run must not turn
+    /// into "engine unavailable".
+    #[test]
+    fn the_config_dir_is_created_when_it_does_not_exist_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("nested").join("zoder-config");
+        assert!(!config_dir.exists());
+        assert_eq!(daemon_working_dir(&config_dir), config_dir);
+        assert!(
+            config_dir.is_dir(),
+            "the daemon's cwd must exist before the spawn, or the spawn fails"
+        );
+    }
+
+    /// An existing config dir is used as-is, and a home directory is only ever
+    /// used, never created out of an environment variable.
+    #[test]
+    fn the_home_fallback_is_used_only_when_the_config_dir_is_unusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home dir");
+        // A regular file where the config dir should be: it can neither be
+        // used nor created.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("write");
+
+        assert_eq!(neutral_daemon_dir(&blocked, Some(home.clone())), home);
+        assert_eq!(neutral_daemon_dir(Path::new(""), Some(home.clone())), home);
+        // No usable home and no usable config dir: the filesystem root. Never
+        // the caller's cwd, which is the bug.
+        assert_eq!(neutral_daemon_dir(&blocked, None), PathBuf::from("/"));
+        // A config dir always wins over $HOME.
+        let config_dir = dir.path().join("cfg");
+        assert_eq!(
+            neutral_daemon_dir(&config_dir, Some(home)),
+            config_dir,
+            "the daemon's own state directory is the neutral home for it"
+        );
+    }
+
+    /// The pid of the daemon THIS zoder spawned is recorded the moment it
+    /// exists: in the reap scope's own registry and in the pid file the
+    /// reaper reads, so no reap can select it.
+    #[test]
+    fn the_spawned_daemon_pid_is_recorded_for_the_reaper() {
+        let pidfile = super::daemon_pid_file_path();
+        assert!(
+            pidfile.ends_with("daemon.pid"),
+            "the pid must be recorded next to the socket it serves: {}",
+            pidfile.display()
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = install_fixture(dir.path(), "fake-zeroclaw");
+        let child = Command::new(&fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the fixture");
+        let pid = child.id();
+        super::reaper::note_daemon_pid(pid);
+        assert!(
+            super::reaper::daemon_pid_spared(pid),
+            "the pid a spawn just handed us must be exempt from our reap scope: \
+             this process spawned it, and the daemon outlives us by design"
+        );
+        kill_exact(child);
+        // pid 0 is not an identity; recording it must not make pid 0 exempt.
+        super::record_daemon_pid(0);
+        assert!(
+            !super::reaper::daemon_pid_spared(0),
+            "a zero pid is not a daemon and must not become one"
         );
     }
 }
