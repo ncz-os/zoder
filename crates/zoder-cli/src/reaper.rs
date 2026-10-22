@@ -500,7 +500,6 @@ fn install_signal_handler(plan: ReapPlan) {
 // /proc access. Linux only; everything above is a no-op elsewhere.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
 struct ProcStat {
     state: String,
     comm: String,
@@ -513,20 +512,31 @@ struct ProcStat {
 /// `rfind(')')`: a process named `foo)bar` would end the parse early. The
 /// closing paren is the first one followed by the state field — a single
 /// letter from `/proc`'s state set followed by whitespace.
-#[cfg(target_os = "linux")]
+/// Parse `/proc/<pid>/stat`. Field 2 (`comm`) is parenthesized and may contain
+/// spaces AND parentheses, so the closing paren has to be found without
+/// assuming a well-behaved command name:
+///
+/// * the LAST `)` followed by the state field wins. That is correct when comm
+///   itself contains `)` (`42 (worker) R) S 7 ...` — the embedded `)` is
+///   followed by `) S`, which is not a state field, and the real close is the
+///   final candidate.
+/// * the FIRST such `)` is the fallback, for the other direction: a kernel that
+///   renders `wchan` symbolically puts a paren later in the line.
+/// * a candidate must have the state field (one letter from /proc's state set)
+///   followed by whitespace AND enough remaining fields to reach `starttime`.
 fn parse_stat(raw: &str) -> Option<ProcStat> {
-    const STATES: &str = "RSDZTtWXxKPI";
     let open = raw.find('(')?;
     let after_open = raw.get(open + 1..)?;
-    let close = after_open.char_indices().find_map(|(i, c)| {
-        if c != ')' {
-            return None;
-        }
-        let tail = after_open.get(i + 1..)?.trim_start();
-        let mut chars = tail.chars();
-        let state = chars.next()?;
-        (STATES.contains(state) && chars.as_str().starts_with(' ')).then_some(i)
-    })?;
+    let close = after_open
+        .char_indices()
+        .rev()
+        .find(|(i, c)| *c == ')' && valid_stat_tail(&after_open[i + 1..]))
+        .or_else(|| {
+            after_open
+                .char_indices()
+                .find(|(i, c)| *c == ')' && valid_stat_tail(&after_open[i + 1..]))
+        })
+        .map(|(i, _)| i)?;
     let comm = after_open.get(..close)?.to_string();
     let rest = after_open.get(close + 1..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -540,6 +550,19 @@ fn parse_stat(raw: &str) -> Option<ProcStat> {
         ppid,
         start_ticks,
     })
+}
+
+/// Does the text after a candidate `)` start a plausible stat tail?
+fn valid_stat_tail(tail: &str) -> bool {
+    const STATES: &str = "RSDZTtWXxKPI";
+    let tail = tail.trim_start();
+    let mut chars = tail.chars();
+    let Some(state) = chars.next() else {
+        return false;
+    };
+    STATES.contains(state)
+        && chars.as_str().starts_with(' ')
+        && tail.split_whitespace().count() >= 20
 }
 
 #[cfg(target_os = "linux")]
@@ -703,6 +726,24 @@ fn signal(pid: u32, sig: i32) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
+}
+
+// --------------------------------------------------------------------------
+// Non-Linux: no /proc, so nothing is ever selected and `reap` finds no
+// candidates. The module still has to COMPILE there — every helper the shared
+// code path calls needs an arm, or the crate breaks the moment someone builds
+// zoder on a mac. `confirm_identity` returning `Recycled` is the safe answer:
+// with no candidates there is nothing to signal anyway.
+// --------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
+fn read_stat(_pid: u32) -> Option<ProcStat> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_uid(_pid: u32) -> Option<u32> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1202,6 +1243,25 @@ mod tests {
         assert!(alive(bystander), "the bystander survives");
 
         kill_exact(bystander);
+    }
+
+    /// A root of `/` would select every process on the host. Refuse it.
+    /// A command name may contain a paren followed by a state-looking token
+    /// (`worker) R`). Splitting on the FIRST such paren shifts every later
+    /// field by one and reads `starttime` from the wrong column — which
+    /// silently changes WHICH processes the reaper is allowed to kill.
+    #[test]
+    fn stat_parser_survives_a_comm_that_ends_with_a_state_like_token() {
+        // comm is `worker) R`: the line is `42 (worker) R) S 7 7 ...`.
+        let raw = "42 (worker) R) S 7 7 7 0 -1 4194304 100 0 0 0 1 2 3 4 20 0 1 0 424242 1 2 3";
+        let stat = parse_stat(raw).expect("parse");
+        assert_eq!(stat.comm, "worker) R", "comm keeps the embedded paren");
+        assert_eq!(
+            stat.state, "S",
+            "state is the REAL state field, not the comm's"
+        );
+        assert_eq!(stat.ppid, 7, "ppid is field 4");
+        assert_eq!(stat.start_ticks, 424242, "starttime is field 22");
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
