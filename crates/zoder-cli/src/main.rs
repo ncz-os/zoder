@@ -6892,50 +6892,129 @@ fn daemon_stderr_log_path() -> std::path::PathBuf {
 /// daemon serves (`<data dir>/daemon.sock` by default, so the two live
 /// together). Zeroclaw itself writes no pid file, so zoder writes one for
 /// the daemon IT spawned: the orphan reaper needs a durable, cross-process
-/// record of "which pid is the shared daemon", because the reaper that has
-/// to spare it is frequently a *different* zoder process than the one that
-/// spawned it (job 01a16164's loop reaping while 01a1619b's agent is mid
-/// turn).
+/// record of "which process is the shared daemon", because the reaper that
+/// has to spare it is frequently a *different* zoder process than the one
+/// that spawned it (job 01a16164's loop reaping while 01a1619b's agent is
+/// mid turn).
+///
+/// The record is `<pid> <start_ticks>`. A pid alone is not an identity and
+/// the kernel recycles pids, so a pid-only file would let a stale record
+/// spare whichever unrelated process later inherits that number — the one
+/// failure mode an identity-based exemption must not have. Starttime is what
+/// a reader re-checks before honouring the record, exactly as the reap scope
+/// re-checks it before every signal.
 pub(crate) fn daemon_pid_file_path() -> PathBuf {
     zeroclaw_data_dir().join("daemon.pid")
 }
 
+/// A daemon identity: pid plus the boot-relative clock tick the process
+/// started at. Both halves must match before a reader spares anything.
+pub(crate) type DaemonIdentity = (u32, u64);
+
 /// Record `pid` as the shared zeroclaw daemon: tell the in-process reaper
 /// (exact pid identity — see [`crate::reaper::note_daemon_pid`]) and write
-/// the pid file other zoder processes read.
+/// the record other zoder processes read.
 ///
 /// Best-effort by design. Neither half is allowed to break daemon startup:
-/// a daemon with no pid file is merely harder for a reaper to recognise,
-/// and the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
+/// a daemon with no record is merely harder for a reaper to recognise, and
+/// the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
 /// zeroclaw binary, so the exemption never rests on this file alone.
 fn record_daemon_pid(pid: u32) {
     if pid == 0 {
         return;
     }
+    // In-process first: this needs no /proc read to be useful, and it is the
+    // arm that covers the window between spawn and the first reap scan.
     crate::reaper::note_daemon_pid(pid);
+    let Some(identity) = read_daemon_identity(pid) else {
+        // The child died before /proc could be read. There is no daemon to
+        // spare any more, so there is nothing to record.
+        return;
+    };
     let path = daemon_pid_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&path, format!("{pid}\n")) {
+    if let Err(e) = std::fs::write(&path, format!("{} {}\n", identity.0, identity.1)) {
         eprintln!(
-            "[zoder] could not record the daemon pid at {} ({e}); the reap scope will \
-             still spare this daemon by executable identity, and any other zoder \
+            "[zoder] could not record the daemon identity at {} ({e}); the reap scope \
+             will still spare this daemon by executable identity, and any other zoder \
              process may not",
             path.display()
         );
     }
 }
 
-/// Drop the pid-file record of `pid`, and only of `pid`: a daemon that
-/// died during startup must not leave a pid file behind that names a pid the
-/// kernel will later hand to somebody else. Removing the file when a
-/// DIFFERENT pid is recorded would be a race we can win nothing by — the
+/// Drop the record of `pid`, and only when the live process IS the daemon the
+/// record names: a daemon that died during startup must not leave a record
+/// behind that the kernel will later hand to somebody else. Removing a
+/// DIFFERENT daemon's record would be a race we can win nothing by — the
 /// newer record is the truthful one.
 fn forget_daemon_pid(pid: u32) {
-    if pid != 0 && crate::reaper::recorded_daemon_pid(&daemon_pid_file_path()) == Some(pid) {
+    if pid == 0 {
+        return;
+    }
+    let live = read_daemon_identity(pid);
+    if live.is_some() && read_daemon_record(&daemon_pid_file_path()) == live {
         let _ = std::fs::remove_file(daemon_pid_file_path());
     }
+}
+
+/// Parse the daemon identity recorded at `path`, if it is a plausible one.
+///
+/// `pid <= 1` is rejected outright: init is not a daemon and pid 0 names
+/// nothing. A record with no start time is rejected too — nothing this build
+/// writes is ever pid-only, and honouring one would be exactly the "stale pid
+/// spares a stranger" failure the start time exists to prevent. The start
+/// time is still only a RECORD here; [`crate::reaper`] re-checks the live
+/// process before sparing it.
+pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut fields = raw.split_whitespace();
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    let start_ticks = fields.next()?.parse::<u64>().ok()?;
+    // Exactly two fields, written by this build and nothing else. A record
+    // with trailing junk was not written by `record_daemon_pid`, so nothing
+    // about it can be assumed.
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((pid, start_ticks))
+}
+
+/// `(pid, start_ticks)` for a live process, retried briefly so a pid that was
+/// forked a moment ago is not missed. Reads `/proc`, so it yields `None`
+/// everywhere else — which only costs the cross-process record, never the
+/// in-process one.
+fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    loop {
+        if let Some(identity) = read_daemon_identity_once(pid) {
+            return Some(identity);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn read_daemon_identity_once(pid: u32) -> Option<DaemonIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 22 (`starttime`) counting from field 3, i.e. index 19 after the
+    // state field. Taken from the LAST ')' so a comm containing spaces or
+    // parentheses cannot shift the index — same reasoning as the reaper's own
+    // `parse_stat`.
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some((pid, start_ticks))
 }
 
 /// The working directory for the spawned daemon: a stable, NEUTRAL
