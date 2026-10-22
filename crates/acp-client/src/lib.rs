@@ -685,7 +685,7 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
 
 /// ACP protocol version the daemon's `initialize` expects (matches
 /// `zeroclaw_api::jsonrpc` and `engine_cost.rs`).
-const ACP_PROTOCOL_VERSION: u64 = 1;
+pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 /// Timeout for a short, read-only daemon RPC (for example `agents/status`).
 /// These calls are used by CLI inventory commands and must not hang forever if
