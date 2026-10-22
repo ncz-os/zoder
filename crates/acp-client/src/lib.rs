@@ -45,7 +45,25 @@ pub async fn track_session_id<F: std::future::Future>(
     SESSION_TRACKER.scope(tracker, turn).await
 }
 
+/// A process-global hook fired the moment an engine session is minted, before
+/// the turn that will use it returns. `zoder`'s reap scope installs one so a
+/// SIGTERM arriving MID-TURN can still cancel the session that is editing the
+/// tree right now: waiting for the turn to return would leave exactly the
+/// live turn uncancellable. First registration wins; a second call is ignored.
+type SessionObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+static SESSION_OBSERVER: std::sync::OnceLock<SessionObserver> = std::sync::OnceLock::new();
+
+/// Install the process-global "a session was just minted" hook. See
+/// [`SESSION_OBSERVER`].
+pub fn set_session_observer(observer: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = SESSION_OBSERVER.set(std::sync::Arc::new(observer));
+}
+
 fn record_active_session(session: &str) {
+    if let Some(observer) = SESSION_OBSERVER.get() {
+        observer(session);
+    }
     let _ = SESSION_TRACKER.try_with(|tracker| {
         *tracker.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.to_owned());
     });
@@ -54,6 +72,27 @@ fn record_active_session(session: &str) {
 #[cfg(test)]
 mod watchdog_session_tests {
     use super::*;
+
+    /// The reap scope learns a session id from this hook, and it has to fire
+    /// while the turn is still running: a SIGTERM mid-turn can only cancel a
+    /// session that was already observed.
+    #[test]
+    fn minted_session_reaches_the_process_global_observer() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        set_session_observer(move |id| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(id.to_owned());
+        });
+        record_active_session("minted-for-the-reaper");
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            seen.iter().any(|id| id == "minted-for-the-reaper"),
+            "every minted session must reach the observer, got {seen:?}"
+        );
+    }
 
     #[tokio::test]
     async fn fresh_session_is_available_to_watchdog_before_prompt() {
@@ -646,7 +685,7 @@ pub async fn connect_transport(transport: &EngineTransport) -> anyhow::Result<Co
 
 /// ACP protocol version the daemon's `initialize` expects (matches
 /// `zeroclaw_api::jsonrpc` and `engine_cost.rs`).
-const ACP_PROTOCOL_VERSION: u64 = 1;
+pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 /// Timeout for a short, read-only daemon RPC (for example `agents/status`).
 /// These calls are used by CLI inventory commands and must not hang forever if

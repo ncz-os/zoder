@@ -4596,6 +4596,20 @@ pub(crate) async fn cmd_rescue(
         }
         return Ok(());
     }
+    // The reap scope opens HERE, after the background submitter has returned:
+    // the submitter owns nothing in the workspace, and the detached worker it
+    // just spawned is the process that must reap. See [`crate::reaper`].
+    let mut reap = crate::reaper::ReapGuard::begin(&cwd, &std::env::temp_dir(), cli.no_reap);
+    let result = cmd_rescue_run(cli, task).await;
+    // Cancel the agent session FIRST (so a ghost turn stops editing), then
+    // reap whatever it left running — on the success and the failure path
+    // alike. The guard reaps again from `Drop` if this is ever unwound.
+    reap.cancel_then_reap(crate::reaper::REAP_CANCEL_BUDGET)
+        .await;
+    result
+}
+
+async fn cmd_rescue_run(cli: &crate::Cli, task: &[String]) -> anyhow::Result<()> {
     let task_txt = task.join(" ");
     let task_txt = if task_txt.trim().is_empty() {
         crate::read_prompt(None)?
@@ -4616,6 +4630,8 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // nothing to show for it.
     let engine_kind = crate::resolve_engine_kind(cli)?;
     let t = crate::agentic_turn(cli, engine_kind, prompt, None, !cli.json, None).await?;
+    // The session was already recorded when the engine minted it (see
+    // `reaper::note_session`), which is what lets a SIGTERM mid-turn cancel it.
 
     let ok = t.run.succeeded();
     let timed_out = t.run.outcome == "timeout";
@@ -5911,7 +5927,59 @@ pub(crate) async fn cmd_loop(
         }
         return Ok(());
     }
+    // The reap scope opens HERE, after the background submitter has returned:
+    // the submitter owns nothing in the workspace, and the detached worker it
+    // just spawned is the process that must reap. Recording the loop-start
+    // instant at this point is what makes "started after the loop began"
+    // decidable — see [`crate::reaper`].
+    let mut reap = crate::reaper::ReapGuard::begin(&cwd, &std::env::temp_dir(), cli.no_reap);
+    let result = cmd_loop_run(
+        cli,
+        task,
+        instructions,
+        max_iters,
+        check,
+        reviewer,
+        base,
+        scope,
+        accept_on_green,
+        loop_timeout_secs,
+        agent_timeout_secs,
+        allow_dangerous_check,
+        require_approval,
+        &cwd,
+    )
+    .await;
+    // Every exit path — resolved, unresolved, author/check/review timeout,
+    // free-policy bail — lands here. Cancel the agent session first (a ghost
+    // turn is still editing the tree), then kill what it left running. The
+    // guard reaps again from `Drop`, so a panic unwinding out of
+    // `cmd_loop_run` is covered too.
+    reap.cancel_then_reap(crate::reaper::REAP_CANCEL_BUDGET)
+        .await;
+    result
+}
 
+/// The loop body proper. Split out of [`cmd_loop`] so the reap scope can wrap
+/// every exit path in one place instead of being threaded through the loop's
+/// `break`/`bail!`/timeout exits.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_loop_run(
+    cli: &crate::Cli,
+    task: &[String],
+    instructions: Option<String>,
+    max_iters: usize,
+    check: Option<String>,
+    reviewer: Option<String>,
+    base: Option<String>,
+    scope: ReviewScope,
+    accept_on_green: bool,
+    loop_timeout_secs: u64,
+    agent_timeout_secs: u64,
+    allow_dangerous_check: bool,
+    require_approval: bool,
+    cwd: &Path,
+) -> anyhow::Result<()> {
     // Read the operator's exec-safety policy (the OS-level sandbox backend
     // selection — see `zoder_core::ExecSafetyConfig`). Default = `None`
     // preserves the pre-sandbox byte-for-byte behavior. We do this once at
@@ -5976,7 +6044,7 @@ pub(crate) async fn cmd_loop(
     // identity — see `enforce_repo_commit_author`). `None` when the repo has
     // no commits yet; the transition `None -> Some(sha)` then triggers a
     // correction on the first author-made commit.
-    let mut prev_head: Option<String> = rev_parse_head(&cwd);
+    let mut prev_head: Option<String> = rev_parse_head(cwd);
     // The review base is the HEAD the loop started from. `prev_head` mutates
     // every iteration; this one must not. An explicit `--base` still wins.
     let loop_start_head: Option<String> = prev_head.clone();
@@ -5988,8 +6056,8 @@ pub(crate) async fn cmd_loop(
     // never wrote, resolution on somebody else's diff). Reviewing
     // `start tree -> working tree now` instead attributes exactly the loop's
     // own bytes. Captured before any turn, so it cannot race the author.
-    let loop_start = loop_start_state(&cwd);
-    let review_root = crate::review_diff::repo_root(&cwd);
+    let loop_start = loop_start_state(cwd);
+    let review_root = crate::review_diff::repo_root(cwd);
     if !cli.quiet {
         match (&loop_base, base.as_deref(), loop_start.tree.as_deref()) {
             (Some(b), None, Some(tree)) => eprintln!(
@@ -6035,12 +6103,12 @@ pub(crate) async fn cmd_loop(
     // including commits made by the author, against the initial working state.
     // Auto must never switch to an unrelated branch diff after a commit.
     let mut task_journal = PatchJournal::new();
-    task_journal.record_baseline(&cwd);
+    task_journal.record_baseline(cwd);
     for i in 1..=max_iters {
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
-        journal.record_baseline(&cwd);
+        journal.record_baseline(cwd);
         // 1. Author turn — continue the SAME engine session for memory when
         //    the same agent is still serving the turn (see `continuity`).
         let author_prompt = if i == 1 {
@@ -6193,10 +6261,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         //    was push-safe. See `enforce_repo_commit_author` for the
         //    invariants (author-only, no-op when already correct, no-op
         //    when no configured identity).
-        let current_head: Option<String> = rev_parse_head(&cwd);
+        let current_head: Option<String> = rev_parse_head(cwd);
         let commit_author_enforcement: Option<CommitAuthorEnforcement> =
             if current_head != prev_head {
-                let result = enforce_repo_commit_author(&cwd);
+                let result = enforce_repo_commit_author(cwd);
                 if let CommitAuthorEnforcement::Corrected { from, to } = &result {
                     if !cli.quiet {
                         eprintln!("[zoder] corrected commit author: {from} -> {to}");
@@ -6209,7 +6277,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
         let (label, diff) = loop_task_diff(
-            &cwd,
+            cwd,
             scope,
             base.as_deref(),
             Some(&loop_start),
@@ -6259,7 +6327,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 }
                 let t0 = std::time::Instant::now();
                 let (ok, tail) = run_check_watched(
-                    &cwd,
+                    cwd,
                     c,
                     loop_timeout_secs,
                     allow_dangerous_check,
@@ -6394,7 +6462,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // Read `.zoderignore` from the loop's base revision so a change under
         // review cannot exempt itself.
         let zoderignore = match loop_base.as_deref() {
-            Some(rev) => crate::review_diff::load_zoderignore_at(&cwd, rev),
+            Some(rev) => crate::review_diff::load_zoderignore_at(cwd, rev),
             None => crate::review_diff::load_zoderignore(&review_root),
         };
         let mut review_error: Option<String> = None;
@@ -6575,11 +6643,11 @@ or comment.\n"
         }));
 
         crate::mnemos::checkpoint(
-            &cwd,
+            cwd,
             json!({
                 "job_id": std::env::var("HIVE_JOB_ID").ok(),
                 "workspace": cwd.to_string_lossy(), "iteration": i,
-                "head_sha": rev_parse_head(&cwd), "files": touched,
+                "head_sha": rev_parse_head(cwd), "files": touched,
                 "check_passed": check_passed, "verdict": review.verdict,
                 "blocking_findings": blocking,
                 // D. Bounded, sanitized handoff: severity/title/location of the

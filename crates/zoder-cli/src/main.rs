@@ -15,6 +15,7 @@ mod goose;
 mod jobs;
 mod mnemos;
 mod provider_slots;
+mod reaper;
 mod review_context;
 mod review_diff;
 mod reviewer_pool;
@@ -507,6 +508,15 @@ struct Cli {
     /// Disable the cross-model fallback chain (use only the routed primary).
     #[arg(long, global = true)]
     no_fallback: bool,
+    /// Do not reap processes the agent left behind in the workspace when
+    /// `loop`/`rescue` ends. By default a loop or rescue cancels its agent
+    /// session and then SIGTERM/SIGKILLs any same-uid process whose cwd is
+    /// the `-C` directory (or this run's own scratch directory under the temp
+    /// root) and that started while the run was going. Only pass this when
+    /// something else owns the workspace and you expect its processes to
+    /// outlive the run.
+    #[arg(long, global = true)]
+    no_reap: bool,
 
     // ---- sessions ----
     /// Attach to a named multi-turn session (creates it if missing).
@@ -6822,13 +6832,8 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         .open(&stderr_log)
         .ok();
 
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("daemon")
-        .arg("--ephemeral")
-        .arg("--config-dir")
-        .arg(&config_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
+    announce_daemon_spawn(&daemon_working_dir(&config_dir));
+    let mut cmd = daemon_command(&bin, &config_dir);
     if let Some(file) = stderr_file {
         cmd.stderr(std::process::Stdio::from(file));
     } else {
@@ -6845,6 +6850,10 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
             bin.display()
         ))
     })?;
+    // Record the daemon's identity the moment it exists — not after the
+    // handshake — so no reap scope can ever select it (see
+    // `reaper::note_daemon_identity` and `record_daemon_pid`).
+    let daemon_identity = record_daemon_pid(child.id());
 
     // Poll readiness with the initialize handshake. Bail early if the child
     // exits during startup; on timeout, kill and reap it before returning.
@@ -6853,6 +6862,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = child.wait();
+                forget_daemon_record(daemon_identity);
                 return Err(EngineUnavailableError::new(format!(
                     "zeroclaw daemon exited during startup ({status}); log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6862,6 +6872,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                forget_daemon_record(daemon_identity);
                 return Err(EngineUnavailableError::new(format!(
                     "failed to poll zeroclaw daemon during startup: {e}; log tail:\n{}",
                     read_log_tail(&stderr_log)
@@ -6882,6 +6893,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            forget_daemon_record(daemon_identity);
             return Err(EngineUnavailableError::new(format!(
                 "zeroclaw daemon not ready within 20s ({last_probe}); log tail:\n{}",
                 read_log_tail(&stderr_log)
@@ -6931,6 +6943,321 @@ fn remove_stale_socket(socket: &std::path::Path) {
 /// log — operators know exactly where to look.
 fn daemon_stderr_log_path() -> std::path::PathBuf {
     Config::home().join("logs").join("zeroclaw-daemon.log")
+}
+
+/// Where the ephemeral daemon's pid is recorded, next to the socket that
+/// daemon serves (`<data dir>/daemon.sock` by default, so the two live
+/// together). Zeroclaw itself writes no pid file, so zoder writes one for
+/// the daemon IT spawned: the orphan reaper needs a durable, cross-process
+/// record of "which process is the shared daemon", because the reaper that
+/// has to spare it is frequently a *different* zoder process than the one
+/// that spawned it (job 01a16164's loop reaping while 01a1619b's agent is
+/// mid turn).
+///
+/// The record is `<pid> <start_ticks>`. A pid alone is not an identity and
+/// the kernel recycles pids, so a pid-only file would let a stale record
+/// spare whichever unrelated process later inherits that number — the one
+/// failure mode an identity-based exemption must not have. Starttime is what
+/// a reader re-checks before honouring the record, exactly as the reap scope
+/// re-checks it before every signal.
+pub(crate) fn daemon_pid_file_path() -> PathBuf {
+    zeroclaw_data_dir().join("daemon.pid")
+}
+
+/// A daemon identity: pid plus the boot-relative clock tick the process
+/// started at. Both halves must match before a reader spares anything.
+pub(crate) type DaemonIdentity = (u32, u64);
+
+/// Record `pid` as the shared zeroclaw daemon: tell the in-process reaper
+/// (exact identity — see [`crate::reaper::note_daemon_identity`]) and publish
+/// the record other zoder processes read.
+///
+/// Best-effort by design. Neither half is allowed to break daemon startup:
+/// a daemon with no record is merely harder for a reaper to recognise, and
+/// the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
+/// zeroclaw binary, so the exemption never rests on this file alone.
+fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
+    if pid == 0 {
+        return None;
+    }
+    let identity = read_daemon_identity(pid)?;
+    // In-process first: it needs no filesystem and it is the arm that covers
+    // the window between spawn and the first reap scan.
+    crate::reaper::note_daemon_identity(identity);
+    let path = daemon_pid_file_path();
+    if let Err(e) = write_daemon_record(&path, identity) {
+        eprintln!(
+            "[zoder] could not record the daemon identity at {} ({e}); the reap scope \
+             will still spare this daemon by executable identity, and any other zoder \
+             process may not",
+            path.display()
+        );
+    }
+    Some(identity)
+}
+
+/// Publish the daemon record ATOMICALLY.
+///
+/// `fs::write` on the live path truncates before it writes, so a reaper
+/// scanning concurrently can read an empty record and conclude "not the
+/// daemon" — precisely the window in which another zoder's reap is allowed
+/// to SIGTERM the daemon and kill this one's agent. Write a sibling temp file
+/// and `rename(2)` it over the target: same directory, so the same
+/// filesystem, and the replacement is atomic.
+fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
+    let write = || {
+        // `unwrap_or`, never `unwrap`: an odd path must not turn a daemon
+        // spawn into a panic.
+        let parent = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp = parent.join(format!(".daemon.pid.{}.{}", std::process::id(), nanos));
+        let body = format!("{} {}\n", identity.0, identity.1);
+        let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
+    };
+    with_daemon_record_lock(path, write).unwrap_or_else(write)
+}
+
+/// Parse the daemon identity recorded at `path`, if it is a plausible one.
+///
+/// `pid <= 1` is rejected outright: init is not a daemon and pid 0 names
+/// nothing. A record with no start time is rejected too — nothing this build
+/// writes is ever pid-only, and honouring one would be exactly the "stale pid
+/// spares a stranger" failure the start time exists to prevent. The start
+/// time is still only a RECORD here; [`crate::reaper`] re-checks the live
+/// process before sparing it.
+pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut fields = raw.split_whitespace();
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    let start_ticks = fields.next()?.parse::<u64>().ok()?;
+    // Exactly two fields, written by this build and nothing else. A record
+    // with trailing junk was not written by `record_daemon_pid`, so nothing
+    // about it can be assumed.
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((pid, start_ticks))
+}
+
+/// Run `f` while holding an exclusive lock on the daemon record, across every
+/// zoder process on the host.
+///
+/// This lock is between the two WRITERS, not between writers and readers.
+/// Readers never take it and do not need to: `rename(2)` is what makes a
+/// read see one complete record or the other, and that property does not
+/// depend on any lock. What is NOT atomic on its own is "read it, decide it
+/// is ours, unlink it": between the read and the unlink another zoder can
+/// publish a NEW daemon's record, and this process would delete the live
+/// daemon's cross-process exemption — handing the next reap in another
+/// process the shared daemon. The lock is what makes the compare and the
+/// removal one step.
+///
+/// Returns `None` when the lock could NOT be taken — a read-only data dir, an
+/// exotic filesystem, a lock implementation that fails. The two callers treat
+/// that differently, because the two operations have opposite costs:
+///
+/// * publishing still runs unlocked: `rename` makes the write itself atomic,
+///   so the worst case is two daemons racing to be the recorded one, which is
+///   decided by the readiness probe anyway;
+/// * the compare-and-remove does NOT run unlocked. Deleting a record without
+///   the lock can delete a DIFFERENT daemon's, which strips a live daemon of
+///   its cross-process exemption; leaving a stale record costs nothing at all,
+///   because every reader re-checks the start time before sparing anything.
+fn with_daemon_record_lock<T>(record: &Path, f: impl FnOnce() -> T) -> Option<T> {
+    let lock_path = record.with_extension("pid.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    lock.lock_exclusive().ok()?;
+    // Dropping the handle releases the lock; naming `unlock` here would pick
+    // up std's inherent method, which the crate's MSRV does not have.
+    let out = f();
+    drop(lock);
+    Some(out)
+}
+
+/// Drop the record of a daemon that failed to start, and ONLY that record.
+///
+/// `identity` is what `record_daemon_pid` published, captured at spawn time:
+/// by the time a startup failure is handled the child has already been
+/// `wait`ed, so its `/proc` entry is gone and re-deriving the identity from
+/// the pid would find nothing. Comparing against the recorded pair (rather
+/// than deleting unconditionally) means a daemon that has since been
+/// replaced keeps its own record, and the lock means it cannot be replaced
+/// between the compare and the unlink.
+fn forget_daemon_record(identity: Option<DaemonIdentity>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    crate::reaper::forget_daemon_identity(identity);
+    // Without the lock this is a check-then-act that could delete a different
+    // daemon's record, so it is skipped instead: a stale record is inert.
+    let _ = with_daemon_record_lock(&daemon_pid_file_path(), || {
+        if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
+            let _ = std::fs::remove_file(daemon_pid_file_path());
+        }
+    });
+}
+
+/// `(pid, start_ticks)` for a live process. Reads `/proc`, so it yields `None`
+/// everywhere else — which only costs the cross-process record, never the
+/// in-process one.
+///
+/// The first read normally succeeds: `spawn` returns after `fork`, and the
+/// child is in the process table before the parent can run again. The
+/// retries cover the sliver where it is not yet visible. They are a blocking
+/// sleep on purpose and deliberately short (50 ms total, once per daemon
+/// spawn): this runs on the path that is about to poll the daemon's readiness
+/// handshake for up to 20 s, so 50 ms of blocking is noise, and making it
+/// async would mean making the three cleanup paths async for no benefit.
+fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        if let Some(identity) = crate::reaper::live_identity(pid) {
+            return Some(identity);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The daemon executable zoder would spawn, for the reap exemption to match
+/// against.
+///
+/// `locate_sibling("zeroclaw")` is the same resolver the spawn itself uses,
+/// so the two cannot drift: if this returns a path, that is the file the
+/// daemon is started from, and `/proc/<pid>/exe` for a daemon this zoder
+/// spawned names the same file. When it resolves nothing there is no daemon
+/// binary on this host and the executable arm simply does not fire — the
+/// other two arms (the pid this process spawned, and the record beside the
+/// socket) are identity-based and still spare a running daemon.
+pub(crate) fn daemon_binary_path() -> PathBuf {
+    locate_sibling("zeroclaw")
+        .unwrap_or_else(|| PathBuf::from("zeroclaw").join("unresolved-daemon-binary"))
+}
+
+/// The working directory for the spawned daemon: a stable, NEUTRAL
+/// directory, never the caller's cwd.
+///
+/// 2026-10-21 (ACHILLES): `zeroclaw daemon --ephemeral` inherited the cwd
+/// of whichever zoder happened to spawn it first — job `01a16164`'s
+/// `zoder loop`, so the daemon sat in `/home/jasonperlow/hive-workspaces/
+/// 01a16164-…` while every OTHER zoder on the host talked to it over
+/// `~/.zoder/data/daemon.sock`. That made the daemon a child of one job's
+/// directory in two separate ways: the orphan reaper could select it (same
+/// uid, cwd inside `-C`, started after the loop began) and SIGTERM the
+/// agent of every other concurrent zoder on the host, and the Hive cleanup
+/// could delete a directory a live shared daemon was sitting in.
+///
+/// The config dir is the right home for it: it is where the daemon keeps
+/// its own state (`--config-dir`), it exists for the life of the install,
+/// and no job cleanup removes it. `$HOME` then `/` are fallbacks for the
+/// case where it cannot be used — both are equally neutral, and `/` always
+/// exists.
+///
+/// The directory is created on demand: `Command::current_dir` fails the
+/// spawn outright if the path does not exist, which would turn a first-ever
+/// run into "engine unavailable".
+fn daemon_working_dir(config_dir: &Path) -> PathBuf {
+    neutral_daemon_dir(config_dir, dirs::home_dir())
+}
+
+/// The pure selection core of [`daemon_working_dir`], with the home directory
+/// passed in so the fallbacks are testable without mutating the process
+/// environment (`$HOME` cannot be unset safely in a parallel test binary).
+fn neutral_daemon_dir(config_dir: &Path, home: Option<PathBuf>) -> PathBuf {
+    if !config_dir.as_os_str().is_empty() && usable_or_creatable(config_dir) {
+        return config_dir.to_path_buf();
+    }
+    // Never CREATE a home directory out of an environment variable: an unset
+    // or bogus `$HOME` would create junk at whatever absolute path it names.
+    // It only has to be usable, not creatable.
+    if let Some(home) = home {
+        if !home.as_os_str().is_empty() && usable_as_child_cwd(&home) {
+            return home;
+        }
+    }
+    // The filesystem root: always exists, is never a job directory, and is
+    // never removed by job cleanup. The last resort, and never the caller's
+    // cwd (which is the entire bug).
+    PathBuf::from("/")
+}
+
+fn usable_or_creatable(dir: &Path) -> bool {
+    usable_as_child_cwd(dir) || (std::fs::create_dir_all(dir).is_ok() && usable_as_child_cwd(dir))
+}
+
+/// Can a child actually start in `dir`?
+///
+/// `is_dir()` is not the question. A directory this process cannot SEARCH
+/// looks like a directory, passes `is_dir`, and then fails `Command::
+/// current_dir` — turning a permission detail on the config dir into "engine
+/// unavailable" instead of falling through to `$HOME` and then `/`, which is
+/// the whole point of having a chain.
+fn usable_as_child_cwd(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(raw) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `access` reads the path and reports a permission bit; it does
+    // not dereference anything.
+    unsafe { libc::access(raw.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// The exact argv and working directory used for the ephemeral daemon.
+///
+/// Split out of [`ensure_engine_daemon`] so the spawn's cwd is a testable
+/// seam: the regression test drives a fixture binary through THIS builder,
+/// so "the daemon never inherits the caller's cwd" is pinned by the same
+/// code path production uses. stderr is the caller's business (a log file
+/// when one could be opened, inherited otherwise).
+fn daemon_command(bin: &Path, config_dir: &Path) -> std::process::Command {
+    let working_dir = daemon_working_dir(config_dir);
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("daemon")
+        .arg("--ephemeral")
+        .arg("--config-dir")
+        .arg(config_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .current_dir(&working_dir);
+    cmd
+}
+
+/// Say what was started and from where — at the call site, not inside the
+/// builder, so a test that drives the builder says nothing.
+///
+/// The cwd is not a detail: a daemon that inherited a job's workspace is the
+/// 2026-10-21 incident, and one line naming the directory it actually got is
+/// what makes the next report of that class diagnosable.
+fn announce_daemon_spawn(working_dir: &Path) {
+    eprintln!(
+        "[zoder] starting the shared zeroclaw daemon (identity recorded at {}, cwd {})",
+        daemon_pid_file_path().display(),
+        working_dir.display()
+    );
 }
 
 /// In-process registry of ephemeral daemon children spawned by
@@ -7108,6 +7435,302 @@ mod ephemeral_daemon_reap_tests {
         assert!(
             reaped >= 1,
             "a finished child must be reaped on the next sweep; got {reaped}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod daemon_cwd_tests {
+    //! The shared daemon must not live in a job directory.
+    //!
+    //! 2026-10-21 (ACHILLES): `zoder loop` for hive job `01a16164` spawned
+    //! `zeroclaw daemon --ephemeral` with no `current_dir`, so the daemon
+    //! inherited that job's workspace and served `~/.zoder/data/daemon.sock`
+    //! to every other zoder on the host while sitting in one job's directory.
+    //! It then matched every rule of the orphan reaper's ownership test and
+    //! could be SIGTERM'd, killing another session's agent.
+    //!
+    //! These tests drive the PRODUCTION spawn builder ([`daemon_command`])
+    //! with a fixture binary and then read `/proc/<pid>/cwd` — the exact
+    //! thing the reaper looks at, and the exact thing the Hive cleanup looks
+    //! at when it deletes a workspace.
+    //!
+    //! The test process itself is never `chdir`ed into a workspace: it is one
+    //! process shared with every other test in this binary, so mutating its
+    //! cwd would be a global side effect. Asserting that the child's cwd is
+    //! the config dir AND differs from the caller's pins the defect just as
+    //! tightly, because pre-fix the two were the same value.
+    //!
+    //! Linux-only, like the reaper's own tests: they read `/proc/<pid>/cwd`
+    //! and chmod a fixture, and the crate has to keep building on a mac.
+
+    use super::{daemon_command, daemon_working_dir, neutral_daemon_dir};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Kill a fixture by exact pid and collect it. Never by name.
+    fn kill_exact(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn install_fixture(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nsleep 600\n").expect("write the fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat the fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("make the fixture executable");
+        path
+    }
+
+    /// `/proc/<pid>/cwd` as the reaper sees it, retried briefly because the
+    /// child needs a moment to reach `execve`.
+    fn proc_cwd(pid: u32) -> Option<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(cwd) => return Some(cwd),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The incident: the daemon is spawned from inside a job workspace and
+    /// must still end up in a neutral directory.
+    #[test]
+    fn the_daemon_is_spawned_in_the_config_dir_not_the_callers_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("zoder-config");
+        let fixture = install_fixture(dir.path(), "fake-zeroclaw");
+        let caller_cwd = std::env::current_dir().expect("caller cwd");
+
+        let child = daemon_command(&fixture, &config_dir)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the fixture through the production builder");
+        let pid = child.id();
+        let observed = proc_cwd(pid);
+        kill_exact(child);
+
+        let observed = observed.expect("the spawned daemon must have a readable cwd");
+        let expected = std::fs::canonicalize(&config_dir).expect("config dir was created");
+        assert_eq!(
+            observed, expected,
+            "the shared daemon must run in the config dir it was pointed at"
+        );
+        assert_ne!(
+            observed,
+            caller_cwd.canonicalize().unwrap_or(caller_cwd),
+            "the daemon must not inherit the caller's cwd; that is what put a shared \
+             daemon inside one job's workspace"
+        );
+    }
+
+    /// The config dir is created on demand: `Command::current_dir` fails the
+    /// spawn outright on a missing path, so a first-ever run must not turn
+    /// into "engine unavailable".
+    #[test]
+    fn the_config_dir_is_created_when_it_does_not_exist_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("nested").join("zoder-config");
+        assert!(!config_dir.exists());
+        assert_eq!(daemon_working_dir(&config_dir), config_dir);
+        assert!(
+            config_dir.is_dir(),
+            "the daemon's cwd must exist before the spawn, or the spawn fails"
+        );
+    }
+
+    /// An existing config dir is used as-is, and a home directory is only ever
+    /// used, never created out of an environment variable.
+    #[test]
+    fn the_home_fallback_is_used_only_when_the_config_dir_is_unusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home dir");
+        // A regular file where the config dir should be: it can neither be
+        // used nor created.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("write");
+
+        assert_eq!(neutral_daemon_dir(&blocked, Some(home.clone())), home);
+        assert_eq!(neutral_daemon_dir(Path::new(""), Some(home.clone())), home);
+        // No usable home and no usable config dir: the filesystem root. Never
+        // the caller's cwd, which is the bug.
+        assert_eq!(neutral_daemon_dir(&blocked, None), PathBuf::from("/"));
+        // A config dir always wins over $HOME.
+        let config_dir = dir.path().join("cfg");
+        assert_eq!(
+            neutral_daemon_dir(&config_dir, Some(home)),
+            config_dir,
+            "the daemon's own state directory is the neutral home for it"
+        );
+    }
+
+    /// The executable exemption matches the daemon binary zoder itself would
+    /// spawn, resolved by the same `locate_sibling` the spawn uses. A name
+    /// check would spare anything called `zeroclaw`, including a copy an
+    /// agent dropped in the workspace being reaped.
+    #[test]
+    fn the_exempted_binary_is_the_one_the_spawn_resolves() {
+        // Host-independent: whatever `locate_sibling` resolves (or fails to),
+        // the exemption is pointed at exactly that, so the two cannot drift.
+        let resolved = super::daemon_binary_path();
+        assert_eq!(
+            Some(resolved.clone()),
+            super::locate_sibling("zeroclaw"),
+            "the exemption must target exactly what the spawn resolves"
+        );
+        // When this host HAS the binary, it is the install name zoder looks
+        // for; a host without one is supported and gets the sentinel, not a
+        // panic and not an exemption.
+        if super::locate_sibling("zeroclaw").is_some() {
+            assert!(
+                resolved.ends_with("zeroclaw"),
+                "the exemption must target the install name: {}",
+                resolved.display()
+            );
+        }
+    }
+
+    /// The cross-process record is published atomically. `fs::write` on the
+    /// live path truncates before it writes, so a reaper scanning
+    /// concurrently can read an empty record, conclude "not the daemon", and
+    /// SIGTERM the shared daemon — in exactly the window the record exists to
+    /// close. Temp file plus `rename(2)`: a reader sees the old identity or
+    /// the new one, never a hole.
+    #[test]
+    fn the_daemon_record_is_published_atomically() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.pid");
+        let a: (u32, u64) = (101, 202);
+        let b: (u32, u64) = (303, 404);
+        super::write_daemon_record(&path, a).expect("first record");
+        assert_eq!(super::read_daemon_record(&path), Some(a));
+
+        // Hammer the replacement while a reader spins: every observation must
+        // be one of the two COMPLETE records. `rename` is what makes this
+        // true, and the temp file must not survive it.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, reads, stop) = (path.clone(), Arc::clone(&reads), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match super::read_daemon_record(&path) {
+                        Some(v) => {
+                            assert!(
+                                v == a || v == b,
+                                "a torn read is exactly what this publish path must make \
+                                 impossible: {v:?}"
+                            );
+                            seen += 1;
+                        }
+                        None => panic!("the record must never be unreadable once it is published"),
+                    }
+                }
+                reads.store(seen, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        for i in 0..200u64 {
+            super::write_daemon_record(&path, if i % 2 == 0 { b } else { a }).expect("rewrite");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().expect("reader thread");
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the data dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".daemon.pid."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temp record must be renamed away, never left behind: {leftovers:?}"
+        );
+    }
+
+    /// A directory that cannot be searched is not a working directory, even
+    /// though `is_dir` says it is. Picking one anyway makes the spawn fail
+    /// outright instead of falling through the chain.
+    #[test]
+    fn an_unsearchable_config_dir_falls_through_to_the_home() {
+        if unsafe { libc::geteuid() } == 0 {
+            // root can search anything; the assertion would be vacuous.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("blocked");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        std::fs::create_dir_all(&home).expect("home dir");
+        assert!(blocked.is_dir(), "precondition: it is a directory");
+        let mut perms = std::fs::metadata(&blocked).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&blocked, perms).expect("chmod 000");
+
+        assert_eq!(neutral_daemon_dir(&blocked, Some(home.clone())), home);
+        assert_eq!(neutral_daemon_dir(&blocked, None), PathBuf::from("/"));
+
+        let mut perms = std::fs::metadata(&blocked).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&blocked, perms).expect("chmod back");
+        assert_eq!(
+            neutral_daemon_dir(&blocked, None),
+            blocked,
+            "with search permission back it is the right answer again"
+        );
+    }
+
+    /// The pid of the daemon THIS zoder spawned is recorded the moment it
+    /// exists: in the reap scope's own registry and in the pid file the
+    /// reaper reads, so no reap can select it.
+    #[test]
+    fn the_spawned_daemon_pid_is_recorded_for_the_reaper() {
+        // Pure path resolution: `zeroclaw_data_dir` joins paths and touches
+        // nothing, so this reads no state and creates no file on the host.
+        let pidfile = super::daemon_pid_file_path();
+        assert!(
+            pidfile.ends_with("daemon.pid"),
+            "the pid must be recorded next to the socket it serves: {}",
+            pidfile.display()
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = install_fixture(dir.path(), "fake-zeroclaw");
+        let child = Command::new(&fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the fixture");
+        let pid = child.id();
+        let identity = super::read_daemon_identity(pid).expect("a live fixture is in /proc");
+        super::reaper::note_daemon_identity(identity);
+        assert!(
+            super::reaper::daemon_spared_by_this_process(pid),
+            "the daemon a spawn just handed us must be exempt from our reap scope: \
+             this process spawned it, and the daemon outlives us by design"
+        );
+        kill_exact(child);
+        assert!(
+            !super::reaper::daemon_spared_by_this_process(pid),
+            "once the daemon is gone its exemption must be gone with it, or the next \
+             process to inherit that pid is spared for a daemon that no longer exists"
+        );
+        // pid 0 is not an identity; recording it must not make pid 0 exempt.
+        super::reaper::note_daemon_identity((0, 1));
+        assert!(
+            !super::reaper::daemon_spared_by_this_process(0),
+            "a zero pid is not a daemon and must not become one"
         );
     }
 }
