@@ -18,8 +18,9 @@
 //! * cwd inside the `-C` directory or zoder's own per-run scratch directory
 //!   under the temp root — the workspace the agent was given. Never the temp
 //!   root itself: on a shared host `/tmp` is everybody's cwd,
-//! * started after the loop began (`/proc/<pid>/stat` `starttime`, which no
-//!   pre-existing process can fake),
+//! * not present when the loop began (a pid snapshot taken at scope open) and
+//!   started after it (`/proc/<pid>/stat` `starttime`, which no pre-existing
+//!   process can fake) — the two together are exact at USER_HZ granularity,
 //! * not zoder and not one of zoder's ancestors — never our own tree.
 //!
 //! Selection is by exact PID only. There is no pattern matching anywhere here:
@@ -103,6 +104,11 @@ struct ReapPlan {
     /// empty directory.
     owned_roots: Vec<PathBuf>,
     started_ticks: u64,
+    /// Every pid that existed when the run began. `starttime` is truncated to
+    /// USER_HZ, so a process started a few milliseconds BEFORE the run can
+    /// share the boundary tick exactly; this snapshot is the exact version of
+    /// "started after the loop began", with no granularity window at all.
+    preexisting: HashSet<u32>,
 }
 
 impl ReapPlan {
@@ -112,6 +118,9 @@ impl ReapPlan {
     /// recently" describes all of them. Instead this run gets its own scratch
     /// directory inside it, and that directory is the boundary.
     fn new(cwd: &Path, temp_base: &Path) -> Option<Self> {
+        // Take the pid snapshot and the boot-tick boundary together, before
+        // anything can be spawned on this run's behalf.
+        let preexisting = live_pids();
         let started_ticks = boot_ticks()?;
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut owned_roots: Vec<PathBuf> = Vec::new();
@@ -147,6 +156,7 @@ impl ReapPlan {
             roots,
             owned_roots,
             started_ticks,
+            preexisting,
         })
     }
 
@@ -277,7 +287,7 @@ fn log_outcome(outcome: &ReapOutcome) {
     for entry in &outcome.skipped {
         eprintln!(
             "[zoder] skipped pid={} comm={}: it exited or the pid was recycled before \
-             the signal, so no signal was sent",
+             any signal was sent",
             entry.pid, entry.comm
         );
     }
@@ -365,12 +375,15 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
         if targets.is_empty() {
             break;
         }
+        let mut signalled: HashSet<u32> = HashSet::new();
         for target in &targets {
             if confirm_identity(target, uid) != Identity::Same {
-                // Gone, or the pid now belongs to somebody else.
+                // Gone, or the pid now belongs to somebody else. No signal was
+                // sent, and the log must not claim otherwise.
                 outcome.skipped.push(entry(target, ReapSignal::Term));
                 continue;
             }
+            signalled.insert(target.pid);
             signal(target.pid, libc_sigterm());
         }
         let deadline = Instant::now() + grace;
@@ -382,11 +395,8 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             std::thread::sleep(POLL);
         }
         for target in &targets {
-            if outcome.skipped.iter().any(|s| s.pid == target.pid) {
-                continue;
-            }
-            if confirm_identity(target, uid) != Identity::Same {
-                outcome.skipped.push(entry(target, ReapSignal::Term));
+            if !signalled.contains(&target.pid) {
+                // Already recorded as skipped in the pass above.
                 continue;
             }
             let entry = Reaped {
@@ -395,7 +405,11 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
                 cwd: target.cwd.clone(),
                 signal: ReapSignal::Term,
             };
-            if !alive(target.pid) {
+            // "Gone" and "its pid now belongs to somebody else" mean the same
+            // thing here: the process we selected is no longer running, and it
+            // died because we asked it to. A process that obeyed SIGTERM has no
+            // /proc entry at all, which must NOT be reported as skipped.
+            if confirm_identity(target, uid) != Identity::Same {
                 outcome.reaped.push(entry);
                 continue;
             }
@@ -647,6 +661,31 @@ fn boot_ticks() -> Option<u64> {
     Some(ticks as u64)
 }
 
+/// Every pid that exists right now. Used once per run, at scope open.
+#[cfg(target_os = "linux")]
+fn live_pids() -> HashSet<u32> {
+    let mut pids = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                if pid > 1 {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_pids() -> HashSet<u32> {
+    HashSet::new()
+}
+
 /// Every process the loop may kill. Ordered by pid so the log is stable.
 #[cfg(target_os = "linux")]
 fn scan(plan: &ReapPlan) -> Vec<Candidate> {
@@ -677,12 +716,12 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
             continue;
         }
         // Started before the loop did: not ours to kill, however it got a cwd
-        // inside the workspace. `starttime` is truncated to USER_HZ, and
-        // truncation is monotonic, so a process that started AT or after the
-        // loop instant can never land below this boundary — no slack is
-        // needed to catch one, and adding slack would only widen the window
-        // onto processes that predate the run.
-        if stat.start_ticks < plan.started_ticks {
+        // inside the workspace. Both checks are needed, and neither alone is
+        // exact: `starttime` is truncated to USER_HZ (so a process started a
+        // few ms before the run can share the boundary tick), and the pid
+        // snapshot is taken once (so a pid recycled onto a fresh process after
+        // the snapshot is caught by the tick test).
+        if stat.start_ticks < plan.started_ticks || plan.preexisting.contains(&pid) {
             continue;
         }
         if proc_uid(pid) != Some(uid) {
@@ -1290,6 +1329,34 @@ mod tests {
             let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             seen.retain(|s| s != id);
         }
+    }
+
+    /// A process started in the SAME `USER_HZ` tick as the loop began is still
+    /// a pre-loop process. The tick test alone cannot tell them apart, which is
+    /// why the plan also snapshots the pids that existed at scope open.
+    #[test]
+    fn a_process_from_the_boundary_tick_is_still_a_pre_loop_process() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let boundary_tick = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(boundary_tick), "the fixture to be running");
+        // No sleep: the fixture is as close to "the loop began" as a fixture
+        // can get, so it very likely shares the boundary tick.
+        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+        assert!(
+            plan.preexisting.contains(&boundary_tick),
+            "the snapshot must contain a process that existed at scope open"
+        );
+        assert!(
+            !scan(&plan).iter().any(|c| c.pid == boundary_tick),
+            "a process that existed when the run began is never a candidate, \
+             whatever tick it lands in"
+        );
+        guard.finish();
+        assert!(alive(boundary_tick), "and it must survive the reap");
+
+        kill_exact(boundary_tick);
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
