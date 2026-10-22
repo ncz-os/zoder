@@ -47,6 +47,10 @@ const SIGNAL_REAP_GRACE: Duration = Duration::from_millis(750);
 pub(crate) const REAP_CANCEL_BUDGET: Duration = Duration::from_millis(750);
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
 const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
+/// How many scan/signall passes one reap may make before giving up. Each pass
+/// only runs when it found something new, so a well-behaved agent converges in
+/// two; the bound exists for an agent that forks in a loop.
+const MAX_REAP_PASSES: usize = 8;
 /// Poll interval while waiting for a signalled process to disappear.
 const POLL: Duration = Duration::from_millis(20);
 /// How long to wait for a SIGKILLed process to leave the table. SIGKILL is not
@@ -489,10 +493,12 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     let uid = current_uid();
     let mut outcome = ReapOutcome::default();
     let mut seen: HashSet<u32> = HashSet::new();
-    // Two passes: the second catches anything the agent spawned while the
-    // first pass was still signalling (a parent that forks again before it
-    // dies). `seen` keeps a pid from being reported twice.
-    for _ in 0..2 {
+    // Keep scanning until a pass finds nothing new: a parent can fork again
+    // while the previous pass is still signalling, and a fixed two-pass loop
+    // leaves the last descendants behind. Bounded so an agent that forks
+    // forever cannot stall teardown.
+    let mut bounded_out = false;
+    for _ in 0..MAX_REAP_PASSES {
         let candidates: Vec<Candidate> = scan(plan)
             .into_iter()
             .filter(|c| seen.insert(c.pid))
@@ -502,18 +508,23 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
         }
         let mut targets: Vec<Target> = Vec::new();
         for candidate in &candidates {
+            // Pin FIRST, then validate. The order is the whole point: if the
+            // pid was recycled between the scan and here, the pin now holds the
+            // REPLACEMENT, and the identity check below reads /proc for that
+            // same pid, sees a start time that is not ours, and drops the pin
+            // without signalling. Pinning after the check would leave exactly
+            // that window open.
+            let pin = PidFd::open(candidate.pid);
             if confirm_identity(candidate, uid) != Identity::Same {
-                // Gone, or the pid now belongs to somebody else. No signal was
-                // sent, and the log must not claim otherwise.
+                // Gone, or the pid belongs to somebody else. No signal was sent,
+                // and the log must not claim otherwise.
+                drop(pin);
                 outcome.skipped.push(entry(candidate, ReapSignal::Term));
                 continue;
             }
-            // Pin the identity NOW, while it is confirmed: from here on the
-            // signal and the liveness check are about THIS process, whatever
-            // the pid is recycled onto in between.
             targets.push(Target {
                 candidate: candidate.clone(),
-                pin: PidFd::open(candidate.pid),
+                pin,
             });
         }
         if targets.is_empty() {
@@ -551,6 +562,15 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
                 outcome.reaped.push(record);
             }
         }
+        bounded_out = !scan(plan).iter().all(|c| seen.contains(&c.pid));
+    }
+    if bounded_out {
+        // Say so rather than pretending the workspace is clean: something is
+        // still forking faster than the passes can catch it.
+        eprintln!(
+            "[zoder] WARNING: stopped after {MAX_REAP_PASSES} reap passes with candidates \
+             still appearing; the agent may still be forking new processes"
+        );
     }
     outcome
 }
@@ -1566,6 +1586,67 @@ mod tests {
         );
         assert_eq!(stat.ppid, 7, "ppid is field 4");
         assert_eq!(stat.start_ticks, 424242, "starttime is field 22");
+    }
+
+    /// A parent can fork again while the reap is still signalling the previous
+    /// generation. The reap keeps scanning until a pass finds nothing new, so
+    /// the late descendant is not left behind.
+    // The fixture is deliberately not waited on: the point is to reap it
+    // mid-flight, and waiting would race the reap for its own subject.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn a_descendant_forked_during_the_reap_is_still_reaped() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        // A parent that forks one child, then forks another ~200ms later —
+        // after the first child has been signalled, i.e. mid-pass.
+        let pidfile = ws.cd.join("forker-pids");
+        let script = format!(
+            "sleep 600 & echo $! >> {f}; sleep 0.2; sleep 600 & echo $! >> {f}; wait",
+            f = pidfile.display()
+        );
+        let forker = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&ws.cd)
+            .spawn()
+            .expect("run the forking fixture");
+        let forker_pid = forker.id();
+        wait_until(
+            || {
+                std::fs::read_to_string(&pidfile)
+                    .map(|t| {
+                        t.lines()
+                            .filter(|l| l.trim().parse::<u32>().is_ok())
+                            .count()
+                            >= 2
+                    })
+                    .unwrap_or(false)
+            },
+            "the fixture to fork its second child",
+        );
+        let pids: Vec<u32> = std::fs::read_to_string(&pidfile)
+            .expect("forker pid file")
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        assert_eq!(pids.len(), 2, "the fixture forked two children");
+
+        let outcome = reap(&plan, Duration::from_millis(50));
+        let reaped: Vec<u32> = outcome.reaped.iter().map(|r| r.pid).collect();
+        for pid in &pids {
+            assert!(
+                reaped.contains(pid),
+                "child {pid} must be reaped (reaped: {reaped:?})"
+            );
+            assert!(!alive(*pid), "child {pid} must be gone");
+        }
+        for pid in pids.iter().copied().chain([forker_pid]) {
+            if alive(pid) {
+                kill_exact(pid);
+            }
+        }
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
