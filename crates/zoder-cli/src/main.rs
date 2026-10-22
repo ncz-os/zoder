@@ -7136,7 +7136,7 @@ fn neutral_daemon_dir(config_dir: &Path, home: Option<PathBuf>) -> PathBuf {
     // or bogus `$HOME` would create junk at whatever absolute path it names.
     // It only has to be usable, not creatable.
     if let Some(home) = home {
-        if !home.as_os_str().is_empty() && home.is_dir() {
+        if !home.as_os_str().is_empty() && usable_as_child_cwd(&home) {
             return home;
         }
     }
@@ -7147,7 +7147,27 @@ fn neutral_daemon_dir(config_dir: &Path, home: Option<PathBuf>) -> PathBuf {
 }
 
 fn usable_or_creatable(dir: &Path) -> bool {
-    dir.is_dir() || (std::fs::create_dir_all(dir).is_ok() && dir.is_dir())
+    usable_as_child_cwd(dir) || (std::fs::create_dir_all(dir).is_ok() && usable_as_child_cwd(dir))
+}
+
+/// Can a child actually start in `dir`?
+///
+/// `is_dir()` is not the question. A directory this process cannot SEARCH
+/// looks like a directory, passes `is_dir`, and then fails `Command::
+/// current_dir` — turning a permission detail on the config dir into "engine
+/// unavailable" instead of falling through to `$HOME` and then `/`, which is
+/// the whole point of having a chain.
+fn usable_as_child_cwd(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(raw) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `access` reads the path and reports a permission bit; it does
+    // not dereference anything.
+    unsafe { libc::access(raw.as_ptr(), libc::X_OK) == 0 }
 }
 
 /// The exact argv and working directory used for the ephemeral daemon.
@@ -7581,6 +7601,38 @@ mod daemon_cwd_tests {
         assert!(
             leftovers.is_empty(),
             "the temp record must be renamed away, never left behind: {leftovers:?}"
+        );
+    }
+
+    /// A directory that cannot be searched is not a working directory, even
+    /// though `is_dir` says it is. Picking one anyway makes the spawn fail
+    /// outright instead of falling through the chain.
+    #[test]
+    fn an_unsearchable_config_dir_falls_through_to_the_home() {
+        if unsafe { libc::geteuid() } == 0 {
+            // root can search anything; the assertion would be vacuous.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("blocked");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        std::fs::create_dir_all(&home).expect("home dir");
+        assert!(blocked.is_dir(), "precondition: it is a directory");
+        let mut perms = std::fs::metadata(&blocked).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&blocked, perms).expect("chmod 000");
+
+        assert_eq!(neutral_daemon_dir(&blocked, Some(home.clone())), home);
+        assert_eq!(neutral_daemon_dir(&blocked, None), PathBuf::from("/"));
+
+        let mut perms = std::fs::metadata(&blocked).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&blocked, perms).expect("chmod back");
+        assert_eq!(
+            neutral_daemon_dir(&blocked, None),
+            blocked,
+            "with search permission back it is the right answer again"
         );
     }
 
