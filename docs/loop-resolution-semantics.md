@@ -79,6 +79,21 @@ The reviewer must see the loop's OWN work and ALL of it.
   edits are included. An explicit `--base` still wins. The old default was
   `detect_base` (upstream/default-branch merge-base), which on 2026-10-21
   reported 5994 / 28388 diff lines for changes of ~880 / ~430.
+* **Dirty start.** A commit base is not a working-tree base. `zoder loop -C
+  <tree>` is routinely pointed at a checkout that already carries uncommitted
+  and untracked work, and `git diff <start_head>` charges every byte of it to
+  the author. The loop now snapshots the working tree BEFORE the first author
+  turn (`loop_start_state`) into a real git tree object through a throwaway
+  `GIT_INDEX_FILE` (`git add -A` into the temporary index, `git write-tree`) --
+  tracked and non-ignored untracked files, honouring `.gitignore`, without
+  touching the worktree, the real index, or any ref. The reviewed delta is
+  `git diff <start tree> <current tree>`: loop work of every kind (committed,
+  uncommitted, new, deleted) is in scope and pre-existing state is not. The
+  snapshot tree id and `start_dirty` are recorded per iteration
+  (`review_base_tree`, `start_dirty`), a dirty start prints a one-line warning
+  even under `--quiet`, and a snapshot that cannot be taken makes branch scope
+  refuse the review rather than fall back to a base that misattributes. An
+  explicit `--base` keeps its own three-dot contract.
 * **Chunking.** The loop review now uses the same per-route chunk planner as
   `zoder review` (`plan_loop_review`). Every changed line is in exactly one
   chunk; a chunk over `max_hunk_bytes` is split. Nothing is truncated.
@@ -89,5 +104,6 @@ The reviewer must see the loop's OWN work and ALL of it.
   `reviewer_unavailable` with `review_error` set and stops unresolved. An
   unfinished review is never an approval, even when every finding heuristic
   would return zero blockers.
-* **Evidence.** Each iteration records `review_base`, `review_chunks`, and
-  `review_error`; the human summary prints chunks and the error.
+* **Evidence.** Each iteration records `review_base`, `review_base_tree`,
+  `start_dirty`, `review_chunks`, and `review_error`; the human summary prints
+  chunks and the error.
