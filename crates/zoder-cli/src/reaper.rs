@@ -25,11 +25,14 @@
 //!
 //! Selection is by exact PID only. There is no pattern matching anywhere here:
 //! `pkill yes` would kill every `yes` on the host, including one a human
-//! started. Linux-only via `/proc`; a no-op elsewhere.
+//! started. Where the kernel offers pidfd (5.3+), the selected process is
+//! pinned before it is signalled, so a pid recycled mid-teardown cannot put a
+//! stranger in front of the signal; older kernels fall back to the identity
+//! re-check. Linux-only via `/proc`; a no-op elsewhere.
 //!
 //! `--no-reap` turns the whole thing off.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -104,11 +107,14 @@ struct ReapPlan {
     /// empty directory.
     owned_roots: Vec<PathBuf>,
     started_ticks: u64,
-    /// Every pid that existed when the run began. `starttime` is truncated to
-    /// USER_HZ, so a process started a few milliseconds BEFORE the run can
-    /// share the boundary tick exactly; this snapshot is the exact version of
-    /// "started after the loop began", with no granularity window at all.
-    preexisting: HashSet<u32>,
+    /// pid -> `starttime` for every process that existed when the run began.
+    /// `starttime` is truncated to USER_HZ, so a process started a few
+    /// milliseconds BEFORE the run can share the boundary tick exactly; this
+    /// snapshot is the exact version of "started after the loop began", with
+    /// no granularity window at all. The START TIME is stored, not just the
+    /// pid, so a pid recycled onto a fresh process after the snapshot is
+    /// judged on its own start time and stays eligible.
+    preexisting: HashMap<u32, u64>,
 }
 
 impl ReapPlan {
@@ -319,30 +325,50 @@ impl Drop for ReapGuard {
 /// already completed never acknowledges a cancel, and that is fine — we reap
 /// either way.
 async fn cancel_recorded_sessions(budget: Duration) {
-    let ids = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if ids.is_empty() {
-        return;
-    }
     let socket = crate::engine_socket_path();
     // The budget covers the WHOLE phase, not each session: a loop that drove
     // nine sessions must not spend nine budgets before the first kill.
     let deadline = Instant::now() + budget;
-    for id in ids {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            eprintln!(
-                "[zoder] cancel budget exhausted after {} session(s); remaining \
-                 session(s) are left to the reap",
-                SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len()
-            );
-            break;
+    // Drain repeatedly: the engine can mint a session while we are cancelling
+    // (a fallback transition, a fresh turn), and that session is exactly the
+    // one still editing the tree. One snapshot would leave it uncancelled.
+    let mut cancelled: HashSet<String> = HashSet::new();
+    loop {
+        let pending: Vec<String> = SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|id| !cancelled.contains(*id))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return;
         }
-        match zoder_core::cancel_session(&socket, &id, remaining).await {
-            Ok(()) => eprintln!("[zoder] cancelled agent session {id}"),
-            Err(e) => eprintln!(
-                "[zoder] session {id} cancel not confirmed ({e:#}); \
-                 a turn that already settled does not acknowledge a cancel"
-            ),
+        for id in pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let still_pending = SESSIONS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|id| !cancelled.contains(*id))
+                    .count();
+                if still_pending > 0 {
+                    eprintln!(
+                        "[zoder] cancel budget exhausted with {still_pending} session(s) \
+                         left to the reap"
+                    );
+                }
+                return;
+            }
+            match zoder_core::cancel_session(&socket, &id, remaining).await {
+                Ok(()) => eprintln!("[zoder] cancelled agent session {id}"),
+                Err(e) => eprintln!(
+                    "[zoder] session {id} cancel not confirmed ({e:#}); \
+                     a turn that already settled does not acknowledge a cancel"
+                ),
+            }
+            cancelled.insert(id);
         }
     }
 }
@@ -359,6 +385,105 @@ struct ReapOutcome {
     skipped: Vec<Reaped>,
 }
 
+/// A pidfd pins ONE process identity. Once it is open, every signal sent
+/// through it reaches that process and nothing else — if the pid is recycled
+/// in the meantime, the signal is simply refused (ESRCH) instead of landing on
+/// a stranger. This is what makes "check identity, then signal" atomic
+/// instead of merely adjacent. Kernels without pidfd (pre-5.3) fall back to
+/// plain pid signalling, where the identity re-check is all we have.
+struct PidFd {
+    fd: libc::c_int,
+}
+
+impl PidFd {
+    #[cfg(target_os = "linux")]
+    fn open(pid: u32) -> Option<Self> {
+        // SAFETY: pidfd_open takes (pid, flags) and returns a new fd or -1.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_open as libc::c_long,
+                pid as libc::pid_t,
+                0 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        Some(PidFd {
+            fd: fd as libc::c_int,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_pid: u32) -> Option<Self> {
+        None
+    }
+
+    /// Send `sig` to the pinned process. `sig == 0` is the liveness probe: it
+    /// succeeds while the process is alive and fails with ESRCH once it is
+    /// gone, which is exactly the check the reap loop needs.
+    #[cfg(target_os = "linux")]
+    fn signal(&self, sig: i32) -> bool {
+        // SAFETY: pidfd_send_signal takes (pidfd, sig, info, flags).
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal as libc::c_long,
+                self.fd as libc::c_long,
+                sig as libc::c_int,
+                std::ptr::null::<libc::siginfo_t>(),
+                0 as libc::c_uint,
+            ) == 0
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn signal(&self, _sig: i32) -> bool {
+        false
+    }
+
+    fn alive(&self) -> bool {
+        self.signal(0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidFd {
+    fn drop(&mut self) {
+        // SAFETY: `fd` is owned by this struct and closed exactly once.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// A selected process plus, when the kernel supports it, a pinned identity.
+struct Target {
+    candidate: Candidate,
+    pin: Option<PidFd>,
+}
+
+impl Target {
+    fn deliver(&self, sig: i32) {
+        match self.pin.as_ref() {
+            Some(pin) => {
+                pin.signal(sig);
+            }
+            // No pidfd: fall back to the pid, having just confirmed identity.
+            None => signal(self.candidate.pid, sig),
+        }
+    }
+
+    /// "Still able to run". The pin is authoritative about WHICH process this
+    /// is; `/proc` is authoritative about whether a task can still run at all
+    /// (a zombie holds both its pid and its pidfd but executes nothing).
+    fn alive(&self) -> bool {
+        match self.pin.as_ref() {
+            Some(pin) => pin.alive() && alive(self.candidate.pid),
+            None => alive(self.candidate.pid),
+        }
+    }
+}
+
 /// SIGTERM, grace, SIGKILL — by exact PID, never by name or pattern.
 fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     let uid = current_uid();
@@ -368,65 +493,62 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     // first pass was still signalling (a parent that forks again before it
     // dies). `seen` keeps a pid from being reported twice.
     for _ in 0..2 {
-        let targets: Vec<Candidate> = scan(plan)
+        let candidates: Vec<Candidate> = scan(plan)
             .into_iter()
             .filter(|c| seen.insert(c.pid))
             .collect();
-        if targets.is_empty() {
+        if candidates.is_empty() {
             break;
         }
-        let mut signalled: HashSet<u32> = HashSet::new();
-        for target in &targets {
-            if confirm_identity(target, uid) != Identity::Same {
+        let mut targets: Vec<Target> = Vec::new();
+        for candidate in &candidates {
+            if confirm_identity(candidate, uid) != Identity::Same {
                 // Gone, or the pid now belongs to somebody else. No signal was
                 // sent, and the log must not claim otherwise.
-                outcome.skipped.push(entry(target, ReapSignal::Term));
+                outcome.skipped.push(entry(candidate, ReapSignal::Term));
                 continue;
             }
-            signalled.insert(target.pid);
-            signal(target.pid, libc_sigterm());
+            // Pin the identity NOW, while it is confirmed: from here on the
+            // signal and the liveness check are about THIS process, whatever
+            // the pid is recycled onto in between.
+            targets.push(Target {
+                candidate: candidate.clone(),
+                pin: PidFd::open(candidate.pid),
+            });
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        for target in &targets {
+            target.deliver(libc_sigterm());
         }
         let deadline = Instant::now() + grace;
-        while targets
-            .iter()
-            .any(|c| alive(c.pid) && confirm_identity(c, uid) == Identity::Same)
-            && Instant::now() < deadline
-        {
+        while targets.iter().any(Target::alive) && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }
         for target in &targets {
-            if !signalled.contains(&target.pid) {
-                // Already recorded as skipped in the pass above.
-                continue;
-            }
-            let entry = Reaped {
-                pid: target.pid,
-                comm: target.comm.clone(),
-                cwd: target.cwd.clone(),
-                signal: ReapSignal::Term,
-            };
+            let mut record = entry(&target.candidate, ReapSignal::Term);
             // "Gone" and "its pid now belongs to somebody else" mean the same
             // thing here: the process we selected is no longer running, and it
-            // died because we asked it to. A process that obeyed SIGTERM has no
-            // /proc entry at all, which must NOT be reported as skipped.
-            if confirm_identity(target, uid) != Identity::Same {
-                outcome.reaped.push(entry);
+            // died because we asked it to. A process that obeyed SIGTERM is
+            // gone from /proc, which must NOT be reported as skipped.
+            if !target.alive() {
+                outcome.reaped.push(record);
                 continue;
             }
-            signal(target.pid, libc_sigkill());
+            target.deliver(libc_sigkill());
             let kill_deadline = Instant::now() + KILL_WAIT;
-            while alive(target.pid) && Instant::now() < kill_deadline {
+            while target.alive() && Instant::now() < kill_deadline {
                 std::thread::sleep(POLL);
             }
-            let mut killed = entry;
-            killed.signal = ReapSignal::Kill;
+            record.signal = ReapSignal::Kill;
             // SIGKILL is uncatchable, so "still here" means the kernel is
             // holding it (uninterruptible sleep, a wedged D-state task) — a
             // real, visible failure rather than a silent success claim.
-            if alive(target.pid) && confirm_identity(target, uid) == Identity::Same {
-                outcome.survivors.push(killed);
+            if target.alive() {
+                outcome.survivors.push(record);
             } else {
-                outcome.reaped.push(killed);
+                outcome.reaped.push(record);
             }
         }
     }
@@ -661,20 +783,24 @@ fn boot_ticks() -> Option<u64> {
     Some(ticks as u64)
 }
 
-/// Every pid that exists right now. Used once per run, at scope open.
+/// Every live process right now, as pid -> `starttime`. Read once per run.
 #[cfg(target_os = "linux")]
-fn live_pids() -> HashSet<u32> {
-    let mut pids = HashSet::new();
+fn live_pids() -> HashMap<u32, u64> {
+    let mut pids = HashMap::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            if let Some(pid) = entry
+            let Some(pid) = entry
                 .file_name()
                 .to_str()
                 .and_then(|n| n.parse::<u32>().ok())
-            {
-                if pid > 1 {
-                    pids.insert(pid);
-                }
+            else {
+                continue;
+            };
+            if pid <= 1 {
+                continue;
+            }
+            if let Some(stat) = read_stat(pid) {
+                pids.insert(pid, stat.start_ticks);
             }
         }
     }
@@ -682,8 +808,8 @@ fn live_pids() -> HashSet<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn live_pids() -> HashSet<u32> {
-    HashSet::new()
+fn live_pids() -> HashMap<u32, u64> {
+    HashMap::new()
 }
 
 /// Every process the loop may kill. Ordered by pid so the log is stable.
@@ -721,7 +847,11 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         // few ms before the run can share the boundary tick), and the pid
         // snapshot is taken once (so a pid recycled onto a fresh process after
         // the snapshot is caught by the tick test).
-        if stat.start_ticks < plan.started_ticks || plan.preexisting.contains(&pid) {
+        let same_process_as_at_scope_open = plan
+            .preexisting
+            .get(&pid)
+            .is_some_and(|seen| *seen == stat.start_ticks);
+        if stat.start_ticks < plan.started_ticks || same_process_as_at_scope_open {
             continue;
         }
         if proc_uid(pid) != Some(uid) {
@@ -1345,8 +1475,13 @@ mod tests {
         let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
         let plan = guard.plan.clone().expect("armed guard has a plan");
         assert!(
-            plan.preexisting.contains(&boundary_tick),
+            plan.preexisting.contains_key(&boundary_tick),
             "the snapshot must contain a process that existed at scope open"
+        );
+        assert_eq!(
+            plan.preexisting.get(&boundary_tick).copied(),
+            read_stat(boundary_tick).map(|s| s.start_ticks),
+            "the snapshot stores the start time, so a recycled pid stays eligible"
         );
         assert!(
             !scan(&plan).iter().any(|c| c.pid == boundary_tick),
@@ -1359,7 +1494,62 @@ mod tests {
         kill_exact(boundary_tick);
     }
 
-    /// A root of `/` would select every process on the host. Refuse it.
+    /// When the kernel supports pidfd, a selected process is pinned before it
+    /// is signalled: the fd survives the process's death, refuses signals once
+    /// it is gone, and reports liveness without consulting /proc. That is what
+    /// makes "check identity then signal" atomic instead of merely adjacent.
+    #[test]
+    fn a_pinned_target_reports_its_own_lifecycle() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        // Spawned by a shell that exits, so the fixture is reparented to init:
+        // when it dies it disappears instead of waiting as a zombie for this
+        // test to reap it.
+        let pidfile = ws.cd.join("pin-target.pid");
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 600 & echo $! > {}; exit 0",
+                pidfile.display()
+            ))
+            .current_dir(&ws.cd)
+            .status()
+            .expect("run the fixture shell");
+        assert!(status.success(), "the fixture shell exits cleanly");
+        let victim: u32 = std::fs::read_to_string(&pidfile)
+            .expect("fixture pid file")
+            .trim()
+            .parse()
+            .expect("fixture pid is a number");
+        wait_until(|| alive(victim), "the fixture to be running");
+        let Some(pin) = PidFd::open(victim) else {
+            // Kernel without pidfd (pre-5.3): the fallback path is pid
+            // signalling, which the other tests already cover.
+            eprintln!("[test] pidfd unsupported on this kernel; skipping");
+            kill_exact(victim);
+            return;
+        };
+        assert!(pin.alive(), "a pinned live process reports alive");
+        assert!(pin.signal(0), "signal 0 is the liveness probe");
+        assert!(
+            pin.signal(libc::SIGTERM),
+            "the pinned process is signallable"
+        );
+        wait_until(|| !pin.alive(), "the pinned process to die from SIGTERM");
+        assert!(
+            !pin.alive(),
+            "the pin keeps reporting the truth after the process is gone"
+        );
+        assert!(
+            !pin.signal(libc::SIGTERM),
+            "a pin for a dead process refuses further signals"
+        );
+
+        if alive(victim) {
+            kill_exact(victim);
+        }
+    }
+
     /// A command name may contain a paren followed by a state-looking token
     /// (`worker) R`). Splitting on the FIRST such paren shifts every later
     /// field by one and reads `starttime` from the wrong column — which
