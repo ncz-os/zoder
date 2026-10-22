@@ -542,6 +542,12 @@ pub(crate) struct ReapGuard {
     finished: bool,
 }
 
+/// Translate the negative CLI flag into the guard's positive `enabled`
+/// argument. Both loop and rescue use this single decision.
+pub(crate) fn enabled_for_cli(cli: &crate::Cli) -> bool {
+    !cli.no_reap
+}
+
 impl ReapGuard {
     /// Begin reaping for a run rooted at `cwd` (the `-C` directory) whose
     /// scratch space is `tmp`. `enabled=false` (`--no-reap`) yields a guard
@@ -2234,9 +2240,7 @@ mod tests {
     #[test]
     fn pending_sessions_includes_every_uncancelled_session() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<String> = (0..65)
-            .map(|i| format!("pending-cap-probe-{i}"))
-            .collect();
+        let ids: Vec<String> = (0..65).map(|i| format!("pending-cap-probe-{i}")).collect();
         for id in &ids {
             note_session(id);
         }
@@ -2613,6 +2617,15 @@ mod tests {
         let default =
             crate::Cli::try_parse_from(["zoder", "loop", "task"]).expect("loop without the flag");
         assert!(!default.no_reap, "reaping is ON by default");
+        assert!(enabled_for_cli(&default), "loop must reap by default");
+        assert!(
+            !enabled_for_cli(&on_loop),
+            "--no-reap must disable loop reaping"
+        );
+        assert!(
+            !enabled_for_cli(&on_rescue),
+            "--no-reap must disable rescue reaping"
+        );
     }
 
     /// The reap is silent when there is nothing to reap: no noise on a normal
