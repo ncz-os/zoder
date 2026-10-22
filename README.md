@@ -104,6 +104,7 @@ zoder report
 | `zoder "<prompt>"` / `zoder exec` | Run a task through the free-first router (codex-compatible; `-` reads stdin). |
 | `zoder review` | Run a code review (single model by default). Pass `--panel M1,M2` to fan to additional reviewer models for a multi-model panel. Emits a structured JSON verdict. |
 | `zoder loop` | Author → validate (build/test) → adversarial review → fix, looping until the check passes and the reviewer raises no blocking findings. Pass `--check "<cmd>"` to gate each iteration on a local command (e.g. `cargo test -p foo`), or `--reviewer <model>` for an adversarial second opinion. Multi-model review (the `--panel` flag) is opt-in and only applies to the `review` command; `loop` always uses a single reviewer (configurable via `--reviewer` or the routed model). |
+| `zoder rescue` | Drive one agentic, write-capable turn at a stubborn bug or failing diagnostic, keeping the partial work a timeout leaves behind. Shares the loop's workspace cleanup (below). |
 | `zoder route` | Show the model the router would pick + the cross-family fallback chain. |
 | `zoder report` | Usage + chargeback report: daily/weekly/by-model, with the savings headline. Pass `--vendor <name>` to scope to a TOML-defined vendor (e.g. `enterprise`, `ibm`, `microsoft`). |
 | `zoder spend` | Raw spend rollups from the local ledger. |
@@ -116,6 +117,27 @@ zoder report
 
 Everything is **local-first**: routing, the ledger, health, and reports work on
 your workstation with no service to stand up.
+
+### What a loop/rescue leaves running (and what it cleans up)
+
+An agent started by `loop`/`rescue` can background work of its own — load
+generators, a dev server, a watcher — inside the workspace you handed it
+(`-C`). Those processes belong to the engine daemon's tool shells, not to
+zoder's process group, so neither zoder nor a job runner's `killpg` can reach
+them: on 2026-10-21 a loop's leftovers ran for two hours past both the end of
+the loop and the job runner's own timeout.
+
+So every `loop`/`rescue` exit path — resolved, unresolved, author/check/review
+timeout, SIGTERM, SIGINT — first cancels the agent session, then reaps what the
+agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
+`pid` + `comm` it kills. Selection is deliberately narrow — same uid, cwd
+inside the `-C` directory or zoder's temp dir, started after the run began,
+never zoder itself or one of its ancestors — because this runs on shared hosts
+where another session's processes look identical from the outside. There is no
+`pkill`-style pattern anywhere in the path. Linux only; a no-op elsewhere.
+
+Pass `--no-reap` to turn it off when something else owns the workspace and you
+expect its processes to outlive the run.
 
 ---
 
