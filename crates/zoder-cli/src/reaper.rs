@@ -50,8 +50,10 @@
 //!
 //! * the pid this zoder spawned (recorded by `note_daemon_pid` the instant
 //!   the child exists),
-//! * the pid recorded for the socket (the `<data dir>/daemon.pid` zoder
-//!   writes, so a reaper in a *different* zoder process can spare it too),
+//! * the process recorded for the socket (`<pid> <start_ticks>` in
+//!   `<data dir>/daemon.pid`, so a reaper in a *different* zoder process can
+//!   spare it too — and re-checked against the live process, so a stale
+//!   record whose pid the kernel has since reused spares nobody),
 //! * `/proc/<pid>/exe` being the zeroclaw binary.
 //!
 //! No argv matching anywhere: a process can be renamed into looking like the
@@ -171,7 +173,8 @@ pub(crate) fn daemon_pid_spared(pid: u32) -> bool {
 enum DaemonExemption {
     /// The pid this zoder process spawned.
     Spawned,
-    /// The pid recorded for the socket this reaper talks to.
+    /// The `(pid, start_ticks)` pair recorded for the socket this reaper
+    /// talks to, still matching the live process.
     Recorded,
     /// `/proc/<pid>/exe` resolves to the zeroclaw binary.
     Executable,
@@ -192,11 +195,14 @@ impl DaemonExemption {
 ///
 /// The pid-file arm cannot be cached in the plan: the daemon is usually
 /// spawned *after* the scope opened, which is exactly the case it exists for.
-/// So the file is re-read on the first scan that needs it and the answer held
-/// in `recorded` for the rest of that pass.
+/// So the file is read once per scan, and the result is re-checked against
+/// the LIVE process before it spares anything — a record whose start time no
+/// longer matches is a pid the kernel has handed on to somebody else, and
+/// sparing that stranger is precisely the bug an identity-based exemption
+/// must not have.
 fn daemon_exemption(
     pid: u32,
-    recorded: &mut Option<u32>,
+    recorded: &mut Option<Option<crate::DaemonIdentity>>,
     pid_file: &Path,
 ) -> Option<DaemonExemption> {
     if DAEMON_PIDS
@@ -207,10 +213,12 @@ fn daemon_exemption(
         return Some(DaemonExemption::Spawned);
     }
     if recorded.is_none() {
-        *recorded = recorded_daemon_pid(pid_file);
+        *recorded = Some(crate::read_daemon_record(pid_file));
     }
-    if *recorded == Some(pid) {
-        return Some(DaemonExemption::Recorded);
+    if let Some(Some((recorded_pid, recorded_ticks))) = *recorded {
+        if recorded_pid == pid && live_start_ticks(pid) == Some(recorded_ticks) {
+            return Some(DaemonExemption::Recorded);
+        }
     }
     if executable_is_zeroclaw(pid) {
         return Some(DaemonExemption::Executable);
@@ -218,16 +226,17 @@ fn daemon_exemption(
     None
 }
 
-/// The daemon pid recorded in `path`, if it is a plausible one.
-///
-/// A stale file is the interesting case: the daemon can die without anyone
-/// clearing its record, and the kernel will eventually recycle that pid. The
-/// consequence of trusting a stale record is one process spared from a reap —
-/// the same direction as every other exemption here, and never a stranger
-/// signalled. `pid <= 1` is rejected outright; init is not a daemon.
-pub(crate) fn recorded_daemon_pid(path: &Path) -> Option<u32> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    raw.trim().parse::<u32>().ok().filter(|pid| *pid > 1)
+/// The live process's start time, or `None` if it is gone or unreadable. A
+/// single `/proc` read: this is what turns "the file says 1234" into "the
+/// process at 1234 is still the one we recorded".
+#[cfg(target_os = "linux")]
+fn live_start_ticks(pid: u32) -> Option<u64> {
+    read_stat(pid).map(|stat| stat.start_ticks)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Announce a spared daemon once. Silently skipping a process that matched
@@ -2541,51 +2550,111 @@ mod tests {
         kill_exact(daemon);
     }
 
-    /// The cross-process arm: zoder records the daemon's pid next to the
+    /// The cross-process arm: zoder records the daemon's identity next to the
     /// socket, so a reap scope in a DIFFERENT zoder process (job 01a1619b's
     /// loop, while 01a16164's daemon is serving it) can spare it too. Only
     /// the record is involved here — the fixture's executable is `sleep`.
     #[test]
-    fn the_pid_recorded_for_the_daemon_socket_is_spared_in_another_zoder_process() {
+    fn the_daemon_recorded_for_the_socket_is_spared_in_another_zoder_process() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
         let daemon = spawn_sleeper(&ws.cd);
         wait_until(|| alive(daemon), "the recorded fixture to be running");
-        std::fs::write(&pidfile, format!("{daemon}\n")).expect("record the daemon pid");
-        assert_eq!(recorded_daemon_pid(&pidfile), Some(daemon));
+        let identity = (
+            daemon,
+            live_start_ticks(daemon).expect("a live fixture has a start time"),
+        );
+        std::fs::write(&pidfile, format!("{} {}\n", identity.0, identity.1))
+            .expect("record the daemon identity");
+        assert_eq!(crate::read_daemon_record(&pidfile), Some(identity));
         let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile).expect("plan");
 
         assert!(
             !scan(&plan).iter().any(|c| c.pid == daemon),
-            "the pid recorded for the daemon socket must be spared by another process's reap"
+            "the daemon recorded for the socket must be spared by another process's reap"
         );
 
         kill_exact(daemon);
     }
 
-    /// A pid file that is empty, non-numeric, or names init/pid 0 spares
-    /// nobody: it must not be able to silence the reap wholesale.
+    /// A record the kernel has outgrown must spare nobody. The daemon died,
+    /// nobody cleared `<data dir>/daemon.pid`, and the pid has since been
+    /// handed to an ordinary agent leftover in this workspace: honouring the
+    /// stale record would spare a stranger, which is the one thing an
+    /// identity-based exemption must never do.
     #[test]
-    fn a_garbage_pid_file_spares_nobody() {
+    fn a_stale_daemon_record_spares_nobody_after_the_pid_is_reused() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
-        for junk in ["", "   ", "not-a-pid", "0", "1", "-5", "4294967296"] {
-            std::fs::write(&pidfile, format!("{junk}\n")).expect("write junk");
-            assert_eq!(
-                recorded_daemon_pid(&pidfile),
-                None,
-                "{junk:?} must not parse as a daemon pid"
-            );
+        // The scope opens FIRST: a process that already existed when it did
+        // would be spared by the start-time rule, and this test would prove
+        // nothing about the stale record.
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone()).expect("plan");
+        let stranger = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(stranger), "the fixture to be running");
+        let live = live_start_ticks(stranger).expect("a live fixture has a start time");
+        // Same pid, a start time that is demonstrably not this process's.
+        std::fs::write(&pidfile, format!("{} {}\n", stranger, live + 1))
+            .expect("record a stale identity");
+
+        assert!(
+            scan(&plan).iter().any(|c| c.pid == stranger),
+            "a record whose start time does not match the live process is a recycled pid, \
+             not the daemon: the process it now names must stay reapable"
+        );
+        reap(&plan, Duration::from_millis(50));
+        assert!(!alive(stranger), "the recycled-pid stranger is reaped");
+
+        if alive(stranger) {
+            kill_exact(stranger);
         }
-        std::fs::write(&pidfile, "0\n").expect("write junk");
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile).expect("plan");
+    }
+
+    /// A pid file that is empty, non-numeric, names init/pid 0, or carries a
+    /// pid with no start time spares nobody: it must not be able to silence
+    /// the reap wholesale, and a pid-only record is refused for the same
+    /// reason a stale one is — it cannot be checked against anything.
+    #[test]
+    fn a_garbage_daemon_record_spares_nobody() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let pidfile = ws.root().join("daemon.pid");
+        // Scope first, fixture second, so the fixture is reapable for the
+        // reason under test and not because it predates the run.
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone()).expect("plan");
         let leftover = spawn_sleeper(&ws.cd);
         wait_until(|| alive(leftover), "the fixture to be running");
+        let live = live_start_ticks(leftover).expect("a live fixture has a start time");
+        for junk in [
+            "",
+            "   ",
+            "not-a-pid",
+            "0",
+            "1",
+            "-5",
+            "4294967296",
+            &format!("{leftover}"),
+            &format!("{leftover} not-a-tick"),
+            &format!("{leftover} 0 1 2 3"),
+        ] {
+            std::fs::write(&pidfile, format!("{junk}\n")).expect("write junk");
+            assert_eq!(
+                crate::read_daemon_record(&pidfile),
+                None,
+                "{junk:?} must not parse as a daemon identity"
+            );
+        }
+        // A record naming a live pid with its REAL start time does parse —
+        // and is honoured, which is what makes the refusals above meaningful.
+        std::fs::write(&pidfile, format!("{leftover} {live}\n")).expect("write junk");
+        assert_eq!(crate::read_daemon_record(&pidfile), Some((leftover, live)));
+
+        std::fs::write(&pidfile, "0 12345\n").expect("write junk");
         assert!(
             scan(&plan).iter().any(|c| c.pid == leftover),
-            "an unusable pid file must not turn the reap off"
+            "an unusable daemon record must not turn the reap off"
         );
 
         reap(&plan, Duration::from_millis(50));
