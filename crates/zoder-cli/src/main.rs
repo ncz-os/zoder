@@ -7366,7 +7366,7 @@ mod ephemeral_daemon_reap_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod daemon_cwd_tests {
     //! The shared daemon must not live in a job directory.
     //!
@@ -7387,6 +7387,9 @@ mod daemon_cwd_tests {
     //! cwd would be a global side effect. Asserting that the child's cwd is
     //! the config dir AND differs from the caller's pins the defect just as
     //! tightly, because pre-fix the two were the same value.
+    //!
+    //! Linux-only, like the reaper's own tests: they read `/proc/<pid>/cwd`
+    //! and chmod a fixture, and the crate has to keep building on a mac.
 
     use super::{daemon_command, daemon_working_dir, neutral_daemon_dir};
     use std::os::unix::fs::PermissionsExt;
