@@ -111,8 +111,6 @@ const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
 /// child may fork the next one a moment later. Without this, the reap converges
 /// on "nothing is alive right now" instead of "nothing more is coming".
 const PASS_SETTLE: Duration = Duration::from_millis(250);
-/// How many session ids to remember for teardown.
-const MAX_REMEMBERED_SESSIONS: usize = 64;
 /// `TASK_COMM_LEN` from the kernel: 16 bytes, NUL included.
 const TASK_COMM_LEN: usize = 16;
 /// How many cancel/reap rounds the teardown may take before giving up. Two is
@@ -366,13 +364,6 @@ pub(crate) fn note_session(session_id: &str) {
         return;
     }
     seen.push(session_id.to_string());
-    // Bounded: a loop that drives hundreds of sessions keeps the most recent
-    // ones (the teardown cancels newest-first, and the newest is the one still
-    // editing). The oldest are exactly the ones a settled turn cannot need.
-    if seen.len() > MAX_REMEMBERED_SESSIONS {
-        let excess = seen.len() - MAX_REMEMBERED_SESSIONS;
-        seen.drain(..excess);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -750,7 +741,6 @@ fn pending_sessions() -> Vec<String> {
         .iter()
         .rev()
         .filter(|id| !cancelled.contains(*id))
-        .take(MAX_CANCEL_PASSES)
         .cloned()
         .collect()
 }
@@ -2237,6 +2227,27 @@ mod tests {
             let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             seen.retain(|s| s != id);
         }
+    }
+
+    /// The panic-unwind and signal teardown use this list to send blocking
+    /// cancels. A pass limit must not silently become a session limit.
+    #[test]
+    fn pending_sessions_includes_every_uncancelled_session() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<String> = (0..65)
+            .map(|i| format!("pending-cap-probe-{i}"))
+            .collect();
+        for id in &ids {
+            note_session(id);
+        }
+        let pending = pending_sessions();
+        for id in &ids {
+            assert!(pending.contains(id), "teardown omitted session {id}");
+        }
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id| !ids.contains(id));
     }
 
     /// A process from a tick BEFORE the run began is never ours, even with its
