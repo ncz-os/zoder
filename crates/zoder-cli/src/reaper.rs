@@ -61,7 +61,13 @@
 //!
 //! No argv matching anywhere: a process can be renamed into looking like the
 //! daemon (`cp`, a shell called `zeroclaw`), and the daemon's own argv is not
-//! a stable identity (`--ephemeral` is optional, the config dir varies).
+//! a stable identity (`--ephemeral` is optional, the config dir varies). The
+//! cost of that rule is stated plainly, because it is a real limit rather than
+//! a rounding error: any process running the daemon BINARY is spared, even
+//! one an agent started under a different subcommand. Every other arm is an
+//! exact identity and does not have that reach; this one is the cross-process
+//! fallback, and its failure direction is "spare something" rather than "kill
+//! the shared daemon".
 //!
 //! The daemon's TOOL SHELLS are not exempt. They are what the agent starts —
 //! the `yes` generators of the 01a1601b incident — they are not the daemon

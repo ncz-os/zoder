@@ -6949,7 +6949,7 @@ fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
 /// and `rename(2)` it over the target: same directory, so the same
 /// filesystem, and the replacement is atomic.
 fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
-    with_daemon_record_lock(path, || {
+    let write = || {
         // `unwrap_or`, never `unwrap`: an odd path must not turn a daemon
         // spawn into a panic.
         let parent = path.parent().unwrap_or(Path::new("."));
@@ -6965,7 +6965,8 @@ fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result
             let _ = std::fs::remove_file(&tmp);
         }
         written
-    })
+    };
+    with_daemon_record_lock(path, write).unwrap_or_else(write)
 }
 
 /// Parse the daemon identity recorded at `path`, if it is a plausible one.
@@ -7006,25 +7007,31 @@ pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
 /// process the shared daemon. The lock is what makes the compare and the
 /// removal one step.
 ///
-/// Advisory, best-effort, and never a reason to fail a daemon: if the lock
-/// file cannot be opened the work still runs. Losing the race is then
-/// possible, which is strictly better than refusing to record a daemon at all.
-fn with_daemon_record_lock<T>(record: &Path, f: impl FnOnce() -> T) -> T {
+/// Returns `None` when the lock could NOT be taken — a read-only data dir, an
+/// exotic filesystem, a lock implementation that fails. The two callers treat
+/// that differently, because the two operations have opposite costs:
+///
+/// * publishing still runs unlocked: `rename` makes the write itself atomic,
+///   so the worst case is two daemons racing to be the recorded one, which is
+///   decided by the readiness probe anyway;
+/// * the compare-and-remove does NOT run unlocked. Deleting a record without
+///   the lock can delete a DIFFERENT daemon's, which strips a live daemon of
+///   its cross-process exemption; leaving a stale record costs nothing at all,
+///   because every reader re-checks the start time before sparing anything.
+fn with_daemon_record_lock<T>(record: &Path, f: impl FnOnce() -> T) -> Option<T> {
     let lock_path = record.with_extension("pid.lock");
-    let Ok(lock) = std::fs::OpenOptions::new()
+    let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)
-    else {
-        return f();
-    };
-    let _ = lock.lock_exclusive();
+        .ok()?;
+    lock.lock_exclusive().ok()?;
     // Dropping the handle releases the lock; naming `unlock` here would pick
     // up std's inherent method, which the crate's MSRV does not have.
     let out = f();
     drop(lock);
-    out
+    Some(out)
 }
 
 /// Drop the record of a daemon that failed to start, and ONLY that record.
@@ -7041,7 +7048,9 @@ fn forget_daemon_record(identity: Option<DaemonIdentity>) {
         return;
     };
     crate::reaper::forget_daemon_identity(identity);
-    with_daemon_record_lock(&daemon_pid_file_path(), || {
+    // Without the lock this is a check-then-act that could delete a different
+    // daemon's record, so it is skipped instead: a stale record is inert.
+    let _ = with_daemon_record_lock(&daemon_pid_file_path(), || {
         if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
             let _ = std::fs::remove_file(daemon_pid_file_path());
         }
