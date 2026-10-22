@@ -165,9 +165,13 @@ exists), when it is the process recorded for that socket (`<pid> <start_ticks>`
 in `<data dir>/daemon.pid`, so another zoder's reap scope can spare it too), or
 when `/proc/<pid>/exe` is the exact daemon binary zoder itself spawns (compared
 by resolved file, so a symlinked install matches and a copy an agent dropped in
-the workspace does not). Every arm re-checks the live
-process's start time before it spares anything — a pid on its own is not an
-identity, so a record the kernel has outgrown spares nobody — and the record is
+the workspace does not). Because no arm
+reads argv, the executable one spares any process running that binary, including
+one an agent started under a different subcommand; that is the stated cost of an
+identity-only rule, and its failure direction is "spare something" rather than
+"kill the shared daemon". Every arm re-checks the live process's start time
+before it spares anything — a pid on its own is not an identity, so a record the
+kernel has outgrown spares nobody — and the record is
 published with a temp file plus `rename`, so a reaper scanning concurrently
 never reads a half-written one, and the compare-and-remove that clears a failed
 daemon's record runs under an exclusive lock so it cannot delete a replacement
