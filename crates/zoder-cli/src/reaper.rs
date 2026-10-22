@@ -27,6 +27,13 @@
 //!   process can fake) — the two together are exact at USER_HZ granularity,
 //! * not zoder and not one of zoder's ancestors — never our own tree.
 //!
+//! That is deliberately the whole ownership test, and it is a judgement call:
+//! nothing in /proc says "the agent spawned this". The alternative is the bug
+//! this file exists to fix — a leftover process nobody will ever clean up. On
+//! a shared host the exposure is bounded to same-uid processes whose cwd is
+//! this run's own workspace and that started during this run; `--no-reap` is
+//! the escape hatch for anyone who needs that stricter.
+//!
 //! Selection is by exact PID only. There is no pattern matching anywhere here:
 //! `pkill yes` would kill every `yes` on the host, including one a human
 //! started. Where the kernel offers pidfd (5.3+), the selected process is
@@ -56,6 +63,8 @@ const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
 /// child may fork the next one a moment later. Without this, the reap converges
 /// on "nothing is alive right now" instead of "nothing more is coming".
 const PASS_SETTLE: Duration = Duration::from_millis(250);
+/// `TASK_COMM_LEN` from the kernel: 16 bytes, NUL included.
+const TASK_COMM_LEN: usize = 16;
 /// How many cancel/reap rounds the teardown may take before giving up. Two is
 /// the normal case (something to clean, then confirmation there is nothing).
 const MAX_TEARDOWN_ROUNDS: usize = 4;
@@ -354,7 +363,7 @@ impl Drop for ReapGuard {
         // left — holds on this path too, which matters because `Drop` is the
         // path a panic takes and a panic is exactly when a half-finished turn
         // is most likely to still be editing.
-        cancel_sessions_blocking(&pending_sessions());
+        cancel_sessions_blocking(&crate::engine_socket_path(), &pending_sessions());
         self.finish();
     }
 }
@@ -450,7 +459,7 @@ fn mark_cancelled(id: &str) {
 /// This is deliberately a thinner operation than [`zoder_core::cancel_session`]:
 /// on a panicking path the goal is to make the daemon stop editing, not to
 /// prove it acknowledged.
-fn cancel_sessions_blocking(ids: &[String]) {
+fn cancel_sessions_blocking(socket: &Path, ids: &[String]) {
     #[cfg(unix)]
     {
         use std::io::Read;
@@ -462,7 +471,7 @@ fn cancel_sessions_blocking(ids: &[String]) {
                     continue;
                 }
             }
-            let Ok(mut stream) = UnixStream::connect(crate::engine_socket_path()) else {
+            let Ok(mut stream) = UnixStream::connect(socket) else {
                 // No daemon, no cancel: nothing left editing.
                 continue;
             };
@@ -503,7 +512,7 @@ fn cancel_sessions_blocking(ids: &[String]) {
     }
     #[cfg(not(unix))]
     {
-        let _ = ids;
+        let _ = (socket, ids);
     }
 }
 
@@ -550,7 +559,7 @@ impl ReapOutcome {
 fn teardown_rounds(plan: &ReapPlan, grace: Duration) {
     for round in 0..MAX_TEARDOWN_ROUNDS {
         let cancelled = pending_sessions();
-        cancel_sessions_blocking(&cancelled);
+        cancel_sessions_blocking(&crate::engine_socket_path(), &cancelled);
         let outcome = reap(plan, grace);
         log_outcome(&outcome);
         if cancelled.is_empty() && outcome.quiet() {
@@ -905,6 +914,14 @@ fn parse_stat(raw: &str) -> Option<ProcStat> {
         .find(|(i, c)| *c == ')' && valid_stat_tail(&after_open[i + 1..]))
         .map(|(i, _)| i)?;
     let comm = after_open.get(..close)?.to_string();
+    // The kernel caps a command name at TASK_COMM_LEN (16 bytes including the
+    // NUL), i.e. 15 visible characters. That bound is what makes the backward
+    // search safe: a comm could only fool it by containing `) S ` plus twenty
+    // numeric fields, which cannot fit. A longer "comm" means the line is not
+    // a stat line at all.
+    if comm.len() > TASK_COMM_LEN - 1 {
+        return None;
+    }
     let rest = after_open.get(close + 1..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     // `fields[0]` is stat field 3 (state), so stat field N is `fields[N - 3]`.
@@ -1915,16 +1932,11 @@ mod tests {
             }
         });
 
-        let previous = std::env::var("ZEROCLAW_SOCKET").ok();
-        // SAFETY: single-threaded at this point in the test (the lock is held).
-        unsafe { std::env::set_var("ZEROCLAW_SOCKET", &socket) };
         note_session("blocking-probe");
-        cancel_sessions_blocking(&pending_sessions());
-        if let Some(prev) = previous {
-            unsafe { std::env::set_var("ZEROCLAW_SOCKET", prev) };
-        } else {
-            unsafe { std::env::remove_var("ZEROCLAW_SOCKET") };
-        }
+        // The socket is passed in rather than reached through the environment:
+        // a test that mutates ZEROCLAW_SOCKET races every other test in the
+        // binary that reads it.
+        cancel_sessions_blocking(&socket, &pending_sessions());
         server.join().expect("fake daemon thread");
 
         let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -1940,8 +1952,10 @@ mod tests {
             "the cancel must name the session this run drove"
         );
         // Leave the shared session list clean for the other tests.
-        let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|id| id != "blocking-probe");
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id| id != "blocking-probe");
         CANCELLED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1955,34 +1969,25 @@ mod tests {
     fn no_reap_sends_no_cancel_on_drop() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let socket_dir = tempfile::tempdir().expect("tempdir");
-        let socket = socket_dir.path().join("engine.sock");
-        // Nothing is listening: a cancel attempt would be visible as a connect
-        // attempt to this path, which we can detect by binding it ourselves and
-        // failing if anything connects.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        // Anything that opens this socket proves a cancel went out.
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-        let previous = std::env::var("ZEROCLAW_SOCKET").ok();
-        unsafe { std::env::set_var("ZEROCLAW_SOCKET", &socket) };
         note_session("no-reap-probe");
         {
             let guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, false);
             assert!(!guard.armed(), "--no-reap leaves the guard disarmed");
-            // Dropping here must not connect to the daemon socket.
+            // Dropping here must not touch the engine.
         }
-        if let Some(prev) = previous {
-            unsafe { std::env::set_var("ZEROCLAW_SOCKET", prev) };
-        } else {
-            unsafe { std::env::remove_var("ZEROCLAW_SOCKET") };
-        }
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
+        listener.set_nonblocking(true).expect("nonblocking");
         assert!(
             listener.accept().is_err(),
             "--no-reap must not open a connection to the engine on Drop"
         );
-        let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|id| id != "no-reap-probe");
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id| id != "no-reap-probe");
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
