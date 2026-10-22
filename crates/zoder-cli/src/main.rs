@@ -6776,6 +6776,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         .open(&stderr_log)
         .ok();
 
+    announce_daemon_spawn(&daemon_working_dir(&config_dir));
     let mut cmd = daemon_command(&bin, &config_dir);
     if let Some(file) = stderr_file {
         cmd.stderr(std::process::Stdio::from(file));
@@ -6975,6 +6976,7 @@ fn forget_daemon_record(identity: Option<DaemonIdentity>) {
     let Some(identity) = identity else {
         return;
     };
+    crate::reaper::forget_daemon_identity(identity);
     if read_daemon_record(&daemon_pid_file_path()) == Some(identity) {
         let _ = std::fs::remove_file(daemon_pid_file_path());
     }
@@ -7147,12 +7149,21 @@ fn daemon_command(bin: &Path, config_dir: &Path) -> std::process::Command {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .current_dir(&working_dir);
+    cmd
+}
+
+/// Say what was started and from where — at the call site, not inside the
+/// builder, so a test that drives the builder says nothing.
+///
+/// The cwd is not a detail: a daemon that inherited a job's workspace is the
+/// 2026-10-21 incident, and one line naming the directory it actually got is
+/// what makes the next report of that class diagnosable.
+fn announce_daemon_spawn(working_dir: &Path) {
     eprintln!(
-        "[zoder] starting the shared zeroclaw daemon (pid recorded at {}, cwd {})",
+        "[zoder] starting the shared zeroclaw daemon (identity recorded at {}, cwd {})",
         daemon_pid_file_path().display(),
         working_dir.display()
     );
-    cmd
 }
 
 /// In-process registry of ephemeral daemon children spawned by
@@ -7561,6 +7572,8 @@ mod daemon_cwd_tests {
     /// reaper reads, so no reap can select it.
     #[test]
     fn the_spawned_daemon_pid_is_recorded_for_the_reaper() {
+        // Pure path resolution: `zeroclaw_data_dir` joins paths and touches
+        // nothing, so this reads no state and creates no file on the host.
         let pidfile = super::daemon_pid_file_path();
         assert!(
             pidfile.ends_with("daemon.pid"),
