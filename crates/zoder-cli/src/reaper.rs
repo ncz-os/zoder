@@ -289,13 +289,7 @@ impl ReapGuard {
     }
 
     /// Reap now. Idempotent, and called from `Drop` so an unwinding panic
-    /// still cleans up.
-    ///
-    /// Cancel and reap alternate to a fixed point: reaping takes seconds, the
-    /// engine can mint a session during it, and that session can fork children
-    /// after the last scan. So each round cancels whatever appeared since the
-    /// last round, then reaps, and a round that neither cancels nor kills
-    /// anything ends the loop.
+    /// still cleans up. See [`teardown_rounds`] for the cancel/reap alternation.
     pub(crate) fn finish(&mut self) {
         if self.finished {
             return;
@@ -304,27 +298,7 @@ impl ReapGuard {
         let Some(plan) = self.plan.clone() else {
             return;
         };
-        for round in 0..MAX_TEARDOWN_ROUNDS {
-            let cancelled = pending_sessions();
-            cancel_sessions_blocking(&cancelled);
-            let outcome = reap(&plan, REAP_GRACE);
-            log_outcome(&outcome);
-            if cancelled.is_empty()
-                && outcome.reaped.is_empty()
-                && outcome.skipped.is_empty()
-                && outcome.survivors.is_empty()
-            {
-                plan.cleanup_owned_roots();
-                return;
-            }
-            if round + 1 == MAX_TEARDOWN_ROUNDS {
-                eprintln!(
-                    "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
-                     with the agent still producing work; leftovers may remain"
-                );
-            }
-        }
-        plan.cleanup_owned_roots();
+        teardown_rounds(&plan, REAP_GRACE);
     }
 }
 
@@ -544,6 +518,42 @@ struct ReapOutcome {
     skipped: Vec<Reaped>,
 }
 
+impl ReapOutcome {
+    /// Nothing selected, nothing signalled, nothing left: the workspace is
+    /// clean as far as this reaper can tell.
+    fn quiet(&self) -> bool {
+        self.reaped.is_empty() && self.skipped.is_empty() && self.survivors.is_empty()
+    }
+}
+
+/// Cancel and reap, alternating, until a round does neither.
+///
+/// Every exit path funnels through here — the normal return, the `Drop` during
+/// a panic unwind, and the SIGTERM/SIGINT handler — because they must not be
+/// allowed to drift apart. The alternation exists because reaping takes
+/// seconds: the engine can mint a session during it and that session can fork
+/// children after the last scan, so one cancel followed by one reap is not a
+/// teardown.
+fn teardown_rounds(plan: &ReapPlan, grace: Duration) {
+    for round in 0..MAX_TEARDOWN_ROUNDS {
+        let cancelled = pending_sessions();
+        cancel_sessions_blocking(&cancelled);
+        let outcome = reap(plan, grace);
+        log_outcome(&outcome);
+        if cancelled.is_empty() && outcome.quiet() {
+            plan.cleanup_owned_roots();
+            return;
+        }
+        if round + 1 == MAX_TEARDOWN_ROUNDS {
+            eprintln!(
+                "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
+                 with the agent still producing work; leftovers may remain"
+            );
+        }
+    }
+    plan.cleanup_owned_roots();
+}
+
 /// A pidfd pins ONE process identity. Once it is open, every signal sent
 /// through it reaches that process and nothing else — if the pid is recycled
 /// in the meantime, the signal is simply refused (ESRCH) instead of landing on
@@ -691,7 +701,9 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
         for target in &targets {
             target.deliver(libc_sigterm());
         }
-        let mut reaped_this_pass = 0usize;
+        // Counts targets we signalled, not targets we killed: a survivor is
+        // still evidence that the agent is producing work.
+        let mut signalled_this_pass = 0usize;
         let deadline = Instant::now() + grace;
         while targets.iter().any(Target::alive) && Instant::now() < deadline {
             std::thread::sleep(POLL);
@@ -702,7 +714,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             // thing here: the process we selected is no longer running, and it
             // died because we asked it to. A process that obeyed SIGTERM is
             // gone from /proc, which must NOT be reported as skipped.
-            reaped_this_pass += 1;
+            signalled_this_pass += 1;
             if !target.alive() || confirm_identity(&target.candidate, uid) != Identity::Same {
                 // "Gone" includes "the pid was recycled while we waited": either
                 // way the process we selected is no longer running. Without a
@@ -726,7 +738,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
                 outcome.reaped.push(record);
             }
         }
-        if reaped_this_pass > 0 {
+        if signalled_this_pass > 0 {
             // Let whatever the agent forks next appear before we decide the
             // workspace is clean.
             std::thread::sleep(PASS_SETTLE);
@@ -1033,10 +1045,13 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         // few ms before the run can share the boundary tick), and the pid
         // snapshot is taken once (so a pid recycled onto a fresh process after
         // the snapshot is caught by the tick test).
+        // The snapshot only speaks for processes that were already old when
+        // the boundary was read. Anything it caught AFTER the boundary read
+        // belongs to this run and stays eligible.
         let same_process_as_at_scope_open = plan
             .preexisting
             .get(&pid)
-            .is_some_and(|seen| *seen == stat.start_ticks);
+            .is_some_and(|seen| *seen == stat.start_ticks && *seen <= plan.started_ticks);
         if stat.start_ticks < plan.started_ticks || same_process_as_at_scope_open {
             continue;
         }
