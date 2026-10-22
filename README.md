@@ -104,6 +104,7 @@ zoder report
 | `zoder "<prompt>"` / `zoder exec` | Run a task through the free-first router (codex-compatible; `-` reads stdin). |
 | `zoder review` | Run a code review (single model by default). Pass `--panel M1,M2` to fan to additional reviewer models for a multi-model panel. Emits a structured JSON verdict. |
 | `zoder loop` | Author → validate (build/test) → adversarial review → fix, looping until the check passes and the reviewer raises no blocking findings. Pass `--check "<cmd>"` to gate each iteration on a local command (e.g. `cargo test -p foo`), or `--reviewer <model>` for an adversarial second opinion. Multi-model review (the `--panel` flag) is opt-in and only applies to the `review` command; `loop` always uses a single reviewer (configurable via `--reviewer` or the routed model). |
+| `zoder rescue` | Drive one agentic, write-capable turn at a stubborn bug or failing diagnostic, keeping the partial work a timeout leaves behind. Shares the loop's workspace cleanup (below). |
 | `zoder route` | Show the model the router would pick + the cross-family fallback chain. |
 | `zoder report` | Usage + chargeback report: daily/weekly/by-model, with the savings headline. Pass `--vendor <name>` to scope to a TOML-defined vendor (e.g. `enterprise`, `ibm`, `microsoft`). |
 | `zoder spend` | Raw spend rollups from the local ledger. |
@@ -116,6 +117,77 @@ zoder report
 
 Everything is **local-first**: routing, the ledger, health, and reports work on
 your workstation with no service to stand up.
+
+### What a loop/rescue leaves running (and what it cleans up)
+
+An agent started by `loop`/`rescue` can background work of its own — load
+generators, a dev server, a watcher — inside the workspace you handed it
+(`-C`). Those processes belong to the engine daemon's tool shells, not to
+zoder's process group, so neither zoder nor a job runner's `killpg` can reach
+them: on 2026-10-21 a loop's leftovers ran for two hours past both the end of
+the loop and the job runner's own timeout.
+
+So every `loop`/`rescue` exit path — resolved, unresolved, author/check/review
+timeout, SIGTERM, SIGINT, panic unwind — first cancels the agent session (the
+id is recorded the moment the engine mints it, so a turn that is still running
+when the signal arrives is the one that gets cancelled), then reaps what the
+agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
+`pid` + `comm` it kills. Teardown alternates cancel and reap until a round does
+neither, because the reap itself takes seconds and the agent can fork during
+it.
+
+Selection is deliberately narrow, because this runs on shared hosts where
+another session's processes look identical from the outside. A candidate must
+be: same uid; cwd inside the `-C` directory or inside this run's own scratch
+directory under the temp root (never the temp root itself — on a shared host
+everybody's cwd is under `/tmp`, and `-C /tmp` is refused outright rather than
+honoured); started after the run began (`starttime`, and absent from the pid
+snapshot taken at that moment, so a process that merely shares a `USER_HZ` tick
+with the run is not swept up); not zoder itself or an ancestor; and, where the
+kernel supports pidfd, pinned before it is signalled, so a pid recycled
+mid-teardown cannot put a stranger in front of the signal. There is no
+`pkill`-style pattern anywhere in the path.
+
+Nothing in `/proc` says "the agent spawned this", so that list is the whole
+ownership test — the alternative is the bug this fixes. Its residual exposure
+is a same-uid process somebody else starts in this run's own workspace while
+the run is going. `--no-reap` is the escape hatch when even that is too much.
+On pre-5.3 kernels, which have no pidfd, the check-then-kill window is narrowed
+but cannot be closed. A process that survives SIGKILL is reported as a
+warning, not as a reaped pid. Linux only; a no-op elsewhere.
+
+One process is exempt from all of it, by identity and never by command line:
+the shared zeroclaw daemon. It is not the agent's — it is one daemon per host
+that every zoder drives through `<data dir>/daemon.sock`, and it deliberately
+outlives the run that happened to start it. It is spared when this zoder
+spawned it (`spawn()`'s pid and its start time, recorded the instant the child
+exists), when it is the process recorded for that socket (`<pid> <start_ticks>`
+in `<data dir>/daemon.pid`, so another zoder's reap scope can spare it too), or
+when `/proc/<pid>/exe` is the exact daemon binary zoder itself spawns (compared
+by resolved file, so a symlinked install matches and a copy an agent dropped in
+the workspace does not). Because no arm
+reads argv, the executable one spares any process running that binary, including
+one an agent started under a different subcommand; that is the stated cost of an
+identity-only rule, and its failure direction is "spare something" rather than
+"kill the shared daemon". Every arm re-checks the live process's start time
+before it spares anything — a pid on its own is not an identity, so a record the
+kernel has outgrown spares nobody — and the record is
+published with a temp file plus `rename`, so a reaper scanning concurrently
+never reads a half-written one, and the compare-and-remove that clears a failed
+daemon's record runs under an exclusive lock so it cannot delete a replacement
+another process published in between.
+
+The daemon is also started with a neutral cwd of its own — its config
+directory, falling back to `$HOME` then `/` — so it never sits inside a
+job workspace in the first place; on 2026-10-21 a loop spawned it with no
+`current_dir`, it inherited that job's directory, and it matched every rule in
+the list above while serving everybody else on the host. The daemon's tool
+shells are not exempt (they are what the agent starts, which is the whole
+reason the reap exists), and another session's leftovers remain protected by
+the `-C` rule.
+
+Pass `--no-reap` to turn it off when something else owns the workspace and you
+expect its processes to outlive the run.
 
 ---
 
