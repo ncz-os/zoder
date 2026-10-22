@@ -4599,7 +4599,11 @@ pub(crate) async fn cmd_rescue(
     // The reap scope opens HERE, after the background submitter has returned:
     // the submitter owns nothing in the workspace, and the detached worker it
     // just spawned is the process that must reap. See [`crate::reaper`].
-    let mut reap = crate::reaper::ReapGuard::begin(&cwd, &std::env::temp_dir(), cli.no_reap);
+    let mut reap = crate::reaper::ReapGuard::begin(
+        &cwd,
+        &std::env::temp_dir(),
+        crate::reaper::enabled_for_cli(cli),
+    );
     let result = cmd_rescue_run(cli, task).await;
     // Cancel the agent session FIRST (so a ghost turn stops editing), then
     // reap whatever it left running — on the success and the failure path
@@ -5932,7 +5936,11 @@ pub(crate) async fn cmd_loop(
     // just spawned is the process that must reap. Recording the loop-start
     // instant at this point is what makes "started after the loop began"
     // decidable — see [`crate::reaper`].
-    let mut reap = crate::reaper::ReapGuard::begin(&cwd, &std::env::temp_dir(), cli.no_reap);
+    let mut reap = crate::reaper::ReapGuard::begin(
+        &cwd,
+        &std::env::temp_dir(),
+        crate::reaper::enabled_for_cli(cli),
+    );
     let result = cmd_loop_run(
         cli,
         task,
