@@ -523,7 +523,11 @@ fn send_frame(
     frame: serde_json::Value,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let mut line = serde_json::to_string(&frame).unwrap_or_default();
+    // Serialization of a fixed literal cannot realistically fail, but if it
+    // did, sending an empty line would hand the daemon a malformed frame. Fail
+    // the write instead.
+    let mut line = serde_json::to_string(&frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
     stream.write_all(line.as_bytes())
 }
@@ -836,6 +840,14 @@ fn install_signal_handler(plan: ReapPlan) {
     use tokio::signal::unix::{signal, SignalKind};
     let plan = Arc::new(plan);
     if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    // Exactly one handler per process. Two armed guards would otherwise leave
+    // two tasks racing on the same signal, and the second `std::process::exit`
+    // would truncate the first one's teardown. A zoder process runs one
+    // loop/rescue, so the first armed scope owns the signal path.
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if INSTALLED.set(()).is_err() {
         return;
     }
     // Register the streams HERE, not inside the spawned task: a task that has
