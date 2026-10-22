@@ -2359,6 +2359,38 @@ fn unique_index_path(tag: &str) -> std::path::PathBuf {
     ))
 }
 
+/// A throwaway `GIT_INDEX_FILE` that deletes itself on EVERY exit path.
+///
+/// `snapshot_tree` has three failure returns after git has created the file
+/// (`copy`, `add -A`, `write-tree`). Removing it by hand on the happy path only
+/// leaks the file whenever git fails, and a leaked index in a shared `TMPDIR`
+/// outlives the process that owned it. Ownership by `Drop` is the only way to
+/// make "cleaned up on every path" a property of the type rather than of every
+/// future edit to the function body.
+struct TempIndex {
+    path: std::path::PathBuf,
+}
+
+impl TempIndex {
+    fn new(tag: &str) -> Self {
+        let path = unique_index_path(tag);
+        // Never inherit an index left behind by a crashed predecessor.
+        let _ = std::fs::remove_file(&path);
+        Self { path }
+    }
+
+    /// `GIT_INDEX_FILE` as a git environment pair.
+    fn env(&self) -> (&'static str, String) {
+        ("GIT_INDEX_FILE", self.path.to_string_lossy().to_string())
+    }
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(cwd).args(args);
@@ -2663,21 +2695,25 @@ impl PatchJournal {
     /// crucially no less. Where the two error directions conflict, this errs
     /// toward showing the reviewer too much: an extra hunk is a nuisance, a
     /// missing one is an unreviewed change.
-    fn snapshot_tree(cwd: &Path) -> Option<String> {
-        let idx = unique_index_path("baseline");
-        let _ = std::fs::remove_file(&idx);
-        let idx_s = idx.to_string_lossy().to_string();
+    ///
+    /// The temporary index is owned by a [`TempIndex`] guard, so it is removed
+    /// on every path — including the three `?` returns below, which a
+    /// hand-rolled `remove_file` on the happy path would have leaked.
+    pub(crate) fn snapshot_tree(cwd: &Path) -> Option<String> {
+        let idx = TempIndex::new("baseline");
         // Seed from the real index: tracked files may match .gitignore, and
         // an empty alternate index would silently omit their changes.
         let index_path = run_git(cwd, &["rev-parse", "--git-path", "index"]).ok()?;
         let index_path = cwd.join(index_path.trim());
         if index_path.exists() {
-            std::fs::copy(index_path, &idx).ok()?;
+            std::fs::copy(index_path, &idx.path).ok()?;
         }
-        // `add -A` honours .gitignore, so build artefacts stay out.
-        run_git_env(cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
-        let tree = run_git_env(cwd, &["write-tree"], &[("GIT_INDEX_FILE", &idx_s)]).ok()?;
-        let _ = std::fs::remove_file(&idx);
+        let (key, val) = idx.env();
+        // `add -A` honours .gitignore, so build artefacts stay out. It reads
+        // the worktree and writes ONLY the temporary index: no ref, no real
+        // index entry, and no worktree write is touched by this measurement.
+        run_git_env(cwd, &["add", "-A"], &[(key, &val)]).ok()?;
+        let tree = run_git_env(cwd, &["write-tree"], &[(key, &val)]).ok()?;
         let tree = tree.trim().to_string();
         if tree.is_empty() {
             None
@@ -5424,21 +5460,65 @@ fn loop_review_base(explicit: Option<&str>, start_head: Option<&str>) -> Option<
         .or_else(|| start_head.map(str::to_string))
 }
 
-/// Diff the working tree against the loop's starting commit.
+/// The working-tree state a loop started from, captured BEFORE the first
+/// author turn.
 ///
-/// Two-dot (`git diff <sha>`) rather than `<sha>...HEAD` so uncommitted author
-/// edits AND commits made during the loop are both in scope. Untracked files
-/// are appended as synthetic new-file hunks, matching working-tree scope.
-fn loop_start_diff(cwd: &Path, start_head: &str) -> anyhow::Result<String> {
-    let mut d = run_git_diff(cwd, &["diff", start_head])?;
-    let untracked = untracked_not_ignored_diff(cwd);
-    if !untracked.is_empty() {
-        if !d.is_empty() && !d.ends_with('\n') {
-            d.push('\n');
-        }
-        d.push_str(&untracked);
+/// `tree` is a real git tree object holding every tracked and every
+/// non-ignored untracked file exactly as it was on disk when the loop began
+/// (see [`PatchJournal::snapshot_tree`]). It is taken through a throwaway
+/// `GIT_INDEX_FILE`, so measuring the tree never stages the user's work, never
+/// rewrites the index and never moves a ref.
+///
+/// Why a tree and not the starting commit: `git diff <start_head>` treats every
+/// edit already sitting in the tree when the loop starts as if the loop wrote
+/// it. On a `-C <tree>` checkout that already carries uncommitted and untracked
+/// work, that inflated `diff_lines`, sent hunks the author never touched to the
+/// reviewer, and let the loop "resolve" on somebody else's diff. The loop delta
+/// is therefore the diff from THIS tree to the working tree at review time.
+///
+/// `dirty` records that the start was not clean, so the iteration record says so
+/// instead of leaving a reviewer to infer it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LoopStartState {
+    /// Tree object id of the loop's starting working-tree state, or `None` when
+    /// the snapshot could not be taken (no git, unwritable temp dir).
+    pub(crate) tree: Option<String>,
+    /// Whether the working tree already had tracked or untracked changes.
+    pub(crate) dirty: bool,
+}
+
+/// Capture the loop's starting working-tree state. Never fails: a failed
+/// snapshot is reported as `tree: None`, which the review path treats as
+/// "the loop delta cannot be isolated" and refuses to guess.
+fn loop_start_state(cwd: &Path) -> LoopStartState {
+    let dirty = run_git(cwd, &["status", "--porcelain"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    LoopStartState {
+        tree: PatchJournal::snapshot_tree(cwd),
+        dirty,
     }
-    Ok(d)
+}
+
+/// The loop's own delta: the working-tree state captured at loop start vs the
+/// working-tree state now.
+///
+/// This is a content diff between two trees, so it covers every form of loop
+/// work — uncommitted edits, committed edits (the commit moves HEAD but the
+/// content on disk is what the reviewer must see), new files, and deletions —
+/// while excluding every byte that was already there when the loop started.
+///
+/// Errors when the CURRENT state cannot be snapshotted: an incomplete pair
+/// (start tree, no now-tree) would silently review nothing, and "no findings"
+/// from an empty diff is indistinguishable from an approval.
+fn loop_snapshot_diff(cwd: &Path, start_tree: &str) -> anyhow::Result<String> {
+    let current = PatchJournal::snapshot_tree(cwd).ok_or_else(|| {
+        anyhow!(
+            "working-tree snapshot failed while computing the loop delta from {start_tree}; \
+             refusing to review a partial delta"
+        )
+    })?;
+    run_git_diff(cwd, &["diff", start_tree, &current])
 }
 
 /// Auto uses a stable task baseline; explicit review scopes keep their contract,
@@ -5448,13 +5528,14 @@ fn loop_start_diff(cwd: &Path, start_head: &str) -> anyhow::Result<String> {
 /// "empty diff" and rejected the iteration. When the working-tree diff has no
 /// content but the task baseline shows changes, review the task delta instead
 /// and say so in the label. `--scope branch` reviews from the loop's starting
-/// HEAD (`loop_start_head`) unless `--base` was given, so unrelated history is
-/// never attributed to the author.
+/// working-tree SNAPSHOT (`loop_start`, captured before the first author turn)
+/// unless `--base` was given, so neither unrelated history nor edits that
+/// predate the loop is ever attributed to the author.
 fn loop_task_diff(
     cwd: &Path,
     scope: ReviewScope,
     base: Option<&str>,
-    loop_start_head: Option<&str>,
+    loop_start: Option<&LoopStartState>,
     task_journal: &PatchJournal,
 ) -> anyhow::Result<(String, String)> {
     match scope {
@@ -5484,13 +5565,20 @@ fn loop_task_diff(
                 Ok((label, diff))
             }
         }
-        ReviewScope::Branch => match (base, loop_start_head) {
+        ReviewScope::Branch => match (base, loop_start.and_then(|s| s.tree.as_deref())) {
             (Some(b), _) => build_diff(cwd, scope, Some(b)),
-            (None, Some(start)) => Ok((
-                format!("branch (base {start} = loop start)"),
-                loop_start_diff(cwd, start)?,
+            (None, Some(tree)) => Ok((
+                format!("branch (base {tree} = loop start working-tree snapshot)"),
+                loop_snapshot_diff(cwd, tree)?,
             )),
-            (None, None) => build_diff(cwd, scope, None),
+            // No snapshot means the loop cannot tell its own edits from the
+            // ones already on disk. Falling back to the commit base is exactly
+            // the misattribution this closes, and `detect_base`'s merge-base
+            // is worse still, so fail closed instead of guessing.
+            (None, None) => anyhow::bail!(
+                "loop start snapshot unavailable; refusing to review a delta that could \
+                 include pre-existing working-tree changes"
+            ),
         },
     }
 }
@@ -5886,16 +5974,46 @@ pub(crate) async fn cmd_loop(
     // every iteration; this one must not. An explicit `--base` still wins.
     let loop_start_head: Option<String> = prev_head.clone();
     let loop_base: Option<String> = loop_review_base(base.as_deref(), loop_start_head.as_deref());
+    // Snapshot the working tree NOW, before the first author turn. This is the
+    // loop's real starting point: a `-C <tree>` checkout often already carries
+    // uncommitted and untracked work, and diffing from the starting COMMIT
+    // charged all of it to the author (inflated `diff_lines`, hunks the loop
+    // never wrote, resolution on somebody else's diff). Reviewing
+    // `start tree -> working tree now` instead attributes exactly the loop's
+    // own bytes. Captured before any turn, so it cannot race the author.
+    let loop_start = loop_start_state(&cwd);
     let review_root = crate::review_diff::repo_root(&cwd);
     if !cli.quiet {
-        match (&loop_base, base.as_deref()) {
-            (Some(b), None) => eprintln!("[loop] review base: {b} (loop start; --base overrides)"),
-            (Some(b), Some(_)) => eprintln!("[loop] review base: {b} (explicit --base)"),
-            (None, _) => eprintln!(
-                "[loop] review base: unresolved (repository has no commits); \
-                 branch scope falls back to its default merge-base"
+        match (&loop_base, base.as_deref(), loop_start.tree.as_deref()) {
+            (Some(b), None, Some(tree)) => eprintln!(
+                "[loop] review base: {b} (loop start commit) + working-tree snapshot {tree}; \
+                 --base overrides both"
+            ),
+            (Some(b), None, None) => {
+                eprintln!("[loop] review base: {b} (loop start; --base overrides)")
+            }
+            (Some(b), Some(_), _) => eprintln!("[loop] review base: {b} (explicit --base)"),
+            (None, _, _) => eprintln!(
+                "[loop] review base: unresolved (repository has no commits); branch scope \
+                 reviews the loop-start working-tree snapshot"
             ),
         }
+    }
+    // Deliberately NOT gated on `quiet`: this is not progress chatter, it
+    // changes how every later iteration record must be read. A dirty start
+    // means "these diff_lines are the loop's work, not the tree's", and a
+    // failed snapshot means branch scope will refuse to review at all.
+    match (&loop_start.tree, loop_start.dirty) {
+        (Some(tree), true) => eprintln!(
+            "[loop] working tree was already dirty at start (snapshot tree {tree}); \
+             pre-existing tracked and untracked changes are excluded from the reviewed delta"
+        ),
+        (Some(_), false) => {}
+        (None, _) => eprintln!(
+            "[loop] WARNING: could not snapshot the working tree at loop start; the loop \
+             cannot tell its own changes from pre-existing ones and branch-scope review \
+             will refuse to run"
+        ),
     }
     const STALL_LIMIT: usize = 3;
 
@@ -6087,7 +6205,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             &cwd,
             scope,
             base.as_deref(),
-            loop_start_head.as_deref(),
+            Some(&loop_start),
             &task_journal,
         )?;
         let diff_lines = diff.lines().count();
@@ -6430,6 +6548,13 @@ or comment.\n"
             "check_phase_timed_out": check_timed_out,
             "loop_timeout_secs": loop_timeout_secs,
             "review_base": loop_base,
+            // The two facts that make `diff_lines` interpretable: WHICH tree
+            // the delta was computed from, and whether the tree already held
+            // edits when the loop began. Without them the count cannot be
+            // audited against `git diff <start_head>`, which is exactly how the
+            // dirty-start misattribution stayed invisible.
+            "review_base_tree": loop_start.tree,
+            "start_dirty": loop_start.dirty,
             "review_chunks": review_chunks,
             "review_error": review_error,
             "verdict": review.verdict,
@@ -15243,8 +15368,10 @@ mod loop_review_base_tests {
     }
 
     /// master is left at the seed commit; the fix branch carries 300 lines of
-    /// unrelated history, then the loop starts, then makes its own change.
-    fn repo_with_diverged_history() -> (tempfile::TempDir, PathBuf, String) {
+    /// unrelated history, the loop starts (clean), then it makes its own
+    /// change and commits it. Returns the loop-start snapshot taken before the
+    /// loop's change, which is what the loop reviews from.
+    fn repo_with_diverged_history() -> (tempfile::TempDir, PathBuf, LoopStartState) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         git(&repo, &["init", "-q", "-b", "master"]);
@@ -15260,7 +15387,11 @@ mod loop_review_base_tests {
         std::fs::write(repo.join("bulk.txt"), bulk).unwrap();
         git(&repo, &["add", "bulk.txt"]);
         git(&repo, &["commit", "-q", "-m", "unrelated history"]);
-        let loop_start = git(&repo, &["rev-parse", "HEAD"]);
+        let loop_start = loop_start_state(&repo);
+        assert!(
+            !loop_start.dirty && loop_start.tree.is_some(),
+            "a freshly committed tree is the clean-start case: {loop_start:?}"
+        );
         std::fs::write(repo.join("app.txt"), "base\nloop fix\n").unwrap();
         git(&repo, &["add", "app.txt"]);
         git(&repo, &["commit", "-q", "-m", "loop change"]);
@@ -15322,9 +15453,16 @@ mod loop_review_base_tests {
             label.contains("loop start"),
             "label must name the base: {label}"
         );
+        assert!(
+            label.contains(loop_start.tree.as_deref().unwrap_or("")),
+            "the label must carry the snapshot tree id so the record is auditable: {label}"
+        );
 
-        // Uncommitted loop work (the common case) is in scope too: the diff
-        // is two-dot (`git diff <start>`), not `<start>...HEAD`.
+        // A committed loop change is in scope because the diff is a CONTENT
+        // diff between two working-tree snapshots: the commit moved HEAD, but
+        // the bytes the reviewer must judge are the bytes on disk.
+        // Uncommitted loop work (the common case) is in scope for the same
+        // reason -- no `<start>...HEAD` three-dot narrowing.
         std::fs::write(repo.join("app.txt"), "base\nloop fix\nuncommitted\n").unwrap();
         let (_, diff) = loop_task_diff(
             &repo,
@@ -15349,5 +15487,300 @@ mod loop_review_base_tests {
             explicit.contains("unrelated history line 0"),
             "--base master must keep its branch-vs-master meaning"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A loop that starts on a dirty tree must not be charged for the dirt.
+    //
+    // Regression: `zoder loop -C <tree>` is routinely pointed at a worktree
+    // that already carries uncommitted and untracked work. Reviewing
+    // `git diff <start_head>` then (a) sent the reviewer hunks the author
+    // never wrote, (b) inflated `diff_lines`, and (c) let the loop resolve
+    // on somebody else's diff. The reviewed delta is now the diff from the
+    // working-tree snapshot taken at loop start to the working tree now.
+    // -----------------------------------------------------------------------
+
+    /// Seed repo with one tracked file committed and one tracked file
+    /// (tracked.txt) left with pre-loop uncommitted edits, plus a pre-loop
+    /// untracked file, plus a gitignored build artefact. That is the exact
+    /// shape of a `-C <dirty tree>` loop start.
+    fn repo_dirty_before_the_loop() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git(&repo, &["init", "-q", "-b", "master"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "loop-dirty-test"]);
+        std::fs::write(repo.join("app.txt"), "seed\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "committed content\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "build/\n").unwrap();
+        git(&repo, &["add", "app.txt", "tracked.txt", ".gitignore"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        // Pre-existing dirt: an uncommitted tracked edit and an untracked file.
+        std::fs::write(
+            repo.join("tracked.txt"),
+            "committed content\nPRE EXISTING HUMAN EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("scratch.txt"), "PRE EXISTING UNTRACKED\n").unwrap();
+        std::fs::create_dir_all(repo.join("build")).unwrap();
+        std::fs::write(repo.join("build/out.o"), "ignored artefact\n").unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn dirty_tracked_and_untracked_changes_present_at_start_are_not_in_the_loop_delta() {
+        let (_dir, repo) = repo_dirty_before_the_loop();
+        let start = loop_start_state(&repo);
+        assert!(start.dirty, "this repo is dirty on purpose: {start:?}");
+        assert!(start.tree.is_some(), "snapshot must be taken: {start:?}");
+
+        // The loop's own work.
+        std::fs::write(repo.join("app.txt"), "seed\nloop change\n").unwrap();
+        std::fs::write(repo.join("loop_new.rs"), "pub fn loop() {}\n").unwrap();
+
+        let (_label, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&start),
+            &PatchJournal::new(),
+        )
+        .unwrap();
+
+        assert!(
+            diff.contains("+loop change"),
+            "the loop's own edit must be reviewed: {diff}"
+        );
+        assert!(
+            diff.contains("loop_new.rs"),
+            "a file the loop created must be reviewed: {diff}"
+        );
+        assert!(
+            !diff.contains("PRE EXISTING HUMAN EDIT"),
+            "a pre-existing uncommitted tracked edit must NOT be charged to the loop: {diff}"
+        );
+        assert!(
+            !diff.contains("scratch.txt"),
+            "a pre-existing untracked file must NOT be charged to the loop: {diff}"
+        );
+        assert!(
+            !diff.contains("build/out.o") && !diff.contains("ignored artefact"),
+            "gitignored artefacts must stay out of the delta: {diff}"
+        );
+        // The old base charged two files for a one-line change; the snapshot
+        // delta charges one file and one new file.
+        assert!(
+            diff.lines().count() < 25,
+            "{} lines for a one-line edit + one new file is the dirty-start defect",
+            diff.lines().count()
+        );
+    }
+
+    #[test]
+    fn loop_delta_excludes_a_preexisting_edit_to_a_file_the_loop_also_touched() {
+        // Same file, two authors: the human edited it before the loop started,
+        // the loop appended after. Only the appended line may be attributed.
+        let (_dir, repo) = repo_dirty_before_the_loop();
+        let start = loop_start_state(&repo);
+        std::fs::write(
+            repo.join("tracked.txt"),
+            "committed content\nPRE EXISTING HUMAN EDIT\nLOOP APPENDED LINE\n",
+        )
+        .unwrap();
+
+        let (_label, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&start),
+            &PatchJournal::new(),
+        )
+        .unwrap();
+
+        assert!(diff.contains("+LOOP APPENDED LINE"), "{diff}");
+        // The human's line is allowed to appear as CONTEXT (the reviewer needs
+        // it); what must never happen is it being charged as an addition.
+        assert!(
+            !added_lines(&diff).contains(&"PRE EXISTING HUMAN EDIT".to_string()),
+            "the human's line is not the loop's work: {diff}"
+        );
+        assert!(
+            diff.contains(" PRE EXISTING HUMAN EDIT"),
+            "unchanged context still belongs in the review: {diff}"
+        );
+    }
+
+    #[test]
+    fn clean_start_delta_is_unchanged_and_pre_start_state_is_clean() {
+        let (_dir, repo, start) = repo_with_diverged_history();
+        assert!(!start.dirty, "clean start must be recorded as clean");
+        let (_label, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&start),
+            &PatchJournal::new(),
+        )
+        .unwrap();
+        assert!(diff.contains("+loop fix"), "{diff}");
+        assert_eq!(
+            diff.lines().count(),
+            7,
+            "a clean start must produce the same compact diff as before the fix: {diff}"
+        );
+    }
+
+    #[test]
+    fn branch_scope_without_a_snapshot_fails_closed() {
+        // A missing snapshot means the loop cannot separate its own edits from
+        // the ones already on disk. Falling back to a commit base is precisely
+        // the misattribution this closes, so refuse instead of guessing.
+        let (_dir, repo, _) = repo_with_diverged_history();
+        let err = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            None,
+            Some(&LoopStartState {
+                tree: None,
+                dirty: false,
+            }),
+            &PatchJournal::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("snapshot unavailable"), "must say why: {err}");
+    }
+
+    #[test]
+    fn explicit_base_wins_even_on_a_dirty_start() {
+        // `--base` is the operator's override and keeps its own three-dot
+        // contract; the snapshot only supplies the DEFAULT base. Prove it by
+        // requiring the override's diff to be byte-identical to what
+        // `build_diff` produces for that base.
+        let (_dir, repo) = repo_dirty_before_the_loop();
+        let start = loop_start_state(&repo);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("app.txt"), "seed\nloop change\n").unwrap();
+
+        let (label, diff) = loop_task_diff(
+            &repo,
+            ReviewScope::Branch,
+            Some(&base),
+            Some(&start),
+            &PatchJournal::new(),
+        )
+        .unwrap();
+        let (expect_label, expect_diff) =
+            build_diff(&repo, ReviewScope::Branch, Some(&base)).unwrap();
+        assert_eq!(diff, expect_diff, "--base must keep its own contract");
+        assert_eq!(label, expect_label);
+        assert!(
+            label.contains(&base),
+            "label must name the explicit base: {label}"
+        );
+    }
+
+    #[test]
+    fn start_snapshot_touches_neither_the_index_nor_the_worktree_nor_refs() {
+        let (_dir, repo) = repo_dirty_before_the_loop();
+        let head_before = git(&repo, &["rev-parse", "HEAD"]);
+        let worktree_before = sorted_worktree(&repo);
+        let status_before = git(&repo, &["status", "--porcelain"]);
+        assert!(
+            status_before.contains("tracked.txt") && status_before.contains("scratch.txt"),
+            "precondition: the repo really is dirty: {status_before:?}"
+        );
+
+        let start = loop_start_state(&repo);
+        assert!(start.tree.is_some(), "{start:?}");
+
+        assert_eq!(
+            git(&repo, &["diff", "--cached", "--name-only"]),
+            "",
+            "taking the snapshot must not stage anything"
+        );
+        assert_eq!(
+            git(&repo, &["status", "--porcelain"]),
+            status_before,
+            "the working tree must be byte-identical after the snapshot"
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(sorted_worktree(&repo), worktree_before);
+    }
+
+    #[test]
+    fn temp_index_is_removed_on_every_path_including_an_early_bail() {
+        // Cleanup is a property of the GUARD, not of the happy path: git
+        // creates the index file after `TempIndex::new`, and every `?` in
+        // `snapshot_tree` (copy / `add -A` / `write-tree`) returns while it is
+        // still open. A hand-rolled `remove_file` only covered the success
+        // path, so a failing snapshot leaked a stale index into a shared
+        // TMPDIR for every iteration of every concurrent loop.
+        fn snapshot_that_bails_after_git_wrote_the_file() -> std::path::PathBuf {
+            let idx = TempIndex::new("early-bail");
+            let path = idx.path.clone();
+            // Stand in for `git add -A` writing GIT_INDEX_FILE.
+            std::fs::write(&path, b"DIRC\0\0\0\0").unwrap();
+            assert!(path.exists(), "precondition: the file exists mid-snapshot");
+            // Stand in for `run_git_env(...).ok()?` returning early: `idx` is
+            // dropped here and takes the file with it.
+            drop(idx);
+            path
+        }
+
+        let path = snapshot_that_bails_after_git_wrote_the_file();
+        assert!(
+            !path.exists(),
+            "the throwaway index must not outlive an early bail: {}",
+            path.display()
+        );
+
+        // A crashed predecessor's leftover is never inherited either.
+        let idx = TempIndex::new("stale-probe");
+        std::fs::write(&idx.path, b"stale").unwrap();
+        let stale = idx.path.clone();
+        drop(idx);
+        assert!(!stale.exists(), "{}", stale.display());
+    }
+
+    /// Every worktree file with its content, so a mutation shows up as a diff.
+    fn sorted_worktree(repo: &Path) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        let mut stack = vec![repo.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if name == ".git" {
+                    continue;
+                }
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(content) = std::fs::read_to_string(&p) {
+                    v.push((
+                        p.strip_prefix(repo)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string(),
+                        content,
+                    ));
+                }
+            }
+        }
+        v.sort();
+        v
+    }
+
+    /// The ADDED lines of a unified diff, without the leading `+`. Context
+    /// lines are review context, not attribution: only `+` lines are content
+    /// the loop is being charged for.
+    fn added_lines(diff: &str) -> Vec<String> {
+        diff.lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .map(|l| l[1..].to_string())
+            .collect()
     }
 }
