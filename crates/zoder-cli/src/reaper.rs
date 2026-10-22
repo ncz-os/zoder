@@ -29,10 +29,45 @@
 //!
 //! That is deliberately the whole ownership test, and it is a judgement call:
 //! nothing in /proc says "the agent spawned this". The alternative is the bug
-//! this file exists to fix — a leftover process nobody will ever clean up. On
-//! a shared host the exposure is bounded to same-uid processes whose cwd is
+//! this file exists to fix — a leftover process nobody will ever clean up. On a
+//! shared host the exposure is bounded to same-uid processes whose cwd is
 //! this run's own workspace and that started during this run; `--no-reap` is
 //! the escape hatch for anyone who needs that stricter.
+//!
+//! ## The shared daemon is exempt, by identity
+//!
+//! Every rule above describes the AGENT's processes, but the zeroclaw daemon
+//! is not the agent's: it is one daemon per host that every zoder on the box
+//! drives through `<data dir>/daemon.sock`. 2026-10-21 (ACHILLES): job
+//! `01a16164`'s `zoder loop` spawned the daemon with no `current_dir` set, so
+//! the daemon inherited the JOB's workspace as its cwd. The daemon matched
+//! every rule in the list — same uid, cwd inside `-C`, started after the loop
+//! began, not an ancestor — so this reaper SIGTERM'd it, killing the agent of
+//! every other zoder on the host that was mid-turn.
+//!
+//! So the daemon is excluded outright, and the exclusion is deliberately made
+//! of identity only, never of command-line text:
+//!
+//! * the pid this zoder spawned (recorded by `note_daemon_pid` the instant
+//!   the child exists),
+//! * the pid recorded for the socket (the `<data dir>/daemon.pid` zoder
+//!   writes, so a reaper in a *different* zoder process can spare it too),
+//! * `/proc/<pid>/exe` being the zeroclaw binary.
+//!
+//! No argv matching anywhere: a process can be renamed into looking like the
+//! daemon (`cp`, a shell called `zeroclaw`), and the daemon's own argv is not
+//! a stable identity (`--ephemeral` is optional, the config dir varies).
+//!
+//! The daemon's CHILDREN are not exempt. They are the tool shells the agent
+//! starts — the `yes` generators of the 01a1601b incident — and they still
+//! match every ownership rule, so they are still reaped. And processes the
+//! daemon runs for OTHER sessions are still protected by the cwd rule above:
+//! another session's leftovers live in another job's workspace, not in `-C`.
+//!
+//! The neutral spawn that keeps the daemon out of a job directory in the
+//! first place lives in the CLI ([`crate::daemon_working_dir`]); the
+//! exemption here is what makes that fix defence in depth rather than the
+//! only thing standing between a reap and somebody else's agent.
 //!
 //! Selection is by exact PID only. There is no pattern matching anywhere here:
 //! `pkill yes` would kill every `yes` on the host, including one a human
@@ -88,6 +123,144 @@ const KILL_WAIT: Duration = Duration::from_millis(500);
 /// the loop never reached its own author-timeout cancel. A ghost turn from
 /// iteration 1 keeps editing the tree just as hard as one from iteration 9.
 static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The pid of the shared zeroclaw daemon, when THIS zoder process spawned it.
+///
+/// Recorded the instant `Command::spawn` returns (see
+/// `crate::record_daemon_pid`), which is the only moment the reaper cannot
+/// yet be looking: a scope that opened before the spawn has a snapshot with
+/// no daemon in it and a boundary the daemon starts after, so every ownership
+/// rule in this file selects it. The daemon outlives zoder by design — it
+/// serves every concurrent session on the host — so it must never be one of
+/// our reap targets.
+static DAEMON_PIDS: std::sync::LazyLock<Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Pids already reported as spared, so the exemption is announced once per
+/// daemon per process instead of on every scan of every teardown round.
+static REPORTED_DAEMONS: std::sync::LazyLock<Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Remember the shared daemon's pid so no reap scope can select it. Called by
+/// the CLI immediately after the daemon child is spawned.
+///
+/// `pid == 0` is ignored: it is not an identity, and treating it as one would
+/// exempt a real pid on a buggy `spawn`.
+pub(crate) fn note_daemon_pid(pid: u32) {
+    if pid > 1 {
+        DAEMON_PIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid);
+    }
+}
+
+/// Is `pid` exempt as "a daemon this process spawned"? Test-only seam for the
+/// in-process arm of [`daemon_exemption`], which the scan calls directly.
+#[cfg(test)]
+pub(crate) fn daemon_pid_spared(pid: u32) -> bool {
+    DAEMON_PIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid)
+}
+
+/// Why a process is exempt from the reap. Every arm is an identity the kernel
+/// exposes for the process itself; none of them is its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonExemption {
+    /// The pid this zoder process spawned.
+    Spawned,
+    /// The pid recorded for the socket this reaper talks to.
+    Recorded,
+    /// `/proc/<pid>/exe` resolves to the zeroclaw binary.
+    Executable,
+}
+
+impl DaemonExemption {
+    fn reason(self) -> &'static str {
+        match self {
+            DaemonExemption::Spawned => "the pid this zoder spawned",
+            DaemonExemption::Recorded => "the pid recorded for the daemon socket",
+            DaemonExemption::Executable => "/proc/<pid>/exe is the zeroclaw binary",
+        }
+    }
+}
+
+/// Is this process the shared zeroclaw daemon? Checked for every candidate,
+/// on every pass, because a daemon can appear at any time during a run.
+///
+/// The pid-file arm cannot be cached in the plan: the daemon is usually
+/// spawned *after* the scope opened, which is exactly the case it exists for.
+/// So the file is re-read on the first scan that needs it and the answer held
+/// in `recorded` for the rest of that pass.
+fn daemon_exemption(
+    pid: u32,
+    recorded: &mut Option<u32>,
+    pid_file: &Path,
+) -> Option<DaemonExemption> {
+    if DAEMON_PIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid)
+    {
+        return Some(DaemonExemption::Spawned);
+    }
+    if recorded.is_none() {
+        *recorded = recorded_daemon_pid(pid_file);
+    }
+    if *recorded == Some(pid) {
+        return Some(DaemonExemption::Recorded);
+    }
+    if executable_is_zeroclaw(pid) {
+        return Some(DaemonExemption::Executable);
+    }
+    None
+}
+
+/// The daemon pid recorded in `path`, if it is a plausible one.
+///
+/// A stale file is the interesting case: the daemon can die without anyone
+/// clearing its record, and the kernel will eventually recycle that pid. The
+/// consequence of trusting a stale record is one process spared from a reap —
+/// the same direction as every other exemption here, and never a stranger
+/// signalled. `pid <= 1` is rejected outright; init is not a daemon.
+pub(crate) fn recorded_daemon_pid(path: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.trim().parse::<u32>().ok().filter(|pid| *pid > 1)
+}
+
+/// Announce a spared daemon once. Silently skipping a process that matched
+/// every ownership rule would make the reap log claim a clean workspace while
+/// a shared daemon sat inside it; the honest form of that is one line naming
+/// the pid and the reason.
+fn report_spared_daemon(pid: u32, exemption: DaemonExemption) {
+    if REPORTED_DAEMONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pid)
+    {
+        eprintln!(
+            "[zoder] left shared zeroclaw daemon pid={pid} running ({}); it serves every \
+             zoder on this host, not just this run",
+            exemption.reason()
+        );
+    }
+}
+
+/// Does `exe` name the zeroclaw binary?
+///
+/// Only the executable is ever consulted, never `/proc/<pid>/cmdline`: argv
+/// is trivial to fake (`cp /bin/sleep /tmp/zeroclaw`, a shell script named
+/// `zeroclaw`), while the executable is what the kernel will actually run.
+/// The match is the EXACT install name zoder itself resolves
+/// (`locate_sibling("zeroclaw")` can only ever find `<dir>/zeroclaw`), not
+/// a prefix: `zeroclaw-old`, `zeroclaw.bak-…` and friends are somebody
+/// else's decision to make, and every extra pattern is more surface for a
+/// process to be spared by accident.
+fn executable_name_is_zeroclaw(exe: &Path) -> bool {
+    exe.file_name().and_then(|n| n.to_str()) == Some("zeroclaw")
+}
 
 /// Sessions a cancel has already been sent for, so the async phase, the
 /// blocking path and the final sweep never send the same one twice.
@@ -159,6 +332,10 @@ struct ReapPlan {
     /// pid, so a pid recycled onto a fresh process after the snapshot is
     /// judged on its own start time and stays eligible.
     preexisting: HashMap<u32, u64>,
+    /// Where the shared daemon's pid is recorded (`<data dir>/daemon.pid`).
+    /// Re-read on every scan rather than parsed once here, because the daemon
+    /// is typically spawned *after* this plan exists.
+    daemon_pid_file: PathBuf,
 }
 
 impl ReapPlan {
@@ -167,7 +344,11 @@ impl ReapPlan {
     /// cwd somewhere under `/tmp`, and "same uid + cwd in /tmp + started
     /// recently" describes all of them. Instead this run gets its own scratch
     /// directory inside it, and that directory is the boundary.
-    fn new(cwd: &Path, temp_base: &Path) -> Option<Self> {
+    ///
+    /// `daemon_pid_file` is where the shared daemon's pid is recorded; it is
+    /// carried in the plan rather than read here so the exemption is testable
+    /// against a fixture file instead of the developer's real `~/.zoder`.
+    fn new(cwd: &Path, temp_base: &Path, daemon_pid_file: PathBuf) -> Option<Self> {
         // Order matters: the boot-tick boundary is read FIRST and the pid
         // snapshot second, so every process that existed before the boundary
         // is in the snapshot. (The other order leaves a window in which a
@@ -210,6 +391,7 @@ impl ReapPlan {
             owned_roots,
             started_ticks,
             preexisting,
+            daemon_pid_file,
         })
     }
 
@@ -276,7 +458,9 @@ impl ReapGuard {
     /// scratch space is `tmp`. `enabled=false` (`--no-reap`) yields a guard
     /// that does nothing at all, including no signal handling.
     pub(crate) fn begin(cwd: &Path, tmp: &Path, enabled: bool) -> Self {
-        let plan = enabled.then(|| ReapPlan::new(cwd, tmp)).flatten();
+        let plan = enabled
+            .then(|| ReapPlan::new(cwd, tmp, crate::daemon_pid_file_path()))
+            .flatten();
         if let Some(plan) = plan.as_ref() {
             // Every session the engine mints is recorded the moment it exists,
             // not when its turn returns: a SIGTERM in the middle of a 900 s
@@ -1097,6 +1281,9 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         return Vec::new();
     };
     let mut found: Vec<Candidate> = Vec::new();
+    // Resolved once per scan, not once per pid: the pid file is a single read
+    // for the whole table, and only when something could actually match.
+    let mut recorded_daemon = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -1107,6 +1294,14 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         };
         // pid 1 is init; `protected` covers zoder itself and its ancestors.
         if pid <= 1 || protected.contains(&pid) {
+            continue;
+        }
+        // The shared zeroclaw daemon is not this run's to kill, however it
+        // came to match the rules below: it serves every zoder on the host.
+        // Checked by identity only (spawned pid, recorded pid, executable).
+        if let Some(exemption) = daemon_exemption(pid, &mut recorded_daemon, &plan.daemon_pid_file)
+        {
+            report_spared_daemon(pid, exemption);
             continue;
         }
         let Some(stat) = read_stat(pid) else {
@@ -1174,6 +1369,26 @@ fn strip_deleted_suffix(path: &Path) -> PathBuf {
         Some(stripped) => PathBuf::from(stripped),
         None => path.to_path_buf(),
     }
+}
+
+/// `/proc/<pid>/exe` for this process, with the "(deleted)" suffix a replaced
+/// binary leaves behind stripped.
+///
+/// This is the ONLY identity the reap scope uses for "the daemon": not argv,
+/// not `comm`, not the pid file alone. An unreadable link (a process that
+/// dropped `dumpable`, a pid mid-exit) reads as "not the daemon", which is
+/// the safe answer here only because the other two arms still apply.
+#[cfg(target_os = "linux")]
+fn executable_is_zeroclaw(pid: u32) -> bool {
+    let Ok(raw) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    executable_name_is_zeroclaw(&strip_deleted_suffix(&raw))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn executable_is_zeroclaw(_pid: u32) -> bool {
+    false
 }
 
 /// Alive means "can still run": a missing pid, or one in Z/X state, is dead.
@@ -1291,6 +1506,111 @@ mod tests {
         fn outside(&self) -> PathBuf {
             self._dir.path().join("elsewhere")
         }
+
+        /// A daemon-pid file that does NOT exist, for plans whose tests are
+        /// about something else. The developer's real `~/.zoder/data/
+        /// daemon.pid` must never decide whether a fixture is a candidate.
+        fn daemon_pid_file(&self) -> PathBuf {
+            self._dir.path().join("absent-daemon.pid")
+        }
+
+        /// The tempdir root itself — where fixture binaries are installed. It
+        /// is deliberately NOT a reap root, so a fixture executable parked
+        /// here can never be mistaken for the workspace.
+        fn root(&self) -> PathBuf {
+            self._dir.path().to_path_buf()
+        }
+    }
+
+    /// Install a REAL executable named `zeroclaw`.
+    ///
+    /// A symlink would not do: `/proc/<pid>/exe` resolves to the file the
+    /// kernel actually executed, so a link called `zeroclaw` still reads as
+    /// whatever it points at. Copying the binary is what makes the
+    /// executable-identity arm see in a test exactly what it sees in
+    /// production.
+    ///
+    /// The source is `/bin/sh` on purpose. `/bin/sleep` on some hosts is a
+    /// symlink into a multi-call `coreutils` binary that dispatches on
+    /// argv[0]: copied to `zeroclaw` it prints "unknown program" and exits,
+    /// which is a fixture that dies on its own and tests nothing. `dash` runs
+    /// the same whatever it is called.
+    fn install_fake_zeroclaw(root: &Path, source: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = root.join("zeroclaw");
+        std::fs::copy(source, &exe).unwrap_or_else(|e| panic!("copy {source} to {exe:?}: {e}"));
+        let mut perms = std::fs::metadata(&exe)
+            .expect("stat the copy")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exe, perms).expect("make the copy executable");
+        exe
+    }
+
+    /// A shell body that backgrounds one long-lived child, records its pid, and
+    /// then stays alive — so the "daemon" is still running (and still the
+    /// parent of an agent leftover) when the reap does its scan.
+    fn daemon_script(pidfile: &Path) -> String {
+        format!("sleep 600 & echo $! > {}; wait", pidfile.display())
+    }
+
+    /// A daemon fixture that has NO child of its own inside the reap roots: the
+    /// one helper it runs is moved to `helper_cwd` (outside `-C`) before it
+    /// execs. That is what a shared daemon actually looks like — its own
+    /// machinery lives outside the job workspace — and it keeps the fixture
+    /// alive across the reap, so a test can assert the daemon SURVIVED rather
+    /// than infer it from a selection list.
+    fn neutral_daemon_script(pidfile: &Path, helper_cwd: &Path) -> String {
+        format!(
+            "( cd '{}' && exec sleep 600 ) & echo $! > {}; wait",
+            helper_cwd.display(),
+            pidfile.display()
+        )
+    }
+
+    /// Spawn the daemon fixture with its cwd in `cwd`, and wait until the whole
+    /// shape is up: the daemon running in `cwd`, its helper recorded, the
+    /// helper out in `helper_cwd`. Returns (daemon, helper).
+    fn spawn_fake_daemon(
+        exe: &Path,
+        cwd: &Path,
+        helper_cwd: &Path,
+        pidfile: &Path,
+    ) -> (std::process::Child, u32) {
+        let daemon = Command::new(exe)
+            .arg("-c")
+            .arg(neutral_daemon_script(pidfile, helper_cwd))
+            .current_dir(cwd)
+            .spawn()
+            .expect("spawn the fake daemon");
+        let daemon_pid = daemon.id();
+        let helper = read_pidfile(pidfile);
+        wait_until(
+            || {
+                alive(daemon_pid)
+                    && alive(helper)
+                    && proc_cwd(helper).as_deref() == Some(helper_cwd)
+            },
+            "the fake daemon and its out-of-scope helper to settle",
+        );
+        (daemon, helper)
+    }
+
+    fn read_pidfile(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {} to name a pid",
+                path.display()
+            );
+            std::thread::sleep(POLL);
+        }
     }
 
     /// Spawn a long-lived child with its cwd inside `cwd` and return its pid.
@@ -1330,6 +1650,13 @@ mod tests {
             std::thread::sleep(POLL);
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// `/proc/<pid>/cwd`, the way the reaper and the incident both see it.
+    fn proc_cwd(pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .map(|cwd| strip_deleted_suffix(&cwd))
     }
 
     /// Kill a fixture this test created, by exact pid. Never by name.
@@ -1500,7 +1827,7 @@ mod tests {
     fn sigterm_ignoring_process_is_escalated_to_sigkill() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
         let stubborn = spawn_sigterm_ignoring(&ws.cd);
         wait_until(
             || alive(stubborn),
@@ -1704,7 +2031,7 @@ mod tests {
         wait_until(|| alive(bystander), "the bystander fixture to be running");
 
         // Same directory passed as both the workspace and the temp base.
-        let plan = ReapPlan::new(&ws.tmp_root, &ws.tmp_root).expect("plan");
+        let plan = ReapPlan::new(&ws.tmp_root, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
         assert!(
             !plan.owns_cwd(&ws.tmp_root),
             "-C <temp root> must not make the shared temp root a reap root"
@@ -1865,7 +2192,7 @@ mod tests {
     fn a_descendant_forked_during_the_reap_is_still_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
         // A parent that forks one child, then forks another ~200ms later —
         // after the first child has been signalled, i.e. mid-pass.
         let pidfile = ws.cd.join("forker-pids");
@@ -2048,7 +2375,12 @@ mod tests {
     #[test]
     fn a_root_of_slash_arms_nothing() {
         assert!(
-            ReapPlan::new(Path::new("/"), Path::new("/")).is_none(),
+            ReapPlan::new(
+                Path::new("/"),
+                Path::new("/"),
+                PathBuf::from("/nonexistent/daemon.pid"),
+            )
+            .is_none(),
             "a / root must not produce a reap plan"
         );
     }
@@ -2058,7 +2390,7 @@ mod tests {
     #[test]
     fn plan_covers_the_cd_directory_and_this_runs_scratch_dir_only() {
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
         assert!(plan.owns_cwd(&ws.cd.join("src/lib.rs")));
         let scratch = plan
             .owned_roots
@@ -2101,11 +2433,287 @@ mod tests {
     fn a_clean_run_reaps_nothing() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root).expect("plan");
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
         let outcome = reap(&plan, Duration::from_millis(50));
         assert!(
             outcome.reaped.is_empty() && outcome.skipped.is_empty() && outcome.survivors.is_empty(),
             "an empty workspace must produce no reaped, skipped or surviving processes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared zeroclaw daemon (2026-10-21, ACHILLES hive job 01a16164).
+    // -----------------------------------------------------------------------
+
+    /// The incident, at the reap scope. A `zeroclaw` daemon sits inside `-C`,
+    /// same uid, started after the loop began — so every ownership rule in
+    /// this file selects it — and an ordinary leftover sits right beside it.
+    /// The daemon must survive; the leftover must not.
+    ///
+    /// Both fixtures are spawned AFTER the scope opens on purpose: a daemon
+    /// that predated the loop would be spared by the start-time rule alone,
+    /// which is exactly the loophole that let this through in the first
+    /// place.
+    #[test]
+    fn a_shared_daemon_in_the_workspace_is_spared_and_an_ordinary_leftover_is_still_reaped() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+
+        let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
+        let (mut daemon, helper) = spawn_fake_daemon(
+            &daemon_exe,
+            &ws.cd,
+            &ws.outside(),
+            &ws.cd.join("daemon-helper.pid"),
+        );
+        let daemon_pid = daemon.id();
+        let leftover = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(leftover), "the ordinary fixture to be running");
+        assert!(
+            executable_is_zeroclaw(daemon_pid),
+            "precondition: /proc/<pid>/exe must name the daemon, or this test proves nothing"
+        );
+        assert_eq!(
+            proc_cwd(daemon_pid).as_deref(),
+            Some(ws.cd.as_path()),
+            "precondition: the daemon sits INSIDE -C, which is the whole incident"
+        );
+
+        let selected: Vec<u32> = scan(&plan).iter().map(|c| c.pid).collect();
+        assert!(
+            selected.contains(&leftover),
+            "an ordinary leftover in -C started during the loop is ours to reap"
+        );
+        assert!(
+            !selected.contains(&daemon_pid),
+            "the shared daemon matches every ownership rule and must still be spared"
+        );
+
+        guard.finish();
+        assert!(
+            alive(daemon_pid),
+            "SIGTERM'ing the shared daemon kills the agent of every other zoder on this host"
+        );
+        assert!(
+            !alive(leftover),
+            "the exemption is the daemon itself, not everything in the workspace"
+        );
+
+        kill_exact(daemon_pid);
+        kill_exact(helper);
+        let _ = daemon.wait();
+        kill_exact(leftover);
+    }
+
+    /// Identity beats evidence. A daemon this process spawned is spared even
+    /// when nothing about it looks like zeroclaw — which is the window
+    /// between `spawn` returning and the executable being inspectable, and the
+    /// window that matters, because that is when the reaper's first scan runs
+    /// in a signal teardown.
+    #[test]
+    fn the_pid_this_zoder_spawned_is_spared_whatever_its_executable_is() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+        let daemon = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(daemon), "the spawned fixture to be running");
+        assert!(
+            !executable_is_zeroclaw(daemon),
+            "precondition: this fixture is /bin/sleep, not the zeroclaw binary"
+        );
+
+        note_daemon_pid(daemon);
+        assert!(daemon_pid_spared(daemon));
+        assert!(
+            !scan(&plan).iter().any(|c| c.pid == daemon),
+            "the pid this process handed out from spawn() is exempt by identity"
+        );
+
+        guard.finish();
+        assert!(
+            alive(daemon),
+            "our own daemon child must survive our own reap"
+        );
+
+        kill_exact(daemon);
+    }
+
+    /// The cross-process arm: zoder records the daemon's pid next to the
+    /// socket, so a reap scope in a DIFFERENT zoder process (job 01a1619b's
+    /// loop, while 01a16164's daemon is serving it) can spare it too. Only
+    /// the record is involved here — the fixture's executable is `sleep`.
+    #[test]
+    fn the_pid_recorded_for_the_daemon_socket_is_spared_in_another_zoder_process() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let pidfile = ws.root().join("daemon.pid");
+        let daemon = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(daemon), "the recorded fixture to be running");
+        std::fs::write(&pidfile, format!("{daemon}\n")).expect("record the daemon pid");
+        assert_eq!(recorded_daemon_pid(&pidfile), Some(daemon));
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile).expect("plan");
+
+        assert!(
+            !scan(&plan).iter().any(|c| c.pid == daemon),
+            "the pid recorded for the daemon socket must be spared by another process's reap"
+        );
+
+        kill_exact(daemon);
+    }
+
+    /// A pid file that is empty, non-numeric, or names init/pid 0 spares
+    /// nobody: it must not be able to silence the reap wholesale.
+    #[test]
+    fn a_garbage_pid_file_spares_nobody() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let pidfile = ws.root().join("daemon.pid");
+        for junk in ["", "   ", "not-a-pid", "0", "1", "-5", "4294967296"] {
+            std::fs::write(&pidfile, format!("{junk}\n")).expect("write junk");
+            assert_eq!(
+                recorded_daemon_pid(&pidfile),
+                None,
+                "{junk:?} must not parse as a daemon pid"
+            );
+        }
+        std::fs::write(&pidfile, "0\n").expect("write junk");
+        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile).expect("plan");
+        let leftover = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(leftover), "the fixture to be running");
+        assert!(
+            scan(&plan).iter().any(|c| c.pid == leftover),
+            "an unusable pid file must not turn the reap off"
+        );
+
+        reap(&plan, Duration::from_millis(50));
+        assert!(!alive(leftover), "an ordinary leftover is still reaped");
+        kill_exact(leftover);
+    }
+
+    /// The daemon's CHILDREN are not exempt. They are the tool shells the
+    /// agent starts — the 368 `yes` generators of the 01a1601b incident — so a
+    /// blanket "skip the daemon's subtree" exemption would undo the reaper
+    /// while fixing this.
+    #[test]
+    fn the_shared_daemons_own_children_in_the_workspace_are_still_reaped() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+
+        let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
+        let pidfile = ws.cd.join("daemon-child.pid");
+        let mut daemon = Command::new(&daemon_exe)
+            .arg("-c")
+            .arg(daemon_script(&pidfile))
+            .current_dir(&ws.cd)
+            .spawn()
+            .expect("spawn the fake daemon");
+        let daemon_pid = daemon.id();
+        let agent_child = read_pidfile(&pidfile);
+        wait_until(
+            || alive(daemon_pid) && alive(agent_child),
+            "the daemon and its agent child to be running",
+        );
+
+        let selected: Vec<u32> = scan(&plan).iter().map(|c| c.pid).collect();
+        assert!(
+            !selected.contains(&daemon_pid),
+            "the daemon process itself is spared"
+        );
+        assert!(
+            selected.contains(&agent_child),
+            "the tool shell the agent started is an ordinary orphan and must be reaped"
+        );
+
+        let outcome = reap(&plan, Duration::from_millis(50));
+        assert!(
+            !alive(agent_child),
+            "the daemon's leftovers in the workspace are exactly what the reap is for"
+        );
+        // The daemon is not merely spared from selection: it appears in no
+        // reap outcome at all, not even as a survivor or a recycled skip.
+        for entry in outcome
+            .reaped
+            .iter()
+            .chain(outcome.skipped.iter())
+            .chain(outcome.survivors.iter())
+        {
+            assert_ne!(
+                entry.pid, daemon_pid,
+                "the daemon must never be signalled, not even to find out it is gone"
+            );
+        }
+        // The fixture daemon exits of its own accord once its last child is
+        // gone, which is why its survival is asserted in
+        // `a_shared_daemon_in_the_workspace_is_spared_and_...` instead.
+
+        kill_exact(daemon_pid);
+        let _ = daemon.wait();
+    }
+
+    /// …and the other direction: a process the daemon runs for SOMEONE ELSE
+    /// is not ours. Its cwd is another job's workspace, which is outside
+    /// `-C`, so the ownership test never reaches it — the exemption is not
+    /// what protects it, and the reap must not start treating the daemon's
+    /// whole subtree as fair game because of this fix.
+    #[test]
+    fn a_leftover_of_another_session_served_by_the_same_daemon_is_untouched() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let plan = guard.plan.clone().expect("armed guard has a plan");
+
+        let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
+        let pidfile = ws.outside().join("other-session.pid");
+        let mut daemon = Command::new(&daemon_exe)
+            .arg("-c")
+            .arg(daemon_script(&pidfile))
+            .current_dir(ws.outside())
+            .spawn()
+            .expect("spawn the fake daemon");
+        let daemon_pid = daemon.id();
+        let other_sessions_leftover = read_pidfile(&pidfile);
+        wait_until(
+            || alive(daemon_pid) && alive(other_sessions_leftover),
+            "the daemon and the other session's leftover to be running",
+        );
+
+        let selected: Vec<u32> = scan(&plan).iter().map(|c| c.pid).collect();
+        assert!(
+            !selected.contains(&daemon_pid) && !selected.contains(&other_sessions_leftover),
+            "neither the daemon nor another session's leftover is in this run's scope"
+        );
+
+        guard.finish();
+        assert!(
+            alive(other_sessions_leftover),
+            "a concurrent session's agent must not be killed by our teardown"
+        );
+
+        kill_exact(daemon_pid);
+        kill_exact(other_sessions_leftover);
+        let _ = daemon.wait();
+    }
+
+    /// Executable identity, not argv. The name has to be the install name zoder
+    /// itself resolves, and nothing looser.
+    #[test]
+    fn executable_names_that_mean_the_zeroclaw_binary() {
+        assert!(executable_name_is_zeroclaw(Path::new(
+            "/home/jasonperlow/.local/bin/zeroclaw"
+        )));
+        assert!(executable_name_is_zeroclaw(Path::new(
+            "/opt/zoder/zeroclaw"
+        )));
+        assert!(!executable_name_is_zeroclaw(Path::new("/usr/bin/yes")));
+        assert!(!executable_name_is_zeroclaw(Path::new(
+            "/tmp/evil/zeroclaw-not-really"
+        )));
+        assert!(!executable_name_is_zeroclaw(Path::new("/tmp/my-zeroclaw")));
+        assert!(!executable_name_is_zeroclaw(Path::new("/")));
     }
 }
