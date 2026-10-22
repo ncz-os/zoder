@@ -26,6 +26,27 @@ name = "enterprise"
 # default = false                      # leave config.json's default_provider alone
 # default_provider = "enterprise-gateway"
 
+# Overall provider request budget in seconds for every call on this host
+# (the built-in default is 120). Same merge rule as the other [profile] keys:
+# the default-claiming overlay wins, else the alphabetically last one that
+# sets it.
+# request_timeout_s = 120
+#
+# Per MODEL, when one route is much slower than the rest: a vendor overlay
+# cannot carry that key, so pin it on the engine profile in the engine's
+# config.toml instead (MiniMax-M3 measured past 120s on a ~650-line review
+# chunk, 2026-10-21, while gemma4-31b answered the same diff in seconds):
+#
+#   [providers.models.custom.minimax]
+#   model = "MiniMax-M3"
+#   request_timeout_s = 600
+#
+# or on the zoder-side models map in config.json:
+#
+#   "models": { "custom.minimax": { "model": "MiniMax-M3", "request_timeout_s": 600 } }
+#
+# `--request-timeout` beats both. See docs/CONCURRENCY.md.
+
 # When this overlay is the active/default one, these colours brand every
 # `zoder report` / `zoder finops` table. Omitted fields fall back to the
 # built-in default; colour is suppressed when stdout isn't a TTY or NO_COLOR is set.
