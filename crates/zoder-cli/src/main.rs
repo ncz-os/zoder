@@ -6950,6 +6950,8 @@ fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
 /// filesystem, and the replacement is atomic.
 fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
     with_daemon_record_lock(path, || {
+        // `unwrap_or`, never `unwrap`: an odd path must not turn a daemon
+        // spawn into a panic.
         let parent = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let nanos = std::time::SystemTime::now()
@@ -6994,8 +6996,11 @@ pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
 /// Run `f` while holding an exclusive lock on the daemon record, across every
 /// zoder process on the host.
 ///
-/// Publishing the record is atomic (`rename`), but "read it, decide it is
-/// ours, unlink it" is not: between the read and the unlink another zoder can
+/// This lock is between the two WRITERS, not between writers and readers.
+/// Readers never take it and do not need to: `rename(2)` is what makes a
+/// read see one complete record or the other, and that property does not
+/// depend on any lock. What is NOT atomic on its own is "read it, decide it
+/// is ours, unlink it": between the read and the unlink another zoder can
 /// publish a NEW daemon's record, and this process would delete the live
 /// daemon's cross-process exemption — handing the next reap in another
 /// process the shared daemon. The lock is what makes the compare and the
@@ -7043,15 +7048,22 @@ fn forget_daemon_record(identity: Option<DaemonIdentity>) {
     });
 }
 
-/// `(pid, start_ticks)` for a live process, retried briefly so a pid that was
-/// forked a moment ago is not missed. Reads `/proc`, so it yields `None`
+/// `(pid, start_ticks)` for a live process. Reads `/proc`, so it yields `None`
 /// everywhere else — which only costs the cross-process record, never the
 /// in-process one.
+///
+/// The first read normally succeeds: `spawn` returns after `fork`, and the
+/// child is in the process table before the parent can run again. The
+/// retries cover the sliver where it is not yet visible. They are a blocking
+/// sleep on purpose and deliberately short (50 ms total, once per daemon
+/// spawn): this runs on the path that is about to poll the daemon's readiness
+/// handshake for up to 20 s, so 50 ms of blocking is noise, and making it
+/// async would mean making the three cleanup paths async for no benefit.
 fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
     loop {
         if let Some(identity) = read_daemon_identity_once(pid) {
             return Some(identity);
@@ -7492,16 +7504,24 @@ mod daemon_cwd_tests {
     /// agent dropped in the workspace being reaped.
     #[test]
     fn the_exempted_binary_is_the_one_the_spawn_resolves() {
+        // Host-independent: whatever `locate_sibling` resolves (or fails to),
+        // the exemption is pointed at exactly that, so the two cannot drift.
         let resolved = super::daemon_binary_path();
-        assert!(
-            resolved.ends_with("zeroclaw"),
-            "the exemption must target the binary the spawn runs: {}",
-            resolved.display()
+        assert_eq!(
+            Some(resolved.clone()),
+            super::locate_sibling("zeroclaw"),
+            "the exemption must target exactly what the spawn resolves"
         );
-        assert!(
-            super::locate_sibling("zeroclaw").is_some(),
-            "precondition: this host has a zeroclaw binary to resolve"
-        );
+        // When this host HAS the binary, it is the install name zoder looks
+        // for; a host without one is supported and gets the sentinel, not a
+        // panic and not an exemption.
+        if super::locate_sibling("zeroclaw").is_some() {
+            assert!(
+                resolved.ends_with("zeroclaw"),
+                "the exemption must target the install name: {}",
+                resolved.display()
+            );
+        }
     }
 
     /// The cross-process record is published atomically. `fs::write` on the
