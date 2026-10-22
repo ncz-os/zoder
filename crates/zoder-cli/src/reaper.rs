@@ -54,7 +54,10 @@
 //!   `<data dir>/daemon.pid`, so a reaper in a *different* zoder process can
 //!   spare it too — and re-checked against the live process, so a stale
 //!   record whose pid the kernel has since reused spares nobody),
-//! * `/proc/<pid>/exe` being the zeroclaw binary.
+//! * `/proc/<pid>/exe` being the zeroclaw binary — the exact install NAME in a
+//!   directory an install writes to (zoder's own, or a trusted install dir).
+//!   The name alone would spare anything called `zeroclaw`, including a copy
+//!   an agent dropped in the very workspace being reaped.
 //!
 //! No argv matching anywhere: a process can be renamed into looking like the
 //! daemon (`cp`, a shell called `zeroclaw`), and the daemon's own argv is not
@@ -220,6 +223,7 @@ fn daemon_exemption(
     pid: u32,
     recorded: &mut Option<Option<crate::DaemonIdentity>>,
     pid_file: &Path,
+    trusted_exe_dirs: &[PathBuf],
 ) -> Option<DaemonExemption> {
     if spawned_daemon_still_matches(pid) {
         return Some(DaemonExemption::Spawned);
@@ -232,8 +236,10 @@ fn daemon_exemption(
             return Some(DaemonExemption::Recorded);
         }
     }
-    if executable_is_zeroclaw(pid) {
-        return Some(DaemonExemption::Executable);
+    if let Some(exe) = process_executable(pid) {
+        if executable_is_zeroclaw(&exe, trusted_exe_dirs) {
+            return Some(DaemonExemption::Executable);
+        }
     }
     None
 }
@@ -278,16 +284,24 @@ fn report_spared_daemon(pid: u32, exemption: DaemonExemption) {
     }
 }
 
-/// Does `exe` name the zeroclaw binary?
+/// Is `exe` the zeroclaw daemon binary?
 ///
-/// Only the executable is ever consulted, never `/proc/<pid>/cmdline`: argv
-/// is trivial to fake (`cp /bin/sleep /tmp/zeroclaw`, a shell script named
-/// `zeroclaw`), while the executable is what the kernel will actually run.
-/// The match is the EXACT install name zoder itself resolves
-/// (`locate_sibling("zeroclaw")` can only ever find `<dir>/zeroclaw`), not
-/// a prefix: `zeroclaw-old`, `zeroclaw.bak-…` and friends are somebody
-/// else's decision to make, and every extra pattern is more surface for a
-/// process to be spared by accident.
+/// Two facts, not one. The NAME has to be the exact install name zoder
+/// itself resolves (`locate_sibling("zeroclaw")` can only ever find
+/// `<dir>/zeroclaw`), and the DIRECTORY has to be one an install writes to.
+/// A name check alone would exempt anything called `zeroclaw` — including a
+/// binary an agent copied into the very workspace being reaped, which is the
+/// one thing an identity-based exemption must never become. `executable` is
+/// never the argv: `/proc/<pid>/cmdline` is trivially faked, the executable
+/// is what the kernel will actually run.
+fn executable_is_zeroclaw(exe: &Path, trusted_dirs: &[PathBuf]) -> bool {
+    executable_name_is_zeroclaw(exe)
+        && exe
+            .parent()
+            .is_some_and(|dir| trusted_dirs.iter().any(|trusted| trusted == dir))
+}
+
+/// The name half, split out so it is testable on its own.
 fn executable_name_is_zeroclaw(exe: &Path) -> bool {
     exe.file_name().and_then(|n| n.to_str()) == Some("zeroclaw")
 }
@@ -366,6 +380,11 @@ struct ReapPlan {
     /// Re-read on every scan rather than parsed once here, because the daemon
     /// is typically spawned *after* this plan exists.
     daemon_pid_file: PathBuf,
+    /// Directories a real zeroclaw daemon executable may live in (zoder's own
+    /// directory and the trusted install dirs). The executable exemption is
+    /// scoped to these: a binary merely NAMED `zeroclaw`, dropped in a
+    /// workspace by an agent that wants to dodge the reap, is not the daemon.
+    daemon_exe_dirs: Vec<PathBuf>,
 }
 
 impl ReapPlan {
@@ -375,10 +394,15 @@ impl ReapPlan {
     /// recently" describes all of them. Instead this run gets its own scratch
     /// directory inside it, and that directory is the boundary.
     ///
-    /// `daemon_pid_file` is where the shared daemon's pid is recorded; it is
-    /// carried in the plan rather than read here so the exemption is testable
-    /// against a fixture file instead of the developer's real `~/.zoder`.
-    fn new(cwd: &Path, temp_base: &Path, daemon_pid_file: PathBuf) -> Option<Self> {
+    /// `daemon_pid_file` and `daemon_exe_dirs` are carried in the plan
+    /// rather than read from the environment here, so the exemption is
+    /// testable against fixtures instead of the developer's real `~/.zoder`.
+    fn new(
+        cwd: &Path,
+        temp_base: &Path,
+        daemon_pid_file: PathBuf,
+        daemon_exe_dirs: Vec<PathBuf>,
+    ) -> Option<Self> {
         // Order matters: the boot-tick boundary is read FIRST and the pid
         // snapshot second, so every process that existed before the boundary
         // is in the snapshot. (The other order leaves a window in which a
@@ -422,6 +446,7 @@ impl ReapPlan {
             started_ticks,
             preexisting,
             daemon_pid_file,
+            daemon_exe_dirs,
         })
     }
 
@@ -488,8 +513,28 @@ impl ReapGuard {
     /// scratch space is `tmp`. `enabled=false` (`--no-reap`) yields a guard
     /// that does nothing at all, including no signal handling.
     pub(crate) fn begin(cwd: &Path, tmp: &Path, enabled: bool) -> Self {
+        Self::begin_with(
+            cwd,
+            tmp,
+            enabled,
+            crate::daemon_pid_file_path(),
+            crate::daemon_exe_dirs_for_this_process(),
+        )
+    }
+
+    /// [`ReapGuard::begin`] with the daemon-identity inputs supplied by the
+    /// caller. Only the tests need this: they must not read (or worse, write)
+    /// a developer's real `~/.zoder/data/daemon.pid`, and they need the
+    /// executable arm pointed at a fixture install directory.
+    pub(crate) fn begin_with(
+        cwd: &Path,
+        tmp: &Path,
+        enabled: bool,
+        daemon_pid_file: PathBuf,
+        daemon_exe_dirs: Vec<PathBuf>,
+    ) -> Self {
         let plan = enabled
-            .then(|| ReapPlan::new(cwd, tmp, crate::daemon_pid_file_path()))
+            .then(|| ReapPlan::new(cwd, tmp, daemon_pid_file, daemon_exe_dirs))
             .flatten();
         if let Some(plan) = plan.as_ref() {
             // Every session the engine mints is recorded the moment it exists,
@@ -1329,8 +1374,12 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         // The shared zeroclaw daemon is not this run's to kill, however it
         // came to match the rules below: it serves every zoder on the host.
         // Checked by identity only (spawned pid, recorded pid, executable).
-        if let Some(exemption) = daemon_exemption(pid, &mut recorded_daemon, &plan.daemon_pid_file)
-        {
+        if let Some(exemption) = daemon_exemption(
+            pid,
+            &mut recorded_daemon,
+            &plan.daemon_pid_file,
+            &plan.daemon_exe_dirs,
+        ) {
             report_spared_daemon(pid, exemption);
             continue;
         }
@@ -1401,24 +1450,22 @@ fn strip_deleted_suffix(path: &Path) -> PathBuf {
     }
 }
 
-/// `/proc/<pid>/exe` for this process, with the "(deleted)" suffix a replaced
-/// binary leaves behind stripped.
+/// `/proc/<pid>/exe`, with the "(deleted)" suffix a replaced binary leaves
+/// behind stripped — an install that swaps the file out from under a running
+/// daemon must not stop that daemon from being recognised.
 ///
-/// This is the ONLY identity the reap scope uses for "the daemon": not argv,
-/// not `comm`, not the pid file alone. An unreadable link (a process that
-/// dropped `dumpable`, a pid mid-exit) reads as "not the daemon", which is
-/// the safe answer here only because the other two arms still apply.
+/// An unreadable link (a process that dropped `dumpable`, a pid mid-exit)
+/// reads as "no executable", which is the safe answer here only because the
+/// other two arms still apply.
 #[cfg(target_os = "linux")]
-fn executable_is_zeroclaw(pid: u32) -> bool {
-    let Ok(raw) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
-        return false;
-    };
-    executable_name_is_zeroclaw(&strip_deleted_suffix(&raw))
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let raw = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(strip_deleted_suffix(&raw))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn executable_is_zeroclaw(_pid: u32) -> bool {
-    false
+fn process_executable(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 /// Alive means "can still run": a missing pid, or one in Z/X state, is dead.
@@ -1546,9 +1593,30 @@ mod tests {
 
         /// The tempdir root itself — where fixture binaries are installed. It
         /// is deliberately NOT a reap root, so a fixture executable parked
-        /// here can never be mistaken for the workspace.
+        /// here can never be mistaken for the workspace. It doubles as the
+        /// fixture "install directory" the executable exemption trusts.
         fn root(&self) -> PathBuf {
             self._dir.path().to_path_buf()
+        }
+
+        /// The executable arm only trusts a real install directory, so the
+        /// fixture daemon has to live in one. Pointing it at the tempdir
+        /// keeps the test hermetic: nothing is written to the developer's
+        /// actual `~/.local/bin`.
+        fn trusted_daemon_dirs(&self) -> Vec<PathBuf> {
+            vec![self.root()]
+        }
+
+        /// Open a guard whose daemon-identity inputs are fixtures rather than
+        /// this machine's real `~/.zoder`.
+        fn begin(&self) -> ReapGuard {
+            ReapGuard::begin_with(
+                &self.cd,
+                &self.tmp_root,
+                true,
+                self.daemon_pid_file(),
+                self.trusted_daemon_dirs(),
+            )
         }
     }
 
@@ -1707,7 +1775,7 @@ mod tests {
     fn fake_agent_detached_child_in_cd_is_reaped_and_would_otherwise_leak() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         assert!(guard.armed(), "Linux plan should be armed");
 
         // The fake agent: spawn a detached child in the workspace, record it,
@@ -1761,7 +1829,7 @@ mod tests {
     fn process_outside_the_cd_is_never_touched() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let outsider = spawn_sleeper(&ws.outside());
         wait_until(|| alive(outsider), "the outsider fixture to be running");
 
@@ -1788,7 +1856,7 @@ mod tests {
         // boundary cannot be mistaken for "started after".
         std::thread::sleep(Duration::from_millis(150));
 
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
         assert!(
             !scan(&plan).iter().any(|c| c.pid == predates),
@@ -1810,7 +1878,7 @@ mod tests {
     fn process_in_this_runs_scratch_dir_is_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let scratch = guard
             .plan
             .as_ref()
@@ -1837,7 +1905,7 @@ mod tests {
     fn a_process_in_the_shared_temp_root_is_not_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let bystander = spawn_sleeper(&ws.tmp_root);
         wait_until(|| alive(bystander), "the bystander fixture to be running");
 
@@ -1857,7 +1925,13 @@ mod tests {
     fn sigterm_ignoring_process_is_escalated_to_sigkill() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         let stubborn = spawn_sigterm_ignoring(&ws.cd);
         wait_until(
             || alive(stubborn),
@@ -1892,7 +1966,13 @@ mod tests {
     fn no_reap_leaves_the_agent_children_running() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, false);
+        let mut guard = ReapGuard::begin_with(
+            &ws.cd,
+            &ws.tmp_root,
+            false,
+            ws.daemon_pid_file(),
+            Vec::new(),
+        );
         assert!(!guard.armed(), "--no-reap must not arm a plan");
         let leaked = spawn_sleeper(&ws.cd);
         wait_until(|| alive(leaked), "the fixture to be running");
@@ -1910,7 +1990,7 @@ mod tests {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let leaked = {
-            let _guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+            let _guard = ws.begin();
             let leaked = spawn_sleeper(&ws.cd);
             wait_until(|| alive(leaked), "the fixture to be running");
             // `_guard` leaves scope here with no `finish()` call.
@@ -1928,7 +2008,7 @@ mod tests {
     fn scan_never_selects_zoder_itself_or_its_ancestors() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
         let selected: Vec<u32> = scan(&plan).iter().map(|c| c.pid).collect();
         let protected = protected_pids();
@@ -2031,7 +2111,7 @@ mod tests {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let scratch = {
-            let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+            let mut guard = ws.begin();
             let scratch = guard
                 .plan
                 .as_ref()
@@ -2061,7 +2141,13 @@ mod tests {
         wait_until(|| alive(bystander), "the bystander fixture to be running");
 
         // Same directory passed as both the workspace and the temp base.
-        let plan = ReapPlan::new(&ws.tmp_root, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.tmp_root,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         assert!(
             !plan.owns_cwd(&ws.tmp_root),
             "-C <temp root> must not make the shared temp root a reap root"
@@ -2117,7 +2203,7 @@ mod tests {
         // Clear the tick granularity so the fixture is unambiguously older
         // than the boundary the guard is about to take.
         std::thread::sleep(Duration::from_millis(150));
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
         let start = read_stat(older).map(|s| s.start_ticks).unwrap_or(0);
         assert!(
@@ -2222,7 +2308,13 @@ mod tests {
     fn a_descendant_forked_during_the_reap_is_still_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         // A parent that forks one child, then forks another ~200ms later —
         // after the first child has been signalled, i.e. mid-pass.
         let pidfile = ws.cd.join("forker-pids");
@@ -2409,6 +2501,7 @@ mod tests {
                 Path::new("/"),
                 Path::new("/"),
                 PathBuf::from("/nonexistent/daemon.pid"),
+                Vec::new(),
             )
             .is_none(),
             "a / root must not produce a reap plan"
@@ -2420,7 +2513,13 @@ mod tests {
     #[test]
     fn plan_covers_the_cd_directory_and_this_runs_scratch_dir_only() {
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         assert!(plan.owns_cwd(&ws.cd.join("src/lib.rs")));
         let scratch = plan
             .owned_roots
@@ -2463,7 +2562,13 @@ mod tests {
     fn a_clean_run_reaps_nothing() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, ws.daemon_pid_file()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         let outcome = reap(&plan, Duration::from_millis(50));
         assert!(
             outcome.reaped.is_empty() && outcome.skipped.is_empty() && outcome.survivors.is_empty(),
@@ -2488,7 +2593,7 @@ mod tests {
     fn a_shared_daemon_in_the_workspace_is_spared_and_an_ordinary_leftover_is_still_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
 
         let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
@@ -2502,7 +2607,8 @@ mod tests {
         let leftover = spawn_sleeper(&ws.cd);
         wait_until(|| alive(leftover), "the ordinary fixture to be running");
         assert!(
-            executable_is_zeroclaw(daemon_pid),
+            process_executable(daemon_pid)
+                .is_some_and(|exe| executable_is_zeroclaw(&exe, &ws.trusted_daemon_dirs())),
             "precondition: /proc/<pid>/exe must name the daemon, or this test proves nothing"
         );
         assert_eq!(
@@ -2546,12 +2652,13 @@ mod tests {
     fn the_pid_this_zoder_spawned_is_spared_whatever_its_executable_is() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
         let daemon = spawn_sleeper(&ws.cd);
         wait_until(|| alive(daemon), "the spawned fixture to be running");
         assert!(
-            !executable_is_zeroclaw(daemon),
+            !process_executable(daemon)
+                .is_some_and(|exe| executable_is_zeroclaw(&exe, &ws.trusted_daemon_dirs())),
             "precondition: this fixture is /bin/sleep, not the zeroclaw binary"
         );
 
@@ -2590,6 +2697,16 @@ mod tests {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
+        // Scope FIRST, daemon second. A fixture that predates the scope is
+        // excluded by the start-time rule whatever the record says, so the
+        // assertion below would pass without the record doing anything.
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         let daemon = spawn_sleeper(&ws.cd);
         wait_until(|| alive(daemon), "the recorded fixture to be running");
         let identity = (
@@ -2599,11 +2716,24 @@ mod tests {
         std::fs::write(&pidfile, format!("{} {}\n", identity.0, identity.1))
             .expect("record the daemon identity");
         assert_eq!(crate::read_daemon_record(&pidfile), Some(identity));
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile).expect("plan");
 
         assert!(
             !scan(&plan).iter().any(|c| c.pid == daemon),
             "the daemon recorded for the socket must be spared by another process's reap"
+        );
+        // …and the fixture is genuinely eligible, so the assertion above is
+        // about the record and not about a process nobody would have reaped.
+        assert!(
+            ReapPlan::new(
+                &ws.cd,
+                &ws.tmp_root,
+                ws.daemon_pid_file(),
+                ws.trusted_daemon_dirs()
+            )
+            .expect("plan")
+            .daemon_pid_file
+                != plan.daemon_pid_file,
+            "the comparison plan must read a pid file that does not exist"
         );
 
         kill_exact(daemon);
@@ -2622,7 +2752,13 @@ mod tests {
         // The scope opens FIRST: a process that already existed when it did
         // would be spared by the start-time rule, and this test would prove
         // nothing about the stale record.
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         let stranger = spawn_sleeper(&ws.cd);
         wait_until(|| alive(stranger), "the fixture to be running");
         let live = live_start_ticks(stranger).expect("a live fixture has a start time");
@@ -2654,7 +2790,13 @@ mod tests {
         let pidfile = ws.root().join("daemon.pid");
         // Scope first, fixture second, so the fixture is reapable for the
         // reason under test and not because it predates the run.
-        let plan = ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            ws.trusted_daemon_dirs(),
+        )
+        .expect("plan");
         let leftover = spawn_sleeper(&ws.cd);
         wait_until(|| alive(leftover), "the fixture to be running");
         let live = live_start_ticks(leftover).expect("a live fixture has a start time");
@@ -2701,7 +2843,7 @@ mod tests {
     fn the_shared_daemons_own_children_in_the_workspace_are_still_reaped() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
 
         let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
@@ -2764,7 +2906,7 @@ mod tests {
     fn a_leftover_of_another_session_served_by_the_same_daemon_is_untouched() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
+        let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
 
         let daemon_exe = install_fake_zeroclaw(&ws.root(), "/bin/sh");
@@ -2799,21 +2941,33 @@ mod tests {
         let _ = daemon.wait();
     }
 
-    /// Executable identity, not argv. The name has to be the install name zoder
-    /// itself resolves, and nothing looser.
+    /// Executable identity: the exact install NAME in a trusted install
+    /// DIRECTORY. The name alone would spare anything called `zeroclaw` — the
+    /// binary an agent copied into the workspace being reaped is the realistic
+    /// version of that, and it is precisely the process that must be reaped.
     #[test]
-    fn executable_names_that_mean_the_zeroclaw_binary() {
-        assert!(executable_name_is_zeroclaw(Path::new(
-            "/home/jasonperlow/.local/bin/zeroclaw"
-        )));
-        assert!(executable_name_is_zeroclaw(Path::new(
-            "/opt/zoder/zeroclaw"
-        )));
-        assert!(!executable_name_is_zeroclaw(Path::new("/usr/bin/yes")));
-        assert!(!executable_name_is_zeroclaw(Path::new(
-            "/tmp/evil/zeroclaw-not-really"
-        )));
-        assert!(!executable_name_is_zeroclaw(Path::new("/tmp/my-zeroclaw")));
-        assert!(!executable_name_is_zeroclaw(Path::new("/")));
+    fn the_executable_arm_needs_the_install_name_in_a_trusted_directory() {
+        let trusted = vec![
+            PathBuf::from("/home/jasonperlow/.local/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ];
+        let spared = |p: &str| executable_is_zeroclaw(Path::new(p), &trusted);
+
+        assert!(spared("/home/jasonperlow/.local/bin/zeroclaw"));
+        assert!(spared("/usr/local/bin/zeroclaw"));
+        // Wrong name, right directory.
+        assert!(!spared("/usr/local/bin/yes"));
+        assert!(!spared(
+            "/home/jasonperlow/.local/bin/zeroclaw.bak-20261011"
+        ));
+        assert!(!spared("/home/jasonperlow/.local/bin/my-zeroclaw"));
+        // Right name, untrusted directory: an agent's copy in its own workspace.
+        assert!(!spared("/tmp/ws-01a16164/zeroclaw"));
+        assert!(!spared(
+            "/home/jasonperlow/Projects/hive-workspaces/01a16164/zeroclaw"
+        ));
+        // Right name, no directory at all.
+        assert!(!spared("zeroclaw"));
+        assert!(!spared("/"));
     }
 }
