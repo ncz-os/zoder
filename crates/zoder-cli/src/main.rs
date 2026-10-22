@@ -7074,7 +7074,7 @@ fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
     loop {
-        if let Some(identity) = read_daemon_identity_once(pid) {
+        if let Some(identity) = crate::reaper::live_identity(pid) {
             return Some(identity);
         }
         if std::time::Instant::now() >= deadline {
@@ -7082,18 +7082,6 @@ fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-}
-
-fn read_daemon_identity_once(pid: u32) -> Option<DaemonIdentity> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Field 22 (`starttime`) counting from field 3, i.e. index 19 after the
-    // state field. Taken from the LAST ')' so a comm containing spaces or
-    // parentheses cannot shift the index — same reasoning as the reaper's own
-    // `parse_stat`.
-    let close = stat.rfind(')')?;
-    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
-    Some((pid, start_ticks))
 }
 
 /// The daemon executable zoder would spawn, for the reap exemption to match
