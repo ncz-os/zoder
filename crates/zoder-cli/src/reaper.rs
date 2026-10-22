@@ -454,6 +454,23 @@ fn mark_unreachable(id: &str) -> bool {
         .insert(id.to_string())
 }
 
+/// How many of this run's sessions the engine was found unreachable for,
+/// whichever cancel phase (async or blocking) found it first. Read from the
+/// process-wide set, not from one phase's report, so the teardown's answer
+/// does not depend on which phase happened to hit the missing socket.
+fn unreachable_session_count() -> usize {
+    let unreachable: HashSet<String> = UNREACHABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|id| unreachable.contains(*id))
+        .count()
+}
+
 /// Membership test, for the tests that assert a session was retired. The
 /// production readers iterate the set inside a lock rather than pay for a
 /// lookup per id.
@@ -1094,10 +1111,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // session stopped: its daemon may still run on a socket inode nothing
         // can name. So it also blocks early convergence, and the loop keeps
         // reaping for every remaining round instead of declaring the run quiet.
-        if pending_sessions().is_empty()
-            && outcome.quiet()
-            && report.unreachable_sessions.is_empty()
-        {
+        if pending_sessions().is_empty() && outcome.quiet() && unreachable_session_count() == 0 {
             plan.cleanup_owned_roots();
             return report;
         }
@@ -1116,13 +1130,14 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
             }
         }
     }
-    if !report.unreachable_sessions.is_empty() {
+    let unreachable = unreachable_session_count();
+    if unreachable > 0 {
         eprintln!(
             "[zoder] WARNING: {} session(s) could not be cancelled because the engine socket \
              at {} is gone; they may still run in a daemon that lost its socket. The \
              workspace was reaped for all {MAX_TEARDOWN_ROUNDS} rounds, but work started \
              after this teardown is not covered",
-            report.unreachable_sessions.len(),
+            unreachable,
             socket.display()
         );
     }
@@ -2824,6 +2839,40 @@ mod tests {
             CancelFailure::NotConfirmed,
             "a handshake failure is the ordinary unconfirmed cancel"
         );
+    }
+
+    /// The async cancel phase can be the one that meets the missing socket:
+    /// it retires the session before the blocking phase runs, so the blocking
+    /// phase reports nothing. The teardown must still treat that session as
+    /// possibly running, whichever phase found it.
+    #[test]
+    fn a_session_the_async_phase_retired_still_keeps_the_reap_running() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = absent_socket(&dir, "engine.sock");
+        let id = "unreachable-async-first-probe";
+        note_session(id);
+        assert!(mark_unreachable(id), "the async phase retires it first");
+
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            ws.daemon_pid_file(),
+            ws.daemon_binary(),
+        )
+        .expect("a reap plan for a real workspace");
+        let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
+
+        assert!(
+            report.unreachable_sessions.is_empty(),
+            "the blocking phase had nothing left to report"
+        );
+        assert_eq!(
+            report.rounds, MAX_TEARDOWN_ROUNDS,
+            "a session retired by the async phase may still be running too"
+        );
+        forget_session(id);
     }
 
     /// 2026-10-22 (MINOS, hive job `01a163c9`): the engine socket path no
