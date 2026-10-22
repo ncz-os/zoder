@@ -855,8 +855,9 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
                         if mark_unreachable(&id) {
                             eprintln!(
                                 "[zoder] session {id} not cancelled: the engine at {} is \
-                                 unreachable ({e:#}); the session ended with it and is not \
-                                 treated as work still running",
+                                 unreachable ({e:#}); it cannot be cancelled from here and may \
+                                 still run in a daemon that lost its socket; whatever it \
+                                 leaves in the workspace is still reaped",
                                 socket.display()
                             );
                         }
@@ -941,8 +942,9 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
                     if io_error_proves_no_listener(&error) && mark_unreachable(id) {
                         eprintln!(
                             "[zoder] session {id} not cancelled: the engine at {} is \
-                             unreachable ({error}); the session ended with it and is not \
-                             treated as work still running",
+                             unreachable ({error}); it cannot be cancelled from here and may \
+                             still run in a daemon that lost its socket; whatever it \
+                             leaves in the workspace is still reaped",
                             socket.display()
                         );
                         unreachable.push(id.clone());
