@@ -266,8 +266,8 @@ upstream-zeroclaw:
 # pipeline schedule as the rest, an hour before the 09:15 native build, so the
 # fork the build reads is always fresh.
 #
-# Needs the masked ZEROCLAW_SYNC_TOKEN CI/CD variable (write_repository on
-# ncz-os/zeroclaw). A merge conflict fails the job WITHOUT pushing -> the red
+# Needs the masked ZEROCLAW_SYNC_TOKEN CI/CD variable (read_repository and
+# write_repository on ncz-os/zeroclaw, which is private: used for clone AND push). A merge conflict fails the job WITHOUT pushing -> the red
 # pipeline is filed to MNEMOS by buildwatch_gitlab. It never force-pushes.
 zeroclaw-fork-sync:
   stage: upstream
@@ -281,6 +281,11 @@ zeroclaw-fork-sync:
     - apt-get update -qq && apt-get install -y -qq git >/dev/null
   script:
     - export FORK_PUSH_URL="https://oauth2:${ZEROCLAW_SYNC_TOKEN}@gitlab.com/ncz-os/zeroclaw.git"
+    # The fork is private: the CLONE needs the token too, not just the push.
+    # With only the push authenticated, `git clone` of the bare URL failed with
+    # "could not read Username" every day from 2026-10-16, the fork went stale,
+    # and the native nightly published nothing after 10-11.
+    - export FORK_URL="$FORK_PUSH_URL"
     - bash scripts/ci/zeroclaw-fork-sync.sh
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
