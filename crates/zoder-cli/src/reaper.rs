@@ -80,7 +80,8 @@ static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Sessions a cancel has already been sent for, so the async phase, the
 /// blocking path and the final sweep never send the same one twice.
-static CANCELLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Record a session id the agent is driving. Fed by the acp-client session
 /// observer the moment the engine mints it; the exit path and the signal
@@ -342,6 +343,12 @@ fn log_outcome(outcome: &ReapOutcome) {
 
 impl Drop for ReapGuard {
     fn drop(&mut self) {
+        if self.plan.is_none() {
+            // `--no-reap` means NO cleanup, including this one. A user who
+            // asked for the scope to be off must not get a surprise
+            // `session/cancel` on the way out.
+            return;
+        }
         // `Drop` cannot await, so the cancel is sent the blocking way. The
         // ordering the module promises — stop the agent, then kill what it
         // left — holds on this path too, which matters because `Drop` is the
@@ -428,10 +435,10 @@ fn pending_sessions() -> Vec<String> {
 }
 
 fn mark_cancelled(id: &str) {
-    let mut cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
-    if !cancelled.iter().any(|seen| seen == id) {
-        cancelled.push(id.to_string());
-    }
+    CANCELLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string());
 }
 
 /// Fire-and-forget `session/cancel` over a blocking socket, for the one exit
@@ -451,7 +458,7 @@ fn cancel_sessions_blocking(ids: &[String]) {
         for id in ids {
             {
                 let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
-                if cancelled.iter().any(|seen| seen == id) {
+                if cancelled.contains(id) {
                     continue;
                 }
             }
@@ -1935,8 +1942,47 @@ mod tests {
         // Leave the shared session list clean for the other tests.
         let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
         sessions.retain(|id| id != "blocking-probe");
-        let mut cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
-        cancelled.retain(|id| id != "blocking-probe");
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("blocking-probe");
+    }
+
+    /// `--no-reap` really means off, including on the `Drop` path: no cancel,
+    /// no reap, no signal handlers. A user who asked for the scope to be off
+    /// must not get a surprise `session/cancel` on the way out.
+    #[test]
+    fn no_reap_sends_no_cancel_on_drop() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = Workspace::new();
+        let socket_dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_dir.path().join("engine.sock");
+        // Nothing is listening: a cancel attempt would be visible as a connect
+        // attempt to this path, which we can detect by binding it ourselves and
+        // failing if anything connects.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let previous = std::env::var("ZEROCLAW_SOCKET").ok();
+        unsafe { std::env::set_var("ZEROCLAW_SOCKET", &socket) };
+        note_session("no-reap-probe");
+        {
+            let guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, false);
+            assert!(!guard.armed(), "--no-reap leaves the guard disarmed");
+            // Dropping here must not connect to the daemon socket.
+        }
+        if let Some(prev) = previous {
+            unsafe { std::env::set_var("ZEROCLAW_SOCKET", prev) };
+        } else {
+            unsafe { std::env::remove_var("ZEROCLAW_SOCKET") };
+        }
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        assert!(
+            listener.accept().is_err(),
+            "--no-reap must not open a connection to the engine on Drop"
+        );
+        let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|id| id != "no-reap-probe");
     }
 
     /// A root of `/` would select every process on the host. Refuse it.
