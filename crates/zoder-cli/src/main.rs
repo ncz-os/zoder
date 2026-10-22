@@ -6795,7 +6795,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
     })?;
     // Record the daemon's identity the moment it exists — not after the
     // handshake — so no reap scope can ever select it (see
-    // `reaper::note_daemon_pid` and `record_daemon_pid`).
+    // `reaper::note_daemon_identity` and `record_daemon_pid`).
     record_daemon_pid(child.id());
 
     // Poll readiness with the initialize handshake. Bail early if the child
@@ -6912,7 +6912,7 @@ pub(crate) fn daemon_pid_file_path() -> PathBuf {
 pub(crate) type DaemonIdentity = (u32, u64);
 
 /// Record `pid` as the shared zeroclaw daemon: tell the in-process reaper
-/// (exact pid identity — see [`crate::reaper::note_daemon_pid`]) and write
+/// (exact identity — see [`crate::reaper::note_daemon_identity`]) and publish
 /// the record other zoder processes read.
 ///
 /// Best-effort by design. Neither half is allowed to break daemon startup:
@@ -6923,19 +6923,16 @@ fn record_daemon_pid(pid: u32) {
     if pid == 0 {
         return;
     }
-    // In-process first: this needs no /proc read to be useful, and it is the
-    // arm that covers the window between spawn and the first reap scan.
-    crate::reaper::note_daemon_pid(pid);
     let Some(identity) = read_daemon_identity(pid) else {
         // The child died before /proc could be read. There is no daemon to
         // spare any more, so there is nothing to record.
         return;
     };
+    // In-process first: it needs no filesystem and it is the arm that covers
+    // the window between spawn and the first reap scan.
+    crate::reaper::note_daemon_identity(identity);
     let path = daemon_pid_file_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&path, format!("{} {}\n", identity.0, identity.1)) {
+    if let Err(e) = write_daemon_record(&path, identity) {
         eprintln!(
             "[zoder] could not record the daemon identity at {} ({e}); the reap scope \
              will still spare this daemon by executable identity, and any other zoder \
@@ -6943,6 +6940,30 @@ fn record_daemon_pid(pid: u32) {
             path.display()
         );
     }
+}
+
+/// Publish the daemon record ATOMICALLY.
+///
+/// `fs::write` on the live path truncates before it writes, so a reaper
+/// scanning concurrently can read an empty record and conclude "not the
+/// daemon" — precisely the window in which another zoder's reap is allowed
+/// to SIGTERM the daemon and kill this one's agent. Write a sibling temp file
+/// and `rename(2)` it over the target: same directory, so the same
+/// filesystem, and the replacement is atomic.
+fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".daemon.pid.{}.{}", std::process::id(), nanos));
+    let body = format!("{} {}\n", identity.0, identity.1);
+    let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Drop the record of `pid`, and only when the live process IS the daemon the
@@ -7404,6 +7425,66 @@ mod daemon_cwd_tests {
         );
     }
 
+    /// The cross-process record is published atomically. `fs::write` on the
+    /// live path truncates before it writes, so a reaper scanning
+    /// concurrently can read an empty record, conclude "not the daemon", and
+    /// SIGTERM the shared daemon — in exactly the window the record exists to
+    /// close. Temp file plus `rename(2)`: a reader sees the old identity or
+    /// the new one, never a hole.
+    #[test]
+    fn the_daemon_record_is_published_atomically() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.pid");
+        let a: (u32, u64) = (101, 202);
+        let b: (u32, u64) = (303, 404);
+        super::write_daemon_record(&path, a).expect("first record");
+        assert_eq!(super::read_daemon_record(&path), Some(a));
+
+        // Hammer the replacement while a reader spins: every observation must
+        // be one of the two COMPLETE records. `rename` is what makes this
+        // true, and the temp file must not survive it.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, reads, stop) = (path.clone(), Arc::clone(&reads), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match super::read_daemon_record(&path) {
+                        Some(v) => {
+                            assert!(
+                                v == a || v == b,
+                                "a torn read is exactly what this publish path must make \
+                                 impossible: {v:?}"
+                            );
+                            seen += 1;
+                        }
+                        None => panic!("the record must never be unreadable once it is published"),
+                    }
+                }
+                reads.store(seen, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        for i in 0..200u64 {
+            super::write_daemon_record(&path, if i % 2 == 0 { b } else { a }).expect("rewrite");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().expect("reader thread");
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the data dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "daemon.pid")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temp record must be renamed away, never left behind: {leftovers:?}"
+        );
+    }
+
     /// The pid of the daemon THIS zoder spawned is recorded the moment it
     /// exists: in the reap scope's own registry and in the pid file the
     /// reaper reads, so no reap can select it.
@@ -7423,17 +7504,23 @@ mod daemon_cwd_tests {
             .spawn()
             .expect("spawn the fixture");
         let pid = child.id();
-        super::reaper::note_daemon_pid(pid);
+        let identity = super::read_daemon_identity(pid).expect("a live fixture is in /proc");
+        super::reaper::note_daemon_identity(identity);
         assert!(
-            super::reaper::daemon_pid_spared(pid),
-            "the pid a spawn just handed us must be exempt from our reap scope: \
+            super::reaper::daemon_spared_by_this_process(pid),
+            "the daemon a spawn just handed us must be exempt from our reap scope: \
              this process spawned it, and the daemon outlives us by design"
         );
         kill_exact(child);
-        // pid 0 is not an identity; recording it must not make pid 0 exempt.
-        super::record_daemon_pid(0);
         assert!(
-            !super::reaper::daemon_pid_spared(0),
+            !super::reaper::daemon_spared_by_this_process(pid),
+            "once the daemon is gone its exemption must be gone with it, or the next \
+             process to inherit that pid is spared for a daemon that no longer exists"
+        );
+        // pid 0 is not an identity; recording it must not make pid 0 exempt.
+        super::reaper::note_daemon_identity((0, 1));
+        assert!(
+            !super::reaper::daemon_spared_by_this_process(0),
             "a zero pid is not a daemon and must not become one"
         );
     }
