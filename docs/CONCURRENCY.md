@@ -109,6 +109,10 @@ A `request_timeout_s` of `0` is rejected at load — on a vendor overlay /
 error — because a zero budget can never complete a call and silently replacing
 it would hide the mistake until the next slow review.
 
+The zoder-side `models` map matches on the model id, so two aliases that serve
+one model id with **different** budgets are a load-time error rather than a
+coin flip between them.
+
 ## The ledger (fixed 2026-10-10)
 
 Before this fix every billable call left a 64 KiB slot in

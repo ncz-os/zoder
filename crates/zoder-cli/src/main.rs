@@ -8203,6 +8203,19 @@ mod cli_tier_reasoning_parse_tests {
     }
 
     #[test]
+    fn a_per_model_budget_never_moves_the_model_less_budget_used_by_probes_and_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        assert_eq!(
+            provider_request_timeout_s(&cli, &cfg),
+            120,
+            "health probes and catalog fetches carry no model, so a per-model budget must not \
+             reach them (the agentic admission probe included)"
+        );
+    }
+
+    #[test]
     fn a_zero_per_model_budget_is_rejected_rather_than_silently_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
@@ -8972,14 +8985,13 @@ pub(crate) async fn agentic_turn(
     // The agentic engine does not switch models on its own, so an unhealthy
     // EIH route stops here with the reason instead of being dialed.
     if crate::eih_health::is_gated(&routed_provider) {
+        // Global budget on purpose: this client is the health/admission probe
+        // (`admit` bounds it further with ZODER_EIH_PROBE_TIMEOUT_MS), not a
+        // generation call, so a per-model `request_timeout_s` must not give a
+        // health check the slow model's patience.
         let probe_client = OpenAiProvider::new_with_request_timeout_s(
             &routed_provider,
-            Some(provider_request_timeout_s_for_model(
-                cli,
-                &eng.cfg,
-                Some(&eng.engine_models),
-                &primary,
-            )),
+            Some(provider_request_timeout_s(cli, &eng.cfg)),
         )?;
         if let Err(message) = crate::eih_health::admit(
             &eng.cfg.health_path,
