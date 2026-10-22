@@ -177,9 +177,10 @@ The daemon is also started with a neutral cwd of its own — its config
 directory, falling back to `$HOME` then `/` — so it never sits inside a
 job workspace in the first place; on 2026-10-21 a loop spawned it with no
 `current_dir`, it inherited that job's directory, and it matched every rule in
-the list above while serving everybody else on the host. The daemon's children
-are not exempt (they are the agent's tool shells, which is the whole reason the
-reap exists), and another session's leftovers remain protected by the `-C` rule.
+the list above while serving everybody else on the host. The daemon's tool
+shells are not exempt (they are what the agent starts, which is the whole
+reason the reap exists), and another session's leftovers remain protected by
+the `-C` rule.
 
 Pass `--no-reap` to turn it off when something else owns the workspace and you
 expect its processes to outlive the run.

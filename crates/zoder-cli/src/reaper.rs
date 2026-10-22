@@ -63,11 +63,13 @@
 //! daemon (`cp`, a shell called `zeroclaw`), and the daemon's own argv is not
 //! a stable identity (`--ephemeral` is optional, the config dir varies).
 //!
-//! The daemon's CHILDREN are not exempt. They are the tool shells the agent
-//! starts — the `yes` generators of the 01a1601b incident — and they still
-//! match every ownership rule, so they are still reaped. And processes the
-//! daemon runs for OTHER sessions are still protected by the cwd rule above:
-//! another session's leftovers live in another job's workspace, not in `-C`.
+//! The daemon's TOOL SHELLS are not exempt. They are what the agent starts —
+//! the `yes` generators of the 01a1601b incident — they are not the daemon
+//! binary, and they still match every ownership rule, so they are still
+//! reaped. (A child that re-execs the daemon binary is, by definition, the
+//! daemon, and is spared with it.) And processes the daemon runs for OTHER
+//! sessions are still protected by the cwd rule above: another session's
+//! leftovers live in another job's workspace, not in `-C`.
 //!
 //! The neutral spawn that keeps the daemon out of a job directory in the
 //! first place lives in the CLI ([`crate::daemon_working_dir`]); the
