@@ -3163,7 +3163,9 @@ impl Config {
     /// When several aliases serve one model id the first entry in alias order
     /// wins. That is the pre-existing rule for the sampling knobs; for
     /// `request_timeout_s` it cannot be allowed to silently pick a budget, so
-    /// [`Self::validate`] rejects conflicting duplicates up front.
+    /// [`Self::validate`] rejects ambiguous duplicates up front and
+    /// [`Self::model_request_timeout_s`] prefers whichever alias declares a
+    /// budget.
     pub fn model_entry_for(&self, model: &str) -> Option<&ModelEntry> {
         self.models
             .values()
@@ -3174,9 +3176,18 @@ impl Config {
     /// `request_timeout_s` on the entry that serves `model`). `None` means
     /// "not set here" — the caller falls through to the engine profile's
     /// per-model value, then the global budget.
+    ///
+    /// When several aliases declare a budget for one model id, the first
+    /// DECLARING entry in alias order wins rather than the first matching
+    /// entry: an alias that simply has no budget of its own must never hide a
+    /// budget another alias declared for the same model. [`Self::validate`]
+    /// rejects that ambiguity at load anyway, so this is the belt to that
+    /// braces.
     pub fn model_request_timeout_s(&self, model: &str) -> Option<u64> {
-        self.model_entry_for(model)
-            .and_then(|entry| entry.request_timeout_s)
+        self.models
+            .values()
+            .filter(|entry| entry.model.as_deref() == Some(model))
+            .find_map(|entry| entry.request_timeout_s)
     }
 
     /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
@@ -3428,32 +3439,41 @@ impl Config {
         }
         // Two aliases serving one model id cannot both own that model's
         // budget: the lookup matches on the model id, so one of them would
-        // silently win. Fail at load instead of letting an operator's slow
-        // model be cut at whichever budget happened to sort first.
-        let mut budgets_by_model: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+        // silently win — or, worse, an alias with no budget of its own would
+        // hide the budget another alias declared for the same model. Fail at
+        // load instead of letting an operator's slow model be cut at whichever
+        // budget happened to sort first.
+        let mut budgets_by_model: BTreeMap<&str, Vec<(&str, Option<u64>)>> = BTreeMap::new();
         for (alias, entry) in &self.models {
-            let (Some(model), Some(secs)) = (entry.model.as_deref(), entry.request_timeout_s)
-            else {
+            let Some(model) = entry.model.as_deref() else {
                 continue;
             };
             budgets_by_model
                 .entry(model)
                 .or_default()
-                .push((alias.as_str(), secs));
+                .push((alias.as_str(), entry.request_timeout_s));
         }
         for (model, budgets) in budgets_by_model {
-            let first = budgets[0].1;
-            if budgets.iter().any(|(_, secs)| *secs != first) {
-                let declared = budgets
-                    .iter()
-                    .map(|(alias, secs)| format!("{alias}={secs}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                errs.push(format!(
-                    "model {model:?} has conflicting request_timeout_s values ({declared}); \
-                     one model id can carry only one per-model budget"
-                ));
+            // Unambiguous when the model has a single alias, or when every
+            // alias serving it agrees on the budget (including "no alias sets
+            // one"). Anything else leaves the model id without one answer.
+            let distinct: std::collections::BTreeSet<Option<u64>> =
+                budgets.iter().map(|(_, secs)| *secs).collect();
+            if budgets.len() < 2 || distinct.len() < 2 {
+                continue;
             }
+            let declared = budgets
+                .iter()
+                .map(|(alias, secs)| match secs {
+                    Some(secs) => format!("{alias}={secs}"),
+                    None => format!("{alias}=<unset>"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            errs.push(format!(
+                "model {model:?} has an ambiguous per-model request budget ({declared}); \
+                 one model id can be served by only one alias carrying request_timeout_s"
+            ));
         }
         for (name, cap) in [
             ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
@@ -4237,23 +4257,28 @@ request_timeout_s = 0
     }
 
     #[test]
-    fn conflicting_per_model_budgets_for_one_model_id_are_rejected() {
+    fn ambiguous_per_model_budgets_for_one_model_id_are_rejected() {
         let mut cfg = Config::default_provider(std::path::Path::new("/nonexistent-zoder-home"));
-        for (alias, secs) in [("custom.a", 600), ("custom.b", 300)] {
-            cfg.models.insert(
-                alias.to_string(),
-                ModelEntry {
-                    model: Some("MiniMax-M3".to_string()),
-                    request_timeout_s: Some(secs),
-                    ..Default::default()
-                },
-            );
+        let entry = |secs: Option<u64>| ModelEntry {
+            model: Some("MiniMax-M3".to_string()),
+            request_timeout_s: secs,
+            ..Default::default()
+        };
+        for (alias, secs) in [
+            ("custom.a", Some(600)),
+            ("custom.b", Some(300)),
+            ("custom.c", None),
+        ] {
+            cfg.models.insert(alias.to_string(), entry(secs));
         }
-        assert!(
+        let ambiguous = |cfg: &Config| {
             cfg.validate().iter().any(|p| {
-                p.contains("MiniMax-M3") && p.contains("conflicting request_timeout_s")
-            }),
-            "two aliases cannot own one model's budget: {:?}",
+                p.contains("MiniMax-M3") && p.contains("ambiguous per-model request budget")
+            })
+        };
+        assert!(
+            ambiguous(&cfg),
+            "differing budgets for one model id must be rejected: {:?}",
             cfg.validate()
         );
 
@@ -4262,13 +4287,46 @@ request_timeout_s = 0
             .get_mut("custom.b")
             .expect("custom.b exists")
             .request_timeout_s = Some(600);
+        cfg.models
+            .get_mut("custom.c")
+            .expect("custom.c exists")
+            .request_timeout_s = Some(600);
         assert!(
-            !cfg.validate()
-                .iter()
-                .any(|p| p.contains("conflicting request_timeout_s")),
-            "identical budgets are not a conflict: {:?}",
+            !ambiguous(&cfg),
+            "identical budgets on every alias are not a conflict: {:?}",
             cfg.validate()
         );
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), Some(600));
+
+        // An alias with no budget of its own must not be able to hide the
+        // budget another alias declares for the same model (review finding,
+        // 2026-10-21): that would silently leave the slow model on the global
+        // budget, which is the failure this whole feature exists to fix.
+        cfg.models
+            .get_mut("custom.c")
+            .expect("custom.c exists")
+            .request_timeout_s = None;
+        assert!(
+            ambiguous(&cfg),
+            "one alias declaring a budget while another is unset is ambiguous: {:?}",
+            cfg.validate()
+        );
+        assert_eq!(
+            cfg.model_request_timeout_s("MiniMax-M3"),
+            Some(600),
+            "even an unvalidated config must not let the unset alias hide a declared budget"
+        );
+
+        // Several aliases that all declare nothing stay valid: no budget is
+        // declared for that model, which is unambiguous.
+        for alias in ["custom.a", "custom.b"] {
+            cfg.models
+                .get_mut(alias)
+                .expect("alias exists")
+                .request_timeout_s = None;
+        }
+        assert!(!ambiguous(&cfg), "{:?}", cfg.validate());
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), None);
     }
 
     #[test]
