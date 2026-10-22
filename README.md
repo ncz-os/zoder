@@ -131,10 +131,15 @@ So every `loop`/`rescue` exit path — resolved, unresolved, author/check/review
 timeout, SIGTERM, SIGINT — first cancels the agent session, then reaps what the
 agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
 `pid` + `comm` it kills. Selection is deliberately narrow — same uid, cwd
-inside the `-C` directory or zoder's temp dir, started after the run began,
-never zoder itself or one of its ancestors — because this runs on shared hosts
-where another session's processes look identical from the outside. There is no
-`pkill`-style pattern anywhere in the path. Linux only; a no-op elsewhere.
+inside the `-C` directory or inside this run's own scratch directory under the
+temp root (never the temp root itself: on a shared host everybody's cwd is
+under `/tmp`), started after the run began, never zoder itself or one of its
+ancestors, and the pid's `starttime` re-checked immediately before each signal
+so a recycled pid is skipped rather than killed. This is because the reaper
+runs on shared hosts where another session's processes look identical from the
+outside. There is no `pkill`-style pattern anywhere in the path. Linux only; a
+no-op elsewhere. A process that survives SIGKILL is reported as a warning, not
+as a reaped pid.
 
 Pass `--no-reap` to turn it off when something else owns the workspace and you
 expect its processes to outlive the run.
