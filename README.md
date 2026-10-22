@@ -128,23 +128,33 @@ them: on 2026-10-21 a loop's leftovers ran for two hours past both the end of
 the loop and the job runner's own timeout.
 
 So every `loop`/`rescue` exit path — resolved, unresolved, author/check/review
-timeout, SIGTERM, SIGINT — first cancels the agent session (recorded the moment
-the engine mints it, so a turn that is still running when the signal arrives is
-the one that gets cancelled), then reaps what the agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
-`pid` + `comm` it kills. Selection is deliberately narrow — same uid, cwd
-inside the `-C` directory or inside this run's own scratch directory under the
-temp root (never the temp root itself — on a shared host everybody's cwd is
-under `/tmp`, and `-C /tmp` is refused outright rather than honoured), started
-after the run began, never zoder itself or one of its
-ancestors, absent from the pid snapshot taken when the run started, and with a
-`starttime` no earlier than the run's first tick — the pid's `starttime` is
-re-checked immediately before each signal — and where the kernel supports
-pidfd, pinned before it is signalled, so a pid recycled mid-teardown cannot put
-a stranger in front of the signal. This is because the reaper
-runs on shared hosts where another session's processes look identical from the
-outside. There is no `pkill`-style pattern anywhere in the path. Linux only; a
-no-op elsewhere. A process that survives SIGKILL is reported as a warning, not
-as a reaped pid.
+timeout, SIGTERM, SIGINT, panic unwind — first cancels the agent session (the
+id is recorded the moment the engine mints it, so a turn that is still running
+when the signal arrives is the one that gets cancelled), then reaps what the
+agent left behind: SIGTERM, a short grace, SIGKILL, by exact PID, logging every
+`pid` + `comm` it kills. Teardown alternates cancel and reap until a round does
+neither, because the reap itself takes seconds and the agent can fork during
+it.
+
+Selection is deliberately narrow, because this runs on shared hosts where
+another session's processes look identical from the outside. A candidate must
+be: same uid; cwd inside the `-C` directory or inside this run's own scratch
+directory under the temp root (never the temp root itself — on a shared host
+everybody's cwd is under `/tmp`, and `-C /tmp` is refused outright rather than
+honoured); started after the run began (`starttime`, and absent from the pid
+snapshot taken at that moment, so a process that merely shares a `USER_HZ` tick
+with the run is not swept up); not zoder itself or an ancestor; and, where the
+kernel supports pidfd, pinned before it is signalled, so a pid recycled
+mid-teardown cannot put a stranger in front of the signal. There is no
+`pkill`-style pattern anywhere in the path.
+
+Nothing in `/proc` says "the agent spawned this", so that list is the whole
+ownership test — the alternative is the bug this fixes. Its residual exposure
+is a same-uid process somebody else starts in this run's own workspace while
+the run is going. `--no-reap` is the escape hatch when even that is too much.
+On pre-5.3 kernels, which have no pidfd, the check-then-kill window is narrowed
+but cannot be closed. A process that survives SIGKILL is reported as a
+warning, not as a reaped pid. Linux only; a no-op elsewhere.
 
 Pass `--no-reap` to turn it off when something else owns the workspace and you
 expect its processes to outlive the run.
