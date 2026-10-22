@@ -860,26 +860,45 @@ fn install_signal_handler(plan: ReapPlan) {
     // in that window would take the default disposition — die immediately, no
     // cancel, no reap, children reparented to init. That window is exactly the
     // failure this change exists to close.
+    // A half-installed handler is worse than none: once tokio has claimed a
+    // signal, the default disposition is gone, so returning early would leave
+    // SIGTERM swallowed with nothing behind it. Whatever registers gets a
+    // task.
     let term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGTERM handler unavailable ({e}); reaping is signal-blind");
-            return;
+            eprintln!("[zoder] SIGTERM handler unavailable ({e}); a signalled run will not reap");
+            None
         }
     };
     let intr = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGINT handler unavailable ({e}); reaping is signal-blind");
-            return;
+            eprintln!("[zoder] SIGINT handler unavailable ({e}); Ctrl-C will not reap");
+            None
         }
     };
+    if term.is_none() && intr.is_none() {
+        eprintln!("[zoder] no signal handler could be installed; reaping is signal-blind");
+        return;
+    }
     tokio::spawn(async move {
-        let mut term = term;
-        let mut intr = intr;
-        let (name, code) = tokio::select! {
-            _ = term.recv() => ("SIGTERM", 143),
-            _ = intr.recv() => ("SIGINT", 130),
+        let (name, code) = match (term, intr) {
+            (Some(mut term), Some(mut intr)) => {
+                tokio::select! {
+                    _ = term.recv() => ("SIGTERM", 143),
+                    _ = intr.recv() => ("SIGINT", 130),
+                }
+            }
+            (Some(mut term), None) => {
+                term.recv().await;
+                ("SIGTERM", 143)
+            }
+            (None, Some(mut intr)) => {
+                intr.recv().await;
+                ("SIGINT", 130)
+            }
+            (None, None) => return,
         };
         eprintln!(
             "[zoder] {name} received: cancelling the agent session and reaping \
@@ -1094,13 +1113,21 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
         // few ms before the run can share the boundary tick), and the pid
         // snapshot is taken once (so a pid recycled onto a fresh process after
         // the snapshot is caught by the tick test).
-        // The snapshot only speaks for processes that were already old when
-        // the boundary was read. Anything it caught AFTER the boundary read
+        // The snapshot only speaks for processes that were ALREADY OLD when
+        // the boundary was read. A process the snapshot caught after that read
         // belongs to this run and stays eligible.
+        //
+        // The boundary tick itself is the ambiguous case: `starttime` has
+        // 10 ms granularity, so a process that started microseconds before the
+        // run and one that started microseconds after it share a tick. The tie
+        // breaks toward INCLUSION, because the failure mode being fixed is a
+        // leak nobody will ever clean up, while the cost of the other side is
+        // one same-uid process in this workspace that started within 10 ms of
+        // the run - which, in practice, is an agent child anyway.
         let same_process_as_at_scope_open = plan
             .preexisting
             .get(&pid)
-            .is_some_and(|seen| *seen == stat.start_ticks && *seen <= plan.started_ticks);
+            .is_some_and(|seen| *seen == stat.start_ticks && *seen < plan.started_ticks);
         if stat.start_ticks < plan.started_ticks || same_process_as_at_scope_open {
             continue;
         }
@@ -1711,37 +1738,37 @@ mod tests {
         }
     }
 
-    /// A process started in the SAME `USER_HZ` tick as the loop began is still
-    /// a pre-loop process. The tick test alone cannot tell them apart, which is
-    /// why the plan also snapshots the pids that existed at scope open.
+    /// A process from a tick BEFORE the run began is never ours, even with its
+    /// cwd inside the workspace. This is the boundary the pid snapshot draws,
+    /// and it is the half of the granularity problem that can be decided.
     #[test]
-    fn a_process_from_the_boundary_tick_is_still_a_pre_loop_process() {
+    fn a_process_from_an_earlier_tick_is_never_a_candidate() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ws = Workspace::new();
-        let boundary_tick = spawn_sleeper(&ws.cd);
-        wait_until(|| alive(boundary_tick), "the fixture to be running");
-        // No sleep: the fixture is as close to "the loop began" as a fixture
-        // can get, so it very likely shares the boundary tick.
+        let older = spawn_sleeper(&ws.cd);
+        wait_until(|| alive(older), "the fixture to be running");
+        // Clear the tick granularity so the fixture is unambiguously older
+        // than the boundary the guard is about to take.
+        std::thread::sleep(Duration::from_millis(150));
         let mut guard = ReapGuard::begin(&ws.cd, &ws.tmp_root, true);
         let plan = guard.plan.clone().expect("armed guard has a plan");
+        let start = read_stat(older).map(|s| s.start_ticks).unwrap_or(0);
         assert!(
-            plan.preexisting.contains_key(&boundary_tick),
-            "the snapshot must contain a process that existed at scope open"
-        );
-        assert_eq!(
-            plan.preexisting.get(&boundary_tick).copied(),
-            read_stat(boundary_tick).map(|s| s.start_ticks),
-            "the snapshot stores the start time, so a recycled pid stays eligible"
+            start < plan.started_ticks,
+            "the fixture must be strictly older than the boundary for this test to mean anything"
         );
         assert!(
-            !scan(&plan).iter().any(|c| c.pid == boundary_tick),
-            "a process that existed when the run began is never a candidate, \
-             whatever tick it lands in"
+            plan.preexisting.contains_key(&older),
+            "the snapshot records pid -> start time, not just the pid"
+        );
+        assert!(
+            !scan(&plan).iter().any(|c| c.pid == older),
+            "a process from an earlier tick is never selected"
         );
         guard.finish();
-        assert!(alive(boundary_tick), "and it must survive the reap");
+        assert!(alive(older), "and it must survive the reap");
 
-        kill_exact(boundary_tick);
+        kill_exact(older);
     }
 
     /// When the kernel supports pidfd, a selected process is pinned before it
