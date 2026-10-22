@@ -160,13 +160,17 @@ One process is exempt from all of it, by identity and never by command line:
 the shared zeroclaw daemon. It is not the agent's — it is one daemon per host
 that every zoder drives through `<data dir>/daemon.sock`, and it deliberately
 outlives the run that happened to start it. It is spared when this zoder
-spawned it (the pid `spawn()` returned, recorded the instant the child exists),
-when it is the process recorded for that socket (`<pid> <start_ticks>` in
-`<data dir>/daemon.pid`, so another zoder's reap scope can spare it too — and
-the start time is re-read before the record is honoured, so a stale record
-whose pid the kernel has since reused spares nobody), or when
-`/proc/<pid>/exe` is the zeroclaw binary. The daemon is also started with a neutral cwd of its own — its
-config directory, falling back to `$HOME` then `/` — so it never sits inside a
+spawned it (`spawn()`'s pid and its start time, recorded the instant the child
+exists), when it is the process recorded for that socket (`<pid> <start_ticks>`
+in `<data dir>/daemon.pid`, so another zoder's reap scope can spare it too), or
+when `/proc/<pid>/exe` is the zeroclaw binary. Every arm re-checks the live
+process's start time before it spares anything — a pid on its own is not an
+identity, so a record the kernel has outgrown spares nobody — and the record is
+published with a temp file plus `rename`, so a reaper scanning concurrently
+never reads a half-written one.
+
+The daemon is also started with a neutral cwd of its own — its config
+directory, falling back to `$HOME` then `/` — so it never sits inside a
 job workspace in the first place; on 2026-10-21 a loop spawned it with no
 `current_dir`, it inherited that job's directory, and it matched every rule in
 the list above while serving everybody else on the host. The daemon's children

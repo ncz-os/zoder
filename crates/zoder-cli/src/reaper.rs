@@ -48,8 +48,8 @@
 //! So the daemon is excluded outright, and the exclusion is deliberately made
 //! of identity only, never of command-line text:
 //!
-//! * the pid this zoder spawned (recorded by `note_daemon_pid` the instant
-//!   the child exists),
+//! * the process this zoder spawned (recorded by `note_daemon_identity` the
+//!   instant the child exists, pid AND start time),
 //! * the process recorded for the socket (`<pid> <start_ticks>` in
 //!   `<data dir>/daemon.pid`, so a reaper in a *different* zoder process can
 //!   spare it too — and re-checked against the live process, so a stale
@@ -126,52 +126,69 @@ const KILL_WAIT: Duration = Duration::from_millis(500);
 /// iteration 1 keeps editing the tree just as hard as one from iteration 9.
 static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// The pid of the shared zeroclaw daemon, when THIS zoder process spawned it.
+/// The identity (pid -> start_ticks) of the shared zeroclaw daemon, when THIS
+/// zoder process spawned it.
 ///
 /// Recorded the instant `Command::spawn` returns (see
-/// `crate::record_daemon_pid`), which is the only moment the reaper cannot
-/// yet be looking: a scope that opened before the spawn has a snapshot with
-/// no daemon in it and a boundary the daemon starts after, so every ownership
-/// rule in this file selects it. The daemon outlives zoder by design — it
-/// serves every concurrent session on the host — so it must never be one of
-/// our reap targets.
-static DAEMON_PIDS: std::sync::LazyLock<Mutex<HashSet<u32>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+/// `crate::record_daemon_pid`), which is the moment a scope opened earlier
+/// cannot yet be looking: its pid snapshot has no daemon in it and its
+/// boundary predates the daemon, so every ownership rule in this file selects
+/// the daemon. The daemon outlives zoder by design — it serves every
+/// concurrent session on the host — so it must never be one of our reap
+/// targets.
+///
+/// The value is the start time, not a bare pid, for the same reason the reap
+/// re-checks it before every signal: the kernel recycles pids, and a daemon
+/// that dies must not leave a standing permission to spare whoever inherits
+/// its number.
+static DAEMON_PIDS: std::sync::LazyLock<Mutex<HashMap<u32, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Pids already reported as spared, so the exemption is announced once per
 /// daemon per process instead of on every scan of every teardown round.
 static REPORTED_DAEMONS: std::sync::LazyLock<Mutex<HashSet<u32>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Remember the shared daemon's pid so no reap scope can select it. Called by
-/// the CLI immediately after the daemon child is spawned.
-///
-/// `pid == 0` is ignored: it is not an identity, and treating it as one would
-/// exempt a real pid on a buggy `spawn`.
-pub(crate) fn note_daemon_pid(pid: u32) {
+/// Remember the shared daemon's identity so no reap scope can select it.
+/// Called by the CLI immediately after the daemon child is spawned.
+pub(crate) fn note_daemon_identity(identity: crate::DaemonIdentity) {
+    let (pid, start_ticks) = identity;
     if pid > 1 {
         DAEMON_PIDS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(pid);
+            .insert(pid, start_ticks);
     }
 }
 
-/// Is `pid` exempt as "a daemon this process spawned"? Test-only seam for the
-/// in-process arm of [`daemon_exemption`], which the scan calls directly.
+/// Is `pid` exempt as "a daemon this process spawned", right now? Test-only
+/// seam for the in-process arm of [`daemon_exemption`], which the scan calls
+/// directly.
 #[cfg(test)]
-pub(crate) fn daemon_pid_spared(pid: u32) -> bool {
-    DAEMON_PIDS
+pub(crate) fn daemon_spared_by_this_process(pid: u32) -> bool {
+    spawned_daemon_still_matches(pid)
+}
+
+/// The in-process arm: recorded for this pid AND still the same process.
+/// The second half is what keeps a dead daemon from leaving a standing
+/// exemption behind for whoever the kernel hands its pid to next.
+fn spawned_daemon_still_matches(pid: u32) -> bool {
+    let recorded = DAEMON_PIDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&pid)
+        .get(&pid)
+        .copied();
+    match recorded {
+        Some(start_ticks) => live_start_ticks(pid) == Some(start_ticks),
+        None => false,
+    }
 }
 
 /// Why a process is exempt from the reap. Every arm is an identity the kernel
 /// exposes for the process itself; none of them is its command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonExemption {
-    /// The pid this zoder process spawned.
+    /// The process this zoder process spawned, still running.
     Spawned,
     /// The `(pid, start_ticks)` pair recorded for the socket this reaper
     /// talks to, still matching the live process.
@@ -183,7 +200,7 @@ enum DaemonExemption {
 impl DaemonExemption {
     fn reason(self) -> &'static str {
         match self {
-            DaemonExemption::Spawned => "the pid this zoder spawned",
+            DaemonExemption::Spawned => "the daemon this zoder spawned",
             DaemonExemption::Recorded => "the pid recorded for the daemon socket",
             DaemonExemption::Executable => "/proc/<pid>/exe is the zeroclaw binary",
         }
@@ -193,23 +210,18 @@ impl DaemonExemption {
 /// Is this process the shared zeroclaw daemon? Checked for every candidate,
 /// on every pass, because a daemon can appear at any time during a run.
 ///
-/// The pid-file arm cannot be cached in the plan: the daemon is usually
-/// spawned *after* the scope opened, which is exactly the case it exists for.
-/// So the file is read once per scan, and the result is re-checked against
-/// the LIVE process before it spares anything — a record whose start time no
-/// longer matches is a pid the kernel has handed on to somebody else, and
-/// sparing that stranger is precisely the bug an identity-based exemption
-/// must not have.
+/// Every arm is re-checked against the LIVE process before it spares
+/// anything. A pid on its own is not an identity: the kernel recycles them,
+/// and an exemption that outlives the process it was granted to is exactly
+/// the "spare a stranger" bug. The pid-file arm cannot be cached in the plan
+/// either — the daemon is usually spawned *after* the scope opened, which is
+/// the case it exists for — so the record is read once per scan.
 fn daemon_exemption(
     pid: u32,
     recorded: &mut Option<Option<crate::DaemonIdentity>>,
     pid_file: &Path,
 ) -> Option<DaemonExemption> {
-    if DAEMON_PIDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(&pid)
-    {
+    if spawned_daemon_still_matches(pid) {
         return Some(DaemonExemption::Spawned);
     }
     if recorded.is_none() {
@@ -227,11 +239,20 @@ fn daemon_exemption(
 }
 
 /// The live process's start time, or `None` if it is gone or unreadable. A
-/// single `/proc` read: this is what turns "the file says 1234" into "the
-/// process at 1234 is still the one we recorded".
+/// single `/proc` read: this is what turns "the record says 1234 started at
+/// tick T" into "the process at 1234 still is that one".
+///
+/// A zombie reads as `None` for the same reason it reads as dead to
+/// [`alive`]: it holds its pid and its start time but executes nothing, so
+/// there is no daemon there for anybody to be spared from — and the scan
+/// skips Z/X before selection anyway.
 #[cfg(target_os = "linux")]
 fn live_start_ticks(pid: u32) -> Option<u64> {
-    read_stat(pid).map(|stat| stat.start_ticks)
+    let stat = read_stat(pid)?;
+    if stat.state == "Z" || stat.state == "X" {
+        return None;
+    }
+    Some(stat.start_ticks)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2534,8 +2555,12 @@ mod tests {
             "precondition: this fixture is /bin/sleep, not the zeroclaw binary"
         );
 
-        note_daemon_pid(daemon);
-        assert!(daemon_pid_spared(daemon));
+        let identity = (
+            daemon,
+            live_start_ticks(daemon).expect("a live fixture has a start time"),
+        );
+        note_daemon_identity(identity);
+        assert!(daemon_spared_by_this_process(daemon));
         assert!(
             !scan(&plan).iter().any(|c| c.pid == daemon),
             "the pid this process handed out from spawn() is exempt by identity"
@@ -2547,7 +2572,13 @@ mod tests {
             "our own daemon child must survive our own reap"
         );
 
+        // …and the exemption dies with it: a record for a pid whose process is
+        // gone must not spare whoever the kernel hands that number to next.
         kill_exact(daemon);
+        assert!(
+            !daemon_spared_by_this_process(daemon),
+            "a dead daemon must not leave a standing exemption behind"
+        );
     }
 
     /// The cross-process arm: zoder records the daemon's identity next to the
