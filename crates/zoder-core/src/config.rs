@@ -468,6 +468,20 @@ pub struct ModelEntry {
     /// ("requires adaptive thinking") and accepts `minimal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-model provider request timeout in seconds. The same budget as
+    /// [`Config::request_timeout_s`], but pinned to one model instead of every
+    /// call, so a slow reviewer can be given a large budget without slowing
+    /// failure detection for the fast local models beside it.
+    ///
+    /// Measured 2026-10-21 (HYDRA): `MiniMax-M3` on a ~650-line review chunk
+    /// ran past the 120s default twice ("still waiting for minimax-m3 after
+    /// 90s ... request budget 120s" -> "review incomplete") while
+    /// gemma4-31b and MiniMax-M3.1-Flash-Preview answered the same diff.
+    ///
+    /// Precedence: `--request-timeout` > this key > the global
+    /// `request_timeout_s` > `ZODER_TIMEOUT_S` > the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_s: Option<u64>,
 }
 
 /// Read-only projection of the zeroclaw engine's `config.toml` model routing.
@@ -509,6 +523,11 @@ struct EngineProviderModel {
     chat_template_kwargs: Option<serde_json::Value>,
     reasoning_effort: Option<String>,
     response_format: Option<serde_json::Value>,
+    /// Per-model provider request budget in seconds declared on the engine
+    /// profile (`[providers.models.<family>.<alias>] request_timeout_s`).
+    /// `None` leaves the call on the global `--request-timeout` / config /
+    /// env budget.
+    request_timeout_s: Option<u64>,
     kind: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
@@ -772,6 +791,34 @@ impl EngineModelRegistry {
             .values()
             .find(|profile| profile.model == model && profile.response_format.is_some())
             .and_then(|profile| profile.response_format.as_ref())
+    }
+
+    /// Return the per-model provider request budget declared on the engine
+    /// profile that serves this model, with the same precedence as
+    /// [`Self::reasoning_effort_for_model`]: the selected agent's profile,
+    /// then the reviewer's, then any other profile serving the id.
+    ///
+    /// `None` means "no per-model override" — the caller keeps the global
+    /// `--request-timeout` / config / `ZODER_TIMEOUT_S` / default budget.
+    pub fn request_timeout_s_for_model(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+    ) -> Option<u64> {
+        for alias in agent_alias.into_iter().chain(std::iter::once("reviewer")) {
+            if let Some(profile) = self
+                .model_provider_ref_for_agent(alias)
+                .and_then(|reference| self.models.get(reference))
+            {
+                if profile.model == model && profile.request_timeout_s.is_some() {
+                    return profile.request_timeout_s;
+                }
+            }
+        }
+        self.models
+            .values()
+            .find(|profile| profile.model == model && profile.request_timeout_s.is_some())
+            .and_then(|profile| profile.request_timeout_s)
     }
 
     /// Return the exact provider-profile reference configured on an agent,
@@ -1545,6 +1592,7 @@ fn collect_engine_models(
                         .or_else(|| child.get("response_format"))
                         .and_then(|value| serde_json::to_value(value).ok())
                         .filter(serde_json::Value::is_object),
+                    request_timeout_s: toml_request_timeout_s(child, &alias)?,
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1625,6 +1673,7 @@ fn collect_engine_models_json(
                         .or_else(|| child.get("response_format"))
                         .filter(|value| value.is_object())
                         .cloned(),
+                    request_timeout_s: json_request_timeout_s(child, &alias)?,
                     kind: child
                         .get("kind")
                         .or_else(|| child.get("type"))
@@ -1722,6 +1771,52 @@ fn json_string_array(
 
 fn default_kind() -> String {
     "openai-chat".into()
+}
+
+/// Read `request_timeout_s` from an engine provider profile. A zero (or
+/// negative) budget is a load-time error rather than a silently clamped
+/// default: the same shape as the global `request_timeout_s` check, so an
+/// operator who meant "no limit" gets told instead of a call that can never
+/// complete.
+fn toml_request_timeout_s(
+    table: &toml::Table,
+    provider_alias: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = table.get("request_timeout_s") else {
+        return Ok(None);
+    };
+    let secs = value.as_integer().filter(|secs| *secs > 0).ok_or_else(|| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field \"request_timeout_s\" must be a positive \
+             number of seconds"
+        )
+    })?;
+    Ok(Some(u64::try_from(secs).map_err(|_| {
+        anyhow::anyhow!(
+            "engine provider {provider_alias:?} field \"request_timeout_s\" exceeds the \
+             representable request budget"
+        )
+    })?))
+}
+
+/// [`toml_request_timeout_s`] for the daemon's masked `config/get` JSON.
+fn json_request_timeout_s(
+    object: &serde_json::Map<String, serde_json::Value>,
+    provider_alias: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = object.get("request_timeout_s") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .filter(|secs| *secs > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine provider {provider_alias:?} field \"request_timeout_s\" must be a \
+                 positive number of seconds"
+            )
+        })
 }
 
 /// Named report colour palette. Each field is an ANSI SGR parameter string
@@ -3058,6 +3153,26 @@ impl Config {
         self.models.get(mp).and_then(|m| m.model.clone())
     }
 
+    /// The zoder-side `[providers.models.*]`-shaped entry that serves
+    /// `model`, matched on the model id rather than the alias key so it
+    /// applies whichever alias resolved the route. Single definition of that
+    /// match so the per-model sampling knobs and the per-model request
+    /// budget can never disagree about which entry a model uses.
+    pub fn model_entry_for(&self, model: &str) -> Option<&ModelEntry> {
+        self.models
+            .values()
+            .find(|entry| entry.model.as_deref() == Some(model))
+    }
+
+    /// Per-model request budget from zoder's own `models` map (a
+    /// `request_timeout_s` on the entry that serves `model`). `None` means
+    /// "not set here" — the caller falls through to the engine profile's
+    /// per-model value, then the global budget.
+    pub fn model_request_timeout_s(&self, model: &str) -> Option<u64> {
+        self.model_entry_for(model)
+            .and_then(|entry| entry.request_timeout_s)
+    }
+
     /// Resolve the profile-level `reviewer_model` setting as an ORDERED list of
     /// reviewer candidates (head first). The legacy single-string form is
     /// preserved: a `Config::reviewer_model` containing a single model id is
@@ -3297,6 +3412,13 @@ impl Config {
         }
         if self.request_timeout_s.is_some_and(|secs| secs == 0) {
             errs.push("request_timeout_s must be greater than zero".into());
+        }
+        for (alias, entry) in &self.models {
+            if entry.request_timeout_s == Some(0) {
+                errs.push(format!(
+                    "models.{alias}.request_timeout_s must be greater than zero"
+                ));
+            }
         }
         for (name, cap) in [
             ("max_cost_per_call_usd", self.budget.max_cost_per_call_usd),
@@ -3961,6 +4083,121 @@ provider_extra = { reasoning_effort = "none" }
         assert_eq!(
             registry.reasoning_effort_for_model("model-c", None),
             Some("none")
+        );
+    }
+
+    #[test]
+    fn per_model_request_timeout_comes_from_the_selected_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.other]
+model = "model-a"
+request_timeout_s = 900
+[providers.models.custom.reviewer]
+model = "model-a"
+request_timeout_s = 600
+[providers.models.custom.fast]
+model = "model-b"
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.request_timeout_s_for_model("model-a", None),
+            Some(600),
+            "the reviewer route's profile wins over another profile serving the same model"
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("model-b", None),
+            None,
+            "a profile that sets no budget must not invent one"
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("different", None),
+            None
+        );
+    }
+
+    #[test]
+    fn per_model_request_timeout_projects_from_the_daemon_json_projection() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "slow": { "model": "MiniMax-M3", "request_timeout_s": 600 },
+                        "fast": { "model": "gemma4-31b" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            registry.request_timeout_s_for_model("MiniMax-M3", None),
+            Some(600)
+        );
+        assert_eq!(
+            registry.request_timeout_s_for_model("gemma4-31b", None),
+            None
+        );
+    }
+
+    #[test]
+    fn per_model_request_timeout_must_be_a_positive_number_of_seconds() {
+        let zero = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.slow]
+model = "MiniMax-M3"
+request_timeout_s = 0
+"#,
+        )
+        .expect_err("a zero per-model budget can never complete a call");
+        assert!(
+            zero.to_string().contains("request_timeout_s"),
+            "the error must name the offending field: {zero}"
+        );
+
+        let negative = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": { "slow": { "model": "MiniMax-M3", "request_timeout_s": -1 } }
+                }
+            }
+        }))
+        .expect_err("a negative per-model budget must be rejected, not clamped");
+        assert!(
+            negative.to_string().contains("request_timeout_s"),
+            "the error must name the offending field: {negative}"
+        );
+    }
+
+    #[test]
+    fn zoder_model_entry_supplies_the_per_model_request_timeout() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/nonexistent-zoder-home"));
+        let mut slow = ModelEntry {
+            model: Some("MiniMax-M3".to_string()),
+            ..Default::default()
+        };
+        slow.request_timeout_s = Some(600);
+        let mut fast = ModelEntry {
+            model: Some("gemma4-31b".to_string()),
+            ..Default::default()
+        };
+        fast.temperature = Some(0.1);
+        cfg.models.insert("custom.slow".to_string(), slow);
+        cfg.models.insert("custom.fast".to_string(), fast);
+
+        assert_eq!(cfg.model_request_timeout_s("MiniMax-M3"), Some(600));
+        assert_eq!(
+            cfg.model_request_timeout_s("gemma4-31b"),
+            None,
+            "an entry with sampling config but no budget must not pin a timeout"
+        );
+        assert_eq!(
+            cfg.model_entry_for("gemma4-31b")
+                .and_then(|e| e.temperature),
+            Some(0.1),
+            "the shared model-entry lookup must still see the sampling knobs"
         );
     }
 

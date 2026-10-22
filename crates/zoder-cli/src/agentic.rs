@@ -1392,11 +1392,7 @@ async fn dispatch_reviewer_for_model(
     // yet local review checkpoints keep their chat-template options there.
     // Fall back to that read-only engine registry for kwargs, or a thinking
     // model can spend the whole output budget without returning an answer.
-    let model_cfg = eng
-        .cfg
-        .models
-        .values()
-        .find(|m| m.model.as_deref() == Some(model));
+    let model_cfg = eng.cfg.model_entry_for(model);
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -1432,9 +1428,20 @@ async fn dispatch_reviewer_for_model(
             .response_format_for_model(model, cli.agent.as_deref())
             .cloned(),
     };
+    // Per-model request budget: the panel member / loop reviewer being dispatched
+    // right now, not a host-wide number. A slow reviewer (MiniMax-M3 measured
+    // >120s on a ~650-line chunk, 2026-10-21) is cut at the global default
+    // while its fast panel neighbours have no reason to wait; a per-model
+    // `request_timeout_s` lets the slow one be given a real budget without
+    // slowing failure detection for the others.
     let provider = match OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
-        Some(crate::provider_request_timeout_s(cli, &eng.cfg)),
+        Some(crate::provider_request_timeout_s_for_model(
+            cli,
+            &eng.cfg,
+            Some(&eng.engine_models),
+            model,
+        )),
     ) {
         Ok(p) => p.with_wait_notices(!cli.quiet),
         Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),

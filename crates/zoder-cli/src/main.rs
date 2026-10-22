@@ -189,6 +189,9 @@ pub(crate) fn paid_without_opt_in(
     ))
 }
 
+/// Overall request budget for calls that carry no model of their own
+/// (provider catalog fetches, `/models` probes). Model-scoped calls use
+/// [`provider_request_timeout_s_for_model`].
 fn effective_request_timeout_s(cli: &Cli, cfg: &Config, env_timeout_s: Option<u64>) -> u64 {
     cli.request_timeout
         .or(cfg.request_timeout_s)
@@ -198,6 +201,56 @@ fn effective_request_timeout_s(cli: &Cli, cfg: &Config, env_timeout_s: Option<u6
 
 pub(crate) fn provider_request_timeout_s(cli: &Cli, cfg: &Config) -> u64 {
     effective_request_timeout_s(cli, cfg, zoder_core::request_timeout_s_from_env())
+}
+
+/// Request budget for one model-scoped call.
+///
+/// Precedence (highest first):
+///   1. `--request-timeout` (per invocation),
+///   2. `request_timeout_s` on the zoder `models` entry serving this model,
+///   3. `request_timeout_s` on the engine provider profile serving this model
+///      (`[providers.models.<family>.<alias>]`, agent profile first),
+///   4. the global `request_timeout_s`,
+///   5. `ZODER_TIMEOUT_S`,
+///   6. `DEFAULT_REQUEST_TIMEOUT_S`.
+///
+/// Steps 2 and 3 exist because one provider routinely serves models with
+/// very different latency: measured 2026-10-21, MiniMax-M3 needed more than
+/// the 120s default on a ~650-line review chunk while gemma4-31b and
+/// MiniMax-M3.1-Flash-Preview answered the same diff. Raising the budget
+/// globally instead would delay failure detection for the fast local models.
+fn effective_request_timeout_s_for_model(
+    cli: &Cli,
+    cfg: &Config,
+    env_timeout_s: Option<u64>,
+    engine_models: Option<&EngineModelRegistry>,
+    model: &str,
+) -> u64 {
+    cli.request_timeout
+        .or_else(|| cfg.model_request_timeout_s(model))
+        .or_else(|| {
+            engine_models.and_then(|registry| {
+                registry.request_timeout_s_for_model(model, cli.agent.as_deref())
+            })
+        })
+        .or(cfg.request_timeout_s)
+        .or(env_timeout_s)
+        .unwrap_or(zoder_core::DEFAULT_REQUEST_TIMEOUT_S)
+}
+
+pub(crate) fn provider_request_timeout_s_for_model(
+    cli: &Cli,
+    cfg: &Config,
+    engine_models: Option<&EngineModelRegistry>,
+    model: &str,
+) -> u64 {
+    effective_request_timeout_s_for_model(
+        cli,
+        cfg,
+        zoder_core::request_timeout_s_from_env(),
+        engine_models,
+        model,
+    )
 }
 
 /// Durably account for a completed dispatch before enforcing its post-call
@@ -5743,15 +5796,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 .with_wait_notices(!cli.quiet),
             );
         }
-        let provider = &provider_clients[&pid];
+        // Per-model request budget. The cached client above is built with the
+        // global budget so one provider can serve many models; this call's
+        // deadline belongs to the MODEL, so retime a copy for this link only
+        // (the shared connection pool makes that free).
+        let per_model_provider = provider_clients[&pid].with_request_timeout_s(
+            provider_request_timeout_s_for_model(cli, &eng.cfg, Some(&eng.engine_models), model_id),
+        )?;
+        let provider = &per_model_provider;
         // Per-model sampling from `[providers.models.*]`. Matched on the model
         // id rather than the alias key so it works whichever alias resolved
         // here. Absent config keeps the previous behaviour exactly.
-        let model_cfg = eng
-            .cfg
-            .models
-            .values()
-            .find(|m| m.model.as_deref() == Some(model_id.as_str()));
+        let model_cfg = eng.cfg.model_entry_for(model_id);
         let req = ChatRequest {
             model: model_id.clone(),
             messages: messages.clone(),
@@ -8013,6 +8069,163 @@ mod cli_tier_reasoning_parse_tests {
             zoder_core::DEFAULT_REQUEST_TIMEOUT_S
         );
     }
+
+    /// A config with one slow model pinned on its own budget, used by the
+    /// per-model precedence tests below. `MiniMax-M3` measured >120s on a
+    /// ~650-line review chunk (HYDRA, 2026-10-21) while its neighbours on the
+    /// same diff answered inside the default.
+    fn cfg_with_per_model_timeout(
+        dir: &std::path::Path,
+        model: &str,
+        per_model: Option<u64>,
+    ) -> Config {
+        let mut cfg = Config::default_provider(dir);
+        cfg.request_timeout_s = Some(120);
+        let mut entry = zoder_core::config::ModelEntry {
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
+        entry.request_timeout_s = per_model;
+        cfg.models.insert("custom.slow".to_string(), entry);
+        cfg
+    }
+
+    fn engine_registry_with_per_model_timeout(model: &str, secs: u64) -> EngineModelRegistry {
+        EngineModelRegistry::from_toml(&format!(
+            "[providers.models.custom.slow]\nmodel = \"{model}\"\nrequest_timeout_s = {secs}\n"
+        ))
+        .expect("engine registry with a per-model request budget must parse")
+    }
+
+    #[test]
+    fn per_model_request_timeout_wins_over_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, Some(55), None, "MiniMax-M3"),
+            600,
+            "a per-model budget must beat the global config value"
+        );
+        // A model with no per-model entry keeps the global budget: raising one
+        // slow model must not slow failure detection for its fast neighbours.
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, Some(55), None, "gemma4-31b"),
+            120
+        );
+    }
+
+    #[test]
+    fn absent_per_model_request_timeout_falls_back_to_global_then_env_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, Some(55), None, "gemma4-31b"),
+            120,
+            "a model without its own budget uses the global config value"
+        );
+
+        let mut cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", None);
+        cfg.request_timeout_s = None;
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, Some(55), None, "MiniMax-M3"),
+            55,
+            "with no config value at all the env budget applies"
+        );
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, None, None, "MiniMax-M3"),
+            zoder_core::DEFAULT_REQUEST_TIMEOUT_S,
+            "no per-model, config or env value keeps the built-in default"
+        );
+    }
+
+    #[test]
+    fn cli_request_timeout_flag_wins_over_a_per_model_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "exec", "--request-timeout", "900"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        let engine = engine_registry_with_per_model_timeout("MiniMax-M3", 600);
+        assert_eq!(
+            effective_request_timeout_s_for_model(
+                &cli,
+                &cfg,
+                Some(55),
+                Some(&engine),
+                "MiniMax-M3"
+            ),
+            900,
+            "--request-timeout is a per-invocation override and must win"
+        );
+    }
+
+    #[test]
+    fn engine_profile_request_timeout_applies_when_the_zoder_entry_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", None);
+        let engine = engine_registry_with_per_model_timeout("MiniMax-M3", 600);
+        assert_eq!(
+            effective_request_timeout_s_for_model(
+                &cli,
+                &cfg,
+                Some(55),
+                Some(&engine),
+                "MiniMax-M3"
+            ),
+            600,
+            "the engine profile's per-model budget applies when zoder's own entry is silent"
+        );
+        assert_eq!(
+            effective_request_timeout_s_for_model(&cli, &cfg, Some(55), Some(&engine), "qwen38"),
+            120,
+            "a model no profile pins keeps the global budget"
+        );
+    }
+
+    #[test]
+    fn zoder_model_entry_beats_the_engine_profile_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        let engine = engine_registry_with_per_model_timeout("MiniMax-M3", 300);
+        assert_eq!(
+            effective_request_timeout_s_for_model(
+                &cli,
+                &cfg,
+                Some(55),
+                Some(&engine),
+                "MiniMax-M3"
+            ),
+            600,
+            "zoder's own models entry is the operator-facing knob and wins"
+        );
+    }
+
+    #[test]
+    fn a_zero_per_model_budget_is_rejected_rather_than_silently_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(600));
+        let problems = cfg.validate();
+        assert!(
+            problems.is_empty(),
+            "a positive per-model budget must validate: {problems:?}"
+        );
+
+        let mut zeroed = cfg_with_per_model_timeout(dir.path(), "MiniMax-M3", Some(0));
+        zeroed
+            .models
+            .get_mut("custom.slow")
+            .unwrap()
+            .request_timeout_s = Some(0);
+        assert!(
+            zeroed
+                .validate()
+                .iter()
+                .any(|p| p.contains("custom.slow.request_timeout_s")),
+            "a zero per-model budget must be a validation error"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8761,7 +8974,12 @@ pub(crate) async fn agentic_turn(
     if crate::eih_health::is_gated(&routed_provider) {
         let probe_client = OpenAiProvider::new_with_request_timeout_s(
             &routed_provider,
-            Some(provider_request_timeout_s(cli, &eng.cfg)),
+            Some(provider_request_timeout_s_for_model(
+                cli,
+                &eng.cfg,
+                Some(&eng.engine_models),
+                &primary,
+            )),
         )?;
         if let Err(message) = crate::eih_health::admit(
             &eng.cfg.health_path,
@@ -11152,6 +11370,11 @@ async fn run_probe_default(
                 zoder_core::config::PLACEHOLDER_PROVIDER_HOST
             )
         })?;
+    // A health probe is a `max_tokens = 1` liveness ping bounded by
+    // PROBE_PING_TIMEOUT_S (20s), not a generation call, so it deliberately
+    // stays on the GLOBAL budget: no per-model `request_timeout_s` can extend
+    // a ping, and letting one did nothing except make the sweep's worst case
+    // depend on a slow model's config.
     let provider = OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
         Some(provider_request_timeout_s(cli, &eng.cfg)),
@@ -11346,6 +11569,10 @@ async fn run_probe_all(
         {
             continue;
         }
+        // Global budget on purpose: this client's pings are the bounded
+        // liveness checks below (list_models + a max_tokens=1 ping, each under
+        // PROBE_PING_TIMEOUT_S), so a per-model `request_timeout_s` could not
+        // lengthen them.
         let provider = match OpenAiProvider::new_with_request_timeout_s(
             p,
             Some(provider_request_timeout_s(cli, &eng.cfg)),
@@ -11823,6 +12050,8 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
                 zoder_core::config::PLACEHOLDER_PROVIDER_HOST
             )
         })?;
+    // Catalog fetches are not model-scoped calls, so they stay on the global
+    // budget (no per-model `request_timeout_s` applies).
     let provider = OpenAiProvider::new_with_request_timeout_s(
         provider_cfg,
         Some(provider_request_timeout_s(cli, &eng.cfg)),
