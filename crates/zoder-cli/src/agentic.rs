@@ -885,7 +885,7 @@ unbound, or missing imports:\n{context}"
         .ok()
         .map(|p| (p.users, p.max_tokens))
     };
-    let (completion, reviewer_reports) = complete_review_chunks(
+    let (completion, reviewer_report) = complete_review_chunks(
         cli,
         reviewer_override,
         reviewer_chain,
@@ -915,20 +915,24 @@ unbound, or missing imports:\n{context}"
     // returns `Ok` when every chunk did, so this is `true` here; the shape
     // stays per-reviewer so the record keeps its contract when the loop ever
     // fans out to a panel.
-    let reviewer_verdicts = reviewer_reports
+    // On every Ok return path `served_model` is Some (a successful call
+    // completed at least one chunk, and an empty chunk list is impossible —
+    // an empty plan is rejected before dispatch). `unwrap_or_default` here
+    // is unreachable; it only keeps the borrow checker happy without a
+    // second error path for a state that cannot occur.
+    let reviewer_verdicts: Vec<serde_json::Value> = reviewer_report
+        .chunks
         .iter()
-        .map(|r| {
-            let complete = !r.chunks.is_empty()
-                && r.chunks
-                    .iter()
-                    .all(|c| c.structured && c.served_model == r.served_model);
+        .map(|c| {
+            let complete = c.structured
+                && c.served_model == reviewer_report.served_model.clone().unwrap_or_default();
             json!({
-                "model": r.served_model,
+                "model": reviewer_report.served_model.clone().unwrap_or_default(),
                 "verdict": review.verdict,
                 "complete": complete,
             })
         })
-        .collect::<Vec<_>>();
+        .collect();
     Ok((
         review,
         Some(completion.model),
@@ -3787,10 +3791,22 @@ struct ChunkCompletion {
 /// One reviewer's view of its chunk plan: the requested/served models, the
 /// per-chunk structured-verdict evidence, and the chunk count the review was
 /// sized for.
+///
+/// `complete_review_chunks` handles ONE reviewer per call (its callers fan
+/// out to a panel by calling it once per slot), so the function returns
+/// exactly this one report — never more, never an empty vector. A `None`
+/// model identity means "no chunk completed": the fields are reported as
+/// ABSENT rather than fabricated as empty strings.
 #[derive(Debug)]
 struct ReviewerChunkReport {
-    requested_model: String,
-    served_model: String,
+    /// The model the chunks were requested for. `None` only when no chunk
+    /// completed (empty report); on every successful call the first
+    /// completed chunk pinned it, so it is present.
+    requested_model: Option<String>,
+    /// The model that actually served the review. `None` only when no chunk
+    /// completed; when present it equals the served model of EVERY chunk
+    /// (a mixed-model review bails before returning).
+    served_model: Option<String>,
     /// One entry per chunk of the review, in chunk order.
     chunks: Vec<ChunkCompletion>,
 }
@@ -3809,7 +3825,7 @@ async fn complete_review_chunks(
     max_tokens: u32,
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
-) -> anyhow::Result<(Completion, Vec<ReviewerChunkReport>)> {
+) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
     // sized for THAT model; mixing models across chunks is refused below, so
@@ -3817,8 +3833,14 @@ async fn complete_review_chunks(
     let mut users: Vec<String> = users.to_vec();
     let mut max_tokens = max_tokens;
     let mut replanned = false;
-    let mut selected_model: Option<String> = None;
-    let mut selected_requested: Option<String> = None;
+    // The model that served the review so far, pinned by the FIRST
+    // completed chunk — replanned or not. Every later chunk must match it
+    // (mixed-model reviews bail), so once pinned it cannot change.
+    let mut served_model: Option<String> = None;
+    // The requested model is captured in the SAME single capture, so the two
+    // can never disagree about which dispatch established the review: no
+    // replan and a replan both go through it.
+    let mut requested_model: Option<String> = None;
     // Per-chunk evidence: which model was requested, which served, and whether
     // the chunk's structured verdict came back BEFORE any repair or fallback.
     // A re-asked or re-dispatched chunk keeps its first (pre-repair)
@@ -3843,7 +3865,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         );
         let mut completion = complete_once(
             cli,
-            selected_model.as_deref().or(model_override),
+            served_model.as_deref().or(model_override),
             reviewer_chain,
             system,
             &user,
@@ -3853,7 +3875,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
         cost_usd += completion.cost_usd;
         receipts.extend(completion.receipts.clone());
-        if idx == 0 && !replanned && selected_model.is_none() {
+        if idx == 0 && !replanned && served_model.is_none() {
             if let Some(planned) = planned_model.as_deref() {
                 if completion.model != planned {
                     if let Some((new_users, new_tokens)) = replan(&completion.model) {
@@ -3870,8 +3892,11 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                             users = new_users;
                             max_tokens = new_tokens;
                             replanned = true;
-                            selected_model = Some(completion.model);
-                            selected_requested = Some(completion.requested_model);
+                            // Do NOT capture the model here: the re-dispatched
+                            // first chunk goes through the loop's single model
+                            // capture below, exactly like the no-replan path.
+                            // Capturing at replan time would key the review on
+                            // a dispatch that never produced a chunk.
                             continue;
                         }
                     }
@@ -3932,7 +3957,10 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 completion.model
             );
         }
-        if let Some(first) = &selected_model {
+        // Single model capture, shared by the replanned and non-replanned
+        // paths: the first COMPLETED chunk pins the served and requested
+        // models; every later chunk must match (bail above otherwise).
+        if let Some(first) = &served_model {
             if first != &completion.model {
                 anyhow::bail!(
                     "review chunk {}/{} used {}, after earlier chunks used {}; refusing a mixed-model approval",
@@ -3943,32 +3971,33 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 );
             }
         } else {
-            selected_model = Some(completion.model.clone());
-            selected_requested = Some(completion.requested_model.clone());
+            served_model = Some(completion.model.clone());
+            requested_model = Some(completion.requested_model.clone());
         }
         chunk_records.push(record);
         append_chunk_review(&mut merged, review, idx, users.len());
         idx += 1;
     }
-    // One report per reviewer: the requested and served models plus the
-    // per-chunk structured-verdict evidence, in chunk order.
+    // One report per reviewer: the requested and served models (ABSENT,
+    // never an empty string, when no chunk completed) plus the per-chunk
+    // structured-verdict evidence, in chunk order.
     let report = ReviewerChunkReport {
-        requested_model: selected_requested
-            .clone()
-            .or_else(|| selected_model.clone())
-            .unwrap_or_default(),
-        served_model: selected_model.clone().unwrap_or_default(),
+        requested_model,
+        served_model,
         chunks: chunk_records,
     };
     let completion = Completion {
-        requested_model: report.requested_model.clone(),
-        model: selected_model.ok_or_else(|| anyhow!("no review chunks were generated"))?,
+        requested_model: report.requested_model.clone().unwrap_or_default(),
+        model: report
+            .served_model
+            .clone()
+            .ok_or_else(|| anyhow!("no review chunks were generated"))?,
         content: serde_json::to_string(&merged)?,
         cost_usd,
         receipts,
         chunks: users.len(),
     };
-    Ok((completion, vec![report]))
+    Ok((completion, report))
 }
 
 /// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
@@ -13169,6 +13198,37 @@ mod reviewer_chain_dispatch_tests {
         assert_eq!(replans.load(Ordering::SeqCst), 1, "re-plans exactly once");
         // 1 call for the original first chunk + 2 for the re-planned chunks.
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+        // The replanned review's report: ONE report for the whole call, and
+        // BOTH model identities captured from the re-dispatched first chunk
+        // (the replanned model), not from the abandoned pre-replan dispatch.
+        let report = complete_review_chunks(
+            &cli,
+            Some("working-model/glm-5.1"),
+            &[],
+            REVIEW_SYSTEM,
+            &["one big chunk sized for another reviewer".into()],
+            2048,
+            Some("planned-model/large-chunks".into()),
+            &|_| Some((vec!["part a".into(), "part b".into()], 4096)),
+        )
+        .await
+        .unwrap()
+        .1;
+        assert_eq!(
+            report.served_model.as_deref(),
+            Some("working-model/glm-5.1"),
+            "the report must name the model that served the RE-PLANNED chunks"
+        );
+        assert_eq!(
+            report.requested_model.as_deref(),
+            Some("working-model/glm-5.1"),
+            "the requested identity must be captured from the same dispatch as the served one"
+        );
+        assert_eq!(
+            report.chunks.len(),
+            2,
+            "one evidence entry per re-planned chunk"
+        );
 
         // No re-plan when the planned model served the chunk.
         hits.store(0, Ordering::SeqCst);
@@ -14406,15 +14466,21 @@ model_provider = "custom.nemotron35"
         assert!(chunks > 1, "20 file sections must span more than one chunk");
         assert_eq!(model.as_deref(), Some("working-model/reviewer"));
         assert_eq!(review.verdict, "approve");
-        // Exactly one reviewer reported, and it is complete.
-        assert_eq!(reviewer_verdicts.len(), 1);
-        let v = &reviewer_verdicts[0];
-        assert_eq!(v["model"], "working-model/reviewer");
-        assert_eq!(v["verdict"], "approve");
+        // One entry per chunk of the review, all complete, all served by the
+        // requested reviewer.
         assert_eq!(
-            v["complete"], true,
-            "every requested reviewer returned a structured verdict for every chunk"
+            reviewer_verdicts.len(),
+            chunks,
+            "one verdict entry per reviewed chunk"
         );
+        for v in &reviewer_verdicts {
+            assert_eq!(v["model"], "working-model/reviewer");
+            assert_eq!(v["verdict"], "approve");
+            assert_eq!(
+                v["complete"], true,
+                "every requested reviewer returned a structured verdict for every chunk"
+            );
+        }
         // The iteration-level predicate the record stores as `review_complete`:
         // non-empty verdicts, all complete.
         let review_complete = !reviewer_verdicts.is_empty()
@@ -14529,6 +14595,44 @@ model_provider = "custom.nemotron35"
             err.to_string().contains("invalid JSON twice"),
             "the diagnostic must name the unstructured chunk: {err}"
         );
+    }
+
+    /// The chunk report the loop record keys on: ONE report per call (a call
+    /// is one reviewer's chunks — callers fan out to a panel by calling
+    /// once per slot, never by passing multiple reviewers), with model
+    /// identity as an explicit `Option` — `None` is "no chunk completed",
+    /// never an empty string.
+    #[test]
+    fn reviewer_chunk_report_is_one_per_call_and_model_identity_is_explicit() {
+        // An empty review: no chunk completed, so both model identities are
+        // ABSENT (None), not fabricated as "".
+        let empty = ReviewerChunkReport {
+            requested_model: None,
+            served_model: None,
+            chunks: Vec::new(),
+        };
+        assert!(
+            empty.requested_model.is_none(),
+            "absent, not an empty string"
+        );
+        assert!(empty.served_model.is_none(), "absent, not an empty string");
+        assert!(empty.chunks.is_empty());
+        // A completed single-chunk review: both identities present.
+        let done = ReviewerChunkReport {
+            requested_model: Some("working-model/reviewer".into()),
+            served_model: Some("working-model/reviewer".into()),
+            chunks: vec![ChunkCompletion {
+                requested_model: "working-model/reviewer".into(),
+                served_model: "working-model/reviewer".into(),
+                structured: true,
+            }],
+        };
+        assert_eq!(
+            done.requested_model.as_deref(),
+            Some("working-model/reviewer")
+        );
+        assert_eq!(done.served_model.as_deref(), Some("working-model/reviewer"));
+        assert_eq!(done.chunks.len(), 1);
     }
 
     /// REGRESSION (mid-review fallback to a different model): a chunk the
