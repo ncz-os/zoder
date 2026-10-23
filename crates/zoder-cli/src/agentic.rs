@@ -3817,6 +3817,16 @@ struct ReviewerChunkReport {
 /// chunk prompts and output budget, or `None` to keep the current chunks.
 type ReplanFn<'a> = dyn Fn(&str) -> Option<(Vec<String>, u32)> + 'a;
 
+/// The chunk walker's mixed-model enforcement, as a pure predicate: `true`
+/// when a chunk was served by a model DIFFERENT from the one that pinned
+/// the review (the model that served the earlier chunks). A mixed-model
+/// review is a mixed-model approval, and a mixed-model approval is refused
+/// — the caller bails, so the review surfaces as incomplete, never as
+/// complete. The first chunk is never mixed by definition (it pins).
+fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
+    pinned_served != this_served
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
@@ -3836,8 +3846,10 @@ async fn complete_review_chunks(
     let mut max_tokens = max_tokens;
     let mut replanned = false;
     // The model that served the review so far, pinned by the FIRST
-    // completed chunk — replanned or not. Every later chunk must match it
-    // (mixed-model reviews bail), so once pinned it cannot change.
+    // completed chunk — replanned or not. `None` only while no chunk has
+    // completed yet; the capture below (the `else` arm of the single model
+    // check) assigns it on the first success, and every later chunk must
+    // match the pinned value or the review bails as a mixed-model approval.
     let mut served_model: Option<String> = None;
     // The requested model is captured in the SAME single capture, so the two
     // can never disagree about which dispatch established the review: no
@@ -3959,13 +3971,18 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 completion.model
             );
         }
-        // Single model capture, shared by the replanned and non-replanned
-        // paths: the first COMPLETED chunk pins the served and requested
-        // models; every later chunk must match (bail above otherwise).
+        // Single model capture AND the canonical mixed-model enforcement,
+        // shared by the replanned and non-replanned paths: the first
+        // COMPLETED chunk pins the served and requested models; every LATER
+        // chunk is then checked against the pinned `served_model` by the
+        // pure `mixed_model_chunk` predicate below and the review bails if
+        // the provider served it by a different model. A mid-review fallback
+        // to a different model is a mixed-model approval, and a mixed-model
+        // approval is refused — never accepted as a complete review.
         if let Some(first) = &served_model {
-            if first != &completion.model {
+            if mixed_model_chunk(first, &completion.model) {
                 anyhow::bail!(
-                    "review chunk {}/{} used {}, after earlier chunks used {}; refusing a mixed-model approval",
+                    "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
                     idx + 1,
                     users.len(),
                     completion.model,
@@ -14641,11 +14658,13 @@ model_provider = "custom.nemotron35"
         assert_eq!(done.chunks.len(), 1);
     }
 
-    /// REGRESSION (mid-review fallback to a different model): a chunk the
-    /// provider SERVES with a model different from the one REQUESTED is a
-    /// model change mid-review. The chunk walker refuses it as a mixed-model
-    /// approval — a substitution must surface as incomplete, never as
-    /// complete.
+    /// REGRESSION (provider-side model substitution): the provider answers a
+    /// chunk with a model id different from the one requested. The DISPATCH
+    /// refuses the reported substitution (provenance mismatch) BEFORE the
+    /// chunk walker's own mixed-model check — a substitution must surface as
+    /// incomplete, never as complete. (The chunk walker's own mid-review
+    /// fallback enforcement is pinned separately by
+    /// `loop_review_mid_review_model_fallback_is_incomplete`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_review_served_model_substitution_is_incomplete() {
         let home_dir = tempfile::tempdir().unwrap();
@@ -14653,8 +14672,7 @@ model_provider = "custom.nemotron35"
         let _guard = HomeGuard::new(home);
         let server = MockServer::start().await;
         // The provider answers with a DIFFERENT model id than requested. The
-        // dispatch rejects the reported substitution (provenance mismatch) —
-        // either way the review is incomplete, never complete.
+        // dispatch rejects the reported substitution (provenance mismatch).
         Mock::given(method("POST"))
             .and(path("/working/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -14690,6 +14708,86 @@ model_provider = "custom.nemotron35"
             server.received_requests().await.unwrap().len(),
             1,
             "the substituted reviewer call is the only one that ran"
+        );
+    }
+
+    /// REGRESSION (mixed-model enforcement, provider-side): the provider
+    /// serves chunk 1 with the requested model and chunk 2 with a different
+    /// one. Regardless of WHICH layer refuses it — the dispatch's provenance
+    /// check or the chunk walker's own `mixed_model_chunk` check (pinned by
+    /// the unit test below) — the review MUST fail. A mid-review fallback to
+    /// a different model can never be a complete approval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_mid_review_model_fallback_is_incomplete() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        // First request: chunk 1 served by the requested model. Second
+        // request: chunk 2 served by a different, configured model (the
+        // provider's fallback). Both answer with a structured verdict, so
+        // the ONLY thing that can stop the review is a model-identity check.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let served = if n == 0 {
+                    "working-model/reviewer"
+                } else {
+                    "working-model/fallback"
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "model": served,
+                    "choices": [{
+                        "message": {"content": r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#},
+                        "finish_reason": "stop",
+                    }]
+                }))
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer", "working-model/fallback"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let err = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &["working-model/fallback".into()],
+            REVIEW_SYSTEM,
+            &["chunk one".into(), "chunk two".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await;
+        let err = err.expect_err("a mid-review fallback to a different model must fail the review");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("mixed-model") || chain.contains("provenance mismatch"),
+            "a model-identity check must refuse the mixed-model review: {chain}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "chunk 1 ran on the requested model; chunk 2's fallback is where the bail happens"
+        );
+    }
+
+    /// The chunk walker's mixed-model enforcement, pinned as a pure
+    /// predicate: a chunk served by a model different from the pinned one is
+    /// a mixed-model approval and is refused; same model is fine. The first
+    /// chunk is never mixed by definition (it pins the review).
+    #[test]
+    fn mixed_model_chunk_refuses_a_different_serving_model() {
+        assert!(
+            !mixed_model_chunk("model-a", "model-a"),
+            "same model is not mixed"
+        );
+        assert!(
+            mixed_model_chunk("model-a", "model-b"),
+            "a chunk served by a different model is a mixed-model approval"
         );
     }
 
