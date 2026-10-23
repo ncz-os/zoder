@@ -107,3 +107,46 @@ The reviewer must see the loop's OWN work and ALL of it.
 * **Evidence.** Each iteration records `review_base`, `review_base_tree`,
   `start_dirty`, `review_chunks`, and `review_error`; the human summary prints
   chunks and the error.
+
+## F. Review completeness and finding identity (2026-10-23)
+
+The per-iteration record in the loop's JSON (`result.json` / stdout, under
+`log[]`) now says whether the review actually finished, and gives every
+finding a stable identity and an explicit disposition. All three are
+**additive**: every pre-existing field keeps its name and meaning, and an
+old-schema record still parses with the new fields absent.
+
+* **`review_complete` (bool, per iteration).** `true` ONLY when every
+  requested reviewer returned a structured JSON verdict for every chunk of
+  the diff. `false` for a PARTIAL review (a chunk that never returned a
+  structured verdict, even after its repair retry), a reviewer timeout or
+  provider failure (the `Err` path, `reviewer_unavailable`), and a mid-review
+  fallback to a different model — zoder refuses mixed-model approval, and the
+  record surfaces that refusal as incomplete, never as complete. When the
+  review errored, `reviewer_verdicts` is absent (empty) and `review_complete`
+  is `false`. Downstream triage (Hive's shadow-mode loop triage) keys on this
+  field to decide whether a non-converging loop can be judged.
+* **`reviewer_verdicts` (array, per iteration).** One entry per requested
+  reviewer: `{model, verdict, complete}`. `model` is the model that served the
+  review, `verdict` is the aggregated review verdict, and `complete` is the
+  per-reviewer structured-verdict evidence (every chunk structured, same
+  serving model). The iteration's `review_complete` is `true` iff the array is
+  non-empty and every entry is `complete: true`.
+* **`findings` (array, per iteration and at the top level for the last
+  iteration).** Each finding carries its existing fields (`severity`,
+  `title`, `body`, `location`) plus two new ones:
+  * `fingerprint` — a stable string: the finding's normalized file path (the
+    path part of its `location`; a pathless finding uses no path) plus its
+    normalized title (lowercased, runs of whitespace/hyphen/punctuation
+    collapsed to a single space). The same defect re-raised in the next round
+    — after line shifts, case changes, or re-hyphenation — maps to the same
+    fingerprint; the same title in a different file does not.
+  * `disposition` — one of `open | real | disproved | intended`, default
+    `open`. Only an EXPLICIT value recorded by an author or reviewer in the
+    review payload sets a non-`open` disposition; an unknown or missing value
+    stays `open`. zoder never infers a disposition from severity, verdict, or
+    prose.
+
+The human (non-`--json`) summary now prints the per-iteration finding count
+and a `review=complete|INCOMPLETE|unknown` marker alongside the existing
+fields.

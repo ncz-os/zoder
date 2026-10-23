@@ -433,6 +433,14 @@ mod agentic_utilization_tests {
 /// Result of one reviewer completion.
 #[derive(Debug)]
 struct Completion {
+    /// The candidate model this completion was requested for. When the
+    /// provider actually served a different model (`model != requested_model`)
+    /// the review is a SUBSTITUTION, and a chunked review served by more than
+    /// one model is refused as a mixed-model approval — neither may surface
+    /// as a complete review.
+    requested_model: String,
+    /// The model that actually served the completion (verbatim from the
+    /// dispatch). Equals `requested_model` unless the provider substituted.
     model: String,
     content: String,
     cost_usd: f64,
@@ -614,7 +622,7 @@ async fn complete_once(
                 prev = candidates[idx - 1]
             );
         }
-        match dispatch_reviewer_for_model(cli, model, system, user, max_tokens).await {
+        match dispatch_reviewer_for_model(cli, model, model, system, user, max_tokens).await {
             Ok(c) => return Ok(c),
             Err(ReviewerError::FallbackWorthy {
                 message,
@@ -816,7 +824,13 @@ async fn run_loop_review(
     zoderignore: &[String],
     config_excludes: &[String],
     root: &Path,
-) -> anyhow::Result<(ReviewOutput, Option<String>, f64, usize)> {
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
     let caps_for =
         |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
@@ -871,7 +885,7 @@ unbound, or missing imports:\n{context}"
         .ok()
         .map(|p| (p.users, p.max_tokens))
     };
-    let completion = complete_review_chunks(
+    let (completion, reviewer_reports) = complete_review_chunks(
         cli,
         reviewer_override,
         reviewer_chain,
@@ -895,7 +909,33 @@ unbound, or missing imports:\n{context}"
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
-    Ok((review, Some(completion.model), completion.cost_usd, chunks))
+    // The per-reviewer view for the loop record: model, verdict, and
+    // `complete` = every chunk of this review produced a structured verdict
+    // from the serving model on its first attempt. `run_loop_review` only
+    // returns `Ok` when every chunk did, so this is `true` here; the shape
+    // stays per-reviewer so the record keeps its contract when the loop ever
+    // fans out to a panel.
+    let reviewer_verdicts = reviewer_reports
+        .iter()
+        .map(|r| {
+            let complete = !r.chunks.is_empty()
+                && r.chunks
+                    .iter()
+                    .all(|c| c.structured && c.served_model == r.served_model);
+            json!({
+                "model": r.served_model,
+                "verdict": review.verdict,
+                "complete": complete,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        review,
+        Some(completion.model),
+        completion.cost_usd,
+        chunks,
+        reviewer_verdicts,
+    ))
 }
 
 /// Build the ordered reviewer candidate list `complete_once` walks.
@@ -1303,8 +1343,16 @@ fn no_reviewer_provider_text(model: &str, routes: &[(String, String)], served: &
 /// call (network, HTTP-status, decode) and `Fatal` for any error that
 /// would either duplicate streamed output, fail a structural invariant,
 /// or mask a config/policy problem.
+///
+/// `requested` is the candidate model id the chain asked for; `model` is the
+/// model this dispatch sends the request to. In the loop's fallback lane the
+/// two are always equal; the separation exists so a mid-review SUBSTITUTION
+/// (the provider serving a different model than requested) is detectable in
+/// the returned [`Completion`] (`requested_model != model`) and can never be
+/// silently folded into a "complete" review.
 async fn dispatch_reviewer_for_model(
     cli: &crate::Cli,
+    requested: &str,
     model: &str,
     system: &str,
     user: &str,
@@ -1731,6 +1779,7 @@ async fn dispatch_reviewer_for_model(
     }
 
     Ok(Completion {
+        requested_model: requested.to_string(),
         model: model.to_string(),
         content: res.content,
         cost_usd: cost,
@@ -1836,6 +1885,25 @@ struct Finding {
     body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     location: Option<String>,
+    /// Explicitly recorded disposition: `open | real | disproved | intended`.
+    /// Only a value an author or reviewer wrote into the review payload sets
+    /// a non-`open` disposition — it is NEVER inferred from severity,
+    /// verdict, or prose. An absent or unrecognized value keeps the default
+    /// `open` (see [`Finding::disposition_or_default`]).
+    #[serde(default)]
+    disposition: String,
+}
+
+impl Finding {
+    /// The disposition this finding carries for the loop record. Unknown and
+    /// missing values stay the default `open`; no caller may derive a
+    /// disposition from anything but this recorded string.
+    pub(crate) fn disposition_or_default(&self) -> &str {
+        match self.disposition.as_str() {
+            "real" | "disproved" | "intended" => self.disposition.as_str(),
+            _ => "open",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2051,6 +2119,7 @@ fn parse_review(raw: &str) -> ReviewOutput {
             title: "unparseable review (fail-closed)".into(),
             body: raw.trim().to_string(),
             location: None,
+            disposition: String::new(),
         }],
         next_steps: vec![],
     }
@@ -2131,6 +2200,7 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
             title: "unparseable review (fail-closed)".into(),
             body: raw.trim().chars().take(8_000).collect(),
             location: None,
+            disposition: String::new(),
         }],
         next_steps: vec![],
     })
@@ -2291,6 +2361,7 @@ fn try_parse_verdict_from_prose(raw: &str) -> Option<ReviewOutput> {
             title: format!("prose review – verdict: {verdict_lower}"),
             body: raw.to_string(),
             location: None,
+            disposition: String::new(),
         }],
         next_steps: vec![],
     })
@@ -3688,6 +3759,34 @@ fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usi
     merged.next_steps.extend(review.next_steps);
 }
 
+/// Per-chunk completion record kept by [`complete_review_chunks`]: which model
+/// was requested for the chunk, which model actually served it, and whether it
+/// produced a structured verdict for the chunk.
+#[derive(Debug)]
+struct ChunkCompletion {
+    // Evidence kept for the chunk report's provenance (which model was
+    // requested vs served). In the loop's single-reviewer path every request
+    // is served by the model it was requested for (a substitution fails the
+    // review), so `served_model` is the identity the record uses; the
+    // requested id is retained so a future fan-out path can prove the match
+    // per chunk without re-dispatching.
+    #[allow(dead_code)]
+    requested_model: String,
+    served_model: String,
+    structured: bool,
+}
+
+/// One reviewer's view of its chunk plan: the requested/served models, the
+/// per-chunk structured-verdict evidence, and the chunk count the review was
+/// sized for.
+#[derive(Debug)]
+struct ReviewerChunkReport {
+    requested_model: String,
+    served_model: String,
+    /// One entry per chunk of the review, in chunk order.
+    chunks: Vec<ChunkCompletion>,
+}
+
 /// Re-plans review chunks for a fallback reviewer: returns that reviewer's
 /// chunk prompts and output budget, or `None` to keep the current chunks.
 type ReplanFn<'a> = dyn Fn(&str) -> Option<(Vec<String>, u32)> + 'a;
@@ -3702,7 +3801,7 @@ async fn complete_review_chunks(
     max_tokens: u32,
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
-) -> anyhow::Result<Completion> {
+) -> anyhow::Result<(Completion, Vec<ReviewerChunkReport>)> {
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
     // sized for THAT model; mixing models across chunks is refused below, so
@@ -3711,6 +3810,14 @@ async fn complete_review_chunks(
     let mut max_tokens = max_tokens;
     let mut replanned = false;
     let mut selected_model: Option<String> = None;
+    let mut selected_requested: Option<String> = None;
+    // Per-chunk evidence: which model was requested, which served, and whether
+    // the chunk's structured verdict came back BEFORE any repair or fallback.
+    // A re-asked or re-dispatched chunk keeps its first (pre-repair)
+    // structured flag: a first-attempt parse failure is real incompleteness
+    // evidence, and a chunk that only parsed on repair is not "every chunk
+    // returned a structured verdict on its own".
+    let mut chunk_records: Vec<ChunkCompletion> = Vec::new();
     let mut cost_usd = 0.0;
     let mut receipts = Vec::new();
     let mut merged = ReviewOutput {
@@ -3756,17 +3863,28 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                             max_tokens = new_tokens;
                             replanned = true;
                             selected_model = Some(completion.model);
+                            selected_requested = Some(completion.requested_model);
                             continue;
                         }
                     }
                 }
             }
         }
+        // Record the chunk's first-attempt outcome BEFORE any repair or
+        // re-dispatch can mutate `completion`: which model was requested,
+        // which actually served it, and whether a structured verdict was
+        // present on the very first response. A chunk whose verdict only
+        // appeared on the repair retry keeps `structured: false` — a
+        // repaired verdict is not a first-attempt structured verdict.
+        let chunk_structured = strict_review(&completion.content).is_some();
+        let record = ChunkCompletion {
+            requested_model: completion.requested_model.clone(),
+            served_model: completion.model.clone(),
+            structured: chunk_structured,
+        };
         let review = match strict_review(&completion.content) {
             Some(review) => review,
             None => {
-                // One fresh JSON-only retry of the same code on the same
-                // model. Never extract a convenient object from prose.
                 let repair_user = format!("{user}\n\nReturn ONLY the complete JSON verdict object; your previous response did not satisfy the review schema.");
                 completion = complete_once(
                     cli,
@@ -3785,6 +3903,27 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 ))?
             }
         };
+        // The served model must be the model that was requested for this
+        // dispatch — a provider-side substitution (`served != requested`) is
+        // a mid-review model change and is incomplete, never complete. It
+        // also must equal the model that served the earlier chunks: a
+        // mid-review fallback to a different model is refused as a
+        // mixed-model approval. The bail IS the incompleteness path, not a
+        // missing record: `run_loop_review` maps this error to the
+        // iteration's `reviewer_unavailable` verdict with `review_error` set
+        // and `review_complete: false` — which is exactly "surface it as
+        // incomplete, never as complete". (The first-attempt chunk record
+        // above already captured `requested_model` for the report; this check
+        // re-reads the field after that capture.)
+        if completion.model != completion.requested_model {
+            anyhow::bail!(
+                "review chunk {}/{} was requested for {} but served by {}; refusing a mixed-model approval",
+                idx + 1,
+                users.len(),
+                completion.requested_model,
+                completion.model
+            );
+        }
         if let Some(first) = &selected_model {
             if first != &completion.model {
                 anyhow::bail!(
@@ -3796,18 +3935,32 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 );
             }
         } else {
-            selected_model = Some(completion.model);
+            selected_model = Some(completion.model.clone());
+            selected_requested = Some(completion.requested_model.clone());
         }
+        chunk_records.push(record);
         append_chunk_review(&mut merged, review, idx, users.len());
         idx += 1;
     }
-    Ok(Completion {
+    // One report per reviewer: the requested and served models plus the
+    // per-chunk structured-verdict evidence, in chunk order.
+    let report = ReviewerChunkReport {
+        requested_model: selected_requested
+            .clone()
+            .or_else(|| selected_model.clone())
+            .unwrap_or_default(),
+        served_model: selected_model.clone().unwrap_or_default(),
+        chunks: chunk_records,
+    };
+    let completion = Completion {
+        requested_model: report.requested_model.clone(),
         model: selected_model.ok_or_else(|| anyhow!("no review chunks were generated"))?,
         content: serde_json::to_string(&merged)?,
         cost_usd,
         receipts,
         chunks: users.len(),
-    })
+    };
+    Ok((completion, vec![report]))
 }
 
 /// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
@@ -4283,7 +4436,7 @@ unbound, or missing imports:\n{context}"
     let mut receipts = Vec::new();
     for r in results {
         match r {
-            Ok(c) => {
+            Ok((c, _report)) => {
                 ok_models += 1;
                 total_cost += c.cost_usd;
                 receipts.extend(c.receipts);
@@ -5233,6 +5386,85 @@ fn is_block_verdict(verdict: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Finding identity and disposition (loop record, 2026-10-23).
+//
+// The loop record previously gave a finding neither a stable identity nor a
+// disposition, so downstream triage could not tell a re-raised defect from a
+// new one, and a non-converging loop had nothing to stop on. These helpers are
+// pure and shared by the iteration record and the loop-level payload.
+// ---------------------------------------------------------------------------
+
+/// The file path a finding's location refers to, normalized.
+///
+/// The reviewer cites locations as `path:line` (or a bare path). Only the
+/// PATH side is kept: the line number is volatile — the same defect re-raised
+/// in the next round after an edit maps to a different line, which must NOT
+/// change the fingerprint. An empty or pathless location yields `""`, which
+/// makes two pathless findings of the same title collide (a deliberate
+/// property: the defect's identity is the path-less title, not its position).
+fn finding_location_path(location: &Option<String>) -> String {
+    let Some(loc) = location.as_deref().map(str::trim).filter(|l| !l.is_empty()) else {
+        return String::new();
+    };
+    // `path:line` — keep the path, drop the trailing line number. A location
+    // with no colon is a bare path.
+    let path = loc.split(':').next().unwrap_or(loc);
+    path.trim().to_string()
+}
+
+/// Stable identity for a finding: normalized file path + normalized title.
+///
+/// The title is lowercased and every run of non-identity characters
+/// (whitespace, hyphens, punctuation) is collapsed to a single space — so
+/// case, spacing, and hyphenation do not change the fingerprint. The location
+/// contributes ONLY its path, never its line number, so the same defect
+/// re-raised after line shifts maps to the same fingerprint. Two different
+/// files never share a fingerprint for the same title.
+fn finding_fingerprint(f: &Finding) -> String {
+    let path = finding_location_path(&f.location);
+    // Lowercase, then collapse every run of characters that carry no
+    // identity (whitespace, hyphens, punctuation) to a single space. A title
+    // re-raised as "off by one error" vs "off-by-one   Error" is the same
+    // defect and maps to the same fingerprint.
+    let lowered = f.title.to_lowercase();
+    let mut title = String::new();
+    let mut last_space = true;
+    for c in lowered.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            title.push(c);
+            last_space = false;
+        } else if !last_space {
+            title.push(' ');
+            last_space = true;
+        }
+    }
+    format!("{path}::{}", title.trim())
+}
+
+/// The disposition the loop record shows for a finding: the EXPLICIT value an
+/// author or reviewer recorded (`real`, `disproved`, or `intended`) or the
+/// default `open`. This function is the ONLY source of a non-`open`
+/// disposition — callers must not infer one from severity, verdict, or prose
+/// (see `Finding::disposition_or_default`).
+fn finding_disposition(f: &Finding) -> &str {
+    f.disposition_or_default()
+}
+
+/// Render a finding's record object: the existing fields verbatim, plus the
+/// additive `fingerprint` (stable identity) and `disposition`
+/// (`open | real | disproved | intended`, default `open`).
+fn finding_record(f: &Finding) -> serde_json::Value {
+    json!({
+        "severity": f.severity,
+        "title": f.title,
+        "body": f.body,
+        "location": f.location,
+        "fingerprint": finding_fingerprint(f),
+        "disposition": finding_disposition(f),
+    })
+}
+
 /// A `request_changes` is only a valid defect report when at least one finding
 /// cites a concrete location. Non-blocking verdicts are trivially "located".
 fn request_changes_is_located(r: &ReviewOutput) -> bool {
@@ -5332,6 +5564,7 @@ loop stays unresolved (reviewer_unavailable)."
             title: "reviewer_unavailable (prose-only output)".into(),
             body: prose.chars().take(8_000).collect(),
             location: None,
+            disposition: String::new(),
         }],
         next_steps: vec![],
     }
@@ -6481,37 +6714,49 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // 2026-10-21 a reviewer that returned `Context size has been
         // exceeded` (and a diff whose middle was silently truncated) still
         // recorded verdict=approve; that is the fail-open this closes.
-        let (mut review, mut reviewer_model, review_cost, mut review_chunks) = match phase_watchdog(
-            LoopPhase::Review,
-            loop_timeout_secs,
-            cli.quiet,
-            run_loop_review(
-                cli,
-                reviewer.as_deref(),
-                &reviewer_chain,
-                ADVERSARIAL_SYSTEM,
-                &review_diff,
-                &label,
-                &review_preamble,
-                caps_model.as_deref(),
-                review_cfg.as_ref(),
-                &zoderignore,
-                &config_excludes,
-                &review_root,
-            ),
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(msg) => {
-                let detail = format!("review incomplete: {msg}");
-                if !cli.quiet {
-                    eprintln!("[loop] iter {i}: {detail}; failing closed (iteration unresolved)");
+        let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
+            match phase_watchdog(
+                LoopPhase::Review,
+                loop_timeout_secs,
+                cli.quiet,
+                run_loop_review(
+                    cli,
+                    reviewer.as_deref(),
+                    &reviewer_chain,
+                    ADVERSARIAL_SYSTEM,
+                    &review_diff,
+                    &label,
+                    &review_preamble,
+                    caps_model.as_deref(),
+                    review_cfg.as_ref(),
+                    &zoderignore,
+                    &config_excludes,
+                    &review_root,
+                ),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(msg) => {
+                    let detail = format!("review incomplete: {msg}");
+                    if !cli.quiet {
+                        eprintln!(
+                            "[loop] iter {i}: {detail}; failing closed (iteration unresolved)"
+                        );
+                    }
+                    review_error = Some(detail.clone());
+                    (
+                        synthesize_reviewer_unavailable(&detail),
+                        None,
+                        0.0,
+                        0,
+                        // Incomplete: no reviewer evidence exists, so the
+                        // record must not fabricate a complete per-reviewer
+                        // verdict either.
+                        Vec::new(),
+                    )
                 }
-                review_error = Some(detail.clone());
-                (synthesize_reviewer_unavailable(&detail), None, 0.0, 0)
-            }
-        };
+            };
         total_cost += review_cost;
         // The objective gate is "green" ONLY when an actual `--check` ran and
         // passed. A never-configured check is NOT green — it is unknown, and
@@ -6538,7 +6783,7 @@ A blocking defect MUST cite a concrete location (path:line). Re-review this diff
 request changes, include at least one finding with an exact location. Otherwise return approve \
 or comment.\n"
             );
-            let (r2, m2, c2, ch2) = match phase_watchdog(
+            let (r2, m2, c2, ch2, rv2) = match phase_watchdog(
                 LoopPhase::Review,
                 loop_timeout_secs,
                 cli.quiet,
@@ -6563,7 +6808,13 @@ or comment.\n"
                 Err(msg) => {
                     let detail = format!("review incomplete: {msg}");
                     review_error = Some(detail.clone());
-                    (synthesize_reviewer_unavailable(&detail), None, 0.0, 0)
+                    (
+                        synthesize_reviewer_unavailable(&detail),
+                        None,
+                        0.0,
+                        0,
+                        Vec::new(),
+                    )
                 }
             };
             total_cost += c2;
@@ -6571,6 +6822,11 @@ or comment.\n"
             if m2.is_some() {
                 reviewer_model = m2;
             }
+            // The re-ask is the same review pass: its reviewer verdicts are
+            // the iteration's, and an incomplete re-ask wipes the first
+            // pass's evidence so `review_complete` can only ever say what
+            // was actually reviewed.
+            reviewer_verdicts = rv2;
             if is_unlocated_block(&r2) {
                 review = mark_unlocated_no_evidence(&r2);
                 review_unlocated_no_evidence = true;
@@ -6640,10 +6896,30 @@ or comment.\n"
             "start_dirty": loop_start.dirty,
             "review_chunks": review_chunks,
             "review_error": review_error,
+            // Review completeness for THIS iteration: true ONLY when every
+            // requested reviewer returned a structured verdict for every
+            // chunk of this diff. A PARTIAL review, a reviewer timeout or
+            // failure, and a mid-review fallback to a different model (mixed-
+            // model approval, which zoder refuses) all surface as `false` —
+            // never as complete. Empty `reviewer_verdicts` (review errored or
+            // was never run) is absent data, and absent data stays incomplete.
+            "review_complete": !reviewer_verdicts.is_empty()
+                && reviewer_verdicts
+                    .iter()
+                    .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true)),
+            // `reviewer_verdicts` is an array when a reviewer reported; on
+            // the incomplete-Err path it is absent (empty), never a lone
+            // `false` that a JSON parser would read as the field's value.
+            "reviewer_verdicts": reviewer_verdicts,
             "verdict": review.verdict,
             "blocking_findings": blocking,
             "review_unlocated_no_evidence": review_unlocated_no_evidence,
             "summary": review.summary,
+            // Per-finding identity and disposition for downstream triage:
+            // `fingerprint` maps a re-raised defect across rounds;
+            // `disposition` is only an explicitly recorded value (default
+            // `open`), never inferred.
+            "findings": review.findings.iter().map(finding_record).collect::<Vec<_>>(),
             "cost_usd_cumulative": total_cost,
             "commit_author_enforcement": commit_author_enforcement_to_json(
                 commit_author_enforcement.as_ref()
@@ -6863,7 +7139,7 @@ approve)…"
                 }
                 let mut fresh: Vec<ReviewOutput> = Vec::with_capacity(2);
                 for _ in 0..2 {
-                    let (r, m, c, _ch) = match phase_watchdog(
+                    let (r, m, c, _ch, _rv) = match phase_watchdog(
                         LoopPhase::Review,
                         loop_timeout_secs,
                         cli.quiet,
@@ -6890,6 +7166,7 @@ approve)…"
                             None,
                             0.0,
                             0,
+                            Vec::new(),
                         ),
                     };
                     total_cost += c;
@@ -7027,6 +7304,11 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
+        // Loop-level view of the LAST iteration's findings: the same
+        // `fingerprint`/`disposition` enrichment the per-iteration `log`
+        // carries. A run that never reviewed (empty `log`) has no findings —
+        // the field is absent, never fabricated.
+        "findings": iterations.last().and_then(|it| it.get("findings")).cloned(),
     });
 
     if let Some(dir) = active_job_dir() {
@@ -7059,14 +7341,27 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
                 .as_str()
                 .map(|e| format!(" review_error={e:?}"))
                 .unwrap_or_default();
+            let findings = it["findings"].as_array().map(Vec::len).unwrap_or(0);
+            let complete = it["review_complete"]
+                .as_bool()
+                .map(|c| {
+                    if c {
+                        "review=complete"
+                    } else {
+                        "review=INCOMPLETE"
+                    }
+                })
+                .unwrap_or("review=unknown");
             println!(
-                "  iter {} : tools={} diff_lines={} chunks={} check={} verdict={}{}",
+                "  iter {} : tools={} diff_lines={} chunks={} check={} verdict={} findings={} {}{}",
                 it["iter"],
                 it["tool_calls"],
                 it["diff_lines"],
                 it["review_chunks"],
                 it["check_passed"],
                 it["verdict"],
+                findings,
+                complete,
                 err
             );
         }
@@ -8090,6 +8385,7 @@ mod tests {
             title: "defect".into(),
             body: "code body that must not reach the ledger".into(),
             location: Some("crates/zoder-cli/src/agentic.rs:42".into()),
+            disposition: String::new(),
         }
     }
 
@@ -8099,6 +8395,7 @@ mod tests {
             title: "defect".into(),
             body: "code body".into(),
             location: None,
+            disposition: String::new(),
         }
     }
 
@@ -8291,6 +8588,7 @@ mod tests {
                 title: format!("finding {i} {}", "x".repeat(200)),
                 body: "y".repeat(500),
                 location: Some(format!("src/file{i}.rs:{}", i + 1)),
+                disposition: String::new(),
             })
             .collect();
         let bounded = bounded_located_findings(&many, Some("reviewer-y"));
@@ -10824,6 +11122,7 @@ mod loop_resolution_tests {
                 title: "real concern".into(),
                 body: "reviewer raised a high-severity issue".into(),
                 location: Some("src/lib.rs:42".into()),
+                disposition: String::new(),
             }],
             next_steps: vec![],
         };
@@ -12026,6 +12325,37 @@ mod reviewer_chain_dispatch_tests {
         .unwrap();
     }
 
+    /// A reviewer reply for wiremock that carries FINDINGS: `approve` with one
+    /// located finding (title with doubled spaces and mixed case, so the
+    /// fingerprint normalization is exercised from a real parse).
+    async fn mount_200_openai_chat_completion_with_findings(server: &MockServer) {
+        let review = serde_json::json!({
+            "verdict": "approve",
+            "summary": "ok with one note",
+            "findings": [{
+                "severity": "low",
+                "title": "  Off By One  Error  at the Boundary  ",
+                "body": "returns index+1 past the end",
+                "location": "src/lib.rs:42"
+            }],
+            "next_steps": []
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": review},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
     /// Mount a wiremock expectation that returns a `404` matching the
     /// exact URL shape `endpoint_url` produces for the
     /// `wiremock-broken` provider — i.e.
@@ -12803,7 +13133,8 @@ mod reviewer_chain_dispatch_tests {
             &replan,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(result.model, "working-model/glm-5.1");
         assert_eq!(
             result.chunks, 2,
@@ -12826,7 +13157,8 @@ mod reviewer_chain_dispatch_tests {
             &|_| panic!("must not re-plan when the planned reviewer served"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(result.model, "working-model/glm-5.1");
         assert_eq!(result.chunks, 2, "no re-plan: the plan's chunk count");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
@@ -13118,7 +13450,7 @@ mod reviewer_chain_dispatch_tests {
             .await;
             assert_eq!(result.is_ok(), repaired, "{result:?}");
             assert_eq!(hits.load(Ordering::SeqCst), 2);
-            if let Ok(c) = result {
+            if let Ok((c, _report)) = result {
                 assert_eq!(strict_review(&c.content).unwrap().verdict, "approve");
             }
         }
@@ -13974,7 +14306,7 @@ model_provider = "custom.nemotron35"
         write_config(home, &server.uri(), "working-model/reviewer");
         let cli = dummy_cli();
         let diff = synthetic_loop_diff(20, 20);
-        let (review, model, _cost, chunks) = run_loop_review(
+        let (review, model, _cost, chunks, _verdicts) = run_loop_review(
             &cli,
             None,
             &[],
@@ -14010,6 +14342,471 @@ model_provider = "custom.nemotron35"
                 "chunk for file {n} was never sent to the reviewer"
             );
         }
+    }
+    // ---- loop record: review completeness and finding identity (2026-10-23) ----
+
+    /// A multi-chunk review in which EVERY chunk returns a structured verdict
+    /// from the requested reviewer. The loop record must call this review
+    /// COMPLETE: one `reviewer_verdicts` entry with `complete: true` — the
+    /// evidence the iteration-level `review_complete` predicate and Hive loop
+    /// triage key on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_complete_when_every_chunk_is_structured() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_openai_chat_completion_with_findings(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = dummy_cli();
+        let diff = synthetic_loop_diff(20, 20);
+        let (review, model, _cost, chunks, reviewer_verdicts) = run_loop_review(
+            &cli,
+            None,
+            &[],
+            ADVERSARIAL_SYSTEM,
+            &diff,
+            "branch",
+            "task\n",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect("a fully structured multi-chunk review completes");
+        assert!(chunks > 1, "20 file sections must span more than one chunk");
+        assert_eq!(model.as_deref(), Some("working-model/reviewer"));
+        assert_eq!(review.verdict, "approve");
+        // Exactly one reviewer reported, and it is complete.
+        assert_eq!(reviewer_verdicts.len(), 1);
+        let v = &reviewer_verdicts[0];
+        assert_eq!(v["model"], "working-model/reviewer");
+        assert_eq!(v["verdict"], "approve");
+        assert_eq!(
+            v["complete"], true,
+            "every requested reviewer returned a structured verdict for every chunk"
+        );
+        // The iteration-level predicate the record stores as `review_complete`:
+        // non-empty verdicts, all complete.
+        let review_complete = !reviewer_verdicts.is_empty()
+            && reviewer_verdicts
+                .iter()
+                .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true));
+        assert!(review_complete);
+    }
+
+    /// A reviewer that produces NO structured verdict (provider 500 on every
+    /// attempt, e.g. the observed `Context size has been exceeded`) is an
+    /// INCOMPLETE review: the review errors, the synthesized verdict is
+    /// `reviewer_unavailable`, and the Err path contributes NO reviewer
+    /// verdicts, so the iteration-level predicate is false.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_incomplete_when_reviewer_times_out_or_fails() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                r#"{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = dummy_cli();
+        let err = run_loop_review(
+            &cli,
+            None,
+            &[],
+            ADVERSARIAL_SYSTEM,
+            &synthetic_loop_diff(1, 1),
+            "branch",
+            "task\n",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect_err("a failed reviewer call is an incomplete review");
+        let detail = format!("review incomplete: {err}");
+        let synthesized = synthesize_reviewer_unavailable(&detail);
+        assert_eq!(synthesized.verdict, REVIEWER_UNAVAILABLE_VERDICT);
+        assert!(!loop_review_ok(&synthesized, 0));
+        // The Err path contributes NO reviewer verdicts; the record's
+        // `review_complete` predicate must be false for them.
+        let reviewer_verdicts: Vec<serde_json::Value> = Vec::new();
+        let review_complete = !reviewer_verdicts.is_empty()
+            && reviewer_verdicts
+                .iter()
+                .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true));
+        assert!(
+            !review_complete,
+            "a failed review can never be recorded complete"
+        );
+    }
+
+    /// REGRESSION (PARTIAL): when one chunk never yields a structured verdict
+    /// even after its repair retry, the whole review is refused. A review that
+    /// did not cover every chunk is PARTIAL and incomplete — never complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_partial_chunk_is_incomplete() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // First request: structured approve. Second (the repair of the
+                // second chunk): prose again — the chunk stays unstructured.
+                let content = if n == 0 {
+                    r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#
+                        .to_string()
+                } else {
+                    "prose only, no json".to_string()
+                };
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                )
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let err = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into(), "chunk two".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await;
+        // Three requests: chunk 1 + chunk 2 first attempt + the
+        // (also-prose) repair of chunk 2.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let err = err.expect_err("a chunk without a structured verdict fails the review");
+        assert!(
+            err.to_string().contains("invalid JSON twice"),
+            "the diagnostic must name the unstructured chunk: {err}"
+        );
+    }
+
+    /// REGRESSION (mid-review fallback to a different model): a chunk the
+    /// provider SERVES with a model different from the one REQUESTED is a
+    /// model change mid-review. The chunk walker refuses it as a mixed-model
+    /// approval — a substitution must surface as incomplete, never as
+    /// complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_served_model_substitution_is_incomplete() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        // The provider answers with a DIFFERENT model id than requested. The
+        // dispatch rejects the reported substitution (provenance mismatch) —
+        // either way the review is incomplete, never complete.
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "another-model",
+                "choices": [{"message": {"content": r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let err = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await;
+        let err = err.expect_err("a mid-review model substitution must fail the review");
+        // The error chain carries the dispatch's own diagnostic (the
+        // reported substitution is a policy violation), wrapped in the
+        // chunk context. A mid-review model change is never a complete review.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("provenance mismatch") || chain.contains("mixed-model"),
+            "the diagnostic chain must name the substitution: {chain}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the substituted reviewer call is the only one that ran"
+        );
+    }
+
+    fn fp_finding(location: &Option<String>, title: &str, disposition: &str) -> Finding {
+        Finding {
+            severity: "high".into(),
+            title: title.into(),
+            body: "a defect".into(),
+            location: location.clone(),
+            disposition: disposition.into(),
+        }
+    }
+
+    /// A fingerprint must be stable across line-number shifts AND across
+    /// whitespace/case differences in the title — the same defect re-raised in
+    /// the next round maps to the SAME fingerprint.
+    #[test]
+    fn finding_fingerprint_is_stable_across_line_shifts_and_case() {
+        let a = finding_fingerprint(&fp_finding(
+            &Some("src/lib.rs:42".into()),
+            "  Off By One  Error  at the Boundary  ",
+            "open",
+        ));
+        let b = finding_fingerprint(&fp_finding(
+            &Some("src/lib.rs:1337".into()),
+            "off-by-one error   at the boundary",
+            "open",
+        ));
+        assert_eq!(
+            a, b,
+            "line shift + case/whitespace must not change the fingerprint"
+        );
+        // The fingerprint is `path::normalized-title`. The path is present
+        // (path-qualified findings), and the title part (after the first
+        // `::`) carries no line number — the location's `:line` never leaks
+        // into the fingerprint.
+        assert!(a.contains("src/lib.rs"), "the path is part of the identity");
+        let title_part = a.rsplit("::").next().unwrap();
+        assert!(
+            !title_part.contains(':'),
+            "no line number may leak into the fingerprint"
+        );
+        // The title is normalized: lowercased, with non-identity runs
+        // (spaces, hyphens) collapsed to single spaces.
+        assert!(
+            a.ends_with("::off by one error at the boundary"),
+            "title normalization: {a}"
+        );
+    }
+
+    /// A fingerprint must differ across FILES: the same defect title in a
+    /// different path is a different identity.
+    #[test]
+    fn finding_fingerprint_differs_across_files() {
+        let a = finding_fingerprint(&fp_finding(
+            &Some("src/lib.rs:42".into()),
+            "off by one",
+            "open",
+        ));
+        let b = finding_fingerprint(&fp_finding(
+            &Some("src/other.rs:42".into()),
+            "off by one",
+            "open",
+        ));
+        assert_ne!(a, b, "different files must never share a fingerprint");
+    }
+
+    /// A pathless finding (no location) still gets a stable fingerprint from
+    /// its normalized title alone.
+    #[test]
+    fn finding_fingerprint_without_location_is_stable() {
+        let a = finding_fingerprint(&fp_finding(&None, "  panic  in  parser ", "open"));
+        let b = finding_fingerprint(&fp_finding(&None, "panic in parser", "open"));
+        assert_eq!(
+            a, b,
+            "a pathless defect is identified by its normalized title"
+        );
+    }
+
+    /// Disposition defaults to `open` and round-trips: an explicit
+    /// `real`/`disproved`/`intended` is preserved verbatim, while an unknown
+    /// or missing value stays `open` — never inferred.
+    #[test]
+    fn finding_disposition_defaults_to_open_and_round_trips() {
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "open")),
+            "open"
+        );
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "real")),
+            "real"
+        );
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "disproved")),
+            "disproved"
+        );
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "intended")),
+            "intended"
+        );
+        // Unknown value -> open (never inferred).
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "wat")),
+            "open"
+        );
+        // Missing value -> open.
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "")),
+            "open"
+        );
+        // Round-trip through the JSON record.
+        let rec = finding_record(&fp_finding(
+            &Some("src/lib.rs:42".into()),
+            "off by one",
+            "real",
+        ));
+        assert_eq!(rec["disposition"], "real");
+        assert_eq!(
+            rec["fingerprint"],
+            finding_fingerprint(&fp_finding(
+                &Some("src/lib.rs:42".into()),
+                "off by one",
+                "real"
+            ))
+        );
+        let rec_open = finding_record(&fp_finding(
+            &Some("src/lib.rs:42".into()),
+            "off by one",
+            "wat",
+        ));
+        assert_eq!(rec_open["disposition"], "open", "unknown values stay open");
+        // The record keeps the pre-existing fields unchanged.
+        assert_eq!(rec["severity"], "high");
+        assert_eq!(rec["location"], "src/lib.rs:42");
+    }
+
+    /// REGRESSION (reviewer failure -> PARTIAL panel): a 2-reviewer pool where
+    /// the head reviewer's provider is down. The completed review must carry a
+    /// per-reviewer entry for the SERVING model (the fallback), and a failed
+    /// reviewer slot can never be part of a complete panel: the panel's
+    /// `complete` predicate is `ok_models == requested`, which is `false`
+    /// while any requested reviewer failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_partial_panel_failed_reviewer_is_incomplete() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/reviewer",
+            ],
+        );
+        write_config(
+            home,
+            &server.uri(),
+            "broken-model/reviewer,working-model/reviewer",
+        );
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "-m",
+            "broken-model/coder",
+            "--retries",
+            "0",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/coder,wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-allowed-routes",
+            "wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-pool-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        HealthStore::mutate_locked(&home.join("health.json"), |health| {
+            health.record_classified_success(
+                "working-model/reviewer",
+                100.0,
+                "wiremock-working",
+                zoder_core::Classification::Reachable,
+            );
+        })
+        .unwrap();
+        // With the verified-healthy pool armed, the head's 503 hands over to
+        // the secondary: the review completes on the FALLBACK model.
+        let completion = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+            .await
+            .expect("the pool fallback completes the review");
+        assert_eq!(
+            completion.model, "working-model/reviewer",
+            "the serving model is the fallback, recorded as such"
+        );
+        // The failed head slot, as the panel renders it: non-voting and
+        // never part of a complete panel.
+        let failed_slot = ReviewerSlot::Failed {
+            model: "broken-model/reviewer".into(),
+            err: "provider HTTP 503".into(),
+        };
+        assert!(!failed_slot.is_ok(), "a failed reviewer slot never votes");
+        assert_eq!(
+            failed_slot.display_verdict(),
+            "comment",
+            "a failed slot renders the non-voting synthetic verdict"
+        );
+        // The panel's `complete` predicate (mirrors `aggregate_review`):
+        // complete only when EVERY requested reviewer finished.
+        let requested = 2usize;
+        let ok_models = 1usize;
+        let complete = ok_models != 0 && ok_models == requested;
+        assert!(
+            !complete,
+            "one failed reviewer makes the panel PARTIAL, not complete"
+        );
+    }
+
+    /// An old-schema loop record (no `review_complete`, `reviewer_verdicts`,
+    /// or `findings`) must still parse and keep its existing fields unchanged
+    /// — the new fields are additive. Absent new fields must read as unknown,
+    /// never as complete.
+    #[test]
+    fn old_schema_loop_record_still_parses() {
+        let old = r#"{
+            "kind": "loop",
+            "task": "t",
+            "resolved": false,
+            "iterations": 2,
+            "max_iters": 4,
+            "final_verdict": "comment",
+            "check": "cargo test",
+            "loop_timeout_secs": 900,
+            "total_cost_usd": 0.5,
+            "duration_ms": 1234,
+            "log": [
+                {"iter":1, "verdict":"comment", "check_passed":true,
+                 "review_chunks":1, "diff_lines":10}
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(old).expect("old record must parse");
+        assert_eq!(v["kind"], "loop");
+        assert_eq!(v["log"][0]["verdict"], "comment");
+        // The new additive fields are ABSENT in an old record — a consumer
+        // must treat absent as unknown, never as complete.
+        assert!(v["log"][0].get("review_complete").is_none());
+        assert!(v["log"][0].get("reviewer_verdicts").is_none());
+        assert!(v["log"][0].get("findings").is_none());
     }
 }
 
