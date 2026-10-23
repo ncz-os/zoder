@@ -140,6 +140,12 @@ old-schema record still parses with the new fields absent.
   iteration's `review_complete` is `true` iff the array is non-empty and
   every entry is `complete: true`. Model identity in the underlying report
   is `null` (absent), never an empty string, when no chunk completed.
+  Enforcement has two layers: the dispatch refuses a chunk whose reported
+  served model differs from the requested one (provenance mismatch), and
+  the chunk walker itself bails when a chunk is served by a model different
+  from the one that pinned the review (mixed-model approval). A mixed-model
+  review therefore never returns `Ok` — it is always `review_complete:
+  false`.
 * **`findings` (array, per iteration and at the top level for the last
   iteration).** Each finding carries its existing fields (`severity`,
   `title`, `body`, `location`) plus two new ones:
