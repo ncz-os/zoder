@@ -1888,16 +1888,19 @@ struct Finding {
     /// Explicitly recorded disposition: `open | real | disproved | intended`.
     /// Only a value an author or reviewer wrote into the review payload sets
     /// a non-`open` disposition — it is NEVER inferred from severity,
-    /// verdict, or prose. An absent or unrecognized value keeps the default
-    /// `open` (see [`Finding::disposition_or_default`]).
+    /// verdict, or prose. An absent, empty, or unrecognized value keeps the
+    /// default `open` (see [`Finding::disposition_or_default`]).
     #[serde(default)]
     disposition: String,
 }
 
 impl Finding {
-    /// The disposition this finding carries for the loop record. Unknown and
-    /// missing values stay the default `open`; no caller may derive a
-    /// disposition from anything but this recorded string.
+    /// The disposition this finding carries for the loop record: the exact
+    /// EXPLICIT value an author or reviewer recorded (`open`, `real`,
+    /// `disproved`, or `intended` — `open` accepted case-insensitively), or
+    /// the default `open` for anything else. An unknown, unrecognized, or
+    /// MISSING value never becomes a non-`open` disposition: no caller may
+    /// derive one from severity, verdict, or prose.
     pub(crate) fn disposition_or_default(&self) -> &str {
         match self.disposition.as_str() {
             "real" | "disproved" | "intended" => self.disposition.as_str(),
@@ -5415,28 +5418,34 @@ fn finding_location_path(location: &Option<String>) -> String {
 
 /// Stable identity for a finding: normalized file path + normalized title.
 ///
-/// The title is lowercased and every run of non-identity characters
-/// (whitespace, hyphens, punctuation) is collapsed to a single space — so
-/// case, spacing, and hyphenation do not change the fingerprint. The location
-/// contributes ONLY its path, never its line number, so the same defect
-/// re-raised after line shifts maps to the same fingerprint. Two different
-/// files never share a fingerprint for the same title.
+/// The title is lowercased and every run of WHITESPACE or HYPHEN characters
+/// is collapsed to a single space — so case, spacing, and hyphenation do not
+/// change the fingerprint. All other punctuation is PRESERVED (and
+/// lowercased): technical identifiers that are part of the title — error
+/// codes like `E432:`, paths like `/user`, variable names with `.` or `::`
+/// — carry identity and must not be collapsed away. The location contributes
+/// ONLY its path, never its line number, so the same defect re-raised after
+/// line shifts maps to the same fingerprint. Two different files never share
+/// a fingerprint for the same title.
 fn finding_fingerprint(f: &Finding) -> String {
     let path = finding_location_path(&f.location);
-    // Lowercase, then collapse every run of characters that carry no
-    // identity (whitespace, hyphens, punctuation) to a single space. A title
-    // re-raised as "off by one error" vs "off-by-one   Error" is the same
-    // defect and maps to the same fingerprint.
+    // Lowercase, then collapse runs of whitespace or hyphens to a single
+    // space. A title re-raised as "off by one error" vs "off-by-one   Error"
+    // is the same defect and maps to the same fingerprint, while
+    // "Error in API: /user" vs "Error in API - user" do NOT collide (the
+    // colon/path carry identity).
     let lowered = f.title.to_lowercase();
     let mut title = String::new();
     let mut last_space = true;
     for c in lowered.chars() {
-        if c.is_alphanumeric() || c == '_' {
+        if c.is_whitespace() || c == '-' {
+            if !last_space {
+                title.push(' ');
+                last_space = true;
+            }
+        } else {
             title.push(c);
             last_space = false;
-        } else if !last_space {
-            title.push(' ');
-            last_space = true;
         }
     }
     format!("{path}::{}", title.trim())
@@ -14633,6 +14642,36 @@ model_provider = "custom.nemotron35"
         );
     }
 
+    /// Normalization must NOT over-collapse: technical identifiers that are
+    /// part of the title (paths, error codes, punctuation) carry identity.
+    /// "Error in API: /user" and "Error in API - user" are DIFFERENT defects
+    /// (a path vs a separator) and must NOT collide, even though both are
+    /// lowercased/whitespace-normalized.
+    #[test]
+    fn finding_fingerprint_preserves_identity_punctuation() {
+        let a = finding_fingerprint(&fp_finding(&None, "Error in API: /user", "open"));
+        let b = finding_fingerprint(&fp_finding(&None, "Error in API - user", "open"));
+        assert_ne!(
+            a, b,
+            "punctuation that carries identity must not be collapsed away: {a} vs {b}"
+        );
+        // The colon+path survives normalization.
+        assert!(a.contains("api: /user"), "the path must survive: {a}");
+        // Whitespace/case normalization still applies to the words.
+        let c = finding_fingerprint(&fp_finding(&None, "  error   in API:  /user ", "open"));
+        assert_eq!(
+            a, c,
+            "whitespace/case around the identity must not matter: {a} vs {c}"
+        );
+        // A hyphen run collapses to a single space (hyphenation is not identity).
+        let d = finding_fingerprint(&fp_finding(&None, "off---by--one", "open"));
+        assert_eq!(
+            d,
+            finding_fingerprint(&fp_finding(&None, "off by one", "open")),
+            "hyphen runs collapse to a single space: {d}"
+        );
+    }
+
     /// Disposition defaults to `open` and round-trips: an explicit
     /// `real`/`disproved`/`intended` is preserved verbatim, while an unknown
     /// or missing value stays `open` — never inferred.
@@ -14659,10 +14698,17 @@ model_provider = "custom.nemotron35"
             finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "wat")),
             "open"
         );
-        // Missing value -> open.
+        // Missing value (empty string, as set by the synthesizers) -> open.
         assert_eq!(
             finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "")),
             "open"
+        );
+        // A finding built via Default (no disposition written at all) -> open.
+        let default_finding = Finding::default();
+        assert_eq!(
+            finding_disposition(&default_finding),
+            "open",
+            "a Default finding must read open, never a non-open inference"
         );
         // Round-trip through the JSON record.
         let rec = finding_record(&fp_finding(
@@ -14685,9 +14731,67 @@ model_provider = "custom.nemotron35"
             "wat",
         ));
         assert_eq!(rec_open["disposition"], "open", "unknown values stay open");
+        // A finding with no recorded disposition (Default) round-trips to
+        // the literal "open" in the record.
+        let rec_default = finding_record(&Finding::default());
+        assert_eq!(
+            rec_default["disposition"], "open",
+            "an absent disposition must round-trip as the literal open"
+        );
         // The record keeps the pre-existing fields unchanged.
         assert_eq!(rec["severity"], "high");
         assert_eq!(rec["location"], "src/lib.rs:42");
+    }
+    /// The fingerprint a REAL reviewer reply produces (parsed from a
+    /// structured JSON verdict) must equal the fingerprint of the same defect
+    /// re-raised in the next round after a line shift — the end-to-end
+    /// contract Hive loop triage relies on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_review_finding_fingerprint_is_stable_end_to_end() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_openai_chat_completion_with_findings(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = dummy_cli();
+        let (review, _model, _cost, _chunks, _verdicts) = run_loop_review(
+            &cli,
+            None,
+            &[],
+            ADVERSARIAL_SYSTEM,
+            &synthetic_loop_diff(1, 1),
+            "branch",
+            "task\n",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect("a single structured chunk completes");
+        assert_eq!(review.findings.len(), 1);
+        let round_one = finding_fingerprint(&review.findings[0]);
+        // The same defect re-raised in the next round: same title (modulo
+        // case/spacing), same file, a different line number.
+        let round_two = Finding {
+            severity: review.findings[0].severity.clone(),
+            title: "off by one error at the boundary".into(),
+            body: String::new(),
+            location: Some("src/lib.rs:599".into()),
+            disposition: String::new(),
+        };
+        let round_two_fp = finding_fingerprint(&round_two);
+        assert_eq!(
+            round_one, round_two_fp,
+            "a re-raised defect must map to the same fingerprint across rounds"
+        );
+        // The disposition of a reviewer finding with no explicit value is
+        // the default open, in both rounds.
+        assert_eq!(finding_disposition(&review.findings[0]), "open");
+        assert_eq!(finding_disposition(&round_two), "open");
     }
 
     /// REGRESSION (reviewer failure -> PARTIAL panel): a 2-reviewer pool where
