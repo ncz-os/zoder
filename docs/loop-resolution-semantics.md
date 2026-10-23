@@ -126,12 +126,19 @@ old-schema record still parses with the new fields absent.
   review errored, `reviewer_verdicts` is absent (empty) and `review_complete`
   is `false`. Downstream triage (Hive's shadow-mode loop triage) keys on this
   field to decide whether a non-converging loop can be judged.
-* **`reviewer_verdicts` (array, per iteration).** One entry per requested
-  reviewer: `{model, verdict, complete}`. `model` is the model that served the
-  review, `verdict` is the aggregated review verdict, and `complete` is the
-  per-reviewer structured-verdict evidence (every chunk structured, same
-  serving model). The iteration's `review_complete` is `true` iff the array is
-  non-empty and every entry is `complete: true`.
+* **`reviewer_verdicts` (array, per iteration).** One entry per reviewed
+  CHUNK of the iteration, in chunk order: `{model, verdict, complete}`.
+  `model` is the model that served the review (a mid-review fallback is
+  refused as a mixed-model approval, so it is the same for every entry),
+  `verdict` is the aggregated review verdict, and `complete` is that chunk's
+  first-attempt structured-verdict evidence — the chunk returned a
+  structured JSON verdict from the serving model on its FIRST attempt,
+  before any repair or re-dispatch. (The loop dispatches one reviewer per
+  review; the entry shape stays per-chunk so the record keeps its contract
+  when the loop ever fans out to a panel.) The iteration's `review_complete`
+  is `true` iff the array is non-empty and every entry is `complete: true`.
+  Model identity in the underlying report is `null` (absent), never an empty
+  string, when no chunk completed.
 * **`findings` (array, per iteration and at the top level for the last
   iteration).** Each finding carries its existing fields (`severity`,
   `title`, `body`, `location`) plus two new ones:
