@@ -1886,24 +1886,29 @@ struct Finding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     location: Option<String>,
     /// Explicitly recorded disposition: `open | real | disproved | intended`.
-    /// Only a value an author or reviewer wrote into the review payload sets
-    /// a non-`open` disposition — it is NEVER inferred from severity,
-    /// verdict, or prose. An absent, empty, or unrecognized value keeps the
-    /// default `open` (see [`Finding::disposition_or_default`]).
-    #[serde(default)]
-    disposition: String,
+    /// `None` means "no disposition was recorded" — an old-schema payload
+    /// (no field) and a missing value both parse to `None` and stay
+    /// ABSENT (skipped) when the record is serialized back out. Only a
+    /// value an author or reviewer wrote into the review payload sets a
+    /// non-`open` disposition; it is NEVER inferred from severity, verdict,
+    /// or prose. The loop record always shows a value: `None`, `""`, or an
+    /// unrecognized string reads as the default `open` (see
+    /// [`Finding::disposition_or_default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition: Option<String>,
 }
 
 impl Finding {
-    /// The disposition this finding carries for the loop record: the exact
-    /// EXPLICIT value an author or reviewer recorded (`open`, `real`,
-    /// `disproved`, or `intended` — `open` accepted case-insensitively), or
-    /// the default `open` for anything else. An unknown, unrecognized, or
-    /// MISSING value never becomes a non-`open` disposition: no caller may
-    /// derive one from severity, verdict, or prose.
+    /// The disposition the loop record shows for a finding: an EXPLICIT
+    /// `real` / `disproved` / `intended` recorded by an author or reviewer,
+    /// or the default `open` for anything else — `None` (absent), `""`
+    /// (empty), or an unrecognized value. No caller may derive a
+    /// disposition from severity, verdict, or prose.
     pub(crate) fn disposition_or_default(&self) -> &str {
-        match self.disposition.as_str() {
-            "real" | "disproved" | "intended" => self.disposition.as_str(),
+        match self.disposition.as_deref() {
+            Some("real") | Some("disproved") | Some("intended") => {
+                self.disposition.as_deref().unwrap()
+            }
             _ => "open",
         }
     }
@@ -2122,7 +2127,7 @@ fn parse_review(raw: &str) -> ReviewOutput {
             title: "unparseable review (fail-closed)".into(),
             body: raw.trim().to_string(),
             location: None,
-            disposition: String::new(),
+            disposition: None,
         }],
         next_steps: vec![],
     }
@@ -2203,7 +2208,7 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
             title: "unparseable review (fail-closed)".into(),
             body: raw.trim().chars().take(8_000).collect(),
             location: None,
-            disposition: String::new(),
+            disposition: None,
         }],
         next_steps: vec![],
     })
@@ -2364,7 +2369,7 @@ fn try_parse_verdict_from_prose(raw: &str) -> Option<ReviewOutput> {
             title: format!("prose review – verdict: {verdict_lower}"),
             body: raw.to_string(),
             location: None,
-            disposition: String::new(),
+            disposition: None,
         }],
         next_steps: vec![],
     })
@@ -5418,33 +5423,45 @@ fn finding_location_path(location: &Option<String>) -> String {
 
 /// Stable identity for a finding: normalized file path + normalized title.
 ///
-/// The title is lowercased and every run of WHITESPACE or HYPHEN characters
-/// is collapsed to a single space — so case, spacing, and hyphenation do not
-/// change the fingerprint. All other punctuation is PRESERVED (and
-/// lowercased): technical identifiers that are part of the title — error
-/// codes like `E432:`, paths like `/user`, variable names with `.` or `::`
-/// — carry identity and must not be collapsed away. The location contributes
-/// ONLY its path, never its line number, so the same defect re-raised after
-/// line shifts maps to the same fingerprint. Two different files never share
-/// a fingerprint for the same title.
+/// The title is lowercased and every run of WHITESPACE is collapsed to a
+/// single space. Hyphens are the one ambiguous separator and are handled
+/// positionally: a hyphen BETWEEN two identifier characters (e.g.
+/// `off-by-one`, a kebab-case token, `api-v1`) is PRESERVED — it carries
+/// identity — while a hyphen that is not between two alphanumeric/underscore
+/// characters (i.e. a formatting dash, possibly padded with whitespace,
+/// like "Error in API - user") is collapsed away. All other punctuation is
+/// preserved as-is (lowercased): error codes like `E432:`, paths like
+/// `/user`, variable names with `.` or `::` keep their identity. The
+/// location contributes ONLY its path, never its line number, so the same
+/// defect re-raised after line shifts maps to the same fingerprint. Two
+/// different files never share a fingerprint for the same title.
 fn finding_fingerprint(f: &Finding) -> String {
     let path = finding_location_path(&f.location);
-    // Lowercase, then collapse runs of whitespace or hyphens to a single
-    // space. A title re-raised as "off by one error" vs "off-by-one   Error"
-    // is the same defect and maps to the same fingerprint, while
-    // "Error in API: /user" vs "Error in API - user" do NOT collide (the
-    // colon/path carry identity).
     let lowered = f.title.to_lowercase();
+    let chars: Vec<char> = lowered.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut title = String::new();
     let mut last_space = true;
-    for c in lowered.chars() {
-        if c.is_whitespace() || c == '-' {
+    for (i, c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            if !last_space {
+                title.push(' ');
+                last_space = true;
+            }
+        } else if *c == '-'
+            && (i == 0
+                || i == chars.len() - 1
+                || !is_ident(chars[i - 1])
+                || !is_ident(chars[i + 1]))
+        {
+            // A formatting dash (not flanked by identifier characters on
+            // both sides) carries no identity — treat it like whitespace.
             if !last_space {
                 title.push(' ');
                 last_space = true;
             }
         } else {
-            title.push(c);
+            title.push(*c);
             last_space = false;
         }
     }
@@ -5573,7 +5590,7 @@ loop stays unresolved (reviewer_unavailable)."
             title: "reviewer_unavailable (prose-only output)".into(),
             body: prose.chars().take(8_000).collect(),
             location: None,
-            disposition: String::new(),
+            disposition: None,
         }],
         next_steps: vec![],
     }
@@ -8394,7 +8411,7 @@ mod tests {
             title: "defect".into(),
             body: "code body that must not reach the ledger".into(),
             location: Some("crates/zoder-cli/src/agentic.rs:42".into()),
-            disposition: String::new(),
+            disposition: None,
         }
     }
 
@@ -8404,7 +8421,7 @@ mod tests {
             title: "defect".into(),
             body: "code body".into(),
             location: None,
-            disposition: String::new(),
+            disposition: None,
         }
     }
 
@@ -8597,7 +8614,7 @@ mod tests {
                 title: format!("finding {i} {}", "x".repeat(200)),
                 body: "y".repeat(500),
                 location: Some(format!("src/file{i}.rs:{}", i + 1)),
-                disposition: String::new(),
+                disposition: None,
             })
             .collect();
         let bounded = bounded_located_findings(&many, Some("reviewer-y"));
@@ -11131,7 +11148,7 @@ mod loop_resolution_tests {
                 title: "real concern".into(),
                 body: "reviewer raised a high-severity issue".into(),
                 location: Some("src/lib.rs:42".into()),
-                disposition: String::new(),
+                disposition: None,
             }],
             next_steps: vec![],
         };
@@ -14572,7 +14589,13 @@ model_provider = "custom.nemotron35"
             title: title.into(),
             body: "a defect".into(),
             location: location.clone(),
-            disposition: disposition.into(),
+            // `""` models "no recorded disposition" (None); everything else
+            // is an explicit recorded value.
+            disposition: if disposition.is_empty() {
+                None
+            } else {
+                Some(disposition.into())
+            },
         }
     }
 
@@ -14588,7 +14611,7 @@ model_provider = "custom.nemotron35"
         ));
         let b = finding_fingerprint(&fp_finding(
             &Some("src/lib.rs:1337".into()),
-            "off-by-one error   at the boundary",
+            "off by one error   at the boundary",
             "open",
         ));
         assert_eq!(
@@ -14663,12 +14686,26 @@ model_provider = "custom.nemotron35"
             a, c,
             "whitespace/case around the identity must not matter: {a} vs {c}"
         );
-        // A hyphen run collapses to a single space (hyphenation is not identity).
-        let d = finding_fingerprint(&fp_finding(&None, "off---by--one", "open"));
+        // A formatting dash (a hyphen not between two identifier characters,
+        // even when padded with whitespace) collapses to a space.
+        let d = finding_fingerprint(&fp_finding(&None, "Error in API - user", "open"));
+        let d2 = finding_fingerprint(&fp_finding(&None, "Error in API  -   user", "open"));
+        assert_eq!(d, d2, "padding around a formatting dash must not matter");
+        // But a hyphen BETWEEN identifier characters is identity: a
+        // kebab-case token stays intact and does NOT collide with its
+        // spaced variant.
+        let e = finding_fingerprint(&fp_finding(&None, "off-by-one", "open"));
         assert_eq!(
-            d,
-            finding_fingerprint(&fp_finding(&None, "off by one", "open")),
-            "hyphen runs collapse to a single space: {d}"
+            e, "::off-by-one",
+            "a kebab-case token keeps its hyphens: {e}"
+        );
+        // ...and so a kebab-case identifier does NOT collide with its spaced
+        // form: "api-v1" and "api v1" are distinct identities.
+        let f = finding_fingerprint(&fp_finding(&None, "api-v1", "open"));
+        let g = finding_fingerprint(&fp_finding(&None, "api v1", "open"));
+        assert_ne!(
+            f, g,
+            "a kebab-case identifier must not collide with its spaced form: {f} vs {g}"
         );
     }
 
@@ -14698,7 +14735,7 @@ model_provider = "custom.nemotron35"
             finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "wat")),
             "open"
         );
-        // Missing value (empty string, as set by the synthesizers) -> open.
+        // Missing value (None — what an old-schema payload parses to) -> open.
         assert_eq!(
             finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "")),
             "open"
@@ -14709,6 +14746,12 @@ model_provider = "custom.nemotron35"
             finding_disposition(&default_finding),
             "open",
             "a Default finding must read open, never a non-open inference"
+        );
+        // An explicit recorded "open" round-trips to the same value.
+        assert_eq!(
+            finding_disposition(&fp_finding(&Some("src/lib.rs:1".into()), "d", "Open")),
+            "open",
+            "an explicit open is accepted (case-insensitively) and stays open"
         );
         // Round-trip through the JSON record.
         let rec = finding_record(&fp_finding(
@@ -14741,6 +14784,54 @@ model_provider = "custom.nemotron35"
         // The record keeps the pre-existing fields unchanged.
         assert_eq!(rec["severity"], "high");
         assert_eq!(rec["location"], "src/lib.rs:42");
+    }
+
+    /// An EXPLICIT but EMPTY recorded disposition (some payloads carry
+    /// `"disposition": ""`) must not be silently dropped: it is a recorded
+    /// value that round-trips verbatim, and it reads as the default `open`
+    /// in the loop record.
+    #[test]
+    fn empty_recorded_disposition_round_trips_verbatim() {
+        let json =
+            r#"{"severity":"high","title":"t","body":"b","location":"a.rs:1","disposition":""}"#;
+        let f: Finding = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            f.disposition.as_deref(),
+            Some(""),
+            "an explicit empty value is recorded, not dropped"
+        );
+        let re = serde_json::to_value(&f).unwrap();
+        assert_eq!(
+            re["disposition"], "",
+            "the empty recorded value must round-trip verbatim, not become absent"
+        );
+        assert_eq!(f.disposition_or_default(), "open");
+    }
+
+    /// An OLD-SCHEMA finding (no `disposition` field at all) must still
+    /// parse, the field must stay ABSENT (None) on re-serialization — never
+    /// fabricated as an empty string — and the loop record must show the
+    /// default `open`.
+    #[test]
+    fn old_schema_finding_parses_and_stays_absent_on_round_trip() {
+        let old_json =
+            r#"{"severity":"high","title":"off by one","body":"b","location":"src/lib.rs:42"}"#;
+        let f: Finding = serde_json::from_str(old_json).expect("old-schema finding parses");
+        assert!(
+            f.disposition.is_none(),
+            "a missing disposition must stay absent (None), not an empty string"
+        );
+        assert_eq!(f.disposition_or_default(), "open");
+        // Re-serialized: the field is omitted, not `"disposition": ""`.
+        let re = serde_json::to_value(&f).unwrap();
+        assert!(
+            re.get("disposition").is_none(),
+            "an unrecorded disposition must be skipped on serialization: {re}"
+        );
+        // ...but the loop record (which must always show a value) is open.
+        let rec = finding_record(&f);
+        assert_eq!(rec["disposition"], "open");
+        assert_eq!(rec["title"], "off by one");
     }
     /// The fingerprint a REAL reviewer reply produces (parsed from a
     /// structured JSON verdict) must equal the fingerprint of the same defect
@@ -14781,7 +14872,7 @@ model_provider = "custom.nemotron35"
             title: "off by one error at the boundary".into(),
             body: String::new(),
             location: Some("src/lib.rs:599".into()),
-            disposition: String::new(),
+            disposition: None,
         };
         let round_two_fp = finding_fingerprint(&round_two);
         assert_eq!(

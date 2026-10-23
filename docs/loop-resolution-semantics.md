@@ -137,19 +137,25 @@ old-schema record still parses with the new fields absent.
   `title`, `body`, `location`) plus two new ones:
   * `fingerprint` — a stable string: the finding's normalized file path (the
     path part of its `location`; a pathless finding uses no path) plus its
-    normalized title (lowercased; runs of whitespace AND hyphens collapsed to
-    a single space; all other punctuation preserved). The same defect
-    re-raised in the next round — after line shifts, case changes, extra
-    spacing, or re-hyphenation — maps to the same fingerprint; the same title
-    in a different file does not. Punctuation that carries identity (a `/`
-    in a path, a `:` before a line, an error code) is NOT collapsed, so two
-    distinct technical titles cannot collide.
+    normalized title: lowercased, runs of whitespace collapsed to a single
+    space, and every OTHER character preserved — including hyphens inside
+    identifiers (`off-by-one` keeps its hyphens). A dash that is not between
+    two identifier characters (a formatting separator, e.g. "Error in API -
+    user") is treated as whitespace. The same defect re-raised in the next
+    round — after line shifts, case changes, or extra spacing — maps to the
+    same fingerprint; the same title in a different file does not.
+    Punctuation that carries identity (a `/` in a path, a `:` before a line,
+    an error code, a kebab-case token) is NOT collapsed, so two distinct
+    technical titles cannot collide.
   * `disposition` — one of `open | real | disproved | intended`, default
     `open`. Only an EXPLICIT value recorded by an author or reviewer in the
-    review payload sets a non-`open` disposition; an unknown, empty, or
-    missing value stays `open` (the record always carries the literal
-    `open`, never an absence). zoder never infers a disposition from
-    severity, verdict, or prose.
+    review payload sets a non-`open` disposition; an unknown or missing value
+    stays `open` (the record always carries the literal `open`, never an
+    absence). zoder never infers a disposition from severity, verdict, or
+    prose. The underlying finding field is optional: a record parsed from an
+    old-schema payload (no field) keeps the disposition ABSENT, never
+    fabricated as an empty string, while the loop record still shows the
+    default `open`.
 
 The human (non-`--json`) summary now prints the per-iteration finding count
 and a `review=complete|INCOMPLETE|unknown` marker alongside the existing
