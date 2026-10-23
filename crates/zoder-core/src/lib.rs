@@ -44,8 +44,9 @@ pub use acp_client::{
     agents_status, cancel_session, fetch_engine_config, fetch_quickstart_diagnostics, list_agents,
     new_session, probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call,
     wait_for_socket, write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent,
-    AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy,
-    DaemonReadiness, EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
+    AgentIdleTimeout, AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult,
+    AgentsStatusResult, ApprovalPolicy, DaemonReadiness, EngineKind, GooseProviderEnv,
+    WriteToolMatrixRow, DEFAULT_AGENT_IDLE_TIMEOUT_S, DEFAULT_AUTO_APPROVE, IDLE_TIMEOUT_OUTCOME,
 };
 /// Settle budget the loop grants the daemon to ACK a `session/cancel` after
 /// the author-phase watchdog fires (see `cancel_session`). Canonical value
@@ -53,6 +54,15 @@ pub use acp_client::{
 /// wire-shape tests so a change here is exercised by the test that guards
 /// the loop's `build_diff` ordering.
 pub const CANCEL_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// ACP idle watchdog window from the environment (`ZODER_AGENT_IDLE_S`).
+/// `None` when unset or unparseable; an explicit `0` is honored by the
+/// resolver (`agent_idle_timeout_s`) as "disabled".
+pub fn agent_idle_timeout_s_from_env() -> Option<u64> {
+    std::env::var("ZODER_AGENT_IDLE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use catalog_models::{
     fetch_catalog_models, merge_into_corpus, merge_or_degrade, CatalogModel, CatalogResponse,
