@@ -909,30 +909,32 @@ unbound, or missing imports:\n{context}"
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
-    // The per-reviewer view for the loop record: model, verdict, and
-    // `complete` = every chunk of this review produced a structured verdict
-    // from the serving model on its first attempt. `run_loop_review` only
-    // returns `Ok` when every chunk did, so this is `true` here; the shape
-    // stays per-reviewer so the record keeps its contract when the loop ever
-    // fans out to a panel.
-    // On every Ok return path `served_model` is Some (a successful call
-    // completed at least one chunk, and an empty chunk list is impossible —
-    // an empty plan is rejected before dispatch). `unwrap_or_default` here
-    // is unreachable; it only keeps the borrow checker happy without a
-    // second error path for a state that cannot occur.
-    let reviewer_verdicts: Vec<serde_json::Value> = reviewer_report
-        .chunks
-        .iter()
-        .map(|c| {
-            let complete = c.structured
-                && c.served_model == reviewer_report.served_model.clone().unwrap_or_default();
-            json!({
-                "model": reviewer_report.served_model.clone().unwrap_or_default(),
-                "verdict": review.verdict,
-                "complete": complete,
-            })
-        })
-        .collect();
+    // The per-REVIEWER view for the loop record: one entry for this review's
+    // reviewer (the loop dispatches one reviewer per review; the shape stays
+    // a list so the record keeps its contract when the loop ever fans out to
+    // a panel). `model` is the model that served the review; `verdict` is the
+    // aggregated verdict; `complete` = every chunk returned a STRUCTURED
+    // verdict on its FIRST attempt AND was served by the model that was
+    // REQUESTED for it (a mid-review fallback to a different model is
+    // incomplete, never complete). `complete_review_chunks` already bails on
+    // any chunk served by a different model, so a mixed-model review can
+    // never reach this code as `Ok` — the check is the record's own
+    // self-contained evidence, not a trust in the bail.
+    // On every Ok return path both model identities are `Some` (a successful
+    // call completed at least one chunk, which pinned them; an empty plan is
+    // rejected before dispatch). The `unwrap_or_default` below is therefore
+    // unreachable — it only keeps the borrow checker happy without a second
+    // error path for a state that cannot occur.
+    let chunk_complete = !reviewer_report.chunks.is_empty()
+        && reviewer_report
+            .chunks
+            .iter()
+            .all(|c| c.structured && c.served_model == c.requested_model);
+    let reviewer_verdicts = vec![json!({
+        "model": reviewer_report.served_model.clone().unwrap_or_default(),
+        "verdict": review.verdict,
+        "complete": chunk_complete,
+    })];
     Ok((
         review,
         Some(completion.model),
@@ -14431,9 +14433,10 @@ model_provider = "custom.nemotron35"
     }
     // ---- loop record: review completeness and finding identity (2026-10-23) ----
 
-    /// A multi-chunk review in which EVERY chunk returns a structured verdict
-    /// from the requested reviewer. The loop record must call this review
-    /// COMPLETE: one `reviewer_verdicts` entry with `complete: true` — the
+    /// A complete review in which EVERY chunk (a 3-of-3-style review: all
+    /// chunks structured, from the requested reviewer) returns a structured
+    /// verdict. The loop record must call this review COMPLETE: one
+    /// `reviewer_verdicts` entry per reviewer with `complete: true` — the
     /// evidence the iteration-level `review_complete` predicate and Hive loop
     /// triage key on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14446,7 +14449,7 @@ model_provider = "custom.nemotron35"
         write_corpus(home, &["working-model/reviewer"]);
         write_config(home, &server.uri(), "working-model/reviewer");
         let cli = dummy_cli();
-        let diff = synthetic_loop_diff(20, 20);
+        let diff = synthetic_loop_diff(20, 100);
         let (review, model, _cost, chunks, reviewer_verdicts) = run_loop_review(
             &cli,
             None,
@@ -14463,24 +14466,27 @@ model_provider = "custom.nemotron35"
         )
         .await
         .expect("a fully structured multi-chunk review completes");
-        assert!(chunks > 1, "20 file sections must span more than one chunk");
+        // 20 file sections span at least 3 chunks: a 3-of-3 (or larger)
+        // structured review.
+        assert!(
+            chunks >= 3,
+            "the review must span at least 3 chunks: {chunks}"
+        );
         assert_eq!(model.as_deref(), Some("working-model/reviewer"));
         assert_eq!(review.verdict, "approve");
-        // One entry per chunk of the review, all complete, all served by the
-        // requested reviewer.
+        // Exactly ONE per-reviewer entry (not one per chunk), complete.
         assert_eq!(
             reviewer_verdicts.len(),
-            chunks,
-            "one verdict entry per reviewed chunk"
+            1,
+            "one entry per reviewer, never one per chunk"
         );
-        for v in &reviewer_verdicts {
-            assert_eq!(v["model"], "working-model/reviewer");
-            assert_eq!(v["verdict"], "approve");
-            assert_eq!(
-                v["complete"], true,
-                "every requested reviewer returned a structured verdict for every chunk"
-            );
-        }
+        let v = &reviewer_verdicts[0];
+        assert_eq!(v["model"], "working-model/reviewer");
+        assert_eq!(v["verdict"], "approve");
+        assert_eq!(
+            v["complete"], true,
+            "every requested reviewer returned a structured verdict for every chunk"
+        );
         // The iteration-level predicate the record stores as `review_complete`:
         // non-empty verdicts, all complete.
         let review_complete = !reviewer_verdicts.is_empty()
