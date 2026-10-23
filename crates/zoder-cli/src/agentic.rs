@@ -3950,27 +3950,19 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 ))?
             }
         };
-        // The served model must be the model that was requested for this
-        // dispatch — a provider-side substitution (`served != requested`) is
-        // a mid-review model change and is incomplete, never complete. It
-        // also must equal the model that served the earlier chunks: a
-        // mid-review fallback to a different model is refused as a
-        // mixed-model approval. The bail IS the incompleteness path, not a
-        // missing record: `run_loop_review` maps this error to the
+        // No `served != requested` check here: `complete_once` dispatches each
+        // candidate with the same id as both the requested and the dispatched
+        // model, so the two can never differ on a returned `Completion`. A
+        // provider-side substitution is refused earlier, inside
+        // `dispatch_reviewer_for_model`, which compares the provider's reported
+        // response model with the requested one (reviewer provenance
+        // mismatch) before any `Completion` is returned. What remains to
+        // enforce at this level is a mid-review FALLBACK to a different
+        // candidate, which the check below catches against the model that
+        // served the earlier chunks. Either way the bail IS the
+        // incompleteness path: `run_loop_review` maps the error to the
         // iteration's `reviewer_unavailable` verdict with `review_error` set
-        // and `review_complete: false` — which is exactly "surface it as
-        // incomplete, never as complete". (The first-attempt chunk record
-        // above already captured `requested_model` for the report; this check
-        // re-reads the field after that capture.)
-        if completion.model != completion.requested_model {
-            anyhow::bail!(
-                "review chunk {}/{} was requested for {} but served by {}; refusing a mixed-model approval",
-                idx + 1,
-                users.len(),
-                completion.requested_model,
-                completion.model
-            );
-        }
+        // and `review_complete: false`.
         // Single model capture AND the canonical mixed-model enforcement,
         // shared by the replanned and non-replanned paths: the first
         // COMPLETED chunk pins the served and requested models; every LATER
