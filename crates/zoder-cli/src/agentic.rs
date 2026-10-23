@@ -5463,10 +5463,40 @@ fn finding_location_path(location: &Option<String>) -> String {
     let Some(loc) = location.as_deref().map(str::trim).filter(|l| !l.is_empty()) else {
         return String::new();
     };
-    // `path:line` — keep the path, drop the trailing line number. A location
-    // with no colon is a bare path.
-    let path = loc.split(':').next().unwrap_or(loc);
+    // `path:line`, `path:line:col` or `path:start-end` — keep the path, drop
+    // the trailing line spec(s). Only a numeric tail is dropped, so a colon
+    // inside the path itself (a drive letter) survives. A location with no
+    // line spec is a bare path.
+    let mut path = loc;
+    for _ in 0..2 {
+        match path.rsplit_once(':') {
+            Some((head, tail)) if is_line_spec(tail) => path = head,
+            _ => break,
+        }
+    }
     path.trim().to_string()
+}
+
+/// A trailing `line`, `Lline`, or `start-end` segment (an empty tail, from a
+/// dangling `path:`, counts too).
+fn is_line_spec(tail: &str) -> bool {
+    let t = tail.trim();
+    let t = t.strip_prefix(['L', 'l']).unwrap_or(t);
+    t.is_empty()
+        || (t.chars().any(|c| c.is_ascii_digit())
+            && t.chars()
+                .all(|c| c.is_ascii_digit() || c == '-' || c == ','))
+}
+
+/// The iteration-level `review_complete` the loop record stores: true only
+/// when there is reviewer evidence and every reviewer verdict is complete.
+/// Empty evidence (review errored or never ran) is absent data, and absent
+/// data stays incomplete.
+fn iteration_review_complete(reviewer_verdicts: &[serde_json::Value]) -> bool {
+    !reviewer_verdicts.is_empty()
+        && reviewer_verdicts
+            .iter()
+            .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 /// Stable identity for a finding: normalized file path + normalized title.
@@ -6977,10 +7007,7 @@ or comment.\n"
             // model approval, which zoder refuses) all surface as `false` —
             // never as complete. Empty `reviewer_verdicts` (review errored or
             // was never run) is absent data, and absent data stays incomplete.
-            "review_complete": !reviewer_verdicts.is_empty()
-                && reviewer_verdicts
-                    .iter()
-                    .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true)),
+            "review_complete": iteration_review_complete(&reviewer_verdicts),
             // `reviewer_verdicts` is an array when a reviewer reported; on
             // the incomplete-Err path it is absent (empty), never a lone
             // `false` that a JSON parser would read as the field's value.
@@ -14506,10 +14533,7 @@ model_provider = "custom.nemotron35"
         );
         // The iteration-level predicate the record stores as `review_complete`:
         // non-empty verdicts, all complete.
-        let review_complete = !reviewer_verdicts.is_empty()
-            && reviewer_verdicts
-                .iter()
-                .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true));
+        let review_complete = iteration_review_complete(&reviewer_verdicts);
         assert!(review_complete);
     }
 
@@ -14557,10 +14581,7 @@ model_provider = "custom.nemotron35"
         // The Err path contributes NO reviewer verdicts; the record's
         // `review_complete` predicate must be false for them.
         let reviewer_verdicts: Vec<serde_json::Value> = Vec::new();
-        let review_complete = !reviewer_verdicts.is_empty()
-            && reviewer_verdicts
-                .iter()
-                .all(|v| v.get("complete").and_then(serde_json::Value::as_bool) == Some(true));
+        let review_complete = iteration_review_complete(&reviewer_verdicts);
         assert!(
             !review_complete,
             "a failed review can never be recorded complete"
@@ -14878,6 +14899,43 @@ model_provider = "custom.nemotron35"
     /// "Error in API: /user" and "Error in API - user" are DIFFERENT defects
     /// (a path vs a separator) and must NOT collide, even though both are
     /// lowercased/whitespace-normalized.
+    /// A location is `path:line`, `path:line:col` or `path:start-end`. Only the
+    /// trailing numeric segment(s) are dropped: a colon inside the path itself
+    /// (a drive letter) must survive.
+    #[test]
+    fn finding_location_path_drops_only_trailing_line_specs() {
+        let p = |s: &str| finding_location_path(&Some(s.to_string()));
+        assert_eq!(p("src/lib.rs:42"), "src/lib.rs");
+        assert_eq!(p("src/lib.rs:42:7"), "src/lib.rs");
+        assert_eq!(p("src/lib.rs:10-20"), "src/lib.rs");
+        assert_eq!(p("src/lib.rs:L42"), "src/lib.rs");
+        assert_eq!(p("src/lib.rs:"), "src/lib.rs");
+        assert_eq!(p("src/lib.rs"), "src/lib.rs");
+        assert_eq!(p("C:\\src\\lib.rs:42"), "C:\\src\\lib.rs");
+        assert_eq!(p("C:\\src\\lib.rs"), "C:\\src\\lib.rs");
+        assert_eq!(p("  src/lib.rs:42  "), "src/lib.rs");
+        assert_eq!(finding_location_path(&None), "");
+        assert_eq!(finding_location_path(&Some("   ".into())), "");
+    }
+
+    /// The iteration-level predicate the loop record stores as
+    /// `review_complete`: absent evidence is incomplete, and every reviewer
+    /// verdict must say `complete: true`.
+    #[test]
+    fn iteration_review_complete_requires_every_verdict_complete() {
+        use serde_json::json;
+        assert!(!iteration_review_complete(&[]));
+        assert!(iteration_review_complete(&[
+            json!({"model": "a", "complete": true}),
+            json!({"model": "b", "complete": true}),
+        ]));
+        assert!(!iteration_review_complete(&[
+            json!({"model": "a", "complete": true}),
+            json!({"model": "b", "complete": false}),
+        ]));
+        assert!(!iteration_review_complete(&[json!({"model": "a"})]));
+    }
+
     #[test]
     fn finding_fingerprint_preserves_identity_punctuation() {
         let a = finding_fingerprint(&fp_finding(&None, "Error in API: /user", "open"));
@@ -15169,13 +15227,21 @@ model_provider = "custom.nemotron35"
             "comment",
             "a failed slot renders the non-voting synthetic verdict"
         );
-        // The panel's `complete` predicate (mirrors `aggregate_review`):
-        // complete only when EVERY requested reviewer finished.
-        let requested = 2usize;
-        let ok_models = 1usize;
-        let complete = ok_models != 0 && ok_models == requested;
-        assert!(
-            !complete,
+        // The real panel aggregation: one reviewer that voted plus the
+        // failed one is PARTIAL, not complete.
+        let voted = ReviewerSlot::Ok {
+            model: "working-model/reviewer".into(),
+            review: ReviewOutput {
+                verdict: "approve".into(),
+                ..ReviewOutput::default()
+            },
+        };
+        let slots = vec![voted, failed_slot];
+        let (_, all_failed, payload) = aggregate_review(&slots, 0.0, 2, 1, 1);
+        assert!(!all_failed);
+        assert_eq!(
+            payload["complete"].as_bool(),
+            Some(false),
             "one failed reviewer makes the panel PARTIAL, not complete"
         );
     }
