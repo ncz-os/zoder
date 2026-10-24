@@ -581,30 +581,10 @@ fn provider_error_is_model_unavailable(
 /// byte-for-byte identical: a `reviewer_model` field with one id yields
 /// a one-element chain, no fallback is available, the original error
 /// message is preserved.
-async fn complete_once(
-    cli: &crate::Cli,
-    model_override: Option<&str>,
-    reviewer_chain: &[String],
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-) -> anyhow::Result<Completion> {
-    complete_once_with_engine_config(
-        cli,
-        model_override,
-        reviewer_chain,
-        system,
-        user,
-        max_tokens,
-        None,
-    )
-    .await
-}
-
-/// [`complete_once`] with an explicit engine-config path.
+/// Run one reviewer completion.
 ///
 /// `engine_config` overrides the `ZEROCLAW_CONFIG_DIR`-derived engine
-/// model registry path. `None` resolves it from the process environment
+/// model registry path; `None` resolves it from the process environment
 /// (production behavior).
 ///
 /// The override is threaded as an explicit parameter so a TEST can point
@@ -614,7 +594,7 @@ async fn complete_once(
 /// and the loser resolves the alias registry from the winner's config —
 /// an intermittent, genuinely confusing failure. See
 /// `crate::child_env` for the wider story.
-async fn complete_once_with_engine_config(
+async fn complete_once(
     cli: &crate::Cli,
     model_override: Option<&str>,
     reviewer_chain: &[String],
@@ -630,12 +610,8 @@ async fn complete_once_with_engine_config(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut candidates = build_reviewer_candidates_with_engine_config(
-        cli,
-        model_override,
-        reviewer_chain,
-        engine_config,
-    )?;
+    let mut candidates =
+        build_reviewer_candidates(cli, model_override, reviewer_chain, engine_config)?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -1009,22 +985,14 @@ unbound, or missing imports:\n{context}"
 /// route a same-family reviewer ahead of a configured cross-family one. The
 /// pure ordering for 1--4 lives in `order_reviewer_candidates` so the
 /// precedence seam is unit-testable without I/O.
-pub(crate) fn build_reviewer_candidates(
-    cli: &crate::Cli,
-    model_override: Option<&str>,
-    reviewer_chain: &[String],
-) -> anyhow::Result<Vec<String>> {
-    build_reviewer_candidates_with_engine_config(cli, model_override, reviewer_chain, None)
-}
-
-/// [`build_reviewer_candidates`] with an explicit engine-config path.
+/// Resolve the ordered reviewer-candidate list for `cli`.
 ///
 /// `engine_config` overrides the `ZEROCLAW_CONFIG_DIR`-derived engine
 /// model registry path; `None` resolves it from the process environment
 /// (production behavior). Threading it explicitly lets a TEST point the
 /// engine at a fixture `config.toml` without mutating the process
 /// environment, which is process-global shared mutable state.
-pub(crate) fn build_reviewer_candidates_with_engine_config(
+pub(crate) fn build_reviewer_candidates(
     cli: &crate::Cli,
     model_override: Option<&str>,
     reviewer_chain: &[String],
@@ -3994,6 +3962,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
             system,
             &user,
             max_tokens,
+            None,
         )
         .await
         .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
@@ -4050,6 +4019,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                     system,
                     &repair_user,
                     reviewer_retry_budget(max_tokens),
+                    None,
                 )
                 .await?;
                 cost_usd += completion.cost_usd;
@@ -12752,7 +12722,7 @@ mod reviewer_chain_dispatch_tests {
             "--reviewer-pool-routes", "wiremock-working=working-model/reviewer",
         ]).unwrap();
         assert_eq!(
-            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            build_reviewer_candidates(&cli, None, &[], None).unwrap(),
             ["broken-model/reviewer"]
         );
         HealthStore::mutate_locked(&home.join("health.json"), |health| {
@@ -12765,16 +12735,16 @@ mod reviewer_chain_dispatch_tests {
         })
         .unwrap();
         assert_eq!(
-            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            build_reviewer_candidates(&cli, None, &[], None).unwrap(),
             ["broken-model/reviewer", "working-model/reviewer"]
         );
         cli.no_fallback = true;
         assert_eq!(
-            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            build_reviewer_candidates(&cli, None, &[], None).unwrap(),
             ["broken-model/reviewer"]
         );
         cli.no_fallback = false;
-        let completion = complete_once(&cli, None, &[], "system", "review", 1024)
+        let completion = complete_once(&cli, None, &[], "system", "review", 1024, None)
             .await
             .unwrap();
         assert_eq!(completion.model, "working-model/reviewer");
@@ -12801,12 +12771,14 @@ mod reviewer_chain_dispatch_tests {
         })
         .unwrap();
         assert_eq!(
-            build_reviewer_candidates(&cli, None, &[]).unwrap(),
+            build_reviewer_candidates(&cli, None, &[], None).unwrap(),
             ["broken-model/reviewer"]
         );
-        assert!(complete_once(&cli, None, &[], "system", "review", 1024)
-            .await
-            .is_err());
+        assert!(
+            complete_once(&cli, None, &[], "system", "review", 1024, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             server
                 .received_requests()
@@ -12820,17 +12792,17 @@ mod reviewer_chain_dispatch_tests {
         );
         cli.reviewer_allowed_routes = cli.allowed_routes.clone();
         cli.reviewer_pool_routes = Some("wiremock-broken=broken-model/coder".into());
-        assert!(build_reviewer_candidates(&cli, None, &[])
+        assert!(build_reviewer_candidates(&cli, None, &[], None)
             .unwrap_err()
             .to_string()
             .contains("author route"));
         cli.reviewer_pool_routes = Some("wiremock-broken=broken-model/reviewer".into());
-        assert!(build_reviewer_candidates(&cli, None, &[])
+        assert!(build_reviewer_candidates(&cli, None, &[], None)
             .unwrap_err()
             .to_string()
             .contains("primary reviewer"));
         cli.reviewer_allowed_routes = None;
-        assert!(build_reviewer_candidates(&cli, None, &[])
+        assert!(build_reviewer_candidates(&cli, None, &[], None)
             .unwrap_err()
             .to_string()
             .contains("requires --reviewer-allowed-routes"));
@@ -12862,10 +12834,10 @@ mod reviewer_chain_dispatch_tests {
         let routes = crate::resolve_chain(&cli, &engine, &HealthStore::default()).unwrap();
         assert_eq!(routes.primary, vec!["broken-model/head"]);
         assert_eq!(
-            build_reviewer_candidates(&cli, None, &routes.reviewer).unwrap(),
+            build_reviewer_candidates(&cli, None, &routes.reviewer, None).unwrap(),
             vec!["working-model/reviewer"]
         );
-        assert!(build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).is_err());
+        assert!(build_reviewer_candidates(&cli, Some("broken-model/head"), &[], None).is_err());
         assert!(crate::require_allowed_route(&cli, "wiremock-broken", "broken-model/head").is_ok());
         assert!(crate::require_allowed_reviewer_route(
             &cli,
@@ -12934,7 +12906,7 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=working-model/reviewer",
         ])
         .unwrap();
-        assert!(build_reviewer_candidates(&cli, None, &[]).is_err());
+        assert!(build_reviewer_candidates(&cli, None, &[], None).is_err());
         assert!(crate::require_allowed_reviewer_route(
             &cli,
             "wiremock-working",
@@ -12964,7 +12936,8 @@ mod reviewer_chain_dispatch_tests {
         ])
         .unwrap();
 
-        let candidates = build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).unwrap();
+        let candidates =
+            build_reviewer_candidates(&cli, Some("broken-model/head"), &[], None).unwrap();
         assert_eq!(candidates, vec!["broken-model/head"]);
 
         let cli = Cli::try_parse_from([
@@ -12976,7 +12949,8 @@ mod reviewer_chain_dispatch_tests {
         ])
         .unwrap();
 
-        let err = build_reviewer_candidates(&cli, Some("broken-model/head"), &[]).unwrap_err();
+        let err =
+            build_reviewer_candidates(&cli, Some("broken-model/head"), &[], None).unwrap_err();
         assert!(err
             .to_string()
             .contains("explicit reviewer route is outside --allowed-routes"));
@@ -13000,10 +12974,10 @@ mod reviewer_chain_dispatch_tests {
             "working-model/reviewer".to_string(),
             "broken-model/head".to_string(),
         ];
-        let candidates = build_reviewer_candidates(&cli, None, &scenario).unwrap();
+        let candidates = build_reviewer_candidates(&cli, None, &scenario, None).unwrap();
         assert_eq!(candidates, vec!["working-model/reviewer"]);
         assert!(
-            build_reviewer_candidates(&cli, Some("broken-model/head"), &scenario)
+            build_reviewer_candidates(&cli, Some("broken-model/head"), &scenario, None)
                 .err()
                 .unwrap()
                 .to_string()
@@ -13029,9 +13003,10 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=vendor/working-model-reviewer-it",
         ])
         .unwrap();
-        let err = build_reviewer_candidates(&cli, Some("vendor/working-model-reviewer-it"), &[])
-            .unwrap_err()
-            .to_string();
+        let err =
+            build_reviewer_candidates(&cli, Some("vendor/working-model-reviewer-it"), &[], None)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("no real provider is configured"), "{err}");
         assert!(!err.contains("outside"), "{err}");
         assert!(
@@ -13050,7 +13025,7 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=working-model/reviewer",
         ])
         .unwrap();
-        let err = build_reviewer_candidates(&cli, Some("broken-model/head"), &[])
+        let err = build_reviewer_candidates(&cli, Some("broken-model/head"), &[], None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -13121,7 +13096,7 @@ mod reviewer_chain_dispatch_tests {
             .expect("resolve_chain should succeed");
 
         // build_reviewer_candidates returns includes configured working reviewer
-        let candidates = build_reviewer_candidates(&cli, None, &chain.reviewer)
+        let candidates = build_reviewer_candidates(&cli, None, &chain.reviewer, None)
             .expect("build_reviewer_candidates should succeed");
         assert!(
             candidates.contains(&"working-model/reviewer".to_string()),
@@ -13200,6 +13175,7 @@ mod reviewer_chain_dispatch_tests {
             "sys",
             "user",
             2048,
+            None,
         )
         .await;
 
@@ -13258,7 +13234,7 @@ mod reviewer_chain_dispatch_tests {
         let cli =
             Cli::try_parse_from(["zoder", "exec", "--request-timeout", "1", "--retries", "1"])
                 .expect("clap parse");
-        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048, None)
             .await
             .expect("same reviewer model should be retried before fallback");
         assert_eq!(
@@ -13307,7 +13283,7 @@ mod reviewer_chain_dispatch_tests {
         );
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).expect("clap parse");
-        let err = complete_once(&cli, None, &[], "sys", "user", 2048)
+        let err = complete_once(&cli, None, &[], "sys", "user", 2048, None)
             .await
             .expect_err("a single 503 is transient, not model-unavailable fallback");
         let msg = format!("{err:#}");
@@ -13532,14 +13508,14 @@ mod reviewer_chain_dispatch_tests {
         let cli = Cli::try_parse_from(["zoder", "review", "--retries", "2"]).unwrap();
         let _ = crate::eih_health::take_skipped();
 
-        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(first.model, "eih-model/nemo");
         assert_eq!(first.receipts[0]["health"]["source"], "probe");
         assert_eq!(model_hits.load(Ordering::SeqCst), 1);
 
-        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(second.receipts[0]["health"]["source"], "cache");
@@ -13552,7 +13528,7 @@ mod reviewer_chain_dispatch_tests {
         // 429: exactly one chat attempt (no in-process retry), breaker open
         // for at least Retry-After, review served by the fallback.
         let before = chat_hits.load(Ordering::SeqCst);
-        let third = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let third = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(third.model, "working-model/reviewer");
@@ -13570,7 +13546,7 @@ mod reviewer_chain_dispatch_tests {
             model_hits.load(Ordering::SeqCst),
             chat_hits.load(Ordering::SeqCst),
         );
-        let fourth = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let fourth = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(fourth.model, "working-model/reviewer");
@@ -13616,7 +13592,7 @@ mod reviewer_chain_dispatch_tests {
         let cli = Cli::try_parse_from(["zoder", "review", "--retries", "0"]).unwrap();
         let _ = crate::eih_health::take_skipped();
 
-        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let first = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(first.model, "working-model/reviewer");
@@ -13636,7 +13612,7 @@ mod reviewer_chain_dispatch_tests {
             g.retry_not_before_unix = Some(chrono::Utc::now().timestamp() - 1);
         })
         .unwrap();
-        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let second = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
         assert_eq!(second.model, "eih-model/nemo");
@@ -13672,7 +13648,7 @@ mod reviewer_chain_dispatch_tests {
         let _ = crate::eih_health::take_skipped();
         crate::eih_health::PROBE_TIMEOUT_OVERRIDE_MS.store(200, Ordering::SeqCst);
         let started = std::time::Instant::now();
-        let result = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048).await;
+        let result = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None).await;
         crate::eih_health::PROBE_TIMEOUT_OVERRIDE_MS.store(0, Ordering::SeqCst);
         let err = result.unwrap_err().to_string();
         assert!(
@@ -13743,6 +13719,7 @@ mod reviewer_chain_dispatch_tests {
             REVIEW_SYSTEM,
             "diff",
             2048,
+            None,
         )
         .await;
         assert!(result
@@ -13774,7 +13751,7 @@ mod reviewer_chain_dispatch_tests {
         );
 
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "1"]).expect("clap parse");
-        let c = complete_once(&cli, None, &[], "sys", "user", 2048)
+        let c = complete_once(&cli, None, &[], "sys", "user", 2048, None)
             .await
             .expect("persistent 5xx should fall through after retrying the same model");
         assert_eq!(
@@ -13827,7 +13804,7 @@ mod reviewer_chain_dispatch_tests {
         // this same tempdir's `engine` subdirectory.
         //
         // The engine config path is passed EXPLICITLY to
-        // `complete_once_with_engine_config` rather than being pushed
+        // `complete_once` rather than being pushed
         // into the process environment via `ZEROCLAW_CONFIG_DIR`. The env
         // var is process-global shared mutable state: a parallel test
         // that sets it to a different directory would win the race, and
@@ -13882,7 +13859,7 @@ model_provider = "custom.reviewer"
         .unwrap();
 
         let cli = dummy_cli();
-        let c = complete_once_with_engine_config(
+        let c = complete_once(
             &cli,
             Some("reviewer"),
             &[],
@@ -14008,7 +13985,7 @@ model_provider = "custom.nemotron35"
         // pool) — NOT `model_override` — so it must dispatch literally
         // regardless of the colliding `[agents.nemotron35]` alias above.
         let cli = dummy_cli();
-        let c = complete_once_with_engine_config(
+        let c = complete_once(
             &cli,
             None,
             &["nemotron35".to_string()],
@@ -14081,6 +14058,7 @@ model_provider = "custom.nemotron35"
             "You are a reviewer.",
             "review this diff",
             2048,
+            None,
         )
         .await;
         let c = result.expect("the chain must produce a completion; the broken head must fall through to the working tail");
@@ -14139,7 +14117,7 @@ model_provider = "custom.nemotron35"
         );
 
         let cli = dummy_cli();
-        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048, None).await;
         let err =
             result.expect_err("every candidate errored; complete_once must surface a failure");
         let msg = format!("{err:#}");
@@ -14197,7 +14175,7 @@ model_provider = "custom.nemotron35"
         );
 
         let cli = dummy_cli();
-        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048, None).await;
         let err = result.expect_err(
             "single-model config + failing backend must still error (the legacy behavior was \
              to surface the head's error); the new chain logic must not 'succeed' by \
@@ -14276,7 +14254,7 @@ model_provider = "custom.nemotron35"
         );
 
         let cli = dummy_cli();
-        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048, None).await;
         // Drop the scoped mount NOW so wiremock's request count for
         // it stops incrementing (we already took our reading
         // through the dispatcher error path; nothing after this
@@ -14383,7 +14361,7 @@ model_provider = "custom.nemotron35"
         );
 
         let cli = dummy_cli();
-        let result = complete_once(&cli, None, &[], "sys", "user", 2048).await;
+        let result = complete_once(&cli, None, &[], "sys", "user", 2048, None).await;
         let c = result.expect("a clean reviewer call must return Ok");
         assert_eq!(c.model, "working-model/glm-5.1");
         assert!(c.content.contains("working reviewer ok"));
@@ -15349,7 +15327,7 @@ model_provider = "custom.nemotron35"
         .unwrap();
         // With the verified-healthy pool armed, the head's 503 hands over to
         // the secondary: the review completes on the FALLBACK model.
-        let completion = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048)
+        let completion = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .expect("the pool fallback completes the review");
         assert_eq!(

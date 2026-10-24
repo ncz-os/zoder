@@ -4524,7 +4524,8 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     // Resolve the effective reviewer chain using the same logic as the
     // agentic execution path to ensure the preview matches reality.
     // This handles configured reviewers and allowlist filtering.
-    let reviewer_resolution = agentic::build_reviewer_candidates(cli, None, &resolved.reviewer);
+    let reviewer_resolution =
+        agentic::build_reviewer_candidates(cli, None, &resolved.reviewer, None);
     let reviewers = match reviewer_resolution {
         Ok(r) => r,
         Err(e) => {
