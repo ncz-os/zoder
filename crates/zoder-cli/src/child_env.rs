@@ -206,6 +206,55 @@ mod tests {
         );
     }
 
+    /// An EMPTY override set must leave the child with the FULL inherited
+    /// environment — including `PATH`.
+    ///
+    /// This pins the semantics of [`ChildEnv::new`]: "no overrides" means
+    /// "inherit everything", NOT "start from an empty environment". A
+    /// reviewer reading `run_git` as `run_git_env(cwd, args,
+    /// &ChildEnv::new())` could reasonably worry that the git children
+    /// would lose `PATH` (and so fail to find `git` itself, or any
+    /// helper `git` shells out to). They do not: `apply_std` only ADDS
+    /// overrides and REMOVEs the keys listed in `unset`; it never clears
+    /// the inherited environment. `Command` inherits the parent's
+    /// environment by default, and an empty `ChildEnv` adds nothing to
+    /// and removes nothing from it.
+    #[test]
+    fn an_empty_override_set_leaves_the_child_environment_intact() {
+        let path_before = std::env::var_os("PATH").expect("the parent has a PATH");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf %s \"${PATH}\"");
+        ChildEnv::new().apply_std(&mut cmd);
+        let out = cmd.output().expect("spawn sh");
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            path_before.to_string_lossy(),
+            "an empty override set must leave the child's PATH exactly as \
+             the parent had it"
+        );
+    }
+
+    /// The same contract, observed through the git helper the production
+    /// code uses: a `git` spawned with an EMPTY override set still sees
+    /// the ambient environment, so `run_git` behaves exactly as it did
+    /// before the `ChildEnv` refactor.
+    #[test]
+    fn an_empty_override_set_still_finds_git_on_the_inherited_path() {
+        // Find `git` the way the production helper does: through the
+        // inherited PATH, with no override applied.
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("--version");
+        ChildEnv::new().apply_std(&mut cmd);
+        let out = cmd.output().expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git must be reachable through the inherited PATH with an \
+             empty override set; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// **REGRESSION: the EFAULT ("Bad address") flake.**
     ///
     /// This is the root cause of the sporadic
