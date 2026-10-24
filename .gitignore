@@ -30,3 +30,12 @@ bench/raw/
 # never commit — they contain local CI/PAT noise that pollutes diffs and
 # never belongs in the repo).
 /memory
+
+# Local scratch roots for the test harness. `/t` is where the test
+# suite writes its per-run session dirs when TMPDIR points inside the
+# workspace; `.tmpbuild/` holds the flake-evidence harness (stress
+# scripts, base/fixed test binaries, load generators) and the scratch
+# worktree used to measure the pre-fix failure rate. Both are local
+# development artifacts — never commit them.
+/t
+/.tmpbuild/

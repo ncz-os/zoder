@@ -8,6 +8,7 @@ use anyhow::Context;
 use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
+mod child_env;
 mod eih_health;
 mod evals;
 mod exec_safety;
@@ -1680,13 +1681,36 @@ mod provider_route_corpus_tests {
 
 impl Engine {
     fn load() -> anyhow::Result<Self> {
+        Self::load_with_engine_config(None)
+    }
+
+    /// [`Engine::load`] with an explicit engine-config path.
+    ///
+    /// `engine_config` overrides the `ZEROCLAW_CONFIG_DIR`-derived path.
+    /// `None` means "resolve from the process environment", which is what
+    /// production wants.
+    ///
+    /// The override exists so a TEST can point the engine model registry
+    /// at a fixture `config.toml` WITHOUT mutating the process
+    /// environment. `ZEROCLAW_CONFIG_DIR` is process-global shared mutable
+    /// state: two tests that set it to different directories race, and the
+    /// loser reads the winner's engine config — a real, intermittent
+    /// failure (the alias registry resolves to the wrong model). The
+    /// override travels as an explicit parameter instead, so nothing
+    /// global is touched. See `crate::child_env` for the wider story
+    /// about process-global state in a parallel test binary.
+    fn load_with_engine_config(engine_config: Option<&std::path::Path>) -> anyhow::Result<Self> {
         let mut cfg = Config::load()?;
-        let engine_models = EngineModelRegistry::load_from(&engine_config_path())?;
+        let engine_cfg_path = match engine_config {
+            Some(p) => p.to_path_buf(),
+            None => engine_config_path(),
+        };
+        let engine_models = EngineModelRegistry::load_from(&engine_cfg_path)?;
         cfg.bind_engine_provider_refs(&engine_models)
             .with_context(|| {
                 format!(
                     "validating zoder/Zeroclaw provider mappings while loading {}",
-                    engine_config_path().display()
+                    engine_cfg_path.display()
                 )
             })?;
         let corpus = Corpus::load(&cfg.corpus_path)?;

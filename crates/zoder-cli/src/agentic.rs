@@ -589,6 +589,40 @@ async fn complete_once(
     user: &str,
     max_tokens: u32,
 ) -> anyhow::Result<Completion> {
+    complete_once_with_engine_config(
+        cli,
+        model_override,
+        reviewer_chain,
+        system,
+        user,
+        max_tokens,
+        None,
+    )
+    .await
+}
+
+/// [`complete_once`] with an explicit engine-config path.
+///
+/// `engine_config` overrides the `ZEROCLAW_CONFIG_DIR`-derived engine
+/// model registry path. `None` resolves it from the process environment
+/// (production behavior).
+///
+/// The override is threaded as an explicit parameter so a TEST can point
+/// the engine at a fixture `config.toml` without mutating the process
+/// environment. `ZEROCLAW_CONFIG_DIR` is process-global shared mutable
+/// state: two parallel tests that set it to different directories race,
+/// and the loser resolves the alias registry from the winner's config —
+/// an intermittent, genuinely confusing failure. See
+/// `crate::child_env` for the wider story.
+async fn complete_once_with_engine_config(
+    cli: &crate::Cli,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    engine_config: Option<&Path>,
+) -> anyhow::Result<Completion> {
     // Build the ordered candidate list the dispatch loop walks. The shape
     // is `head, rest…` — the SAME model-resolution rules `complete_once`
     // already had, just lifted into a list so we can fall through to the
@@ -596,7 +630,12 @@ async fn complete_once(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut candidates = build_reviewer_candidates(cli, model_override, reviewer_chain)?;
+    let mut candidates = build_reviewer_candidates_with_engine_config(
+        cli,
+        model_override,
+        reviewer_chain,
+        engine_config,
+    )?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -622,7 +661,17 @@ async fn complete_once(
                 prev = candidates[idx - 1]
             );
         }
-        match dispatch_reviewer_for_model(cli, model, model, system, user, max_tokens).await {
+        match dispatch_reviewer_for_model(
+            cli,
+            model,
+            model,
+            system,
+            user,
+            max_tokens,
+            engine_config,
+        )
+        .await
+        {
             Ok(c) => return Ok(c),
             Err(ReviewerError::FallbackWorthy {
                 message,
@@ -642,7 +691,7 @@ async fn complete_once(
                 // id is resolved from routing if available (consistent
                 // with author path / agentic turn) so the on-disk store
                 // sees the same stamp as the author's pre-gate entry.
-                if let Ok(eng) = Engine::load() {
+                if let Ok(eng) = Engine::load_with_engine_config(engine_config) {
                     // Resolve the provider id BEFORE taking the health lock --
                     // this is read-only routing config I/O and touches no
                     // health state, so it must not extend the locked critical
@@ -965,7 +1014,23 @@ pub(crate) fn build_reviewer_candidates(
     model_override: Option<&str>,
     reviewer_chain: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let eng = Engine::load()?;
+    build_reviewer_candidates_with_engine_config(cli, model_override, reviewer_chain, None)
+}
+
+/// [`build_reviewer_candidates`] with an explicit engine-config path.
+///
+/// `engine_config` overrides the `ZEROCLAW_CONFIG_DIR`-derived engine
+/// model registry path; `None` resolves it from the process environment
+/// (production behavior). Threading it explicitly lets a TEST point the
+/// engine at a fixture `config.toml` without mutating the process
+/// environment, which is process-global shared mutable state.
+pub(crate) fn build_reviewer_candidates_with_engine_config(
+    cli: &crate::Cli,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    engine_config: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
+    let eng = Engine::load_with_engine_config(engine_config)?;
 
     // Resolve the reviewer-model-side channel: any per-agent or profile-
     // level `reviewer_model` override, treated as an ordered chain. Note
@@ -1363,9 +1428,10 @@ async fn dispatch_reviewer_for_model(
     system: &str,
     user: &str,
     max_tokens: u32,
+    engine_config: Option<&Path>,
 ) -> Result<Completion, ReviewerError> {
     let started = std::time::Instant::now();
-    let eng = match Engine::load() {
+    let eng = match Engine::load_with_engine_config(engine_config) {
         Ok(eng) => eng,
         Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
     };
@@ -2471,9 +2537,11 @@ impl TempIndex {
         Self { path }
     }
 
-    /// `GIT_INDEX_FILE` as a git environment pair.
-    fn env(&self) -> (&'static str, String) {
-        ("GIT_INDEX_FILE", self.path.to_string_lossy().to_string())
+    /// `GIT_INDEX_FILE` as a git environment pair, applied to the CHILD
+    /// only (`Command::env`) — never to the process environment, which is
+    /// process-global shared mutable state. See [`crate::child_env`].
+    fn child_env(&self) -> crate::child_env::ChildEnv {
+        crate::child_env::ChildEnv::new().set("GIT_INDEX_FILE", self.path.to_string_lossy())
     }
 }
 
@@ -2483,12 +2551,35 @@ impl Drop for TempIndex {
     }
 }
 
-fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<String> {
+/// Env overrides that make a `git` child ignore the host's global and
+/// system configuration scopes.
+///
+/// `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` have been honoured by git
+/// since 1.7.10; pointing them at `/dev/null` makes those scopes read as
+/// empty, so the repo's own (local) config is the only scope that matters.
+///
+/// These are applied to the CHILD (`Command::env`), never through the
+/// process environment. `setenv` mutates process-global state that other
+/// threads are concurrently copying into their own children, which is
+/// exactly how a parallel test suite ends up with sporadic
+/// `spawn git: Bad address` (EFAULT) failures — see
+/// [`crate::child_env`] for the full story.
+#[cfg(test)]
+pub(crate) fn hermetic_git_env() -> crate::child_env::ChildEnv {
+    crate::child_env::ChildEnv::from_pairs(&[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ])
+}
+
+fn run_git_env(
+    cwd: &Path,
+    args: &[&str],
+    env: &crate::child_env::ChildEnv,
+) -> anyhow::Result<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(cwd).args(args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    env.apply_std(&mut cmd);
     let out = cmd
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
@@ -2503,20 +2594,7 @@ fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> anyhow::Resul
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    run_git_env(cwd, args, &crate::child_env::ChildEnv::new())
 }
 
 fn read_to_byte_cap<R: Read>(mut reader: R, max: usize) -> std::io::Result<CappedRead> {
@@ -2800,12 +2878,13 @@ impl PatchJournal {
         if index_path.exists() {
             std::fs::copy(index_path, &idx.path).ok()?;
         }
-        let (key, val) = idx.env();
+        // `GIT_INDEX_FILE` goes to the CHILD only — see `crate::child_env`.
+        let env = idx.child_env();
         // `add -A` honours .gitignore, so build artefacts stay out. It reads
         // the worktree and writes ONLY the temporary index: no ref, no real
         // index entry, and no worktree write is touched by this measurement.
-        run_git_env(cwd, &["add", "-A"], &[(key, &val)]).ok()?;
-        let tree = run_git_env(cwd, &["write-tree"], &[(key, &val)]).ok()?;
+        run_git_env(cwd, &["add", "-A"], &env).ok()?;
+        let tree = run_git_env(cwd, &["write-tree"], &env).ok()?;
         let tree = tree.trim().to_string();
         if tree.is_empty() {
             None
@@ -3349,7 +3428,15 @@ fn ceil_char_boundary_from_end(s: &str, n: usize) -> usize {
 /// repository present). Trims trailing whitespace; an empty trimmed result
 /// is also treated as `None` defensively (e.g. some plumbing edge cases).
 fn rev_parse_head(cwd: &Path) -> Option<String> {
-    run_git(cwd, &["rev-parse", "HEAD"])
+    rev_parse_head_with_env(cwd, &crate::child_env::ChildEnv::new())
+}
+
+/// [`rev_parse_head`] with per-child environment overrides.
+///
+/// The overrides are applied to the `git` child (`Command::env`), never to
+/// the process environment — see [`crate::child_env`].
+fn rev_parse_head_with_env(cwd: &Path, env: &crate::child_env::ChildEnv) -> Option<String> {
+    run_git_env(cwd, &["rev-parse", "HEAD"], env)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -3430,12 +3517,33 @@ fn commit_author_enforcement_to_json(result: Option<&CommitAuthorEnforcement>) -
 /// Returns the outcome for observability and tests. Any git failure is
 /// captured as `Failed { reason }` — this function never panics and
 /// never returns an `Err`, so the loop can keep going.
+///
+/// The child inherits the operator's environment, which is what production
+/// wants: the repo's identity may legitimately come from the operator's
+/// global `~/.gitconfig`. Tests that need a hermetic git call
+/// [`enforce_repo_commit_author_with_env`] instead.
 fn enforce_repo_commit_author(cwd: &Path) -> CommitAuthorEnforcement {
+    enforce_repo_commit_author_with_env(cwd, &crate::child_env::ChildEnv::new())
+}
+
+/// [`enforce_repo_commit_author`] with per-child environment overrides.
+///
+/// `env` is applied to every `git` child this function spawns (via
+/// `Command::env`), never to the process environment. That distinction
+/// matters: mutating the process environment is process-global shared
+/// mutable state, and doing so while sibling threads fork/exec their own
+/// children corrupts those children's environment block — the classic
+/// symptom is `spawn git: Bad address` (EFAULT) in whichever test happened
+/// to be spawning a child at that moment. See [`crate::child_env`].
+fn enforce_repo_commit_author_with_env(
+    cwd: &Path,
+    env: &crate::child_env::ChildEnv,
+) -> CommitAuthorEnforcement {
     // 1. Resolve HEAD's SHA. A brand-new repo with no commits errors out
     //    here — there is nothing to correct, and the next author turn may
     //    create the first commit (which a future iter will catch via the
     //    `None -> Some(sha)` SHA transition in `cmd_loop`).
-    let Some(_head_sha) = rev_parse_head(cwd) else {
+    let Some(_head_sha) = rev_parse_head_with_env(cwd, env) else {
         return CommitAuthorEnforcement::NoCommit;
     };
 
@@ -3444,11 +3552,11 @@ fn enforce_repo_commit_author(cwd: &Path) -> CommitAuthorEnforcement {
     //    (we deliberately do NOT pass `--global`, which would bypass the
     //    local repo override). If either is missing, there is nothing
     //    correct to amend to — leave the commit alone.
-    let cfg_name = run_git(cwd, &["config", "user.name"])
+    let cfg_name = run_git_env(cwd, &["config", "user.name"], env)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let cfg_email = run_git(cwd, &["config", "user.email"])
+    let cfg_email = run_git_env(cwd, &["config", "user.email"], env)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -3461,7 +3569,7 @@ fn enforce_repo_commit_author(cwd: &Path) -> CommitAuthorEnforcement {
     // 3. Read HEAD's current author. `%an <%ae>` is the literal shape
     //    git itself renders, so the comparison is byte-exact (no
     //    whitespace or quoting surprises).
-    let current = match run_git(cwd, &["log", "-1", "--format=%an <%ae>"]) {
+    let current = match run_git_env(cwd, &["log", "-1", "--format=%an <%ae>"], env) {
         Ok(s) => s.trim().to_string(),
         Err(e) => {
             return CommitAuthorEnforcement::Failed {
@@ -3477,11 +3585,13 @@ fn enforce_repo_commit_author(cwd: &Path) -> CommitAuthorEnforcement {
     //    committer untouched; only the author field is rewritten. The
     //    new commit object has a different SHA (the author is part of
     //    the object), but content is preserved.
-    let amend = std::process::Command::new("git")
+    let mut amend_cmd = std::process::Command::new("git");
+    amend_cmd
         .arg("-C")
         .arg(cwd)
-        .args(["commit", "--amend", "--author", &desired, "--no-edit"])
-        .status();
+        .args(["commit", "--amend", "--author", &desired, "--no-edit"]);
+    env.apply_std(&mut amend_cmd);
+    let amend = amend_cmd.status();
     match amend {
         Ok(s) if s.success() => CommitAuthorEnforcement::Corrected {
             from: current,
@@ -5138,6 +5248,36 @@ async fn run_check_watched(
     allow_dangerous: bool,
     policy: &zoder_core::ExecSafetyConfig,
 ) -> (bool, String) {
+    run_check_watched_with_env(
+        cwd,
+        cmd,
+        secs,
+        allow_dangerous,
+        policy,
+        &crate::child_env::ChildEnv::new(),
+    )
+    .await
+}
+
+/// [`run_check_watched`] with per-child environment overrides.
+///
+/// `env` is applied to the spawned check with `Command::env` /
+/// `Command::env_remove` — to the CHILD, never to the process
+/// environment. A test that needs the check to see a specific `$HOME`
+/// or `$PATH` (e.g. to prove that a login shell sources `~/.profile`)
+/// passes the override here instead of mutating the process
+/// environment. Mutating the process environment is process-global
+/// shared mutable state: a concurrent `fork`/`exec` on another thread
+/// can copy a torn `environ` and fail with `EFAULT` ("Bad address").
+/// See [`crate::child_env`].
+async fn run_check_watched_with_env(
+    cwd: &Path,
+    cmd: &str,
+    secs: u64,
+    allow_dangerous: bool,
+    policy: &zoder_core::ExecSafetyConfig,
+    env: &crate::child_env::ChildEnv,
+) -> (bool, String) {
     if !allow_dangerous {
         match crate::exec_safety::inspect_shell_command(cmd) {
             crate::exec_safety::ExecVerdict::Allow => {}
@@ -5168,6 +5308,9 @@ async fn run_check_watched(
     for arg in &plan.argv[1..] {
         command.arg(arg);
     }
+    // Per-child environment overrides. Applied to the CHILD only — the
+    // process environment is never mutated (see `crate::child_env`).
+    env.apply_tokio(&mut command);
     // Z-15: the dispatch canonicalized the cwd ONCE into `plan.cwd`
     // and threaded that canonical path into the bwrap argv (`--bind`
     // and `--chdir`). The production `.current_dir()` MUST use the
@@ -13681,23 +13824,21 @@ mod reviewer_chain_dispatch_tests {
         // `Engine::load()` reads the engine (zeroclaw) config from
         // `ZEROCLAW_CONFIG_DIR`'s `config.toml`, a separate file/dir from
         // zoder's own `ZODER_HOME`-relative `config.json`. Both point at
-        // this same tempdir's `engine` subdirectory; restored on drop.
+        // this same tempdir's `engine` subdirectory.
+        //
+        // The engine config path is passed EXPLICITLY to
+        // `complete_once_with_engine_config` rather than being pushed
+        // into the process environment via `ZEROCLAW_CONFIG_DIR`. The env
+        // var is process-global shared mutable state: a parallel test
+        // that sets it to a different directory would win the race, and
+        // this test would then resolve the alias registry from the
+        // WRONG engine config — an intermittent failure that looks like
+        // a routing bug. See `crate::child_env`.
         let engine_dir = home.join("engine");
         std::fs::create_dir_all(&engine_dir).expect("mkdir engine_dir");
-        let prev_engine_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &engine_dir);
-        struct EngineDirGuard(Option<String>);
-        impl Drop for EngineDirGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
-                    None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
-                }
-            }
-        }
-        let _engine_dir_guard = EngineDirGuard(prev_engine_dir);
+        let engine_config = engine_dir.join("config.toml");
         std::fs::write(
-            engine_dir.join("config.toml"),
+            engine_config.clone(),
             r#"
 [providers.models.custom.reviewer]
 type = "openai-compatible"
@@ -13741,12 +13882,20 @@ model_provider = "custom.reviewer"
         .unwrap();
 
         let cli = dummy_cli();
-        let c = complete_once(&cli, Some("reviewer"), &[], "sys", "user", 2048)
-            .await
-            .expect(
-                "an agent-alias reviewer candidate must resolve to its real \
+        let c = complete_once_with_engine_config(
+            &cli,
+            Some("reviewer"),
+            &[],
+            "sys",
+            "user",
+            2048,
+            Some(&engine_config),
+        )
+        .await
+        .expect(
+            "an agent-alias reviewer candidate must resolve to its real \
                  model before dispatch, not fail with 'no real provider'",
-            );
+        );
         assert_eq!(
             c.model, "nemotron35",
             "the reported reviewer model must be the resolved checkpoint id, not the alias"
@@ -13803,25 +13952,17 @@ model_provider = "custom.reviewer"
         let home = home_dir.path().to_path_buf();
         let _g = HomeGuard::new(&home);
 
+        // The engine config path is passed EXPLICITLY (see the sibling
+        // test `reviewer_alias_candidate_resolves_to_real_model_on_the_wire`
+        // for why `ZEROCLAW_CONFIG_DIR` must not be mutated here).
         let engine_dir = home.join("engine");
         std::fs::create_dir_all(&engine_dir).expect("mkdir engine_dir");
-        let prev_engine_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &engine_dir);
-        struct EngineDirGuard(Option<String>);
-        impl Drop for EngineDirGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
-                    None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
-                }
-            }
-        }
-        let _engine_dir_guard = EngineDirGuard(prev_engine_dir);
+        let engine_config = engine_dir.join("config.toml");
         // An agent alias LITERALLY named "nemotron35" that routes to a
         // DIFFERENT model ("decoy-model") — the collision the fix must
         // not fall into.
         std::fs::write(
-            engine_dir.join("config.toml"),
+            engine_config.clone(),
             r#"
 [providers.models.custom.nemotron35]
 type = "openai-compatible"
@@ -13867,9 +14008,17 @@ model_provider = "custom.nemotron35"
         // pool) — NOT `model_override` — so it must dispatch literally
         // regardless of the colliding `[agents.nemotron35]` alias above.
         let cli = dummy_cli();
-        let c = complete_once(&cli, None, &["nemotron35".to_string()], "sys", "user", 2048)
-            .await
-            .expect("a scenario-routed literal model id must dispatch");
+        let c = complete_once_with_engine_config(
+            &cli,
+            None,
+            &["nemotron35".to_string()],
+            "sys",
+            "user",
+            2048,
+            Some(&engine_config),
+        )
+        .await
+        .expect("a scenario-routed literal model id must dispatch");
         assert_eq!(
             c.model, "nemotron35",
             "a scenario-routed literal model id must never be rewritten to \
@@ -15303,13 +15452,19 @@ mod commit_author_enforcement_tests {
     /// Run `git` against `repo`, asserting success. Mirrors the helper in
     /// `review_diff_soundness_tests` (kept independent so this module
     /// has no cross-module coupling).
+    ///
+    /// Every invocation is HERMETIC: `GIT_CONFIG_GLOBAL` /
+    /// `GIT_CONFIG_SYSTEM` point at `/dev/null` so the host's
+    /// `~/.gitconfig` and `/etc/gitconfig` cannot influence the result.
+    /// The overrides are applied to the CHILD (`Command::env`), never to
+    /// the process environment — writing to the process environment is
+    /// process-global shared mutable state and corrupts concurrently
+    /// spawned children (EFAULT, "Bad address").
     fn run(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("spawn git");
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo).args(args);
+        hermetic_git_env().apply_std(&mut cmd);
+        let out = cmd.output().expect("spawn git");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -15319,13 +15474,14 @@ mod commit_author_enforcement_tests {
 
     /// Run `git` and return its trimmed stdout, asserting success. Used
     /// for read-only probes (`rev-parse`, `log`, `config`).
+    ///
+    /// Hermetic for the same reason as [`run`]: the overrides go to the
+    /// child, not to the process environment.
     fn read(repo: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("spawn git");
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo).args(args);
+        hermetic_git_env().apply_std(&mut cmd);
+        let out = cmd.output().expect("spawn git");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -15385,7 +15541,7 @@ mod commit_author_enforcement_tests {
              or this test pins nothing"
         );
 
-        let result = enforce_repo_commit_author(&repo);
+        let result = enforce_repo_commit_author_with_env(&repo, &hermetic_git_env());
         match &result {
             CommitAuthorEnforcement::Corrected { from, to } => {
                 assert_eq!(from, "Seed Author <seed-author@example.invalid>");
@@ -15439,7 +15595,7 @@ mod commit_author_enforcement_tests {
         // to put the seed commit on the right identity, then run the
         // helper again — that second run is the actual no-op case
         // under test.
-        let _ = enforce_repo_commit_author(&repo);
+        let _ = enforce_repo_commit_author_with_env(&repo, &hermetic_git_env());
         let post_amend_sha = read(&repo, &["rev-parse", "HEAD"]);
         let post_amend_author = read(&repo, &["log", "-1", "--format=%an <%ae>"]);
         assert_eq!(
@@ -15447,7 +15603,7 @@ mod commit_author_enforcement_tests {
             "first run must align the seed commit's author with the configured identity"
         );
 
-        let result = enforce_repo_commit_author(&repo);
+        let result = enforce_repo_commit_author_with_env(&repo, &hermetic_git_env());
         match &result {
             CommitAuthorEnforcement::AlreadyCorrect { current } => {
                 assert_eq!(current, "Already Right <already-right@example.invalid>");
@@ -15502,8 +15658,8 @@ mod commit_author_enforcement_tests {
         // Unset BOTH user fields at the local scope. The
         // local-then-global lookup will then resolve to "no
         // identity" ONLY if the global scope is also empty, which
-        // is the case in the test sandbox because we override the
-        // env below.
+        // is the case in the test sandbox because every git child
+        // here is spawned with the hermetic env overrides.
         let _ = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -15515,22 +15671,17 @@ mod commit_author_enforcement_tests {
             .args(["config", "--unset", "user.email"])
             .status();
 
-        // Hermetic git: ignore the host's global / system config so
-        // a CI runner with `user.name=ULTRA build` in `~/.gitconfig`
-        // does not leak into the test. The local repo's own config
-        // (where we just unset user.name / user.email) is the only
-        // scope that matters.
-        let _guard = HermeticGitConfig::installed();
-
         // Pre-condition: `git config user.name` resolves to empty.
-        let probe = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["config", "user.name"])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("spawn git");
+        // The hermetic overrides go to the CHILD (`Command::env`),
+        // never to the process environment: mutating the process
+        // environment is process-global shared mutable state, and
+        // doing it while sibling threads fork/exec their own children
+        // tears their environment block apart (EFAULT / "Bad
+        // address"). See `crate::child_env`.
+        let mut probe_cmd = std::process::Command::new("git");
+        probe_cmd.arg("-C").arg(&repo).args(["config", "user.name"]);
+        hermetic_git_env().apply_std(&mut probe_cmd);
+        let probe = probe_cmd.output().expect("spawn git");
         assert!(
             !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim().is_empty(),
             "pre-condition: the test repo must have no user.name set (probe exit={:?} stdout={:?})",
@@ -15541,7 +15692,7 @@ mod commit_author_enforcement_tests {
         let pre_sha = read(&repo, &["rev-parse", "HEAD"]);
         let pre_author = read(&repo, &["log", "-1", "--format=%an <%ae>"]);
 
-        let result = enforce_repo_commit_author(&repo);
+        let result = enforce_repo_commit_author_with_env(&repo, &hermetic_git_env());
         assert!(
             matches!(result, CommitAuthorEnforcement::NoConfiguredIdentity),
             "no configured identity must surface as NoConfiguredIdentity, got {result:?}"
@@ -15563,129 +15714,6 @@ mod commit_author_enforcement_tests {
         drop(dir);
     }
 
-    /// Test-scoped RAII guard that makes every `git` invocation in
-    /// this test process see an empty global / system config. Used
-    /// by tests that need a "no identity is set anywhere" precondition
-    /// regardless of the host's `~/.gitconfig` (CI runners frequently
-    /// have a `user.name=...` in their global config which would
-    /// otherwise leak in and break the no-identity assertion).
-    ///
-    /// Unix-only: the only way to override the global config location
-    /// cleanly is the `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` env
-    /// vars, set via `libc::setenv`. On non-unix the test is
-    /// conditional and the guard is a no-op (its only consumer is
-    /// also unix-only — see the `cfg` attribute on the tests below).
-    ///
-    /// **Concurrency.** `setenv` mutates the whole-process env, so
-    /// a test that holds this guard MUST also hold the shared
-    /// `GIT_ENV_LOCK` mutex to serialize against other tests in this
-    /// binary that might be reading git config concurrently. Without
-    /// the lock, two parallel tests could see each other's
-    /// `GIT_CONFIG_GLOBAL` and one of them would observe the wrong
-    /// identity. The lock is held for the guard's lifetime — a few
-    /// `git` invocations in the test body — so the wall-clock cost
-    /// is small and parallel test throughput is preserved.
-    struct HermeticGitConfig {
-        // RAII: `_lock` must be declared FIRST so its `Drop` runs
-        // LAST (Rust drops fields in declaration order). The lock
-        // must still be held when `Drop` for `HermeticGitConfig`
-        // (the one below) runs `unsetenv` — otherwise another test
-        // could grab the lock, see the env-var override, and leak
-        // it. This is the same field-ordering discipline `EnvGuard`
-        // uses elsewhere in this crate.
-        #[cfg(unix)]
-        _lock: std::sync::MutexGuard<'static, ()>,
-        _private: (),
-    }
-
-    /// Process-wide serialization point for tests that touch
-    /// `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`. See
-    /// `HermeticGitConfig` for the why.
-    #[cfg(unix)]
-    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    impl HermeticGitConfig {
-        /// Construct and install the guard. Construction calls
-        /// `install()` so the test body only has to bind the value
-        /// to a `_guard` binding for `Drop` to run at scope exit.
-        fn installed() -> Self {
-            Self::install();
-            // The lock is held for the guard's lifetime. Declared
-            // as `Option` so the unix / non-unix arms can both
-            // share the same struct shape (the field is absent on
-            // non-unix, where the lock is also absent).
-            #[cfg(unix)]
-            let lock = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            Self {
-                #[cfg(unix)]
-                _lock: lock,
-                _private: (),
-            }
-        }
-
-        #[cfg(unix)]
-        fn install() {
-            // `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` are honored
-            // by `git` since 1.7.10; pointing them at `/dev/null`
-            // makes git treat those scopes as empty. We use process
-            // env (not thread-local) because `Command::new("git")`
-            // inherits the parent process's env by default — every
-            // test invocation already runs inside a `cargo test`
-            // process, so setting the env once at the top of the
-            // test propagates to every `git` child the test spawns
-            // (including the ones the helper itself spawns via
-            // `std::process::Command`).
-            //
-            // SAFETY: `setenv` is not thread-safe; this test is
-            // `#[test]` (not `#[tokio::test]`), so the test function
-            // is the only thread that observes the change in the
-            // short window between `setenv` and the test's
-            // `git` invocations. The mutex held by `_lock`
-            // (declared above) serializes against any other test
-            // that might be reading git config in parallel. The
-            // `&str` -> `*const i8` cast is safe because the
-            // pointers are derived from string literals with
-            // `'static` lifetime; `setenv` only copies the bytes
-            // during the call, so the borrow is released before
-            // the function returns.
-            unsafe {
-                libc::setenv(
-                    c"GIT_CONFIG_GLOBAL".as_ptr() as *const libc::c_char,
-                    c"/dev/null".as_ptr() as *const libc::c_char,
-                    1,
-                );
-                libc::setenv(
-                    c"GIT_CONFIG_SYSTEM".as_ptr() as *const libc::c_char,
-                    c"/dev/null".as_ptr() as *const libc::c_char,
-                    1,
-                );
-            }
-        }
-
-        #[cfg(not(unix))]
-        fn install() {}
-    }
-
-    #[cfg(unix)]
-    impl Drop for HermeticGitConfig {
-        fn drop(&mut self) {
-            // Best-effort: clear the env so the next test (if any)
-            // sees the host's normal git config. We do not fail the
-            // test on `unsetenv` errors — the only consequence is
-            // residual process env, which is harmless after the
-            // process exits. SAFETY: see `install`; the cast is from
-            // a `'static` string literal. The lock (`_lock`) is
-            // still held at this point (Rust drops `_lock` AFTER
-            // `HermeticGitConfig`'s own `Drop`, because `_lock` is
-            // declared first in the struct), so another test cannot
-            // observe a half-cleaned env.
-            unsafe {
-                libc::unsetenv(c"GIT_CONFIG_GLOBAL".as_ptr() as *const libc::c_char);
-                libc::unsetenv(c"GIT_CONFIG_SYSTEM".as_ptr() as *const libc::c_char);
-            }
-        }
-    }
-
     /// A brand-new repo with NO commits must return `NoCommit` and
     /// must not error. The author turn may be in the middle of
     /// staging untracked files — there is nothing to amend and the
@@ -15698,7 +15726,7 @@ mod commit_author_enforcement_tests {
         run(&repo, &["config", "user.email", "x@example.invalid"]);
         run(&repo, &["config", "user.name", "X"]);
 
-        let result = enforce_repo_commit_author(&repo);
+        let result = enforce_repo_commit_author_with_env(&repo, &hermetic_git_env());
         assert!(
             matches!(result, CommitAuthorEnforcement::NoCommit),
             "no-commit repo must surface as NoCommit, got {result:?}"
@@ -15919,62 +15947,48 @@ mod commit_author_enforcement_tests {
             .status()
             .expect("git init");
 
-        // Run the check with HOME pointed at our fake operator home and
-        // an explicitly-stripped PATH so the only way `post-edit-check`
+        // The check must run with HOME pointed at our fake operator home
+        // and an explicitly-stripped PATH so the only way `post-edit-check`
         // can be discovered is via `~/.profile` being sourced. This is
-        // the exact scenario the bug report describes: the loop
-        // driver's PATH doesn't include the operator's toolchain, but
-        // a fresh terminal's PATH (which sources `~/.profile`) does.
+        // the exact scenario the bug report describes: the loop driver's
+        // PATH doesn't include the operator's toolchain, but a fresh
+        // terminal's PATH (which sources `~/.profile`) does.
         //
-        // We need to set BOTH `ZODER_HOME` (the path the loop itself
-        // reads; the existing `EnvGuard` is enough for that) AND
-        // `HOME` (the path the login shell sources `~/.profile` from;
-        // a real `zoder loop` invocation inherits the operator's
-        // `HOME` from their terminal, so the equivalent here is to
-        // set it explicitly). The test's `EnvGuard` deliberately
-        // scopes only `ZODER_HOME` (it would be wrong for it to touch
-        // `HOME` — the lock would become unrelated to operator
-        // config). We restore `HOME` ourselves on the way out.
-        let _env_guard = crate::test_env::EnvGuard::new(&home_path);
-        let saved_path = std::env::var_os("PATH");
-        let saved_home = std::env::var_os("HOME");
-        // A PATH that has only the standard system dirs — no
-        // `~/.cargo/bin`, no `~/.local/bin`, no `~/bin`. The pre-fix
-        // `sh -c` child would inherit this and fail to find the tool.
-        std::env::set_var(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-        std::env::set_var("HOME", &home_path);
-        // Wipe the few interactive-only env vars the login shell
-        // consults; some of them (LOGNAME/USER mismatch on systemd /
-        // launchd-driven launches, in particular) can cause `dash`'s
-        // `-l` mode to skip the profile when only `HOME` is set. The
-        // test's `HOME` is the only thing we want the login logic to
-        // see.
-        for v in ["USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR"] {
-            std::env::remove_var(v);
-        }
-        let (ok, tail) = run_check_watched(
+        // The overrides go to the CHILD (`Command::env` /
+        // `Command::env_remove`), never to the process environment. The
+        // process environment is process-global shared mutable state: a
+        // concurrent `fork`/`exec` on another thread can copy a torn
+        // `environ` and fail with `EFAULT` ("Bad address"), and a
+        // concurrent reader can observe the wrong `$HOME`/`$PATH`. See
+        // `crate::child_env`.
+        let child_env = crate::child_env::ChildEnv::new()
+            // A PATH that has only the standard system dirs — no
+            // `~/.cargo/bin`, no `~/.local/bin`, no `~/bin`. The pre-fix
+            // `sh -c` child would inherit this and fail to find the tool.
+            .set(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
+            .set("HOME", home_path.to_string_lossy())
+            // Wipe the few interactive-only env vars the login shell
+            // consults; some of them (LOGNAME/USER mismatch on systemd /
+            // launchd-driven launches, in particular) can cause `dash`'s
+            // `-l` mode to skip the profile when only `HOME` is set. The
+            // test's `HOME` is the only thing we want the login logic to
+            // see.
+            .unset("USER")
+            .unset("LOGNAME")
+            .unset("SHELL")
+            .unset("XDG_RUNTIME_DIR");
+        let (ok, tail) = run_check_watched_with_env(
             &repo,
             "post-edit-check",
             30,
             false,
             &zoder_core::ExecSafetyConfig::default(),
+            &child_env,
         )
         .await;
-        // Restore PATH / HOME so the rest of the test suite / drop
-        // guard see sane values. (EnvGuard restores ZODER_HOME on drop;
-        // PATH and HOME are not in its scope by design — only
-        // ZODER_HOME is.)
-        match saved_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
 
         assert!(
             ok,
@@ -15995,16 +16009,26 @@ mod patch_journal_tests {
 
     /// Initialize a temp git repo with one committed file. Returns the
     /// repo path.
+    ///
+    /// Every `git` child here is spawned with the hermetic env overrides
+    /// (`GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` → `/dev/null`) applied to
+    /// the CHILD, so the host's `~/.gitconfig` cannot leak a `user.name` /
+    /// `user.email` into the fixture and change what the tests observe.
+    ///
+    /// The overrides go to the child, never to the process environment:
+    /// the process environment is process-global shared mutable state, and
+    /// writing to it while sibling threads fork/exec their own children
+    /// tears their environment block apart (EFAULT, "Bad address"). That
+    /// was the root cause of the sporadic failures in this module — see
+    /// `crate::child_env`.
     fn init_temp_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-C").arg(&repo).args(args);
+            hermetic_git_env().apply_std(&mut cmd);
+            let out = cmd.output().unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?} failed: {}",
@@ -16084,6 +16108,70 @@ mod patch_journal_tests {
         assert!(
             j.agent_diff(&repo).contains("AGENT CHANGED THIS"),
             "an agent edit to a pre-existing untracked file must reach review"
+        );
+    }
+
+    /// **REGRESSION: the hermetic-git contract must hold per CHILD.**
+    ///
+    /// The pre-fix harness installed a hermetic
+    /// `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` into the PROCESS
+    /// environment via raw `libc::setenv` / `libc::unsetenv`. Those
+    /// calls take no lock, so they race every concurrently-spawning
+    /// sibling test: `fork` copies the `environ` array while the
+    /// mutator is rewriting it, the child gets a torn environment
+    /// block, and `execve` fails with `EFAULT` ("Bad address"). That
+    /// is exactly how
+    /// `patch_journal_tests::agent_diff_shows_tracked_file_modification`
+    /// — and four other tests in three modules — failed sporadically.
+    ///
+    /// This test pins the FIXED contract:
+    ///
+    ///   1. The process environment is NOT mutated by the test
+    ///      harness (a `GIT_CONFIG_GLOBAL` visible in this process
+    ///      would mean the old, racy guard came back).
+    ///   2. A `git` child spawned with the hermetic overrides really
+    ///      does see an empty global/system config scope — so the
+    ///      host's `~/.gitconfig` cannot leak into the fixture.
+    ///
+    /// Point 1 FAILS before the fix (the guard sets the var in this
+    /// very process) and PASSES after it.
+    #[test]
+    fn git_children_are_hermetic_without_mutating_the_process_environment() {
+        // --- (1) the process environment must be untouched -----------
+        assert!(
+            std::env::var_os("GIT_CONFIG_GLOBAL").is_none(),
+            "the test harness must not install GIT_CONFIG_GLOBAL in the \
+             PROCESS environment; raw setenv there races every \
+             concurrently-spawning sibling test and tears the child's \
+             environ block (EFAULT / \"Bad address\"). Overrides belong \
+             on the child (Command::env), not on the process."
+        );
+        assert!(
+            std::env::var_os("GIT_CONFIG_SYSTEM").is_none(),
+            "the test harness must not install GIT_CONFIG_SYSTEM in the \
+             PROCESS environment; overrides belong on the child \
+             (Command::env), not on the process."
+        );
+
+        // --- (2) the overrides must really reach the child ------------
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(&repo)
+            .args(["config", "--global", "--list"]);
+        hermetic_git_env().apply_std(&mut cmd);
+        let out = cmd.output().expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git config --global --list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "a git child spawned with the hermetic overrides must see an \
+             EMPTY global config scope, but it saw: {:?}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 
@@ -16377,12 +16465,10 @@ mod patch_journal_tests {
         // Agent creates a new file and commits it.
         std::fs::write(repo.join("agent_work.rs"), "fn agent_fix() {}\n").unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-C").arg(&repo).args(args);
+            hermetic_git_env().apply_std(&mut cmd);
+            let out = cmd.output().unwrap();
             assert!(
                 out.status.success(),
                 "git {:?} failed: {}",
@@ -16693,13 +16779,23 @@ mod loop_review_base_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    /// Run `git` against `repo` and return its trimmed stdout.
+    ///
+    /// Every invocation is HERMETIC: `GIT_CONFIG_GLOBAL` /
+    /// `GIT_CONFIG_SYSTEM` point at `/dev/null` so the host's
+    /// `~/.gitconfig` and `/etc/gitconfig` cannot influence what the test
+    /// observes (a host `user.name` / `init.defaultBranch` / `safe.directory`
+    /// entry changes the shape of the fixture).
+    ///
+    /// The overrides are applied to the CHILD (`Command::env`), never to
+    /// the process environment — writing to the process environment is
+    /// process-global shared mutable state and corrupts concurrently
+    /// spawned children (EFAULT, "Bad address"). See `crate::child_env`.
     fn git(repo: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap();
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(repo).args(args);
+        hermetic_git_env().apply_std(&mut cmd);
+        let out = cmd.output().unwrap();
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
