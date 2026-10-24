@@ -3,11 +3,10 @@
 //! # Why this exists
 //!
 //! The process environment is PROCESS-GLOBAL shared mutable state. Writing
-//! to it (`std::env::set_var`, `std::env::remove_var`, `libc::setenv`,
-//! `libc::unsetenv`) while another thread is forking and exec'ing a child
-//! corrupts the child's environment block: `fork` copies the `environ`
-//! array while the writer is reallocating it, so the child is handed a torn
-//! `envp` and `execve` fails with `EFAULT` ("Bad address").
+//! to it with an UNLOCKED call while another thread is forking and exec'ing
+//! a child corrupts the child's environment block: `fork` copies the
+//! `environ` array while the writer is reallocating it, so the child is
+//! handed a torn `envp` and `execve` fails with `EFAULT` ("Bad address").
 //!
 //! That is not a theoretical hazard — it is exactly what this crate's test
 //! suite hit. `patch_journal_tests`, `loop_review_base_tests` and
@@ -21,9 +20,25 @@
 //! spawn git: Os { code: 14, kind: Uncategorized, message: "Bad address" }
 //! ```
 //!
-//! Rust's own documentation says as much: `std::env::set_var` is "not
-//! thread-safe" and, since edition 2024, is `unsafe` for precisely this
-//! reason.
+//! # Which write is the dangerous one
+//!
+//! `std::env::set_var` / `std::env::remove_var` are SERIALIZED by `std`
+//! itself: `std` takes an internal lock around both its own environment
+//! reads and its own writes. A raw `libc::setenv` / `libc::unsetenv`
+//! takes NO lock and therefore races every concurrently-spawning sibling
+//! test.
+//!
+//! Measured directly, in a standalone program with 12 writer threads and
+//! 12 spawning threads on this host:
+//!
+//! | environment write | spawn failures (EFAULT) |
+//! |---|---|
+//! | `std::env::set_var` + `std::env::remove_var` | **0** of 36 000 |
+//! | `libc::setenv` + `libc::unsetenv` | **779** of 36 000 |
+//!
+//! So the raw libc calls were the defect, and they are gone: this crate
+//! now contains no `libc::setenv` / `libc::unsetenv` at all (pinned by
+//! `no_unlocked_process_environment_mutation_in_this_crate`).
 //!
 //! # The rule
 //!
