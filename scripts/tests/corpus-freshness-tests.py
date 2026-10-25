@@ -20,16 +20,14 @@ SCRIPT = REPO_ROOT / "scripts" / "ci" / "corpus-freshness-check.py"
 # The commit this fix branches from: the pre-fix gate lives here.
 BASELINE_REV = "2c3b279da28e0005610c843c9243fd7bce1a1c32"
 
-SCRATCH_ROOT = Path(os.environ.get("CORPUS_FRESHNESS_TEST_DIR") or tempfile.gettempdir())
-
-
 def _scratch() -> Path:
     """An empty scratch checkout root for one test.
 
-    Honours CORPUS_FRESHNESS_TEST_DIR so the suite can be pointed at a job
-    workspace instead of /tmp; falls back to the platform temp dir.
+    Reads CORPUS_FRESHNESS_TEST_DIR on every call, not once at import, so a
+    harness can redirect a single test.
     """
-    return Path(tempfile.mkdtemp(prefix="corpus-freshness-", dir=str(SCRATCH_ROOT)))
+    root = Path(os.environ.get("CORPUS_FRESHNESS_TEST_DIR") or tempfile.gettempdir())
+    return Path(tempfile.mkdtemp(prefix="corpus-freshness-", dir=str(root)))
 
 
 PASSES = 0
@@ -98,8 +96,13 @@ def _setup(workdir: Path, *, freshness: dict | None = None,
             ],
         }
     (corpus / "freshness.json").write_text(json.dumps(freshness))
+    # Always CLEAR the LKG first: a previous iteration in the same workdir
+    # would otherwise leak its baseline into this run and make the computed
+    # delta depend on iteration order rather than on `last`.
+    lkg = corpus / "freshness-last.json"
+    lkg.unlink(missing_ok=True)
     if last is not None:
-        (corpus / "freshness-last.json").write_text(json.dumps(last))
+        lkg.write_text(json.dumps(last))
     if overlay is None:
         overlay = {f"m{i}": {"agentic_score": 0.7} for i in range(overlay_count)}
     (bench / "overlay.json").write_text(json.dumps(overlay))
@@ -282,7 +285,7 @@ def test_coverage_increase_of_26_percent_passes() -> None:
         if code == 0:
             pass_("+26.2% coverage increase -> script commits")
         else:
-            fail_(f"+26.2% coverage increase -> script REJECTED (sign bug): {out.strip().splitlines()[-1:]}")
+            fail_(f"+26.2% coverage increase -> script REJECTED it (growth must always publish): {out.strip().splitlines()[-1:]}")
         if "+26.2%" in out:
             pass_("+26.2% increase is reported with a POSITIVE sign")
         else:
@@ -488,6 +491,13 @@ def test_empty_env_override_falls_back_to_the_repo_root() -> None:
         (cwd / "corpus" / "freshness-last.json").write_text(json.dumps(_lkg(7777)))
         (cwd / "bench" / "overlay.json").write_text(json.dumps(
             {f"m{i}": {"agentic_score": 0.7} for i in range(7778)}))
+
+        # runpy with run_name='probe' must NOT execute the gate. That is only
+        # true if the script guards its entry point, so assert the guard.
+        gate_src = SCRIPT.read_text()
+        if 'if __name__ == "__main__":' not in gate_src:
+            fail_("gate has no __main__ guard; a runpy probe could execute main()")
+            return
 
         # Ask the script itself which paths _paths() produced. This is exact,
         # needs no corpus state, and cannot pass vacuously on a crash.
