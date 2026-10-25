@@ -37,7 +37,10 @@ def _scratch() -> Path:
     root = Path(os.environ.get("CORPUS_FRESHNESS_TEST_DIR") or tempfile.gettempdir())
     if not root.is_dir():
         raise RuntimeError(
-            f"CORPUS_FRESHNESS_TEST_DIR points at {root}, which is not a directory")
+            "CORPUS_FRESHNESS_TEST_DIR must be an EXISTING DIRECTORY that the "
+            f"suite can create scratch checkouts under; it is currently {root!r}. "
+            "Unset it to fall back to the platform temp dir "
+            f"({tempfile.gettempdir()!r}), or point it at a job workspace.")
     return Path(tempfile.mkdtemp(prefix="corpus-freshness-", dir=str(root)))
 
 
@@ -334,7 +337,9 @@ def test_coverage_within_threshold_passes_in_both_directions() -> None:
     workdir = _scratch()
     try:
         # 191 -> 191 (0%), 191 -> 181 (-5.2%), 191 -> 201 (+5.2%).
-        for count, label in ((191, "flat 0%"), (181, "-5.2% drop"), (201, "+5.2% increase")):
+        for count, label, sign in ((191, "flat 0%", "+0.0%"),
+                                   (181, "-5.2% drop", "-5.2%"),
+                                   (201, "+5.2% increase", "+5.2%")):
             # Re-materialise the layout each round: `_setup` is the only thing
             # that creates corpus/ and bench/, and the check rewrites the LKG
             # file in place on a pass.
@@ -344,6 +349,11 @@ def test_coverage_within_threshold_passes_in_both_directions() -> None:
                 pass_(f"within-threshold {label} -> script commits")
             else:
                 fail_(f"within-threshold {label} -> script REJECTED: {out.strip().splitlines()[-1:]}")
+            delta = next((l for l in out.splitlines() if "delta" in l), "")
+            if sign in delta:
+                pass_(f"within-threshold {label} is printed with the correct sign ({sign})")
+            else:
+                fail_(f"within-threshold {label} printed the wrong sign: {delta!r}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -398,7 +408,12 @@ def test_the_gate_agrees_with_a_signed_delta_table() -> None:
         The new code keeps the verdict and fixes the number.
     """
     workdir = _scratch()
-    prefixed = workdir / "pre-fix-gate.py"   # scratch only: never the repo root
+    # The pre-fix gate computes REPO_ROOT = Path(__file__).resolve().parents[2].
+    # Put the copy at <workdir>/a/b/pre-fix-gate.py so that parents[2] resolves
+    # to the workdir itself: the run then reads the intended corpus whether or
+    # not the env override is honoured, instead of silently depending on it.
+    prefixed = workdir / "a" / "b" / "pre-fix-gate.py"
+    prefixed.parent.mkdir(parents=True, exist_ok=True)
     try:
         if not PREFIX_GATE.exists():
             fail_(f"vendored pre-fix gate is missing: {PREFIX_GATE}")
