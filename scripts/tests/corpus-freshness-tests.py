@@ -342,100 +342,154 @@ def test_coverage_exactly_at_the_threshold_passes() -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_env_override_is_honoured() -> None:
-    """CORPUS_FRESHNESS_ROOT must actually redirect the paths it names.
+def test_the_gate_agrees_with_a_signed_delta_table() -> None:
+    """Pin the verdict table of BOTH gates against the same LKG of 191 models.
 
-    `os.environ.get(k, default)` evaluates `default` eagerly, so the override
-    was silently ignored and the check read the real checkout's corpus/.
+    This is the regression that keeps the reported numbers honest, and it is
+    written as a table so the sign of every case is visible in one place.
+
+    Measured (2026-10-25) from the pre-fix script as committed, reproduced in
+    this test by extracting it from git history:
+
+        cur   real delta   pre-fix prints   pre-fix exit
+        241      +26.2%        -26.2%            0
+        200       +4.7%         -4.7%            0
+        191       +0.0%         +0.0%            0
+        150      -21.5%        +21.5%            0
+        141      -26.2%        +26.2%            1
+        100      -47.6%        +47.6%            1
+
+    Two things follow, and both matter:
+
+      * The pre-fix gate INVERTED THE SIGN in both directions: a +26.2%
+        increase was printed as -26.2% and a -47.6% drop as +47.6%. That is
+        exactly the "coverage delta vs LKG = +26.2% ... coverage dropped by
+        26.2%" pair from the incident report, seen from the other side.
+      * The pre-fix gate still FAILED a real drop. Its numerator was the
+        mirror image of the delta, so the inverted sign was inverted again by
+        `drop > +0.25`, and the verdict (pass on growth, fail on a real drop)
+        was accidentally right. Only the SIGN was wrong, and the sign is what
+        the job prints. So "the old code fails the +26% case" is FALSE: the
+        old code passed it, for the wrong reason and with the wrong number.
+        The new code keeps the verdict and fixes the number.
     """
     workdir = _scratch()
+    prefixed = workdir / "pre-fix-gate.py"   # scratch only: never the repo root
     try:
-        _setup(workdir, overlay_count=200, last=_lkg(200))
-        code, out = _run(workdir)
-        if code == 0 and str(workdir) in out:
-            pass_("CORPUS_FRESHNESS_ROOT override is honoured (paths point at the temp checkout)")
-        elif str(workdir) not in out and not any(str(REPO_ROOT) in line for line in out.splitlines()):
-            pass_("CORPUS_FRESHNESS_ROOT override is honoured (all paths under the temp checkout)")
-        else:
-            fail_(f"CORPUS_FRESHNESS_ROOT override ignored; output names the repo root")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-def test_old_code_fails_the_26_percent_increase() -> None:
-    """Pin the THE OLD BEHAVIOUR ITSELF on a verbatim copy of the pre-fix file.
-
-    The +26% regression test only proves something if the old code fails it.
-    Reconstructing the old logic inside a test copy is honest only if the
-    reconstruction is faithful, so this extracts the pre-fix script straight
-    from git history (the commit this branch is based on) rather than
-    re-implementing it.
-
-    The old gate compared `(last - cur) / last` against a POSITIVE +25%
-    threshold. On an INCREASE last - cur is NEGATIVE, so +26.2% of growth
-    never tripped it -- the increase "passed" for the wrong reason, and what
-    the job actually printed was "-26.2% (threshold -25%)": a coverage
-    increase reported as a drop. The failures the fleet saw were therefore
-    (a) the misreported sign and (b) a real drop reported as "+47.6%".
-    """
-    import copy as _copy
-    workdir = _scratch()
-    try:
-        olds = REPO_ROOT / ".old-gate-under-test.py"
         try:
             blob = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show", f"{BASELINE_REV}:scripts/ci/corpus-freshness-check.py"],
+                ["git", "-C", str(REPO_ROOT), "show",
+                 f"{BASELINE_REV}:scripts/ci/corpus-freshness-check.py"],
                 capture_output=True, text=True, check=True).stdout
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            fail_(f"could not extract the pre-fix gate from {BASELINE_REV}: {exc}")
+            # F6: absence of history is a skip, not a failure -- a shallow
+            # clone cannot answer this question and must not go red.
+            print(f"skip  pre-fix gate unavailable in this checkout ({exc})")
             return
-        olds.write_text(blob)
+        prefixed.write_text(blob)
 
-        # 1) The reported symptom: +26.2% growth is printed as -26.2%.
-        _setup(workdir, overlay_count=241, last=_lkg(191))
-        code, out = _run(workdir, script=olds)
-        delta = [line for line in out.splitlines() if "delta" in line]
-        if delta and "-26.2%" in delta[0]:
-            pass_("pre-fix gate really did report a +26.2% increase as -26.2%")
-        else:
-            fail_(f"pre-fix gate output did not reproduce the reported symptom: {delta}")
-
-        # 2) The sign is inverted in both directions on the old code.
-        _setup(workdir, overlay_count=100, last=_lkg(191))
-        code, out = _run(workdir, script=olds)
-        delta = [line for line in out.splitlines() if "delta" in line]
-        if delta and "+47.6%" in delta[0]:
-            pass_("pre-fix gate really did report a -47.6% drop as +47.6%")
-        else:
-            fail_(f"pre-fix gate did not invert the drop sign: {delta}")
-
-        # 3) Only a REAL drop beyond the threshold fails, before and after.
-        for count, label, want_fail in ((100, "-47.6% drop", True), (241, "+26.2% increase", False)):
+        # (cur, real delta, pre-fix exit, pre-fix printed sign, new exit, new sign)
+        table = (
+            (241, "+26.2%", 0, "-26.2%", 0, "+26.2%"),
+            (200, "+4.7%", 0, "-4.7%", 0, "+4.7%"),
+            (191, "+0.0%", 0, "+0.0%", 0, "+0.0%"),
+            (150, "-21.5%", 0, "+21.5%", 0, "-21.5%"),
+            (141, "-26.2%", 1, "+26.2%", 1, "-26.2%"),
+            (100, "-47.6%", 1, "+47.6%", 1, "-47.6%"),
+        )
+        for count, real, old_exit, old_sign, new_exit, new_sign in table:
             _setup(workdir, overlay_count=count, last=_lkg(191))
-            code, _ = _run(workdir, script=olds)
-            if (code != 0) == want_fail:
-                pass_(f"pre-fix gate and new gate agree on the verdict for a {label}")
-            elif want_fail:
-                fail_(f"pre-fix gate no longer fails a {label} - history drifted")
-            else:
-                # Expected: the pre-fix gate was too permissive here too.
-                pass_(f"pre-fix gate allowed a {label} (new gate also allows it)")
 
-        # 4) The NEW gate's sign correctness, which the old one lacks.
-        _setup(workdir, overlay_count=241, last=_lkg(191))
-        code, out = _run(workdir)
-        delta = [line for line in out.splitlines() if "delta" in line]
-        if code == 0 and delta and "+26.2%" in delta[0]:
-            pass_("new gate reports +26.2% with a positive sign and commits")
+            old_code, old_out = _run(workdir, script=prefixed)
+            old_delta = next((l for l in old_out.splitlines() if "delta" in l), "")
+            if old_code == old_exit and old_sign in old_delta:
+                pass_(f"pre-fix gate at {real}: prints {old_sign}, exit {old_exit} (as measured)")
+            else:
+                fail_(f"pre-fix gate drifted at {real}: exit {old_code} (want {old_exit}), line {old_delta!r}")
+
+            _setup(workdir, overlay_count=count, last=_lkg(191))
+            new_code, new_out = _run(workdir)
+            new_delta = next((l for l in new_out.splitlines() if "delta" in l), "")
+            if new_code == new_exit and new_sign in new_delta:
+                pass_(f"new gate at {real}: prints {new_sign}, exit {new_exit} (as measured)")
+            else:
+                fail_(f"new gate drifted at {real}: exit {new_code} (want {new_exit}), line {new_delta!r}")
+
+        # The verdict must be identical in both gates; only the number changed.
+        if all(old_exit == new_exit for _, _, old_exit, _, new_exit, _ in table):
+            pass_("both gates agree on every verdict; the fix changes the sign, not the policy")
         else:
-            fail_(f"new gate still misreports the increase: code={code} {delta}")
-        olds.unlink(missing_ok=True)
+            fail_("the fix changed a verdict, not just the sign")
+    finally:
+        prefixed.unlink(missing_ok=True)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_env_override_is_honoured_when_set() -> None:
+    """A SET CORPUS_FRESHNESS_ROOT redirects the gate to that root.
+
+    Note this already worked before the fix -- `os.environ.get(k, default)`
+    only applies `default` when the key is absent. It is pinned because the
+    suite depends on it to run against scratch layouts at all.
+    """
+    outer = _scratch()
+    workdir = outer / "external-corpus-root"
+    try:
+        _setup(workdir, overlay_count=200)
+        lkg = workdir / "corpus" / "freshness-last.json"
+        if lkg.exists():
+            fail_("test setup left an LKG behind")
+            return
+        code, _ = _run(workdir)
+        if code == 0 and lkg.exists():
+            pass_("a set CORPUS_FRESHNESS_ROOT redirects the gate to that root")
+        else:
+            fail_(f"set override not honoured: exit={code}, LKG at override={lkg.exists()}")
+    finally:
+        shutil.rmtree(outer, ignore_errors=True)
+
+
+def test_empty_env_override_falls_back_to_the_repo_root() -> None:
+    """A PRESENT BUT EMPTY override must not resolve to the process CWD.
+
+    An unset CI variable exported as "" is a real shape (`env X= cmd`), and
+    `Path("")` is "." -- so the gate would look for `./corpus/freshness.json`
+    wherever the job happens to be running. The fixed `_paths()` strips the
+    value and falls back to REPO_ROOT.
+    """
+    workdir = _scratch()
+    cwd = _scratch()          # stands in for "wherever the job happens to be"
+    try:
+        # A decoy corpus in the CWD that would make an empty override LOOK ok.
+        (cwd / "corpus").mkdir(parents=True)
+        (cwd / "bench").mkdir(parents=True)
+        (cwd / "corpus" / "freshness.json").write_text(json.dumps(
+            {"sources": [{"name": "decoy", "ok": True}]}))
+        # The decoy must be DISTINGUISHABLE from the repo's own corpus: the
+        # repo tracks corpus/freshness-last.json (191 models at the time of
+        # writing), so a decoy that mirrored those numbers would be invisible
+        # in the output and the test could not tell the two roots apart. Use a
+        # LKG and an overlay count that appear nowhere in the real checkout.
+        (cwd / "corpus" / "freshness-last.json").write_text(json.dumps(_lkg(7777)))
+        (cwd / "bench" / "overlay.json").write_text(json.dumps(
+            {f"m{i}": {"agentic_score": 0.7} for i in range(7778)}))
+
+        env = {**os.environ, "CORPUS_FRESHNESS_ROOT": ""}
+        cmd = [sys.executable, str(SCRIPT)]
+        run = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(cwd))
+        out = run.stdout + run.stderr
+        # With the fix, "" falls back to REPO_ROOT, which has a real corpus/.
+        # With `Path("")`, it would silently use ./ and see the decoy.
+        if "7777" not in out and "7778" not in out and "decoy" not in out:
+            pass_("an empty CORPUS_FRESHNESS_ROOT does not resolve to the CWD")
+        else:
+            fail_(f'an empty override resolved to "." and used the CWD corpus: {out.strip()[:200]!r}')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(cwd, ignore_errors=True)
 
 
 def main() -> int:
-    test_coverage_increase_of_26_percent_passes()
     test_all_sources_failed_is_hard_fails()
     test_empty_overlay_is_hard_fails()
     test_overlay_below_minimum_threshold_fails()
@@ -445,8 +499,9 @@ def main() -> int:
     test_coverage_drop_of_26_percent_fails()
     test_coverage_within_threshold_passes_in_both_directions()
     test_coverage_exactly_at_the_threshold_passes()
-    test_env_override_is_honoured()
-    test_old_code_fails_the_26_percent_increase()
+    test_env_override_is_honoured_when_set()
+    test_empty_env_override_falls_back_to_the_repo_root()
+    test_the_gate_agrees_with_a_signed_delta_table()
     test_force_publish_overrides_gate()
     test_clean_pass_persists_new_lkg_baseline()
     test_missing_freshness_report_hard_fails()

@@ -34,11 +34,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def _paths() -> tuple[Path, Path]:
     """Resolve corpus + overlay paths. Tests can override via env vars."""
-    # `os.environ.get(k, default)` evaluates `default` eagerly, so it can never
-    # substitute a value -- an override set by a test was silently ignored and
-    # the check read (and rewrote) the real checkout's corpus/. Only fall back
-    # when the override is absent or empty.
-    base = Path(os.environ.get("CORPUS_FRESHNESS_ROOT") or str(REPO_ROOT))
+    # `os.environ.get(key, default)` evaluates `default` eagerly but only
+    # RETURNS it when the key is ABSENT -- a set override has always been
+    # honoured, so this is not the bug it first looks like. What the plain
+    # form cannot survive is a PRESENT BUT EMPTY value (an unset CI variable
+    # exported as ""): `Path("")` is the current directory, so the gate would
+    # look for `./corpus/freshness.json` wherever the job happens to be. An
+    # empty or whitespace-only override now falls back to the repo root.
+    override = (os.environ.get("CORPUS_FRESHNESS_ROOT") or "").strip()
+    base = Path(override) if override else REPO_ROOT
     return base / "corpus", base / "bench" / "overlay.json"
 
 # Allowed coverage drop between consecutive runs, expressed as a fraction
