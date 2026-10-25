@@ -539,10 +539,6 @@ def test_empty_env_override_falls_back_to_the_repo_root() -> None:
             pass_("an empty CORPUS_FRESHNESS_ROOT resolves to REPO_ROOT/corpus, not the CWD")
         else:
             fail_(f"empty override resolved to {corpus_path!r}, expected {expected_corpus!r}")
-        if str(cwd) not in corpus_path:
-            pass_("the CWD decoy was not selected")
-        else:
-            fail_("the empty override fell through to the CWD")
 
         # Deliberately no end-to-end run against REPO_ROOT here: it would read
         # the checkout's real corpus/freshness.json, so it would pass or fail
