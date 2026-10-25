@@ -130,7 +130,7 @@ leaves an orphan process behind.
 
 The request budget is a property of the **model**, not only of the host. One
 provider routinely serves a fast local reviewer and a slow frontier model, and
-the two need opposite budgets: measured 2026-10-21 (HYDRA),
+the two need opposite budgets: measured 2026-10-21 on a shared host,
 `zoder review --panel MiniMax-M3 ...` on a ~650-line diff was cut twice at the
 120s default ("[zoder] still waiting for minimax-m3 after 90s ... request budget
 120s" -> "review incomplete") while `gemma4-31b` and
@@ -191,8 +191,8 @@ a coin flip between two budgets nor one alias silently hiding the other's.
 
 Before this fix every billable call left a 64 KiB slot in
 `~/.zoder/ledger.jsonl` and every reservation re-read the whole file under a
-host-wide lock. Measured: ACHILLES 506 MB / 7,725 calls, HYDRA 328 MB. One
-review chunk then spent seconds re-reading hundreds of MB while holding the
+host-wide lock. Measured on two fleet hosts: 506 MB / 7,725 calls on one and
+328 MB on the other. One review chunk then spent seconds re-reading hundreds of MB while holding the
 lock, and concurrent sessions serialized silently. Slots are now 4 KiB and a
 mostly-padding ledger is compacted on the next write (see the ledger module
 docs); `ledger_wait_ms` shows what is left.
@@ -208,9 +208,9 @@ Optional, off by default. Configured by environment only, so an older binary
 reading the same shared config never meets an unknown key:
 
 ```sh
-# at most 2 concurrent reviewer calls to the CERBERUS gemma route from this
-# host, 4 to EIH, unlimited for everything else
-export ZODER_PROVIDER_CONCURRENCY="cerberus-reviewer=2,nvidia-eih=4"
+# at most 2 concurrent reviewer calls to the provider-a route from this
+# host, 4 to provider-b, unlimited for everything else
+export ZODER_PROVIDER_CONCURRENCY="provider-a=2,provider-b=4"
 # fail (and let the next reviewer candidate take over) after 15 minutes
 export ZODER_QUEUE_TIMEOUT_S=900
 ```
@@ -221,17 +221,17 @@ on the host. A process that dies releases its slot automatically. A queue
 timeout is a capacity failure, so the reviewer chain moves to the next
 configured reviewer instead of failing the review.
 
-## Recommended settings for a shared host (HYDRA)
+## Recommended settings for a shared host
 
-HYDRA runs about ten agent sessions against one Zeroclaw daemon, and their
-reviews all go to the same two reviewer routes.
+A shared host runs about ten agent sessions against one Zeroclaw daemon, and
+their reviews all go to the same two reviewer routes.
 
 - Deploy a zoder build that contains the ledger fix first; it removes the
   dominant serialization.
-- `ZODER_PROVIDER_CONCURRENCY="cerberus-reviewer=2,nvidia-eih=4"`: CERBERUS
+- `ZODER_PROVIDER_CONCURRENCY="provider-a=2,provider-b=4"`: provider-a
   serves gemma4-31b from one GPU, so more than two concurrent chunks from one
-  host only lengthens everyone's queue; EIH rate-limits (HTTP 429) under
-  bursts.
+  host only lengthens everyone's queue; the hosted provider rate-limits
+  (HTTP 429) under bursts.
 - `ZODER_QUEUE_TIMEOUT_S=900` (the default).
 - Keep `--request-timeout` at 300 for gemma reviews of large chunks.
 - Pin `request_timeout_s = 600` on the `MiniMax-M3` profile (see "Per-model
@@ -244,34 +244,44 @@ reviews all go to the same two reviewer routes.
 
 These are recommendations; nothing is applied automatically.
 
-## EIH health gate (before any EIH query)
+## Health gate for a rate-limited hosted provider
 
-NVIDIA EIH (`https://integrate.api.nvidia.com/v1`) rate-limits fleet-wide:
-a study run saw HTTP 429 on 7.5% of reviewer calls, in bursts, even at one
-request in flight. zoder therefore never queries an EIH model blindly:
+A provider explicitly opts in to pre-query health gating by id:
+
+```toml
+[health]
+providers = ["provider-a"]
+```
+
+Gating is opt-in: a provider that is not listed is never probed or skipped
+before a query, whatever its endpoint. For an opted-in provider, a study run
+saw HTTP 429 on 7.5% of reviewer calls, in bursts, even at one request in
+flight, so zoder never queries it blindly:
 
 - Before the first query of a run, and again once the last check is older
-  than `ZODER_EIH_HEALTH_TTL_S` (default 300s) or after any 429/5xx/timeout,
-  it runs a bounded `GET {base}/models` (`ZODER_EIH_PROBE_TIMEOUT_MS`,
-  default 5000) that must list the model. EIH has no per-model status
-  endpoint. The "Healthy" table seen in fleet logs is zoder's own
-  `~/.zoder/health.json` (`zoder health`), which is where the gate keeps its
-  state, so all zoder processes on a host share it.
+  than `ZODER_PROVIDER_HEALTH_TTL_S` (default 300s) or after any
+  429/5xx/timeout, it runs a bounded `GET {base}/models`
+  (`ZODER_PROVIDER_HEALTH_PROBE_TIMEOUT_MS`, default 5000) that must list the
+  model. The provider needs no per-model status endpoint. The "Healthy" table
+  seen in logs is zoder's own `~/.zoder/health.json` (`zoder health`), which
+  is where the gate keeps its state, so all zoder processes on a host share
+  it.
 - A per-model circuit breaker in that store opens on 429, 5xx, timeouts and
   failed probes: 30s backoff doubling to 15 min, never shorter than the
   provider's Retry-After. After the backoff one process claims a half-open
   probe; success closes the breaker.
-- An EIH 429 is not retried in-process (that only hammers the shared
-  limiter): the breaker opens and the reviewer chain falls to the next
-  configured route.
+- A 429 from a gated provider is not retried in-process (that only hammers
+  the shared limiter): the breaker opens and the reviewer chain falls to the
+  next configured route.
 - While the breaker is open the model is skipped without any request. The
   review JSON lists it in `skipped_unhealthy` (model, provider, reason,
-  `retry_not_before_unix`), and each EIH receipt carries a `health` object
+  `retry_not_before_unix`), and each gated receipt carries a `health` object
   (`source`: `cache`, `probe` or `half_open_probe`). A skipped reviewer is
   never a pass: the slot either falls back (its receipt names the serving
   model) or fails, and a panel missing a member stays incomplete.
-- `zoder exec --oneshot` skips an unhealthy EIH link in its chain the same
-  way; an agentic `zoder exec` whose route is EIH stops with the reason
+- `zoder exec --oneshot` skips an unhealthy gated link in its chain the same
+  way; an agentic `zoder exec` whose route is gated stops with the reason
   (the engine does not switch models by itself).
 
-Routing rules are unchanged: Nemotron is served only by the EIH route.
+Routing rules are unchanged; opting a provider in to the gate does not
+change which provider serves a model.

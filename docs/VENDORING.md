@@ -57,7 +57,7 @@ locally; `backend-oracle`/`backend-db2`/`backend-mysql` need Oracle Instant
 Client / DB2 CLI / MySQL client at build+runtime). They are all **feature-gated
 off by default** so the default build and `--features ci-all` never require them.
 
-### Verification (ULTRA, `cargo +1.93.0`, base `c170d39a8`)
+### Verification (arm64 build host, `cargo +1.93.0`, base `c170d39a8`)
 
 `check --workspace` ✅ · `clippy --workspace --all-targets --features ci-all -D warnings` ✅ ·
 `fmt --all --check` ✅ · `test -p zeroclaw-pricing` (4 conformance vectors) ✅ ·
@@ -101,7 +101,7 @@ Then add a row to the feature inventory above. Keep the delta a **single commit*
   (gitignored) and builds the engine + `zerocode`.
 - `ZEROCLAW_SRC_DIR=<path>` reuses an existing checkout (skips clone, reuses the
   build cache) — handy for CI and local iteration.
-- Heavy zeroclaw builds run **off the dev Mac** (e.g. ULTRA) per fleet policy.
+- Heavy zeroclaw builds run **off the dev Mac** (e.g. on a Linux build host) per fleet policy.
 
 ## Accepted limits of the existing RPC surface
 
