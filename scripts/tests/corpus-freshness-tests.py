@@ -383,7 +383,7 @@ def test_the_gate_agrees_with_a_signed_delta_table() -> None:
     written as a table so the sign of every case is visible in one place.
 
     Measured (2026-10-25) from the pre-fix script as committed, reproduced in
-    this test by extracting it from git history:
+    this test from the vendored, digest-pinned copy PREFIX_GATE:
 
         cur   real delta   pre-fix prints   pre-fix exit
         241      +26.2%        -26.2%            0
@@ -527,13 +527,13 @@ def test_empty_env_override_falls_back_to_the_repo_root() -> None:
         )
         env = {**os.environ, "CORPUS_FRESHNESS_ROOT": ""}
         run = subprocess.run([sys.executable, "-c", probe], capture_output=True,
-                             text=True, env=env, cwd=str(cwd))
+                             text=True, env=env, cwd=str(cwd), check=False)
         out = run.stdout + run.stderr
         line = next((l for l in out.splitlines() if l.startswith("PROBE[")), None)
         if line is None:
             fail_(f"probe produced no path tuple: {out.strip()[:200]!r}")
             return
-        corpus_path, overlay_path = json.loads(line[len("PROBE"):])
+        corpus_path, _overlay_path = json.loads(line[len("PROBE"):])
         expected_corpus = str(REPO_ROOT / "corpus")
         if corpus_path == expected_corpus:
             pass_("an empty CORPUS_FRESHNESS_ROOT resolves to REPO_ROOT/corpus, not the CWD")
