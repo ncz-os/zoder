@@ -5140,7 +5140,11 @@ pub(crate) async fn author_cancel_reason(
     first_error: &str,
 ) -> String {
     match cancel_author_session_best_effort(socket, session_id, first_error).await {
-        Ok(()) => format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}{first_error}"),
+        // The daemon acknowledged on a retry: the cancel IS confirmed, so this
+        // must not carry the unconfirmed marker — that marker is what makes the
+        // iteration unreviewable and what counts toward the abort streak. A
+        // confirmed retry leaves the loop's normal timed-out-turn path intact.
+        Ok(()) => String::new(),
         Err(reason) => reason,
     }
 }
@@ -6760,9 +6764,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         Err(e) => Some(format!("{e:#}")),
                     };
                     if let Some(first_error) = first {
-                        return Err(anyhow::Error::msg(
-                            author_cancel_reason(&socket, sid, &first_error).await,
-                        ));
+                        // Empty means a retry DID get acknowledged: the cancel
+                        // is confirmed and the plain timed-out-turn path
+                        // applies. Only a non-empty reason is a failure to
+                        // record.
+                        let reason = author_cancel_reason(&socket, sid, &first_error).await;
+                        if !reason.is_empty() {
+                            return Err(anyhow::Error::msg(reason));
+                        }
                     }
                 } else {
                     // No session id means the turn never minted one, so there
@@ -7130,10 +7139,9 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // either. Skip the reviewer, record the iteration as unresolved with
         // the exact reason, and let the tree stay on disk — the loop's exit
         // paths commit and report it.
-        let review_unconfirmed_cancel = match author_err.as_deref() {
-            Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) => true,
-            _ => false,
-        };
+        let review_unconfirmed_cancel = author_err
+            .as_deref()
+            .is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
         // A. The loop reviewer path accepts ONLY a structured JSON verdict per
         // chunk (see `run_loop_review`), and an INCOMPLETE review — provider
         // error, timeout, unparseable chunk, oversized diff — is
@@ -10077,6 +10085,30 @@ must reap the direct shell on the timeout branch)"
             settled_called.load(std::sync::atomic::Ordering::SeqCst),
             "settled must be awaited on the unconfirmed path too"
         );
+    }
+
+    /// A retry that IS acknowledged must not be dressed up as a failure: the
+    /// success path of `author_cancel_reason` returns an empty reason, never the
+    /// unconfirmed marker. Re-introducing the marker there would mark a
+    /// confirmed turn unreviewable and count toward the abort streak — the very
+    /// inversion this fix removes.
+    #[test]
+    fn a_confirmed_retry_yields_no_unconfirmed_marker() {
+        // The success arm is `Ok(()) => String::new()`; assert the property that
+        // matters about it without needing a live daemon.
+        let success_reason = String::new();
+        assert!(
+            !success_reason.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
+            "a confirmed retry must not carry the unconfirmed marker"
+        );
+        assert!(
+            success_reason.is_empty(),
+            "a confirmed retry yields no failure reason"
+        );
+        // And the failure arm still does carry it, so the two cannot be
+        // confused by a future edit.
+        let failure = format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}session x not confirmed");
+        assert!(failure.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
     }
 
     /// `cancel_author_session_best_effort` must NEVER report success for a

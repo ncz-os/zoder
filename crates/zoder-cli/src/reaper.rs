@@ -928,16 +928,44 @@ pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_millis(1500);
 /// discard work or to stop the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnconfirmedCancelOutcome {
-    /// A retry was acknowledged. The turn is stopped; nothing else to do.
-    Confirmed,
+    /// A retry was acknowledged, on retry `n` of [`CANCEL_RETRY_ATTEMPTS`]. The
+    /// turn is stopped; nothing else to do. The count travels with the arm so
+    /// the settled record can say WHICH retry succeeded instead of guessing.
+    Confirmed(usize),
     /// The engine socket lost its listener during the retries (ENOENT /
     /// ECONNREFUSED): the daemon that owned the session is gone, and the
-    /// session with it.
+    /// session with it. No retry after that point could have been made, so this
+    /// carries no attempt count.
     DaemonGone,
-    /// The daemon is there and never acknowledged. A settled turn does not ack
-    /// a cancel and a heavily loaded daemon can outlast every retry, so this is
-    /// "could not prove the turn stopped", not "the turn is running".
-    NeverAcknowledged,
+    /// The daemon is there and never acknowledged, after `n` retries. A settled
+    /// turn does not ack a cancel and a heavily loaded daemon can outlast every
+    /// retry, so this is "could not prove the turn stopped", not "the turn is
+    /// running".
+    NeverAcknowledged(usize),
+}
+
+/// What `<socket dir>/daemon.pid` says about the process that owns `socket`.
+/// "No record" and "a record naming a process that is not the daemon" are
+/// different facts: in the second case a daemon IS running, it is just not the
+/// one the stale record describes, so it is not ours to signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonRecordState {
+    /// The record names this live process (pid and start time both match).
+    Live(u32),
+    /// A record exists, but the pid now belongs to a different process.
+    RecycledPid(u32),
+    /// No record at all, or one that does not parse.
+    Missing,
+}
+
+impl DaemonRecordState {
+    /// The pid that is safe to signal, if any.
+    pub(crate) fn pid(self) -> Option<u32> {
+        match self {
+            DaemonRecordState::Live(pid) => Some(pid),
+            DaemonRecordState::RecycledPid(_) | DaemonRecordState::Missing => None,
+        }
+    }
 }
 
 /// Re-send `session/cancel` for `id` a bounded number of times with backoff,
@@ -958,7 +986,7 @@ pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> Unconfi
                     attempt + 1,
                     CANCEL_RETRY_ATTEMPTS
                 );
-                return UnconfirmedCancelOutcome::Confirmed;
+                return UnconfirmedCancelOutcome::Confirmed(attempt + 1);
             }
             Err(e) => {
                 if classify_cancel_error(&e) == CancelFailure::EngineUnreachable {
@@ -969,7 +997,7 @@ pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> Unconfi
             }
         }
     }
-    UnconfirmedCancelOutcome::NeverAcknowledged
+    UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS)
 }
 
 /// What an unconfirmed cancel settled to, for the log and for the tests.
@@ -1005,10 +1033,14 @@ pub(crate) fn settle_unconfirmed_cancel(
 ) -> UnconfirmedCancel {
     let mut settled = UnconfirmedCancel {
         session_id: id.to_string(),
-        attempts: if outcome == UnconfirmedCancelOutcome::Confirmed {
-            1
-        } else {
-            1 + CANCEL_RETRY_ATTEMPTS
+        // The caller's failure IS attempt 1; `retry_unconfirmed_cancel` reports
+        // how many of its own attempts it spent before giving up, so the total
+        // is exact for every outcome instead of a constant that is only right
+        // for the retry-exhausted case.
+        attempts: 1 + match outcome {
+            UnconfirmedCancelOutcome::Confirmed(attempts)
+            | UnconfirmedCancelOutcome::NeverAcknowledged(attempts) => attempts,
+            UnconfirmedCancelOutcome::DaemonGone => 0,
         },
         outcome,
         daemon_pid: None,
@@ -1018,11 +1050,19 @@ pub(crate) fn settle_unconfirmed_cancel(
     // Whatever happened, this process must not ask again: the answer is now a
     // fact about the run, and the log carries one line per session.
     mark_cancelled(id);
-    if outcome == UnconfirmedCancelOutcome::Confirmed {
-        settled.reason = format!("session {id} cancel confirmed after retrying an unconfirmed one");
+    if let UnconfirmedCancelOutcome::Confirmed(attempts) = outcome {
+        settled.reason = format!(
+            "session {id} cancel confirmed on retry {}/{} of an unconfirmed one",
+            attempts, CANCEL_RETRY_ATTEMPTS
+        );
         return settled;
     }
-    let daemon_pid = daemon_pid_for_socket(socket);
+    // Distinguish "the record names nobody" from "there is no record at all":
+    // a recycled pid is a live daemon, just not the one that owned the session,
+    // and an operator reading "no live daemon pid is recorded" would be told
+    // the opposite of what happened.
+    let record = daemon_record_state(socket);
+    let daemon_pid = record.pid();
     settled.daemon_pid = daemon_pid;
     if let Some(pid) = daemon_pid {
         // Best effort, by EXACT pid — the identity the reaper already spares,
@@ -1039,31 +1079,53 @@ pub(crate) fn settle_unconfirmed_cancel(
         }
         settled.daemon_stopped = !alive(pid);
     }
-    let cause = match outcome {
-        UnconfirmedCancelOutcome::Confirmed => unreachable!("handled above"),
-        UnconfirmedCancelOutcome::DaemonGone => {
-            "the engine socket lost its listener during the retries, so the daemon that owned \
-             the session is gone and the turn with it"
+    // Every arm yields the operator-facing cause as a String so the record and
+    // the log carry the same text.
+    let cause: String = match outcome {
+        // Settled by the early return above; this arm completes the match
+        // without an `unreachable!()` claim, and still yields a usable reason.
+        UnconfirmedCancelOutcome::Confirmed(attempts) => {
+            format!("cancel confirmed on retry {attempts} of an unconfirmed one")
         }
-        UnconfirmedCancelOutcome::NeverAcknowledged if settled.daemon_stopped => {
+        UnconfirmedCancelOutcome::DaemonGone => "the engine socket lost its listener during the \
+             retries, so the daemon that owned the session is gone and the turn with it"
+            .to_string(),
+        UnconfirmedCancelOutcome::NeverAcknowledged(_) if settled.daemon_stopped => {
             "the daemon never acknowledged it and was stopped by pid, which ends any turn it \
              was still running"
+                .to_string()
         }
-        UnconfirmedCancelOutcome::NeverAcknowledged => match daemon_pid {
-            Some(_) => "the daemon never acknowledged it and could not be stopped by pid",
-            None => {
-                "the daemon never acknowledged it (a turn that already settled does not ack a \
-                 cancel, and a slow daemon can outlast every retry) and no live daemon pid is \
-                 recorded for this socket, so it is left running"
+        UnconfirmedCancelOutcome::NeverAcknowledged(_) => match record {
+            DaemonRecordState::Live(_) => {
+                "the daemon never acknowledged it and could not be stopped by pid".to_string()
             }
+            // A live daemon IS running here — it is simply not the process the
+            // (stale) record describes, so it is not ours to kill. Saying "no
+            // live daemon is recorded" would state the opposite of the truth.
+            DaemonRecordState::RecycledPid(pid) => format!(
+                "the daemon never acknowledged it, and the recorded daemon pid {pid} now belongs \
+                 to a different process (the record is stale), so no daemon was stopped"
+            ),
+            DaemonRecordState::Missing => "the daemon never acknowledged it (a turn that already \
+                 settled does not ack a cancel, and a slow daemon can outlast every retry) and no \
+                 daemon record exists for this socket, so there is no process to stop"
+                .to_string(),
         },
     };
-    settled.reason = format!(
-        "session {id} cancel not confirmed after {} attempt(s) ({first_error}); {cause}. \
-         Treated as best-effort cleanup: the worktree is preserved, not discarded, and whatever \
-         the agent left running in the workspace is still reaped",
-        settled.attempts
-    );
+    let attempts = settled.attempts;
+    finish(
+        settled,
+        format!(
+            "session {id} cancel not confirmed after {attempts} attempt(s) ({first_error}); \
+             {cause}. Treated as best-effort cleanup: the worktree is preserved, not discarded, \
+             and whatever the agent left running in the workspace is still reaped"
+        ),
+    )
+}
+
+/// Set the operator-facing reason, log it once, and hand the record back.
+fn finish(mut settled: UnconfirmedCancel, reason: String) -> UnconfirmedCancel {
+    settled.reason = reason;
     eprintln!("[zoder] {}", settled.reason);
     settled
 }
@@ -1076,14 +1138,29 @@ pub(crate) fn settle_unconfirmed_cancel(
 /// `(pid, start_ticks)` contract, that the spawner writes and the reaper's
 /// daemon exemption already honours: "which process owns this socket" has one
 /// answer in this crate, not two.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn daemon_pid_for_socket(socket: &Path) -> Option<u32> {
-    let (pid, start_ticks) = crate::read_daemon_record(&daemon_pid_file_next_to(socket))?;
+    daemon_record_state(socket).pid()
+}
+
+/// What the `<data dir>/daemon.pid` record next to `socket` says, with the live
+/// process re-checked so a recycled pid is reported as recycled rather than as
+/// "no daemon".
+///
+/// This reads the SAME record, with the same `(pid, start_ticks)` contract, that
+/// the spawner writes and the reaper's daemon exemption already honours: "which
+/// process owns this socket" has one answer in this crate, not two.
+pub(crate) fn daemon_record_state(socket: &Path) -> DaemonRecordState {
+    let Some((pid, start_ticks)) = crate::read_daemon_record(&daemon_pid_file_next_to(socket))
+    else {
+        return DaemonRecordState::Missing;
+    };
     // The record is only a claim; `/proc` decides. A reused pid presents a
     // different start time and names nobody.
     if live_start_ticks(pid) != Some(start_ticks) {
-        return None;
+        return DaemonRecordState::RecycledPid(pid);
     }
-    Some(pid)
+    DaemonRecordState::Live(pid)
 }
 
 /// The daemon pid file that belongs to `socket`'s directory: the socket lives
@@ -3308,7 +3385,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            UnconfirmedCancelOutcome::NeverAcknowledged,
+            UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
             "a daemon that accepts every cancel and answers none is never acknowledged"
         );
         assert_eq!(
@@ -3377,16 +3454,18 @@ mod tests {
 
         assert_eq!(
             outcome,
-            UnconfirmedCancelOutcome::Confirmed,
-            "a daemon that acks the second attempt HAS confirmed the cancel"
+            UnconfirmedCancelOutcome::Confirmed(2),
+            "a daemon that acks only the SECOND retry reports retry 2 (the counter is sealed \
+             on the retry that succeeded, not on the first one)"
         );
         assert_eq!(
-            settled.attempts, 1,
-            "a confirmed retry is not an unconfirmed cancel"
+            settled.attempts, 3,
+            "a cancel confirmed on retry 2 is three attempts (the caller's first + both \
+             retries) — the count must be measured, never assumed"
         );
         assert!(
-            settled.reason.contains("confirmed after retrying"),
-            "the reason must say the retry worked: {}",
+            settled.reason.contains("confirmed on retry 2/"),
+            "the reason must name WHICH retry worked: {}",
             settled.reason
         );
         assert_eq!(
@@ -3483,7 +3562,10 @@ mod tests {
             "first not confirmed",
         );
 
-        assert_eq!(outcome, UnconfirmedCancelOutcome::NeverAcknowledged);
+        assert_eq!(
+            outcome,
+            UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS)
+        );
         assert_eq!(settled.daemon_pid, Some(daemon_pid));
         assert!(
             settled.daemon_stopped,
@@ -3535,6 +3617,88 @@ mod tests {
             "the bystander must not have been signalled"
         );
         kill_exact(bystander);
+    }
+
+    /// A STALE record is not an ABSENT one. When the recorded pid now belongs to
+    /// a different process there is still a daemon alive somewhere — it is just
+    /// not the one the record describes — so the settle line must say the record
+    /// is stale and that no daemon was stopped, instead of claiming "no live
+    /// daemon pid is recorded ... so it is left running", which states the
+    /// opposite of what happened.
+    #[test]
+    fn a_stale_daemon_record_is_reported_as_stale_not_absent() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let bystander = spawn_sleeper(dir.path());
+        std::fs::write(
+            socket.with_file_name("daemon.pid"),
+            format!("{bystander} 1\n"),
+        )
+        .expect("write a stale daemon record");
+        note_session("stale-record-probe");
+
+        assert_eq!(
+            daemon_record_state(&socket),
+            DaemonRecordState::RecycledPid(bystander),
+            "a record whose start time does not match names a recycled pid"
+        );
+
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "stale-record-probe",
+            UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
+            "first not confirmed",
+        );
+
+        assert!(
+            settled.reason.contains("record is stale"),
+            "the stale record must be named as stale: {}",
+            settled.reason
+        );
+        assert!(
+            !settled.reason.contains("no live daemon pid is recorded"),
+            "a stale record must not be reported as an absent one: {}",
+            settled.reason
+        );
+        assert!(!settled.daemon_stopped, "nothing may be stopped by pid");
+        assert_eq!(settled.daemon_pid, None);
+        assert!(
+            alive(bystander),
+            "the bystander behind the recycled pid must not be signalled"
+        );
+
+        forget_session("stale-record-probe");
+        kill_exact(bystander);
+    }
+
+    /// An ABSENT record says exactly that, and differs from the stale case.
+    #[test]
+    fn an_absent_daemon_record_is_reported_as_absent() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        note_session("absent-record-probe");
+
+        assert_eq!(daemon_record_state(&socket), DaemonRecordState::Missing);
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "absent-record-probe",
+            UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
+            "first not confirmed",
+        );
+        assert!(
+            settled.reason.contains("no daemon record exists"),
+            "an absent record must be named as absent: {}",
+            settled.reason
+        );
+        assert!(
+            !settled.reason.contains("record is stale"),
+            "an absent record must not be reported as stale: {}",
+            settled.reason
+        );
+
+        forget_session("absent-record-probe");
     }
 
     /// The warning still fires when it is true, and only for what a signal
