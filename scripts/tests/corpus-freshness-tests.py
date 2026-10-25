@@ -68,6 +68,18 @@ def _run(script_cwd: Path, force: bool = False, *extra: str,
     return r.returncode, (r.stdout + r.stderr)
 
 
+def _run_env(cwd: Path, env_overrides: dict[str, str]) -> tuple[int, str]:
+    """Run the gate from `cwd` with an explicit environment, verbatim.
+
+    Unlike `_run`, this does NOT inject CORPUS_FRESHNESS_ROOT -- the caller
+    passes exactly what it wants to test (including an empty value).
+    """
+    env = {**os.environ, **env_overrides}
+    r = subprocess.run([sys.executable, str(SCRIPT)], cwd=str(cwd),
+                       capture_output=True, text=True, env=env)
+    return r.returncode, r.stdout + r.stderr
+
+
 def _setup(workdir: Path, *, freshness: dict | None = None,
            overlay: dict | None = None,
            last: dict | None = None,
@@ -251,13 +263,17 @@ def _lkg(count: int) -> dict:
 def test_coverage_increase_of_26_percent_passes() -> None:
     """The 2026-10-25 corpus-sync outage.
 
-    LKG had 191 scored models and the run produced 241 — a +26.2% INCREASE,
-    which corpus-sync reported as "coverage dropped by 26.2%" and refused to
-    publish. Growing coverage is never an outage: it must exit 0.
+    LKG had 191 scored models and the run produced 241 — a +26.2% INCREASE
+    that the gate printed as "coverage delta vs LKG = -26.2%", i.e. reported
+    as a drop. Growing coverage is never an outage: it must exit 0, and it
+    must say +26.2%.
 
-    This is the case the OLD code fails: with `(last - cur) / last` the growth
-    comes out as +26.2%, which is > the +25% threshold, so the old script
-    exits 1 and the corpus never publishes.
+    What the OLD code got wrong here was the NUMBER, not the verdict. With
+    `(last - cur) / last` the growth comes out as -0.262, which is NOT
+    `> +0.25`, so the old gate also exited 0 — it passed for the wrong reason
+    and printed a drop. `test_the_gate_agrees_with_a_signed_delta_table` pins
+    that measured table; do not describe this case as one the old code
+    rejected, because it did not.
     """
     workdir = _scratch()
     try:
@@ -283,7 +299,9 @@ def test_coverage_drop_of_26_percent_fails() -> None:
     """The mirror of the case above: a real −26.2% DROP must still fail.
 
     LKG 191 -> current 141 is −26.2%, past the 25% threshold. Without this the
-    +26% test could be satisfied by removing the gate entirely.
+    +26% test could be satisfied by removing the gate entirely. The old gate
+    also rejected this case (its inverted delta +0.262 tripped `> +0.25`), so
+    the fix here is again the sign, not the verdict.
     """
     workdir = _scratch()
     try:
@@ -450,42 +468,62 @@ def test_env_override_is_honoured_when_set() -> None:
 
 
 def test_empty_env_override_falls_back_to_the_repo_root() -> None:
-    """A PRESENT BUT EMPTY override must not resolve to the process CWD.
+    """A PRESENT BUT EMPTY override must resolve to REPO_ROOT, not the CWD.
 
     An unset CI variable exported as "" is a real shape (`env X= cmd`), and
     `Path("")` is "." -- so the gate would look for `./corpus/freshness.json`
-    wherever the job happens to be running. The fixed `_paths()` strips the
-    value and falls back to REPO_ROOT.
+    wherever the job happens to be running.
+
+    The assertion does not depend on the checkout's corpus being fresh, on the
+    real LKG, or on the real overlay: it asks the script what it resolved to.
+    A decoy corpus in the CWD carries model counts (7777/7778) that appear
+    nowhere in this repository, so "the decoy was used" is unambiguous.
     """
-    workdir = _scratch()
     cwd = _scratch()          # stands in for "wherever the job happens to be"
     try:
-        # A decoy corpus in the CWD that would make an empty override LOOK ok.
         (cwd / "corpus").mkdir(parents=True)
         (cwd / "bench").mkdir(parents=True)
         (cwd / "corpus" / "freshness.json").write_text(json.dumps(
             {"sources": [{"name": "decoy", "ok": True}]}))
-        # The decoy must be DISTINGUISHABLE from the repo's own corpus: the
-        # repo tracks corpus/freshness-last.json (191 models at the time of
-        # writing), so a decoy that mirrored those numbers would be invisible
-        # in the output and the test could not tell the two roots apart. Use a
-        # LKG and an overlay count that appear nowhere in the real checkout.
         (cwd / "corpus" / "freshness-last.json").write_text(json.dumps(_lkg(7777)))
         (cwd / "bench" / "overlay.json").write_text(json.dumps(
             {f"m{i}": {"agentic_score": 0.7} for i in range(7778)}))
 
+        # Ask the script itself which paths _paths() produced. This is exact,
+        # needs no corpus state, and cannot pass vacuously on a crash.
+        probe = (
+            "import json, runpy, sys\n"
+            f"sys.argv = [{str(SCRIPT)!r}]\n"
+            f"g = runpy.run_path({str(SCRIPT)!r}, run_name='probe')\n"
+            "corpus, overlay = g['_paths']()\n"
+            "print('PROBE' + json.dumps([str(corpus), str(overlay)]))\n"
+        )
         env = {**os.environ, "CORPUS_FRESHNESS_ROOT": ""}
-        cmd = [sys.executable, str(SCRIPT)]
-        run = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(cwd))
+        run = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                             text=True, env=env, cwd=str(cwd))
         out = run.stdout + run.stderr
-        # With the fix, "" falls back to REPO_ROOT, which has a real corpus/.
-        # With `Path("")`, it would silently use ./ and see the decoy.
-        if "7777" not in out and "7778" not in out and "decoy" not in out:
-            pass_("an empty CORPUS_FRESHNESS_ROOT does not resolve to the CWD")
+        line = next((l for l in out.splitlines() if l.startswith("PROBE[")), None)
+        if line is None:
+            fail_(f"probe produced no path tuple: {out.strip()[:200]!r}")
+            return
+        corpus_path, overlay_path = json.loads(line[len("PROBE"):])
+        expected_corpus = str(REPO_ROOT / "corpus")
+        if corpus_path == expected_corpus:
+            pass_("an empty CORPUS_FRESHNESS_ROOT resolves to REPO_ROOT/corpus, not the CWD")
         else:
-            fail_(f'an empty override resolved to "." and used the CWD corpus: {out.strip()[:200]!r}')
+            fail_(f"empty override resolved to {corpus_path!r}, expected {expected_corpus!r}")
+        if str(cwd) not in corpus_path:
+            pass_("the CWD decoy was not selected")
+        else:
+            fail_("the empty override fell through to the CWD")
+
+        # And end-to-end: the gate must not mention the decoy counts.
+        code, gate_out = _run_env(cwd, {"CORPUS_FRESHNESS_ROOT": ""})
+        if "7777" not in gate_out and "7778" not in gate_out:
+            pass_("a full run with an empty override never reads the CWD decoy")
+        else:
+            fail_(f"the gate read the CWD decoy: {gate_out.strip()[:200]!r}")
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
         shutil.rmtree(cwd, ignore_errors=True)
 
 
