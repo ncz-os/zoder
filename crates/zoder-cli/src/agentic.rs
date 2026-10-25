@@ -16105,8 +16105,9 @@ mod patch_journal_tests {
     /// This test pins the FIXED contract:
     ///
     ///   1. The process environment is NOT mutated by the test
-    ///      harness (a `GIT_CONFIG_GLOBAL` visible in this process
-    ///      would mean the old, racy guard came back).
+    ///      harness (its own hermetic value visible in this process
+    ///      would mean the old, racy guard came back). A value the
+    ///      host or CI exported itself is not the harness's doing.
     ///   2. A `git` child spawned with the hermetic overrides really
     ///      does see an empty global/system config scope — so the
     ///      host's `~/.gitconfig` cannot leak into the fixture.
@@ -16116,20 +16117,19 @@ mod patch_journal_tests {
     #[test]
     fn git_children_are_hermetic_without_mutating_the_process_environment() {
         // --- (1) the process environment must be untouched -----------
-        assert!(
-            std::env::var_os("GIT_CONFIG_GLOBAL").is_none(),
-            "the test harness must not install GIT_CONFIG_GLOBAL in the \
-             PROCESS environment; raw setenv there races every \
-             concurrently-spawning sibling test and tears the child's \
-             environ block (EFAULT / \"Bad address\"). Overrides belong \
-             on the child (Command::env), not on the process."
-        );
-        assert!(
-            std::env::var_os("GIT_CONFIG_SYSTEM").is_none(),
-            "the test harness must not install GIT_CONFIG_SYSTEM in the \
-             PROCESS environment; overrides belong on the child \
-             (Command::env), not on the process."
-        );
+        let hermetic = hermetic_git_env();
+        for key in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+            let value = hermetic.get(key).expect("hermetic override");
+            assert_ne!(
+                std::env::var(key).ok().as_deref(),
+                Some(value),
+                "the test harness must not install {key} in the PROCESS \
+                 environment; raw setenv there races every \
+                 concurrently-spawning sibling test and tears the child's \
+                 environ block (EFAULT / \"Bad address\"). Overrides belong \
+                 on the child (Command::env), not on the process."
+            );
+        }
 
         // --- (2) the overrides must really reach the child ------------
         let dir = tempfile::tempdir().unwrap();
@@ -16138,7 +16138,7 @@ mod patch_journal_tests {
         cmd.arg("-C")
             .arg(&repo)
             .args(["config", "--global", "--list"]);
-        hermetic_git_env().apply_std(&mut cmd);
+        hermetic.apply_std(&mut cmd);
         let out = cmd.output().expect("spawn git");
         assert!(
             out.status.success(),
