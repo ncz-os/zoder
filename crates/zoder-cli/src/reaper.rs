@@ -889,7 +889,17 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
                         // settled (a settled turn never acknowledges a cancel).
                         // Retry briefly, then treat it as best-effort and say
                         // exactly why — never as a reason to stop the run.
-                        let settled = retry_unconfirmed_cancel(socket, &id).await;
+                        //
+                        // The retries share what is LEFT of the phase budget
+                        // rather than a fixed per-attempt cap: this loop is
+                        // itself deadline-bounded, and a retry sequence that
+                        // outlives the deadline is cut off mid-flight, which
+                        // leaves the cancel unsettled — the state this path
+                        // exists to prevent.
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        let per_attempt = retry_attempt_budget(left);
+                        let settled =
+                            retry_unconfirmed_cancel_within(socket, &id, per_attempt).await;
                         settle_unconfirmed_cancel(socket, &id, settled, &format!("{e:#}"));
                     }
                 },
@@ -917,6 +927,7 @@ const CANCEL_RETRY_BACKOFF: [Duration; 3] = [
 /// did not answer, so waiting the full budget again is just a slower way to
 /// learn the same thing.
 const CANCEL_RETRY_BUDGET: Duration = Duration::from_millis(1500);
+
 /// How long a daemon gets to exit after `SIGTERM` before it is escalated to
 /// `SIGKILL`, when its pid is the only handle left. Same order as the ordinary
 /// reap grace: enough for an orderly exit, short enough that a wedged daemon
@@ -975,16 +986,92 @@ impl DaemonRecordState {
 /// An ENOENT/ECONNREFUSED retry ends the sequence immediately: a socket with no
 /// listener is a fact no further attempt can change (the 01a163c9 lesson), so
 /// asking again would only burn the budget.
+/// The number of retries, the backoff delays, and the per-attempt budget for a
+/// sequence given `left` of its phase budget.
+///
+/// All three shrink together, in that order of preference: the retry COUNT is
+/// reduced first (two good attempts beat three where none can reach the wire),
+/// then the per-attempt budget and the backoff are split across what is left.
+/// Reserving the full nominal backoff first would starve the attempts whenever
+/// the phase budget is smaller than the backoff alone — the reap budget is — and
+/// an attempt with no time to reach the wire "confirms" nothing: it would report
+/// the daemon silent when it was never asked.
+///
+/// `left` is the per-attempt cap the caller wants honoured as an upper bound
+/// (normally [`CANCEL_RETRY_BUDGET`], but a caller with less time left passes
+/// less), so passing the remaining phase budget makes the whole sequence fit
+/// inside the caller's deadline instead of being cut off mid-flight.
+fn retry_plan(left: Duration) -> (usize, Vec<Duration>, Duration) {
+    let nominal_backoff: Duration = CANCEL_RETRY_BACKOFF.iter().copied().sum();
+    // How many retries can each get at least the floor of attempt time plus its
+    // share of backoff? One is the minimum: "unconfirmed" must still mean asked.
+    let floor_total = RETRY_ATTEMPT_FLOOR * CANCEL_RETRY_ATTEMPTS as u32 + nominal_backoff;
+    let retries = if left >= floor_total {
+        CANCEL_RETRY_ATTEMPTS
+    } else {
+        let per_retry = RETRY_ATTEMPT_FLOOR + nominal_backoff / CANCEL_RETRY_ATTEMPTS as u32;
+        ((left.as_secs_f64() / per_retry.as_secs_f64()).floor() as usize)
+            .clamp(1, CANCEL_RETRY_ATTEMPTS)
+    };
+    // Half of what is left goes to the attempts, half to the backoff — the
+    // daemon needs time to drain, and we need time to hear the answer.
+    let attempt_total = (left / 2).min(CANCEL_RETRY_BUDGET * retries as u32);
+    let per_attempt =
+        (attempt_total / retries as u32).clamp(Duration::from_millis(1), CANCEL_RETRY_BUDGET);
+    let backoff_total = left.saturating_sub(per_attempt * retries as u32);
+    // Scale the nominal curve down proportionally, preserving its shape.
+    let scale = if nominal_backoff.is_zero() {
+        0.0
+    } else {
+        (backoff_total.as_secs_f64() / nominal_backoff.as_secs_f64()).min(1.0)
+    };
+    let backoff = CANCEL_RETRY_BACKOFF[..retries.min(CANCEL_RETRY_BACKOFF.len())]
+        .iter()
+        .map(|d| d.mul_f64(scale))
+        .collect();
+    (retries, backoff, per_attempt)
+}
+
+/// The per-attempt budget [`retry_plan`] would use for `left`.
+fn retry_attempt_budget(left: Duration) -> Duration {
+    retry_plan(left).2
+}
+
+/// The least time an attempt is given, even when the phase budget is nearly
+/// spent: a cancel that is cut off before it reaches the socket teaches us
+/// nothing, and "not confirmed" must mean the daemon stayed silent, not that we
+/// hung up on it.
+const RETRY_ATTEMPT_FLOOR: Duration = Duration::from_millis(150);
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> UnconfirmedCancelOutcome {
-    for attempt in 0..CANCEL_RETRY_ATTEMPTS {
-        let backoff = CANCEL_RETRY_BACKOFF[attempt.min(CANCEL_RETRY_BACKOFF.len() - 1)];
-        tokio::time::sleep(backoff).await;
-        match zoder_core::cancel_session(socket, id, CANCEL_RETRY_BUDGET).await {
+    retry_unconfirmed_cancel_within(socket, id, CANCEL_RETRY_BUDGET).await
+}
+
+/// The same sequence, with the per-attempt budget supplied by the caller.
+///
+/// [`retry_unconfirmed_cancel_within`] exists because the caller knows how much
+/// of the phase budget is left: a retry that outlives it is cut off by the
+/// caller mid-flight, which leaves the cancel unsettled instead of settled. The
+/// sequence therefore never spends more than the budget it is given.
+pub(crate) async fn retry_unconfirmed_cancel_within(
+    socket: &Path,
+    id: &str,
+    per_attempt: Duration,
+) -> UnconfirmedCancelOutcome {
+    let (retries, backoff, per_attempt) = retry_plan(per_attempt);
+    for attempt in 0..retries {
+        let delay = backoff
+            .get(attempt)
+            .copied()
+            .unwrap_or_else(|| *backoff.last().unwrap_or(&Duration::ZERO));
+        tokio::time::sleep(delay).await;
+        match zoder_core::cancel_session(socket, id, per_attempt).await {
             Ok(()) => {
                 eprintln!(
                     "[zoder] session {id} cancel confirmed on retry {}/{}",
                     attempt + 1,
-                    CANCEL_RETRY_ATTEMPTS
+                    retries
                 );
                 return UnconfirmedCancelOutcome::Confirmed(attempt + 1);
             }
@@ -997,7 +1084,7 @@ pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> Unconfi
             }
         }
     }
-    UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS)
+    UnconfirmedCancelOutcome::NeverAcknowledged(retries)
 }
 
 /// What an unconfirmed cancel settled to, for the log and for the tests.
@@ -1052,8 +1139,7 @@ pub(crate) fn settle_unconfirmed_cancel(
     mark_cancelled(id);
     if let UnconfirmedCancelOutcome::Confirmed(attempts) = outcome {
         settled.reason = format!(
-            "session {id} cancel confirmed on retry {}/{} of an unconfirmed one",
-            attempts, CANCEL_RETRY_ATTEMPTS
+            "session {id} cancel confirmed on retry {attempts} of a previously unconfirmed one"
         );
         return settled;
     }
@@ -1064,20 +1150,30 @@ pub(crate) fn settle_unconfirmed_cancel(
     let record = daemon_record_state(socket);
     let daemon_pid = record.pid();
     settled.daemon_pid = daemon_pid;
-    if let Some(pid) = daemon_pid {
-        // Best effort, by EXACT pid — the identity the reaper already spares,
-        // terminated on purpose and only on this path. Never by name, never by
-        // pattern, and never when the record no longer matches the live
-        // process (`daemon_pid_for_socket` re-checks the start time).
-        signal(pid, libc_sigterm());
-        let deadline = Instant::now() + DAEMON_EXIT_GRACE;
-        while alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(POLL);
+    if let DaemonRecordState::Live(pid) = record {
+        // The identity is `(pid, start_ticks)`, and the START TIME is re-read
+        // immediately before every signal. Between the check above and the
+        // signal the daemon could exit and the kernel could hand its pid to an
+        // unrelated process; signalling on the bare pid would then kill a
+        // stranger. Re-reading the start time makes the window as small as the
+        // syscall allows, and a mismatch means the pid is no longer the daemon,
+        // so nothing is signalled.
+        let expected = live_start_ticks(pid);
+        if signal_if_same_process(pid, expected, libc_sigterm()) {
+            let deadline = Instant::now() + DAEMON_EXIT_GRACE;
+            while alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(POLL);
+            }
+            // Escalate only to the SAME process that ignored the SIGTERM.
+            if alive(pid) {
+                signal_if_same_process(pid, expected, libc_sigkill());
+            }
+            settled.daemon_stopped = !alive(pid);
+        } else {
+            // The pid was recycled before the signal: nothing was sent, so
+            // nothing was stopped and nothing may be claimed.
+            settled.daemon_stopped = false;
         }
-        if alive(pid) {
-            signal(pid, libc_sigkill());
-        }
-        settled.daemon_stopped = !alive(pid);
     }
     // Every arm yields the operator-facing cause as a String so the record and
     // the log carry the same text.
@@ -2060,6 +2156,30 @@ fn libc_sigkill() -> i32 {
     libc::SIGKILL
 }
 
+/// Send `sig` to `pid` only if that pid is STILL the process with `expected`
+/// start time, and report whether anything was sent.
+///
+/// A pid is not a process identity: between reading a record and signalling it
+/// the target can exit and the kernel can reuse the number. Comparing the start
+/// time immediately before the `kill(2)` closes that window to the syscall, so
+/// a recycled pid is never signalled.
+///
+/// Returns `false` when the process is gone or was replaced — in both cases
+/// there is nothing of ours left to signal.
+#[cfg(target_os = "linux")]
+fn signal_if_same_process(pid: u32, expected: Option<u64>, sig: i32) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    if live_start_ticks(pid) != Some(expected) {
+        return false;
+    }
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 fn signal(pid: u32, sig: i32) {
     // Exact pid, always. There is no `pkill`/`pgrep` fallback anywhere here:
@@ -2114,6 +2234,12 @@ fn libc_sigkill() -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn signal(_pid: u32, _sig: i32) {}
+
+/// No `/proc`, so no start time to compare: nothing is ever signalled here.
+#[cfg(not(target_os = "linux"))]
+fn signal_if_same_process(_pid: u32, _expected: Option<u64>, _sig: i32) -> bool {
+    false
+}
 // ---------------------------------------------------------------------------
 // Regression tests: the 2026-10-21 shared-host orphan incident.
 // All Linux-only: they read /proc and spawn real processes.
@@ -3279,6 +3405,129 @@ mod tests {
     // discarded. The cancel is cleanup; the tree is the product.
     // -----------------------------------------------------------------------
 
+    /// The retry sequence must FIT the phase budget, not merely be bounded:
+    /// a retry cut off by the caller's deadline leaves the cancel unsettled,
+    /// which is the state this whole path exists to prevent.
+    ///
+    /// The measured worst case is one silent daemon (every attempt burns its
+    /// full per-attempt budget) retried inside a budget that has actually run
+    /// out, which is the tightest the sequence ever gets.
+    #[tokio::test]
+    async fn the_retry_sequence_fits_the_phase_budget_it_is_given() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, _attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("budget-probe");
+
+        // A phase budget far smaller than the default per-attempt cap: the
+        // retries must shrink to fit it rather than overrun and be cut off.
+        let given = REAP_CANCEL_BUDGET;
+        let per_attempt = retry_attempt_budget(given);
+        assert!(
+            per_attempt <= given,
+            "no single retry may claim more than the whole budget: {per_attempt:?} > {given:?}"
+        );
+        let started = Instant::now();
+        let _ = retry_unconfirmed_cancel_within(&socket, "budget-probe", per_attempt).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= given + DAEMON_EXIT_GRACE,
+            "the retry sequence must finish inside the budget it was handed \
+             ({given:?}), not run past it: took {elapsed:?}"
+        );
+
+        forget_session("budget-probe");
+        drop(server);
+    }
+
+    /// The budget split degrades sanely at both ends: a healthy deadline still
+    /// gets a full-length attempt, and a nearly spent one still gets enough to
+    /// reach the wire (never zero, which would "confirm" nothing).
+    #[test]
+    fn the_retry_budget_fits_the_deadline_at_both_ends() {
+        assert_eq!(
+            retry_attempt_budget(Duration::from_secs(60)),
+            CANCEL_RETRY_BUDGET,
+            "a generous deadline must not make a retry wait longer than one cancel"
+        );
+        // With NOTHING left, a retry still gets a non-zero slice — enough to
+        // reach the wire — but it must not be inflated to the floor, because
+        // that would push the sequence past a deadline that has already expired.
+        let spent_deadline = retry_attempt_budget(Duration::ZERO);
+        assert!(
+            spent_deadline > Duration::ZERO && spent_deadline < RETRY_ATTEMPT_FLOOR,
+            "an exhausted deadline gets a minimal but non-zero attempt: {spent_deadline:?}"
+        );
+        let tight = retry_attempt_budget(REAP_CANCEL_BUDGET);
+        assert!(
+            tight >= RETRY_ATTEMPT_FLOOR && tight <= CANCEL_RETRY_BUDGET,
+            "a tight budget lands between the floor and the cap: {tight:?}"
+        );
+        // The plan must agree with itself: attempts plus scaled backoff cannot
+        // exceed the phase budget it targets, in either half.
+        let (retries, scaled_backoff, planned) = retry_plan(REAP_CANCEL_BUDGET);
+        assert_eq!(planned, tight, "the plan and the accessor must agree");
+        assert_eq!(
+            scaled_backoff.len(),
+            retries,
+            "the scaled curve keeps one delay per retry"
+        );
+        assert!(
+            (1..=CANCEL_RETRY_ATTEMPTS).contains(&retries),
+            "a retry count always fits the bounded range: {retries}"
+        );
+        let spent: Duration =
+            planned * retries as u32 + scaled_backoff.iter().copied().sum::<Duration>();
+        assert!(
+            spent <= REAP_CANCEL_BUDGET,
+            "the split plus its scaled backoff must fit the budget it targets: \
+             {spent:?} > {REAP_CANCEL_BUDGET:?}"
+        );
+    }
+
+    /// A pid is not a process identity. A signal is sent ONLY when the start
+    /// time still matches, so a pid recycled between the record check and the
+    /// signal cannot take a stranger down with it.
+    #[test]
+    fn a_recycled_pid_is_never_signalled() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bystander = spawn_sleeper(dir.path());
+        let real = crate::reaper::live_start_ticks(bystander).expect("the fixture is live");
+
+        // Wrong start time => the pid now names someone else => no signal.
+        assert!(
+            !signal_if_same_process(bystander, Some(real.wrapping_add(1)), libc_sigterm()),
+            "a mismatched start time must send nothing"
+        );
+        assert!(
+            alive(bystander),
+            "the bystander must survive a signal aimed at a recycled pid"
+        );
+
+        // No start time at all => nothing to compare => no signal.
+        assert!(
+            !signal_if_same_process(bystander, None, libc_sigterm()),
+            "an unknown identity must send nothing"
+        );
+        assert!(alive(bystander), "the bystander must still survive");
+
+        // The REAL identity DOES signal: the guard must not disarm the reap.
+        assert!(
+            signal_if_same_process(bystander, Some(real), libc_sigterm()),
+            "a matching start time must be signalled"
+        );
+        let deadline = Instant::now() + DAEMON_EXIT_GRACE;
+        while alive(bystander) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        if alive(bystander) {
+            kill_exact(bystander);
+        }
+    }
+
     /// A fake daemon for the unconfirmed-cancel tests.
     ///
     /// `ack` decides, per CANCEL attempt, what the daemon does: `true` answers
@@ -3537,7 +3786,7 @@ mod tests {
              retries) — the count must be measured, never assumed"
         );
         assert!(
-            settled.reason.contains("confirmed on retry 2/"),
+            settled.reason.contains("confirmed on retry 2 "),
             "the reason must name WHICH retry worked: {}",
             settled.reason
         );
