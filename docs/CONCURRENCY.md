@@ -52,6 +52,80 @@ budget (`--request-timeout`, default 120s) still bounds the wait; once tokens
 start, the idle guard (`ZODER_IDLE_S`, default 25s) applies, including while a
 model is only streaming reasoning.
 
+## The ACP idle watchdog (agentic turns)
+
+The provider-level idle guard above bounds a single provider HTTP call. The
+**ACP idle watchdog** bounds the agentic TURN: the gap between two
+SUBSTANTIVE outputs from the engine session.
+
+The watchdog has **TWO** windows, because the two waits have different
+causes:
+
+| window | default (self-hosted route) | default (hosted route) | measured from |
+|---|---|---|---|
+| `first_event` | **600s** | 60s | the start of the turn, until the first SUBSTANTIVE output |
+| `between_events` | **180s** | 60s | the last SUBSTANTIVE output |
+
+A **substantive** output is a token (a message chunk or a thought chunk) or a
+tool call. Session metadata, usage reports and keepalives are **not**
+substantive: they neither end the first phase nor restart any clock.
+
+**Phase rules**
+
+1. From the start of the turn until the first substantive output, the
+   `first_event` window applies.
+2. After the first substantive output, the shorter `between_events` window
+   applies.
+3. A pending tool call **suspends** the watchdog (that wait is bounded by the
+   total turn budget). When the tool round **completes**, the phase resets
+   to the `first_event` window, because the next model turn is a new cold
+   start.
+
+The first window is the long one on purpose: the wait for the first token of
+a turn is a **cold start** (a local model loading its weights), not a wedge.
+A single window could not express both — a 180s window kills a slow local
+model before it has produced anything, while a 600s window hides a wedged
+session for ten minutes.
+
+The windows are measured between substantive events, never against the total
+turn runtime (`--agent-timeout`, default 900s), so a long but steady stream
+is never killed — only a session that produces NOTHING is. Such a turn now
+ends with the distinct `idle_timeout` outcome and a structured reason (which
+window tripped, the window length, the last-event age and the model) instead
+of consuming the whole total budget:
+
+```
+zoder: ACP idle timeout: the session produced no substantive output for 181.2s
+       (window=between_events, window_secs=180.000, last-event age 181.2s, model=qwen38)
+```
+
+**Configuration** — each window is set independently, and `0` disables that
+window only:
+
+| knob | first-event window | between-events window |
+|---|---|---|
+| CLI flag | `--agent-idle-timeout-first-event` | `--agent-idle-timeout-between-events` |
+| CLI alias | `--agent-idle-timeout` (sets **both**) | `--agent-idle-timeout` (sets **both**) |
+| config key | `agent_idle_timeout_first_event_s` | `agent_idle_timeout_between_events_s` |
+| config alias | `agent_idle_timeout_s` (sets **both**) | `agent_idle_timeout_s` (sets **both**) |
+| env var | `ZODER_AGENT_IDLE_FIRST_EVENT_S` | `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` |
+| env alias | `ZODER_AGENT_IDLE_S` (sets **both**) | `ZODER_AGENT_IDLE_S` (sets **both**) |
+
+Precedence **per window**, highest first: the specific CLI flag > the legacy
+CLI alias > the specific config key > the legacy config key > the specific
+env var > the legacy env var > the built-in default. The built-in default
+follows the ROUTE: a self-hosted (local) route — a loopback or local-network endpoint (including a private LAN
+address) or a
+self-hosted engine family such as `vllm` / `sglang` / `llamacpp` — gets
+600s/180s, and so does a hosted provider, which can queue or prefill a
+request for minutes before its first token.
+zoder derives the route from the endpoint, so the default is not a guess.
+
+A pending tool call suspends the watchdog (that wait is bounded by the total
+turn budget), and the turn is wound down through the existing teardown path
+(`session/cancel` + the spawned child's reap), so an idle timeout never
+leaves an orphan process behind.
+
 ## Per-model request budget
 
 The request budget is a property of the **model**, not only of the host. One

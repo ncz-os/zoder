@@ -44,8 +44,12 @@ pub use acp_client::{
     agents_status, cancel_session, fetch_engine_config, fetch_quickstart_diagnostics, list_agents,
     new_session, probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call,
     wait_for_socket, write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent,
-    AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult, AgentsStatusResult, ApprovalPolicy,
-    DaemonReadiness, EngineKind, GooseProviderEnv, WriteToolMatrixRow, DEFAULT_AUTO_APPROVE,
+    AgentIdleWindows, AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult,
+    AgentsStatusResult, ApprovalPolicy, DaemonReadiness, EngineKind, GooseProviderEnv,
+    WriteToolMatrixRow, AGENT_IDLE_BETWEEN_EVENTS_ENV, AGENT_IDLE_FIRST_EVENT_ENV,
+    AGENT_IDLE_TIMEOUT_ENV, DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S, DEFAULT_AGENT_IDLE_FIRST_EVENT_S,
+    DEFAULT_AUTO_APPROVE, HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S, HOSTED_AGENT_IDLE_FIRST_EVENT_S,
+    IDLE_TIMEOUT_OUTCOME,
 };
 /// Settle budget the loop grants the daemon to ACK a `session/cancel` after
 /// the author-phase watchdog fires (see `cancel_session`). Canonical value
@@ -53,6 +57,37 @@ pub use acp_client::{
 /// wire-shape tests so a change here is exercised by the test that guards
 /// the loop's `build_diff` ordering.
 pub const CANCEL_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// ACP idle watchdog window from the environment (`ZODER_AGENT_IDLE_S`).
+/// `None` when unset or unparseable; an explicit `0` is honored by the
+/// resolver (`agent_idle_timeout_s`) as "disabled".
+pub fn agent_idle_timeout_s_from_env() -> Option<u64> {
+    std::env::var(AGENT_IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// First-event idle window from the environment
+/// (`ZODER_AGENT_IDLE_FIRST_EVENT_S`).
+///
+/// `None` when unset or unparseable; an explicit `0` is honored by the
+/// resolver as "this window is disabled".
+pub fn agent_idle_first_event_s_from_env() -> Option<u64> {
+    std::env::var(AGENT_IDLE_FIRST_EVENT_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Between-events idle window from the environment
+/// (`ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`).
+///
+/// `None` when unset or unparseable; an explicit `0` is honored by the
+/// resolver as "this window is disabled".
+pub fn agent_idle_between_events_s_from_env() -> Option<u64> {
+    std::env::var(AGENT_IDLE_BETWEEN_EVENTS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
 pub use budget::{estimate_tokens, Budget, BudgetVerdict};
 pub use catalog_models::{
     fetch_catalog_models, merge_into_corpus, merge_or_degrade, CatalogModel, CatalogResponse,
@@ -115,3 +150,48 @@ pub use subscription_tiers::{
 
 /// Crate version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod idle_timeout_env_tests {
+    //! Tests for the ACP idle-watchdog environment override.
+    //!
+    //! The env var is process-global, so the tests that flip it are
+    //! serialized behind one mutex (the same pattern the provider tests
+    //! use for `AZURE_OPENAI_API_VERSION`).
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    use super::*;
+
+    #[test]
+    fn env_var_name_is_the_documented_one() {
+        assert_eq!(
+            AGENT_IDLE_TIMEOUT_ENV, "ZODER_AGENT_IDLE_S",
+            "the documented environment variable name must not drift"
+        );
+    }
+
+    #[test]
+    fn env_value_is_parsed_and_zero_is_preserved() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(AGENT_IDLE_TIMEOUT_ENV).ok();
+        std::env::set_var(AGENT_IDLE_TIMEOUT_ENV, "45");
+        assert_eq!(agent_idle_timeout_s_from_env(), Some(45));
+
+        // `0` must survive the parse: it is the documented "disable"
+        // value, and the resolver (not the env reader) decides what it
+        // means.
+        std::env::set_var(AGENT_IDLE_TIMEOUT_ENV, "0");
+        assert_eq!(agent_idle_timeout_s_from_env(), Some(0));
+
+        // A non-numeric value is ignored (the resolver falls back to the
+        // config / default), never a panic.
+        std::env::set_var(AGENT_IDLE_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(agent_idle_timeout_s_from_env(), None);
+
+        match previous {
+            Some(value) => std::env::set_var(AGENT_IDLE_TIMEOUT_ENV, value),
+            None => std::env::remove_var(AGENT_IDLE_TIMEOUT_ENV),
+        }
+    }
+}

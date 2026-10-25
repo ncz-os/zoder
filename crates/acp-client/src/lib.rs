@@ -812,6 +812,419 @@ impl std::fmt::Debug for GooseProviderEnv {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ACP idle watchdog ("no event" watchdog)
+// ---------------------------------------------------------------------------
+
+/// Default window for the FIRST substantive output of a turn, in seconds.
+///
+/// The first window is deliberately generous: the wait for the first token
+/// of a turn is a COLD START (a local model loading weights, a hosted
+/// provider queueing a cold request), not a wedge. A model that has not
+/// produced anything yet has not had a chance to fail.
+///
+/// See [`DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S`] for the shorter window that
+/// applies once the session has proved it is alive.
+pub const DEFAULT_AGENT_IDLE_FIRST_EVENT_S: u64 = 600;
+
+/// Default window BETWEEN two substantive outputs, in seconds.
+///
+/// Once the session has produced a token (or a tool call) it is ALIVE, so
+/// the gap between two events can be bounded tightly: a session that
+/// stops mid-answer is wedged, not warming up.
+pub const DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S: u64 = 180;
+
+/// First-output window used when the turn runs against a HOSTED provider.
+///
+/// The same as a self-hosted route: a hosted gateway can queue, rate-limit
+/// or prefill a large request for well over a minute before its first
+/// token, so a short window would end healthy turns. Kept as its own
+/// constant so the two routes can be tuned apart.
+pub const HOSTED_AGENT_IDLE_FIRST_EVENT_S: u64 = DEFAULT_AGENT_IDLE_FIRST_EVENT_S;
+
+/// Between-outputs window used when the turn runs against a HOSTED provider.
+pub const HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S: u64 = DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S;
+
+/// Outcome string for a turn ended by the idle watchdog.
+///
+/// Deliberately distinct from `"timeout"` (the total turn budget) so a
+/// caller can tell "the engine produced nothing for N seconds" apart from
+/// "the turn ran out of its total budget" — the two need different
+/// operator responses (raise the idle window vs. raise the total budget).
+pub const IDLE_TIMEOUT_OUTCOME: &str = "idle_timeout";
+
+/// Environment variable that overrides the idle-watchdog window (seconds).
+///
+/// `ZODER_AGENT_IDLE_S=0` disables BOTH windows. It is the legacy single
+/// knob and remains supported as an alias for the two specific variables.
+pub const AGENT_IDLE_TIMEOUT_ENV: &str = "ZODER_AGENT_IDLE_S";
+
+/// Environment variable that overrides the FIRST-event window (seconds).
+///
+/// `ZODER_AGENT_IDLE_FIRST_EVENT_S=0` disables the first-event window
+/// only; the between-events window is untouched.
+pub const AGENT_IDLE_FIRST_EVENT_ENV: &str = "ZODER_AGENT_IDLE_FIRST_EVENT_S";
+
+/// Environment variable that overrides the BETWEEN-events window (seconds).
+///
+/// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S=0` disables the between-events
+/// window only; the first-event window is untouched.
+pub const AGENT_IDLE_BETWEEN_EVENTS_ENV: &str = "ZODER_AGENT_IDLE_BETWEEN_EVENTS_S";
+
+/// Which idle window is in force for the current phase of a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleWindowPhase {
+    /// From the start of the turn (or the end of a tool round) until the
+    /// first SUBSTANTIVE output — a token or a tool call. Session
+    /// metadata and keepalives do NOT end this phase.
+    FirstEvent,
+    /// Between two substantive outputs.
+    BetweenEvents,
+}
+
+impl IdleWindowPhase {
+    /// The stable name of the phase, as reported in the idle error.
+    fn as_str(self) -> &'static str {
+        match self {
+            IdleWindowPhase::FirstEvent => "first_event",
+            IdleWindowPhase::BetweenEvents => "between_events",
+        }
+    }
+}
+
+/// The two idle-watchdog windows for one agentic turn.
+///
+/// `None` for a window means "disabled": that phase of the turn is not
+/// bounded by the idle watchdog at all. `Some(_)` is a window that is
+/// measured against the relevant clock (the phase start for the
+/// first-event window, the last substantive event for the
+/// between-events window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentIdleWindows {
+    first_event: Option<Duration>,
+    between_events: Option<Duration>,
+}
+
+impl Default for AgentIdleWindows {
+    /// The documented defaults ([`DEFAULT_AGENT_IDLE_FIRST_EVENT_S`] and
+    /// [`DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S`]).
+    fn default() -> Self {
+        Self::from_secs(
+            DEFAULT_AGENT_IDLE_FIRST_EVENT_S,
+            DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S,
+        )
+    }
+}
+
+impl AgentIdleWindows {
+    /// Both windows disabled: the driver behaves exactly as it did before
+    /// the watchdog existed and only the total turn budget can end the
+    /// turn.
+    pub const fn disabled() -> Self {
+        Self {
+            first_event: None,
+            between_events: None,
+        }
+    }
+
+    /// Build both windows from a whole number of seconds.
+    ///
+    /// `0` disables that window independently — the documented way to
+    /// turn one phase of the watchdog off without giving up the other.
+    pub fn from_secs(first_event_s: u64, between_events_s: u64) -> Self {
+        Self::from_durations(
+            (first_event_s > 0).then(|| Duration::from_secs(first_event_s)),
+            (between_events_s > 0).then(|| Duration::from_secs(between_events_s)),
+        )
+    }
+
+    /// Build both windows from whole milliseconds.
+    ///
+    /// The scaled counterpart of [`Self::from_secs`], used by the tests so
+    /// the two-window semantics can be exercised in milliseconds instead
+    /// of minutes. `0` disables that window independently.
+    pub fn from_millis(first_event_ms: u64, between_events_ms: u64) -> Self {
+        Self::from_durations(
+            (first_event_ms > 0).then(|| Duration::from_millis(first_event_ms)),
+            (between_events_ms > 0).then(|| Duration::from_millis(between_events_ms)),
+        )
+    }
+
+    /// Build both windows from explicit durations.
+    ///
+    /// A zero-length duration is treated as "disabled", so `Some(0)` and
+    /// `None` mean the same thing.
+    pub fn from_durations(first_event: Option<Duration>, between_events: Option<Duration>) -> Self {
+        Self {
+            first_event: first_event.filter(|d| !d.is_zero()),
+            between_events: between_events.filter(|d| !d.is_zero()),
+        }
+    }
+
+    /// The first-event window, or `None` when it is disabled.
+    pub fn first_event(&self) -> Option<Duration> {
+        self.first_event
+    }
+
+    /// The between-events window, or `None` when it is disabled.
+    pub fn between_events(&self) -> Option<Duration> {
+        self.between_events
+    }
+
+    /// Is either window armed?
+    pub fn is_enabled(&self) -> bool {
+        self.first_event.is_some() || self.between_events.is_some()
+    }
+
+    /// The first-event window in whole seconds, or `None` when disabled.
+    pub fn first_event_secs(&self) -> Option<u64> {
+        self.first_event.map(|w| w.as_secs())
+    }
+
+    /// The between-events window in whole seconds, or `None` when disabled.
+    pub fn between_events_secs(&self) -> Option<u64> {
+        self.between_events.map(|w| w.as_secs())
+    }
+}
+
+/// Tracks the idle (no-substantive-event) time of one ACP turn and
+/// computes the effective deadline for the streaming read.
+///
+/// Four rules define the contract:
+///
+/// 1. **Two windows, chosen by phase.** The FIRST window runs from the
+///    start of the turn until the first SUBSTANTIVE output (a token or a
+///    tool call). After that the shorter BETWEEN window applies. A cold
+///    local model gets the long allowance; a session that has already
+///    spoken gets the short one.
+/// 2. **Metadata and keepalives do not count.** A frame that carries no
+///    token and no tool call (session metadata, usage reports, keepalives)
+///    neither ends the first phase nor restarts any clock. Only a
+///    substantive event does.
+/// 3. **A pending tool call suspends the idle deadline.** A tool
+///    execution is a wait whose bound is owned elsewhere (the turn's total
+///    budget), so the watchdog must not fire on it; the engine's tool
+///    calls are not the client's to police here. When the tool round
+///    completes, the phase resets to the FIRST window — the next model
+///    turn is a new cold start.
+/// 4. **The total turn budget always wins.** The effective read deadline
+///    is `min(total_deadline, idle_deadline)`, so raising an idle window
+///    can never extend a turn beyond `--agent-timeout`.
+struct IdleWatchdog {
+    first_event: Option<Duration>,
+    between_events: Option<Duration>,
+    phase: IdleWindowPhase,
+    /// When the current phase began. The first-event window is measured
+    /// from here (the turn start, or the end of the last tool round).
+    phase_start: tokio::time::Instant,
+    /// When the last SUBSTANTIVE event arrived. The between-events window
+    /// is measured from here.
+    last_substantive: Option<tokio::time::Instant>,
+    tool_wait: bool,
+}
+
+impl IdleWatchdog {
+    fn new(windows: AgentIdleWindows) -> Self {
+        Self {
+            first_event: windows.first_event(),
+            between_events: windows.between_events(),
+            phase: IdleWindowPhase::FirstEvent,
+            phase_start: tokio::time::Instant::now(),
+            last_substantive: None,
+            tool_wait: false,
+        }
+    }
+
+    /// Record a SUBSTANTIVE event: a token or a tool call.
+    ///
+    /// This ends the first-event phase (the session has proved it is
+    /// alive) and restarts the between-events clock.
+    fn note_substantive_event(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.last_substantive = Some(now);
+        if self.phase == IdleWindowPhase::FirstEvent {
+            self.phase = IdleWindowPhase::BetweenEvents;
+        }
+    }
+
+    /// Record a NON-substantive event (session metadata, a keepalive).
+    ///
+    /// Deliberately a no-op on the clocks: metadata does not end the
+    /// first phase and does not restart the between-events clock, so a
+    /// session that only emits metadata is still caught by the watchdog.
+    fn note_metadata_event(&mut self) {}
+
+    /// Record one `session/update` notification, classified by its kind.
+    ///
+    /// A `session/update` whose kind names model OUTPUT (a message
+    /// chunk, a thought chunk, the final message) or a TOOL CALL is
+    /// SUBSTANTIVE: it ends the first-event phase and restarts the
+    /// between-events clock. Every other kind (usage reports, mode
+    /// changes, tool status updates, keepalives) is metadata: it changes
+    /// neither phase nor clock.
+    fn note_update_kind(&mut self, kind: &str) {
+        match kind {
+            "agent_message_chunk"
+            | "agent_thought_chunk"
+            | "agent_message"
+            | "tool_call"
+            | "permission_request" => self.note_substantive_event(),
+            _ => self.note_metadata_event(),
+        }
+    }
+
+    /// Record the completion of a tool round.
+    ///
+    /// The next model turn is a new cold start, so the phase resets to
+    /// the FIRST window and the first-event clock starts over from here.
+    fn note_tool_round_complete(&mut self) {
+        self.tool_wait = false;
+        self.phase = IdleWindowPhase::FirstEvent;
+        self.phase_start = tokio::time::Instant::now();
+        self.last_substantive = None;
+    }
+
+    /// Enter (or leave) a tool-call wait.
+    ///
+    /// The phase resets to the FIRST window only when a tool round that
+    /// was actually pending completes: a stray `tool_result` for a tool
+    /// that was never called must not hand the turn a fresh cold-start
+    /// window.
+    fn set_tool_wait(&mut self, waiting: bool) {
+        let was_waiting = self.tool_wait;
+        self.tool_wait = waiting;
+        if !waiting && was_waiting {
+            self.note_tool_round_complete();
+        }
+    }
+
+    /// The window that applies in the current phase.
+    fn active_window(&self) -> Option<Duration> {
+        match self.phase {
+            IdleWindowPhase::FirstEvent => self.first_event,
+            IdleWindowPhase::BetweenEvents => self.between_events,
+        }
+    }
+
+    /// The idle deadline, or `None` when no window applies (the watchdog
+    /// is disabled for this phase) or a tool call is pending.
+    fn idle_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.tool_wait {
+            return None;
+        }
+        let window = self.active_window()?;
+        let base = match self.phase {
+            IdleWindowPhase::FirstEvent => self.phase_start,
+            IdleWindowPhase::BetweenEvents => self.last_substantive.unwrap_or(self.phase_start),
+        };
+        Some(base + window)
+    }
+
+    /// How long ago the last SUBSTANTIVE event arrived (or the phase
+    /// started, when the turn has not produced one yet).
+    fn last_event_age(&self) -> Duration {
+        let base = self.last_substantive.unwrap_or(self.phase_start);
+        base.elapsed()
+    }
+}
+
+/// The deadline the next read must respect: the earlier of the total turn
+/// budget and the idle window.
+///
+/// `idle_deadline` is the idle deadline computed for THIS read and
+/// `overall` is the total turn deadline. The idle window only shortens the
+/// read when it is STRICTLY earlier, so raising an idle window can never
+/// extend a turn beyond the total budget, and a turn whose two budgets
+/// expire at the same instant is reported as a total timeout.
+fn idle_read_deadline(
+    idle_deadline: Option<tokio::time::Instant>,
+    overall: tokio::time::Instant,
+) -> tokio::time::Instant {
+    match idle_deadline {
+        Some(idle) if idle < overall => idle,
+        _ => overall,
+    }
+}
+
+/// Did the idle window (rather than the total budget) just expire?
+///
+/// This is the exact complement of [`idle_read_deadline`]: the idle branch
+/// is taken only when the idle deadline was strictly earlier than the
+/// total budget, so a turn bounded by the total budget alone can never be
+/// misreported as an idle timeout.
+fn idle_fired(idle_deadline: Option<tokio::time::Instant>, overall: tokio::time::Instant) -> bool {
+    match idle_deadline {
+        Some(idle) => idle < overall && tokio::time::Instant::now() >= idle,
+        None => false,
+    }
+}
+
+/// The `session/update` kind of a ZEROCLAW frame, or `""`.
+///
+/// The zeroclaw dialect puts the discriminator on `params.type`.
+fn zeroclaw_frame_kind(frame: &Value) -> &str {
+    match frame.get("method").and_then(Value::as_str) {
+        Some("session/update") => {}
+        // A permission request is the engine acting on the turn (it precedes a
+        // tool call), so it is live output, not metadata.
+        Some("session/request_permission") => return "permission_request",
+        _ => return "",
+    }
+    frame
+        .get("params")
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// The `session/update` kind of a GOOSE frame, or `""`.
+///
+/// The ACP v1 dialect nests the discriminator on
+/// `params.update.sessionUpdate` (a future build may flatten it onto
+/// `params.update.type`, which is accepted too).
+fn goose_frame_kind(frame: &Value) -> &str {
+    match frame.get("method").and_then(Value::as_str) {
+        Some("session/update") => {}
+        // A permission request is the engine acting on the turn (it precedes a
+        // tool call), so it is live output, not metadata.
+        Some("session/request_permission") => return "permission_request",
+        _ => return "",
+    }
+    frame
+        .get("params")
+        .and_then(|p| p.get("update"))
+        .and_then(|u| {
+            u.get("sessionUpdate")
+                .or_else(|| u.get("session_update"))
+                .or_else(|| u.get("type"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Build the structured, operator-facing description of an idle timeout.
+///
+/// The message names the WINDOW that tripped (and its length), so the
+/// operator knows whether to raise the cold-start allowance or the
+/// between-events allowance; it also names the model (so an operator
+/// knows WHICH session went quiet) and the age of the last event (so they
+/// can tell "the model thinks for a long time" from "the session is
+/// wedged").
+fn idle_timeout_detail(opts: &AgentOptions, watchdog: &IdleWatchdog) -> String {
+    let model = opts
+        .model_id
+        .as_deref()
+        .or(opts.model_override.as_deref())
+        .unwrap_or(opts.agent_alias.as_str());
+    let age = watchdog.last_event_age().as_secs_f64();
+    let phase = watchdog.phase.as_str();
+    let window = watchdog.active_window().unwrap_or_default().as_secs_f64();
+    format!(
+        "ACP idle timeout: the session produced no substantive output for {age:.1}s \
+         (window={phase}, window_secs={window:.3}, last-event age {age:.1}s, model={model})"
+    )
+}
+
 /// Inputs for one agentic turn.
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -865,6 +1278,31 @@ pub struct AgentOptions {
     pub approval: ApprovalPolicy,
     /// Overall wall-clock budget for the turn.
     pub timeout: Duration,
+    /// Idle watchdog windows: how long the ACP session may produce NO
+    /// SUBSTANTIVE output before the turn is ended with the distinct
+    /// [`IDLE_TIMEOUT_OUTCOME`] outcome (instead of waiting for the much
+    /// larger total [`Self::timeout`] budget).
+    ///
+    /// TWO windows, because the two waits have different causes:
+    ///
+    /// * `first_event` runs from the start of the turn until the first
+    ///   SUBSTANTIVE output (a token or a tool call). It covers the
+    ///   COLD START of a slow local model, so it is the long one.
+    /// * `between_events` runs between two substantive outputs. Once the
+    ///   session has spoken it is alive, so the gap can be short.
+    ///
+    /// Session metadata and keepalives are NOT substantive: they neither
+    /// end the first phase nor restart the between-events clock.
+    ///
+    /// A pending tool call suspends the watchdog (that wait is bounded by
+    /// the turn's total budget), so the watchdog never fires on a tool
+    /// execution; when the tool round completes, the phase resets to the
+    /// first-event window for the next model turn.
+    ///
+    /// Either window can be disabled independently with `0`. The default
+    /// is [`DEFAULT_AGENT_IDLE_FIRST_EVENT_S`] /
+    /// [`DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S`].
+    pub idle_windows: AgentIdleWindows,
     /// Resolved provider to bridge into the spawned `goose acp` child
     /// (the CREDENTIAL/ENDPOINT seam). When set, `run_goose_agent`
     /// forwards the provider's API key + base_url as `OPENAI_API_KEY`
@@ -991,6 +1429,11 @@ impl AgentOptions {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: Duration::from_secs(900),
+            // IDLE WATCHDOG: armed by default with the documented windows.
+            // `AgentIdleWindows::disabled()` (or a `0` in either window)
+            // restores the pre-watchdog behaviour (only the total turn
+            // budget can end a turn).
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             // SLICE 1 default: writes are confined to cwd until the CLI
             // flag ships and the default is reviewed.
@@ -2682,6 +3125,10 @@ async fn drive<F: FnMut(AgentEvent)>(
     let mut pending_tool_results: HashMap<String, u32> = HashMap::new();
     let mut failure_detail: Option<String> = None;
     let mut line = String::new();
+    // IDLE WATCHDOG: armed here (AFTER the prompt was released) so the
+    // window measures the silence of the TURN, not the setup handshake
+    // (the handshake RPCs have their own `SETUP_RPC_TIMEOUT`).
+    let mut watchdog = IdleWatchdog::new(opts.idle_windows);
     let outcome: String = loop {
         // The streaming-loop dispatch on the per-frame read result is
         // exhaustive over [`read_frame_line_capped`]'s
@@ -2700,9 +3147,49 @@ async fn drive<F: FnMut(AgentEvent)>(
         //     oversized frame, generic io::Error). Same matrix as
         //     EOF; the error is preserved on `failure_detail` for
         //     operator diagnosis.
-        match tokio::time::timeout_at(deadline, read_frame_line_capped(&mut reader, &mut line))
-            .await
+        // IDLE WATCHDOG: the read is bounded by the EARLIER of the total
+        // turn budget and the idle window (the time since the last engine
+        // event). A steady stream therefore keeps the turn alive no matter
+        // how long it runs, while a session that goes completely silent is
+        // ended long before the total budget elapses.
+        //
+        // The idle deadline is computed ONCE per iteration and used for
+        // BOTH the read deadline and the branch guard below, so the two
+        // can never disagree about which budget expired.
+        let idle_deadline = watchdog.idle_deadline();
+        let read_deadline = idle_read_deadline(idle_deadline, deadline);
+        match tokio::time::timeout_at(
+            read_deadline,
+            read_frame_line_capped(&mut reader, &mut line),
+        )
+        .await
         {
+            // IDLE WATCHDOG fired: the engine produced NO event for the
+            // whole idle window. End the turn with the DISTINCT
+            // `idle_timeout` outcome and a structured reason (last-event
+            // age + model) so the operator can tell this apart from the
+            // total-budget timeout.
+            //
+            // Teardown goes through the SAME `session/cancel` path the
+            // total-budget branch uses, so the engine stops editing files
+            // and the turn is wound down exactly as before — the watchdog
+            // adds a new ENDING, it does not add a second teardown path.
+            Err(_) if idle_fired(idle_deadline, deadline) => {
+                let detail = idle_timeout_detail(opts, &watchdog);
+                eprintln!("zoder: {detail}");
+                failure_detail = Some(detail);
+                let _ = write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": "cancel",
+                        "method": "session/cancel",
+                        "params": { "session_id": session_id },
+                    }),
+                )
+                .await;
+                break IDLE_TIMEOUT_OUTCOME.to_string();
+            }
             // Budget exhausted. CANCEL the turn server-side so the engine stops
             // editing files (otherwise a ghost agent keeps running after we
             // return + fail the job), then preserve whatever streamed so far.
@@ -2804,6 +3291,12 @@ async fn drive<F: FnMut(AgentEvent)>(
             Ok(v) => v,
             Err(_) => continue,
         };
+        // IDLE WATCHDOG: classify the frame BEFORE dispatching it. Only a
+        // SUBSTANTIVE frame (a token, a thought chunk, the final message,
+        // or a tool call) ends the first-event phase and restarts the
+        // between-events clock; session metadata and keepalives are
+        // metadata and change neither phase nor clock.
+        watchdog.note_update_kind(zeroclaw_frame_kind(&frame));
         let headers = utilization_headers(&frame);
         if !headers.is_empty() {
             on_event(AgentEvent::Utilization { headers });
@@ -2922,6 +3415,11 @@ async fn drive<F: FnMut(AgentEvent)>(
                     .unwrap_or("tool")
                     .to_string();
                 *pending_tool_results.entry(name.clone()).or_insert(0) += 1;
+                // IDLE WATCHDOG: a tool call is pending, so the engine is
+                // executing something and no events reach the client until
+                // the result arrives. That wait is bounded by the turn's
+                // TOTAL budget, so the idle watchdog must not fire on it.
+                watchdog.set_tool_wait(pending_tool_results.values().any(|n| *n > 0));
                 on_event(AgentEvent::ToolCall { name });
             }
             "tool_result" => {
@@ -2962,6 +3460,10 @@ async fn drive<F: FnMut(AgentEvent)>(
                     // `values().any(|n| *n > 0)` which is indifferent
                     // to zero-valued entries vs. absent keys.
                 }
+                // IDLE WATCHDOG: the tool wait ends here (if no other tool
+                // is still pending), so the idle clock starts running again
+                // from this event.
+                watchdog.set_tool_wait(pending_tool_results.values().any(|n| *n > 0));
                 on_event(AgentEvent::ToolResult { name });
             }
             "context_usage" => {
@@ -4500,6 +5002,17 @@ where
     //     from `session/new` and the cancel tells it to drop the
     //     pending prompt it may have already received).
     let mut prompt_sent = false;
+    // IDLE WATCHDOG: armed when the prompt is released (not during the
+    // handshake, which has its own deadline) so the window measures the
+    // silence of the TURN.
+    let mut watchdog = IdleWatchdog::new(opts.idle_windows);
+    // Number of tool calls the engine announced but has not yet reported a
+    // result for. A pending tool call SUSPENDS the idle watchdog: the
+    // engine is executing something and that wait is bounded by the turn's
+    // total budget, not by the idle window.
+    let mut pending_tool_calls: u32 = 0;
+    // Structured reason for a non-completed turn (idle timeout today).
+    let mut failure_detail: Option<String> = None;
     let outcome: String = loop {
         // 3. Send `session/prompt` on the first iteration, BEFORE reading.
         //    Doing it here (inside the loop, after the reader is set up
@@ -4519,12 +5032,52 @@ where
             // write — no scheduler-induced gap between "sent prompt"
             // and "ready to read reply".
         }
+        let idle_deadline = watchdog.idle_deadline();
         let got_line = match tokio::time::timeout_at(
-            deadline,
+            // IDLE WATCHDOG: the read is bounded by the EARLIER of the
+            // total turn budget and the idle window (time since the last
+            // engine event). A steady stream keeps the turn alive no
+            // matter how long it runs; only a silence ends it.
+            //
+            // The idle deadline is computed ONCE per iteration and used
+            // for BOTH the read deadline and the branch guard below, so
+            // the two can never disagree about which budget expired.
+            idle_read_deadline(idle_deadline, deadline),
             read_frame_line_capped(reader, &mut line),
         )
         .await
         {
+            // IDLE WATCHDOG fired: goose produced NO event for the whole
+            // idle window. End the turn with the DISTINCT `idle_timeout`
+            // outcome and a structured reason (last-event age + model).
+            // The teardown is the SAME `session/cancel` notification the
+            // total-budget branch sends, and the caller reaps the child
+            // process on every exit path — so the watchdog cannot leave an
+            // orphaned `goose` behind.
+            //
+            // The frame is a NOTIFICATION (no `id`) and uses the standard
+            // ACP camelCase `sessionId`, exactly like the total-budget
+            // branch below: goose speaks standard ACP v1, where
+            // `session/cancel` expects no reply. (Zeroclaw's `drive` uses
+            // the other dialect — an `id` and a snake_case `session_id` —
+            // because that engine's cancel IS a request; the two engines
+            // are deliberately different and each frame matches its own
+            // engine's contract.)
+            Err(_) if idle_fired(idle_deadline, deadline) => {
+                let detail = idle_timeout_detail(opts, &watchdog);
+                eprintln!("zoder: {detail}");
+                failure_detail = Some(detail);
+                let _ = write_frame(
+                    write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": { "sessionId": &session_id },
+                    }),
+                )
+                .await;
+                break IDLE_TIMEOUT_OUTCOME.to_string();
+            }
             Err(_) => {
                 // Budget exhausted. Best-effort: ask goose to stop the turn
                 // so it doesn't keep editing files in the background after
@@ -4605,6 +5158,12 @@ where
             Ok(v) => v,
             Err(_) => continue,
         };
+        // IDLE WATCHDOG: classify the frame BEFORE dispatching it. Only a
+        // SUBSTANTIVE frame (a token, a thought chunk, the final message,
+        // or a tool call) ends the first-event phase and restarts the
+        // between-events clock; session metadata and keepalives are
+        // metadata and change neither phase nor clock.
+        watchdog.note_update_kind(goose_frame_kind(&frame));
         let headers = utilization_headers(&frame);
         if !headers.is_empty() {
             on_event(AgentEvent::Utilization { headers });
@@ -4916,6 +5475,12 @@ where
                 // agree on "one logical call == one event" — otherwise the
                 // counter says 1 but the CLI shows 3 invocations.
                 tool_calls += 1;
+                // IDLE WATCHDOG: a tool call is pending → the engine is
+                // executing something and no events reach the client until
+                // the result arrives. That wait is bounded by the turn's
+                // TOTAL budget, so the idle watchdog must not fire on it.
+                pending_tool_calls = pending_tool_calls.saturating_add(1);
+                watchdog.set_tool_wait(pending_tool_calls > 0);
                 let name = update
                     .get("title")
                     .or_else(|| update.get("name"))
@@ -4933,6 +5498,11 @@ where
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
+                // IDLE WATCHDOG: the tool wait ends here (if no other tool
+                // is still pending), so the idle clock starts running again
+                // from this event.
+                pending_tool_calls = pending_tool_calls.saturating_sub(1);
+                watchdog.set_tool_wait(pending_tool_calls > 0);
                 on_event(AgentEvent::ToolResult { name });
             }
             "usage_update" | "usage" => {
@@ -4979,8 +5549,10 @@ where
         // `stopReason`, not on a zeroclaw-style `turn_complete { outcome,
         // content }` frame, so the "diagnosis arrived only in the terminal
         // frame" case this field exists for has not been observed here.
-        // Left None deliberately rather than guessed at.
-        failure_detail: None,
+        // The ONE exception is the idle watchdog: it ends the turn with a
+        // structured reason (last-event age + model) that exists nowhere
+        // else, so it must be surfaced.
+        failure_detail,
     })
 }
 
@@ -6956,6 +7528,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(5),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             // SLICE 1: defaults matching `AgentOptions::new` — keep tests
             // non-breaking (enforce off, trust off) and pin the writable
@@ -11243,6 +11816,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             // Match the rest of the test surface: enforcement off,
             // trust off, writable root set to the synthetic cwd.
@@ -11370,6 +11944,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -11525,6 +12100,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -11815,6 +12391,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -12014,6 +12591,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -12172,6 +12750,7 @@ mod tests {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -12202,6 +12781,835 @@ mod tests {
         assert_eq!(run.session_id, "z-twocall-1");
 
         let _ = server.await;
+    }
+
+    // ---------------------------------------------------------------------------
+    // ACP idle watchdog (two-window watchdog) — regression tests
+    // ---------------------------------------------------------------------------
+
+    /// Behaviour of the fake zeroclaw daemon used by the idle-watchdog tests.
+    #[derive(Debug, Clone, Copy)]
+    enum FakeEngine {
+        /// Complete the ACP handshake, read the prompt, then produce NO frame
+        /// at all — the "wedged engine" shape from the fault report.
+        Silent,
+        /// Complete the ACP handshake, read the prompt, then stream one
+        /// `agent_message_chunk` every `gap` for `count` chunks and finish the
+        /// turn with `turn_complete`. The stream is SLOW relative to the idle
+        /// window but never silent for longer than the window.
+        Steady { gap: Duration, count: usize },
+        /// Complete the ACP handshake, read the prompt, then produce only
+        /// NON-substantive frames (session metadata / keepalives) every
+        /// `gap` for `count` frames, and then go SILENT.
+        ///
+        /// Metadata must NOT end the first-event phase and must NOT restart
+        /// any clock, so this shape must still be caught — and it must be
+        /// caught by the FIRST-event window, not the between-events one.
+        MetadataOnly { gap: Duration, count: usize },
+        /// Complete the ACP handshake, read the prompt, wait `startup` (a
+        /// COLD START longer than the between-events window but shorter than
+        /// the first-event window), then stream one chunk and go silent.
+        ///
+        /// The late first token must be measured by the FIRST window (so the
+        /// turn survives the cold start) and the silence AFTER it must be
+        /// measured by the BETWEEN window.
+        LateStart { startup: Duration, gap: Duration },
+        /// Complete the ACP handshake, read the prompt, announce one tool
+        /// call, wait `gap` (LONGER than the idle window), report the tool
+        /// result, and then finish the turn with `turn_complete`.
+        ///
+        /// A pending tool call suspends the idle watchdog (that wait is
+        /// bounded by the turn's total budget), so this turn must complete
+        /// instead of ending with the idle outcome.
+        ToolWait { gap: Duration },
+        /// Complete the ACP handshake, read the prompt, announce one tool
+        /// call, wait `gap` (LONGER than the idle window), report the tool
+        /// result, and then go SILENT (no `turn_complete`).
+        ///
+        /// The tool round completion resets the phase to the FIRST window,
+        /// so the silence after the tool result must be measured by the
+        /// FIRST window — and not by the short between-events window.
+        ToolWaitThenSilent { gap: Duration },
+    }
+
+    /// Run a fake zeroclaw daemon on `listener`.
+    ///
+    /// The handshake is the standard one the real driver expects
+    /// (`initialize` -> `session/new`); the prompt frame is read (so the
+    /// client's write never blocks) and then `behavior` decides what the
+    /// engine does.
+    async fn run_fake_zeroclaw(listener: tokio::net::UnixListener, behavior: FakeEngine) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+
+        // initialize
+        reader.read_line(&mut line).await.unwrap();
+        write_frame(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+            }),
+        )
+        .await
+        .unwrap();
+
+        // session/new
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        write_frame(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "new",
+                "result": { "session_id": "idle-watchdog-session" },
+            }),
+        )
+        .await
+        .unwrap();
+
+        // session/prompt (read and ignored)
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+
+        match behavior {
+            FakeEngine::Silent => {
+                // Produce NOTHING from here on. The client must end the turn
+                // on its own (idle watchdog), not wait for the total budget.
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::Steady { gap, count } => {
+                for index in 0..count {
+                    tokio::time::sleep(gap).await;
+                    write_frame(
+                        &mut write_half,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "type": "agent_message_chunk",
+                                "text": format!("chunk {index} "),
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "type": "turn_complete",
+                            "outcome": "completed",
+                            "content": "done",
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+                // Keep the socket open until the client hangs up.
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::MetadataOnly { gap, count } => {
+                // Produce ONLY metadata frames. `context_usage` is session
+                // metadata: it is not a token and not a tool call, so it must
+                // not end the first-event phase and must not restart any
+                // clock.
+                for index in 0..count {
+                    tokio::time::sleep(gap).await;
+                    write_frame(
+                        &mut write_half,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "type": "context_usage",
+                                "used": index,
+                                "total": count,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                // Then go completely silent.
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::LateStart { startup, gap } => {
+                // A COLD START: no frame at all for `startup`.
+                tokio::time::sleep(startup).await;
+                // Then ONE token — the first SUBSTANTIVE output — and then
+                // silence.
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "type": "agent_message_chunk",
+                            "text": "late first token",
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(gap).await;
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::ToolWait { gap } => {
+                // Announce a tool call, then go quiet for LONGER than the
+                // idle window. The watchdog must not fire: the tool wait
+                // is bounded by the turn's total budget.
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "type": "tool_call", "name": "shell" },
+                    }),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(gap).await;
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "type": "tool_result", "name": "shell" },
+                    }),
+                )
+                .await
+                .unwrap();
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "type": "turn_complete",
+                            "outcome": "completed",
+                            "content": "done",
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::ToolWaitThenSilent { gap } => {
+                // Same as `ToolWait`, but the engine NEVER finishes the turn:
+                // it goes silent AFTER the tool round. The watchdog must end
+                // the turn, and it must do so with the FIRST window, because
+                // a tool round completion resets the phase.
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "type": "tool_call", "name": "shell" },
+                    }),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(gap).await;
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "type": "tool_result", "name": "shell" },
+                    }),
+                )
+                .await
+                .unwrap();
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[test]
+    fn the_idle_window_only_shortens_a_read_when_it_is_strictly_earlier() {
+        // The idle window may only SHORTEN the read, and only when it is
+        // strictly earlier than the total turn budget. A turn whose two
+        // budgets expire together is a total timeout, never an idle one,
+        // and a turn bounded by the total budget alone can never be
+        // misreported as an idle timeout.
+        let now = tokio::time::Instant::now();
+        let overall = now + Duration::from_secs(100);
+
+        // Idle deadline LATER than the total budget -> the read is bounded
+        // by the total budget and the idle branch must not fire.
+        let later = Some(now + Duration::from_secs(200));
+        assert_eq!(idle_read_deadline(later, overall), overall);
+        assert!(!idle_fired(later, overall));
+
+        // Idle deadline EARLIER than the total budget -> the read is
+        // bounded by the idle window.
+        let earlier_deadline = now + Duration::from_secs(10);
+        let earlier = Some(earlier_deadline);
+        assert_eq!(idle_read_deadline(earlier, overall), earlier_deadline);
+        // ...but it has not elapsed yet, so the idle branch has not fired.
+        assert!(!idle_fired(earlier, overall));
+        // Once the window has elapsed, the idle branch fires.
+        assert!(idle_fired(Some(now - Duration::from_secs(1)), overall));
+
+        // No idle deadline at all (watchdog disabled, or a tool call is
+        // pending): the total budget governs and the idle branch is dead.
+        assert_eq!(idle_read_deadline(None, overall), overall);
+        assert!(!idle_fired(None, overall));
+    }
+
+    #[test]
+    fn the_two_idle_windows_have_their_documented_defaults() {
+        // The documented defaults are the WHOLE point of the change: a long
+        // first-event window (a cold local model needs it) and a short
+        // between-events window (a session that already spoke does not).
+        assert_eq!(DEFAULT_AGENT_IDLE_FIRST_EVENT_S, 600);
+        assert_eq!(DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S, 180);
+
+        let defaults = AgentIdleWindows::default();
+        assert_eq!(defaults.first_event_secs(), Some(600));
+        assert_eq!(defaults.between_events_secs(), Some(180));
+        assert!(defaults.is_enabled());
+    }
+
+    #[test]
+    fn either_idle_window_can_be_disabled_independently() {
+        // `0` disables ONE window without touching the other. That is the
+        // whole point of the split: an operator who trusts the cold-start
+        // allowance but not the between-events one (or the other way
+        // round) must be able to say so.
+        let only_between = AgentIdleWindows::from_secs(0, 180);
+        assert_eq!(only_between.first_event(), None);
+        assert_eq!(
+            only_between.between_events(),
+            Some(Duration::from_secs(180))
+        );
+        assert!(only_between.is_enabled());
+
+        let only_first = AgentIdleWindows::from_secs(600, 0);
+        assert_eq!(only_first.first_event(), Some(Duration::from_secs(600)));
+        assert_eq!(only_first.between_events(), None);
+        assert!(only_first.is_enabled());
+
+        let neither = AgentIdleWindows::from_secs(0, 0);
+        assert!(!neither.is_enabled());
+        assert_eq!(neither, AgentIdleWindows::disabled());
+    }
+
+    #[test]
+    fn a_substantive_event_switches_the_phase_and_metadata_does_not() {
+        // The phase machine, in isolation:
+        //   * metadata (a keepalive / session update) neither ends the
+        //     first phase nor restarts any clock;
+        //   * a token (or a tool call) ends the first phase and starts the
+        //     between-events clock.
+        let windows = AgentIdleWindows::from_millis(600, 180);
+        let mut watchdog = IdleWatchdog::new(windows);
+
+        // The FIRST window is armed at session start.
+        assert_eq!(watchdog.phase, IdleWindowPhase::FirstEvent);
+        let first_deadline = watchdog.idle_deadline().expect("the first window is armed");
+        assert!(
+            first_deadline >= tokio::time::Instant::now() + Duration::from_millis(550),
+            "the first window must be the long one"
+        );
+
+        // Metadata does NOT end the first phase.
+        watchdog.note_update_kind("context_usage");
+        assert_eq!(watchdog.phase, IdleWindowPhase::FirstEvent);
+        assert_eq!(watchdog.idle_deadline(), Some(first_deadline));
+
+        // A token DOES end it, and the between-events window takes over.
+        watchdog.note_update_kind("agent_message_chunk");
+        assert_eq!(watchdog.phase, IdleWindowPhase::BetweenEvents);
+        let between_deadline = watchdog
+            .idle_deadline()
+            .expect("the between window is armed");
+        assert!(
+            between_deadline <= tokio::time::Instant::now() + Duration::from_millis(180),
+            "the between window must be the short one"
+        );
+
+        // Metadata in the between phase must not restart the clock.
+        watchdog.note_update_kind("usage");
+        assert_eq!(watchdog.idle_deadline(), Some(between_deadline));
+
+        // A tool call is substantive too.
+        watchdog.note_update_kind("tool_call");
+        assert_eq!(watchdog.phase, IdleWindowPhase::BetweenEvents);
+    }
+
+    #[test]
+    fn a_permission_request_is_live_output_not_metadata() {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {}
+        });
+        assert_eq!(zeroclaw_frame_kind(&frame), "permission_request");
+        assert_eq!(goose_frame_kind(&frame), "permission_request");
+
+        let mut watchdog = IdleWatchdog::new(AgentIdleWindows::from_millis(600, 180));
+        assert_eq!(
+            watchdog.active_window(),
+            Some(std::time::Duration::from_millis(600))
+        );
+        watchdog.note_update_kind(zeroclaw_frame_kind(&frame));
+        assert_eq!(
+            watchdog.active_window(),
+            Some(std::time::Duration::from_millis(180)),
+            "a permission request ends the cold-start phase"
+        );
+    }
+
+    #[test]
+    fn a_tool_round_completion_resets_the_phase_to_the_first_window() {
+        // After a tool round the next model turn is a new COLD START, so the
+        // phase resets to the FIRST window and the first-event clock starts
+        // over from the tool completion.
+        let windows = AgentIdleWindows::from_millis(600, 180);
+        let mut watchdog = IdleWatchdog::new(windows);
+
+        // A tool call is substantive and suspends the deadline.
+        watchdog.note_update_kind("tool_call");
+        watchdog.set_tool_wait(true);
+        assert_eq!(
+            watchdog.idle_deadline(),
+            None,
+            "a tool wait suspends the watchdog"
+        );
+
+        // The tool result closes the round.
+        watchdog.set_tool_wait(false);
+        assert_eq!(watchdog.phase, IdleWindowPhase::FirstEvent);
+        let deadline = watchdog
+            .idle_deadline()
+            .expect("the first window is re-armed");
+        assert!(
+            deadline >= tokio::time::Instant::now() + Duration::from_millis(550),
+            "the tool round must re-arm the LONG first window, not the short one"
+        );
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_pending_tool_call_suspends_the_idle_watchdog() {
+        // A tool call that takes LONGER than the idle window must not end
+        // the turn: that wait is bounded by the turn's total budget, not
+        // by the idle window.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tool-wait.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::ToolWait {
+                gap: Duration::from_millis(2500),
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a pending tool call must not trip the idle watchdog");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            run.outcome, "completed",
+            "the turn must survive a tool wait longer than the idle window; got {run:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(2500),
+            "the turn must have waited for the tool; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tool_round_completion_resets_the_watchdog_to_the_first_window() {
+        // A tool round that completes and is followed by silence must be
+        // measured by the FIRST window: the next model turn is a new cold
+        // start, so the long allowance applies again. If the phase were NOT
+        // reset, the short between-events window would end this turn.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tool-reset.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::ToolWaitThenSilent {
+                gap: Duration::from_millis(300),
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the turn");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(
+            detail.contains("window=first_event"),
+            "a tool round completion must reset the phase to the first window; got {detail}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300 + 550),
+            "the silence after the tool round must be measured by the LONG first window; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_silent_session_trips_the_first_event_window_not_the_short_one() {
+        // The fault: `zoder exec -m qwen38` streamed ZERO tokens for minutes
+        // and only the 900s --agent-timeout ended it. With the watchdog the
+        // same silence ends the turn after the FIRST-EVENT window, with a
+        // distinct `idle_timeout` outcome and a structured reason.
+        //
+        // The window is scaled down to milliseconds: 600ms stands in for
+        // 600s, 180ms for 180s. The trip must be measured by the LONG
+        // window — a silent session must NOT be killed by the short
+        // between-events window, which is exactly the cold-start bug this
+        // change exists to fix.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("idle-watchdog.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(listener, FakeEngine::Silent));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the turn (not the total budget)");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            run.outcome, IDLE_TIMEOUT_OUTCOME,
+            "a silent session must end with the distinct idle-timeout outcome; got {run:?}"
+        );
+        assert_ne!(run.outcome, "timeout", "the idle outcome must be distinct");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(detail.contains("idle timeout"), "{detail}");
+        assert!(detail.contains("last-event age"), "{detail}");
+        assert!(detail.contains("model=qwen38"), "{detail}");
+        // The error must name the WINDOW that tripped and its length.
+        assert!(
+            detail.contains("window=first_event"),
+            "a silent session must trip the FIRST-event window; got {detail}"
+        );
+        assert!(
+            detail.contains("window_secs=0.600"),
+            "the error must report the tripped window's length; got {detail}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "the trip must be measured by the long first window, not the short one; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the idle watchdog must fire well before the 60s total budget; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_late_first_token_then_silence_trips_the_between_events_window() {
+        // The phase transition, end to end: a session that takes a long time
+        // to produce its FIRST token must be given the long first-event
+        // window (it survives the cold start), and the silence AFTER that
+        // token must be measured by the SHORT between-events window.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("late-start.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::LateStart {
+                startup: Duration::from_millis(400),
+                gap: Duration::from_millis(10),
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        // The first window (600ms) is LONGER than the cold start (400ms), so
+        // the late token arrives in time; the between window (180ms) is the
+        // one that ends the turn.
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the turn");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(
+            detail.contains("window=between_events"),
+            "the silence after the first token must trip the BETWEEN window; got {detail}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "the cold start must have been waited out; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "the silence after the token must be measured by the SHORT window; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_only_events_do_not_end_the_first_phase() {
+        // Session metadata and keepalives are NOT substantive: they must
+        // neither end the first-event phase nor restart any clock. A
+        // metadata-only session must therefore still be caught — and it must
+        // be caught by the FIRST window, because the phase never advanced.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("metadata-only.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::MetadataOnly {
+                gap: Duration::from_millis(40),
+                count: 5,
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the turn");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(
+            detail.contains("window=first_event"),
+            "metadata must not end the first phase; got {detail}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "the metadata frames must not have shortened the first window; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_slow_but_steady_stream_is_not_killed_by_the_idle_watchdog() {
+        // A stream that is SLOWER than the idle window but never silent for
+        // longer than it must survive: the watchdog measures the gap BETWEEN
+        // events, never the total runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("steady-stream.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::Steady {
+                gap: Duration::from_millis(150),
+                count: 20,
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let mut streamed = String::new();
+        let run = run_agent(&opts, |ev| {
+            if let AgentEvent::Text(t) = ev {
+                streamed.push_str(&t);
+            }
+        })
+        .await
+        .expect("a steady stream must complete normally");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, "completed", "got {run:?}");
+        assert!(
+            elapsed >= Duration::from_millis(2500),
+            "the turn must have run for longer than the idle window; took {elapsed:?}"
+        );
+        assert!(
+            streamed.contains("chunk 19"),
+            "the whole stream must be preserved; got {streamed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_disabled_idle_watchdog_preserves_the_old_behaviour() {
+        // `0` on BOTH windows disables the watchdog: the silent session is
+        // ended by the TOTAL turn budget, exactly as before the watchdog
+        // existed.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("idle-disabled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(listener, FakeEngine::Silent));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.timeout = Duration::from_secs(1);
+        opts.idle_windows = AgentIdleWindows::from_millis(0, 0);
+        assert!(!opts.idle_windows.is_enabled());
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a disabled watchdog must not error the turn");
+        let elapsed = started.elapsed();
+
+        assert_ne!(
+            run.outcome, IDLE_TIMEOUT_OUTCOME,
+            "a disabled watchdog must never produce the idle outcome; got {run:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the turn must have ended on the TOTAL budget; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_disabled_between_events_window_leaves_the_first_window_armed() {
+        // Disabling ONE window must not disable the other: with the
+        // between-events window off, a silent session is still caught — by
+        // the FIRST-event window.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("between-disabled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(listener, FakeEngine::Silent));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 0);
+        assert!(opts.idle_windows.is_enabled());
+
+        let started = std::time::Instant::now();
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the turn");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(
+            detail.contains("window=first_event"),
+            "the first window must still be armed; got {detail}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "the first window must still measure the silence; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goose_idle_timeout_teardown_leaves_no_child_process() {
+        // The watchdog must end the turn through the EXISTING teardown path:
+        // the spawned `goose` child is cancelled AND reaped, so an idle
+        // timeout can never leave an orphan behind.
+        //
+        // The fake engine is a `/bin/sh` child that answers the ACP
+        // handshake on stdout and then goes completely silent.
+        let script = r#"while IFS= read -r line; do
+  case "$line" in
+    *'"id":"init"'*) printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}' ;;
+    *'"id":"new"'*) printf '%s\n' '{"jsonrpc":"2.0","id":"new","result":{"sessionId":"goose-idle-session"}}' ;;
+  esac
+done
+"#;
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(false);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn the fake goose child");
+        let pid = child.id().expect("spawned child must have a pid");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut conn = ConnectedTransport {
+            reader: TransportReader::ChildStdout(stdout),
+            writer: TransportWriter::ChildStdin(stdin),
+            child: Some(child),
+            pgid: Some(pid as i32),
+        };
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.model_id = Some("qwen38".to_string());
+        opts.timeout = Duration::from_secs(60);
+        opts.idle_windows = AgentIdleWindows::from_millis(600, 180);
+
+        let started = std::time::Instant::now();
+        let run = run_goose_agent_with_conn(&mut conn, &opts, |_| {})
+            .await
+            .expect("the idle watchdog must end the goose turn");
+        let elapsed = started.elapsed();
+
+        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("an idle timeout must carry a structured reason");
+        assert!(detail.contains("idle timeout"), "{detail}");
+        assert!(detail.contains("model=qwen38"), "{detail}");
+        assert!(
+            detail.contains("window=first_event"),
+            "a silent goose session must trip the first window; got {detail}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the idle watchdog must fire well before the 60s total budget; took {elapsed:?}"
+        );
+
+        // Teardown: the child must be gone (the unconditional `kill_child()`
+        // on every exit path is the existing teardown the watchdog reuses).
+        let alive_after = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(
+            alive_after, -1,
+            "the spawned engine child must be reaped after an idle timeout (kill(0) returned {})",
+            alive_after
+        );
     }
 }
 
@@ -12780,6 +14188,7 @@ mod goose_acp_real_turn {
             show_reasoning: false,
             approval: ApprovalPolicy::None,
             timeout: std::time::Duration::from_secs(60),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             // SLICE 1: defaults matching `AgentOptions::new` — keep this
             // real-engine oracle test non-breaking (enforce off,
@@ -13087,6 +14496,7 @@ mod goose_acp_real_turn {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
@@ -13231,6 +14641,7 @@ mod goose_acp_real_turn {
             show_reasoning: false,
             approval: ApprovalPolicy::Allowlist,
             timeout: std::time::Duration::from_secs(10),
+            idle_windows: AgentIdleWindows::default(),
             goose_provider: None,
             writable_roots: vec![std::path::PathBuf::from("/tmp")],
             enforce_writable_roots: false,
