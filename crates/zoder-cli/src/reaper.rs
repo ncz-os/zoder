@@ -3291,57 +3291,130 @@ mod tests {
         socket: &Path,
         ack: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     ) -> (
-        std::thread::JoinHandle<()>,
+        SilentCancelDaemon,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = UnixListener::bind(socket).expect("bind the fake daemon");
         let attempts = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = attempts.clone();
-        // Serves connections until the fixture's socket is gone; every cancel
-        // it accepts is counted, and only the attempts `ack` says are answered.
+        // Non-blocking accept, so the thread can notice a shutdown request even
+        // when no client ever connects: a blocked `incoming()` would outlive
+        // the test that owns it.
+        listener
+            .set_nonblocking(true)
+            .expect("make the fake daemon listener non-blocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        // Serves connections until it is told to stop; every cancel it accepts
+        // is counted, and only the attempts `ack` says are answered.
         let handle = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { return };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut writer = stream.try_clone().expect("clone the stream");
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+            while !stopping.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = serve_one_cancel_stream(stream, &ack, &seen);
                     }
-                    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                        continue;
-                    };
-                    match frame.get("method").and_then(|m| m.as_str()).unwrap_or("") {
-                        "initialize" => {
-                            let _ = writer.write_all(
-                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n",
-                            );
-                        }
-                        "session/cancel" => {
-                            let n = seen.fetch_add(1, Ordering::SeqCst);
-                            let answer = ack.lock().unwrap_or_else(|e| e.into_inner());
-                            let answer = answer.get(n).copied().unwrap_or(false);
-                            if answer {
-                                let _ = writer.write_all(
-                                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\
-                                      \"params\":{\"type\":\"turn_complete\"}}\n",
-                                );
-                            }
-                        }
-                        _ => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
                     }
+                    Err(_) => return,
                 }
             }
         });
-        (handle, attempts)
+        (
+            SilentCancelDaemon {
+                handle: Some(handle),
+                stop,
+            },
+            attempts,
+        )
+    }
+
+    /// Handle one accepted connection: read frames, answer what `ack` allows.
+    fn serve_one_cancel_stream(
+        stream: std::os::unix::net::UnixStream,
+        ack: &std::sync::Mutex<Vec<bool>>,
+        seen: &std::sync::atomic::AtomicUsize,
+    ) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut writer = stream.try_clone()?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            match frame.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => {
+                    let _ =
+                        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n");
+                }
+                "session/cancel" => {
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    let answer = ack
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(n)
+                        .copied()
+                        .unwrap_or(false);
+                    if answer {
+                        let _ = writer.write_all(
+                            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\
+                              \"params\":{\"type\":\"turn_complete\"}}\n",
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The fake daemon's thread, joined on drop so no test can leak it.
+    struct SilentCancelDaemon {
+        handle: Option<std::thread::JoinHandle<()>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for SilentCancelDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                // Bounded: the thread polls every 5 ms and is never awaited
+                // while it could block on a client.
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Write a `<data dir>/daemon.pid` record for `pid` that can NEVER match:
+    /// the start time is the live process's own, minus one. Deriving it this way
+    /// (rather than hardcoding a tick such as 1) makes "the record is stale" a
+    /// proven fact instead of an assumption about where the process started in
+    /// the boot timeline.
+    fn record_a_stale_daemon_for_socket(socket: &Path, pid: u32) -> u64 {
+        let live = crate::reaper::live_start_ticks(pid).expect("the fixture is live");
+        let impossible = live.saturating_sub(1);
+        assert_ne!(
+            impossible, live,
+            "the stale tick must differ from the live one"
+        );
+        std::fs::write(
+            socket.with_file_name("daemon.pid"),
+            format!("{pid} {impossible}\n"),
+        )
+        .expect("write a stale daemon record");
+        impossible
     }
 
     /// Write the `<data dir>/daemon.pid` record for `pid`, exactly the way the
@@ -3534,12 +3607,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
 
-        // Stand-in daemon: a real process that ignores the socket entirely.
-        // 60 s, not 600: if the fix regresses and the process is never
-        // stopped, this fixture must still die on its own instead of wedging
-        // the test binary behind a listener that outlives the run.
+        // Stand-in daemon: a real process that ignores the socket entirely and
+        // exits on its own well inside the test budget, so a panic before the
+        // cleanup below cannot orphan it. The fix still has to stop it by pid;
+        // this only bounds the damage if the fix regresses.
         let daemon = Command::new("/bin/sleep")
-            .arg("60")
+            .arg("20")
             .spawn()
             .expect("spawn the daemon fixture");
         let daemon_pid = daemon.id();
@@ -3599,13 +3672,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let bystander = spawn_sleeper(dir.path());
-        // A record for the bystander's pid but an impossible start time: the
-        // live process is not the one the record describes.
-        std::fs::write(
-            socket.with_file_name("daemon.pid"),
-            format!("{bystander} 1\n"),
-        )
-        .expect("write a stale daemon record");
+        // A record for the bystander's pid but a start time it provably does
+        // not have: the live process is not the one the record describes.
+        record_a_stale_daemon_for_socket(&socket, bystander);
 
         assert_eq!(
             daemon_pid_for_socket(&socket),
@@ -3631,11 +3700,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let bystander = spawn_sleeper(dir.path());
-        std::fs::write(
-            socket.with_file_name("daemon.pid"),
-            format!("{bystander} 1\n"),
-        )
-        .expect("write a stale daemon record");
+        let stale_ticks = record_a_stale_daemon_for_socket(&socket, bystander);
+        assert_ne!(
+            crate::reaper::live_start_ticks(bystander),
+            Some(stale_ticks),
+            "the record must be stale against the LIVE start time, not merely odd"
+        );
         note_session("stale-record-probe");
 
         assert_eq!(
