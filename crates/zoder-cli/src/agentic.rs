@@ -5056,6 +5056,95 @@ pub(crate) fn validate_loop_timeouts(
 /// the same number the loop uses.
 pub(crate) const SETTLE_BUDGET_SECS: u64 = zoder_core::CANCEL_SETTLE_BUDGET.as_secs();
 
+/// How many times the author-phase watchdog re-sends `session/cancel` before it
+/// settles the cancel best-effort. Same order as `reaper`'s cancel retry: a
+/// daemon that is merely slow usually answers the next attempt, and a daemon
+/// whose turn already finished never answers at all.
+pub(crate) const AUTHOR_CANCEL_RETRY_ATTEMPTS: usize = 2;
+/// Backoff between those re-sends. Short on purpose: the author phase is
+/// already over budget when it runs.
+pub(crate) const AUTHOR_CANCEL_RETRY_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(300);
+/// Consecutive iterations whose author-turn cancel could not be confirmed that
+/// ABORT the loop. One is a slow daemon; two in a row means the daemon is not
+/// answering this loop at all, and continuing would keep reviewing trees
+/// nobody can prove are quiet.
+pub(crate) const UNCONFIRMED_CANCEL_ABORT_THRESHOLD: usize = 2;
+
+/// The marker that tells the loop's error handling "the author's diff cannot
+/// be trusted, do not review it".
+pub(crate) const AUTHOR_CANCEL_UNCONFIRMED_MARKER: &str = "author cancellation unconfirmed:";
+
+/// Prefix of a best-effort author-cancel warning: the turn MAY still be
+/// running, the tree may be mid-edit, so the iteration is unresolved — but the
+/// tree is still captured, preserved and reported.
+pub(crate) const AUTHOR_CANCEL_BEST_EFFORT_MARKER: &str = "author cancel UNCONFIRMED:";
+
+/// Retry a failed `session/cancel` a bounded number of times.
+///
+/// `Ok(())` means the daemon acknowledged the cancel on a retry. If every
+/// attempt fails, this returns `Err(reason)` carrying
+/// [`AUTHOR_CANCEL_BEST_EFFORT_MARKER`] and the exact per-attempt errors — it
+/// NEVER reports success for a cancel nobody acknowledged.
+///
+/// Returning `Err` here does NOT stop the loop: the caller wraps the reason in
+/// the [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`] form, which makes the iteration
+/// UNRESOLVED (unreviewable, exact reason recorded) while the worktree is still
+/// captured, committed and preserved. Cleanup failing must never discard the
+/// author's work (a supervised loop run: 0 commits, 0 files, hours of edits lost
+/// to a fatal "cancel not confirmed").
+pub(crate) async fn cancel_author_session_best_effort(
+    socket: &std::path::Path,
+    session_id: &str,
+    first_error: &str,
+) -> Result<(), String> {
+    // Every failure reason is accumulated so the returned error names what
+    // actually happened, not just the last attempt.
+    let mut failures: Vec<String> = vec![format!("first attempt: {first_error}")];
+    for attempt in 0..AUTHOR_CANCEL_RETRY_ATTEMPTS {
+        tokio::time::sleep(AUTHOR_CANCEL_RETRY_BACKOFF).await;
+        let n = attempt + 1;
+        match zoder_core::cancel_session(
+            socket,
+            session_id,
+            std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
+        )
+        .await
+        {
+            Ok(()) => {
+                eprintln!("[loop] daemon acknowledged the author cancel on retry {n}");
+                return Ok(());
+            }
+            Err(e) => failures.push(format!("retry {n}: {e:#}")),
+        }
+    }
+    // Exhausted: the cancel was never confirmed. Report it — do not pretend.
+    Err(format!(
+        "{AUTHOR_CANCEL_BEST_EFFORT_MARKER} session {session_id} was not acknowledged after {} \
+         attempt(s) [{}]. The turn may still be running, so this iteration's diff is reported as \
+         unresolved — but the worktree is preserved, committed and reviewed rather than discarded",
+        failures.len(),
+        failures.join("; ")
+    ))
+}
+
+/// Turn a `session/cancel` failure into the reason string the loop records.
+///
+/// A cancel the daemon never acknowledged is cleanup we could not complete, not
+/// a reason to stop the loop: it is retried in bounded fashion, and if it stays
+/// unconfirmed the iteration is marked unresolved with this precise reason while
+/// everything the author wrote stays on disk, gets captured, and is reported.
+pub(crate) async fn author_cancel_reason(
+    socket: &std::path::Path,
+    session_id: &str,
+    first_error: &str,
+) -> String {
+    match cancel_author_session_best_effort(socket, session_id, first_error).await {
+        Ok(()) => format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}{first_error}"),
+        Err(reason) => reason,
+    }
+}
+
 /// Label for a `loop` phase. Phases are user-visible in the watchdog log
 /// line ("loop: <phase> timed out after <N>s, killing") and in the per-iter
 /// `author_outcome` / `review_outcome` fields when a phase wedges.
@@ -5126,11 +5215,16 @@ where
 ///
 /// On timeout the function logs the standard "timed out, killing"
 /// marker, awaits `cancel`, awaits `settled`, and returns `Err`. On
-/// success it forwards the inner result verbatim. A failed or timed-out
-/// cancellation stops the loop before any diff capture or further edits.
+/// success it forwards the inner result verbatim.
 ///
-/// NON-BREAKING on success: when the inner future completes within
-/// budget, `cancel` and `settled` are never invoked.
+/// A failed cancel no longer stops the loop: the cancellation is re-sent
+/// (`AUTHOR_CANCEL_RETRY_ATTEMPTS`) and then settled best-effort, so an
+/// unconfirmed cancel surfaces as an UNRESOLVED iteration that still captures
+/// and reports the tree, carrying the exact reason. (It used to return
+/// `Err("author cancellation unconfirmed: …")`, which the loop turned into a
+/// fatal bail — a supervised loop run lost every edit that way.)
+/// `settled` is still awaited either way, because it is the margin that keeps
+/// `build_diff` from racing the daemon's last write.
 async fn author_phase_with_cancel<F, C, S>(
     secs: u64,
     quiet: bool,
@@ -5150,23 +5244,29 @@ where
             if !quiet {
                 eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
             }
-            // An acknowledgement is required before reviewing this tree.
-            let cancelled =
-                tokio::time::timeout(std::time::Duration::from_secs(SETTLE_BUDGET_SECS), cancel)
-                    .await
-                    .map_err(|_| anyhow!("cancellation deadline expired"))
-                    .and_then(|r| r);
-            if let Err(error) = cancelled {
-                return Err(format!("author cancellation unconfirmed: {error}; refusing to review a potentially active tree"));
-            }
-            // Gate `build_diff` on the daemon having settled (or its
-            // settle budget having elapsed). Without this, the loop
-            // would race the daemon's last few tool-call writes against
-            // `build_diff` and review a torn tree.
+            // The settle signal is awaited on EVERY path below: the diff is
+            // captured after this function returns, and a tree captured while
+            // the daemon is still writing is the torn-tree bug this wrapper
+            // exists to prevent.
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_secs(SETTLE_BUDGET_SECS * 2),
+                cancel,
+            )
+            .await
+            .map_err(|_| "cancellation deadline expired".to_string())
+            .and_then(|r| r.map_err(|e| format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}{e}")));
             settled.await;
-            Err(format!(
-                "author phase timed out after {secs}s (killed, daemon cancel issued)"
-            ))
+            match cancelled {
+                Ok(()) => Err(format!(
+                    "author phase timed out after {secs}s (killed, daemon cancel issued)"
+                )),
+                // Best-effort: the caller must still capture and report the
+                // tree, but it must NOT treat this diff as reviewable.
+                Err(cancel_err) => Err(format!(
+                    "author phase timed out after {secs}s (killed, daemon cancel unconfirmed: \
+                     {cancel_err})"
+                )),
+            }
         }
     }
 }
@@ -6608,6 +6708,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // [`author_phase_with_cancel`] for the cancel/settle contract and the
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
+        // Consecutive author turns whose cancel could not be confirmed. This is
+        // the ONE thing about an unconfirmed cancel that can stop the loop: two
+        // in a row means the daemon is not answering this loop at all. A single
+        // one is a slow daemon, and cleanup failing must never throw the
+        // author's work away (a supervised loop run).
+        let mut unconfirmed_cancel_streak = 0usize;
         let engine_kind = crate::resolve_engine_kind(cli)?;
         // Capture the daemon's actual session/new result before prompt
         // dispatch, including first turns and rejected-resume replacements.
@@ -6631,21 +6737,40 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 ),
             ),
             async move {
-                // Require cancellation acknowledgement before diff capture.
                 let socket = crate::engine_socket_path();
                 let session_id_for_cancel = session_id_for_cancel
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 if let Some(sid) = session_id_for_cancel.as_deref() {
-                    zoder_core::cancel_session(
+                    // A cancel the daemon never acknowledges is cleanup we
+                    // could not finish, NOT a reason to stop the loop: retried
+                    // in bounded fashion; if it stays unconfirmed the iteration
+                    // is marked unresolved with the precise reason. What the
+                    // author already wrote stays on disk, gets captured, and is
+                    // reported.
+                    let first = match zoder_core::cancel_session(
                         &socket,
                         sid,
                         std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("{e:#}")),
+                    };
+                    if let Some(first_error) = first {
+                        return Err(anyhow::Error::msg(
+                            author_cancel_reason(&socket, sid, &first_error).await,
+                        ));
+                    }
                 } else {
-                    anyhow::bail!("no session id available for cancellation");
+                    // No session id means the turn never minted one, so there
+                    // is no turn to cancel. That is not a failure: the tree is
+                    // still captured and reported.
+                    eprintln!(
+                        "[loop] author timed out before a session id was minted; nothing to cancel"
+                    );
                 }
                 Ok::<(), anyhow::Error>(())
             },
@@ -6688,8 +6813,21 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 Some(t)
             }
             Err(msg) => {
-                if msg.starts_with("author cancellation unconfirmed:") {
-                    anyhow::bail!("{msg}");
+                // An unconfirmed author cancel is NOT fatal any more: the tree
+                // still gets captured, committed and reported, and the reason
+                // is carried in `author_error` + the iter record. Only a run
+                // of them (the daemon is not answering this loop at all)
+                // stops it — and only after this iteration's work is counted.
+                if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                    unconfirmed_cancel_streak += 1;
+                    eprintln!(
+                        "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
+                         confirmed ({unconfirmed_cancel_streak}/{UNCONFIRMED_CANCEL_ABORT_THRESHOLD}). \
+                         The tree is captured and reported as unresolved, and the edits on disk \
+                         are preserved"
+                    );
+                } else {
+                    unconfirmed_cancel_streak = 0;
                 }
                 let timed_out = msg.contains("timed out") || msg.contains("timeout");
                 if !cli.quiet {
@@ -6750,6 +6888,20 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // (accept with a warning). Anything less is rejected and the loop
         // continues to the next iteration.
         let diff_substance = classify_diff_substance(&diff);
+
+        // The author's cancel was never confirmed: the engine may still be
+        // writing to this tree, so this snapshot cannot be reviewed as a
+        // finished turn. The WORK is not discarded — it is captured above, the
+        // iteration is reported as unresolved, and the loop's own exit paths
+        // commit/report whatever is in the worktree. Only a run of unconfirmed
+        // cancels (the daemon is not answering at all) stops the loop, and it
+        // stops HERE, after the tree has been captured, so no edit is lost.
+        let cancel_unconfirmed = matches!(
+            author_err.as_deref(),
+            Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
+        );
+        let aborted_on_unconfirmed_cancel =
+            cancel_unconfirmed && unconfirmed_cancel_streak >= UNCONFIRMED_CANCEL_ABORT_THRESHOLD;
 
         // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
         // headers from the diff output; this is the same set the reviewer sees.
@@ -6838,6 +6990,54 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             }
             break;
         }
+        if aborted_on_unconfirmed_cancel {
+            // The daemon has not acknowledged a cancel twice in a row: it is
+            // not answering this loop at all, so every further turn would be
+            // another unprovable tree. Stop — but DO NOT discard this
+            // iteration's work: the diff was captured above, this record is
+            // pushed, and the loop's own exit paths commit what is on disk.
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: the daemon did not confirm an author cancel \
+                     {unconfirmed_cancel_streak} times in a row; stopping with this iteration's \
+                     work preserved and reported."
+                );
+            }
+            iterations.push(json!({
+                "iter": i,
+                "author_model": turn.as_ref().map(|t| t.model.clone()),
+                "author_error": turn
+                    .as_ref()
+                    .and_then(|t| t.run.failure_detail.clone())
+                    .or_else(|| author_err.clone()),
+                "author_outcome": match (&turn, &author_err) {
+                    (Some(t), _) => t.run.outcome.clone(),
+                    (None, Some(e)) => format!("interrupted: {e}"),
+                    (None, None) => "interrupted".to_string(),
+                },
+                "author_cancel_unconfirmed": author_err.as_deref().is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)),
+                "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                "diff_lines": diff_lines,
+                "substance": format!("{:?}", diff_substance),
+                "check": check.as_deref(),
+                "check_passed": check_passed,
+                "review_base": loop_base,
+                "review_base_tree": loop_start.tree,
+                "start_dirty": loop_start.dirty,
+                "review_chunks": 0,
+                "review_error": "review skipped: the author cancel was never confirmed, so this \
+diff is not a finished turn",
+                "review_complete": false,
+                "reviewer_verdicts": [],
+                "review_unconfirmed_cancel": true,
+                "verdict": "reviewer_unavailable",
+                "findings": [],
+                "resolved": false,
+                "abort_reason": "author cancel unconfirmed twice in a row",
+            }));
+            final_verdict = "reviewer_unavailable".into();
+            break;
+        }
         if check_timeout_streak > 0 && check_timed_out {
             // Distinct from a dead-engine abort: a hanging check on an empty
             // diff is logged but the loop continues; the next author turn has
@@ -6924,6 +7124,16 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
             None => crate::review_diff::load_zoderignore(&review_root),
         };
         let mut review_error: Option<String> = None;
+        // The author's cancel was never acknowledged, so the daemon may still
+        // be writing to this tree: it must not be reviewed as a finished turn
+        // (that is the torn-tree invariant), but it must NOT be thrown away
+        // either. Skip the reviewer, record the iteration as unresolved with
+        // the exact reason, and let the tree stay on disk — the loop's exit
+        // paths commit and report it.
+        let review_unconfirmed_cancel = match author_err.as_deref() {
+            Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) => true,
+            _ => false,
+        };
         // A. The loop reviewer path accepts ONLY a structured JSON verdict per
         // chunk (see `run_loop_review`), and an INCOMPLETE review — provider
         // error, timeout, unparseable chunk, oversized diff — is
@@ -6932,46 +7142,63 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // exceeded` (and a diff whose middle was silently truncated) still
         // recorded verdict=approve; that is the fail-open this closes.
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
-            match phase_watchdog(
-                LoopPhase::Review,
-                loop_timeout_secs,
-                cli.quiet,
-                run_loop_review(
-                    cli,
-                    reviewer.as_deref(),
-                    &reviewer_chain,
-                    ADVERSARIAL_SYSTEM,
-                    &review_diff,
-                    &label,
-                    &review_preamble,
-                    caps_model.as_deref(),
-                    review_cfg.as_ref(),
-                    &zoderignore,
-                    &config_excludes,
-                    &review_root,
-                ),
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(msg) => {
-                    let detail = format!("review incomplete: {msg}");
-                    if !cli.quiet {
-                        eprintln!(
-                            "[loop] iter {i}: {detail}; failing closed (iteration unresolved)"
-                        );
+            if review_unconfirmed_cancel {
+                let detail = "review skipped: the author cancel was never confirmed, so this \
+diff is not a finished turn"
+                    .to_string();
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else {
+                match phase_watchdog(
+                    LoopPhase::Review,
+                    loop_timeout_secs,
+                    cli.quiet,
+                    run_loop_review(
+                        cli,
+                        reviewer.as_deref(),
+                        &reviewer_chain,
+                        ADVERSARIAL_SYSTEM,
+                        &review_diff,
+                        &label,
+                        &review_preamble,
+                        caps_model.as_deref(),
+                        review_cfg.as_ref(),
+                        &zoderignore,
+                        &config_excludes,
+                        &review_root,
+                    ),
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(msg) => {
+                        let detail = format!("review incomplete: {msg}");
+                        if !cli.quiet {
+                            eprintln!(
+                                "[loop] iter {i}: {detail}; failing closed (iteration unresolved)"
+                            );
+                        }
+                        review_error = Some(detail.clone());
+                        (
+                            synthesize_reviewer_unavailable(&detail),
+                            None,
+                            0.0,
+                            0,
+                            // Incomplete: no reviewer evidence exists, so the
+                            // record must not fabricate a complete per-reviewer
+                            // verdict either.
+                            Vec::new(),
+                        )
                     }
-                    review_error = Some(detail.clone());
-                    (
-                        synthesize_reviewer_unavailable(&detail),
-                        None,
-                        0.0,
-                        0,
-                        // Incomplete: no reviewer evidence exists, so the
-                        // record must not fabricate a complete per-reviewer
-                        // verdict either.
-                        Vec::new(),
-                    )
                 }
             };
         total_cost += review_cost;
@@ -9810,7 +10037,7 @@ must reap the direct shell on the timeout branch)"
             "Z-8 fix: cancel must be invoked exactly once on timeout"
         );
         assert!(
-            settled_called.load(Ordering::SeqCst),
+            settled_called.load(std::sync::atomic::Ordering::SeqCst),
             "Z-8 fix: watchdog must await the settled signal before returning"
         );
         assert!(
@@ -9819,19 +10046,82 @@ must reap the direct shell on the timeout branch)"
         );
     }
 
+    /// The incident shape (a supervised loop run): the daemon never acknowledges
+    /// the cancel. The iteration must come back as an UNRESOLVED error that
+    /// carries the unconfirmed marker — NOT the old fatal
+    /// `author cancellation unconfirmed:` bail that discarded the worktree —
+    /// and `settled` must still be awaited, because the diff is captured after
+    /// this function returns and must not race the daemon's last write.
     #[tokio::test]
-    async fn failed_cancellation_never_reaches_settled_or_review() {
+    async fn unconfirmed_cancellation_does_not_bail_the_loop_and_still_awaits_settled() {
+        let settled_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settled_flag = settled_called.clone();
         let result = author_phase_with_cancel(
             1,
             true,
             std::future::pending::<anyhow::Result<crate::TurnResult>>(),
             async { anyhow::bail!("daemon did not acknowledge cancellation") },
-            async { panic!("must not proceed after unconfirmed cancellation") },
+            async move { settled_flag.store(true, std::sync::atomic::Ordering::SeqCst) },
         )
         .await;
-        assert!(result
-            .unwrap_err()
-            .starts_with("author cancellation unconfirmed:"));
+        let msg = result.expect_err("a timed-out turn is still an Err");
+        assert!(
+            msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
+            "the reason must carry the unconfirmed marker; got: {msg}"
+        );
+        assert!(
+            !msg.starts_with("author cancellation unconfirmed:"),
+            "the old fatal bail prefix must be gone; got: {msg}"
+        );
+        assert!(
+            settled_called.load(std::sync::atomic::Ordering::SeqCst),
+            "settled must be awaited on the unconfirmed path too"
+        );
+    }
+
+    /// `cancel_author_session_best_effort` must NEVER report success for a
+    /// cancel nobody acknowledged: after every bounded retry fails against a
+    /// dead socket it returns `Err` naming the session and the attempts.
+    #[tokio::test]
+    async fn an_exhausted_cancel_retry_returns_err_not_ok() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-cancel-retry-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // A socket path with no listener: every attempt fails immediately.
+        let socket = dir.join("no-such-daemon.sock");
+        let err = cancel_author_session_best_effort(
+            &socket,
+            "3c96a286-9315-4fe5-88e0-0a3aff763aed",
+            "daemon did not acknowledge",
+        )
+        .await
+        .expect_err("an unacknowledged cancel must not return Ok");
+        assert!(
+            err.contains(AUTHOR_CANCEL_BEST_EFFORT_MARKER),
+            "the failure must be marked best-effort; got: {err}"
+        );
+        assert!(
+            err.contains("3c96a286-9315-4fe5-88e0-0a3aff763aed"),
+            "the failure must name the session; got: {err}"
+        );
+        assert!(
+            err.contains("first attempt: daemon did not acknowledge"),
+            "the original failure must be preserved; got: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "after {} attempt(s)",
+                AUTHOR_CANCEL_RETRY_ATTEMPTS + 1
+            )),
+            "the failure must count every attempt; got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

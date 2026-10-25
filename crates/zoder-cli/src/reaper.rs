@@ -883,14 +883,213 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
                             );
                         }
                     }
-                    CancelFailure::NotConfirmed => eprintln!(
-                        "[zoder] session {id} cancel not confirmed ({e:#}); \
-                         a turn that already settled does not acknowledge a cancel"
-                    ),
+                    CancelFailure::NotConfirmed => {
+                        // One attempt is not an answer: the daemon may be slow,
+                        // may have already exited, or the turn may already have
+                        // settled (a settled turn never acknowledges a cancel).
+                        // Retry briefly, then treat it as best-effort and say
+                        // exactly why — never as a reason to stop the run.
+                        let settled = retry_unconfirmed_cancel(socket, &id).await;
+                        settle_unconfirmed_cancel(socket, &id, settled, &format!("{e:#}"));
+                    }
                 },
             }
         }
     }
+}
+
+/// How many times an UNCONFIRMED cancel is re-sent before it is settled
+/// best-effort. Three attempts with the delays below cover the three shapes the
+/// lost-work incident could produce — a slow daemon, a daemon that had already
+/// exited, a turn that had already finished — without spending the teardown
+/// budget on one session: ~900 ms of backoff in total, and each attempt is
+/// capped by its own settle budget inside `zoder_core::cancel_session`.
+const CANCEL_RETRY_ATTEMPTS: usize = 3;
+/// Bounded backoff between cancel attempts, indexed by attempt number. It
+/// doubles and then stops: the point is to let a busy daemon drain, not to hang.
+const CANCEL_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(150),
+    Duration::from_millis(300),
+    Duration::from_millis(450),
+];
+/// Per-attempt budget for a cancel RETRY, deliberately below the whole-phase
+/// budget: an unconfirmed cancel means the engine accepted our connection and
+/// did not answer, so waiting the full budget again is just a slower way to
+/// learn the same thing.
+const CANCEL_RETRY_BUDGET: Duration = Duration::from_millis(1500);
+/// How long a daemon gets to exit after `SIGTERM` before it is escalated to
+/// `SIGKILL`, when its pid is the only handle left. Same order as the ordinary
+/// reap grace: enough for an orderly exit, short enough that a wedged daemon
+/// cannot hold the run open.
+pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_millis(1500);
+
+/// What retrying an unconfirmed cancel settled to. These are different facts
+/// about the world and are reported differently; none of them is a reason to
+/// discard work or to stop the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnconfirmedCancelOutcome {
+    /// A retry was acknowledged. The turn is stopped; nothing else to do.
+    Confirmed,
+    /// The engine socket lost its listener during the retries (ENOENT /
+    /// ECONNREFUSED): the daemon that owned the session is gone, and the
+    /// session with it.
+    DaemonGone,
+    /// The daemon is there and never acknowledged. A settled turn does not ack
+    /// a cancel and a heavily loaded daemon can outlast every retry, so this is
+    /// "could not prove the turn stopped", not "the turn is running".
+    NeverAcknowledged,
+}
+
+/// Re-send `session/cancel` for `id` a bounded number of times with backoff,
+/// and report what was learned. The FIRST attempt has already failed when the
+/// caller gets here.
+///
+/// An ENOENT/ECONNREFUSED retry ends the sequence immediately: a socket with no
+/// listener is a fact no further attempt can change (the 01a163c9 lesson), so
+/// asking again would only burn the budget.
+pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> UnconfirmedCancelOutcome {
+    for attempt in 0..CANCEL_RETRY_ATTEMPTS {
+        let backoff = CANCEL_RETRY_BACKOFF[attempt.min(CANCEL_RETRY_BACKOFF.len() - 1)];
+        tokio::time::sleep(backoff).await;
+        match zoder_core::cancel_session(socket, id, CANCEL_RETRY_BUDGET).await {
+            Ok(()) => {
+                eprintln!(
+                    "[zoder] session {id} cancel confirmed on retry {}/{}",
+                    attempt + 1,
+                    CANCEL_RETRY_ATTEMPTS
+                );
+                return UnconfirmedCancelOutcome::Confirmed;
+            }
+            Err(e) => {
+                if classify_cancel_error(&e) == CancelFailure::EngineUnreachable {
+                    // The daemon went away between attempts: nothing is left
+                    // to cancel, and no retry can change that.
+                    return UnconfirmedCancelOutcome::DaemonGone;
+                }
+            }
+        }
+    }
+    UnconfirmedCancelOutcome::NeverAcknowledged
+}
+
+/// What an unconfirmed cancel settled to, for the log and for the tests.
+/// `reason` is the exact operator-facing line and is never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnconfirmedCancel {
+    pub session_id: String,
+    /// Cancel attempts made in total, including the caller's first one.
+    pub attempts: usize,
+    pub outcome: UnconfirmedCancelOutcome,
+    /// The daemon process recorded for this socket, re-checked live.
+    pub daemon_pid: Option<u32>,
+    /// True when that daemon is no longer running — whether because it was
+    /// already gone or because this function stopped it by exact pid.
+    pub daemon_stopped: bool,
+    pub reason: String,
+}
+
+/// Settle a cancel that was never confirmed: state the precise reason, and —
+/// when the daemon that owns `socket` is known and still running and will not
+/// answer — stop it by exact pid so no session outlives the only process that
+/// could still be running it.
+///
+/// This NEVER fails the run and NEVER touches the worktree. The lost-work incident
+/// incident lost a job's edits because an unconfirmed cancel aborted the loop
+/// before the tree was captured and committed: the worktree is the product, the
+/// cancel is cleanup, and cleanup does not get a veto over the product.
+pub(crate) fn settle_unconfirmed_cancel(
+    socket: &Path,
+    id: &str,
+    outcome: UnconfirmedCancelOutcome,
+    first_error: &str,
+) -> UnconfirmedCancel {
+    let mut settled = UnconfirmedCancel {
+        session_id: id.to_string(),
+        attempts: if outcome == UnconfirmedCancelOutcome::Confirmed {
+            1
+        } else {
+            1 + CANCEL_RETRY_ATTEMPTS
+        },
+        outcome,
+        daemon_pid: None,
+        daemon_stopped: false,
+        reason: String::new(),
+    };
+    // Whatever happened, this process must not ask again: the answer is now a
+    // fact about the run, and the log carries one line per session.
+    mark_cancelled(id);
+    if outcome == UnconfirmedCancelOutcome::Confirmed {
+        settled.reason = format!("session {id} cancel confirmed after retrying an unconfirmed one");
+        return settled;
+    }
+    let daemon_pid = daemon_pid_for_socket(socket);
+    settled.daemon_pid = daemon_pid;
+    if let Some(pid) = daemon_pid {
+        // Best effort, by EXACT pid — the identity the reaper already spares,
+        // terminated on purpose and only on this path. Never by name, never by
+        // pattern, and never when the record no longer matches the live
+        // process (`daemon_pid_for_socket` re-checks the start time).
+        signal(pid, libc_sigterm());
+        let deadline = Instant::now() + DAEMON_EXIT_GRACE;
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        if alive(pid) {
+            signal(pid, libc_sigkill());
+        }
+        settled.daemon_stopped = !alive(pid);
+    }
+    let cause = match outcome {
+        UnconfirmedCancelOutcome::Confirmed => unreachable!("handled above"),
+        UnconfirmedCancelOutcome::DaemonGone => {
+            "the engine socket lost its listener during the retries, so the daemon that owned \
+             the session is gone and the turn with it"
+        }
+        UnconfirmedCancelOutcome::NeverAcknowledged if settled.daemon_stopped => {
+            "the daemon never acknowledged it and was stopped by pid, which ends any turn it \
+             was still running"
+        }
+        UnconfirmedCancelOutcome::NeverAcknowledged => match daemon_pid {
+            Some(_) => "the daemon never acknowledged it and could not be stopped by pid",
+            None => {
+                "the daemon never acknowledged it (a turn that already settled does not ack a \
+                 cancel, and a slow daemon can outlast every retry) and no live daemon pid is \
+                 recorded for this socket, so it is left running"
+            }
+        },
+    };
+    settled.reason = format!(
+        "session {id} cancel not confirmed after {} attempt(s) ({first_error}); {cause}. \
+         Treated as best-effort cleanup: the worktree is preserved, not discarded, and whatever \
+         the agent left running in the workspace is still reaped",
+        settled.attempts
+    );
+    eprintln!("[zoder] {}", settled.reason);
+    settled
+}
+
+/// The daemon identity recorded for `socket`'s data directory, re-checked
+/// against the live process so a stale record whose pid the kernel recycled
+/// names nobody.
+///
+/// This reads the SAME `<data dir>/daemon.pid` record, with the same
+/// `(pid, start_ticks)` contract, that the spawner writes and the reaper's
+/// daemon exemption already honours: "which process owns this socket" has one
+/// answer in this crate, not two.
+pub(crate) fn daemon_pid_for_socket(socket: &Path) -> Option<u32> {
+    let (pid, start_ticks) = crate::read_daemon_record(&daemon_pid_file_next_to(socket))?;
+    // The record is only a claim; `/proc` decides. A reused pid presents a
+    // different start time and names nobody.
+    if live_start_ticks(pid) != Some(start_ticks) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// The daemon pid file that belongs to `socket`'s directory: the socket lives
+/// at `<data dir>/daemon.sock` and its record at `<data dir>/daemon.pid`.
+fn daemon_pid_file_next_to(socket: &Path) -> PathBuf {
+    socket.with_file_name("daemon.pid")
 }
 
 /// Session ids that were never cancelled AND are not already known to be
@@ -2993,6 +3192,349 @@ mod tests {
             "a retired session must not be offered to the blocking path or a later round"
         );
         forget_session("async-unreachable-probe");
+    }
+
+    // -----------------------------------------------------------------------
+    // the lost-work incident: a `zoder loop`
+    // died with `session <id> cancel not confirmed (daemon did not ...)`. The
+    // unconfirmed cancel was FATAL, so the loop never captured or committed the
+    // edits the author had already written: 0 commits, 0 files, hours of work
+    // discarded. The cancel is cleanup; the tree is the product.
+    // -----------------------------------------------------------------------
+
+    /// A fake daemon for the unconfirmed-cancel tests.
+    ///
+    /// `ack` decides, per CANCEL attempt, what the daemon does: `true` answers
+    /// with `turn_complete` (acknowledged), `false` accepts the cancel and
+    /// says NOTHING (the slow/settled/hung shapes). Every received frame is
+    /// recorded so a test can count the attempts that really reached the wire.
+    /// The listener serves every connection until the fixture is dropped, so
+    /// the retry loop sees the same daemon each time — which is the point.
+    fn spawn_silent_cancel_daemon(
+        socket: &Path,
+        ack: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = UnixListener::bind(socket).expect("bind the fake daemon");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        // Serves connections until the fixture's socket is gone; every cancel
+        // it accepts is counted, and only the attempts `ack` says are answered.
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut writer = stream.try_clone().expect("clone the stream");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                        continue;
+                    };
+                    match frame.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                        "initialize" => {
+                            let _ = writer.write_all(
+                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n",
+                            );
+                        }
+                        "session/cancel" => {
+                            let n = seen.fetch_add(1, Ordering::SeqCst);
+                            let answer = ack.lock().unwrap_or_else(|e| e.into_inner());
+                            let answer = answer.get(n).copied().unwrap_or(false);
+                            if answer {
+                                let _ = writer.write_all(
+                                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\
+                                      \"params\":{\"type\":\"turn_complete\"}}\n",
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        (handle, attempts)
+    }
+
+    /// Write the `<data dir>/daemon.pid` record for `pid`, exactly the way the
+    /// spawner writes it, so `daemon_pid_for_socket` reads what production
+    /// reads.
+    fn record_daemon_for_socket(socket: &Path, pid: u32) {
+        let start = crate::reaper::live_start_ticks(pid).expect("the fixture is live");
+        std::fs::write(
+            socket.with_file_name("daemon.pid"),
+            format!("{pid} {start}\n"),
+        )
+        .expect("write the daemon record");
+    }
+
+    /// The incident, in its most common shape: the daemon is slow (or the turn
+    /// already finished) and never acknowledges the cancel.
+    ///
+    /// Before the fix this was the FATAL path — the loop aborted with "cancel
+    /// not confirmed" and the author's edits were never reported. After it:
+    /// three bounded retries reach the wire, the cancel is settled as
+    /// best-effort with a reason that names the retries AND the missing
+    /// acknowledgement, and the session is retired so nothing re-asks.
+    #[tokio::test]
+    async fn an_unconfirmed_cancel_is_retried_then_settled_best_effort() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("unconfirmed-probe");
+
+        let started = Instant::now();
+        let outcome = retry_unconfirmed_cancel(&socket, "unconfirmed-probe").await;
+        let elapsed = started.elapsed();
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "unconfirmed-probe",
+            outcome,
+            "daemon did not acknowledge session/cancel within 1.5s",
+        );
+
+        assert_eq!(
+            outcome,
+            UnconfirmedCancelOutcome::NeverAcknowledged,
+            "a daemon that accepts every cancel and answers none is never acknowledged"
+        );
+        assert_eq!(
+            settled.attempts,
+            1 + CANCEL_RETRY_ATTEMPTS,
+            "the first attempt plus every bounded retry must reach the wire"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            CANCEL_RETRY_ATTEMPTS,
+            "the fixture must have seen one session/cancel per retry, not a cached answer"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(20),
+            "the retry loop must be bounded, not open-ended: took {elapsed:?}"
+        );
+        assert!(
+            !settled.daemon_stopped,
+            "no daemon pid was recorded for this socket, so nothing could be stopped"
+        );
+        assert_eq!(settled.daemon_pid, None);
+        assert!(
+            settled
+                .reason
+                .contains("cancel not confirmed after 4 attempt(s)"),
+            "the reason must count the attempts: {}",
+            settled.reason
+        );
+        assert!(
+            settled.reason.contains("never acknowledged"),
+            "the reason must name the unacknowledged cancel: {}",
+            settled.reason
+        );
+        assert!(
+            settled
+                .reason
+                .contains("worktree is preserved, not discarded"),
+            "the reason must say the work is not being thrown away: {}",
+            settled.reason
+        );
+        assert!(
+            !pending_sessions().contains(&"unconfirmed-probe".to_string()),
+            "a settled cancel must be retired: nothing may re-ask it and fail the run again"
+        );
+
+        forget_session("unconfirmed-probe");
+        drop(server);
+    }
+
+    /// A daemon that answers a LATER attempt (slow, not dead) is confirmed, and
+    /// the session is reported as stopped rather than as unconfirmed.
+    #[tokio::test]
+    async fn a_slow_daemon_is_confirmed_on_a_bounded_retry() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        // First retry silent, second retry acks: exactly the "daemon was busy"
+        // shape the incident left unproven.
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(vec![false, true])));
+        note_session("slow-daemon-probe");
+
+        let outcome = retry_unconfirmed_cancel(&socket, "slow-daemon-probe").await;
+        let settled =
+            settle_unconfirmed_cancel(&socket, "slow-daemon-probe", outcome, "first not confirmed");
+
+        assert_eq!(
+            outcome,
+            UnconfirmedCancelOutcome::Confirmed,
+            "a daemon that acks the second attempt HAS confirmed the cancel"
+        );
+        assert_eq!(
+            settled.attempts, 1,
+            "a confirmed retry is not an unconfirmed cancel"
+        );
+        assert!(
+            settled.reason.contains("confirmed after retrying"),
+            "the reason must say the retry worked: {}",
+            settled.reason
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the retry must stop as soon as the daemon acknowledges"
+        );
+        assert!(!pending_sessions().contains(&"slow-daemon-probe".to_string()));
+
+        forget_session("slow-daemon-probe");
+        drop(server);
+    }
+
+    /// The daemon EXITED between the first cancel and the retries. The socket
+    /// entry is gone, so the session died with it: that is a fact to report, not
+    /// three more attempts against a path that does not exist (the 01a163c9
+    /// lesson, applied to the retry path).
+    #[tokio::test]
+    async fn a_daemon_that_exited_during_the_retries_is_reported_as_gone() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        // The daemon dies before any retry: the socket entry is unlinked.
+        std::fs::remove_file(&socket).expect("unlink the socket the way EndpointGuard does");
+        note_session("exited-daemon-probe");
+
+        let started = Instant::now();
+        let outcome = retry_unconfirmed_cancel(&socket, "exited-daemon-probe").await;
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "exited-daemon-probe",
+            outcome,
+            "first not confirmed",
+        );
+
+        assert_eq!(outcome, UnconfirmedCancelOutcome::DaemonGone);
+        assert!(
+            settled.reason.contains("lost its listener"),
+            "the reason must name the vanished engine: {}",
+            settled.reason
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a gone daemon is not retried: the first ENOENT retry ends the sequence"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no cancel can reach a socket that does not exist"
+        );
+
+        forget_session("exited-daemon-probe");
+        drop(server);
+    }
+
+    /// The session ALREADY FINISHED (its turn completed before the cancel
+    /// arrived), so the daemon has nothing to acknowledge. With a recorded
+    /// daemon pid the process is the last handle we hold: it is stopped by
+    /// EXACT pid, and the report says so — the session cannot outlive the
+    /// daemon that owns it.
+    #[tokio::test]
+    async fn a_silent_daemon_is_stopped_by_exact_pid_as_the_last_resort() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+
+        // Stand-in daemon: a real process that ignores the socket entirely.
+        // 60 s, not 600: if the fix regresses and the process is never
+        // stopped, this fixture must still die on its own instead of wedging
+        // the test binary behind a listener that outlives the run.
+        let daemon = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the daemon fixture");
+        let daemon_pid = daemon.id();
+        let (server, _attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        record_daemon_for_socket(&socket, daemon_pid);
+        note_session("settled-session-probe");
+        wait_until(|| alive(daemon_pid), "the daemon fixture to be running");
+
+        assert_eq!(
+            daemon_pid_for_socket(&socket),
+            Some(daemon_pid),
+            "precondition: the record names the live fixture"
+        );
+        let outcome = retry_unconfirmed_cancel(&socket, "settled-session-probe").await;
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "settled-session-probe",
+            outcome,
+            "first not confirmed",
+        );
+
+        assert_eq!(outcome, UnconfirmedCancelOutcome::NeverAcknowledged);
+        assert_eq!(settled.daemon_pid, Some(daemon_pid));
+        assert!(
+            settled.daemon_stopped,
+            "the daemon that would not acknowledge the cancel must be stopped by pid"
+        );
+        assert!(
+            !alive(daemon_pid),
+            "the exact pid named by the record must be gone"
+        );
+        assert!(
+            settled.reason.contains("stopped by pid"),
+            "the reason must say how the session was ended: {}",
+            settled.reason
+        );
+
+        // Belt and braces on a failed assertion: never leave the fixture
+        // behind. It is not ours to keep, so it is killed by exact pid.
+        if alive(daemon_pid) {
+            kill_exact(daemon_pid);
+        }
+        forget_session("settled-session-probe");
+        drop(server);
+    }
+
+    /// A daemon record whose pid the kernel has since reused names nobody: the
+    /// helper must refuse it rather than signal a stranger. This is the one
+    /// dangerous direction, so it is pinned separately.
+    #[test]
+    fn a_stale_daemon_record_stops_no_process() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let bystander = spawn_sleeper(dir.path());
+        // A record for the bystander's pid but an impossible start time: the
+        // live process is not the one the record describes.
+        std::fs::write(
+            socket.with_file_name("daemon.pid"),
+            format!("{bystander} 1\n"),
+        )
+        .expect("write a stale daemon record");
+
+        assert_eq!(
+            daemon_pid_for_socket(&socket),
+            None,
+            "a record whose start time does not match the live process names nobody"
+        );
+        assert!(
+            alive(bystander),
+            "the bystander must not have been signalled"
+        );
+        kill_exact(bystander);
     }
 
     /// The warning still fires when it is true, and only for what a signal
