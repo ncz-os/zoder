@@ -184,8 +184,8 @@ engine-sync-tests:
 # Continuous build of UPSTREAM zeroclaw master.
 #
 # Why this exists: as of 2026-09-26 nothing anywhere tracked upstream
-# zeroclaw. Measured that day - HYDRA's checkout was 610 commits behind
-# zeroclaw-labs/zeroclaw master, ULTRA's was at a different head again, and
+# zeroclaw. Measured that day - one builder checkout was 610 commits behind
+# zeroclaw-labs/zeroclaw master, another was at a different head again, and
 # the only zeroclaw automation on the fleet was zeroclaw-sync.timer, which
 # syncs CONFIG, not source. The fleet's pull-nightly.sh pulls prebuilt
 # binaries from a GitHub release, so upstream could break us for weeks

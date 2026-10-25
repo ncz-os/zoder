@@ -36070,22 +36070,6 @@
       }
     },
     {
-      "id": "fireworks_ai/accounts/fireworks/models/pythia-12b",
-      "host": "fireworks_ai",
-      "leaf": "accounts/fireworks/models/pythia-12b",
-      "family": "fireworks_ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.19999999999999998,
-        "output_usd_per_mtok": 0.19999999999999998,
-        "source": "litellm"
-      }
-    },
-    {
       "id": "fireworks_ai/accounts/fireworks/models/qwen-qwq-32b-preview",
       "host": "fireworks_ai",
       "leaf": "accounts/fireworks/models/qwen-qwq-32b-preview",

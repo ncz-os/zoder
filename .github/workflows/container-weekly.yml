@@ -2,7 +2,7 @@ name: weekly stack container (ghcr, multi-arch)
 
 # The full zoder stack image (zoder + zerocode + zeroclaw + goose) built for
 # BOTH linux/amd64 and linux/arm64 and published to ghcr.io/ncz-os/zoder. Built
-# on GitHub because GitLab.com has no free arm64 runner (only self-hosted ULTRA),
+# on GitHub because GitLab.com has no free arm64 runner (only a self-hosted arm64 runner),
 # whereas GitHub has free NATIVE arm64 runners — so each arch compiles natively
 # (no QEMU-slow arm64 build, no self-hosted dependency). ghcr.io is the
 # topology-sanctioned GitHub role (registry hosting). Standard docker

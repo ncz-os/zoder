@@ -1769,7 +1769,7 @@ mod tests {
             .any(|e| e.cost_unknown));
     }
 
-    /// Measured on ACHILLES: 4,337 of 7,746 rows were stale armed
+    /// Measured on a fleet host: 4,337 of 7,746 rows were stale armed
     /// reservations (failed/abandoned calls, days old) kept at 64 KiB each,
     /// so compaction never reached its threshold. Stale armed rows are
     /// trimmed (still unknown-cost spend); fresh ones keep their slot.

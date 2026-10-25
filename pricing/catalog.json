@@ -5691,10 +5691,6 @@
       "input_usd_per_mtok": 0.8999999999999999,
       "output_usd_per_mtok": 0.8999999999999999
     },
-    "fireworks_ai/accounts/fireworks/models/pythia-12b": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 0.19999999999999998
-    },
     "fireworks_ai/accounts/fireworks/models/qwen-qwq-32b-preview": {
       "input_usd_per_mtok": 0.8999999999999999,
       "output_usd_per_mtok": 0.8999999999999999

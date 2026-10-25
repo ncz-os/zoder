@@ -66,7 +66,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -242,7 +242,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --scope <SCOPE>
           Possible values:
@@ -438,7 +438,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -608,7 +608,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -778,7 +778,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -947,7 +947,7 @@ Options:
           Exit non-zero if the configuration is invalid
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -1116,7 +1116,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --validate
           Exit non-zero if the configuration is invalid
@@ -1288,7 +1288,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --limit <LIMIT>
           Show at most N rows
@@ -1461,7 +1461,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -1636,7 +1636,7 @@ Options:
           Only include spend on/after this date (YYYY-MM-DD)
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --until <UNTIL>
           Only include spend on/before this date (YYYY-MM-DD)
@@ -1813,7 +1813,7 @@ Options:
           Repo root to gate (default: current working directory)
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --local-iterate
           Local-iterate mode: missing tools become Skipped (Yellow) so you can iterate fast on a dev box. The gate reports which checks were skipped and what install commands restore the strict posture. Use this only for inner-loop speed; the `--strict` default is the posture that earns the "it passed the gate" claim
@@ -1997,7 +1997,7 @@ Options:
           Probe every configured provider's live model catalog (not just the default provider / free chat candidates). With `-m`, probe only that exact model on providers configured to serve it. Discovery calls `GET /v1/models` per provider; if that fails, falls back to the provider's declared model. Output is a per-provider report with model/status/latency rows
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --install-daily
           Install the daily `--probe --all` sweep into launchd (macOS) or a systemd user timer (Linux). Idempotent: re-running overwrites the existing job
@@ -2174,7 +2174,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -2347,7 +2347,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --max-iters <MAX_ITERS>
           Maximum author/review iterations before giving up
@@ -2555,7 +2555,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -2721,7 +2721,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -2890,7 +2890,7 @@ Options:
           
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --record <RECORD>
           
@@ -3062,7 +3062,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --paid
           
@@ -3239,7 +3239,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -3405,7 +3405,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -3577,7 +3577,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -3752,7 +3752,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -3918,7 +3918,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -4094,7 +4094,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --top <TOP>
           Max rows in the by-model table (e.g. `--top 100`). 0 = show all
@@ -4278,7 +4278,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -4448,7 +4448,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -4617,7 +4617,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --scope <SCOPE>
           Review scope: auto | working-tree | branch
@@ -4815,7 +4815,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -4985,7 +4985,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -5151,7 +5151,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -5325,7 +5325,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -5500,7 +5500,7 @@ Options:
           Only include spend on/after this date (YYYY-MM-DD)
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --until <UNTIL>
           Only include spend on/before this date (YYYY-MM-DD)
@@ -5682,7 +5682,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -5848,7 +5848,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -6018,7 +6018,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch
@@ -6187,7 +6187,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --allowed-routes <PROVIDER=MODEL,...>
-          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b
+          Restrict every author and reviewer attempt, including fallbacks, to exact provider=model pairs (comma separated). An empty or unavailable allowlist fails before dispatch; for example: provider-a=model-a,provider-b=model-b
 
       --reviewer-allowed-routes <PROVIDER=MODEL,...>
           Restrict reviewer attempts to exact provider=model pairs (comma separated). Intersects with --allowed-routes if both are provided. An empty or unavailable allowlist fails before dispatch

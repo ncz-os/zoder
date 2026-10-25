@@ -7418,7 +7418,7 @@ pub(crate) fn daemon_binary_path() -> PathBuf {
 /// The working directory for the spawned daemon: a stable, NEUTRAL
 /// directory, never the caller's cwd.
 ///
-/// 2026-10-21 (ACHILLES): `zeroclaw daemon --ephemeral` inherited the cwd
+/// 2026-10-21 (a fleet host): `zeroclaw daemon --ephemeral` inherited the cwd
 /// of whichever zoder happened to spawn it first — job `01a16164`'s
 /// `zoder loop`, so the daemon sat in `/home/jasonperlow/hive-workspaces/
 /// 01a16164-…` while every OTHER zoder on the host talked to it over
@@ -7703,7 +7703,7 @@ mod ephemeral_daemon_reap_tests {
 mod daemon_cwd_tests {
     //! The shared daemon must not live in a job directory.
     //!
-    //! 2026-10-21 (ACHILLES): `zoder loop` for hive job `01a16164` spawned
+    //! 2026-10-21 (a fleet host): `zoder loop` for hive job `01a16164` spawned
     //! `zeroclaw daemon --ephemeral` with no `current_dir`, so the daemon
     //! inherited that job's workspace and served `~/.zoder/data/daemon.sock`
     //! to every other zoder on the host while sitting in one job's directory.
@@ -9262,7 +9262,7 @@ mod cli_tier_reasoning_parse_tests {
 
     /// A config with one slow model pinned on its own budget, used by the
     /// per-model precedence tests below. `MiniMax-M3` measured >120s on a
-    /// ~650-line review chunk (HYDRA, 2026-10-21) while its neighbours on the
+    /// ~650-line review chunk (shared host, 2026-10-21) while its neighbours on the
     /// same diff answered inside the default.
     fn cfg_with_per_model_timeout(
         dir: &std::path::Path,

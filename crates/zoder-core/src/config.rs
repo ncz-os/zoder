@@ -558,7 +558,7 @@ pub struct ModelEntry {
     /// call, so a slow reviewer can be given a large budget without slowing
     /// failure detection for the fast local models beside it.
     ///
-    /// Measured 2026-10-21 (HYDRA): `MiniMax-M3` on a ~650-line review chunk
+    /// Measured 2026-10-21 on a shared host: `MiniMax-M3` on a ~650-line review chunk
     /// ran past the 120s default twice ("still waiting for minimax-m3 after
     /// 90s ... request budget 120s" -> "review incomplete") while
     /// gemma4-31b and MiniMax-M3.1-Flash-Preview answered the same diff.

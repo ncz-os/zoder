@@ -1034,7 +1034,7 @@ pub(crate) fn build_reviewer_candidates(
     // for exactly this reason — so a real provider legitimately claims
     // the ALIAS too, and gating on that left the alias dispatched
     // verbatim, reproducing the original 404 through a different route
-    // (caught live on ULTRA: `--reviewer reviewer` still 404'd after
+    // (caught live on a build host: `--reviewer reviewer` still 404'd after
     // the first version of this fix landed, because `serves` includes
     // "reviewer" for routing purposes only).
     //
