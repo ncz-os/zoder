@@ -77,18 +77,6 @@ def _run(script_cwd: Path, force: bool = False, *extra: str,
     return r.returncode, (r.stdout + r.stderr)
 
 
-def _run_env(cwd: Path, env_overrides: dict[str, str]) -> tuple[int, str]:
-    """Run the gate from `cwd` with an explicit environment, verbatim.
-
-    Unlike `_run`, this does NOT inject CORPUS_FRESHNESS_ROOT -- the caller
-    passes exactly what it wants to test (including an empty value).
-    """
-    env = {**os.environ, **env_overrides}
-    r = subprocess.run([sys.executable, str(SCRIPT)], cwd=str(cwd),
-                       capture_output=True, text=True, env=env)
-    return r.returncode, r.stdout + r.stderr
-
-
 def _setup(workdir: Path, *, freshness: dict | None = None,
            overlay: dict | None = None,
            last: dict | None = None,
@@ -110,6 +98,10 @@ def _setup(workdir: Path, *, freshness: dict | None = None,
     # Always CLEAR the LKG first: a previous iteration in the same workdir
     # would otherwise leak its baseline into this run and make the computed
     # delta depend on iteration order rather than on `last`.
+    #
+    # LOAD-BEARING for test_the_gate_agrees_with_a_signed_delta_table: that
+    # test calls _setup twice per row, and the pre-fix gate rewrites the LKG
+    # on a passing run. Removing this unlink silently corrupts the table.
     lkg = corpus / "freshness-last.json"
     lkg.unlink(missing_ok=True)
     if last is not None:
@@ -537,17 +529,10 @@ def test_empty_env_override_falls_back_to_the_repo_root() -> None:
         else:
             fail_("the empty override fell through to the CWD")
 
-        # A second, independent witness: give the DECOY a source set that
-        # would hard-fail the gate, and make the real checkout's own corpus
-        # irrelevant by checking only which freshness.json was consulted. If
-        # the empty override fell through to the CWD, that [] source list is
-        # what the gate would report.
-        (cwd / "corpus" / "freshness.json").write_text(json.dumps({"sources": []}))
-        code, gate_out = _run_env(cwd, {"CORPUS_FRESHNESS_ROOT": ""})
-        if "0/0 sources" not in gate_out and "all sources failed" not in gate_out:
-            pass_("a full run with an empty override does not use the CWD's null source list")
-        else:
-            fail_(f"the gate used the CWD decoy's source list: {gate_out.strip()[:200]!r}")
+        # Deliberately no end-to-end run against REPO_ROOT here: it would read
+        # the checkout's real corpus/freshness.json, so it would pass or fail
+        # on the real corpus's health rather than on the override. The probe
+        # above is the assertion; it is exact and has no such coupling.
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
 
