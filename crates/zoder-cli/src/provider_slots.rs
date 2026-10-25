@@ -1,9 +1,9 @@
 //! Host-wide, per-provider concurrency slots for reviewer calls.
 //!
 //! Every `zoder review` chunk goes straight to its provider endpoint. With
-//! many zoder sessions on one host (ten agent sessions sharing HYDRA), a
-//! single-GPU server such as the CERBERUS gemma4-31b route received every
-//! session's chunk at once and queued them server-side, while each client
+//! many zoder sessions on one host, a single-GPU server such as a local
+//! gemma4-31b route received every session's chunk at once and queued them
+//! server-side, while each client
 //! waited silently for its whole request budget. This module lets an operator
 //! cap concurrent reviewer calls per provider on a host and makes the wait
 //! visible: a counting semaphore made of `flock`-ed slot files under
@@ -173,9 +173,9 @@ mod tests {
     fn limit_spec_parses_pairs_default_and_garbage() {
         assert_eq!(limit_for(None, "p"), 0);
         assert_eq!(limit_for(Some(""), "p"), 0);
-        let spec = Some("cerberus-reviewer=2, *=4 ,bad, x=y, nvidia-eih=0");
-        assert_eq!(limit_for(spec, "cerberus-reviewer"), 2);
-        assert_eq!(limit_for(spec, "nvidia-eih"), 0);
+        let spec = Some("provider-a=2, *=4 ,bad, x=y, provider-b=0");
+        assert_eq!(limit_for(spec, "provider-a"), 2);
+        assert_eq!(limit_for(spec, "provider-b"), 0);
         assert_eq!(limit_for(spec, "other"), 4);
         assert_eq!(limit_for(Some("a=1"), "b"), 0);
     }
@@ -197,30 +197,24 @@ mod tests {
     async fn slots_serialize_measure_wait_and_time_out_clearly() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
-        let first = acquire(&home, "cerberus-reviewer", 1, Duration::from_secs(5), true)
+        let first = acquire(&home, "provider-a", 1, Duration::from_secs(5), true)
             .await
             .unwrap();
         assert!(first.is_held());
 
-        let err = acquire(
-            &home,
-            "cerberus-reviewer",
-            1,
-            Duration::from_millis(300),
-            true,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = acquire(&home, "provider-a", 1, Duration::from_millis(300), true)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("local slot(s) for provider cerberus-reviewer"),
+            err.contains("local slot(s) for provider provider-a"),
             "{err}"
         );
         assert!(err.contains("ZODER_QUEUE_TIMEOUT_S"), "{err}");
 
         let home2 = home.clone();
         let waiter = tokio::spawn(async move {
-            acquire(&home2, "cerberus-reviewer", 1, Duration::from_secs(5), true)
+            acquire(&home2, "provider-a", 1, Duration::from_secs(5), true)
                 .await
                 .unwrap()
         });
@@ -234,7 +228,7 @@ mod tests {
             second.waited
         );
         // A different provider has its own slots.
-        let other = acquire(&home, "nvidia-eih", 1, Duration::from_millis(50), true)
+        let other = acquire(&home, "provider-b", 1, Duration::from_millis(50), true)
             .await
             .unwrap();
         assert!(other.is_held());

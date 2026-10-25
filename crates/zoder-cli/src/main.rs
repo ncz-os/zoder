@@ -9,12 +9,12 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
 mod child_env;
-mod eih_health;
 mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
 mod mnemos;
+mod provider_health;
 mod provider_slots;
 mod reaper;
 mod review_context;
@@ -429,7 +429,7 @@ struct Cli {
     /// Restrict every author and reviewer attempt, including fallbacks, to
     /// exact provider=model pairs (comma separated). An empty or unavailable
     /// allowlist fails before dispatch; for example:
-    /// tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b.
+    /// provider-a=model-a,provider-b=model-b.
     #[arg(long, global = true, value_name = "PROVIDER=MODEL,...")]
     allowed_routes: Option<String>,
 
@@ -6096,19 +6096,19 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // Per-model timer: health latency must reflect THIS model's call, not
         // the chain-wide elapsed time (which would fold in prior models' time
         // plus retry backoff and skew the router's latency EWMA).
-        // EIH models are never queried blindly (crate::eih_health): an open
-        // breaker or a failed health probe skips this link.
+        // Gated models are never queried blindly (crate::provider_health): an
+        // open breaker or a failed health probe skips this link.
         let link_gated = eng
             .cfg
             .provider(&pid)
-            .is_some_and(crate::eih_health::is_gated);
+            .is_some_and(|p| crate::provider_health::is_gated(&eng.cfg.health, p));
         if link_gated {
             let pcfg = eng
                 .cfg
                 .provider(&pid)
                 .ok_or_else(|| anyhow::anyhow!("provider {pid} not configured"))?;
             if let Err(message) =
-                crate::eih_health::admit(&eng.cfg.health_path, pcfg, provider, model_id).await
+                crate::provider_health::admit(&eng.cfg.health_path, pcfg, provider, model_id).await
             {
                 if !cli.quiet {
                     eprintln!("[zoder] {message}");
@@ -6131,7 +6131,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         {
             Ok((res, reservation)) => {
                 if link_gated {
-                    crate::eih_health::record_success(&eng.cfg.health_path, &pid, model_id);
+                    crate::provider_health::record_success(&eng.cfg.health_path, &pid, model_id);
                 }
                 // Defer the winning model's health recording until after the
                 // policy verify below, so a policy-violating "success" is
@@ -6146,7 +6146,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             Err((e, fatal)) => {
                 attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
                 if link_gated {
-                    crate::eih_health::record_call_error(&eng.cfg.health_path, &pid, model_id, &e);
+                    crate::provider_health::record_call_error(
+                        &eng.cfg.health_path,
+                        &pid,
+                        model_id,
+                        &e,
+                    );
                 }
                 // Y-8: route the failure through the same classify + record
                 // path the `--probe --all` sweep uses, so a 401/403 from
@@ -6326,7 +6331,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "latency_ms": elapsed_ms,
                 "headers_ms": res.telemetry.headers_ms,
                 "first_token_ms": res.telemetry.first_token_ms,
-                "skipped_unhealthy": crate::eih_health::take_skipped(),
+                "skipped_unhealthy": crate::provider_health::take_skipped(),
             })
         );
         if substituted && !cli.quiet {
@@ -9244,7 +9249,7 @@ mod cli_tier_reasoning_parse_tests {
         }
         for url in [
             "https://api.minimax.io/v1",
-            "https://integrate.api.nvidia.com/v1",
+            "https://api.example.invalid/v1",
             "https://api.deepseek.com/v1",
             "http://8.8.8.8/v1",
             "http://172.32.0.1/v1",
@@ -10175,19 +10180,21 @@ pub(crate) async fn agentic_turn(
 
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
-    // EIH author routes are never queried blindly either (crate::eih_health).
-    // The agentic engine does not switch models on its own, so an unhealthy
-    // EIH route stops here with the reason instead of being dialed.
-    if crate::eih_health::is_gated(&routed_provider) {
+    // Gated author routes are never queried blindly either
+    // (crate::provider_health). The agentic engine does not switch models on
+    // its own, so an unhealthy gated route stops here with the reason instead
+    // of being dialed.
+    if crate::provider_health::is_gated(&eng.cfg.health, &routed_provider) {
         // Global budget on purpose: this client is the health/admission probe
-        // (`admit` bounds it further with ZODER_EIH_PROBE_TIMEOUT_MS), not a
-        // generation call, so a per-model `request_timeout_s` must not give a
-        // health check the slow model's patience.
+        // (`admit` bounds it further with
+        // ZODER_PROVIDER_HEALTH_PROBE_TIMEOUT_MS), not a generation call, so a
+        // per-model `request_timeout_s` must not give a health check the slow
+        // model's patience.
         let probe_client = OpenAiProvider::new_with_request_timeout_s(
             &routed_provider,
             Some(provider_request_timeout_s(cli, &eng.cfg)),
         )?;
-        if let Err(message) = crate::eih_health::admit(
+        if let Err(message) = crate::provider_health::admit(
             &eng.cfg.health_path,
             &routed_provider,
             &probe_client,
@@ -16539,7 +16546,7 @@ mod model_selection_tests {
             .unwrap()
             .to_string()
             .contains("no author route matches"));
-        for malformed in ["", "qwen38", "=qwen38", "tydeus-reviewer="] {
+        for malformed in ["", "qwen38", "=qwen38", "provider-a="] {
             let cli =
                 Cli::try_parse_from(["zoder", "exec", "--allowed-routes", malformed]).unwrap();
             assert!(parsed_allowed_routes(&cli).is_err());
@@ -16548,13 +16555,11 @@ mod model_selection_tests {
             "zoder",
             "exec",
             "--allowed-routes",
-            "tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b",
+            "provider-a=model-a,provider-b=model-b",
         ])
         .unwrap();
-        assert!(require_allowed_route(&cli, "tydeus-reviewer", "qwen38").is_ok());
-        assert!(
-            require_allowed_route(&cli, "nvidia-eih", "nvidia/nemotron-3-ultra-550b-a55b").is_ok()
-        );
+        assert!(require_allowed_route(&cli, "provider-a", "model-a").is_ok());
+        assert!(require_allowed_route(&cli, "provider-b", "model-b").is_ok());
         assert!(require_allowed_route(&cli, "minimax-m3", "MiniMax-M3").is_err());
         assert!(require_allowed_route(&cli, "minimax-m3", "qwen38").is_err());
     }
@@ -16655,7 +16660,7 @@ mod model_selection_tests {
     }
 
     /// Runtime postcondition regression for explicit model pins.
-    /// Reproduced on TYDEUS 2026-07-27: `zoder exec -m MiniMax-M3` printed
+    /// Reproduced on a fleet build host 2026-07-27: `zoder exec -m MiniMax-M3` printed
     /// `[zoder] minimax-m2.7 via minimax ... [failed]`. `resolve_agent_alias`
     /// lowercases the pin to `minimax-m3`, the FIRST substring needle
     /// (`"minimax"`) matches, and the local swap-slot `minimax` alias wins —
@@ -19474,10 +19479,10 @@ mod exec_error_detail_tests {
     /// status, provider hint), not just the outcome word.
     #[test]
     fn turn_failure_summary_names_the_engine_reason() {
-        let detail = "\n  turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider tydeus-coder)\nmore";
+        let detail = "\n  turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider provider-a)\nmore";
         assert_eq!(
             turn_failure_summary("failed", Some(detail)),
-            "agentic turn ended: failed: turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider tydeus-coder)"
+            "agentic turn ended: failed: turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider provider-a)"
         );
         assert_eq!(
             turn_failure_summary("timeout", None),
@@ -19498,8 +19503,7 @@ mod exec_error_detail_tests {
     fn oneshot_failure_summary_names_model_and_provider() {
         assert_eq!(oneshot_failure_summary(&[], "boom"), "boom");
         let one = vec![
-            "gemma4-31b via cerberus-reviewer: provider HTTP 503 Service Unavailable: busy"
-                .to_string(),
+            "gemma4-31b via provider-b: provider HTTP 503 Service Unavailable: busy".to_string(),
         ];
         assert_eq!(oneshot_failure_summary(&one, "x"), one[0]);
         let two = vec![

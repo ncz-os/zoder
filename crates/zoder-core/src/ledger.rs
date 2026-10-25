@@ -6,8 +6,8 @@
 //! `flock(2)` advisory locking, which is unreliable over NFS (locks may be
 //! silently ignored or not propagate between clients). The ledger file MUST
 //! therefore live on a LOCAL filesystem. The default `~/.zoder/` is local; a
-//! future config that points the ledger at an NFS mount (for example an
-//! ARGONAS share) would weaken the reserve->commit serialization and must be
+//! future config that points the ledger at an NFS mount (for example a shared
+//! release volume) would weaken the reserve->commit serialization and must be
 //! avoided.
 
 use anyhow::Context;

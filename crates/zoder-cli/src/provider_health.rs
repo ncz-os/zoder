@@ -1,14 +1,21 @@
-//! Pre-query health gate for NVIDIA EIH models
-//! (`https://integrate.api.nvidia.com/v1`).
+//! Pre-query health gate for providers that opt in via `[health]`.
 //!
-//! EIH rate-limits fleet-wide: a study run saw HTTP 429 on 7.5% of reviewer
-//! calls, in bursts, even at one request in flight. Querying it blindly made
-//! every zoder process on every host retry into the same limiter. This gate:
+//! Some hosted providers rate-limit across a fleet: a study run saw HTTP 429
+//! on 7.5% of reviewer calls, in bursts, even at one request in flight.
+//! Querying such a provider blindly made every zoder process on every host
+//! retry into the same limiter. A provider opts in by id:
+//!
+//! ```toml
+//! [health]
+//! providers = ["provider-a"]
+//! ```
+//!
+//! For those providers, this gate:
 //!
 //! * checks a model before the first query of a run, and again after the TTL
-//!   (`ZODER_EIH_HEALTH_TTL_S`, default 300s) or after any 429/5xx/timeout,
+//!   (`ZODER_PROVIDER_HEALTH_TTL_S`, default 300s) or after any 429/5xx/timeout,
 //!   with a bounded `GET {base}/models` probe (5s) that must list the model.
-//!   EIH exposes no per-model status endpoint; the "Healthy" tables in fleet
+//!   The provider needs no per-model status endpoint; the "Healthy" tables in
 //!   logs come from zoder's own `~/.zoder/health.json`, which is also where
 //!   this gate keeps its state, so every process on a host shares it;
 //! * keeps a per-model circuit breaker in that store: it opens on 429, 5xx,
@@ -20,31 +27,30 @@
 //!   as a pass: it is reported in `skipped_unhealthy`, and a panel missing its
 //!   member stays incomplete.
 //!
-//! Routing rules are unchanged: Nemotron is served only by the EIH route.
+//! Providers that do not opt in are never gated, and routing rules are
+//! unchanged.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use zoder_core::config::Provider;
+use zoder_core::config::{HealthConfig, Provider};
 use zoder_core::health::Precheck;
 use zoder_core::{Classification, HealthStore, OpenAiProvider};
 
-/// Host of the NVIDIA EIH gateway.
-pub(crate) const EIH_HOST: &str = "integrate.api.nvidia.com";
 const DEFAULT_TTL_SECS: i64 = 300;
 const DEFAULT_PROBE_TIMEOUT_MS: u64 = 5000;
 
 /// Skip records for this process, drained into `skipped_unhealthy`.
 static SKIPPED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
-/// Providers that are health-gated before every query.
-pub(crate) fn is_gated(provider: &Provider) -> bool {
-    provider.base_url.contains(EIH_HOST) || provider.id == "nvidia-eih"
+/// Whether this provider opted in to pre-query health gating.
+pub(crate) fn is_gated(health: &HealthConfig, provider: &Provider) -> bool {
+    health.providers.iter().any(|id| id == &provider.id)
 }
 
 fn ttl_secs() -> i64 {
-    std::env::var("ZODER_EIH_HEALTH_TTL_S")
+    std::env::var("ZODER_PROVIDER_HEALTH_TTL_S")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_TTL_SECS)
@@ -56,7 +62,7 @@ fn ttl_secs() -> i64 {
 pub(crate) static PROBE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Health-probe bound (`ZODER_EIH_PROBE_TIMEOUT_MS`, default 5000).
+/// Health-probe bound (`ZODER_PROVIDER_HEALTH_PROBE_TIMEOUT_MS`, default 5000).
 fn probe_timeout() -> Duration {
     #[cfg(test)]
     {
@@ -66,7 +72,7 @@ fn probe_timeout() -> Duration {
         }
     }
     Duration::from_millis(
-        std::env::var("ZODER_EIH_PROBE_TIMEOUT_MS")
+        std::env::var("ZODER_PROVIDER_HEALTH_PROBE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_PROBE_TIMEOUT_MS),
@@ -96,8 +102,8 @@ fn note_skip(model: &str, provider: &str, until_unix: i64, reason: &str) -> Stri
     }
     let wait = until_unix.saturating_sub(now()).max(0);
     format!(
-        "skipped unhealthy EIH model {model} (provider {provider}): {reason}; not querying it for \
-         another {wait}s (circuit breaker); falling back to the next configured route"
+        "skipped unhealthy provider model {model} (provider {provider}): {reason}; not querying it \
+         for another {wait}s (circuit breaker); falling back to the next configured route"
     )
 }
 
@@ -280,29 +286,28 @@ mod tests {
         }
     }
 
-    /// Only the EIH route is gated; the local routes (TYDEUS qwen38,
-    /// CERBERUS gemma) and other providers are not.
+    /// Only providers named in `[health].providers` are gated; a provider is
+    /// never gated by its id or endpoint unless the operator opts it in.
     #[test]
-    fn only_eih_routes_are_gated() {
-        assert!(is_gated(&provider(
-            "nvidia-eih",
-            "https://integrate.api.nvidia.com/v1"
-        )));
-        assert!(is_gated(&provider(
-            "eih-other-id",
-            "https://integrate.api.nvidia.com/v1"
-        )));
-        assert!(!is_gated(&provider(
-            "tydeus-coder",
-            "http://192.168.207.73:8006/v1"
-        )));
-        assert!(!is_gated(&provider(
-            "cerberus-reviewer",
-            "http://192.168.207.96:8080/v1"
-        )));
-        assert!(!is_gated(&provider(
-            "minimax-m3",
-            "https://api.minimax.io/v1"
-        )));
+    fn only_opted_in_providers_are_gated() {
+        let health = HealthConfig {
+            providers: vec!["provider-a".into()],
+        };
+        assert!(is_gated(
+            &health,
+            &provider("provider-a", "https://api.example.invalid/v1")
+        ));
+        assert!(!is_gated(
+            &health,
+            &provider("provider-b", "https://api.example.invalid/v1")
+        ));
+        assert!(!is_gated(
+            &health,
+            &provider("provider-c", "http://localhost:8006/v1")
+        ));
+        assert!(!is_gated(
+            &HealthConfig::default(),
+            &provider("provider-a", "https://api.example.invalid/v1")
+        ));
     }
 }
