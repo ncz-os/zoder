@@ -7,6 +7,7 @@ committed a degraded/empty overlay) and passes on the NEW one.
 Run: `python3 scripts/tests/corpus-freshness-tests.py`
 """
 from __future__ import annotations
+import hashlib
 import json
 import os
 import shutil
@@ -17,8 +18,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "ci" / "corpus-freshness-check.py"
-# The commit this fix branches from: the pre-fix gate lives here.
+# The pre-fix gate, VENDORED rather than extracted from git history. A
+# shallow clone cannot `git show` an old commit, and the signed-delta table is
+# the test that actually pins the sign fix -- it must not silently skip. The
+# fixture is a verbatim copy of
+#   scripts/ci/corpus-freshness-check.py @ 2c3b279da28e0005610c843c9243fd7bce1a1c32
+# and the digest below makes any drift in the copy a loud failure.
 BASELINE_REV = "2c3b279da28e0005610c843c9243fd7bce1a1c32"
+PREFIX_GATE = REPO_ROOT / "scripts" / "tests" / "fixtures" / "corpus-freshness-check.prefix-2c3b279.py"
+PREFIX_GATE_SHA256 = "ea6a340d00f94c57b6b56b22703ab1e4e61049934308e06ff472225bcf2ce3b3"
 
 def _scratch() -> Path:
     """An empty scratch checkout root for one test.
@@ -27,6 +35,9 @@ def _scratch() -> Path:
     harness can redirect a single test.
     """
     root = Path(os.environ.get("CORPUS_FRESHNESS_TEST_DIR") or tempfile.gettempdir())
+    if not root.is_dir():
+        raise RuntimeError(
+            f"CORPUS_FRESHNESS_TEST_DIR points at {root}, which is not a directory")
     return Path(tempfile.mkdtemp(prefix="corpus-freshness-", dir=str(root)))
 
 
@@ -397,16 +408,15 @@ def test_the_gate_agrees_with_a_signed_delta_table() -> None:
     workdir = _scratch()
     prefixed = workdir / "pre-fix-gate.py"   # scratch only: never the repo root
     try:
-        try:
-            blob = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show",
-                 f"{BASELINE_REV}:scripts/ci/corpus-freshness-check.py"],
-                capture_output=True, text=True, check=True).stdout
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            # F6: absence of history is a skip, not a failure -- a shallow
-            # clone cannot answer this question and must not go red.
-            print(f"skip  pre-fix gate unavailable in this checkout ({exc})")
+        if not PREFIX_GATE.exists():
+            fail_(f"vendored pre-fix gate is missing: {PREFIX_GATE}")
             return
+        blob = PREFIX_GATE.read_text()
+        digest = hashlib.sha256(blob.encode()).hexdigest()
+        if digest != PREFIX_GATE_SHA256:
+            fail_(f"vendored pre-fix gate drifted: sha256 {digest} != {PREFIX_GATE_SHA256}")
+            return
+        pass_("vendored pre-fix gate matches its pinned digest")
         prefixed.write_text(blob)
 
         # (cur, real delta, pre-fix exit, pre-fix printed sign, new exit, new sign)
@@ -527,12 +537,17 @@ def test_empty_env_override_falls_back_to_the_repo_root() -> None:
         else:
             fail_("the empty override fell through to the CWD")
 
-        # And end-to-end: the gate must not mention the decoy counts.
+        # A second, independent witness: give the DECOY a source set that
+        # would hard-fail the gate, and make the real checkout's own corpus
+        # irrelevant by checking only which freshness.json was consulted. If
+        # the empty override fell through to the CWD, that [] source list is
+        # what the gate would report.
+        (cwd / "corpus" / "freshness.json").write_text(json.dumps({"sources": []}))
         code, gate_out = _run_env(cwd, {"CORPUS_FRESHNESS_ROOT": ""})
-        if "7777" not in gate_out and "7778" not in gate_out:
-            pass_("a full run with an empty override never reads the CWD decoy")
+        if "0/0 sources" not in gate_out and "all sources failed" not in gate_out:
+            pass_("a full run with an empty override does not use the CWD's null source list")
         else:
-            fail_(f"the gate read the CWD decoy: {gate_out.strip()[:200]!r}")
+            fail_(f"the gate used the CWD decoy's source list: {gate_out.strip()[:200]!r}")
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
 
