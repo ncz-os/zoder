@@ -70,9 +70,9 @@ Branch: `fix/astra-review-reliability-20261009`.
 
 ## Verification and scope
 
-Rust compilation/tests run on idle ULTRA `192.168.207.88`, using btrfs under
-`/home/jasonperlow/Projects`. HYDRA and all NCZ worktrees/boot settings are
-excluded. The initial test scratch path exceeded Unix-domain socket pathname
+Rust compilation/tests run on an idle arm64 build host, using btrfs under a
+local projects directory. Other build hosts and all NCZ worktrees/boot
+settings are excluded. The initial test scratch path exceeded Unix-domain socket pathname
 limits; the final run uses the shorter disk-backed `Projects/za1009-tmp`.
 
 Before the final session-tracking addition, 591 CLI tests and all four new
@@ -82,8 +82,8 @@ used to approve these changes; verification uses source inspection, controlled
 HTTP/socket peers and the Rust test suite.
 
 Source delivery does not update installed fleet binaries. The prior mechanical
-log specifically found ULTRA running a stale binary despite fixed source on
-other hosts. Deployment must identify the built source SHA and binary digest;
+log specifically found a fleet host running a stale binary despite fixed source
+on other hosts. Deployment must identify the built source SHA and binary digest;
 the old `zoder 0.2.1` version string alone cannot prove this repair is installed.
 
 ## Known limits
@@ -94,8 +94,8 @@ in the code paths changed by that follow-up; each needs its own change with
 independent evidence.
 
 * **A strict served-model name match can reject a provider that echoes a
-  resolved or dated model id.** The check fails closed. Confirm what CERBERUS
-  `gemma4-31b` and EIH `nemotron` actually return before deploying any change.
+  resolved or dated model id.** The check fails closed. Confirm what the hosted
+  `gemma4-31b` and `nemotron` routes actually return before deploying any change.
 * **`cancel_session` does not validate `session_id` on `turn_complete`.** A
   completion for a different session can be attributed to the cancelled one.
 * **Goose loops abort on the first author timeout.** `record_active_session` is

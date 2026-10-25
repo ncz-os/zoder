@@ -28,7 +28,7 @@ Require completed success for all three build jobs and publication, and read the
 
 GitLab's active `nightly master-of-the-day` schedule runs at **09:00 UTC**. It refreshes the model corpus, syncs the `ncz-os/zeroclaw` engine fork from upstream (`zeroclaw-fork-sync`), and runs scheduled advisory/upstream checks. Per-push Rust gates remain in GitLab. Tagged/dispatch CLI builds are in `release.yml`; the weekly stack image is in `container-weekly.yml`.
 
-`scripts/daily-build.sh` is a retired host-local fallback, not the nightly source of truth. HYDRA's former 04:00 cron is explicitly retired. Do not re-enable stale host cron instructions or assume a local build updates fleet installations. Current fleet pullers consume the canonical rolling channel independently.
+`scripts/daily-build.sh` is a retired host-local fallback, not the nightly source of truth. The former 04:00 cron is explicitly retired. Do not re-enable stale host cron instructions or assume a local build updates fleet installations. Current fleet pullers consume the canonical rolling channel independently.
 
 ## Preserve the rolling release through mirroring
 
