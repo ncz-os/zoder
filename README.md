@@ -746,6 +746,106 @@ profile > global `request_timeout_s` > `ZODER_TIMEOUT_S` > default. Health
 probes and provider catalog fetches keep the global budget. Full details in
 [docs/CONCURRENCY.md](docs/CONCURRENCY.md#per-model-request-budget).
 
+### ACP idle watchdog (two-window watchdog)
+
+An agentic turn is bounded by two different clocks:
+
+* `--agent-timeout` (default 900s) is the **total** turn budget.
+* the **idle windows** below bound the *silence* of the ACP session.
+
+The idle watchdog has **TWO** windows, because the two waits have different
+causes:
+
+| window | default (self-hosted route) | default (hosted route) | measured from |
+|---|---|---|---|
+| `first_event` | **600s** | 60s | the start of the turn, until the first SUBSTANTIVE output |
+| `between_events` | **180s** | 60s | the last SUBSTANTIVE output |
+
+A **substantive** output is a token (a message chunk or a thought chunk) or a
+tool call. Session metadata, usage reports and keepalives are **not**
+substantive: they neither end the first phase nor restart any clock. The
+first window is the long one on purpose — the wait for the first token of a
+turn is a **cold start** (a local model loading its weights, a hosted
+provider queueing a cold request), not a wedge. Once the session has spoken
+it is alive, so the gap between two events can be short.
+
+**Phase rules**
+
+1. From the start of the turn until the first substantive output, the
+   `first_event` window applies.
+2. After the first substantive output, the shorter `between_events` window
+   applies.
+3. A pending tool call **suspends** the watchdog (that wait is bounded by
+   the total turn budget). When the tool round **completes**, the phase
+   resets to the `first_event` window, because the next model turn is a new
+   cold start.
+
+The windows are measured **between substantive events, never against the
+total runtime**, so a long but steady stream is never killed — only a
+*silence* is. This is what turns "zoder exec -m qwen38 streamed zero tokens
+for minutes and only the 900s `--agent-timeout` ended it" into a distinct,
+structured `idle_timeout` outcome in minutes instead of a quarter of an
+hour:
+
+```
+zoder: ACP idle timeout: the session produced no substantive output for 181.2s
+       (window=between_events, window_secs=180.000, last-event age 181.2s, model=qwen38)
+```
+
+The turn ends with `outcome = "idle_timeout"` (distinct from the total-budget
+`"timeout"`), the reason names **which window tripped** together with the
+window length, the last-event age and the model, the session is cancelled
+through the existing teardown path, and a spawned engine child is reaped — so
+an idle timeout never leaves an orphan behind.
+
+A model that legitimately thinks silently for longer than the window needs a
+bigger one. `0` disables **one** window independently (the other stays
+armed); `0` on both restores the pre-watchdog behaviour (only
+`--agent-timeout` can end a turn).
+
+```bash
+# a slow cold start, but a tight gap between events
+zoder exec -m qwen38 --agent-idle-timeout-first-event 900
+zoder exec -m qwen38 --agent-idle-timeout-between-events 120
+
+# the legacy single flag is an ALIAS: it sets BOTH windows
+zoder exec -m qwen38 --agent-idle-timeout 600
+
+# disable one window only
+zoder exec -m qwen38 --agent-idle-timeout-between-events 0
+```
+
+```json
+// config.json
+{
+  "agent_idle_timeout_first_event_s": 900,
+  "agent_idle_timeout_between_events_s": 120
+}
+```
+
+Environment variables: `ZODER_AGENT_IDLE_FIRST_EVENT_S` and
+`ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` (each `0` disables that window). The
+legacy `ZODER_AGENT_IDLE_S` sets both.
+
+Precedence **per window** (highest first):
+
+1. `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`
+2. `--agent-idle-timeout` (the legacy alias — sets **both** windows)
+3. config `agent_idle_timeout_first_event_s` /
+   `agent_idle_timeout_between_events_s`
+4. config `agent_idle_timeout_s` (the legacy key — sets **both** windows)
+5. `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`
+6. `ZODER_AGENT_IDLE_S` (the legacy variable — sets **both** windows)
+7. the built-in default: **600s / 180s**, for a self-hosted (local) route
+   and a hosted provider alike (a hosted gateway can queue or prefill a
+   request for minutes before its first token). zoder tells the two apart from the
+   endpoint (a loopback or local-network address, such as a LAN GPU box, or a self-hosted engine family such as
+   `vllm` / `sglang` / `llamacpp` is local; everything else is hosted), so
+   the defaults follow the route instead of being guessed.
+
+The same windows apply to every agentic dispatch (`exec`, `loop`, `rescue`,
+`run`) and to both engines (Zeroclaw and goose).
+
 ### Vendor overlays: `config.<name>.toml`
 
 `Config::load()` reads `config.json` (or the default free-tier config) and

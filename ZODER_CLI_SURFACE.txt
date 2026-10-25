@@ -137,6 +137,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -308,6 +339,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -446,6 +508,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -586,6 +679,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -725,6 +849,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -862,6 +1017,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1004,6 +1190,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -1145,6 +1362,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -1283,6 +1531,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -1436,6 +1715,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -1586,6 +1896,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -1733,6 +2074,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -1872,6 +2244,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2051,6 +2454,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -2192,6 +2626,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -2326,6 +2791,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2467,6 +2963,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -2612,6 +3139,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -2752,6 +3310,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -2886,6 +3475,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3027,6 +3647,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3172,6 +3823,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -3306,6 +3988,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3463,6 +4176,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -3605,6 +4349,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -3743,6 +4518,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -3910,6 +4716,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -4048,6 +4885,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4188,6 +5056,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -4322,6 +5221,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4465,6 +5395,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -4619,6 +5580,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -4761,6 +5753,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -4895,6 +5918,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
@@ -5035,6 +6089,37 @@ Options:
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
 
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
+
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).
           
@@ -5172,6 +6257,37 @@ Options:
 
       --agent-timeout <SECS>
           Hard wall-clock budget for an agentic turn, in seconds (default 900). When used with `zoder loop`, this is the per-turn budget; the outer loop-phase watchdog (`--loop-timeout`, default 900) must exceed this value or the watchdog fires before the first turn completes
+
+      --agent-idle-timeout <SECS>
+          Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+          
+          Sets BOTH windows: the first-event window and the between-events window. Prefer the two specific flags (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`) when only one of them should change.
+          
+          If the ACP session produces NO SUBSTANTIVE output — no token, no tool call — for the relevant window, the turn is ended with the distinct `idle_timeout` outcome instead of waiting for the full `--agent-timeout` budget. The windows are measured BETWEEN substantive events, so a long but steady stream is never killed; only a silence is.
+          
+          `0` disables the watchdog entirely and restores the pre-watchdog behaviour (only `--agent-timeout` can end a turn).
+          
+          Precedence, highest first: `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`, then this flag, then config `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`, then config `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then the built-in default.
+          
+          The windows are measured between SUBSTANTIVE events, so they never kill a long but steady stream.
+
+      --agent-idle-timeout-first-event <SECS>
+          First-event idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs from the start of the turn until the first SUBSTANTIVE output (a token or a tool call). It covers the COLD START of a slow local model (or a queued hosted request), so it is the long one: the default is 600s.
+          
+          Session metadata and keepalives do NOT end this phase.
+          
+          `0` disables THIS window only; the between-events window is untouched.
+
+      --agent-idle-timeout-between-events <SECS>
+          Between-events idle watchdog window for an agentic turn, in seconds.
+          
+          The window that runs BETWEEN two substantive outputs. Once the session has produced a token it is alive, so the gap can be short: the default is 180s.
+          
+          After a tool round completes the phase resets to the first-event window, because the next model turn is a new cold start.
+          
+          `0` disables THIS window only; the first-event window is untouched.
 
       --persist-session
           Persist the engine-side session id between `zoder` invocations so follow-up runs resume the same engine session instead of spinning up a fresh one every time. The id is stored under `~/.zoder/sessions/engine_sessions.json`, keyed per `(engine_kind, canonical-cwd)` so different repos / engines don't cross-talk. Default OFF (every pre-this-flag run created a fresh session; toggling this flag is the only thing that changes behavior).

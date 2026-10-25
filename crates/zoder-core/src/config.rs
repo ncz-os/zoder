@@ -43,6 +43,20 @@ const CONFIG_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc
 /// sentinel and the detector can never drift.
 pub const PLACEHOLDER_PROVIDER_HOST: &str = "api.example.com";
 
+/// Engine-provider families that are served by a SELF-HOSTED process on the
+/// local machine (a local inference server), as opposed to a hosted API.
+///
+/// Used to tell a cold local route from an already-warm hosted one.
+pub const SELF_HOSTED_ENGINE_FAMILIES: &[&str] = &[
+    "vllm",
+    "sglang",
+    "litellm",
+    "lmstudio",
+    "llamacpp",
+    "osaurus",
+    "atomic_chat",
+];
+
 /// Effective `account_id` for a `SubscriptionPlan` that did not declare an
 /// `account_id` in config. Centralized so the placeholder and every accessor
 /// / validator agree on the same string. Two subscription providers with the
@@ -367,6 +381,77 @@ pub struct Provider {
     /// header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_api_version: Option<String>,
+}
+
+impl Provider {
+    /// Is this provider a SELF-HOSTED (local) route?
+    ///
+    /// A local route (a vllm/sglang/llamacpp server on this machine or LAN, or a
+    /// loopback endpoint) can take minutes to answer its first request
+    /// while the model loads, so callers that need a cold-start allowance
+    /// (the ACP idle watchdog) must treat it differently from a hosted
+    /// provider, which is already warm.
+    ///
+    /// The answer is derived from the endpoint, not guessed from a name:
+    /// a loopback or local-network host in `base_url` OR an engine profile in one of the
+    /// self-hosted families. Everything else — including a provider with
+    /// no `base_url` at all — is HOSTED.
+    pub fn is_local_route(&self) -> bool {
+        if self.base_url_is_local_network() {
+            return true;
+        }
+        self.engine_provider_ref
+            .as_deref()
+            .and_then(|r| r.split_once('.').map(|(family, _)| family))
+            .is_some_and(|family| SELF_HOSTED_ENGINE_FAMILIES.contains(&family))
+    }
+
+    /// Does `base_url` point at this machine or its own network?
+    ///
+    /// Loopback, private (RFC 1918), link-local and unique-local addresses,
+    /// `localhost`, `.local` / `.lan` names and single-label hostnames are
+    /// all treated as the local network. This is what puts a model served
+    /// from a LAN GPU box (`http://192.168.x.x:8000/v1`) on the local
+    /// route, where a loopback-only check would classify it as hosted and
+    /// hand it the short window. A public hostname or address is never local.
+    fn base_url_is_local_network(&self) -> bool {
+        let rest = self
+            .base_url
+            .split_once("://")
+            .map_or(self.base_url.as_str(), |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        // A bracketed IPv6 literal may carry a port after the closing bracket.
+        let host = match authority.strip_prefix('[') {
+            Some(inner) => inner.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(authority),
+        };
+        let host = host.to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        if host == "localhost"
+            || host.ends_with(".localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".lan")
+        {
+            return true;
+        }
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                let first = ip.segments()[0];
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || first & 0xfe00 == 0xfc00 // unique local fc00::/7
+                    || first & 0xffc0 == 0xfe80 // link local fe80::/10
+            }
+            // A bare name with no dot is a LAN host name, not a public DNS name.
+            Err(_) => !host.contains('.'),
+        }
+    }
 }
 
 impl Provider {
@@ -1880,6 +1965,47 @@ pub struct Config {
     /// `ZODER_TIMEOUT_S` > provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_s: Option<u64>,
+    /// Idle-watchdog window for an agentic turn, in seconds (default 180).
+    ///
+    /// LEGACY single-window key: it sets BOTH windows. Prefer the
+    /// specific `agent_idle_timeout_first_event_s` /
+    /// `agent_idle_timeout_between_events_s` keys, which override it for
+    /// their own window.
+    ///
+    /// When the ACP session produces NO event at all for this long, the
+    /// turn is ended with the distinct `idle_timeout` outcome instead of
+    /// waiting for the total `--agent-timeout` budget. The window is
+    /// measured BETWEEN events, so a long but steady stream is never
+    /// killed — only a silence is.
+    ///
+    /// `0` disables the watchdog. CLI precedence: `--agent-idle-timeout` >
+    /// this key > `ZODER_AGENT_IDLE_S` > the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_idle_timeout_s: Option<u64>,
+    /// First-event idle-watchdog window, in seconds (default 600).
+    ///
+    /// The window that runs from the start of the turn until the first
+    /// SUBSTANTIVE output (a token or a tool call). It covers the COLD
+    /// START of a slow local model, so it is the long one. Session
+    /// metadata and keepalives do NOT end this phase.
+    ///
+    /// `0` disables THIS window only; the between-events window is
+    /// untouched. Precedence: `--agent-idle-timeout-first-event` >
+    /// `agent_idle_timeout_first_event_s` > `ZODER_AGENT_IDLE_FIRST_EVENT_S`
+    /// > the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_idle_timeout_first_event_s: Option<u64>,
+    /// Between-events idle-watchdog window, in seconds (default 180).
+    ///
+    /// The window that runs BETWEEN two substantive outputs. Once the
+    /// session has produced a token it is alive, so the gap can be short.
+    ///
+    /// `0` disables THIS window only; the first-event window is
+    /// untouched. Precedence: `--agent-idle-timeout-between-events` >
+    /// `agent_idle_timeout_between_events_s` >
+    /// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` > the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_idle_timeout_between_events_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -2944,6 +3070,9 @@ impl Config {
             free_api_hosts: default_free_hosts(),
             strict_free: default_strict_free(),
             request_timeout_s: None,
+            agent_idle_timeout_s: None,
+            agent_idle_timeout_first_event_s: None,
+            agent_idle_timeout_between_events_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,

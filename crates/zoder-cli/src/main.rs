@@ -204,6 +204,105 @@ pub(crate) fn provider_request_timeout_s(cli: &Cli, cfg: &Config) -> u64 {
     effective_request_timeout_s(cli, cfg, zoder_core::request_timeout_s_from_env())
 }
 
+/// Resolve the ACP idle-watchdog WINDOWS for one turn.
+///
+/// There are TWO windows, because the two waits have different causes:
+///
+/// * `first_event` runs from the start of the turn until the first
+///   SUBSTANTIVE output (a token or a tool call). It covers the COLD
+///   START of a slow local model, so it is the long one.
+/// * `between_events` runs between two substantive outputs. Once the
+///   session has produced a token it is alive, so the gap can be short.
+///
+/// Each window is resolved independently, and `0` disables that window
+/// only. Precedence per window (highest first):
+///   1. `--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`,
+///   2. the legacy `--agent-idle-timeout` (an alias that sets BOTH windows),
+///   3. `agent_idle_timeout_first_event_s` / `agent_idle_timeout_between_events_s`
+///      in the zoder config,
+///   4. the legacy `agent_idle_timeout_s` config key (also sets BOTH),
+///   5. `ZODER_AGENT_IDLE_FIRST_EVENT_S` / `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`,
+///   6. the legacy `ZODER_AGENT_IDLE_S` (also sets BOTH),
+///   7. the built-in default, which depends on the ROUTE: a local
+///      (self-hosted) route gets the long cold-start allowance, a hosted
+///      route gets the short pair.
+///
+/// The windows are measured between SUBSTANTIVE events, so they never kill
+/// a long but steady stream. `0` on both windows disables the watchdog
+/// entirely (the pre-watchdog behaviour: only the total `--agent-timeout`
+/// budget can end a turn).
+fn effective_agent_idle_windows(
+    cli: &Cli,
+    cfg: &Config,
+    env_idle_s: Option<u64>,
+    env_first_event_s: Option<u64>,
+    env_between_events_s: Option<u64>,
+    route: IdleRoute,
+) -> zoder_core::AgentIdleWindows {
+    let (default_first_event_s, default_between_events_s) = match route {
+        // A self-hosted route (a local vllm/sglang/llamacpp server) can
+        // take minutes to answer its FIRST request while it loads the
+        // model, so the cold-start window is the long one.
+        IdleRoute::Local => (
+            zoder_core::DEFAULT_AGENT_IDLE_FIRST_EVENT_S,
+            zoder_core::DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S,
+        ),
+        // A hosted provider is already warm: there is no cold start to
+        // wait out, so both windows are short.
+        IdleRoute::Hosted => (
+            zoder_core::HOSTED_AGENT_IDLE_FIRST_EVENT_S,
+            zoder_core::HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S,
+        ),
+    };
+
+    let first_event_s = cli
+        .agent_idle_timeout_first_event
+        .or(cli.agent_idle_timeout)
+        .or(cfg.agent_idle_timeout_first_event_s)
+        .or(cfg.agent_idle_timeout_s)
+        .or(env_first_event_s)
+        .or(env_idle_s)
+        .unwrap_or(default_first_event_s);
+
+    let between_events_s = cli
+        .agent_idle_timeout_between_events
+        .or(cli.agent_idle_timeout)
+        .or(cfg.agent_idle_timeout_between_events_s)
+        .or(cfg.agent_idle_timeout_s)
+        .or(env_between_events_s)
+        .or(env_idle_s)
+        .unwrap_or(default_between_events_s);
+
+    zoder_core::AgentIdleWindows::from_secs(first_event_s, between_events_s)
+}
+
+/// Which KIND of route serves a turn, so the idle-watchdog defaults can
+/// match the route's cold-start behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleRoute {
+    /// A self-hosted endpoint (a local vllm/sglang/llamacpp server): the
+    /// model may need minutes to load, so the first-event window is long.
+    Local,
+    /// A hosted provider: already warm, so both windows are short.
+    Hosted,
+}
+
+impl IdleRoute {
+    /// Classify a routed provider as local or hosted.
+    ///
+    /// A provider is LOCAL when its base URL points at a loopback or
+    /// local-network address or when its engine profile is one of the self-hosted families; every
+    /// other provider is HOSTED. When the route cannot be classified at
+    /// all (no provider yet) the answer is [`IdleRoute::Hosted`], because a
+    /// hosted provider is the only case where a short window is safe.
+    pub(crate) fn for_provider(provider: Option<&zoder_core::config::Provider>) -> Self {
+        match provider {
+            Some(provider) if provider.is_local_route() => IdleRoute::Local,
+            _ => IdleRoute::Hosted,
+        }
+    }
+}
+
 /// Request budget for one model-scoped call.
 ///
 /// Precedence (highest first):
@@ -429,6 +528,60 @@ struct Cli {
     /// value or the watchdog fires before the first turn completes.
     #[arg(long, global = true, value_name = "SECS")]
     agent_timeout: Option<u64>,
+    /// Idle watchdog window for an agentic turn, in seconds (LEGACY alias).
+    ///
+    /// Sets BOTH windows: the first-event window and the between-events
+    /// window. Prefer the two specific flags
+    /// (`--agent-idle-timeout-first-event` / `--agent-idle-timeout-between-events`)
+    /// when only one of them should change.
+    ///
+    /// If the ACP session produces NO SUBSTANTIVE output — no token, no
+    /// tool call — for the relevant window, the turn is ended with the
+    /// distinct `idle_timeout` outcome instead of waiting for the full
+    /// `--agent-timeout` budget. The windows are measured BETWEEN
+    /// substantive events, so a long but steady stream is never killed;
+    /// only a silence is.
+    ///
+    /// `0` disables the watchdog entirely and restores the pre-watchdog
+    /// behaviour (only `--agent-timeout` can end a turn).
+    ///
+    /// Precedence, highest first: `--agent-idle-timeout-first-event` /
+    /// `--agent-idle-timeout-between-events`, then this flag, then config
+    /// `agent_idle_timeout_first_event_s` /
+    /// `agent_idle_timeout_between_events_s`, then config
+    /// `agent_idle_timeout_s`, then `ZODER_AGENT_IDLE_FIRST_EVENT_S` /
+    /// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S`, then `ZODER_AGENT_IDLE_S`, then
+    /// the built-in default.
+    ///
+    /// The windows are measured between SUBSTANTIVE events, so they never
+    /// kill a long but steady stream.
+    #[arg(long, global = true, value_name = "SECS")]
+    agent_idle_timeout: Option<u64>,
+    /// First-event idle watchdog window for an agentic turn, in seconds.
+    ///
+    /// The window that runs from the start of the turn until the first
+    /// SUBSTANTIVE output (a token or a tool call). It covers the COLD
+    /// START of a slow local model (or a queued hosted request), so it is
+    /// the long one: the default is 600s.
+    ///
+    /// Session metadata and keepalives do NOT end this phase.
+    ///
+    /// `0` disables THIS window only; the between-events window is
+    /// untouched.
+    #[arg(long, global = true, value_name = "SECS")]
+    agent_idle_timeout_first_event: Option<u64>,
+    /// Between-events idle watchdog window for an agentic turn, in seconds.
+    ///
+    /// The window that runs BETWEEN two substantive outputs. Once the
+    /// session has produced a token it is alive, so the gap can be short:
+    /// the default is 180s.
+    ///
+    /// After a tool round completes the phase resets to the first-event
+    /// window, because the next model turn is a new cold start.
+    ///
+    /// `0` disables THIS window only; the first-event window is untouched.
+    #[arg(long, global = true, value_name = "SECS")]
+    agent_idle_timeout_between_events: Option<u64>,
     /// Persist the engine-side session id between `zoder` invocations
     /// so follow-up runs resume the same engine session instead of
     /// spinning up a fresh one every time. The id is stored under
@@ -8693,6 +8846,313 @@ mod cli_tier_reasoning_parse_tests {
         );
     }
 
+    #[test]
+    fn agent_idle_timeout_flag_is_global_and_optional() {
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout", "17"])
+            .expect("--agent-idle-timeout must parse on subcommands");
+        assert_eq!(
+            cli.agent_idle_timeout,
+            Some(17),
+            "the CLI must surface the idle-watchdog window"
+        );
+
+        let unset = Cli::try_parse_from(["zoder", "exec"]).expect("plain exec parses");
+        assert!(
+            unset.agent_idle_timeout.is_none(),
+            "unset CLI idle timeout must remain None so config/env/default precedence can apply"
+        );
+
+        // `0` must be accepted (it is the documented "disable" value) —
+        // a parser that rejected it would make the watchdog impossible to
+        // turn off.
+        let disabled = Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout", "0"])
+            .expect("--agent-idle-timeout 0 must parse");
+        assert_eq!(disabled.agent_idle_timeout, Some(0));
+    }
+
+    #[test]
+    fn agent_idle_timeout_config_key_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "providers": [{
+                    "id": "acme",
+                    "base_url": "https://gw.acme.example/v1",
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"}
+                }],
+                "corpus_path": "/tmp/zoder-idle/corpus.json",
+                "ledger_path": "/tmp/zoder-idle/ledger.jsonl",
+                "health_path": "/tmp/zoder-idle/health.json",
+                "default_provider": "acme",
+                "agent_idle_timeout_s": 42
+            }"#,
+        )
+        .unwrap();
+        let cfg =
+            Config::load_unvalidated_from(dir.path()).expect("agent_idle_timeout_s config loads");
+        assert_eq!(
+            cfg.agent_idle_timeout_s,
+            Some(42),
+            "agent_idle_timeout_s must be available from config"
+        );
+    }
+
+    #[test]
+    fn agent_idle_timeout_precedence_is_cli_config_env_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.agent_idle_timeout_s = Some(33);
+
+        // The legacy single flag is an ALIAS that sets BOTH windows.
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout", "44"]).unwrap();
+        let resolved =
+            effective_agent_idle_windows(&cli, &cfg, Some(55), None, None, IdleRoute::Local);
+        assert_eq!(resolved.first_event_secs(), Some(44));
+        assert_eq!(resolved.between_events_secs(), Some(44));
+
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let resolved =
+            effective_agent_idle_windows(&cli, &cfg, Some(55), None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.first_event_secs(),
+            Some(33),
+            "config wins over env"
+        );
+        assert_eq!(resolved.between_events_secs(), Some(33));
+
+        cfg.agent_idle_timeout_s = None;
+        let resolved =
+            effective_agent_idle_windows(&cli, &cfg, Some(55), None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.first_event_secs(),
+            Some(55),
+            "the environment wins over the default"
+        );
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.first_event_secs(),
+            Some(zoder_core::DEFAULT_AGENT_IDLE_FIRST_EVENT_S),
+            "the documented default applies when nothing else is set"
+        );
+        assert_eq!(
+            resolved.between_events_secs(),
+            Some(zoder_core::DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S)
+        );
+    }
+
+    #[test]
+    fn the_specific_idle_flags_override_the_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.agent_idle_timeout_s = Some(33);
+
+        // The legacy flag sets both windows; the specific flags override it
+        // for their OWN window only.
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--agent-idle-timeout",
+            "44",
+            "--agent-idle-timeout-first-event",
+            "700",
+        ])
+        .unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.first_event_secs(),
+            Some(700),
+            "the specific first-event flag wins for the first window"
+        );
+        assert_eq!(
+            resolved.between_events_secs(),
+            Some(44),
+            "the legacy alias still sets the window it owns"
+        );
+
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout-between-events", "90"])
+                .unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.between_events_secs(),
+            Some(90),
+            "the specific between-events flag wins for the between window"
+        );
+        assert_eq!(
+            resolved.first_event_secs(),
+            Some(33),
+            "the legacy config key still sets the window it owns"
+        );
+    }
+
+    #[test]
+    fn the_per_window_config_keys_and_env_vars_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.agent_idle_timeout_first_event_s = Some(700);
+        cfg.agent_idle_timeout_between_events_s = Some(90);
+
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(resolved.first_event_secs(), Some(700));
+        assert_eq!(resolved.between_events_secs(), Some(90));
+
+        // The config keys win over the environment (the documented
+        // precedence is CLI > config > env > default).
+        let resolved =
+            effective_agent_idle_windows(&cli, &cfg, None, Some(800), Some(95), IdleRoute::Local);
+        assert_eq!(resolved.first_event_secs(), Some(700));
+        assert_eq!(resolved.between_events_secs(), Some(90));
+
+        // With no config key, the specific env vars apply.
+        cfg.agent_idle_timeout_first_event_s = None;
+        cfg.agent_idle_timeout_between_events_s = None;
+        let resolved =
+            effective_agent_idle_windows(&cli, &cfg, None, Some(800), Some(95), IdleRoute::Local);
+        assert_eq!(resolved.first_event_secs(), Some(800));
+        assert_eq!(resolved.between_events_secs(), Some(95));
+    }
+
+    #[test]
+    fn agent_idle_timeout_zero_disables_the_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout", "0"]).unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert!(
+            !resolved.is_enabled(),
+            "0 must disable the idle watchdog entirely"
+        );
+        assert_eq!(resolved.first_event(), None);
+        assert_eq!(resolved.between_events(), None);
+    }
+
+    #[test]
+    fn a_zero_idle_window_disables_only_that_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+
+        let cli = Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout-first-event", "0"])
+            .unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(
+            resolved.first_event(),
+            None,
+            "0 must disable the first-event window"
+        );
+        assert_eq!(
+            resolved.between_events(),
+            Some(std::time::Duration::from_secs(
+                zoder_core::DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S,
+            )),
+            "the between-events window must stay armed"
+        );
+
+        let cli =
+            Cli::try_parse_from(["zoder", "exec", "--agent-idle-timeout-between-events", "0"])
+                .unwrap();
+        let resolved = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(resolved.between_events(), None);
+        assert_eq!(
+            resolved.first_event(),
+            Some(std::time::Duration::from_secs(
+                zoder_core::DEFAULT_AGENT_IDLE_FIRST_EVENT_S,
+            ))
+        );
+    }
+
+    #[test]
+    fn a_hosted_route_gets_the_same_idle_windows_as_a_local_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+        let cli = Cli::try_parse_from(["zoder", "exec"]).unwrap();
+
+        let local = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Local);
+        assert_eq!(
+            local.first_event_secs(),
+            Some(zoder_core::DEFAULT_AGENT_IDLE_FIRST_EVENT_S),
+            "a self-hosted route needs the long cold-start allowance"
+        );
+        assert_eq!(
+            local.between_events_secs(),
+            Some(zoder_core::DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S)
+        );
+
+        let hosted = effective_agent_idle_windows(&cli, &cfg, None, None, None, IdleRoute::Hosted);
+        assert_eq!(
+            hosted.first_event_secs(),
+            Some(600),
+            "a hosted gateway can queue a request for minutes before its first token"
+        );
+        assert_eq!(hosted.between_events_secs(), Some(180));
+    }
+
+    #[test]
+    fn a_loopback_provider_is_a_local_route_and_a_remote_one_is_hosted() {
+        let mut local: Provider = serde_json::from_value(serde_json::json!({
+            "id": "local",
+            "base_url": "http://localhost:8000/v1",
+            "kind": "openai-chat",
+            "auth": { "type": "none" },
+        }))
+        .expect("the provider must deserialize");
+        assert!(local.is_local_route(), "a loopback endpoint is local");
+
+        let mut hosted = local.clone();
+        hosted.base_url = "https://api.groq.com/openai/v1".to_string();
+        assert!(!hosted.is_local_route(), "a remote endpoint is hosted");
+
+        // A self-hosted engine family is local even behind a LAN name.
+        local.base_url = "https://vllm.internal.example/v1".to_string();
+        local.engine_provider_ref = Some("vllm.internal".to_string());
+        assert!(local.is_local_route(), "a vllm engine profile is local");
+    }
+
+    #[test]
+    fn a_lan_gpu_box_is_a_local_route_and_a_public_host_is_not() {
+        let provider = |url: &str| -> Provider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p",
+                "base_url": url,
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+            }))
+            .expect("the provider must deserialize")
+        };
+        // The fleet's own self-hosted routes: a private LAN address behind a
+        // `custom.*` engine profile, which the engine-family check cannot see.
+        for url in [
+            "http://192.168.1.73:8006/v1",
+            "http://10.1.2.3:8000/v1",
+            "http://172.20.0.5/v1",
+            "http://169.254.1.1:8000/v1",
+            "http://[::1]:8000/v1",
+            "http://[fd00::5]:8000/v1",
+            "http://user:pw@127.0.0.1:8080/v1",
+            "http://gpu-box:8000/v1",
+            "http://gpubox.local:8006/v1",
+            "http://0.0.0.0:8000/v1",
+        ] {
+            assert!(
+                provider(url).is_local_route(),
+                "{url} must be a local route"
+            );
+        }
+        for url in [
+            "https://api.minimax.io/v1",
+            "https://integrate.api.nvidia.com/v1",
+            "https://api.deepseek.com/v1",
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://[2001:4860:4860::8888]:443/v1",
+            "https://example.com:8443/v1",
+        ] {
+            assert!(!provider(url).is_local_route(), "{url} must be hosted");
+        }
+    }
+
     /// A config with one slow model pinned on its own budget, used by the
     /// per-model precedence tests below. `MiniMax-M3` measured >120s on a
     /// ~650-line review chunk (HYDRA, 2026-10-21) while its neighbours on the
@@ -9881,6 +10341,24 @@ pub(crate) async fn agentic_turn(
         show_reasoning: cli.show_reasoning,
         approval: parse_approval(cli),
         timeout: std::time::Duration::from_secs(cli.agent_timeout.unwrap_or(900)),
+        // IDLE WATCHDOG: the "no event" watchdog for one turn. Precedence
+        // (highest first): `--agent-idle-timeout` > config
+        // `agent_idle_timeout_s` > `ZODER_AGENT_IDLE_S` > the documented
+        // default. `0` disables it and restores the pre-watchdog
+        // behaviour (only `--agent-timeout` can end a turn).
+        //
+        // TWO windows: a long first-event window for the COLD START of a
+        // slow local model, and a short between-events window for the
+        // silence that follows a session that has already spoken. The
+        // defaults follow the ROUTE; both routes currently get 600s/180s.
+        idle_windows: effective_agent_idle_windows(
+            cli,
+            &eng.cfg,
+            zoder_core::agent_idle_timeout_s_from_env(),
+            zoder_core::agent_idle_first_event_s_from_env(),
+            zoder_core::agent_idle_between_events_s_from_env(),
+            IdleRoute::for_provider(Some(&routed_provider)),
+        ),
         goose_provider,
         // SLICE 2 (execution-safety kernel CLI plumbing): thread the
         // operator's flags into the agentic driver. Defaults are
@@ -10537,12 +11015,25 @@ pub(crate) async fn cmd_exec_agentic(
         // above is whatever the turn produced. Point the user at a clean resume.
         if !cli.quiet && !cli.json {
             let timed_out = t.run.outcome == "timeout";
+            let idle = t.run.outcome == zoder_core::IDLE_TIMEOUT_OUTCOME;
             eprintln!(
                 "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
-                if timed_out { "timed out — partial work kept" } else { "did not complete" },
+                if timed_out {
+                    "timed out — partial work kept"
+                } else if idle {
+                    "went idle — partial work kept"
+                } else {
+                    "did not complete"
+                },
                 t.run.content.len(),
                 t.run.session_id,
-                if timed_out { "  (or raise --agent-timeout <secs>, default 900)" } else { "" },
+                if timed_out {
+                    "  (or raise --agent-timeout <secs>, default 900)"
+                } else if idle {
+                    "  (or raise --agent-idle-timeout <secs>, default 180; 0 disables the idle watchdog)"
+                } else {
+                    ""
+                },
             );
         }
         return Err(anyhow::Error::new(ReportedTurnError(turn_failure_summary(
