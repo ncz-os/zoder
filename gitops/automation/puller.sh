@@ -6,7 +6,7 @@
 #
 # Config: ~/.config/zoder/release.env  (RELEASE_BASE_URL, CHANNEL, CLASS)
 #
-# BUILDER hosts (roles include `builder`, e.g. cerberus/ultra/jperlow-mlt) may set
+# BUILDER hosts (roles include `builder`) may set
 # BUILD_FROM_SOURCE=1 to compile the binary set locally from source instead of
 # fetching a published artifact. ZC_SRC must point at the zeroclaw fork checkout
 # that provides zerocode + zeroclaw (defaults to ~/src/zeroclaw).
@@ -129,7 +129,7 @@ fi
 
 # 3) apply config + restart. Workstation/binaries-only hosts set APPLY_CONFIG=0
 # to PRESERVE a hand-tuned live config (apply.sh would re-render it from the
-# fleet template). In that mode we still restart the daemon when the binary
+# deployment template). In that mode we still restart the daemon when the binary
 # changed, leaving the config untouched.
 if [ "${APPLY_CONFIG:-1}" = 0 ]; then
   log "config apply skipped (APPLY_CONFIG=0; preserving live config)"

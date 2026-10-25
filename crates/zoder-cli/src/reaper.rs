@@ -1,6 +1,6 @@
 //! Reap the processes an agentic `loop`/`rescue` leaked into the workspace.
 //!
-//! 2026-10-21 (HYDRA, hive job `01a1601b`): a `zoder loop` driven through the
+//! 2026-10-21 (fleet host, hive job `01a1601b`): a `zoder loop` driven through the
 //! zeroclaw ACP agent had the agent start 368 `yes` load generators in the
 //! background. They ran for ~2 h at load average 376 and survived BOTH the end
 //! of the loop and the Hive worker's 7200 s timeout, because the worker only
@@ -38,7 +38,7 @@
 //!
 //! Every rule above describes the AGENT's processes, but the zeroclaw daemon
 //! is not the agent's: it is one daemon per host that every zoder on the box
-//! drives through `<data dir>/daemon.sock`. 2026-10-21 (ACHILLES): job
+//! drives through `<data dir>/daemon.sock`. 2026-10-21 (another fleet host): job
 //! `01a16164`'s `zoder loop` spawned the daemon with no `current_dir` set, so
 //! the daemon inherited the JOB's workspace as its cwd. The daemon matched
 //! every rule in the list — same uid, cwd inside `-C`, started after the loop
@@ -93,7 +93,7 @@
 //!
 //! ## An unreachable engine is not a busy agent
 //!
-//! 2026-10-22 (MINOS, hive job `01a163c9`): at the end of a `zoder loop` every
+//! 2026-10-22 (fleet host, hive job `01a163c9`): at the end of a `zoder loop` every
 //! `session/cancel` failed with `connecting to engine at
 //! ~/.zoder/data/daemon.sock: No such file or directory (os error 2)`, the same
 //! "cancel not confirmed" line repeated for one session across the cancel
@@ -1835,7 +1835,7 @@ fn libc_sigkill() -> i32 {
 #[cfg(not(target_os = "linux"))]
 fn signal(_pid: u32, _sig: i32) {}
 // ---------------------------------------------------------------------------
-// Regression tests: the 2026-10-21 HYDRA orphan incident (hive job 01a1601b).
+// Regression tests: the 2026-10-21 shared-host orphan incident (hive job 01a1601b).
 // All Linux-only: they read /proc and spawn real processes.
 // ---------------------------------------------------------------------------
 
@@ -2059,7 +2059,7 @@ mod tests {
 
     /// The incident, end to end: a "fake agent" starts a detached child in the
     /// `-C` workspace and exits, so the child is orphaned (reparented away
-    /// from the run) exactly like the 368 `yes` generators on HYDRA. It must
+    /// from the run) exactly like the 368 `yes` generators left on a shared host. It must
     /// be SELECTED while it is still running (i.e. nothing else would have
     /// killed it) and GONE once the loop's reap scope closes.
     #[test]
@@ -2875,7 +2875,7 @@ mod tests {
         forget_session(id);
     }
 
-    /// 2026-10-22 (MINOS, hive job `01a163c9`): the engine socket path no
+    /// 2026-10-22 (fleet host, hive job `01a163c9`): the engine socket path no
     /// longer existed, yet the teardown ran all four rounds, repeated the same
     /// "cancel not confirmed" line for one session, and then reported the agent
     /// as still producing work. The cancel is not retried (one unreachable
@@ -3194,7 +3194,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The shared zeroclaw daemon (2026-10-21, ACHILLES hive job 01a16164).
+    // The shared zeroclaw daemon (2026-10-21, fleet hive job 01a16164).
     // -----------------------------------------------------------------------
 
     /// The incident, at the reap scope. A `zeroclaw` daemon sits inside `-C`,
