@@ -1942,6 +1942,19 @@ impl Default for Theme {
     }
 }
 
+/// `[health]` block: which providers get the pre-query health gate.
+///
+/// Gating is opt-in by provider id. A provider that is not listed here is
+/// never probed or skipped before a query, regardless of its endpoint, so the
+/// gate carries no vendor or host knowledge of its own.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Provider ids whose calls are gated by the pre-query health check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -1951,6 +1964,10 @@ pub struct Config {
     pub corpus_path: PathBuf,
     pub ledger_path: PathBuf,
     pub health_path: PathBuf,
+    /// Providers that opt in to the pre-query health gate. Absent means no
+    /// provider is gated.
+    #[serde(default)]
+    pub health: HealthConfig,
     /// Hosts considered free/internal for the anti-paid-fallback guard.
     /// Matched by exact host or registrable suffix (never substring).
     #[serde(default = "default_free_hosts")]
@@ -3067,6 +3084,7 @@ impl Config {
             corpus_path: home.join("model_corpus.json"),
             ledger_path: home.join("ledger.jsonl"),
             health_path: home.join("health.json"),
+            health: HealthConfig::default(),
             free_api_hosts: default_free_hosts(),
             strict_free: default_strict_free(),
             request_timeout_s: None,

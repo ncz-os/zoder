@@ -245,7 +245,7 @@ pub struct ModelHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at_unix: Option<i64>,
     /// Pre-query gate (circuit breaker with exponential backoff) for models
-    /// that must never be queried blindly (EIH). Absent = closed.
+    /// that must never be queried blindly. Absent = closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<PreQueryGate>,
 }
@@ -1723,7 +1723,7 @@ mod pre_query_gate_tests {
             m.precheck_at(1000, 300),
             Precheck::NeedsProbe { half_open: false }
         );
-        m.record_gate_success_at(1000, "nvidia-eih");
+        m.record_gate_success_at(1000, "provider-a");
         assert_eq!(
             m.precheck_at(1200, 300),
             Precheck::Fresh {
@@ -1741,7 +1741,7 @@ mod pre_query_gate_tests {
         let mut m = ModelHealth::default();
         m.record_gate_failure_at(
             1000,
-            "nvidia-eih",
+            "provider-a",
             Classification::Capacity,
             None,
             "HTTP 429",
@@ -1762,7 +1762,7 @@ mod pre_query_gate_tests {
         m.claim_half_open_at(t);
         assert!(matches!(m.precheck_at(t + 1, 300), Precheck::Skip { .. }));
         // Probe fails again: doubled backoff.
-        m.record_gate_failure_at(t + 2, "nvidia-eih", Classification::Error, None, "timeout");
+        m.record_gate_failure_at(t + 2, "provider-a", Classification::Error, None, "timeout");
         match m.precheck_at(t + 3, 300) {
             Precheck::Skip { until_unix, .. } => {
                 assert_eq!(until_unix, t + 2 + 2 * GATE_BACKOFF_BASE_SECS)
@@ -1772,7 +1772,7 @@ mod pre_query_gate_tests {
         // Retry-After longer than the backoff wins.
         m.record_gate_failure_at(
             5000,
-            "nvidia-eih",
+            "provider-a",
             Classification::Capacity,
             Some(600),
             "429",
@@ -1782,13 +1782,13 @@ mod pre_query_gate_tests {
         );
         // The cap bounds growth.
         for _ in 0..20 {
-            m.record_gate_failure_at(9000, "nvidia-eih", Classification::Capacity, None, "429");
+            m.record_gate_failure_at(9000, "provider-a", Classification::Capacity, None, "429");
         }
         assert!(
             matches!(m.precheck_at(9001, 300), Precheck::Skip { until_unix, .. } if until_unix == 9000 + GATE_BACKOFF_CAP_SECS)
         );
         // A success closes the gate.
-        m.record_gate_success_at(20000, "nvidia-eih");
+        m.record_gate_success_at(20000, "provider-a");
         assert!(m.gate.is_none());
         assert!(matches!(m.precheck_at(20001, 300), Precheck::Fresh { .. }));
     }

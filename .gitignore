@@ -16,7 +16,7 @@ catalog/model_index*.csv
 gitops/secrets/
 /dist
 gitops/dist/
-# Argonas / merge artifacts — never commit
+# Shared-host / merge artifacts — never commit
 .merge-out/
 .zeroclaw-src/
 
