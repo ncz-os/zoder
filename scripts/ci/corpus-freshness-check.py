@@ -34,7 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def _paths() -> tuple[Path, Path]:
     """Resolve corpus + overlay paths. Tests can override via env vars."""
-    base = Path(os.environ.get("CORPUS_FRESHNESS_ROOT", str(REPO_ROOT)))
+    # `os.environ.get(k, default)` evaluates `default` eagerly, so it can never
+    # substitute a value -- an override set by a test was silently ignored and
+    # the check read (and rewrote) the real checkout's corpus/. Only fall back
+    # when the override is absent or empty.
+    base = Path(os.environ.get("CORPUS_FRESHNESS_ROOT") or str(REPO_ROOT))
     return base / "corpus", base / "bench" / "overlay.json"
 
 # Allowed coverage drop between consecutive runs, expressed as a fraction
@@ -93,11 +97,22 @@ def main() -> int:
         print(f"corpus-freshness: overlay below minimum ({cur_overlay_count} < {MIN_AGENTIC_SCORE_COUNT}); refusing to commit", file=sys.stderr)
         return 1
 
-    # Coverage drop check vs LKG. Conservative in both directions: a
-    # sudden spike (massive new source) is fine, only a DROP is bad.
+    # Coverage delta check vs LKG. Conservative in both directions: a
+    # sudden spike (massive new source) is fine, only a DROP beyond the
+    # threshold is bad.
+    #
+    # The signed delta is (cur - last) / last, so a POSITIVE number is growth
+    # and a NEGATIVE number is a drop. Two faults lived here:
+    #   * the expression was `(last - cur) / last` -- growth already came out
+    #     positive, so on 2026-10-25 a +26.2% increase was compared against a
+    #     +25% "drop" threshold and blocked the corpus publish;
+    #   * the guard then used `abs(drop) > threshold`, which failed BOTH
+    #     directions. `drop` is defined as `cur - last`, never as its
+    #     magnitude, so the magnitude now lives in `drop_magnitude` and the
+    #     comparison is signed: only a negative delta (a real drop) can fail.
     if last_path.exists():
+        last_overlay_count = 0
         try:
-            last_overlay_count = 0
             # Best-effort: re-derive from the prior freshness report if
             # the prior overlay.json isn't checkable (the last-known-good
             # record is always `freshness-last.json` from the prior pass).
@@ -106,11 +121,19 @@ def main() -> int:
         except (json.JSONDecodeError, ValueError, KeyError, TypeError):
             last_overlay_count = 0
         if last_overlay_count > 0:
-            drop = (last_overlay_count - cur_overlay_count) / last_overlay_count
-            print(f"corpus-freshness: coverage delta vs LKG = {drop:+.1%} (threshold {-COVERAGE_DROP_THRESHOLD:.0%})", file=sys.stderr)
-            if drop > COVERAGE_DROP_THRESHOLD:
+            # Signed: positive = growth, negative = drop.
+            drop = (cur_overlay_count - last_overlay_count) / last_overlay_count
+            drop_magnitude = abs(drop)
+            print(
+                f"corpus-freshness: coverage delta vs LKG = {drop:+.1%} (threshold -{COVERAGE_DROP_THRESHOLD:.0%})",
+                file=sys.stderr,
+            )
+            # Only a real DROP beyond the threshold fails. An increase of any
+            # size passes: growing coverage is the corpus getting better, not
+            # an outage.
+            if drop < 0 and drop_magnitude > COVERAGE_DROP_THRESHOLD:
                 print(
-                    f"corpus-freshness: coverage dropped by {drop:.1%}, more than the {COVERAGE_DROP_THRESHOLD:.0%} threshold",
+                    f"corpus-freshness: coverage dropped by {drop_magnitude:.1%}, more than the {COVERAGE_DROP_THRESHOLD:.0%} threshold",
                     file=sys.stderr,
                 )
                 print(
