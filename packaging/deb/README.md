@@ -55,9 +55,8 @@ Buildkite has two credential types and they are not interchangeable:
   puts in `/etc/apt/auth.conf.d/`. It returns an auth error on publish; that is
   by design, not a scope misconfiguration.
 
-The org's write-capable token already exists in the fleet credential store
-(`~/.api_keys_master.json` → `buildkite.api_access_token`). It only has to be
-copied into the repository secret.
+The org's write-capable token already exists in the fleet credential store; it
+only has to be copied into the repository secret.
 
 ## Running it by hand
 
@@ -83,8 +82,5 @@ echo "deb [signed-by=/etc/apt/keyrings/ncz-os-ncz.gpg] https://packages.buildkit
 sudo apt-get update && sudo apt-get install zoder
 ```
 
-Note that the NCZ installer images point their kernel/CIX APT source at a
-Cloudflare R2 bucket rather than at this registry (see `cix-installer`,
-`post-install/24-apt-sources.sh`). That migration was about the *installer's*
-unattended-download path; the Buildkite registry remains the org's published
-APT home and is where zoder is served from.
+(Other ncz-os artifacts, such as installer images, use different download
+paths; this registry remains the published APT home for zoder packages.)

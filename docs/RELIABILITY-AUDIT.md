@@ -81,5 +81,5 @@ zoder #1), **#13** (loop detection disabled on the RPC path), **#1/#5/#6**
 
 ---
 
-*Generated from codex `gpt-5.5` adversarial audits; each finding verified against
+*Generated from an adversarial-model audit; each finding verified against
 source. Fix commits are on `fix/loop-reliability-and-ci`.*

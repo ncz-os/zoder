@@ -1,15 +1,14 @@
 # zoder-plugin-cc
 
-A Claude Code plugin that brings the Zoder agentic coding + review surface into a
-Claude Code terminal session, mirroring `codex-plugin-cc` but driving
-**open-source models** through the **zeroclaw** engine, with cost accounting via
-`zoder` (internal) or `zoder` (public).
+A Claude Code plugin that brings the Zoder agentic coding + review surface into
+a Claude Code terminal session, driving **open-source models** through the
+**zeroclaw** engine, with cost accounting via the local `zoder` binary.
 
 ## What it does
 
-Claude plans/implements; Zoder runs an independent reviewer or write-capable
-pair-programmer on open-weight models, and every run is metered into the shared
-cost ledger.
+The host session plans/implements; zoder runs an independent reviewer or
+write-capable pair-programmer on open-weight models, and every run is metered
+into the shared cost ledger.
 
 ## Slash commands
 
