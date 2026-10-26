@@ -102,8 +102,10 @@ impl Prefix {
     /// Offset at which the tool-schema section begins. Useful for diagnostics;
     /// NOT a boundary for the leak check (the schema block is prefix too).
     pub fn tools_offset(&self) -> usize {
-        let rendered = self.render();
-        rendered.find(&tools_marker()).unwrap_or(rendered.len())
+        // Computed from the fixed layout rather than searched: a system prompt
+        // that happens to contain the marker literal would make `find` point
+        // into the system block.
+        sys_marker().len() + 1 + self.system.trim_end().len() + 1
     }
 }
 
@@ -160,17 +162,28 @@ impl Volatile {
 
     /// Every volatile value, as strings, for the leak check.
     pub fn values(&self) -> Vec<String> {
-        [
-            self.cwd.clone(),
-            self.session_id.clone(),
-            self.model.clone(),
-            self.iteration.map(|n| n.to_string()),
-            self.timestamp.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|v| !v.trim().is_empty())
-        .collect()
+        self.checkable_values().into_iter().map(|(v, _)| v).collect()
+    }
+
+    /// The values worth searching for, each with whether it is a bare number.
+    /// The iteration number is the only value routinely a single digit, so it
+    /// is the only one matched as a standalone token; a 5-byte model alias or a
+    /// `/tmp` cwd is short but distinctive, and skipping those would defeat the
+    /// check for exactly the values most likely to be short.
+    fn checkable_values(&self) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for v in [&self.cwd, &self.session_id, &self.model, &self.timestamp]
+            .into_iter()
+            .flatten()
+        {
+            if !v.trim().is_empty() {
+                out.push((v.clone(), false));
+            }
+        }
+        if let Some(n) = self.iteration {
+            out.push((n.to_string(), true));
+        }
+        out
     }
 }
 
@@ -203,25 +216,52 @@ pub fn render_first_message(prefix: &Prefix, volatile: &Volatile, body: &str) ->
 /// [`MIN_DISTINCTIVE_LEN`] bytes are skipped rather than reported as leaks.
 pub fn volatile_offsets(text: &str, volatile: &Volatile) -> Vec<(String, usize)> {
     let mut out = Vec::new();
-    for value in volatile.values() {
-        // Values shorter than MIN_DISTINCTIVE_LEN are skipped entirely: a bare
-        // iteration number occurs by chance in any prompt, and `v1` is part of
-        // the constant marker. Searching a truncated prefix of a short value
-        // would both panic on a multi-byte boundary and report an offset that
-        // does not correspond to the value it names.
-        if value.len() < MIN_DISTINCTIVE_LEN {
-            continue;
-        }
-        if let Some(pos) = text.find(&value) {
+    for (value, is_number) in volatile.checkable_values() {
+        let pos = if is_number {
+            // A bare number is only evidence as a whole token: no adjacent
+            // digit AND not preceded by a letter. Otherwise "1" matches the
+            // constant `v1` marker, and the check fires on every prompt.
+            find_token(text, &value)
+        } else {
+            // Paths and ids are matched as substrings: a cwd may appear as a
+            // prefix of a longer path.
+            text.find(&value)
+        };
+        if let Some(pos) = pos {
             out.push((value, pos));
         }
     }
     out
 }
 
-/// Shortest volatile value the leak check treats as evidence. A cwd, session
-/// id, model alias or timestamp is well past this; an iteration number is not.
-pub const MIN_DISTINCTIVE_LEN: usize = 6;
+/// First offset at which `needle` appears with no ASCII digit immediately
+/// before or after it.
+fn find_token(text: &str, needle: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(needle) {
+        let at = from + rel;
+        // Not glued to a preceding digit or letter: excludes `v1`, `x12`, and
+        // the tail of a longer number.
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let end = at + needle.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_digit();
+        if before_ok && after_ok {
+            return Some(at);
+        }
+        from = at + 1;
+        if from >= text.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Shortest volatile value the leak check treats as evidence for values that
+/// are NOT bare numbers. Only the iteration number is exempt (and it is matched
+/// as a standalone token), so this floor exists to reject whitespace-only
+/// values rather than to hide short paths: a `/tmp` cwd is checked.
+pub const MIN_DISTINCTIVE_LEN: usize = 1;
 
 /// Result of the prefix-stability check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +530,58 @@ mod tests {
             assert!(!check_stability(&leaking, &volatile).is_stable());
             assert!(check_stability(&prefix(), &volatile).is_stable());
         }
+    }
+
+    #[test]
+    fn short_but_distinctive_values_are_still_caught() {
+        // A 5-byte model alias, a short session id and a short cwd are short
+        // but unambiguous; the old blanket 6-byte floor let them through.
+        for (volatile, needle) in [
+            (
+                Volatile {
+                    model: Some("gpt-4".into()),
+                    ..Default::default()
+                },
+                "gpt-4",
+            ),
+            (
+                Volatile {
+                    session_id: Some("abc12".into()),
+                    ..Default::default()
+                },
+                "abc12",
+            ),
+            (
+                Volatile {
+                    cwd: Some("/tmp".into()),
+                    ..Default::default()
+                },
+                "/tmp",
+            ),
+        ] {
+            let leaky = Prefix::new(format!("model: {needle}\nsys"));
+            match check_stability(&leaky, &volatile) {
+                Stability::Leaked { value, .. } => assert_eq!(value, needle),
+                Stability::Stable => panic!("{needle} in the prefix must be reported"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_iteration_digit_inside_a_number_is_not_a_leak() {
+        // "1" must not match "v1", "x12", or "iteration 1991".
+        let volatile = Volatile {
+            iteration: Some(1),
+            ..Default::default()
+        };
+        for text in ["[zoder-prefix:system v1]", "step x12", "1991 turns", "v2"] {
+            assert!(
+                check_stability(&Prefix::new(text), &volatile).is_stable(),
+                "{text} is not evidence of an iteration leak"
+            );
+        }
+        // A real standalone occurrence is.
+        assert!(!check_stability(&Prefix::new("iteration 1 of the loop"), &volatile).is_stable());
     }
 
     #[test]
