@@ -107,7 +107,6 @@ approximately four-characters-per-token estimate for input tokens. “Before”
 counts a 9,000-byte diff slice; “after” adds the maximum reserved context tail
 and wrapper. They are an upper-bound budget measurement (the actual context
 builder often emits less), not provider billing telemetry.
-They are sizing measurements, not provider billing telemetry.
 
 | History diff | Chunks | Before input tokens/chunk | After input tokens/chunk | Change |
 |---|---:|---:|---:|---:|
@@ -121,13 +120,50 @@ reducing the diff portion when necessary.
 
 ## Default reviewer benchmark
 
-The requested seeded benchmark against the current local reviewer model at
-9,000, 16,000, and 32,000-byte chunks, with and without definition context,
-could not be run in this sandbox because no local OpenAI-compatible reviewer
-endpoint was reachable. No recall, false-positive, or false-undefined result
-is claimed here; the orchestrator should run that matrix and choose the route
-default from the observed data. The prior dense-model result below remains
-historical evidence only.
+`zoder review` over two synthetic fixtures, reviewed by gpt-oss-20b (local,
+reasoning effort low), 2026-10-26. The seeded fixture is a ~97 KB multi-file
+diff (Python, C, Rust) with 8 planted defects: SQL injection, use-after-free,
+off-by-one, fail-open auth, an undefined Rust function, a sign error, a
+check-then-act race and an unchecked return. The clean fixture is a ~24 KB
+correct diff whose names are defined in other chunks. A defect counts as found
+when a finding names its file and a defect keyword. FP = findings that match
+no planted defect; "false undefined" = FPs that call a name undefined.
+`--max-diff-bytes 120000`; one run per cell, so a difference of one or two
+defects is within run-to-run noise.
+
+| fixture | chunk cap | definition context | chunks | recall | FP | false undefined |
+|---|---:|---|---:|---:|---:|---:|
+| seeded | 9,000 | off | 12 | 7/8 | 0 | 0 |
+| seeded | 9,000 | on | 16 | 8/8 | 0 | 0 |
+| seeded | 16,000 | off | 7 | 7/8 | 0 | 0 |
+| seeded | 16,000 | on | 8 | 6/8 | 0 | 0 |
+| seeded | 32,000 | off | 4 | 6/8 | 0 | 0 |
+| seeded | 32,000 | on | 4 | 6/8 | 0 | 0 |
+| seeded | single review (131,072-token window) | on | 1 | 6/8 | 0 | 0 |
+| clean | 9,000 | off | 4 | n/a | 1 | 0 |
+| clean | 9,000 | on | 5 | n/a | 4 | 1 |
+| clean | single review (131,072-token window) | on | 1 | n/a | 1 | 1 |
+
+What the numbers say:
+
+- Recall is 6-8 of 8 at every setting; no chunk size or context setting is
+  clearly better on this fixture at one run per cell.
+- A single review (the route window set, so the whole diff went in one call)
+  found as much as the chunked runs in one call instead of 4-16.
+- The surviving "false undefined" findings were kept on purpose: in one, the
+  sentence making the claim names no symbol; in the other the named constant
+  really is absent and the claim is about intent. The filter drops a finding
+  only when every name it claims is undefined is shown to be defined.
+- The first version of the post-filter treated every identifier in a finding
+  as a claimed name and dropped the finding when any one was defined. On this
+  fixture it removed the real undefined-function defect in most runs (the
+  path stem `main` is defined) and some use-after-free, off-by-one and race
+  findings ("undefined behaviour", "does not exist"). The regression tests in
+  `review_filter.rs` reproduce those findings.
+
+Recommendation: keep 32,000 bytes as the chunk cap for this reviewer (same
+recall within noise, fewest calls), and set `max_context_tokens` on its
+provider entry so that a diff that fits its window is reviewed whole.
 
 ## Where to put it: `~/.zoder/review.toml`
 
