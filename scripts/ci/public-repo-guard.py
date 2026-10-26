@@ -49,7 +49,7 @@ from pathlib import Path
 SALT = b"zoder-public-tree-guard-v1-3f6d2c8a"
 DENYLIST = Path(__file__).resolve().parent / "public-repo-denylist.txt"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
-IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){1,3}\d{1,3}(?![\d.])")
+IPV4_RE = re.compile(r"(?:\d{1,3}\.){1,3}\d{1,3}")
 URL_HOST_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#]+)")
 SCP_HOST_RE = re.compile(r"(?<![\w.-])[\w.-]+@([A-Za-z0-9][A-Za-z0-9.-]*):")
 SSH_HOST_RE = re.compile(
