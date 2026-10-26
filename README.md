@@ -744,6 +744,73 @@ Omit the `budget` block (or any field) for no cap. The estimate is a ballpark
 (token counts are approximate until the call's real telemetry lands in the
 ledger); it is a guard rail, not a hard meter.
 
+### Client discipline for a shared, rate-limited endpoint
+
+Several zoder processes (or several `[[providers]]` entries pointing at the
+same hosted endpoint) can burst a free shared endpoint into 503 "overloaded"
+bursts and 429s of their own making. Every provider accepts optional keys to
+make all of them behave like one well-mannered client. All are optional; with
+none of them set, behaviour is exactly as before.
+
+```json
+{
+  "providers": [
+    {
+      "id": "free-api",
+      "base_url": "https://<host>/v1",
+      "auth": { "type": "bearer", "var": "FREE_API_KEY" },
+      "billing": "free",
+      "overload_backoff_min_s": 5,
+      "first_token_timeout_s": 60,
+      "stream": true,
+      "rate_limit_group": "shared-free-endpoint",
+      "max_concurrent": 4,
+      "max_requests_per_minute": 30
+    }
+  ]
+}
+```
+
+- `overload_backoff_min_s` (u64, > 0) — floor for the retry delay after a
+  provider overload: an HTTP 503 or 529, or an Anthropic-style
+  `overloaded_error` stream frame. A free shared endpoint that is overloaded
+  stays overloaded for seconds, so the default 500 ms exponential base would
+  burst it into more 503s. The floor is applied in every retry loop through
+  one helper and never overrides a server-provided `Retry-After`.
+- `first_token_timeout_s` (u64, > 0) — abort a streamed call as a retryable
+  timeout when no token (answer or reasoning) arrives within this window,
+  instead of riding the whole request budget. Sizing for reasoning models on
+  a shared endpoint: measured first-token p50 ~4–6 s, p90 up to ~34 s.
+- `stream` (bool) — when `true`, zoder sends `stream: true` on
+  OpenAI-compatible chat requests to this provider even on call paths that
+  build non-streaming requests (reviewer, health probe), so first-token time
+  is measured there. Anthropic wire requests always stream.
+- `rate_limit_group` (string) — the shared-endpoint group this provider's
+  call budget belongs to. Two provider entries pointing at the same endpoint
+  set the same group to share one budget. Default: the provider's own id.
+- `max_concurrent` (u32, > 0) — host-wide cap on in-flight requests to this
+  provider's endpoint, enforced across ALL zoder processes on the host via
+  `flock`-ed slot files under `<zoder home>/state/slots/<group>/`. A crashed
+  process cannot leak a slot (the kernel releases the lock on exit).
+- `max_requests_per_minute` (u32, > 0) — host-wide cap on requests started
+  per sliding 60-second window, enforced across all zoder processes via a
+  locked timestamp file under `<zoder home>/state/rate/<group>.json`.
+
+Both caps are **per host** — a cap across several hosts is not possible
+without a shared coordinator. Divide the account's limit by the number of
+hosts that share the account. A waiting call sleeps for its slot / turn
+(bounded by `ZODER_QUEUE_TIMEOUT_S`, default 900 s) and prints one stderr
+notice after ~10 s, instead of failing. The reviewer-only
+`ZODER_PROVIDER_CONCURRENCY` env var still works and takes precedence for
+reviewer calls.
+
+Retry-After: the numeric-seconds form is honoured (capped at 60 s, so a
+hostile huge value waits the cap then falls through as before), and the
+HTTP-date form is now parsed too.
+
+Note: the engine daemon (zeroclaw) makes its own provider calls for
+loop/exec author turns; zoder's client-side limits cannot cover those.
+
 ### Request timeout, per model
 
 Every provider call is bounded by an overall request budget (default 120s;
