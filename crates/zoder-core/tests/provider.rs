@@ -389,7 +389,7 @@ async fn non_streaming_reasoning_only_is_decode_error_for_both_display_settings(
             "show_reasoning={show_reasoning}"
         );
         assert_eq!(
-            error.reasoning.as_deref(),
+            error.reasoning.as_ref().map(|b| b.as_str()),
             Some("thinking aloud"),
             "show_reasoning={show_reasoning}"
         );
@@ -2571,7 +2571,7 @@ async fn non_streaming_empty_length_choice_is_budget_truncation_not_malformed() 
         "the diagnostic must name the exhausted budget, got: {error}"
     );
     assert_eq!(
-        error.reasoning.as_deref(),
+        error.reasoning.as_ref().map(|b| b.as_str()),
         Some("long hidden reasoning"),
         "private reasoning must ride along for triage"
     );

@@ -634,7 +634,7 @@ mod tests {
             message: "anthropic stream error: ...".into(),
             kind: ErrKind::Http,
             status: None,
-            anthropic_error_body: Some(body.into()),
+            anthropic_error_body: Some(Box::new(body.to_string())),
             ..Default::default()
         };
         let cls = classify_err(&e);
@@ -670,7 +670,7 @@ mod tests {
             message: "anthropic stream error: ...".into(),
             kind: ErrKind::Http,
             status: None,
-            anthropic_error_body: Some(body.into()),
+            anthropic_error_body: Some(Box::new(body.to_string())),
             ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Capacity);
@@ -687,7 +687,7 @@ mod tests {
             message: "anthropic stream error: ...".into(),
             kind: ErrKind::Http,
             status: None,
-            anthropic_error_body: Some(body.into()),
+            anthropic_error_body: Some(Box::new(body.to_string())),
             ..Default::default()
         };
         assert_eq!(classify_err(&e), Classification::Unauthorized);
