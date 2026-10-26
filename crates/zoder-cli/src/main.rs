@@ -6405,6 +6405,13 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // id rather than the alias key so it works whichever alias resolved
         // here. Absent config keeps the previous behaviour exactly.
         let model_cfg = eng.cfg.model_entry_for(model_id);
+        // Direct-request settings (reasoning_effort, chat_template_kwargs)
+        // resolved by the shared resolver: explicit --reasoning > zoder
+        // model entry > engine profile for the selected agent > engine
+        // reviewer profile > first engine profile serving the model.
+        let direct = eng
+            .engine_models
+            .request_settings_for(model_id, cli.agent.as_deref(), cli.reasoning.as_deref(), model_cfg);
         // The context levers bound the conversation THIS call carries: the
         // prior session transcript plus the new prompt. They are resolved per
         // model, because the lever profile is per provider.
@@ -6434,14 +6441,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
-            reasoning_effort: cli
-                .reasoning
-                .clone()
-                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone())),
+            reasoning_effort: direct.reasoning_effort,
             top_p: model_cfg.and_then(|m| m.top_p),
             top_k: model_cfg.and_then(|m| m.top_k),
             presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
-            chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
+            chat_template_kwargs: direct.chat_template_kwargs,
             response_format: None,
         };
         // Per-model timer: health latency must reflect THIS model's call, not

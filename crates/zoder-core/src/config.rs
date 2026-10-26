@@ -644,6 +644,23 @@ struct EngineAgentModel {
     model_provider: Option<String>,
 }
 
+/// The per-call request settings a DIRECT (non-loop) chat request sends,
+/// resolved by [`EngineModelRegistry::request_settings_for`].
+///
+/// Every direct `ChatRequest` builder (oneshot, reviewer, health probe)
+/// reads these two fields from one resolver so their precedence order can
+/// never drift apart. `None` values omit the wire field, leaving the
+/// provider's own default in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectRequestSettings {
+    /// Requested reasoning effort (OpenAI-style `reasoning_effort`), or
+    /// `None` to omit the field.
+    pub reasoning_effort: Option<String>,
+    /// Verbatim `chat_template_kwargs` forwarded to the chat template, or
+    /// `None` to omit the field.
+    pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
 /// Routing-relevant projection of one
 /// `[providers.models.<family>.<alias>]` profile. A provider profile is not a
 /// single model: after its primary fails, Zeroclaw can try same-provider model
@@ -830,6 +847,44 @@ impl EngineModelRegistry {
     /// Whether the engine config contributed any agent model routes.
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
+    }
+
+    /// Resolve the request settings a DIRECT call (oneshot, reviewer, health
+    /// probe) sends for `model`, with ONE precedence order shared by every
+    /// such builder:
+    ///
+    /// 1. the caller's explicit value (the `--reasoning` flag, or an
+    ///    explicit `chat_template_kwargs` the caller already chose)
+    /// 2. the zoder config's per-model entry (`model_cfg`)
+    /// 3. the engine profile of the selected agent
+    /// 4. the engine reviewer profile
+    /// 5. the first engine profile serving the model id
+    ///
+    /// Steps 3-5 are exactly the per-field precedence of
+    /// [`Self::reasoning_effort_for_model`] / [`Self::chat_template_kwargs_for_model`]
+    /// (the selected agent's profile wins over the reviewer alias, which
+    /// wins over the first profile in alias order). The agentic loop builds
+    /// its request from the engine's forwarded `provider_extra` blob and must
+    /// not use this resolver; only direct request builders do.
+    pub fn request_settings_for(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+        cli_reasoning: Option<&str>,
+        model_cfg: Option<&ModelEntry>,
+    ) -> DirectRequestSettings {
+        DirectRequestSettings {
+            reasoning_effort: cli_reasoning
+                .map(str::to_owned)
+                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone()))
+                .or_else(|| {
+                    self.reasoning_effort_for_model(model, agent_alias)
+                        .map(str::to_owned)
+                }),
+            chat_template_kwargs: model_cfg
+                .and_then(|m| m.chat_template_kwargs.clone())
+                .or_else(|| self.chat_template_kwargs_for_model(model, agent_alias).cloned()),
+        }
     }
 
     /// Resolve an agent alias to the model the engine is configured to run.
