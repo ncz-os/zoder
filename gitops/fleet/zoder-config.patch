@@ -24,7 +24,7 @@ message above.
 ---
 --- a/fleet/zoder-config/config.toml
 +++ b/fleet/zoder-config/config.toml
-@@ -1,8 +1,49 @@
+@@ -1,9 +1,49 @@
  [profiles.deepseek]
  model = "deepseek-flash"
  max_context_tokens = 128000

@@ -337,7 +337,12 @@ The output is unchanged on disk; re-read the file (or re-run the command) if it 
 /// both cuts snap inward on a char boundary), and the stub's omitted count is the
 /// exact size of the dropped MIDDLE, so `kept + omitted == original len` holds.
 pub fn cap_tool_output(turn: &Turn, cap_bytes: usize) -> Turn {
-    if cap_bytes == 0 || turn.content.len() <= cap_bytes {
+    // One comparison against the EFFECTIVE cap. `cap_bytes` is raised to the
+    // floor before the length test, so a result between the requested cap and
+    // `MIN_CAP_BYTES` is returned untouched by the same rule that keeps a short
+    // result; two separate length checks (one against the raw cap, one against
+    // the raised one) invited changing one and forgetting the other.
+    if cap_bytes == 0 {
         return turn.clone();
     }
     let cap = cap_bytes.max(MIN_CAP_BYTES);
@@ -592,12 +597,12 @@ fn squash(s: &str) -> String {
                 out.push_str("...");
                 break;
             }
-            // A single leading word longer than the budget is cut, not dropped.
+            // A leading word longer than the budget is cut, not dropped. Only a
+            // zero-width cut (the whole budget inside one multi-byte character)
+            // falls through to the ellipsis-only result below.
             let cut = floor_char_boundary(w, budget);
             if cut == 0 {
-                // Not even the ellipsis fits a one-character word: the line is
-                // whitespace and the ellipsis alone.
-                continue;
+                break;
             }
             out.push_str(&w[..cut]);
             out.push_str("...");
@@ -607,6 +612,12 @@ fn squash(s: &str) -> String {
             out.push(' ');
         }
         out.push_str(w);
+    }
+    // A line whose leading word could not be cut at all still reports that
+    // something was dropped rather than squashing to an empty string, which
+    // `push` would then discard as if the line had never been there.
+    if out.is_empty() && !s.trim().is_empty() {
+        out.push_str("...");
     }
     out
 }
@@ -770,13 +781,12 @@ pub fn compact(
         digest.absorbed_digests = absorbed;
     }
     // Order: pinned system prompt and brief, then the digest, then the recent
-    // turns verbatim. A digest is folded out of the HEAD only when it was one of
-    // the absorbed ones (it is now represented by the fresh digest); the tail is
-    // reproduced byte for byte, digest or not, because it is the verbatim
-    // window. Dropping a tail digest here would delete a turn the agent is
-    // still using.
+    // turns verbatim. The pinned head is reproduced VERBATIM, digest or not: a
+    // digest sitting there was never absorbed (only the foldable span is), so
+    // filtering it out would delete its carried lists without merging them and
+    // without counting it in `folded`. The tail is verbatim for the same reason.
     let mut out: Vec<Turn> = Vec::with_capacity(pinned.len() + recent.len() + 1);
-    out.extend(pinned.iter().filter(|t| !is_digest(t)).cloned());
+    out.extend(pinned.iter().cloned());
     out.push(Turn::new("system", digest.render()));
     out.extend(recent.iter().cloned());
     let bytes_after: u64 = out.iter().map(Turn::bytes).sum();
