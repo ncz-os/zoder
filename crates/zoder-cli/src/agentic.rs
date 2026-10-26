@@ -4653,6 +4653,12 @@ unbound, or missing imports:\n{context}"
 
     let agg = emit_reviews(cli, &aggregate);
 
+    // The per-call records belong to the RUN: a review that printed prose
+    // still made calls, and those calls must land in the telemetry file.
+    if let Ok(eng) = Engine::load() {
+        crate::context_opt::flush(&eng.cfg);
+    }
+
     // Critical regression guard (Finding #14): when NO reviewer completed
     // (e.g. the only configured reviewer 401'd, or every panel model timed
     // out) the function used to return `Ok(())` with a synthetic "comment"

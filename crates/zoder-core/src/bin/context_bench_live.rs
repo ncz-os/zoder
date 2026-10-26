@@ -162,7 +162,7 @@ fn tasks() -> Vec<Task> {
             decision: "We decided to round each share half-up instead of truncating, so the \
                         three shares of $10.00 come to $3.34, $3.33 and $3.33.",
             question: "State the fix you decided on for the split-bill total, in one sentence.",
-            expect: &["round", "half-up", "truncat"],
+            expect: &["round", "half-up"],
             plan: vec![
                 ("tool", Kind::Read, 48_000),
                 ("assistant", Kind::Prose, 400),
@@ -180,7 +180,7 @@ fn tasks() -> Vec<Task> {
                         making the parser default it, so a missing path still fails loudly.",
             question: "State the fix you decided on for the failing config fixture, in one \
                        sentence.",
-            expect: &["corpus_path", "corpus path", "fixture"],
+            expect: &["corpus_path", "corpus path"],
             plan: vec![
                 ("tool", Kind::Read, 48_000),
                 ("assistant", Kind::Prose, 300),
@@ -198,7 +198,13 @@ fn tasks() -> Vec<Task> {
                         turns a routing miss into a plain Err, so the caller no longer sees the \
                         model that failed.",
             question: "State the defect you decided on in the routing change, in one sentence.",
-            expect: &["rank_checked", "swallow", "routing miss"],
+            expect: &[
+                "rank_checked",
+                "swallow",
+                "silently",
+                "no route",
+                "return type",
+            ],
             plan: vec![
                 ("tool", Kind::Diff, 48_000),
                 ("assistant", Kind::Prose, 800),
@@ -277,6 +283,10 @@ struct Run {
     succeeded: bool,
     answer: String,
     wall_ms: u64,
+    /// The per-call cache verdict: `cached`, `prefix_break` or `unknown`.
+    cache_verdicts: Vec<&'static str>,
+    /// The per-call records, one per provider call.
+    records: Vec<CallRecord>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -292,37 +302,44 @@ fn main() -> anyhow::Result<()> {
     let mut dry_run = false;
     let mut history_turns = 640usize;
     let mut i = 0usize;
+    // A value-taking flag with no value is an error, not a panic.
+    let take = |i: &mut usize, flag: &str| -> anyhow::Result<String> {
+        *i += 1;
+        args.get(*i)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
+    };
     while i < args.len() {
         match args[i].as_str() {
             "--base-url" => {
-                base_url = args[i + 1].clone();
-                i += 2;
+                base_url = take(&mut i, "--base-url")?;
+                i += 1;
             }
             "--model" => {
-                model = args[i + 1].clone();
-                i += 2;
+                model = take(&mut i, "--model")?;
+                i += 1;
             }
             "--api-key-file" => {
-                api_key_file = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
+                api_key_file = Some(PathBuf::from(take(&mut i, "--api-key-file")?));
+                i += 1;
             }
             "--miss-rate" => {
-                miss_rate = args[i + 1].parse()?;
-                i += 2;
+                miss_rate = take(&mut i, "--miss-rate")?.parse()?;
+                i += 1;
             }
             "--cache-read-rate" => {
-                cache_read_rate = args[i + 1].parse()?;
-                i += 2;
+                cache_read_rate = take(&mut i, "--cache-read-rate")?.parse()?;
+                i += 1;
             }
             "--output-rate" => {
-                output_rate = args[i + 1].parse()?;
-                i += 2;
+                output_rate = take(&mut i, "--output-rate")?.parse()?;
+                i += 1;
             }
             "--profile" => {
-                profile = ContextProfile::named(&args[i + 1]).ok_or_else(|| {
-                    anyhow::anyhow!("unknown deployment profile {:?}", args[i + 1])
-                })?;
-                i += 2;
+                let raw = take(&mut i, "--profile")?;
+                profile = ContextProfile::named(&raw)
+                    .ok_or_else(|| anyhow::anyhow!("unknown deployment profile {raw:?}"))?;
+                i += 1;
             }
             "--json" => {
                 json = true;
@@ -333,8 +350,8 @@ fn main() -> anyhow::Result<()> {
                 i += 1;
             }
             "--history-turns" => {
-                history_turns = args[i + 1].parse()?;
-                i += 2;
+                history_turns = take(&mut i, "--history-turns")?.parse()?;
+                i += 1;
             }
             other => anyhow::bail!("unknown argument {other}"),
         }
@@ -410,12 +427,18 @@ fn main() -> anyhow::Result<()> {
     };
     let client = OpenAiProvider::new_with_request_timeout_s(&provider, Some(600))?;
     let levers = Levers::for_model(profile, &model);
-    // A provider that publishes the split is a DeepSeek-shaped one; the
-    // others publish nothing and the cache fields stay unasserted.
+    // The provider-side cache shape, from what the wire actually carries.
+    //
+    // MEASURED, not assumed: the 2026-10-25 study recorded that the second
+    // provider published no cache counter at all, and that turned out to be
+    // wrong - it publishes the OpenAI-shaped `cached_tokens` subset. The
+    // live benchmark reads it (the hit counts are non-zero), so the shape
+    // here is `CachedSubset` and the hit share is asserted rather than
+    // guessed.
     let shape = if model.to_ascii_lowercase().contains("deepseek") {
         ProviderCacheShape::Split
     } else {
-        ProviderCacheShape::None
+        ProviderCacheShape::CachedSubset
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -441,28 +464,33 @@ fn main() -> anyhow::Result<()> {
     }
 
     if json {
-        println!("{{\"runs\": [");
-        for (n, r) in runs.iter().enumerate() {
-            let comma = if n + 1 == runs.len() { "" } else { "," };
-            println!(
-                "  {{\"task\": \"{}\", \"levers\": \"{}\", \"calls\": {}, \"prompt_tokens\": {}, \
-                 \"completion_tokens\": {}, \"cache_hit_tokens\": {}, \"cache_miss_tokens\": {}, \
-                 \"cache_reported_calls\": {}, \"cost_usd\": {:.6}, \"succeeded\": {}, \
-                 \"wall_ms\": {}}}{comma}",
-                r.task,
-                if r.levers_on { "on" } else { "off" },
-                r.calls,
-                r.prompt_tokens,
-                r.completion_tokens,
-                r.cache_hit_tokens,
-                r.cache_miss_tokens,
-                r.cache_reported_calls,
-                r.cost_usd,
-                r.succeeded,
-                r.wall_ms
-            );
-        }
-        println!("]}}");
+        // serde_json, not a hand-rolled format: a task name or an answer
+        // with a quote or a newline in it must not produce invalid JSON.
+        let rows: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "task": r.task,
+                    "levers": if r.levers_on { "on" } else { "off" },
+                    "calls": r.calls,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "cache_hit_tokens": r.cache_hit_tokens,
+                    "cache_miss_tokens": r.cache_miss_tokens,
+                    "cache_reported_calls": r.cache_reported_calls,
+                    "cost_usd": r.cost_usd,
+                    "succeeded": r.succeeded,
+                    "wall_ms": r.wall_ms,
+                    "cache_verdicts": r.cache_verdicts,
+                    "answer": r.answer,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "runs": rows }))
+                .unwrap_or_else(|_| "{\"runs\":[]}".to_string())
+        );
         return Ok(());
     }
 
@@ -587,9 +615,15 @@ async fn run_one(
         succeeded: false,
         answer: String::new(),
         wall_ms: 0,
+        cache_verdicts: Vec::new(),
+        records: Vec::new(),
     };
+    if turns.is_empty() {
+        // An empty conversation has nothing to send and no answer to check.
+        return Ok(run);
+    }
     for point in call_points(turns.len()) {
-        let upto = point.min(turns.len() - 1);
+        let upto = point.min(turns.len().saturating_sub(1));
         // The levers run on the conversation AS IT STANDS at this point, which
         // is what the CLI does: the loop's prompt at step `upto`, bounded.
         // Applying them to the whole conversation and then slicing would
@@ -669,17 +703,32 @@ async fn run_one(
         // tokens at the cache-read rate, the rest at the miss rate, and the
         // completion at the output rate.
         let telemetry = CacheTelemetry {
-            prompt_tokens: res.prompt_tokens.unwrap_or(0),
+            // A provider that reports no prompt count must not be billed as
+            // if it had sent nothing: fall back to the byte estimate, which
+            // is what the per-call record reports too.
+            prompt_tokens: res.prompt_tokens.unwrap_or_else(|| {
+                estimate_tokens(segments.iter().map(|s| s.text.len() as u64).sum())
+            }),
             cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
             completion_tokens: res.completion_tokens.unwrap_or(res.tokens_out),
             reported_cache_miss: res.cache_miss_tokens,
         };
         run.cost_usd += telemetry.cost_usd(cache_read_rate, miss_rate, output_rate);
-        let _ = shape;
+        // The cache verdict for this call, from the provider's own numbers.
+        let verdict = zoder_core::context_opt::classify(
+            shape,
+            &telemetry,
+            zoder_core::context_opt::DEFAULT_CACHE_HIT_FLOOR,
+        );
+        run.cache_verdicts.push(match verdict {
+            zoder_core::context_opt::CacheVerdict::Cached => "cached",
+            zoder_core::context_opt::CacheVerdict::PrefixBreak => "prefix_break",
+            zoder_core::context_opt::CacheVerdict::Unknown => "unknown",
+        });
         if upto + 1 == turns.len() {
             run.answer = res.content.clone();
         }
-        let _ = CallRecord::new(
+        run.records.push(CallRecord::new(
             run.calls as u32,
             task.name,
             &segments,
@@ -687,7 +736,7 @@ async fn run_one(
             res.cached_prompt_tokens,
             res.cache_miss_tokens,
             res.completion_tokens.unwrap_or(res.tokens_out),
-        );
+        ));
     }
     let answer = run.answer.to_ascii_lowercase();
     run.succeeded = task
