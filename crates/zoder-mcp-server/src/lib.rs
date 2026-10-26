@@ -1446,6 +1446,12 @@ mod test_helpers {
                 serves: vec!["alpha/".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             });
             cfg.providers.push(Provider {
                 model_aliases: Vec::new(),
@@ -1460,6 +1466,12 @@ mod test_helpers {
                 serves: vec!["beta/".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             });
             let corpus = super::tests::fixture_corpus();
             let health = HealthStore::default();

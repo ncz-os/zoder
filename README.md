@@ -744,6 +744,73 @@ Omit the `budget` block (or any field) for no cap. The estimate is a ballpark
 (token counts are approximate until the call's real telemetry lands in the
 ledger); it is a guard rail, not a hard meter.
 
+### Client discipline for a shared, rate-limited endpoint
+
+Several zoder processes (or several `[[providers]]` entries pointing at the
+same hosted endpoint) can burst a free shared endpoint into 503 "overloaded"
+bursts and 429s of their own making. Every provider accepts optional keys to
+make all of them behave like one well-mannered client. All are optional; with
+none of them set, behaviour is exactly as before.
+
+```json
+{
+  "providers": [
+    {
+      "id": "free-api",
+      "base_url": "https://<host>/v1",
+      "auth": { "type": "bearer", "var": "FREE_API_KEY" },
+      "billing": "free",
+      "overload_backoff_min_s": 5,
+      "first_token_timeout_s": 60,
+      "stream": true,
+      "rate_limit_group": "shared-free-endpoint",
+      "max_concurrent": 4,
+      "max_requests_per_minute": 30
+    }
+  ]
+}
+```
+
+- `overload_backoff_min_s` (u64, > 0) — floor for the retry delay after a
+  provider overload: an HTTP 503 or 529, or an Anthropic-style
+  `overloaded_error` stream frame. A free shared endpoint that is overloaded
+  stays overloaded for seconds, so the default 500 ms exponential base would
+  burst it into more 503s. The floor is applied in every retry loop through
+  one helper and never overrides a server-provided `Retry-After`.
+- `first_token_timeout_s` (u64, > 0) — abort a streamed call as a retryable
+  timeout when no token (answer or reasoning) arrives within this window,
+  instead of riding the whole request budget. Sizing for reasoning models on
+  a shared endpoint: measured first-token p50 ~4–6 s, p90 up to ~34 s.
+- `stream` (bool) — when `true`, zoder sends `stream: true` on
+  OpenAI-compatible chat requests to this provider even on call paths that
+  build non-streaming requests (reviewer, health probe), so first-token time
+  is measured there. Anthropic wire requests always stream.
+- `rate_limit_group` (string) — the shared-endpoint group this provider's
+  call budget belongs to. Two provider entries pointing at the same endpoint
+  set the same group to share one budget. Default: the provider's own id.
+- `max_concurrent` (u32, > 0) — host-wide cap on in-flight requests to this
+  provider's endpoint, enforced across ALL zoder processes on the host via
+  `flock`-ed slot files under `<zoder home>/state/slots/<group>/`. A crashed
+  process cannot leak a slot (the kernel releases the lock on exit).
+- `max_requests_per_minute` (u32, > 0) — host-wide cap on requests started
+  per sliding 60-second window, enforced across all zoder processes via a
+  locked timestamp file under `<zoder home>/state/rate/<group>.json`.
+
+Both caps are **per host** — a cap across several hosts is not possible
+without a shared coordinator. Divide the account's limit by the number of
+hosts that share the account. A waiting call sleeps for its slot / turn
+(bounded by `ZODER_QUEUE_TIMEOUT_S`, default 900 s) and prints one stderr
+notice after ~10 s, instead of failing. The reviewer-only
+`ZODER_PROVIDER_CONCURRENCY` env var still works and takes precedence for
+reviewer calls.
+
+Retry-After: the numeric-seconds form is honoured (capped at 60 s, so a
+hostile huge value waits the cap then falls through as before), and the
+HTTP-date form is now parsed too.
+
+Note: the engine daemon (zeroclaw) makes its own provider calls for
+loop/exec author turns; zoder's client-side limits cannot cover those.
+
 ### Request timeout, per model
 
 Every provider call is bounded by an overall request budget (default 120s;
@@ -1025,6 +1092,53 @@ until then use the commands above or re-run the installer.)
 > may be free for *you* though they carry a list price — `zoder refresh` against
 > your own endpoint, plus local config, is what marks those routable for you.
 
+### Freshness gates
+
+The daily `corpus-sync` job refreshes the public artifacts from the public
+sources (LiteLLM + OpenRouter for prices, public coding benchmarks for the
+routing overlay). Two **independent** gates decide what may be published, so
+an outage in one source can never freeze the other:
+
+| Check | Threshold | Result |
+|---|---|---|
+| LiteLLM price list fetched | must succeed | **blocked** — prices are not published |
+| OpenRouter price overlay fetched | must succeed | **blocked** — prices are not published |
+| Pricing catalog size vs. the previously committed catalog | not more than 25% fewer models | **blocked** — prices are not published |
+| Every bench source fetched fresh (or had a local last-known-good file) | all sources covered | overlay kept stale — **prices still published** |
+| Candidate overlay size | at least 50 models with an `agentic_score` | overlay kept stale — **prices still published** |
+| Candidate overlay size vs. the committed overlay | not more than 25% fewer scored models | overlay kept stale — **prices still published** |
+
+A blocked run prints `PRICE SOURCE DEGRADED (<source>: <reason>) - not
+publishing prices.` and exits non-zero; a stale overlay prints a warning with
+the overlay's age and the failing sources, and the run still succeeds. The
+committed overlay is kept **byte-for-byte** while it is stale: a transient
+benchmark outage can never erase routing scores.
+
+`--force-publish` overrides every gate (both the price gate and the overlay
+gate) and says so in its output. Use it only for an explicit operator
+acknowledgement.
+
+`corpus/freshness.json` (schema 2) records the run:
+
+| Field | Meaning |
+|---|---|
+| `schema` | `2` |
+| `ts` | run time (UTC) |
+| `sources[]` | one entry per bench source: `name`, `kind`, `outputs`, `ok`, `reason` |
+| `prices.ok` | did both price sources succeed? |
+| `prices.generated` | the pricing catalog's generation date |
+| `prices.litellm` / `prices.openrouter` | `{ok, models\|added, reason}` per source |
+| `prices.catalog_models` / `prices.previous_catalog_models` | the new and previously committed catalog sizes |
+| `overlay.stale` | was the committed overlay kept? |
+| `overlay.built_at` | when the published overlay was built (carried forward while stale) |
+| `overlay.age_days` | age of the published overlay in whole days |
+| `overlay.models_with_score` / `overlay.candidate_models_with_score` | the published and the candidate scored-model counts |
+| `overlay.reason` | why the candidate was not published (empty when fresh) |
+| `overlay_stale` / `overlay_age_days` | the same two facts at the top level, for old readers |
+
+A schema-1 report (no `schema` key) is still accepted and keeps the historic
+single-gate behaviour.
+
 ### Price and name-matching conformance
 
 The exact rules the pipeline applies — how a raw id is split into provider and
@@ -1043,6 +1157,59 @@ construction rather than by coincidence. Run it with
 builder functions). The fixture records behaviour, it does not set policy — a
 rule worth changing is argued in review, and changing it means changing the
 fixture and the pipeline together.
+
+### Staleness alerts
+
+The daily sync is only useful if someone notices when it stops. From
+2026-10-14 to 2026-10-26 it failed every day and nobody noticed for 13 days:
+the published corpus and pricing catalog stayed at 2026-10-13, and every client
+kept routing on a two-week-old index. Two independent channels now close that
+gap.
+
+**A tracked issue, opened and closed automatically.** A `.post` job
+([`corpus-sync-alert`](.gitlab-ci.yml)) runs after every *scheduled* pipeline,
+even when the sync failed (`when: always`), and reads the `corpus/freshness.json`
+report the sync job publishes as an artifact. It opens exactly **one** open
+issue labelled `corpus-sync` — title `corpus-sync: scheduled data sync is
+failing or stale` — when either:
+
+- the `corpus-sync` job failed in this pipeline **and** in the previous
+  scheduled pipeline on the default branch (two consecutive failures), or
+- the report says the benchmark overlay is more than 7 days old, flagged
+  stale, or prices are not `ok`.
+
+While the problem persists it adds a note to the same issue (never a second
+one); on the first scheduled run with fresh prices and a current overlay it
+adds a final note and **closes the issue itself**, so no one has to remember.
+
+It authenticates with a masked project variable **`CORPUS_ALERT_TOKEN`**
+(`api` scope — it must create issues and post notes; `GITLAB_PUSH_TOKEN` is the
+fallback). Create it under *Settings → CI/CD → Variables*, masked, and never
+commit a token. If no token is set, or the API call fails, the job prints
+`corpus-sync-alert: ALERT NOT DELIVERED: <reason>` and exits non-zero — the job
+is `allow_failure`, so this shows as a warning rather than silently passing.
+`python3 scripts/ci/corpus-sync-alert.py --dry-run` prints the decision and the
+API calls it *would* make without performing any of them. The decision logic
+has offline tests (`python3 scripts/tests/corpus-sync-alert-tests.py`) that fake
+the GitLab API, so the alert path is exercised without a token or a network.
+
+**GitLab's own failure notifications are a second channel worth enabling.**
+Email/Slack notifications for failed pipelines (*Settings → Integrations*, or
+your user notification settings) catch any scheduled job, not just this one,
+and they keep working if the alert job itself is broken. Point them at the
+schedule's owner — a red pipeline nobody is subscribed to is not monitoring.
+
+**The client warns you too.** `zoder` checks the age of the data it actually
+loaded: `zoder config`, `zoder models` and `zoder pricing refresh` print a
+one-line `warning: model corpus is N days old (generated YYYY-MM-DD) …` on
+**stderr** (never stdout, so scripts parsing the output are unaffected) when
+the corpus or pricing catalog is more than **7 days** old, naming the command
+that fixes it. The threshold is `$ZODER_CORPUS_STALE_DAYS`; `0` disables the
+warning, and an unparsable value falls back to 7. This never fails a command —
+an old corpus is a nudge, not an error. `zoder pricing refresh --json` carries
+`pricing_age_days` / `pricing_stale` (and the same text in `pricing_warning`)
+instead of the text; `zoder models --json` keeps its bare array of model
+objects (scripts parse it), so its warning stays on stderr.
 
 ---
 

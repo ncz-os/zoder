@@ -4,6 +4,7 @@
 stages:
   - corpus
   - check
+  - test
   - security
   - upstream
 
@@ -40,9 +41,12 @@ corpus-sync:
     - pip install --quiet -r scripts/ci/corpus-requirements.txt
   script:
     # Fetch every bench source, falling back to the last-known-good snapshot
-    # for any source that fails, and write corpus/freshness.json.
+    # for any source that fails, and write corpus/freshness.json (schema 2).
     - python3 scripts/ci/corpus-fetch-and-overlay.py --allow-lkg-fallback
-    # Refuse to publish an overlay degraded past the freshness threshold.
+    # Two independent gates: the PRICE gate (LiteLLM + OpenRouter + catalog
+    # shrink) blocks publishing prices; the OVERLAY gate only warns and keeps
+    # the last-known-good overlay, so a benchmark outage can no longer freeze
+    # the prices.
     - python3 scripts/ci/corpus-freshness-check.py
     - git config user.name "zoder corpus sync"
     - git config user.email "jperlow@gmail.com"
@@ -60,8 +64,69 @@ corpus-sync:
       fi
       stamp="$(date -u +%Y-%m-%d)"
       scored="$(python3 -c "import json;d=json.load(open('corpus/model_corpus.json'));print(d.get('scored','?'),d.get('routable','?'))")"
-      git commit -m "data(corpus): daily sync ${stamp} (scored/routable: ${scored}) [skip ci]"
+      stale="$(python3 -c "import json;d=json.load(open('corpus/freshness.json'));print((' overlay stale %dd' % d.get('overlay_age_days',0)) if d.get('overlay_stale') else '')")"
+      git commit -m "data(corpus): daily sync ${stamp} (scored/routable: ${scored})${stale} [skip ci]"
       git push -o ci.skip "https://oauth2:${GITLAB_PUSH_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+  # The freshness report is published even when the run failed: the alert job
+  # below reads it to say WHY (which sources, whether prices are ok, how old
+  # the overlay is), and a failure with no artifact is the least useful case.
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - corpus/freshness.json
+
+# The sync failed every day from 2026-10-14 to 2026-10-26 and nobody noticed
+# for 13 days: a red pipeline is not monitoring unless someone is watching it.
+# This job turns a failed or stale sync into ONE labelled issue, notes the
+# same issue while the problem persists, and closes it again on the first
+# healthy scheduled run. See `scripts/ci/corpus-sync-alert.py`.
+#
+# `stage: .post` + `when: always` means it runs even when `corpus-sync`
+# failed, and `needs` pulls in the artifact that says why. `allow_failure`
+# keeps an undeliverable alert from turning the pipeline red on its own --
+# but the job still FAILS loudly (exit 1), so the warning is visible.
+#
+# Needs the masked CORPUS_ALERT_TOKEN project variable with `api` scope (it
+# creates/issues comments on issues); GITLAB_PUSH_TOKEN is the fallback.
+corpus-sync-alert:
+  stage: .post
+  image: python:3.12
+  needs:
+    - job: corpus-sync
+      artifacts: true
+  script:
+    - python3 scripts/ci/corpus-sync-alert.py
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
+      when: always
+  allow_failure: true
+
+
+# The corpus gate is pure Python and offline: its behaviour is pinned by two
+# test suites. Keep them running on every merge request and on every push to
+# the default branch -- but NOT on the daily schedule, which must stay a
+# data-only job.
+corpus-tests:
+  stage: test
+  image: python:3.12
+  needs: []
+  cache: {}
+  variables:
+    # The suites write their scratch checkouts under the project dir, not a
+    # shared system temp dir.
+    TMPDIR: "$CI_PROJECT_DIR/.tmp"
+  before_script:
+    - mkdir -p "$CI_PROJECT_DIR/.tmp"
+  script:
+    - python3 scripts/tests/corpus-freshness-tests.py
+    - python3 scripts/tests/corpus-gate-split-tests.py
+    - python3 scripts/tests/bench-fetchers-tests.py
+    - python3 scripts/tests/pricing-conformance-tests.py
+    - python3 scripts/tests/corpus-sync-alert-tests.py
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
 
 rust-gate:
   stage: check

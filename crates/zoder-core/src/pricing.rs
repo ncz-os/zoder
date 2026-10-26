@@ -834,6 +834,37 @@ impl PricingCatalog {
         Ok(())
     }
 
+    /// The age of this catalog in days, as of `today`, from `generated`
+    /// (`YYYY-MM-DD`). `None` when the date is missing or unparsable — an
+    /// unknown age is never reported as rot.
+    pub fn age_days(&self, today: chrono::NaiveDate) -> Option<i64> {
+        let built = crate::corpus::parse_corpus_date(&self.generated)?;
+        Some((today - built).num_days())
+    }
+
+    /// A one-line warning when this catalog is older than `max_days`, or
+    /// `None` when it is fresh or its age is unknown. `max_days <= 0`
+    /// disables the check.
+    ///
+    /// Mirrors [`crate::corpus::Corpus::staleness_warning`]: prefixed
+    /// `warning:`, printed on stderr only, and it names the command that fixes
+    /// it. Stale prices silently mis-state spend, so the operator should hear
+    /// about it the same way they hear about a stale corpus.
+    pub fn staleness_warning(&self, today: chrono::NaiveDate, max_days: i64) -> Option<String> {
+        if max_days <= 0 {
+            return None;
+        }
+        let days = self.age_days(today)?;
+        if days <= max_days {
+            return None;
+        }
+        let built = crate::corpus::parse_corpus_date(&self.generated)?;
+        Some(format!(
+            "warning: pricing catalog is {days} days old (generated {built}). \
+             Refresh it with: zoder pricing sync"
+        ))
+    }
+
     /// Classify the cost of a single call. Distinct from
     /// [`PricingCatalog::cost`] (which collapses everything to `f64`)
     /// because `Unknown` must be visible: a metered custom model absent
@@ -1709,5 +1740,63 @@ mod cache_aware_pricing_tests {
         // The runtime catalog on a host that has never run the refresh.
         assert!(empty.lookup("deepseek-flash").is_none());
         assert!(empty.lookup_with_fallback("deepseek-flash").is_some());
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    //! Stale prices mis-state spend silently, so the catalog gets the same
+    //! age/warn treatment as the model corpus.
+    use super::*;
+
+    fn catalog(generated: &str) -> PricingCatalog {
+        PricingCatalog {
+            generated: generated.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("valid test date")
+    }
+
+    #[test]
+    fn fresh_catalog_has_no_warning() {
+        let c = catalog("2026-10-26");
+        assert_eq!(Some(0), c.age_days(day("2026-10-26")));
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+    }
+
+    #[test]
+    fn eight_days_old_points_at_pricing_sync() {
+        let c = catalog("2026-10-18");
+        let w = c.staleness_warning(day("2026-10-26"), 7).expect("warning");
+        assert!(
+            w.starts_with("warning: pricing catalog is 8 days old"),
+            "{w}"
+        );
+        assert!(w.contains("generated 2026-10-18"), "{w}");
+        assert!(w.contains("zoder pricing sync"), "{w}");
+    }
+
+    #[test]
+    fn seven_days_is_fine_and_zero_disables() {
+        let c = catalog("2026-10-19");
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+        let old = catalog("2026-01-01");
+        assert!(
+            old.staleness_warning(day("2026-10-26"), 0).is_none(),
+            "0 disables"
+        );
+        assert!(old.staleness_warning(day("2026-10-26"), 7).is_some());
+    }
+
+    #[test]
+    fn missing_generated_never_warns() {
+        for g in ["", "  ", "not-a-date"] {
+            let c = catalog(g);
+            assert_eq!(None, c.age_days(day("2026-10-26")), "{g}");
+            assert!(c.staleness_warning(day("2026-10-26"), 7).is_none(), "{g}");
+        }
     }
 }
