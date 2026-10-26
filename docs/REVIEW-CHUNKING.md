@@ -34,6 +34,36 @@ to another model on the first chunk, the review re-plans its chunks for the
 model that is actually serving (once); a fallback after the first chunk is
 refused as a mixed-model review, as before.
 
+## Single-review budget from the context window
+
+When the reviewer route has `max_context_tokens`, zoder first tries the whole
+diff as one review. Its byte budget is the configured token window minus the
+review's output-token allowance and a fixed 2,048-token margin for the system
+prompt and message framing, converted at four bytes per estimated token (the
+same conservative estimate used by the context-window check). The budget is
+also limited by `max_diff_bytes`. Definition context is included when deciding
+whether the whole review fits. If it does not, zoder returns to the configured
+`max_hunk_bytes` chunk cap. With no context window configured, the single-review
+budget remains `max_hunk_bytes`, preserving the default behavior.
+
+Set `max_context_tokens` on the reviewer provider or, more specifically, the
+reviewer model entry to enable whole-diff sizing:
+
+```toml
+[[providers]]
+id = "provider-a"
+serves = ["provider-a/"]
+max_context_tokens = 131072
+
+[providers.models.custom.model-x]
+model = "provider-a/model-x"
+max_context_tokens = 131072
+```
+
+The model entry takes precedence over the provider value. The emitted chunking
+metadata reports `window_tokens`, `budget_bytes`, and `chunk_cap_bytes` so the
+chosen mode can be inspected in review output.
+
 `zoder review --dry-run` prints the plan per reviewer:
 
 ```
@@ -85,9 +115,9 @@ They are sizing measurements, not provider billing telemetry.
 | `f965acb` (3 files, 21,544 diff bytes) | 3 | 886–2,250 | 1,188–2,893 | up to +34% |
 | `4fea8b7` (5 files, 11,363 diff bytes) | 2 | 591–2,250 | 819–2,893 | up to +39% |
 
-The route cap remains the hard ceiling: the implementation reserves at most a
-quarter for definition context (plus the fixed wrapper allowance), reducing
-the diff portion when necessary.
+The per-chunk route cap remains the hard ceiling: the implementation reserves
+at most a quarter for definition context (plus the fixed wrapper allowance),
+reducing the diff portion when necessary.
 
 ## Default reviewer benchmark
 

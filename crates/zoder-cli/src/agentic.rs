@@ -4840,9 +4840,35 @@ did not satisfy the review schema."
 #[derive(Clone)]
 struct ReviewPlan {
     caps: crate::review_diff::ReviewCaps,
+    window_tokens: Option<u64>,
     prepared: crate::review_diff::PreparedDiff,
     users: Vec<String>,
     chunking: serde_json::Value,
+}
+
+fn single_review_budget(
+    window_tokens: Option<u64>,
+    reserved_tokens: u32,
+    max_diff_bytes: usize,
+    chunk_cap_bytes: usize,
+) -> usize {
+    match window_tokens {
+        None => chunk_cap_bytes,
+        Some(window) => ((window
+            .saturating_sub(u64::from(reserved_tokens))
+            .saturating_mul(zoder_core::context_opt::BYTES_PER_TOKEN)
+            .min(usize::MAX as u64)) as usize)
+            .min(max_diff_bytes),
+    }
+}
+
+fn review_plan_matches(
+    plan_caps: crate::review_diff::ReviewCaps,
+    plan_window_tokens: Option<u64>,
+    caps: crate::review_diff::ReviewCaps,
+    window_tokens: Option<u64>,
+) -> bool {
+    plan_caps == caps && plan_window_tokens == window_tokens
 }
 
 /// Build the per-chunk reviewer prompts for a prepared diff.
@@ -5150,53 +5176,87 @@ unbound, or missing imports:\n{context}"
             )
         }
     };
-    let build_plan = |caps: crate::review_diff::ReviewCaps| -> anyhow::Result<ReviewPlan> {
-        // First try the actual route cap without reserving a context share.
-        // This is important: a diff that fits as one review must not be made
-        // multi-chunk merely because context is enabled.
-        let initial = crate::review_diff::prepare_review_diff_with_chunks(
-            &zoderignore,
-            &diff,
-            &opts.excludes,
-            &config_excludes,
-            caps.max_diff_bytes,
-            caps.max_hunk_bytes,
-            caps.max_chunks,
-            opts.split_hunks,
-        )?;
-        let initial_context_budget = if context_on {
-            crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
-        } else {
-            0
-        };
-        let initial_context_bytes = initial
-            .chunks
-            .first()
-            .map(|chunk| context_for(chunk, initial_context_budget).len())
-            .unwrap_or(0);
-        let initial_fits = initial.chunks.len() == 1
-            && initial.filtered.len().saturating_add(initial_context_bytes) <= caps.max_hunk_bytes;
-        let (prepared, context_budget, reason) = if initial_fits {
-            (
-                initial,
-                initial_context_budget,
-                "whole diff and definition context fit the route budget",
-            )
-        } else {
-            // Context is paid for inside each chunk's route budget. The
-            // reduced diff cap is only needed after the one-chunk attempt.
-            let context_budget = if context_on {
-                crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+    let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
+    let tokens_for = |caps: &crate::review_diff::ReviewCaps| {
+        caps.max_tokens_floor.map_or(base_tokens, |floor| {
+            base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
+        })
+    };
+    let window_for_model = |model: &str| {
+        let provider = eng.as_ref().and_then(|e| {
+            crate::RoutingContext::load(&e.cfg)
+                .ok()
+                .and_then(|routing| {
+                    routing
+                        .real_provider_for_model(&e.cfg, model)
+                        .map(|p| p.id.clone())
+                })
+        });
+        let levers = eng
+            .as_ref()
+            .and_then(|e| crate::context_opt::levers_for(&e.cfg, model));
+        eng.as_ref().and_then(|e| {
+            provider
+                .as_deref()
+                .and_then(|p| crate::context_opt::window_for(&e.cfg, p, model, levers.as_ref()))
+        })
+    };
+    let build_plan =
+        |caps: crate::review_diff::ReviewCaps, model: Option<&str>| -> anyhow::Result<ReviewPlan> {
+            // Resolve the provider the reviewer dispatch uses for this model.
+            let window_tokens = model.and_then(window_for_model);
+            // fit_prompt estimates one token per four bytes. Reserve the review's
+            // complete output allowance plus 2,048 tokens for system and wrapper.
+            let reserved_tokens = u64::from(tokens_for(&caps)).saturating_add(2_048);
+            let single_budget = single_review_budget(
+                window_tokens,
+                reserved_tokens.min(u32::MAX as u64) as u32,
+                caps.max_diff_bytes,
+                caps.max_hunk_bytes,
+            );
+            // Try the full diff against the window-derived single-review budget.
+            let initial = crate::review_diff::prepare_review_diff_with_chunks(
+                &zoderignore,
+                &diff,
+                &opts.excludes,
+                &config_excludes,
+                caps.max_diff_bytes,
+                single_budget,
+                caps.max_chunks,
+                opts.split_hunks,
+            )?;
+            let initial_context_budget = if context_on {
+                crate::review_context::context_budget_for_chunk_cap(single_budget)
             } else {
                 0
             };
-            let chunk_cap = if context_on {
-                crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
+            let initial_context_bytes = initial
+                .chunks
+                .first()
+                .map(|chunk| context_for(chunk, initial_context_budget).len())
+                .unwrap_or(0);
+            let initial_fits = initial.chunks.len() == 1
+                && initial.filtered.len().saturating_add(initial_context_bytes) <= single_budget;
+            let (prepared, context_budget, reason) = if initial_fits {
+                (
+                    initial,
+                    initial_context_budget,
+                    "whole diff and definition context fit the single-review budget",
+                )
             } else {
-                caps.max_hunk_bytes
-            };
-            let prepared = if initial.chunks.len() > 1 {
-                crate::review_diff::prepare_review_diff_with_chunks(
+                // Context is paid for inside each chunk's route budget. The
+                // reduced diff cap is only needed after the one-chunk attempt.
+                let context_budget = if context_on {
+                    crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+                } else {
+                    0
+                };
+                let chunk_cap = if context_on {
+                    crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
+                } else {
+                    caps.max_hunk_bytes
+                };
+                let prepared = crate::review_diff::prepare_review_diff_with_chunks(
                     &zoderignore,
                     &diff,
                     &opts.excludes,
@@ -5205,54 +5265,47 @@ unbound, or missing imports:\n{context}"
                     chunk_cap,
                     caps.max_chunks,
                     opts.split_hunks,
-                )?
-            } else {
-                initial
+                )?;
+                (
+                    prepared,
+                    context_budget,
+                    "diff or definition context exceeds the single-review budget",
+                )
             };
-            (
-                prepared,
+            let context_bytes = prepared
+                .chunks
+                .iter()
+                .map(|chunk| context_for(chunk, context_budget).len())
+                .max()
+                .unwrap_or(0);
+            let chunking = json!({
+                "mode": if prepared.chunks.len() == 1 { "single" } else { "chunked" },
+                "reason": reason,
+                "diff_bytes": prepared.filtered.len(),
+                "context_bytes": context_bytes,
+                "budget_bytes": single_budget,
+                "window_tokens": window_tokens,
+                "chunk_cap_bytes": caps.max_hunk_bytes,
+                "context_capped": context_bytes >= context_budget && context_budget > 0,
+            });
+            let users = build_review_users(
+                &label,
+                &focus_txt,
+                "",
+                &prepared,
                 context_budget,
-                "diff or definition context exceeds the route budget",
-            )
+                &context_for,
+            );
+            Ok(ReviewPlan {
+                caps,
+                window_tokens,
+                prepared,
+                users,
+                chunking,
+            })
         };
-        let context_bytes = prepared
-            .chunks
-            .iter()
-            .map(|chunk| context_for(chunk, context_budget).len())
-            .max()
-            .unwrap_or(0);
-        let chunking = json!({
-            "mode": if prepared.chunks.len() == 1 { "single" } else { "chunked" },
-            "reason": reason,
-            "diff_bytes": prepared.filtered.len(),
-            "context_bytes": context_bytes,
-            "budget_bytes": caps.max_hunk_bytes,
-            "context_capped": context_bytes >= context_budget && context_budget > 0,
-        });
-        let users = build_review_users(
-            &label,
-            &focus_txt,
-            "",
-            &prepared,
-            context_budget,
-            &context_for,
-        );
-        Ok(ReviewPlan {
-            caps,
-            prepared,
-            users,
-            chunking,
-        })
-    };
-    let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
-    let tokens_for = |caps: &crate::review_diff::ReviewCaps| {
-        caps.max_tokens_floor.map_or(base_tokens, |floor| {
-            base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
-        })
-    };
-
     let head_caps = caps_for(reviewer_for_caps.as_deref());
-    let head_plan = build_plan(head_caps)?;
+    let head_plan = build_plan(head_caps, reviewer_for_caps.as_deref())?;
     if !head_plan.prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
         eprintln!("[zoder] {}", head_plan.prepared.excluded.render());
     }
@@ -5268,10 +5321,15 @@ unbound, or missing imports:\n{context}"
             None => head_caps,
             Some(m) => caps_for(Some(m)),
         };
-        let idx = match plans.iter().position(|p| p.caps == caps) {
+        let plan_model = m.as_deref().or(reviewer_for_caps.as_deref());
+        let requested_window = plan_model.and_then(window_for_model);
+        let idx = match plans
+            .iter()
+            .position(|p| review_plan_matches(p.caps, p.window_tokens, caps, requested_window))
+        {
             Some(i) => i,
             None => {
-                plans.push(build_plan(caps)?);
+                plans.push(build_plan(caps, plan_model)?);
                 plans.len() - 1
             }
         };
@@ -5350,7 +5408,7 @@ unbound, or missing imports:\n{context}"
     // a non-Send sink type, so we poll them together via join_all instead).
     let replan = |model: &str| -> Option<(Vec<String>, u32)> {
         let caps = caps_for(Some(model));
-        match build_plan(caps) {
+        match build_plan(caps, Some(model)) {
             Ok(plan) => Some((plan.users, tokens_for(&caps))),
             Err(e) => {
                 if !cli.quiet {
@@ -16314,6 +16372,85 @@ model_provider = "custom.nemotron35"
         assert!(
             entry.ewma_latency_ms.is_some(),
             "reviewer success MUST record ewma_latency_ms (a non-zero latency was measured); got entry={entry:?}"
+        );
+    }
+
+    #[test]
+    fn window_budget_plans_one_chunk_and_fits_dispatch_window() {
+        let window = 50_000;
+        let budget = single_review_budget(Some(window), 10_240, 400_000, 9_000);
+        let diff = synthetic_loop_diff(10, 450);
+        assert!(
+            (140_000..160_000).contains(&diff.len()),
+            "fixture should be about 150 KB"
+        );
+        assert!(
+            diff.len() < budget,
+            "fixture must fit the single-review budget"
+        );
+        let prepared = crate::review_diff::prepare_review_diff_with_chunks(
+            &[],
+            &diff,
+            &[],
+            &[],
+            400_000,
+            budget,
+            64,
+            false,
+        )
+        .unwrap();
+        assert_eq!(prepared.chunks.len(), 1);
+        let users = build_review_users("branch", "", "", &prepared, 0, &|_, _| String::new());
+        assert_eq!(
+            crate::context_opt::fit_prompt(REVIEW_SYSTEM, &users[0], Some(window)).unwrap(),
+            crate::context_opt::WindowOutcome::Fits,
+            "the window-derived budget must leave enough room for the actual review prompt"
+        );
+    }
+
+    #[test]
+    fn window_budget_overflow_falls_back_to_chunk_cap_and_no_window_stays_strict() {
+        let window = 50_000;
+        let budget = single_review_budget(Some(window), 10_240, 400_000, 9_000);
+        let diff = synthetic_loop_diff(10, 457);
+        assert!(diff.len() > budget);
+        assert!(
+            diff.len() - budget < 5_000,
+            "fixture should just exceed the budget: {} bytes vs {budget}",
+            diff.len()
+        );
+        let prepared = crate::review_diff::prepare_review_diff_with_chunks(
+            &[],
+            &diff,
+            &[],
+            &[],
+            400_000,
+            9_000,
+            64,
+            true,
+        )
+        .unwrap();
+        assert!(prepared.chunks.len() > 1);
+        assert_eq!(single_review_budget(None, 10_240, 400_000, 9_000), 9_000);
+        let no_window_plan = crate::review_diff::prepare_review_diff_with_chunks(
+            &[],
+            &synthetic_loop_diff(10, 450),
+            &[],
+            &[],
+            400_000,
+            9_000,
+            64,
+            true,
+        )
+        .unwrap();
+        assert!(no_window_plan.chunks.len() > 1);
+        let caps = review_caps(9_000, 400_000);
+        assert!(review_plan_matches(caps, Some(50_000), caps, Some(50_000)));
+        assert!(!review_plan_matches(caps, Some(30_000), caps, Some(50_000)));
+        assert_ne!(
+            single_review_budget(Some(30_000), 10_240, 400_000, 9_000),
+            single_review_budget(Some(50_000), 10_240, 400_000, 9_000),
+            "identical caps with different route windows need distinct plans"
         );
     }
 
