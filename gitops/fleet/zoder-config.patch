@@ -11,9 +11,9 @@ as well is a behaviour change that should wait for the benchmark.
 
 Not applied, not pushed: the orchestrator deploys after review.
 
-The hunk below is a real unified diff. It was dry-run clean against
-fleet/zoder-config/config.toml as of 2026-10-25; if that file has changed since,
-regenerate with `diff -u` rather than forcing the patch. From the FleetOps repo root:
+The hunk below is a real unified diff. It was dry-run clean against the fleet's
+config.toml as of 2026-10-25; if that file has changed since, regenerate with
+`diff -u` rather than forcing the patch. From the fleet config repo root:
 
     git apply <path-to>/zoder-config.patch
 
@@ -22,8 +22,8 @@ gitops/fleet/zoder-config.patch). Use `git am` instead if you want the commit
 message above.
 
 ---
---- a/fleet/zoder-config/config.toml
-+++ b/fleet/zoder-config/config.toml
+--- a/config.toml
++++ b/config.toml
 @@ -1,9 +1,49 @@
  [profiles.deepseek]
  model = "deepseek-flash"
@@ -31,7 +31,7 @@ message above.
 +# Context levers (zoder docs/CONTEXT-OPTIMIZATION.md).
 +#
 +# The 30 days to 2026-10-25 cost $79.79 with a 212:1 input:output ratio and
-+# 98.9% of input served from cache; one CERBERUS loop spent 32.9M input tokens
++# 98.9% of input served from cache; one loop spent 32.9M input tokens
 +# for 110K output over ~250 calls that each resent the whole window. These
 +# levers bound the working set without touching the window itself.
 +#

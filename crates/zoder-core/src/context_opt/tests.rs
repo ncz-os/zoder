@@ -381,7 +381,7 @@ fn a_zero_keep_window_elides_every_eligible_turn() {
 
 fn conversation(turns: usize, bytes: usize) -> Vec<Turn> {
     let mut v = vec![Turn::new("system", "You are the AUTHOR.")];
-    v.push(Turn::new("user", "TASK: fix the RiskyEats total rounding"));
+    v.push(Turn::new("user", "TASK: fix the order-total rounding"));
     for i in 0..turns {
         // A real tool result: a diff naming the file, then bulk.
         let mut body = format!("diff --git a/src/f{i}.rs b/src/f{i}.rs\n+++ b/src/f{i}.rs\n");

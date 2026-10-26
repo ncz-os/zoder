@@ -4,7 +4,7 @@ Operator brief, 2026-10-25: *"lets context optimize for deepseek. We should
 probably also do it for minimax."*
 
 This document records the evidence, the levers, what each one is expected to
-save, and the FleetOps config deltas to apply after review. It is deliberately
+save, and the fleet config deltas to apply after review. It is deliberately
 honest about what is measured and what is still estimated: the benchmark runs
 that would turn every number below into a measured one cost real money and are
 called out as **pending** where that is the case.
@@ -29,7 +29,7 @@ rates used are the ones the operator's pricing config carries for
 deepseek-flash ($0.003 / $0.15 / $0.60 per M). If a review finds the miss rate
 is not $0.15/M, the derived dollar figures above are the lines to correct.
 
-One `zoder` loop on CERBERUS used **32.9 M input tokens for 110 K output** —
+One `zoder` loop on one host used **32.9 M input tokens for 110 K output** —
 roughly 250 calls each resending a full 128 K window. Every agent turn resends
 the whole growing conversation, and the only lever in play today is
 `max_context_tokens` per profile in `gitops/fleet/zoder-config/config.toml`.
@@ -222,15 +222,14 @@ Be explicit about this when reviewing:
   checked for per-chunk full-context resends. If it resends, it is the largest
   remaining single win and belongs in a follow-up.
 
-## FleetOps deltas
+## Fleet config deltas
 
 `gitops/fleet/zoder-config.patch` in this repository adds the per-provider lever
-profiles to the FleetOps gitops config. It is **not** applied and **not**
-pushed; the orchestrator deploys after review. The hunk is a real unified diff
-with explicit line ranges. It was dry-run clean against the
-`fleet/zoder-config/config.toml` as of 2026-10-25; if that file has changed in its
-first lines the patch will need regenerating (re-run `diff -u` against the
-current file).
+profiles to the fleet's own gitops config. It is **not** applied and **not**
+pushed; the operator deploys after review. The hunk is a real unified diff
+with explicit line ranges. It was dry-run clean against the fleet's
+`config.toml` as of 2026-10-25; if that file has changed in its first lines the
+patch will need regenerating (re-run `diff -u` against the current file).
 
 `max_context_tokens` is deliberately left unchanged in this patch. The levers
 make a large window affordable by keeping the *working set* small; shrinking the
