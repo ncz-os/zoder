@@ -1955,6 +1955,12 @@ pub struct HealthConfig {
     pub providers: Vec<String>,
 }
 
+impl HealthConfig {
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -1966,7 +1972,7 @@ pub struct Config {
     pub health_path: PathBuf,
     /// Providers that opt in to the pre-query health gate. Absent means no
     /// provider is gated.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HealthConfig::is_empty")]
     pub health: HealthConfig,
     /// Hosts considered free/internal for the anti-paid-fallback guard.
     /// Matched by exact host or registrable suffix (never substring).
@@ -3755,6 +3761,11 @@ pub struct VendorOverlay {
     /// chunk caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+    /// Providers contributed by this overlay that opt in to the pre-query
+    /// health gate. The ids are unioned onto the base config, so an overlay
+    /// can enable gating for a provider it also contributes.
+    #[serde(default, skip_serializing_if = "HealthConfig::is_empty")]
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4002,6 +4013,11 @@ fn apply_overlays_filtered(
         }
         if let Some(review) = &overlay.review {
             merge_review_config(&mut cfg.review, review);
+        }
+        for provider_id in &overlay.health.providers {
+            if !cfg.health.providers.contains(provider_id) {
+                cfg.health.providers.push(provider_id.clone());
+            }
         }
         if overlay.theme.is_some() {
             fallback_theme = overlay.theme.clone();
@@ -5344,6 +5360,39 @@ header = "1;38;2;10;20;30"
         assert_eq!(cfg.theme.warn, Theme::default().warn);
         // And the default-claiming overlay also set the active default provider.
         assert_eq!(cfg.default_provider, "acme-gw");
+    }
+
+    #[test]
+    fn overlay_health_block_opts_in_contributed_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.fleet.toml"),
+            r#"
+[health]
+providers = ["provider-a"]
+
+[[providers]]
+id = "provider-a"
+base_url = "https://api.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "K" }
+
+[[providers]]
+id = "provider-b"
+base_url = "https://api.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "K" }
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.health.providers = vec!["provider-b".into()];
+        apply_overlays(&mut cfg, dir.path()).unwrap();
+        assert_eq!(
+            cfg.health.providers,
+            vec!["provider-b".to_string(), "provider-a".to_string()],
+            "an overlay union must keep base opt-ins and add the overlay's"
+        );
     }
 
     #[test]
