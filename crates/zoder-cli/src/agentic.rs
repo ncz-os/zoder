@@ -1952,6 +1952,14 @@ fn no_reviewer_provider_text(model: &str, routes: &[(String, String)], served: &
 /// routing context: loading quota-routing ledger from <home>/ledger.jsonl`
 /// and the actual cause (`opening ledger lock at <home>/ledger.jsonl.lock:
 /// ... Read-only file system / Is a directory`) never reaches the user.
+///
+/// This is the ONLY `RoutingContext::load` call site in this module that
+/// formats the error into a user-facing message of its own (the
+/// `dispatch_reviewer_for_model` fatal path). Every other caller either
+/// propagates the error through anyhow's `?` — where each context layer is
+/// preserved automatically — or deliberately discards it (`.ok()` in the
+/// read-only provider-id lookups, where a failure means "no quota data",
+/// not an error to surface), so neither class can drop the cause chain.
 fn routing_context_load_message(e: &anyhow::Error) -> String {
     format!("loading routing context: {e:#}")
 }
