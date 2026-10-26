@@ -4527,10 +4527,14 @@ fn filter_false_undefined_findings(
     let mut filtered: Vec<serde_json::Value> = Vec::new();
     for finding in review.findings.drain(..) {
         let path = finding_location_path(&finding.location);
-        match crate::review_filter::false_undefined_record_at(
+        // The RAW location is passed too: a `path:A-B` / `path (lines A-B)`
+        // / `path#LA-LB` range says what a no-symbol claim ("undefined
+        // constants and missing imports") is about.
+        match crate::review_filter::false_undefined_record_with_location(
             &finding.title,
             &finding.body,
             &path,
+            finding.location.as_deref(),
             finding.location.as_deref().and_then(finding_location_line),
             read,
         ) {
@@ -9991,6 +9995,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The four "missing import" findings a small reviewer raised on a
+    /// ~600-line Python module, through the REAL aggregation path that writes
+    /// `filtered_findings` into the review JSON. Every claimed import exists at
+    /// the reviewed head, so all four are dropped with evidence lines.
+    #[test]
+    fn import_shape_false_findings_are_filtered_end_to_end() {
+        let source = crate::review_filter::tests::report_module(true);
+        let read = |p: &str| (p == "tools/report.py").then(|| source.clone());
+        let findings: Vec<Finding> = crate::review_filter::tests::import_shapes()
+            .into_iter()
+            .map(|(title, body, location)| Finding {
+                title: title.into(),
+                body: body.into(),
+                location: Some(location.into()),
+                severity: "high".into(),
+                disposition: None,
+            })
+            .collect();
+        let mut review = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "four import complaints".into(),
+            findings,
+            next_steps: vec![],
+            filtered_findings: Vec::new(),
+            ..Default::default()
+        };
+        filter_false_undefined_findings(&mut review, &read);
+        assert!(review.findings.is_empty(), "{:?}", review.findings);
+        assert_eq!(review.filtered_findings.len(), 4, "{review:?}");
+        for record in &review.filtered_findings {
+            assert!(record["location"].is_string(), "{record}");
+            assert!(record["evidence"].is_string(), "{record}");
+            let evidence = record["evidence"].as_str().unwrap();
+            assert!(
+                evidence.starts_with("tools/report.py:"),
+                "evidence must carry the file and line: {record}"
+            );
+        }
+        // The only findings were disproved, so a blocking verdict is downgraded.
+        assert_eq!(review.verdict, "comment");
+
+        // With the imports removed the same findings are kept.
+        let bare = crate::review_filter::tests::report_module(false);
+        let read = |p: &str| (p == "tools/report.py").then(|| bare.clone());
+        let mut review = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "four import complaints".into(),
+            findings: crate::review_filter::tests::import_shapes()
+                .into_iter()
+                .map(|(title, body, location)| Finding {
+                    title: title.into(),
+                    body: body.into(),
+                    location: Some(location.into()),
+                    severity: "high".into(),
+                    disposition: None,
+                })
+                .collect(),
+            next_steps: vec![],
+            filtered_findings: Vec::new(),
+            ..Default::default()
+        };
+        filter_false_undefined_findings(&mut review, &read);
+        assert_eq!(review.findings.len(), 4, "{review:?}");
+        assert!(review.filtered_findings.is_empty());
     }
 
     fn finding(title: &str, severity: &str) -> Finding {
