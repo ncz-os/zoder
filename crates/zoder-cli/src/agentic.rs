@@ -4486,10 +4486,11 @@ fn filter_false_undefined_findings(
     let mut filtered: Vec<serde_json::Value> = Vec::new();
     for finding in review.findings.drain(..) {
         let path = finding_location_path(&finding.location);
-        match crate::review_filter::false_undefined_record(
+        match crate::review_filter::false_undefined_record_at(
             &finding.title,
             &finding.body,
             &path,
+            finding.location.as_deref().and_then(finding_location_line),
             read,
         ) {
             Some(mut record) => {
@@ -4841,6 +4842,7 @@ struct ReviewPlan {
     caps: crate::review_diff::ReviewCaps,
     prepared: crate::review_diff::PreparedDiff,
     users: Vec<String>,
+    chunking: serde_json::Value,
 }
 
 /// Build the per-chunk reviewer prompts for a prepared diff.
@@ -5020,6 +5022,7 @@ pub(crate) async fn cmd_review(
                 failed_models: 1,
                 receipts: &[],
                 exclusions: None,
+                chunking: None,
             },
         );
         anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
@@ -5045,6 +5048,7 @@ pub(crate) async fn cmd_review(
                 failed_models: 0,
                 receipts: &[],
                 exclusions: None,
+                chunking: None,
             },
         );
         return Ok(());
@@ -5147,28 +5151,84 @@ unbound, or missing imports:\n{context}"
         }
     };
     let build_plan = |caps: crate::review_diff::ReviewCaps| -> anyhow::Result<ReviewPlan> {
-        // Definition context is part of this route's per-chunk budget, not an
-        // extra allowance on top of it.
-        let context_budget = if context_on {
-            crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
-        } else {
-            0
-        };
-        let chunk_cap = if context_on {
-            crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
-        } else {
-            caps.max_hunk_bytes
-        };
-        let prepared = crate::review_diff::prepare_review_diff_with_chunks(
+        // First try the actual route cap without reserving a context share.
+        // This is important: a diff that fits as one review must not be made
+        // multi-chunk merely because context is enabled.
+        let initial = crate::review_diff::prepare_review_diff_with_chunks(
             &zoderignore,
             &diff,
             &opts.excludes,
             &config_excludes,
             caps.max_diff_bytes,
-            chunk_cap,
+            caps.max_hunk_bytes,
             caps.max_chunks,
             opts.split_hunks,
         )?;
+        let initial_context_budget = if context_on {
+            crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+        } else {
+            0
+        };
+        let initial_context_bytes = initial
+            .chunks
+            .first()
+            .map(|chunk| context_for(chunk, initial_context_budget).len())
+            .unwrap_or(0);
+        let initial_fits = initial.chunks.len() == 1
+            && initial.filtered.len().saturating_add(initial_context_bytes) <= caps.max_hunk_bytes;
+        let (prepared, context_budget, reason) = if initial_fits {
+            (
+                initial,
+                initial_context_budget,
+                "whole diff and definition context fit the route budget",
+            )
+        } else {
+            // Context is paid for inside each chunk's route budget. The
+            // reduced diff cap is only needed after the one-chunk attempt.
+            let context_budget = if context_on {
+                crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+            } else {
+                0
+            };
+            let chunk_cap = if context_on {
+                crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
+            } else {
+                caps.max_hunk_bytes
+            };
+            let prepared = if initial.chunks.len() > 1 {
+                crate::review_diff::prepare_review_diff_with_chunks(
+                    &zoderignore,
+                    &diff,
+                    &opts.excludes,
+                    &config_excludes,
+                    caps.max_diff_bytes,
+                    chunk_cap,
+                    caps.max_chunks,
+                    opts.split_hunks,
+                )?
+            } else {
+                initial
+            };
+            (
+                prepared,
+                context_budget,
+                "diff or definition context exceeds the route budget",
+            )
+        };
+        let context_bytes = prepared
+            .chunks
+            .iter()
+            .map(|chunk| context_for(chunk, context_budget).len())
+            .max()
+            .unwrap_or(0);
+        let chunking = json!({
+            "mode": if prepared.chunks.len() == 1 { "single" } else { "chunked" },
+            "reason": reason,
+            "diff_bytes": prepared.filtered.len(),
+            "context_bytes": context_bytes,
+            "budget_bytes": caps.max_hunk_bytes,
+            "context_capped": context_bytes >= context_budget && context_budget > 0,
+        });
         let users = build_review_users(
             &label,
             &focus_txt,
@@ -5181,6 +5241,7 @@ unbound, or missing imports:\n{context}"
             caps,
             prepared,
             users,
+            chunking,
         })
     };
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
@@ -5264,6 +5325,7 @@ unbound, or missing imports:\n{context}"
                 failed_models: 1,
                 receipts: &[],
                 exclusions: Some(&prepared.excluded),
+                chunking: None,
             },
         );
         anyhow::bail!(
@@ -5371,6 +5433,7 @@ unbound, or missing imports:\n{context}"
         failed_models: failed_count,
         receipts: &receipts,
         exclusions: Some(&prepared.excluded),
+        chunking: Some(head_plan.chunking.clone()),
     };
 
     let agg = emit_reviews(cli, &aggregate);
@@ -5446,6 +5509,9 @@ struct ReviewAggregate<'a> {
     /// Rendered into the JSON payload / result.json so a consumer can see
     /// exactly what was NOT reviewed.
     exclusions: Option<&'a crate::review_diff::ExclusionReport>,
+    /// The route-specific decision and byte accounting used to choose one or
+    /// multiple chunks.
+    chunking: Option<serde_json::Value>,
 }
 
 /// Compute the aggregate verdict + per-reviewer view out of a list of
@@ -5587,6 +5653,9 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     payload["substituted"] = json!(receipts_show_substitution(aggregate.receipts));
     if let Some(rep) = aggregate.exclusions {
         payload["exclusions"] = exclusion_payload(rep);
+    }
+    if let Some(chunking) = &aggregate.chunking {
+        payload["chunking"] = chunking.clone();
     }
 
     if let Some(dir) = active_job_dir() {
@@ -6516,6 +6585,24 @@ fn finding_location_path(location: &Option<String>) -> String {
         }
     }
     path.trim().to_string()
+}
+
+fn finding_location_line(location: &str) -> Option<usize> {
+    let mut parts: Vec<&str> = location.trim().split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    if parts
+        .last()
+        .is_some_and(|part| part.parse::<usize>().is_ok())
+        && parts.len() > 2
+        && parts[parts.len() - 2].parse::<usize>().is_ok()
+    {
+        parts.pop();
+    }
+    let line = parts.pop()?;
+    let line = line.strip_prefix('L').unwrap_or(line);
+    line.split('-').next()?.parse().ok()
 }
 
 /// A trailing `line`, `Lline`, or `start-end` segment (an empty tail, from a

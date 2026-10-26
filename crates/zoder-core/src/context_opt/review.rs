@@ -61,9 +61,9 @@ pub struct ReviewPrefix {
     /// is constant for the review and belongs to the prefix; the banner that
     /// does carry the part number is in [`ChunkMessage::banner`].
     pub head: String,
-    /// The shared cross-file context header, when *every* chunk of the review
-    /// carries a byte-identical one (see [`hoistable_context`]). Hoisting it
-    /// turns 16 per-call repeats into one cached block.
+    /// Reserved for compatibility with the prefix representation. Cross-file
+    /// context is deliberately never stored here: it is per-chunk evidence
+    /// and must remain in the variable tail of every prompt.
     pub context: String,
 }
 
@@ -81,10 +81,6 @@ impl ReviewPrefix {
         out.push('\n');
         out.push_str(self.head.trim_end());
         out.push('\n');
-        if !self.context.is_empty() {
-            out.push_str(self.context.trim_end());
-            out.push('\n');
-        }
         if !self.diff_map.is_empty() {
             out.push_str(self.diff_map.trim_end());
             out.push('\n');
@@ -154,28 +150,27 @@ impl ChunkMessage {
 
 /// Build the constant prefix from the parts the CLI already computes.
 ///
-/// `contexts` is the per-chunk context header list. When every header is
-/// byte-identical and within [`MAX_HOISTABLE_CONTEXT_BYTES`] it is hoisted out
-/// of the per-chunk blocks; otherwise the headers stay where they are and the
-/// prefix keeps only the truly constant parts.
+/// `contexts` is retained in the API for callers that want to inspect the
+/// per-chunk values, but it is never hoisted. Context is evidence for one
+/// hunk and belongs in that hunk's variable tail.
 pub fn review_prefix(
     system: &str,
     focus: &str,
     diff_map: &str,
     head: &str,
-    contexts: &[String],
+    _contexts: &[String],
 ) -> ReviewPrefix {
     ReviewPrefix {
         system: system.to_string(),
         focus: focus.to_string(),
         diff_map: diff_map.to_string(),
         head: head.to_string(),
-        context: hoistable_context(contexts).unwrap_or_default(),
+        context: String::new(),
     }
 }
 
-/// The shared header when every chunk carries the same non-empty one and it is
-/// small enough to be worth hoisting.
+/// Legacy helper retained for API compatibility. New prompt construction does
+/// not use this value to build a shared prefix.
 pub fn hoistable_context(contexts: &[String]) -> Option<String> {
     hoistable_context_with(contexts, |c| c.to_string())
 }
@@ -244,15 +239,11 @@ pub fn review_prompts(
     contexts: &[String],
     preamble: &str,
 ) -> Vec<String> {
-    let hoisted = !prefix.context.is_empty();
     chunks
         .iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let context = match contexts.get(i) {
-                Some(c) if !hoisted => c.clone(),
-                _ => String::new(),
-            };
+            let context = contexts.get(i).cloned().unwrap_or_default();
             chunk_prompt(
                 prefix,
                 &ChunkMessage {
