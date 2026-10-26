@@ -1,0 +1,69 @@
+From: Jason Perlow <jperlow@gmail.com>
+Subject: [PATCH] fleet: per-provider context levers for DeepSeek and MiniMax
+
+Adds the `context_levers` block to each zoder profile driven by the
+2026-10-25 context-optimization study. Numbers and rationale are in
+zoder's docs/CONTEXT-OPTIMIZATION.md; this patch is the deployable half.
+
+`max_context_tokens` is deliberately untouched. The levers keep the working
+set small, which is what makes the existing window affordable; shrinking the
+window as well is a behaviour change that should wait for the benchmark.
+
+Not applied, not pushed: the orchestrator deploys after review.
+
+diff --git a/fleet/zoder-config/config.toml b/fleet/zoder-config/config.toml
+--- a/fleet/zoder-config/config.toml
++++ b/fleet/zoder-config/config.toml
+@@
+ [profiles.deepseek]
+ model = "deepseek-flash"
+ max_context_tokens = 128000
++# Context levers (docs/CONTEXT-OPTIMIZATION.md).
++#
++# The 30 days to 2026-10-25 cost $79.79 with a 212:1 input:output ratio and
++# 98.9% of input served from cache; one CERBERUS loop spent 32.9M input tokens
++# for 110K output over ~250 calls that each resent the whole window. These
++# three levers bound the working set without touching the window itself.
++#
++# compact_after_tokens = 48000: the measured loop averaged a ~28K prompt
++# before its first edit, so 48K (1.7x) never folds a legitimately large
++# single-file task but folds a 128K working set instead of resending it.
++[profiles.deepseek.context_levers]
++tool_output_cap_bytes = 16384
++elide_after_turns = 8
++elide_min_bytes = 2048
++compact_after_tokens = 48000
++keep_recent_turns = 6
+ 
+ [profiles.minimax]
+ model = "MiniMax-M3"
+ max_context_tokens = 200000
+ request_timeout_s = 600
++# MiniMax publishes no cache counter, so the engine treats it as
++# ProviderCacheShape::None and never asserts a hit share either way. Its
++# metering is by tokens and its window is 200K while a review chunk is 48K,
++# so the working set is kept tighter than DeepSeek's.
++#
++# NOTE: whether MiniMax caches prompts at all is unverified. If it does, the
++# cache-stable prefix is a free win here too; if it does not, the caps and
++# compaction are doing all the work. Measure before tuning these numbers.
++[profiles.minimax.context_levers]
++tool_output_cap_bytes = 12288
++elide_after_turns = 6
++elide_min_bytes = 2048
++compact_after_tokens = 32000
++keep_recent_turns = 6
++
++# Every other profile keeps the default: caps and elision on, compaction off.
++# A local vLLM model has no per-token bill, so a summarised history is pure
++# quality risk for no saving.
++#
++# [profiles.<other>.context_levers]
++# tool_output_cap_bytes = 16384
++# elide_after_turns = 8
++# elide_min_bytes = 2048
++# compact_after_tokens = 0        # 0 disables compaction
++# keep_recent_turns = 6
+
+--
+2.43.0
