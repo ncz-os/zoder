@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -52,9 +53,9 @@ TOKEN_RE = re.compile(r"[a-z0-9]+")
 IPV4_RE = re.compile(r"(?:\d{1,3}\.){1,3}\d{1,3}")
 URL_HOST_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#]+)")
 SCP_HOST_RE = re.compile(r"(?<![\w.-])[\w.-]+@([A-Za-z0-9][A-Za-z0-9.-]*):")
-SSH_HOST_RE = re.compile(
-    r"\bssh\b[^\n]*?(?:[\w.-]+@)?([A-Za-z0-9][A-Za-z0-9.-]*)"
-)
+SSH_CMD_RE = re.compile(r"(?:^|[\s;&|()])ssh(?=\s|$)")
+# ssh short options that consume the following argument.
+SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw")
 RULE_KINDS = ("token", "bigram", "prefix", "host")
 
 
@@ -106,14 +107,58 @@ def _authority_host(authority: str) -> str:
     return value.split(":", 1)[0]
 
 
+def _shell_tokens(text: str) -> list[str]:
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError:
+        return text.split()
+
+
+def _ssh_destination(tokens: list[str]) -> str | None:
+    """The first non-option token after `ssh`, honouring options' arguments."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token.startswith("-") and token != "-":
+            if len(token) == 2 and token[1] in SSH_VALUE_OPTIONS:
+                index += 2
+            else:
+                index += 1
+            continue
+        break
+    if index >= len(tokens):
+        return None
+    return tokens[index]
+
+
+def ssh_host_matches(text: str) -> list[tuple[str, int]]:
+    """Destination hosts of `ssh` commands, with each destination's offset."""
+    found: list[tuple[str, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        for command in SSH_CMD_RE.finditer(line):
+            destination = _ssh_destination(_shell_tokens(line[command.end() :]))
+            if not destination:
+                continue
+            position = line.find(destination, command.end())
+            if position < 0:
+                position = command.end()
+            found.append((_authority_host(destination), offset + position))
+        offset += len(line)
+    return found
+
+
 def host_matches(text: str) -> list[tuple[str, int]]:
     """Every host mention with the offset of the host itself, in text order."""
     found: list[tuple[str, int]] = []
     for match in URL_HOST_RE.finditer(text):
         found.append((_authority_host(match.group(1)), match.start(1)))
-    for regex in (SCP_HOST_RE, SSH_HOST_RE):
-        for match in regex.finditer(text):
-            found.append((match.group(1), match.start(1)))
+    for match in SCP_HOST_RE.finditer(text):
+        found.append((match.group(1), match.start(1)))
+    found.extend(ssh_host_matches(text))
     return found
 
 
@@ -260,6 +305,20 @@ def self_test(rules: dict[str, set[str]]) -> int:
         raise SystemExit(
             "public-repo-guard self-test: repeated host was not reported on "
             f"both of its lines (got {sorted(host_lines)})"
+        )
+
+    ssh_line = (
+        f"ssh -o StrictHostKeyChecking=no -p 2222 {term}.example.invalid uptime\n"
+    )
+    ssh_host_lines = {
+        line
+        for where_value, line, kind in scan_text(ssh_line, rules, "self-test")
+        if where_value == "self-test" and kind == "host"
+    }
+    if ssh_host_lines != {1}:
+        raise SystemExit(
+            "public-repo-guard self-test: ssh destination was not found after "
+            f"its options (got {sorted(ssh_host_lines)})"
         )
 
     with tempfile.TemporaryDirectory(prefix="public-repo-guard-") as scratch:
