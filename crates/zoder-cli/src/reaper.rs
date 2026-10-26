@@ -1009,6 +1009,12 @@ const CANCEL_RETRY_BACKOFF: [Duration; 3] = [
 /// learn the same thing.
 const CANCEL_RETRY_BUDGET: Duration = Duration::from_millis(1500);
 
+/// How much a sequence of timers and timeouts may overshoot the budget it was
+/// given. The plan fits the budget exactly; the OS scheduler does not, so a
+/// sequence of waits is allowed a small slack and nothing more.
+#[cfg_attr(not(test), allow(dead_code))]
+const SCHEDULING_SLACK: Duration = Duration::from_millis(100);
+
 /// How long a daemon gets to exit after `SIGTERM` before it is escalated to
 /// `SIGKILL`, when its pid is the only handle left. Same order as the ordinary
 /// reap grace: enough for an orderly exit, short enough that a wedged daemon
@@ -1026,9 +1032,11 @@ pub(crate) enum UnconfirmedCancelOutcome {
     Confirmed(usize),
     /// The engine socket lost its listener during the retries (ENOENT /
     /// ECONNREFUSED): the daemon that owned the session is gone, and the
-    /// session with it. No retry after that point could have been made, so this
-    /// carries no attempt count.
-    DaemonGone,
+    /// session with it. No retry AFTER that point could have been made, but
+    /// the attempt that FOUND it gone was made, so the count travels with the
+    /// arm: the settled record says how many cancels were sent, not how many
+    /// were planned.
+    DaemonGone(usize),
     /// The daemon is there and never acknowledged, after `n` retries. A settled
     /// turn does not ack a cancel and a heavily loaded daemon can outlast every
     /// retry, so this is "could not prove the turn stopped", not "the turn is
@@ -1146,7 +1154,10 @@ pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> Unconfi
 /// [`retry_unconfirmed_cancel_within`] exists because the caller knows how much
 /// of the phase budget is left: a retry that outlives it is cut off by the
 /// caller mid-flight, which leaves the cancel unsettled instead of settled. The
-/// sequence therefore never spends more than the budget it is given.
+/// sequence therefore spends no more than the budget it is given, up to the
+/// scheduling slack of the timers it waits on and the one attempt that is
+/// ALWAYS made: a budget that is already spent still buys a single
+/// minimum-length ask, because "unconfirmed" must mean asked.
 ///
 /// `budget` is the TOTAL time the whole sequence may take, not a per-attempt
 /// cap: the plan (retry count, backoff, per-attempt timeout) is derived from
@@ -1178,7 +1189,7 @@ pub(crate) async fn retry_unconfirmed_cancel_within(
                 if classify_cancel_error(&e) == CancelFailure::EngineUnreachable {
                     // The daemon went away between attempts: nothing is left
                     // to cancel, and no retry can change that.
-                    return UnconfirmedCancelOutcome::DaemonGone;
+                    return UnconfirmedCancelOutcome::DaemonGone(attempt + 1);
                 }
             }
         }
@@ -1195,6 +1206,10 @@ pub(crate) struct UnconfirmedCancel {
     pub attempts: usize,
     pub outcome: UnconfirmedCancelOutcome,
     /// The daemon process recorded for this socket, re-checked live.
+    ///
+    /// Only the paths that had to look for a daemon to stop set it: a cancel
+    /// the daemon acknowledged never needs one, and reporting `None` there
+    /// says "no daemon was involved", not "no daemon was running".
     pub daemon_pid: Option<u32>,
     /// True when that daemon is no longer running — whether because it was
     /// already gone or because this function stopped it by exact pid.
@@ -1226,7 +1241,7 @@ pub(crate) async fn settle_unconfirmed_cancel(
         attempts: 1 + match outcome {
             UnconfirmedCancelOutcome::Confirmed(attempts)
             | UnconfirmedCancelOutcome::NeverAcknowledged(attempts) => attempts,
-            UnconfirmedCancelOutcome::DaemonGone => 0,
+            UnconfirmedCancelOutcome::DaemonGone(attempts) => attempts,
         },
         outcome,
         daemon_pid: None,
@@ -1304,7 +1319,7 @@ pub(crate) async fn settle_unconfirmed_cancel(
                 }
             }
         }
-        UnconfirmedCancelOutcome::DaemonGone => {
+        UnconfirmedCancelOutcome::DaemonGone(_) => {
             // The socket lost its listener during the retries, so the daemon
             // that owned the session is gone -- unless a recorded daemon
             // survived the signal, which keeps the session pending.
@@ -1323,9 +1338,11 @@ pub(crate) async fn settle_unconfirmed_cancel(
         UnconfirmedCancelOutcome::Confirmed(attempts) => {
             format!("cancel confirmed on retry {attempts} of an unconfirmed one")
         }
-        UnconfirmedCancelOutcome::DaemonGone => "the engine socket lost its listener during the \
+        UnconfirmedCancelOutcome::DaemonGone(_) => {
+            "the engine socket lost its listener during the \
              retries, so the daemon that owned the session is gone and the turn with it"
-            .to_string(),
+                .to_string()
+        }
         UnconfirmedCancelOutcome::NeverAcknowledged(_) if settled.daemon_stopped => {
             "the daemon never acknowledged it and was stopped by pid, which ends any turn it \
              was still running"
@@ -3569,14 +3586,38 @@ mod tests {
         let handle = std::thread::spawn(move || {
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         seen.fetch_add(1, Ordering::SeqCst);
                         {
-                            use std::io::Write;
-                            let _ = stream.write_all(
-                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"error\":{\"code\":-32000,\"message\":\"refused\"}}\n",
+                            use std::io::{BufRead, BufReader, Write};
+                            // The request is read BEFORE the refusal is
+                            // written. A reply that races the client's own
+                            // write can arrive while the client is still
+                            // sending, and the id in the reply has to be the
+                            // one the client sent or the refusal is not an
+                            // answer to anything.
+                            let mut writer = stream.try_clone().expect("clone the stream");
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let mut reader = BufReader::new(stream);
+                            let mut line = String::new();
+                            let mut id = "\"init\"".to_string();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => {}
+                                Ok(_) => {
+                                    if let Ok(frame) =
+                                        serde_json::from_str::<serde_json::Value>(line.trim())
+                                    {
+                                        if let Some(requested) = frame.get("id") {
+                                            id = requested.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                            let refusal = format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32000,\"message\":\"refused\"}}}}\n"
                             );
-                            let _ = stream.flush();
+                            let _ = writer.write_all(refusal.as_bytes());
+                            let _ = writer.flush();
                         }
                         // Give the client time to read the refusal before the
                         // socket goes away: a closed connection would look like
@@ -3656,7 +3697,11 @@ mod tests {
     /// this one pins the arithmetic that made the two differ.
     #[test]
     fn a_per_attempt_slice_re_plans_a_shorter_sequence() {
-        let left = Duration::from_millis(2000);
+        // The remainder is derived from the constants rather than written
+        // down, so the property is about the PLAN and not about one number:
+        // a remainder large enough for the whole plan, whose per-attempt slice
+        // is too small to plan the whole plan again.
+        let left = CANCEL_RETRY_BUDGET * CANCEL_RETRY_ATTEMPTS as u32;
         let (planned, _, _) = retry_plan(left);
         assert_eq!(
             planned, CANCEL_RETRY_ATTEMPTS,
@@ -3789,8 +3834,12 @@ mod tests {
         // the sequence that was planned.
         let _ = retry_unconfirmed_cancel_within(&socket, "budget-probe", given).await;
         let elapsed = started.elapsed();
+        // The bound is the budget plus a small scheduling allowance, NOT the
+        // daemon-exit grace: a grace-sized allowance would let the sequence
+        // overrun the budget it was handed by most of its length and still
+        // pass, which is the one thing this test exists to catch.
         assert!(
-            elapsed <= given + DAEMON_EXIT_GRACE,
+            elapsed <= given + SCHEDULING_SLACK,
             "the retry sequence must finish inside the budget it was handed \
              ({given:?}), not run past it: took {elapsed:?}"
         );
@@ -4207,7 +4256,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, UnconfirmedCancelOutcome::DaemonGone);
+        assert_eq!(outcome, UnconfirmedCancelOutcome::DaemonGone(1));
         assert!(
             settled.reason.contains("lost its listener"),
             "the reason must name the vanished engine: {}",
