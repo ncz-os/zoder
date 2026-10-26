@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use zoder_core::{
-    BillingMode, ChatRequest, Config, CostVerdict, Decision, Entry, HealthStore, Ledger, Message,
-    ModelEntry, OpenAiProvider, PolicyGate, PricingCatalog, Session,
+    BillingMode, ChatRequest, Config, Decision, Entry, HealthStore, Ledger, Message, ModelEntry,
+    OpenAiProvider, PolicyGate, PricingCatalog, Session,
 };
 
 use crate::{Engine, ReviewScope};
@@ -1709,14 +1709,18 @@ async fn dispatch_reviewer_for_model(
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-    let (cost, unknown_cost) = match res.telemetry.cost_usd {
-        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
-        _ => match pricing.classify_cost(model, tokens_in, tokens_out, Some(Utc::now())) {
-            CostVerdict::Priced(cost) => (cost, false),
-            CostVerdict::Free => (0.0, false),
-            CostVerdict::Unknown => (0.0, true),
+    let (cost, unknown_cost) = crate::ledger_call_cost(
+        provider_cfg.is_flat_plan(),
+        res.telemetry.cost_usd,
+        &pricing,
+        model,
+        zoder_core::pricing::CallTokens {
+            tokens_in,
+            tokens_out,
+            cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
         },
-    };
+        Some(Utc::now()),
+    );
     // Post-verify the reviewer call was actually served free (catch a free->paid
     // fallback), and independently reject a known-paid/positive-cost outcome
     // without the explicit opt-in. Both failures are reconciled before they are

@@ -110,6 +110,16 @@ def from_litellm(litellm):
             "_explicit_zero": explicit_zero,
             "_priced": True,
         }
+        # The cache-read rate: the price for an input token the provider served
+        # from its prompt cache. Without it a cache-heavy call bills as if every
+        # token missed the cache, which overstates the spend by an order of
+        # magnitude on a 98%-hit workload.
+        try:
+            cache = float(m["cache_read_input_token_cost"]) * PER_TOK_TO_MTOK
+        except (KeyError, TypeError, ValueError):
+            cache = None
+        if cache is not None and cache >= 0:
+            econ[mid]["cache_read_usd_per_mtok"] = cache
     return econ
 
 
@@ -288,10 +298,15 @@ def load_peak_pricing(out_dir):
         return []
 
 
-def _match_peak(mid, windows):
+def _matches(mid, window):
+    """True when the model id contains one of the window's match substrings."""
     low = mid.lower()
+    return any(sub.lower() in low for sub in window.get("match", []))
+
+
+def _match_peak(mid, windows):
     for w in windows:
-        if any(sub.lower() in low for sub in w.get("match", [])):
+        if _matches(mid, w):
             return w
     return None
 
@@ -302,18 +317,59 @@ def build_pricing(econ, generated, peak=None):
     for mid, e in sorted(econ.items()):
         inp = e["input_usd_per_mtok"]
         out = e["output_usd_per_mtok"]
+        cache = e.get("cache_read_usd_per_mtok", 0.0)
         entry = {"input_usd_per_mtok": inp, "output_usd_per_mtok": out}
+        if cache > 0:
+            entry["cache_read_usd_per_mtok"] = cache
         # Off-peak overlay: apply the curated discount to the base rates and record
         # the UTC window so consumers can charge the cheaper rate inside it.
-        w = _match_peak(mid, peak)
-        if w and (inp > 0 or out > 0):
-            start, end = w["window_utc"]
-            entry["off_peak"] = {
-                "input_usd_per_mtok": round(inp * w.get("input_mult", 1.0), 6),
-                "output_usd_per_mtok": round(out * w.get("output_mult", 1.0), 6),
+        off = _match_peak(mid, [w for w in peak if w.get("kind", "off_peak") != "peak"])
+        if off and (inp > 0 or out > 0):
+            start, end = off["window_utc"]
+            block = {
+                "input_usd_per_mtok": round(inp * off.get("input_mult", 1.0), 6),
+                "output_usd_per_mtok": round(out * off.get("output_mult", 1.0), 6),
                 "window_start_utc_min": _hhmm_to_min(start),
                 "window_end_utc_min": _hhmm_to_min(end),
             }
+            # The cache-read rate scales with the input rate: a provider
+            # charges the same fraction of the miss rate for a hit.
+            if cache > 0:
+                block["cache_read_usd_per_mtok"] = round(
+                    cache * off.get("input_mult", 1.0), 6
+                )
+            entry["off_peak"] = block
+        # Peak overlay: a premium during busy hours. The standard rates are the
+        # base scaled by `base_mult`; inside a peak window the premium rates
+        # apply. Every matching peak entry contributes a window, so a provider
+        # with two daily windows gets both.
+        peaks = [w for w in peak if w.get("kind") == "peak" and _matches(mid, w)]
+        if peaks and (inp > 0 or out > 0):
+            base_mult = float(peaks[0].get("base_mult", 1.0))
+            window_mult = float(peaks[0].get("window_mult", 1.0))
+            windows = []
+            for w in peaks:
+                start, end = w["window_utc"]
+                win = {
+                    "window_start_utc_min": _hhmm_to_min(start),
+                    "window_end_utc_min": _hhmm_to_min(end),
+                }
+                if w.get("weekdays_only"):
+                    win["weekdays_only"] = True
+                windows.append(win)
+            block = {
+                "input_usd_per_mtok": round(inp * window_mult, 6),
+                "output_usd_per_mtok": round(out * window_mult, 6),
+                "windows": windows,
+            }
+            if cache > 0:
+                block["cache_read_usd_per_mtok"] = round(cache * window_mult, 6)
+            entry["peak"] = block
+            # The standard rates are the base scaled by the off-peak factor.
+            entry["input_usd_per_mtok"] = round(inp * base_mult, 6)
+            entry["output_usd_per_mtok"] = round(out * base_mult, 6)
+            if cache > 0:
+                entry["cache_read_usd_per_mtok"] = round(cache * base_mult, 6)
         models[mid] = entry
     return {
         "version": 1,

@@ -166,6 +166,7 @@ fn off_peak_active_at_window_boundaries() {
     let op1 = OffPeak {
         input_usd_per_mtok: 0.0,
         output_usd_per_mtok: 0.0,
+        cache_read_usd_per_mtok: 0.0,
         window_start_utc_min: 0,
         window_end_utc_min: 1440,
     };
@@ -177,6 +178,7 @@ fn off_peak_active_at_window_boundaries() {
     let op2 = OffPeak {
         input_usd_per_mtok: 0.0,
         output_usd_per_mtok: 0.0,
+        cache_read_usd_per_mtok: 0.0,
         window_start_utc_min: 60,
         window_end_utc_min: 120,
     };
@@ -188,6 +190,7 @@ fn off_peak_active_at_window_boundaries() {
     let op3 = OffPeak {
         input_usd_per_mtok: 0.0,
         output_usd_per_mtok: 0.0,
+        cache_read_usd_per_mtok: 0.0,
         window_start_utc_min: 1380,
         window_end_utc_min: 60,
     };

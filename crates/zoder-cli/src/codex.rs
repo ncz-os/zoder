@@ -103,10 +103,24 @@ async fn complete_once(
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-    let cost = res
-        .telemetry
-        .cost_usd
-        .unwrap_or_else(|| pricing.cost(&model, tokens_in, tokens_out));
+    let (cost, cost_unknown) = crate::ledger_call_cost(
+        provider_cfg.is_flat_plan(),
+        res.telemetry.cost_usd,
+        &pricing,
+        &model,
+        zoder_core::pricing::CallTokens {
+            tokens_in,
+            tokens_out,
+            cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
+        },
+        None,
+    );
+    if cost_unknown {
+        eprintln!(
+            "[zoder] cost unknown: no valid telemetry or catalog price for {model}; \
+             the row records the tokens and an unknown cost"
+        );
+    }
     // Post-verify the reviewer call was actually served free (catch a free->paid
     // fallback) and record any violation in the ledger rather than marking clean.
     let violation = gate.verify_free(&model_entry, &res.telemetry).err();
@@ -122,6 +136,7 @@ async fn complete_once(
         tokens_in,
         tokens_out,
         cost_usd: cost,
+        cost_unknown,
         calls: 1,
         violation: violation.clone(),
     });

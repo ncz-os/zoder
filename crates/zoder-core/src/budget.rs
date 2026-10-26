@@ -6,7 +6,7 @@
 //! wires it in just after the prompt is read, before the model call.
 
 use crate::ledger::Ledger;
-use crate::pricing::{CostVerdict, PricingCatalog};
+use crate::pricing::{CallTokens, CostVerdict, PricingCatalog};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -126,8 +126,44 @@ impl Budget {
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
+        self.evaluate_call_with_cache(
+            pricing,
+            model,
+            CallTokens {
+                tokens_in,
+                tokens_out,
+                cache_hit_tokens: 0,
+            },
+            ts,
+            month_spent,
+        )
+    }
+
+    /// Evaluate a call whose cache-hit token count is known.
+    ///
+    /// The pre-call gate estimates from the prompt size, before the response
+    /// says how much of it the provider served from its cache, so it prices
+    /// the whole prompt at the miss rate. This variant takes the hit count
+    /// when the caller knows it: the hits bill at the cache-read rate.
+    /// The cache-aware form of [`Budget::evaluate_call`]: the hits are
+    /// billed at the cache-read rate, the misses at the input rate.
+    ///
+    pub fn evaluate_call_with_cache(
+        &self,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    ) -> BudgetVerdict {
         // Step 1: cost verdict. Unknown = could not price = fail closed.
-        let verdict = pricing.classify_cost(model, tokens_in, tokens_out, ts);
+        let verdict = pricing.classify_cost_with_cache(
+            model,
+            tokens.tokens_in,
+            tokens.tokens_out,
+            tokens.cache_hit_tokens,
+            ts,
+        );
         let estimate_usd = match verdict {
             CostVerdict::Priced(v) => v,
             CostVerdict::Free => return BudgetVerdict::WithinBudget,

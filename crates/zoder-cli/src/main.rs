@@ -144,11 +144,53 @@ fn finops_tags(
         task: Some(finops_task(cli).to_string()),
         tier: Some(cli.tier.clone()),
         cache_hit_ratio: cache_hit_ratio(prompt_tokens, cached_prompt_tokens),
+        cache_hit_tokens: cached_prompt_tokens,
     }
 }
 
 /// The resolved provider is authoritative for marginal billing. Catalog model
 /// prices are only relevant when the serving provider is actually metered.
+/// The cost to record for one call, and whether the cost is unknown.
+///
+/// The provider's own telemetry wins when it reports a charge: it is what
+/// the provider actually billed. Otherwise a FLAT PLAN provider records
+/// $0: the plan is paid for monthly, so the marginal cost of one more call
+/// is zero, and charging the catalog's list price would overstate the
+/// spend and trip the month-to-date cap on a plan that is already paid for.
+/// The tokens are recorded either way.
+///
+/// Every other provider is priced from the catalog: the cache hits at the
+/// cache-read rate, the misses at the input rate and the output tokens at
+/// the output rate, with the peak window that was in effect at the time.
+pub(crate) fn ledger_call_cost(
+    flat_plan: bool,
+    telemetry_cost_usd: Option<f64>,
+    pricing: &PricingCatalog,
+    model: &str,
+    tokens: zoder_core::pricing::CallTokens,
+    ts: Option<DateTime<Utc>>,
+) -> (f64, bool) {
+    if let Some(cost) = telemetry_cost_usd {
+        if cost.is_finite() && cost >= 0.0 {
+            return (cost, false);
+        }
+    }
+    if flat_plan {
+        return (0.0, false);
+    }
+    match pricing.classify_cost_with_cache(
+        model,
+        tokens.tokens_in,
+        tokens.tokens_out,
+        tokens.cache_hit_tokens,
+        ts,
+    ) {
+        CostVerdict::Priced(cost) => (cost, false),
+        CostVerdict::Free => (0.0, false),
+        CostVerdict::Unknown => (0.0, true),
+    }
+}
+
 fn is_cost_neutral_provider(provider: &Provider) -> bool {
     !provider.paid && provider.billing != BillingMode::Metered
 }
@@ -6212,14 +6254,20 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // uses the configured off-peak rate, not peak — Finding #23.
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
-    let (cost, unknown_cost) = match res.telemetry.cost_usd {
-        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
-        _ => match pricing.classify_cost(&used_model, tokens_in, tokens_out, Some(ts_utc)) {
-            CostVerdict::Priced(cost) => (cost, false),
-            CostVerdict::Free => (0.0, false),
-            CostVerdict::Unknown => (0.0, true),
+    let (cost, unknown_cost) = ledger_call_cost(
+        eng.cfg
+            .provider(&used_provider_id)
+            .is_some_and(|p| p.is_flat_plan()),
+        res.telemetry.cost_usd,
+        &pricing,
+        &used_model,
+        zoder_core::pricing::CallTokens {
+            tokens_in,
+            tokens_out,
+            cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
         },
-    };
+        Some(ts_utc),
+    );
     let paid_failure = paid_without_opt_in(
         cli.allow_paid,
         eng.cfg
@@ -12550,14 +12598,20 @@ fn reconcile_probe_success(
     let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = Utc::now();
-    let (cost, cost_unknown) = match result.telemetry.cost_usd {
-        Some(cost) if cost.is_finite() && cost >= 0.0 => (cost, false),
-        _ => match pricing.classify_cost(model_id, tokens_in, tokens_out, Some(ts_utc)) {
-            CostVerdict::Priced(cost) => (cost, false),
-            CostVerdict::Free => (0.0, false),
-            CostVerdict::Unknown => (0.0, true),
+    let (cost, cost_unknown) = ledger_call_cost(
+        eng.cfg
+            .provider(provider_id)
+            .is_some_and(|p| p.is_flat_plan()),
+        result.telemetry.cost_usd,
+        &pricing,
+        model_id,
+        zoder_core::pricing::CallTokens {
+            tokens_in,
+            tokens_out,
+            cache_hit_tokens: result.cached_prompt_tokens.unwrap_or(0),
         },
-    };
+        Some(ts_utc),
+    );
     let model_entry = eng.corpus.get(model_id);
     let verify_failure =
         model_entry.and_then(|model| gate.verify_free(model, &result.telemetry).err());
@@ -13866,7 +13920,9 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // ledger at ingestion time — a DeepSeek call recorded at 20:00 UTC
     // is reconciled at its off-peak rate, not peak.
     let entries = ledger.entries_in(Some(since), None)?;
-    let (local_known, local_cost_unknown) = reconciliation_local_cost(&entries, provider, &pricing);
+    let flat_plan = cfg.provider(provider).is_some_and(|p| p.is_flat_plan());
+    let (local_known, local_cost_unknown) =
+        reconciliation_local_cost(&entries, provider, &pricing, flat_plan);
     let local = (!local_cost_unknown).then_some(local_known);
     let delta = local.map(|value| res.billed_usd - value);
 
@@ -13907,6 +13963,7 @@ fn reconciliation_local_cost(
     entries: &[Entry],
     provider: &str,
     pricing: &PricingCatalog,
+    flat_plan: bool,
 ) -> (f64, bool) {
     let mut known = 0.0;
     let mut unknown = false;
@@ -13914,10 +13971,18 @@ fn reconciliation_local_cost(
         .iter()
         .filter(|entry| entry.provider.eq_ignore_ascii_case(provider))
     {
-        match pricing.classify_cost(
+        // A flat plan is paid for monthly: the marginal cost of one more
+        // call is $0, which is what the ledger row records. Re-pricing it
+        // at the catalog's list price here would report a spend the
+        // provider never charged.
+        if flat_plan {
+            continue;
+        }
+        match pricing.classify_cost_with_cache(
             &entry.model,
             entry.tokens_in,
             entry.tokens_out,
+            entry.tags.cache_hit_tokens.unwrap_or(0),
             Some(entry.ts_utc),
         ) {
             CostVerdict::Priced(cost) => known += cost,
@@ -13948,7 +14013,7 @@ mod reconciliation_cost_tests {
             tags: zoder_core::ledger::FinOpsTags::default(),
         };
         let (known, unknown) =
-            reconciliation_local_cost(&[entry], "openai", &PricingCatalog::default());
+            reconciliation_local_cost(&[entry], "openai", &PricingCatalog::default(), false);
         assert_eq!(known, 0.0);
         assert!(unknown, "missing pricing must not become authoritative $0");
     }
@@ -19550,5 +19615,180 @@ mod exec_error_detail_tests {
         let reported = anyhow::Error::new(ReportedTurnError("agentic turn ended: failed".into()));
         assert!(reported.downcast_ref::<ReportedTurnError>().is_some());
         assert!(e.downcast_ref::<ReportedTurnError>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod ledger_call_cost_tests {
+    use super::*;
+    use zoder_core::pricing::{CallTokens, ModelPrice, PricingCatalog};
+
+    /// A catalog with one model priced the way a metered provider bills it:
+    /// a cache read is cheaper than a miss, and the output costs more.
+    fn catalog() -> PricingCatalog {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "priced/model-alpha".to_string(),
+            ModelPrice {
+                usd_per_mtok: 0.0,
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                cache_read_usd_per_mtok: 0.1,
+                ..Default::default()
+            },
+        );
+        cat
+    }
+
+    /// The cache hits bill at the cache-read rate and the misses at the
+    /// input rate, so a cache-heavy call costs a fraction of a cold one.
+    #[test]
+    fn the_cache_hits_bill_at_the_cache_rate() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            false,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 900_000,
+            },
+            None,
+        );
+        assert!(!unknown);
+        // 900k hits at 0.1/M + 100k misses at 1.0/M = 0.19
+        assert!((cost - 0.19).abs() < 1e-9, "cost was {cost}");
+    }
+
+    /// A cold call (no cache hits) bills every input token at the input
+    /// rate: the cache rate must not lower the price of a call that missed.
+    #[test]
+    fn a_call_without_cache_hits_bills_at_the_input_rate() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            false,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert!((cost - 1.0).abs() < 1e-9, "cost was {cost}");
+    }
+
+    /// A flat plan is paid for monthly: the marginal cost of one more call
+    /// is $0, so the row records the tokens and a $0 cost — not the list
+    /// price of the model it happened to serve.
+    #[test]
+    fn a_flat_plan_provider_records_zero_not_the_list_price() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            true,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 1_000_000,
+                cache_hit_tokens: 900_000,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert_eq!(cost, 0.0);
+    }
+
+    /// The provider's own telemetry wins: it is what the provider actually
+    /// billed, and it applies to a flat plan too (an overage past the plan
+    /// is a real charge).
+    #[test]
+    fn the_provider_telemetry_wins_over_the_catalog() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            false,
+            Some(0.25),
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert!((cost - 0.25).abs() < 1e-9, "cost was {cost}");
+    }
+
+    /// A model the catalog does not know is unknown, never $0: an unknown
+    /// cost fails the month-to-date gate closed, while a $0 cost would let
+    /// a paid call through unpriced.
+    #[test]
+    fn an_unpriced_model_is_unknown_not_free() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            false,
+            None,
+            &cat,
+            "unpriced/model-omega",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(unknown);
+        assert_eq!(cost, 0.0);
+    }
+
+    /// A flat plan's cost is known (it is $0), so it does not fail the
+    /// month-to-date gate closed the way an unknown price does.
+    #[test]
+    fn a_flat_plan_cost_is_known() {
+        let cat = catalog();
+        let (_, unknown) = ledger_call_cost(
+            true,
+            None,
+            &cat,
+            "unpriced/model-omega",
+            CallTokens {
+                tokens_in: 1,
+                tokens_out: 1,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+    }
+
+    /// A provider on a flat plan reports `billing = subscription`; a metered
+    /// or free one does not.
+    #[test]
+    fn only_a_subscription_provider_is_a_flat_plan() {
+        let mut p = Provider {
+            id: "p".into(),
+            engine_provider_ref: None,
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: None,
+        };
+        assert!(!p.is_flat_plan());
+        p.billing = BillingMode::Free;
+        assert!(!p.is_flat_plan());
+        p.billing = BillingMode::Subscription;
+        assert!(p.is_flat_plan());
     }
 }
