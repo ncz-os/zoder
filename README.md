@@ -1025,6 +1025,53 @@ until then use the commands above or re-run the installer.)
 > may be free for *you* though they carry a list price — `zoder refresh` against
 > your own endpoint, plus local config, is what marks those routable for you.
 
+### Freshness gates
+
+The daily `corpus-sync` job refreshes the public artifacts from the public
+sources (LiteLLM + OpenRouter for prices, public coding benchmarks for the
+routing overlay). Two **independent** gates decide what may be published, so
+an outage in one source can never freeze the other:
+
+| Check | Threshold | Result |
+|---|---|---|
+| LiteLLM price list fetched | must succeed | **blocked** — prices are not published |
+| OpenRouter price overlay fetched | must succeed | **blocked** — prices are not published |
+| Pricing catalog size vs. the previously committed catalog | not more than 25% fewer models | **blocked** — prices are not published |
+| Every bench source fetched fresh (or had a local last-known-good file) | all sources covered | overlay kept stale — **prices still published** |
+| Candidate overlay size | at least 50 models with an `agentic_score` | overlay kept stale — **prices still published** |
+| Candidate overlay size vs. the committed overlay | not more than 25% fewer scored models | overlay kept stale — **prices still published** |
+
+A blocked run prints `PRICE SOURCE DEGRADED (<source>: <reason>) - not
+publishing prices.` and exits non-zero; a stale overlay prints a warning with
+the overlay's age and the failing sources, and the run still succeeds. The
+committed overlay is kept **byte-for-byte** while it is stale: a transient
+benchmark outage can never erase routing scores.
+
+`--force-publish` overrides every gate (both the price gate and the overlay
+gate) and says so in its output. Use it only for an explicit operator
+acknowledgement.
+
+`corpus/freshness.json` (schema 2) records the run:
+
+| Field | Meaning |
+|---|---|
+| `schema` | `2` |
+| `ts` | run time (UTC) |
+| `sources[]` | one entry per bench source: `name`, `kind`, `outputs`, `ok`, `reason` |
+| `prices.ok` | did both price sources succeed? |
+| `prices.generated` | the pricing catalog's generation date |
+| `prices.litellm` / `prices.openrouter` | `{ok, models\|added, reason}` per source |
+| `prices.catalog_models` / `prices.previous_catalog_models` | the new and previously committed catalog sizes |
+| `overlay.stale` | was the committed overlay kept? |
+| `overlay.built_at` | when the published overlay was built (carried forward while stale) |
+| `overlay.age_days` | age of the published overlay in whole days |
+| `overlay.models_with_score` / `overlay.candidate_models_with_score` | the published and the candidate scored-model counts |
+| `overlay.reason` | why the candidate was not published (empty when fresh) |
+| `overlay_stale` / `overlay_age_days` | the same two facts at the top level, for old readers |
+
+A schema-1 report (no `schema` key) is still accepted and keeps the historic
+single-gate behaviour.
+
 ### Price and name-matching conformance
 
 The exact rules the pipeline applies — how a raw id is split into provider and
