@@ -28,6 +28,12 @@ fn provider(base_url: &str) -> OpenAiProvider {
         azure_api_version: None,
         max_context_tokens: None,
         model_aliases: Vec::new(),
+        overload_backoff_min_s: None,
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
