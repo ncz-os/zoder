@@ -3698,12 +3698,12 @@ impl Config {
                 serves: vec![engine_provider.model.clone()],
                 azure_api_version: None,
                 max_context_tokens: None,
-            overload_backoff_min_s: None,
-            first_token_timeout_s: None,
-            stream: None,
-            rate_limit_group: None,
-            max_concurrent: None,
-            max_requests_per_minute: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             });
         }
         Ok(())
@@ -3781,12 +3781,12 @@ impl Config {
                 serves: Vec::new(),
                 azure_api_version: None,
                 max_context_tokens: None,
-            overload_backoff_min_s: None,
-            first_token_timeout_s: None,
-            stream: None,
-            rate_limit_group: None,
-            max_concurrent: None,
-            max_requests_per_minute: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             }],
             deployment: DeploymentConfig::default(),
             default_provider: "default".into(),
@@ -6867,11 +6867,7 @@ auth = { type = "env", var = "FLEET_KEY" }
         p.max_concurrent = Some(4);
         p.max_requests_per_minute = Some(30);
         p.rate_limit_group = Some("shared-endpoint".into());
-        assert!(
-            ok.validate().is_empty(),
-            "{:?}",
-            ok.validate()
-        );
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
     }
 
     #[test]
@@ -7893,12 +7889,12 @@ billing = "metered"
                 serves: Vec::new(),
                 azure_api_version: Some((*v).to_string()),
                 max_context_tokens: None,
-            overload_backoff_min_s: None,
-            first_token_timeout_s: None,
-            stream: None,
-            rate_limit_group: None,
-            max_concurrent: None,
-            max_requests_per_minute: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             });
         }
         // Set the default_provider so the validate() step doesn't

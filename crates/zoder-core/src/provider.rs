@@ -1480,12 +1480,8 @@ impl OpenAiProvider {
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_S),
             ),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
-            first_token_timeout: p
-                .first_token_timeout_s
-                .map(Duration::from_secs),
-            overload_backoff_min: p
-                .overload_backoff_min_s
-                .map(Duration::from_secs),
+            first_token_timeout: p.first_token_timeout_s.map(Duration::from_secs),
+            overload_backoff_min: p.overload_backoff_min_s.map(Duration::from_secs),
             request_stream: p.stream.unwrap_or(false),
             wait_notice_interval: None,
             azure_api_version,
@@ -2493,9 +2489,7 @@ impl OpenAiProvider {
         // Time-to-first-token budget: when set, a stream that produces no
         // generation delta (answer or reasoning) within this window fails as
         // a retryable timeout instead of riding the whole request budget.
-        let first_token_deadline = self
-            .first_token_timeout
-            .map(|d| Instant::now() + d);
+        let first_token_deadline = self.first_token_timeout.map(|d| Instant::now() + d);
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -2913,9 +2907,7 @@ impl OpenAiProvider {
         // type), which Anthropic never uses in practice for the messages
         // API — every real frame carries an explicit `event:` line.
         let mut current_event: Option<String> = None;
-        let first_token_deadline = self
-            .first_token_timeout
-            .map(|d| Instant::now() + d);
+        let first_token_deadline = self.first_token_timeout.map(|d| Instant::now() + d);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3328,9 +3320,7 @@ impl OpenAiProvider {
         let loop_started = Instant::now();
         let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
         let mut current_event: Option<String> = None;
-        let first_token_deadline = self
-            .first_token_timeout
-            .map(|d| Instant::now() + d);
+        let first_token_deadline = self.first_token_timeout.map(|d| Instant::now() + d);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

@@ -93,14 +93,11 @@ pub fn safe_group(group: &str) -> String {
 }
 
 fn slots_dir(home: &Path, group: &str) -> PathBuf {
-    home.join("state")
-        .join("slots")
-        .join(safe_group(group))
+    home.join("state").join("slots").join(safe_group(group))
 }
 
 fn rate_file(home: &Path, group: &str) -> PathBuf {
-    home
-        .join("state")
+    home.join("state")
         .join("rate")
         .join(format!("{}.json", safe_group(group)))
 }
@@ -267,8 +264,7 @@ pub async fn acquire(
     quiet: bool,
 ) -> anyhow::Result<Acquired> {
     let slot_started = Instant::now();
-    let guard =
-        wait_for_slot(home, group, max_concurrent, queue_timeout, quiet).await?;
+    let guard = wait_for_slot(home, group, max_concurrent, queue_timeout, quiet).await?;
     let slot_waited = slot_started.elapsed();
     let rate_started = Instant::now();
     wait_for_rate_turn(home, group, max_requests_per_minute, queue_timeout, quiet).await?;
@@ -425,9 +421,7 @@ mod tests {
         }
         // While the child holds it, a slot waiter must time out (it sees a
         // held lock owned by ANOTHER process).
-        let err = match wait_for_slot(home, "g", 1, Duration::from_millis(700), true)
-            .await
-        {
+        let err = match wait_for_slot(home, "g", 1, Duration::from_millis(700), true).await {
             Err(e) => e,
             Ok(guard) => {
                 let child_err = std::fs::read_to_string(&dbg_path).unwrap_or_default();
@@ -493,16 +487,9 @@ mod tests {
     #[tokio::test]
     async fn zero_limits_are_noops() {
         let dir = tempfile::tempdir().unwrap();
-        let a = acquire(
-            dir.path(),
-            "g",
-            0,
-            0,
-            Duration::from_secs(1),
-            true,
-        )
-        .await
-        .unwrap();
+        let a = acquire(dir.path(), "g", 0, 0, Duration::from_secs(1), true)
+            .await
+            .unwrap();
         assert!(!a.is_held());
         assert_eq!(a.limit, 0);
         assert_eq!(a.rate_limit, 0);
