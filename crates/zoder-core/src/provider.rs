@@ -510,6 +510,10 @@ pub struct ProviderError {
 /// "length"`. Fields are `None` when the provider published no usage block
 /// (or published an empty one): the caller then records the call with
 /// unknown usage, exactly as for any other failed call.
+///
+/// This type must stay small: `ProviderError` carries it inline, and the
+/// provider's error type is already large enough that clippy's
+/// `result_large_err` threshold sits right at its boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmptyLengthUsage {
     pub prompt_tokens: Option<u64>,

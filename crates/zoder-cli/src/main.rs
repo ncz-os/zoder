@@ -15936,8 +15936,16 @@ mod oneshot_empty_length_tests {
             .await;
         write_oneshot_home(home, &server.uri());
         let cli = Cli::try_parse_from([
-            "zoder", "exec", "--oneshot", "-m", "local/coder",
-            "--max-tokens", "32", "--retries", "0", "--no-stream",
+            "zoder",
+            "exec",
+            "--oneshot",
+            "-m",
+            "local/coder",
+            "--max-tokens",
+            "32",
+            "--retries",
+            "0",
+            "--no-stream",
         ])
         .unwrap();
         let err = cmd_exec_oneshot(&cli, Some("hi".to_string()))
@@ -15968,8 +15976,7 @@ mod oneshot_empty_length_tests {
             1,
             "oneshot exec must not retry a budget exhaustion with a bigger budget"
         );
-        let body: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(
             body.get("max_tokens").and_then(|v| v.as_u64()),
             Some(32),
@@ -15977,8 +15984,7 @@ mod oneshot_empty_length_tests {
         );
         // The failed call was ledgered with the usage the provider
         // published (as unknown cost: no pricing catalog in the test home).
-        let ledger =
-            std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
+        let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
         let row: serde_json::Value = serde_json::from_str(
             ledger
                 .lines()
