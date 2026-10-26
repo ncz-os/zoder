@@ -208,8 +208,9 @@ Optional, off by default. Configured by environment only, so an older binary
 reading the same shared config never meets an unknown key:
 
 ```sh
-# at most 2 concurrent reviewer calls to the provider-a route from this
-# host, 4 to provider-b, unlimited for everything else
+# at most 2 concurrent reviewer calls to the local single-GPU provider-a
+# route from this host, 4 to the rate-limited hosted provider-b, unlimited
+# for everything else
 export ZODER_PROVIDER_CONCURRENCY="provider-a=2,provider-b=4"
 # fail (and let the next reviewer candidate take over) after 15 minutes
 export ZODER_QUEUE_TIMEOUT_S=900
@@ -228,10 +229,10 @@ their reviews all go to the same two reviewer routes.
 
 - Deploy a zoder build that contains the ledger fix first; it removes the
   dominant serialization.
-- `ZODER_PROVIDER_CONCURRENCY="provider-a=2,provider-b=4"`: provider-a
-  serves gemma4-31b from one GPU, so more than two concurrent chunks from one
-  host only lengthens everyone's queue; the hosted provider rate-limits
-  (HTTP 429) under bursts.
+- `ZODER_PROVIDER_CONCURRENCY="provider-a=2,provider-b=4"`: provider-a is
+  the local single-GPU route serving gemma4-31b, so more than two concurrent
+  chunks from one host only lengthens its queue; provider-b is the hosted
+  provider that rate-limits (HTTP 429) under bursts, so cap it at four.
 - `ZODER_QUEUE_TIMEOUT_S=900` (the default).
 - Keep `--request-timeout` at 300 for gemma reviews of large chunks.
 - Pin `request_timeout_s = 600` on the `MiniMax-M3` profile (see "Per-model
