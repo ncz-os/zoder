@@ -644,6 +644,23 @@ struct EngineAgentModel {
     model_provider: Option<String>,
 }
 
+/// The per-call request settings a DIRECT (non-loop) chat request sends,
+/// resolved by [`EngineModelRegistry::request_settings_for`].
+///
+/// Every direct `ChatRequest` builder (oneshot, reviewer, health probe)
+/// reads these two fields from one resolver so their precedence order can
+/// never drift apart. `None` values omit the wire field, leaving the
+/// provider's own default in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectRequestSettings {
+    /// Requested reasoning effort (OpenAI-style `reasoning_effort`), or
+    /// `None` to omit the field.
+    pub reasoning_effort: Option<String>,
+    /// Verbatim `chat_template_kwargs` forwarded to the chat template, or
+    /// `None` to omit the field.
+    pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
 /// Routing-relevant projection of one
 /// `[providers.models.<family>.<alias>]` profile. A provider profile is not a
 /// single model: after its primary fails, Zeroclaw can try same-provider model
@@ -830,6 +847,47 @@ impl EngineModelRegistry {
     /// Whether the engine config contributed any agent model routes.
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
+    }
+
+    /// Resolve the request settings a DIRECT call (oneshot, reviewer, health
+    /// probe) sends for `model`, with ONE precedence order shared by every
+    /// such builder:
+    ///
+    /// 1. the caller's explicit value (the `--reasoning` flag, or an
+    ///    explicit `chat_template_kwargs` the caller already chose)
+    /// 2. the zoder config's per-model entry (`model_cfg`)
+    /// 3. the engine profile of the selected agent
+    /// 4. the engine reviewer profile
+    /// 5. the first engine profile serving the model id
+    ///
+    /// Steps 3-5 are exactly the per-field precedence of
+    /// [`Self::reasoning_effort_for_model`] / [`Self::chat_template_kwargs_for_model`]
+    /// (the selected agent's profile wins over the reviewer alias, which
+    /// wins over the first profile in alias order). The agentic loop builds
+    /// its request from the engine's forwarded `provider_extra` blob and must
+    /// not use this resolver; only direct request builders do.
+    pub fn request_settings_for(
+        &self,
+        model: &str,
+        agent_alias: Option<&str>,
+        cli_reasoning: Option<&str>,
+        model_cfg: Option<&ModelEntry>,
+    ) -> DirectRequestSettings {
+        DirectRequestSettings {
+            reasoning_effort: cli_reasoning
+                .map(str::to_owned)
+                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone()))
+                .or_else(|| {
+                    self.reasoning_effort_for_model(model, agent_alias)
+                        .map(str::to_owned)
+                }),
+            chat_template_kwargs: model_cfg
+                .and_then(|m| m.chat_template_kwargs.clone())
+                .or_else(|| {
+                    self.chat_template_kwargs_for_model(model, agent_alias)
+                        .cloned()
+                }),
+        }
     }
 
     /// Resolve an agent alias to the model the engine is configured to run.
@@ -8584,5 +8642,104 @@ auth = { type = "env", var = "GUARD_KEY" }
         let rc: ReviewConfig = toml::from_str(raw).expect("escalate block must parse");
         assert_eq!(rc.escalate.paths, vec!["src/security/**", "auth/**"]);
         assert!(!rc.escalate.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod direct_request_settings_tests {
+    use super::*;
+
+    const ENGINE: &str = r#"
+[providers.models.custom.m]
+model = "m"
+provider_extra = { reasoning_effort = "none" }
+
+[providers.models.custom.other]
+model = "m"
+chat_template_kwargs = { enable_thinking = false }
+
+[agents.coder]
+model = "coder-model"
+
+[agents.reviewer]
+model_provider = "custom.m"
+"#;
+
+    fn entry(
+        reasoning_effort: Option<&str>,
+        chat_template_kwargs: Option<serde_json::Value>,
+    ) -> ModelEntry {
+        ModelEntry {
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+            chat_template_kwargs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolver_uses_engine_profile_when_nothing_above_is_set() {
+        let registry = EngineModelRegistry::from_toml(ENGINE).unwrap();
+        // The selected agent ("coder") pins no profile, so the resolver
+        // walks reviewer -> first-profile; both hops live in this registry.
+        let s = registry.request_settings_for("m", Some("coder"), None, None);
+        assert_eq!(s.reasoning_effort.as_deref(), Some("none"));
+        // "m" also has a kwargs-only profile (custom.other): the
+        // first-profile fallback supplies it even though the reviewer
+        // profile does not set kwargs.
+        assert_eq!(
+            s.chat_template_kwargs.as_ref(),
+            Some(&serde_json::json!({"enable_thinking": false}))
+        );
+    }
+
+    #[test]
+    fn resolver_prefers_zoder_model_entry_over_engine_profile() {
+        let registry = EngineModelRegistry::from_toml(ENGINE).unwrap();
+        let cfg = entry(
+            Some("high"),
+            Some(serde_json::json!({"force_nonempty_content": true})),
+        );
+        let s = registry.request_settings_for("m", None, None, Some(&cfg));
+        assert_eq!(s.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            s.chat_template_kwargs.as_ref(),
+            Some(&serde_json::json!({"force_nonempty_content": true}))
+        );
+    }
+
+    #[test]
+    fn resolver_prefers_explicit_cli_over_model_entry() {
+        let registry = EngineModelRegistry::from_toml(ENGINE).unwrap();
+        let cfg = entry(Some("high"), None);
+        let s = registry.request_settings_for("m", None, Some("low"), Some(&cfg));
+        assert_eq!(s.reasoning_effort.as_deref(), Some("low"));
+        // No kwargs anywhere above the engine profile -> the engine
+        // profile's value still wins the last hop.
+        assert_eq!(
+            s.chat_template_kwargs.as_ref(),
+            Some(&serde_json::json!({"enable_thinking": false}))
+        );
+    }
+
+    #[test]
+    fn resolver_omits_fields_when_no_setting_applies() {
+        let registry = EngineModelRegistry::from_toml(ENGINE).unwrap();
+        // "m" is only served by profiles that set at least one of the two
+        // fields; a model nobody serves has no settings at all.
+        let s = registry.request_settings_for("unserved", None, None, None);
+        assert!(s.reasoning_effort.is_none());
+        assert!(s.chat_template_kwargs.is_none());
+
+        // A profile that sets neither field contributes nothing.
+        let bare = EngineModelRegistry::from_toml(
+            r#"
+[providers.models.custom.bare]
+model = "bare-model"
+"#,
+        )
+        .unwrap();
+        let s = bare.request_settings_for("bare-model", None, None, None);
+        assert!(s.reasoning_effort.is_none());
+        assert!(s.chat_template_kwargs.is_none());
     }
 }

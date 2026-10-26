@@ -6405,6 +6405,16 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // id rather than the alias key so it works whichever alias resolved
         // here. Absent config keeps the previous behaviour exactly.
         let model_cfg = eng.cfg.model_entry_for(model_id);
+        // Direct-request settings (reasoning_effort, chat_template_kwargs)
+        // resolved by the shared resolver: explicit --reasoning > zoder
+        // model entry > engine profile for the selected agent > engine
+        // reviewer profile > first engine profile serving the model.
+        let direct = eng.engine_models.request_settings_for(
+            model_id,
+            cli.agent.as_deref(),
+            cli.reasoning.as_deref(),
+            model_cfg,
+        );
         // The context levers bound the conversation THIS call carries: the
         // prior session transcript plus the new prompt. They are resolved per
         // model, because the lever profile is per provider.
@@ -6434,14 +6444,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
-            reasoning_effort: cli
-                .reasoning
-                .clone()
-                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone())),
+            reasoning_effort: direct.reasoning_effort,
             top_p: model_cfg.and_then(|m| m.top_p),
             top_k: model_cfg.and_then(|m| m.top_k),
             presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
-            chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
+            chat_template_kwargs: direct.chat_template_kwargs,
             response_format: None,
         };
         // Per-model timer: health latency must reflect THIS model's call, not
@@ -20584,5 +20591,245 @@ mod ledger_call_cost_tests {
         assert!(!p.is_flat_plan());
         p.billing = BillingMode::Subscription;
         assert!(p.is_flat_plan());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `exec --oneshot` request-settings regression tests.
+//
+// The oneshot builder used to stop at the zoder model entry
+// (`[providers.models.*]`) and ignore the ENGINE profile's
+// `provider_extra = { reasoning_effort = ... }` / `chat_template_kwargs`.
+// A reasoning model that rejects the provider's default effort (HTTP 400)
+// was usable through the loop and the reviewer, but `exec --oneshot` sent no
+// `reasoning_effort` at all. The shared resolver
+// (`EngineModelRegistry::request_settings_for`) closed the gap; these tests
+// assert the resolved fields on the wire against a wiremock provider.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod oneshot_request_settings_tests {
+    use super::*;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "m";
+    const UNSERVED: &str = "unserved-model";
+
+    /// Engine `config.toml` with one profile serving `MODEL` and pinning
+    /// `provider_extra = { reasoning_effort = "none" }`, plus a
+    /// kwargs-only second profile for the same model (the first-profile
+    /// fallback hop).
+    fn engine_toml() -> String {
+        r#"
+[providers.models.custom.m]
+model = "m"
+provider_extra = { reasoning_effort = "none" }
+
+[providers.models.custom.kwargs]
+model = "m"
+chat_template_kwargs = { enable_thinking = false }
+"#
+        .to_string()
+    }
+
+    /// Write the minimal `config.json` + corpus for a cost-neutral provider
+    /// that serves the test models. `models_json` is the optional
+    /// `[providers.models.*]` zoder-side model-entry map.
+    fn write_home(home: &std::path::Path, mock_uri: &str, models_json: Option<serde_json::Value>) {
+        let mut body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [MODEL, UNSERVED],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        // `models` is the zoder-side model-entry map (`[providers.models.*]`
+        // in a vendor overlay) keyed by provider alias. A key that does not
+        // collide with an overlay alias is still matched by model id.
+        if let Some(models) = models_json {
+            body["models"] = models;
+        }
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": MODEL, "free": true, "routable": true},
+                {"id": UNSERVED, "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Point the ENGINE config at `home` and run `exec --oneshot` under the
+    /// shared `ZODER_HOME` guard. Returns the wiremock server (for the body
+    /// assertion) plus the oneshot outcome.
+    async fn run_oneshot(
+        extra_cli: &[&str],
+        engine: Option<&str>,
+        home: &std::path::Path,
+        models_json: Option<serde_json::Value>,
+    ) -> (MockServer, anyhow::Result<()>) {
+        let server = MockServer::start().await;
+        let stream_body = r#"data: {"model":"m","choices":[{"delta":{"content":"ok"}}]}
+
+data: [DONE]
+
+"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_body.to_string()))
+            .mount(&server)
+            .await;
+        write_home(home, &server.uri(), models_json);
+        let _guard = crate::test_env::EnvGuard::new(home);
+        let _socket = std::env::var("ZEROCLAW_SOCKET").ok();
+        // No engine daemon socket in the temp home: the oneshot path must
+        // not need one, and a stale host socket must not leak in.
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        // Engine config: a real file in a temp config dir, so the
+        // production `Engine::load` path picks it up without touching
+        // $ZEROCLAW_CONFIG_DIR on the host.
+        let cfg_path = home.join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        if let Some(engine) = engine {
+            std::fs::write(cfg_path.join("config.toml"), engine).unwrap();
+        }
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+
+        let mut argv = vec![
+            "zoder",
+            "--quiet",
+            "exec",
+            "--oneshot",
+            "-m",
+            MODEL,
+            "test task",
+        ];
+        argv.extend_from_slice(extra_cli);
+        let cli = Cli::try_parse_from(argv).expect("oneshot arguments parse");
+        let result = cmd_exec_oneshot(&cli, Some("test task".to_string())).await;
+        (server, result)
+    }
+
+    async fn received_oneshot_body(server: &MockServer) -> serde_json::Value {
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .find(|r| r.method.as_str() == "POST")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).expect("body is JSON"))
+            .expect("oneshot sent a chat request")
+    }
+
+    #[tokio::test]
+    async fn oneshot_sends_engine_profile_reasoning_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none"),
+            "engine profile provider_extra.reasoning_effort must reach the wire: {body}"
+        );
+        // The kwargs-only profile supplies chat_template_kwargs on the
+        // first-profile fallback hop.
+        assert_eq!(
+            body.get("chat_template_kwargs")
+                .and_then(|v| v.get("enable_thinking"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "engine profile chat_template_kwargs must reach the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_cli_reasoning_overrides_engine_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(
+            &["--reasoning", "low"],
+            Some(&engine_toml()),
+            dir.path(),
+            None,
+        )
+        .await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low"),
+            "an explicit --reasoning flag must win over the engine profile: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_sends_no_reasoning_effort_when_no_profile_sets_it() {
+        // An engine config with a profile that sets neither field.
+        let bare_engine = r#"
+[providers.models.custom.bare]
+model = "m"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(&[], Some(bare_engine), dir.path(), None).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert!(
+            body.get("reasoning_effort").is_none_or(|v| v.is_null()),
+            "no profile setting -> no reasoning_effort field: {body}"
+        );
+        assert!(
+            body.get("chat_template_kwargs").is_none_or(|v| v.is_null()),
+            "no profile setting -> no chat_template_kwargs field: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_zoder_model_entry_wins_over_engine_profile() {
+        let models = serde_json::json!({
+            "local.test": {
+                "model": MODEL,
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"force_nonempty_content": true},
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) =
+            run_oneshot(&[], Some(&engine_toml()), dir.path(), Some(models)).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high"),
+            "the zoder model entry must win over the engine profile: {body}"
+        );
+        assert_eq!(
+            body.get("chat_template_kwargs")
+                .and_then(|v| v.get("force_nonempty_content"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "the zoder model entry must win over the engine profile: {body}"
+        );
     }
 }

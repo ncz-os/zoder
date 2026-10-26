@@ -84,6 +84,14 @@ async fn complete_once(
     }
 
     let messages = vec![Message::new("system", system), Message::new("user", user)];
+    // Direct-request settings from the shared resolver — the same precedence
+    // every direct chat builder uses (explicit --reasoning > zoder model
+    // entry > engine profile for the selected agent > engine reviewer profile
+    // > first engine profile serving the model).
+    let model_cfg = eng.cfg.model_entry_for(&model);
+    let direct = eng
+        .engine_models
+        .request_settings_for(&model, cli.agent.as_deref(), cli.reasoning.as_deref(), model_cfg);
     let req = ChatRequest {
         model: model.clone(),
         messages,
@@ -91,7 +99,8 @@ async fn complete_once(
         temperature: 0.1,
         stream: false,
         show_reasoning: false,
-        reasoning_effort: cli.reasoning.clone(),
+        reasoning_effort: direct.reasoning_effort,
+        chat_template_kwargs: direct.chat_template_kwargs,
         response_format: None,
     };
     let provider = OpenAiProvider::new(provider_cfg)?;
