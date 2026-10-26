@@ -172,6 +172,9 @@ fn rate_admit(path: &Path, limit: u32, now_ms: u128) -> std::io::Result<bool> {
     // fds) always see a consistent sliding window.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        // No `.truncate()`: we read the previous ledger first; the rewrite
+        // below (`set_len(0)` + write) handles the shorter-then-longer case.
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
@@ -192,7 +195,8 @@ fn rate_admit(path: &Path, limit: u32, now_ms: u128) -> std::io::Result<bool> {
     file.seek(std::io::SeekFrom::Start(0))?;
     file.write_all(serde_json::to_string(&stamps).unwrap().as_bytes())?;
     file.flush()?;
-    file.unlock()?;
+    // No explicit unlock: dropping `file` at the end of the function releases
+    // the flock (the same pattern the slot files rely on).
     Ok(admit)
 }
 

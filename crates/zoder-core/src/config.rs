@@ -6842,7 +6842,6 @@ auth = { type = "env", var = "FLEET_KEY" }
     }
 
     #[test]
-    #[test]
     fn validate_rejects_bad_client_discipline_keys() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default_provider(dir.path());
@@ -6889,6 +6888,7 @@ auth = { type = "env", var = "FLEET_KEY" }
         assert_eq!(rpm, 0);
     }
 
+    #[test]
     fn validate_rejects_non_finite_budget_and_routing_percentages() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default_provider(dir.path());

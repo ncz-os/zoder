@@ -5067,19 +5067,42 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
     Ok(())
 }
 
-/// One model's worth of work: try it, retrying transient failures with backoff.
-/// Returns `Ok(result)` on success, `Err((err, fatal))` otherwise. `fatal`
-/// means the caller must NOT fall back (output was already partially emitted).
-async fn try_model(
-    provider: &OpenAiProvider,
-    req: &ChatRequest,
+/// One model attempt's parameters: the output mode, retry count, quiet
+/// flag, the cost ledger, and — for the review chain only — the optional
+/// host-wide call budget for the provider's endpoint group
+/// (`rate_limit_group` + (max_concurrent, max_requests_per_minute) from
+/// `Config::provider_call_budget`; `None` = no configured cap = today's
+/// behaviour: no slot, no rate ledger).
+struct ModelCall<'a> {
     json: bool,
     retries: u32,
     quiet: bool,
-    ledger: &Ledger,
-    initial_reservation: &mut Option<BillableReservation>,
+    ledger: &'a Ledger,
+    initial_reservation: &'a mut Option<BillableReservation>,
     call_budget: Option<(String, usize, u32)>,
+}
+
+/// One model's worth of work: try it, retrying transient failures with
+/// backoff. Returns `Ok(result)` on success, `Err((err, fatal))` otherwise.
+/// `fatal` means the caller must NOT fall back (output was already partially
+/// emitted). When a call budget is configured, each attempt first acquires a
+/// host-wide concurrency slot and a sliding-window rate turn for the
+/// provider's endpoint group, so parallel zoder processes on this host
+/// cannot burst a shared free endpoint into 503s or 429s. `None` (no
+/// configured cap) is a no-op.
+async fn try_model_with_budget(
+    provider: &OpenAiProvider,
+    req: &ChatRequest,
+    call: ModelCall<'_>,
 ) -> anyhow::Result<Result<(ChatResult, BillableReservation), (ProviderError, bool)>> {
+    let ModelCall {
+        json,
+        retries,
+        quiet,
+        ledger,
+        initial_reservation,
+        call_budget,
+    } = call;
     let mut attempt = 0u32;
     loop {
         // Host-wide call budget for this provider's endpoint group: wait for
@@ -6513,18 +6536,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             .cfg
             .provider(&pid)
             .map(|pcfg| eng.cfg.provider_call_budget(pcfg));
-        match try_model(
-            provider,
-            &req,
-            cli.json,
-            cli.retries,
-            cli.quiet,
-            &ledger,
-            &mut initial_reservation,
-            link_call_budget,
-        )
-        .await?
-        {
+        let call = ModelCall {
+            json: cli.json,
+            retries: cli.retries,
+            quiet: cli.quiet,
+            ledger: &ledger,
+            initial_reservation: &mut initial_reservation,
+            call_budget: link_call_budget,
+        };
+        match try_model_with_budget(provider, &req, call).await? {
             Ok((res, reservation)) => {
                 if link_gated {
                     crate::provider_health::record_success(&eng.cfg.health_path, &pid, model_id);
@@ -13500,7 +13520,7 @@ async fn run_probe_all(
                 } else {
                     match zoder_core::provider_rate::acquire(
                         &Config::home(),
-                        &group,
+                        group,
                         conc,
                         rpm,
                         zoder_core::provider_rate::queue_timeout_from_env(),
