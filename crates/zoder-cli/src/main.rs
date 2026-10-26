@@ -19844,6 +19844,7 @@ mod ledger_call_cost_tests {
             subscription: None,
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         };
         assert!(!p.is_flat_plan());
         p.billing = BillingMode::Free;
