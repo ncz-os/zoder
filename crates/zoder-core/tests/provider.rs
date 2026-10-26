@@ -18,6 +18,7 @@ fn provider(base_url: &str) -> OpenAiProvider {
         subscription: None,
         serves: Vec::new(),
         azure_api_version: None,
+        max_context_tokens: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -821,6 +822,7 @@ fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         subscription: None,
         serves: Vec::new(),
         azure_api_version: None,
+        max_context_tokens: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -1473,6 +1475,7 @@ fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         subscription: None,
         serves: Vec::new(),
         azure_api_version: None,
+        max_context_tokens: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -1902,6 +1905,7 @@ fn azure_provider(base_url: &str, auth: Auth, azure_api_version: Option<&str>) -
         subscription: None,
         serves: Vec::new(),
         azure_api_version: azure_api_version.map(|s| s.to_string()),
+        max_context_tokens: None,
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -2390,6 +2394,7 @@ async fn drive_live_arm(
         subscription: None,
         serves: Vec::new(),
         azure_api_version: None,
+        max_context_tokens: None,
     };
     let p_local = OpenAiProvider::new(&cfg).unwrap();
     // Belt + braces: model is unused on the wire for the openai-chat

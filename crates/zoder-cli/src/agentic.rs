@@ -262,6 +262,7 @@ mod agentic_utilization_tests {
             }),
             serves: vec!["gpt-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 
@@ -290,6 +291,7 @@ mod agentic_utilization_tests {
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 

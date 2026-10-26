@@ -1444,6 +1444,7 @@ mod test_helpers {
                 subscription: None,
                 serves: vec!["alpha/".into()],
                 azure_api_version: None,
+                max_context_tokens: None,
             });
             cfg.providers.push(Provider {
                 id: "test-beta".into(),
@@ -1456,6 +1457,7 @@ mod test_helpers {
                 subscription: None,
                 serves: vec!["beta/".into()],
                 azure_api_version: None,
+                max_context_tokens: None,
             });
             let corpus = super::tests::fixture_corpus();
             let health = HealthStore::default();

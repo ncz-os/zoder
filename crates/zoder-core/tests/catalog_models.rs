@@ -42,6 +42,7 @@ fn provider() -> Provider {
         subscription: None,
         serves: vec!["minimax/".into()],
         azure_api_version: None,
+        max_context_tokens: None,
     }
 }
 

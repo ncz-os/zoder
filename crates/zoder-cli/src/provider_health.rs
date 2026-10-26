@@ -283,6 +283,7 @@ mod tests {
             subscription: None,
             serves: vec![],
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 

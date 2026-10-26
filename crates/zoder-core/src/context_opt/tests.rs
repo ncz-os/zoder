@@ -898,3 +898,154 @@ fn applying_the_levers_to_a_short_conversation_is_a_no_op() {
     assert_eq!(out.folded, 0);
     assert_eq!(out.bytes_after, out.bytes_before);
 }
+
+// --- deployment profile ----------------------------------------------------
+
+#[test]
+fn the_fleet_profile_numbers_are_the_documented_ones() {
+    // The fleet numbers are the ones the fleet operator tuned; they are
+    // quoted in docs/CONTEXT-OPTIMIZATION.md and in the deployable config
+    // patch, so a drift in either direction is a bug.
+    assert_eq!(Levers::FLEET_DEEPSEEK.tool_output_cap_bytes, 16_384);
+    assert_eq!(Levers::FLEET_DEEPSEEK.elide_after_turns, 8);
+    assert_eq!(Levers::FLEET_DEEPSEEK.elide_min_bytes, 2_048);
+    assert_eq!(Levers::FLEET_DEEPSEEK.compact_after_tokens, 48_000);
+    assert_eq!(Levers::FLEET_DEEPSEEK.keep_recent_turns, 6);
+    assert_eq!(Levers::FLEET_DEEPSEEK.max_context_tokens, 131_072);
+
+    assert_eq!(Levers::FLEET_MINIMAX.tool_output_cap_bytes, 12_288);
+    assert_eq!(Levers::FLEET_MINIMAX.elide_after_turns, 6);
+    assert_eq!(Levers::FLEET_MINIMAX.compact_after_tokens, 32_000);
+    assert_eq!(Levers::FLEET_MINIMAX.max_context_tokens, 204_800);
+
+    assert_eq!(Levers::FLEET_OTHER.compact_after_tokens, 0);
+    assert_eq!(Levers::FLEET_OTHER.max_context_tokens, 0);
+}
+
+#[test]
+fn the_standalone_profile_numbers_are_looser_than_the_fleet_ones() {
+    // A single operator is not paying a fleet-scale token bill, so the
+    // working set is kept much looser: bigger caps, later compaction, and
+    // more of the recent turns kept verbatim.
+    assert_eq!(
+        Levers::STANDALONE_DEEPSEEK.tool_output_cap_bytes,
+        Levers::FLEET_DEEPSEEK.tool_output_cap_bytes * 2
+    );
+    assert_eq!(
+        Levers::STANDALONE_DEEPSEEK.compact_after_tokens,
+        Levers::FLEET_DEEPSEEK.compact_after_tokens * 2
+    );
+    assert_eq!(
+        Levers::STANDALONE_DEEPSEEK.keep_recent_turns,
+        Levers::FLEET_DEEPSEEK.keep_recent_turns + 4
+    );
+    assert_eq!(
+        Levers::STANDALONE_MINIMAX.tool_output_cap_bytes,
+        Levers::FLEET_MINIMAX.tool_output_cap_bytes * 2
+    );
+    assert_eq!(Levers::STANDALONE_OTHER.compact_after_tokens, 0);
+}
+
+#[test]
+fn the_profile_gate_selects_the_levers_on_the_right_numbers() {
+    assert_eq!(
+        Levers::for_model(ContextProfile::Fleet, "deepseek-flash"),
+        Levers::FLEET_DEEPSEEK
+    );
+    assert_eq!(
+        Levers::for_model(ContextProfile::Standalone, "deepseek-flash"),
+        Levers::STANDALONE_DEEPSEEK
+    );
+    // The namespace in front of the model id is ignored.
+    assert_eq!(
+        Levers::for_model(ContextProfile::Fleet, "azure_ai/FW-DeepSeek-V4-Flash"),
+        Levers::FLEET_DEEPSEEK
+    );
+    // An unknown provider family is OTHER under either profile.
+    assert_eq!(
+        Levers::for_model(ContextProfile::Fleet, "qwen38"),
+        Levers::FLEET_OTHER
+    );
+    assert_eq!(
+        Levers::for_model(ContextProfile::Standalone, "qwen38"),
+        Levers::STANDALONE_OTHER
+    );
+}
+
+#[test]
+fn an_unknown_profile_name_is_not_a_guess() {
+    assert_eq!(ContextProfile::named("cluster"), None);
+    assert_eq!(ContextProfile::named("Fleet"), Some(ContextProfile::Fleet));
+    assert_eq!(
+        ContextProfile::named(" standalone "),
+        Some(ContextProfile::Standalone)
+    );
+}
+
+#[test]
+fn the_fleet_profile_turns_the_levers_on_and_standalone_leaves_them_off() {
+    assert!(ContextProfile::Fleet.default_enabled());
+    assert!(!ContextProfile::Standalone.default_enabled());
+}
+
+// --- fitting a prompt to the provider's window ------------------------------
+
+#[test]
+fn a_prompt_that_already_fits_is_left_alone() {
+    let turns = conversation(2, 500);
+    let fit = fit_to_window(&turns, 100_000);
+    assert_eq!(fit.action, WindowAction::AlreadyFits);
+    assert_eq!(fit.turns.len(), turns.len());
+    assert_eq!(
+        fit.tokens,
+        estimate_tokens(turns.iter().map(Turn::bytes).sum())
+    );
+}
+
+#[test]
+fn no_configured_window_means_no_trimming() {
+    // A window of 0 is "no window stated", NOT "a window of zero tokens".
+    let turns = conversation(40, 8_000);
+    let fit = fit_to_window(&turns, 0);
+    assert_eq!(fit.action, WindowAction::AlreadyFits);
+    assert_eq!(fit.turns.len(), turns.len());
+}
+
+#[test]
+fn an_oversized_prompt_is_elided_until_it_fits() {
+    let turns = conversation(40, 8_000);
+    let before = estimate_tokens(turns.iter().map(Turn::bytes).sum());
+    let fit = fit_to_window(&turns, before / 2);
+    assert_eq!(fit.action, WindowAction::Elided);
+    assert!(
+        fit.tokens <= before / 2,
+        "the fit must land under the window"
+    );
+    assert!(
+        fit.turns.iter().any(is_elided),
+        "the tool outputs were replaced by stubs"
+    );
+    // The brief and the system prompt survive: a prompt that lost the task
+    // is not a smaller task.
+    assert!(fit.turns.iter().any(|t| t.role == "user"));
+}
+
+#[test]
+fn a_prompt_that_cannot_fit_even_after_compaction_fails_rather_than_truncating() {
+    // A window smaller than the pinned head and the brief alone.
+    let turns = conversation(40, 8_000);
+    let fit = fit_to_window(&turns, 1);
+    assert_eq!(fit.action, WindowAction::TooLarge);
+}
+
+#[test]
+fn fitting_to_the_window_never_grows_the_prompt() {
+    let turns = conversation(30, 4_000);
+    for window in [1u64, 10, 1_000, 10_000, 100_000] {
+        let fit = fit_to_window(&turns, window);
+        assert!(
+            fit.tokens <= estimate_tokens(turns.iter().map(Turn::bytes).sum()),
+            "window {window} grew the prompt"
+        );
+    }
+}

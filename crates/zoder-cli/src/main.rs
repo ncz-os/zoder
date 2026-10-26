@@ -14999,6 +14999,7 @@ mod probe_skip_class_tests {
             subscription: None,
             serves: serves.iter().map(|s| s.to_string()).collect(),
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 
@@ -15330,6 +15331,7 @@ mod scenario_routing_tests {
             subscription: None,
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         };
         assert_eq!(
             classify_provider(&p, "enterprise/review-model"),
@@ -15346,6 +15348,7 @@ mod scenario_routing_tests {
             subscription: None,
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         };
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Paid);
         let p = Provider {
@@ -15359,6 +15362,7 @@ mod scenario_routing_tests {
             subscription: None,
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         };
         assert_eq!(classify_provider(&p, "MiniMax-M3"), ProviderClass::Free);
     }
@@ -16475,6 +16479,7 @@ mod subscription_utilization_render_tests {
             }),
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         // Both labels must surface so the operator can tell them apart.
@@ -16569,6 +16574,7 @@ mod model_selection_tests {
             subscription: None,
             serves: vec!["minimax/".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "enterprise-gateway".into(),
@@ -16587,6 +16593,7 @@ mod model_selection_tests {
                 "z-ai/".into(),
             ],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
@@ -16663,6 +16670,7 @@ mod model_selection_tests {
             subscription: None,
             serves: vec!["shared-model".into(), "safe-model".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 
@@ -17034,6 +17042,7 @@ model_provider = "custom.minimax"
             subscription: None,
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let engine_models = EngineModelRegistry::from_toml(
             r#"
@@ -17093,6 +17102,7 @@ model_provider = "custom.groq"
             subscription: None,
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let routing = RoutingContext {
             entries: Vec::new(),
@@ -17121,6 +17131,7 @@ model_provider = "custom.groq"
             subscription: None,
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let cli = Cli::try_parse_from(["zoder", "exec", "-m", "openai/gpt-oss-120b"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
@@ -18755,6 +18766,7 @@ model_provider = "custom.minimax"
             subscription: None,
             serves: vec!["free/nemotron".into(), "free/llama".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let mut corpus = fixture_corpus();
         // Pin corpus entries: the head is paid (owned by the metered
@@ -18979,6 +18991,7 @@ model_provider = "custom.minimax"
                 subscription: Some(plan),
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
+                max_context_tokens: None,
             },
             Provider {
                 id: "openai-metered".into(),
@@ -18991,6 +19004,7 @@ model_provider = "custom.minimax"
                 subscription: None,
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
+                max_context_tokens: None,
             },
         ];
         cfg.default_provider = "openai-sub".into();

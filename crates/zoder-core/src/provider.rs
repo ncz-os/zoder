@@ -82,6 +82,7 @@ mod reliability_deadline_tests {
             subscription: None,
             serves: vec![],
             azure_api_version: None,
+            max_context_tokens: None,
         };
         let mut p = OpenAiProvider::new(&config).unwrap();
         p.request_timeout = Duration::from_millis(total_ms);
@@ -658,6 +659,16 @@ pub struct ChatResult {
     /// Prompt tokens served from a provider cache, when usage telemetry
     /// reports them. This is a subset of `prompt_tokens`.
     pub cached_prompt_tokens: Option<u64>,
+    /// Prompt tokens the provider did NOT serve from its cache, when the
+    /// provider publishes the miss count directly. `None` for a provider
+    /// that publishes no cache counter at all, and for one that publishes
+    /// only a hit count (the miss is then derived as `prompt - hit`).
+    ///
+    /// A published miss can be LARGER than `prompt - hit`: a provider that
+    /// re-bills the whole prompt after a cache break reports the full
+    /// prompt as a miss. The reported figure is kept verbatim so the
+    /// discrepancy is visible rather than silently normalised away.
+    pub cache_miss_tokens: Option<u64>,
     pub telemetry: CallTelemetry,
 }
 
@@ -696,6 +707,15 @@ struct Usage {
     /// Anthropic-compatible gateways commonly expose this at the usage root.
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    /// Providers that publish the prompt-cache split at the usage root
+    /// report the hit count here. This is the only place a provider
+    /// states how much of the prompt it served from cache, so it is read
+    /// before the OpenAI-shaped subset below.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    /// The matching miss count, when the provider publishes one.
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -709,13 +729,22 @@ impl Usage {
         self.prompt_tokens.is_some()
             || self.completion_tokens.is_some()
             || self.cached_prompt_tokens().is_some()
+            || self.cache_miss_tokens().is_some()
     }
 
     fn cached_prompt_tokens(&self) -> Option<u64> {
-        self.prompt_tokens_details
-            .as_ref()
-            .and_then(|details| details.cached_tokens)
+        self.prompt_cache_hit_tokens
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
             .or(self.cache_read_input_tokens)
+    }
+
+    /// The published miss count, if the provider publishes one.
+    fn cache_miss_tokens(&self) -> Option<u64> {
+        self.prompt_cache_miss_tokens
     }
 }
 
@@ -2024,13 +2053,20 @@ impl OpenAiProvider {
             let _ = s.write_all(content.as_bytes());
             let _ = s.flush();
         }
-        let (prompt_tokens, completion_tokens, cached_prompt_tokens) = match parsed.usage {
-            Some(u) => {
-                let cached_prompt_tokens = u.cached_prompt_tokens();
-                (u.prompt_tokens, u.completion_tokens, cached_prompt_tokens)
-            }
-            None => (None, None, None),
-        };
+        let (prompt_tokens, completion_tokens, cached_prompt_tokens, cache_miss_tokens) =
+            match parsed.usage {
+                Some(u) => {
+                    let cached_prompt_tokens = u.cached_prompt_tokens();
+                    let cache_miss_tokens = u.cache_miss_tokens();
+                    (
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        cached_prompt_tokens,
+                        cache_miss_tokens,
+                    )
+                }
+                None => (None, None, None, None),
+            };
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
             content,
@@ -2039,6 +2075,7 @@ impl OpenAiProvider {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
+            cache_miss_tokens,
             telemetry,
         })
     }
@@ -2096,6 +2133,7 @@ impl OpenAiProvider {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
+            cache_miss_tokens: None,
             telemetry,
         })
     }
@@ -2162,6 +2200,7 @@ impl OpenAiProvider {
             // cached-prompt telemetry cap stays at `None` for this
             // branch (see the doc comment for rationale).
             cached_prompt_tokens: None,
+            cache_miss_tokens: None,
             telemetry,
         })
     }
@@ -2192,6 +2231,7 @@ impl OpenAiProvider {
         let mut prompt_tokens: Option<u64> = None;
         let mut completion_tokens: Option<u64> = None;
         let mut cached_prompt_tokens: Option<u64> = None;
+        let mut cache_miss_tokens: Option<u64> = None;
         // True once answer bytes have been written to the sink: a retry of this
         // same model would duplicate visible output.
         let mut emitted = false;
@@ -2395,6 +2435,9 @@ impl OpenAiProvider {
                     if let Some(cached) = u.cached_prompt_tokens() {
                         cached_prompt_tokens = Some(cached);
                     }
+                    if let Some(miss) = u.cache_miss_tokens() {
+                        cache_miss_tokens = Some(miss);
+                    }
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     saw_choice = true;
@@ -2517,6 +2560,7 @@ impl OpenAiProvider {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
+            cache_miss_tokens,
             telemetry,
         })
     }
@@ -2875,6 +2919,10 @@ impl OpenAiProvider {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens,
+            // The Anthropic stream publishes `cache_read_input_tokens`, which is
+            // already folded into `cached_prompt_tokens`; it publishes no
+            // miss count of its own.
+            cache_miss_tokens: None,
             telemetry,
         })
     }
@@ -3222,6 +3270,7 @@ impl OpenAiProvider {
             prompt_tokens,
             completion_tokens,
             cached_prompt_tokens: None,
+            cache_miss_tokens: None,
             telemetry,
         })
     }
@@ -3680,6 +3729,7 @@ mod tests {
             subscription: None,
             serves: Vec::new(),
             azure_api_version: azure_api_version.map(|s| s.to_string()),
+            max_context_tokens: None,
         };
         OpenAiProvider::new(&cfg).expect("fixture provider must build")
     }
@@ -4040,6 +4090,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(anthropic.cached_prompt_tokens(), Some(60));
+    }
+
+    /// A provider that publishes the prompt-cache split at the usage root
+    /// is the only shape that reports BOTH sides of the split. Without this
+    /// the per-call telemetry could never say how many tokens were re-billed
+    /// on a cache break, because the hit count alone leaves the miss
+    /// derived.
+    #[test]
+    fn usage_reads_the_published_cache_split() {
+        let split: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            "prompt_cache_hit_tokens": 900,
+            "prompt_cache_miss_tokens": 100
+        }))
+        .unwrap();
+        assert_eq!(split.cached_prompt_tokens(), Some(900));
+        assert_eq!(split.cache_miss_tokens(), Some(100));
+        assert!(split.is_meaningful());
+
+        // A published miss can exceed `prompt - hit`: a provider that
+        // re-bills the whole prompt after a cache break reports the full
+        // prompt as a miss. The figure is kept verbatim so the discrepancy
+        // stays visible instead of being normalised away.
+        let rebilled: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1000,
+            "prompt_cache_hit_tokens": 900,
+            "prompt_cache_miss_tokens": 1000
+        }))
+        .unwrap();
+        assert_eq!(rebilled.cache_miss_tokens(), Some(1000));
+
+        // No cache fields at all: neither side is claimed.
+        let silent: Usage =
+            serde_json::from_value(serde_json::json!({"prompt_tokens": 100})).unwrap();
+        assert_eq!(silent.cached_prompt_tokens(), None);
+        assert_eq!(silent.cache_miss_tokens(), None);
     }
 
     /// Companion unit tests to the wire-level integration tests in
@@ -4413,6 +4500,7 @@ mod tests {
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         }
     }
 

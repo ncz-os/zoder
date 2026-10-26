@@ -289,6 +289,7 @@ mod tests {
             subscription: None,
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         let g = PolicyGate::new(&cfg, false, true);
         let t = CallTelemetry {

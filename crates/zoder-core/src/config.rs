@@ -381,6 +381,19 @@ pub struct Provider {
     /// header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_api_version: Option<String>,
+    /// This provider's context window, in tokens.
+    ///
+    /// The hard ceiling underneath the context levers: the levers bound
+    /// the *working set* (tool-output caps, stale elision, history
+    /// compaction), and this is the window the bounded working set has to
+    /// fit inside. A provider that publishes no window leaves it absent,
+    /// and no prompt is trimmed to fit a window nobody stated.
+    ///
+    /// `Some(0)` is meaningful and different from absent: it says the
+    /// window is known to be zero tokens, so no prompt can be sent. It is
+    /// not a "no limit" spelling — omit the key for that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 impl Provider {
@@ -577,6 +590,18 @@ pub struct ModelEntry {
     /// `request_timeout_s` > `ZODER_TIMEOUT_S` > the built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_s: Option<u64>,
+    /// This model's context window, in tokens.
+    ///
+    /// The per-model override of the provider's
+    /// [`Provider::max_context_tokens`]: a provider can serve several
+    /// models with different windows, and a gateway can front a provider
+    /// whose window is not the one the provider documents. `None` falls
+    /// back to the provider's value.
+    ///
+    /// This is the ceiling the context levers work inside: the levers
+    /// bound the working set, and this says how much room it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Read-only projection of the zeroclaw engine's `config.toml` model routing.
@@ -2140,13 +2165,26 @@ pub struct Config {
 /// The 2026-10-25 DeepSeek export billed 10.6B input tokens against 50.1M
 /// output, and one `zoder loop` spent 32.9M input tokens for 110K output by
 /// resending a full window on every turn. These are the knobs that bound that
-/// resend. They are **opt-in**: with no `[context]` block the loop behaves
-/// exactly as it did before, because silently shortening an agent's history is
-/// a quality change, not a cost optimisation.
+/// resend.
+///
+/// The block is **profile-gated**. Which deployment the defaults are for
+/// decides both whether the levers are on and how tight they are:
+///
+/// * `standalone` (the default) — one operator's own machine. The levers
+///   are OFF unless the operator turns them on, and when they are on their
+///   defaults are conservative: bigger caps, later compaction, more recent
+///   turns kept verbatim. A single operator is not paying a fleet-scale
+///   token bill, and shortening an agent's history is a quality change.
+/// * `fleet` — a shared, metered deployment. The levers are ON by default
+///   with the tuned numbers the fleet operator chose.
+///
+/// An explicit `enabled` overrides the profile in either direction, and an
+/// explicit `[context.profiles.<key>]` entry overrides the numbers.
 ///
 /// ```toml
 /// [context]
-/// enabled = true
+/// profile = "fleet"                     # "standalone" (default) | "fleet"
+/// enabled = true                        # optional; overrides the profile
 /// # Which built-in profile a model gets when no explicit entry matches.
 /// # "deepseek" / "minimax" / "other"; the model id is sniffed when omitted.
 /// # default_profile = "deepseek"
@@ -2157,13 +2195,19 @@ pub struct Config {
 /// elide_min_bytes = 2048
 /// compact_after_tokens = 48000         # 0 disables compaction
 /// keep_recent_turns = 6
+/// max_context_tokens = 131072          # 0 = no window configured
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfig {
-    /// Master switch. `false` (the default) leaves every lever off.
-    #[serde(default)]
-    pub enabled: bool,
+    /// Which deployment the defaults are for. Absent means
+    /// [`crate::context_opt::ContextProfile::Standalone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::context_opt::ContextProfile>,
+    /// Master switch. `None` (the default) lets the deployment profile
+    /// decide; `Some(true)` / `Some(false)` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Per-provider lever profiles, keyed by a lower-case substring of the
     /// model id (`deepseek`, `minimax`) or by `other`. The first key whose
     /// name appears in the model id wins; `other` is the catch-all.
@@ -2177,40 +2221,57 @@ pub struct ContextConfig {
 
 impl ContextConfig {
     fn is_empty(&self) -> bool {
-        !self.enabled && self.profiles.is_empty() && self.default_profile.is_none()
+        self.profile.is_none()
+            && self.enabled.is_none()
+            && self.profiles.is_empty()
+            && self.default_profile.is_none()
     }
 
-    /// Resolve the levers for `model`. Returns `None` when the block is off,
-    /// so a caller cannot apply a half-configured lever set by accident.
+    /// The deployment profile the defaults are gated on.
+    pub fn deployment_profile(&self) -> crate::context_opt::ContextProfile {
+        self.profile
+            .unwrap_or(crate::context_opt::ContextProfile::Standalone)
+    }
+
+    /// Whether the levers apply, given the deployment profile's default and
+    /// an explicit override.
+    pub fn levers_enabled(&self) -> bool {
+        self.enabled
+            .unwrap_or_else(|| self.deployment_profile().default_enabled())
+    }
+
+    /// Resolve the levers for `model`. Returns `None` when the levers are
+    /// off, so a caller cannot apply a half-configured lever set by accident.
     ///
     /// Matching is by lower-case substring on the model id, longest key first,
     /// so `deepseek-v4-flash` matches a `deepseek` profile regardless of the
     /// provider namespace in front of it (`azure_ai/FW-DeepSeek-V4-Flash`).
     pub fn levers_for(&self, model: &str) -> Option<crate::context_opt::Levers> {
-        if !self.enabled {
+        if !self.levers_enabled() {
             return None;
         }
+        let profile = self.deployment_profile();
         let needle = model.to_ascii_lowercase();
         let mut keys: Vec<&String> = self.profiles.keys().collect();
         // Longest key first: a future `deepseek-v4` entry beats `deepseek`.
         keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
         for key in keys {
             if !key.eq_ignore_ascii_case("other") && needle.contains(&key.to_ascii_lowercase()) {
-                return Some(self.profiles[key].to_levers(key));
+                return Some(self.profiles[key].to_levers(profile, key));
             }
         }
-        if let Some(profile) = self.default_profile.as_deref() {
-            if let Some(entry) = self.profiles.get(profile) {
-                return Some(entry.to_levers(profile));
+        if let Some(name) = self.default_profile.as_deref() {
+            if let Some(entry) = self.profiles.get(name) {
+                return Some(entry.to_levers(profile, name));
             }
-            if let Some(base) = crate::context_opt::Levers::named(profile) {
+            if let Some(base) = crate::context_opt::Levers::named(profile, name) {
                 return Some(base);
             }
         }
         if let Some(entry) = self.profiles.get("other") {
-            return Some(entry.to_levers("other"));
+            return Some(entry.to_levers(profile, "other"));
         }
-        Some(crate::context_opt::Levers::for_model(model))
+        Some(crate::context_opt::Levers::for_model(profile, model))
     }
 
     /// Whether a per-call context record should be written even when the
@@ -2224,6 +2285,8 @@ impl ContextConfig {
         self.levers_for(model).is_some()
             || self.default_profile.is_some()
             || !self.profiles.is_empty()
+            || self.profile.is_some()
+            || self.enabled.is_some()
     }
 }
 
@@ -2244,15 +2307,25 @@ pub struct ContextLeverProfile {
     pub compact_after_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_recent_turns: Option<usize>,
+    /// The provider's context window in tokens. `None` falls back to the
+    /// built-in profile's window; `Some(0)` means "no window configured",
+    /// which is different from a window of zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 impl ContextLeverProfile {
     /// Materialise the profile, filling unset fields from the built-in profile
-    /// `name` ([`crate::context_opt::Levers::named`]; anything unknown means
+    /// `name` under the deployment profile
+    /// ([`crate::context_opt::Levers::named`]; anything unknown means
     /// [`crate::context_opt::Levers::OTHER`]).
-    pub fn to_levers(&self, name: &str) -> crate::context_opt::Levers {
-        let base =
-            crate::context_opt::Levers::named(name).unwrap_or(crate::context_opt::Levers::OTHER);
+    pub fn to_levers(
+        &self,
+        deployment: crate::context_opt::ContextProfile,
+        name: &str,
+    ) -> crate::context_opt::Levers {
+        let base = crate::context_opt::Levers::named(deployment, name)
+            .unwrap_or(crate::context_opt::Levers::OTHER);
         crate::context_opt::Levers {
             tool_output_cap_bytes: self
                 .tool_output_cap_bytes
@@ -2263,6 +2336,7 @@ impl ContextLeverProfile {
                 .compact_after_tokens
                 .unwrap_or(base.compact_after_tokens),
             keep_recent_turns: self.keep_recent_turns.unwrap_or(base.keep_recent_turns),
+            max_context_tokens: self.max_context_tokens.unwrap_or(base.max_context_tokens),
         }
     }
 }
@@ -3159,6 +3233,7 @@ impl Config {
                 subscription: None,
                 serves: vec![engine_provider.model.clone()],
                 azure_api_version: None,
+                max_context_tokens: None,
             });
         }
         Ok(())
@@ -3233,6 +3308,7 @@ impl Config {
                 subscription: None,
                 serves: Vec::new(),
                 azure_api_version: None,
+                max_context_tokens: None,
             }],
             default_provider: "default".into(),
             corpus_path: home.join("model_corpus.json"),
@@ -3472,6 +3548,26 @@ impl Config {
         self.models
             .values()
             .find(|entry| entry.model.as_deref() == Some(model))
+    }
+
+    /// The effective context window, in tokens, for a model served by a
+    /// provider.
+    ///
+    /// Precedence: the per-model entry's `max_context_tokens` first (a
+    /// provider can serve several models with different windows), then the
+    /// provider's. `None` means "no window stated", which is NOT the same
+    /// as a window of zero: the caller must not trim a prompt to fit a
+    /// window nobody published.
+    pub fn max_context_tokens_for(&self, provider_id: &str, model: &str) -> Option<u64> {
+        let per_model = self
+            .models
+            .values()
+            .filter(|entry| entry.model.as_deref() == Some(model))
+            .find_map(|entry| entry.max_context_tokens);
+        per_model.or_else(|| {
+            self.provider(provider_id)
+                .and_then(|p| p.max_context_tokens)
+        })
     }
 
     /// Per-model request budget from zoder's own `models` map (a
@@ -5114,6 +5210,7 @@ model_provider = "custom.primary"
             subscription: None,
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "enterprise-gateway".into(),
@@ -5126,6 +5223,7 @@ model_provider = "custom.primary"
             subscription: None,
             serves: vec!["enterprise/".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         // Prefix match wins, in config order.
         assert_eq!(cfg.provider_for_model("MiniMax-M3").unwrap().id, "minimax");
@@ -5185,6 +5283,7 @@ model_provider = "custom.primary"
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-met".into(),
@@ -5202,6 +5301,7 @@ model_provider = "custom.primary"
             subscription: None,
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         // Empty catalog: explicit `windows` on the subscription resolve
         // directly, no preset lookup needed. (Passing an empty catalog is
@@ -6087,6 +6187,7 @@ auth = { type = "env", var = "ACME_KEY" }
             }),
             serves: vec!["gpt-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-sub".into(),
@@ -6104,6 +6205,7 @@ auth = { type = "env", var = "ACME_KEY" }
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.default_provider = "openai-codex".into();
         let errs = cfg.validate();
@@ -6227,6 +6329,7 @@ auth = { type = "env", var = "ACME_KEY" }
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-team".into(),
@@ -6244,6 +6347,7 @@ auth = { type = "env", var = "ACME_KEY" }
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.default_provider = "minimax-personal".into();
 
@@ -6323,6 +6427,7 @@ auth = { type = "env", var = "ACME_KEY" }
             subscription: Some(shared_plan.clone()),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.providers.push(Provider {
             id: "minimax-x".into(), // intentional duplicate to also trip dup-id
@@ -6335,6 +6440,7 @@ auth = { type = "env", var = "ACME_KEY" }
             subscription: Some(shared_plan),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.default_provider = "minimax-x".into();
 
@@ -6387,6 +6493,7 @@ auth = { type = "env", var = "ACME_KEY" }
             }),
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.default_provider = "minimax-legacy".into();
 
@@ -6686,6 +6793,7 @@ azure_api_version = "2024-10-21"
             subscription: None,
             serves: Vec::new(),
             azure_api_version: Some("2024-10-21".into()),
+            max_context_tokens: None,
         })
         .expect("serialize");
         assert!(
@@ -6722,6 +6830,7 @@ azure_api_version = "2024-10-21"
             subscription: None,
             serves: Vec::new(),
             azure_api_version: None,
+            max_context_tokens: None,
         });
         cfg.default_provider = "azure-legacy".into();
 
@@ -6795,6 +6904,7 @@ billing = "metered"
                 subscription: None,
                 serves: Vec::new(),
                 azure_api_version: Some((*v).to_string()),
+                max_context_tokens: None,
             });
         }
         // Set the default_provider so the validate() step doesn't
