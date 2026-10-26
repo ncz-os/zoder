@@ -215,11 +215,17 @@ pub fn render_first_message(prefix: &Prefix, volatile: &Volatile, body: &str) ->
 ///
 /// Only values long enough to be distinctive are searched. A bare iteration
 /// number (`"3"`) occurs in any prompt by chance, and flagging it would make the
-/// check useless; the markers also contain a literal `v1`. Values under
-/// [`MIN_DISTINCTIVE_LEN`] bytes are skipped rather than reported as leaks.
+/// check useless; the markers also contain a literal `v1`. Every value is
+/// therefore floored at [`MIN_DISTINCTIVE_LEN`]: a shorter one (in practice only
+/// the single-character iteration number, which is still matched as a whole
+/// token) is searched with the token rule instead of as a bare substring.
 pub fn volatile_offsets(text: &str, volatile: &Volatile) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     for (value, is_number) in volatile.checkable_values() {
+        // The floor is `1`, so `is_number` (the token rule) is the only thing it
+        // can change: a numeric value shorter than the floor would be searched
+        // as a plain token rather than as a lone character.
+        let is_number = is_number || value.len() < MIN_DISTINCTIVE_LEN;
         let pos = if is_number {
             // A bare number is only evidence as a whole token: no adjacent
             // digit AND not preceded by a letter. Otherwise "1" matches the
@@ -237,8 +243,8 @@ pub fn volatile_offsets(text: &str, volatile: &Volatile) -> Vec<(String, usize)>
     out
 }
 
-/// First offset at which `needle` appears with no ASCII digit immediately
-/// before or after it.
+/// First offset at which `needle` appears as a whole numeric token: no ASCII
+/// alphanumeric immediately before it, none immediately after it.
 fn find_token(text: &str, needle: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut from = 0;
@@ -255,7 +261,14 @@ fn find_token(text: &str, needle: &str) -> Option<usize> {
         if before_ok && after_ok {
             return Some(at);
         }
-        from = at + 1;
+        // Advance one CHARACTER, not one byte: `at` is a byte offset and the
+        // byte after the rejected match may be the lead byte of a multi-byte
+        // character, in which case `text[from..]` would panic. The case that
+        // gets here is a rejected numeric match followed by non-ASCII text,
+        // e.g. iteration `1` in `"1日"` — `1` is rejected (a digit followed by a
+        // letter is part of an identifier once the after-check is strict), and
+        // the next search must start at byte 1, which is inside `日`.
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
         if from >= text.len() {
             break;
         }
