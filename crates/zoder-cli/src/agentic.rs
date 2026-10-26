@@ -14618,8 +14618,8 @@ model_provider = "custom.nemotron35"
     /// chunks structured, from the requested reviewer) returns a structured
     /// verdict. The loop record must call this review COMPLETE: one
     /// `reviewer_verdicts` entry per reviewer with `complete: true` — the
-    /// evidence the iteration-level `review_complete` predicate and Hive loop
-    /// triage key on.
+    /// evidence the iteration-level `review_complete` predicate and the
+    /// fleet's loop triage key on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_review_complete_when_every_chunk_is_structured() {
         let home_dir = tempfile::tempdir().unwrap();
@@ -15239,7 +15239,7 @@ model_provider = "custom.nemotron35"
     /// The fingerprint a REAL reviewer reply produces (parsed from a
     /// structured JSON verdict) must equal the fingerprint of the same defect
     /// re-raised in the next round after a line shift — the end-to-end
-    /// contract Hive loop triage relies on.
+    /// contract the fleet's loop triage relies on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loop_review_finding_fingerprint_is_stable_end_to_end() {
         let home_dir = tempfile::tempdir().unwrap();

@@ -1,9 +1,9 @@
 //! Reap the processes an agentic `loop`/`rescue` leaked into the workspace.
 //!
-//! 2026-10-21 (fleet host, hive job `01a1601b`): a `zoder loop` driven through the
+//! 2026-10-21 (a fleet host, a fleet job): a `zoder loop` driven through the
 //! zeroclaw ACP agent had the agent start 368 `yes` load generators in the
 //! background. They ran for ~2 h at load average 376 and survived BOTH the end
-//! of the loop and the Hive worker's 7200 s timeout, because the worker only
+//! of the loop and the job runner's 7200 s timeout, because the worker only
 //! kills zoder's own process group (`os.killpg`) and those processes belong to
 //! the zeroclaw daemon's tool shells — a different tree entirely.
 //!
@@ -38,8 +38,8 @@
 //!
 //! Every rule above describes the AGENT's processes, but the zeroclaw daemon
 //! is not the agent's: it is one daemon per host that every zoder on the box
-//! drives through `<data dir>/daemon.sock`. 2026-10-21 (another fleet host): job
-//! `01a16164`'s `zoder loop` spawned the daemon with no `current_dir` set, so
+//! drives through `<data dir>/daemon.sock`. 2026-10-21 (another fleet host): a
+//! `zoder loop` spawned the daemon with no `current_dir` set, so
 //! the daemon inherited the JOB's workspace as its cwd. The daemon matched
 //! every rule in the list — same uid, cwd inside `-C`, started after the loop
 //! began, not an ancestor — so this reaper SIGTERM'd it, killing the agent of
@@ -70,7 +70,7 @@
 //! the shared daemon".
 //!
 //! The daemon's TOOL SHELLS are not exempt. They are what the agent starts —
-//! the `yes` generators of the 01a1601b incident — they are not the daemon
+//! the `yes` generators of that incident — they are not the daemon
 //! binary, and they still match every ownership rule, so they are still
 //! reaped. (A child that re-execs the daemon binary is, by definition, the
 //! daemon, and is spared with it.) And processes the daemon runs for OTHER
@@ -93,7 +93,7 @@
 //!
 //! ## An unreachable engine is not a busy agent
 //!
-//! 2026-10-22 (fleet host, hive job `01a163c9`): at the end of a `zoder loop` every
+//! 2026-10-22 (a fleet host, a fleet job): at the end of a `zoder loop` every
 //! `session/cancel` failed with `connecting to engine at
 //! ~/.zoder/data/daemon.sock: No such file or directory (os error 2)`, the same
 //! "cancel not confirmed" line repeated for one session across the cancel
@@ -387,7 +387,7 @@ static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// whose cancel failed with ENOENT/ECONNREFUSED rather than going unconfirmed.
 ///
 /// Membership is what makes the teardown converge. Retrying such a session is
-/// not "being thorough", it is re-asking a socket that is not there: the 01a163c9
+/// not "being thorough", it is re-asking a socket that is not there: that
 /// run burned eight cancel passes and four teardown rounds proving the engine
 /// was gone, and then reported the agent as still working. The set is also what
 /// keeps the operator's log to one line per session instead of one per attempt.
@@ -814,7 +814,7 @@ impl Drop for ReapGuard {
 /// either way.
 ///
 /// `socket` is passed in rather than resolved from the environment so a test
-/// can point this at a path that does not exist, which is the 01a163c9 case.
+/// can point this at a path that does not exist, which is that case.
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
     // The budget covers the WHOLE phase, not each session: a loop that drove
     // nine sessions must not spend nine budgets before the first kill.
@@ -926,7 +926,7 @@ fn mark_cancelled(id: &str) {
 ///
 /// Returns the sessions this call found the engine unreachable for, so the
 /// teardown can report "the engine was gone" from data instead of from the log.
-/// A missing socket is no longer a silent `continue`: it is the 01a163c9
+/// A missing socket is no longer a silent `continue`: it is the
 /// condition, and the operator needs to see it stated once rather than inferred
 /// from an absence. A session that was already retired is not even attempted,
 /// so this list holds each id at most once per process.
@@ -1065,7 +1065,7 @@ impl ReapOutcome {
 /// same thing instead of the tests scraping stderr.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TeardownReport {
-    /// How many cancel/reap rounds actually ran. The 01a163c9 bug cost four of
+    /// How many cancel/reap rounds actually ran. That bug cost four of
     /// them proving an absent socket was absent.
     rounds: usize,
     /// Sessions whose cancel could not be delivered because the engine socket
@@ -1089,7 +1089,7 @@ struct TeardownReport {
 /// teardown.
 ///
 /// `socket` is a parameter for the same reason [`cancel_sessions_blocking`]'s
-/// is: the absent-socket path (01a163c9) is only reachable by pointing a test
+/// is: the absent-socket path is only reachable by pointing a test
 /// at a path that does not exist, and a test must not mutate `ZEROCLAW_SOCKET`
 /// to arrange that.
 fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownReport {
@@ -1106,7 +1106,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // snapshot taken before it: a cancel this round delivered and a session
         // the engine minted during the reap both have to count, or the loop
         // either runs a pointless round or exits without seeing a new session.
-        // An unreachable session is retired from the CANCEL (01a163c9 kept
+        // An unreachable session is retired from the CANCEL (it kept
         // re-sending a cancel no socket could carry), but it is not proof the
         // session stopped: its daemon may still run on a socket inode nothing
         // can name. So it also blocks early convergence, and the loop keeps
@@ -1118,7 +1118,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // The warning is about WORK, so it is gated on work: the final round's
         // reap pass having found and signalled something new. Running out of
         // rounds while the cancel was talking to a dead socket is not evidence
-        // of anything, and saying so was the second half of the 01a163c9
+        // of anything, and saying so was the second half of that
         // mis-report.
         if round + 1 == MAX_TEARDOWN_ROUNDS {
             report.producing_work = outcome.signalled_new_work();
@@ -1398,7 +1398,7 @@ fn current_uid() -> u32 {
 
 /// SIGTERM/SIGINT while a loop is running: cancel the session, reap, exit.
 /// Without this the signal kills zoder outright — no cancel, no reap, and the
-/// agent's children are reparented to init (ppid 1) exactly as in the 01a1601b
+/// agent's children are reparented to init (ppid 1) exactly as in that
 /// incident.
 fn install_signal_handler(plan: ReapPlan) {
     use std::sync::Arc;
@@ -1835,7 +1835,7 @@ fn libc_sigkill() -> i32 {
 #[cfg(not(target_os = "linux"))]
 fn signal(_pid: u32, _sig: i32) {}
 // ---------------------------------------------------------------------------
-// Regression tests: the 2026-10-21 shared-host orphan incident (hive job 01a1601b).
+// Regression tests: the 2026-10-21 shared-host orphan incident.
 // All Linux-only: they read /proc and spawn real processes.
 // ---------------------------------------------------------------------------
 
@@ -2781,7 +2781,7 @@ mod tests {
             .remove("blocking-probe");
     }
 
-    /// A socket path under a tempdir that was never created. The 01a163c9
+    /// A socket path under a tempdir that was never created. The
     /// failure had no listener AND no entry, so both "no engine" branches of
     /// the classifier have to be exercised; this is the ENOENT one.
     fn absent_socket(dir: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -2875,7 +2875,7 @@ mod tests {
         forget_session(id);
     }
 
-    /// 2026-10-22 (fleet host, hive job `01a163c9`): the engine socket path no
+    /// 2026-10-22 (a fleet host, a fleet job): the engine socket path no
     /// longer existed, yet the teardown ran all four rounds, repeated the same
     /// "cancel not confirmed" line for one session, and then reported the agent
     /// as still producing work. The cancel is not retried (one unreachable
@@ -2931,7 +2931,7 @@ mod tests {
 
     /// The unreachable verdict is a fact about the run, not about the attempt:
     /// one line per session however many rounds, passes or paths ask. (The
-    /// 01a163c9 log carried the same session line once per round.)
+    /// that run carried the same session line once per round.)
     #[test]
     fn an_unreachable_session_is_said_once_no_matter_how_often_it_is_asked() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3194,7 +3194,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The shared zeroclaw daemon (2026-10-21, fleet hive job 01a16164).
+    // The shared zeroclaw daemon (2026-10-21, a fleet job).
     // -----------------------------------------------------------------------
 
     /// The incident, at the reap scope. A `zeroclaw` daemon sits inside `-C`,
@@ -3306,8 +3306,8 @@ mod tests {
     }
 
     /// The cross-process arm: zoder records the daemon's identity next to the
-    /// socket, so a reap scope in a DIFFERENT zoder process (job 01a1619b's
-    /// loop, while 01a16164's daemon is serving it) can spare it too. Only
+    /// socket, so a reap scope in a DIFFERENT zoder process (another job's
+    /// loop, while that job's daemon is serving it) can spare it too. Only
     /// the record is involved here — the fixture's executable is `sleep`.
     #[test]
     fn the_daemon_recorded_for_the_socket_is_spared_in_another_zoder_process() {
@@ -3440,7 +3440,7 @@ mod tests {
     }
 
     /// The daemon's CHILDREN are not exempt. They are the tool shells the
-    /// agent starts — the 368 `yes` generators of the 01a1601b incident — so a
+    /// agent starts — the 368 `yes` generators of that incident — so a
     /// blanket "skip the daemon's subtree" exemption would undo the reaper
     /// while fixing this.
     #[test]

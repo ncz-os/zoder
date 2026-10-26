@@ -2306,7 +2306,7 @@ mod corpus_io_tests {
 
     const OVERLAY: &str = r#"{
         "generated_at": "2026-10-17T00:00:00Z",
-        "source": {"generator": "fleetops"},
+        "source": {"generator": "fleet-config"},
         "models": [
             {
                 "id": "gpt-6-sol",
