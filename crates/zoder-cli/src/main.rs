@@ -20795,13 +20795,11 @@ model = "m"
         result.expect("oneshot call succeeds");
         let body = received_oneshot_body(&server).await;
         assert!(
-            !body.get("reasoning_effort").is_some_and(|v| !v.is_null()),
+            body.get("reasoning_effort").is_none_or(|v| v.is_null()),
             "no profile setting -> no reasoning_effort field: {body}"
         );
         assert!(
-            !body
-                .get("chat_template_kwargs")
-                .is_some_and(|v| !v.is_null()),
+            body.get("chat_template_kwargs").is_none_or(|v| v.is_null()),
             "no profile setting -> no chat_template_kwargs field: {body}"
         );
     }
