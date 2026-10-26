@@ -1,4 +1,5 @@
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{body_partial_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zoder_core::{
@@ -2553,5 +2554,317 @@ async fn y8_live_classification_500_still_trips_breaker() {
         h.breaker_open("broken/model"),
         "Y-8: a 500 path's consecutive_failures MUST still trip the breaker \
          (we're not silently demoting Errors to Capacity); got breaker_open=false"
+    );
+}
+
+// =====================================================================
+// Provider client discipline (shared, rate-limited free endpoint).
+//
+// These pin the per-provider keys that make a burst of zoder processes
+// behave like one well-mannered client of a scarce free endpoint:
+// overload backoff floor, HTTP-date Retry-After, host-wide
+// concurrency/rate caps, first-token timeout, and per-provider streaming.
+// =====================================================================
+
+fn provider_discipline(
+    base_url: &str,
+    overload_backoff_min_s: Option<u64>,
+    first_token_timeout_s: Option<u64>,
+    stream: Option<bool>,
+    rate_limit_group: Option<String>,
+    max_concurrent: Option<u32>,
+    max_requests_per_minute: Option<u32>,
+) -> OpenAiProvider {
+    let cfg = Provider {
+        id: "disc".into(),
+        engine_provider_ref: None,
+        base_url: base_url.to_string(),
+        kind: "openai-chat".into(),
+        auth: Auth::None,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+        azure_api_version: None,
+        max_context_tokens: None,
+        overload_backoff_min_s,
+        first_token_timeout_s,
+        stream,
+        rate_limit_group,
+        max_concurrent,
+        max_requests_per_minute,
+        model_aliases: Vec::new(),
+    };
+    OpenAiProvider::new(&cfg).unwrap()
+}
+
+#[test]
+fn overload_backoff_floor_applies_to_503_and_529_not_429() {
+    use zoder_core::retry_after_value;
+    // 503/529 (overload) with a 5 s floor: every attempt's delay is >= 5 s
+    // even though the exponential base starts at 500 ms.
+    for attempt in 0..6u32 {
+        let d = zoder_core::backoff_delay(attempt, None, Some(Duration::from_secs(5)));
+        assert!(d >= Duration::from_secs(5), "attempt {attempt}: {d:?}");
+    }
+    // Retry-After still wins over the floor.
+    let d = zoder_core::backoff_delay(0, Some(Duration::from_secs(10)), Some(Duration::from_secs(5)));
+    assert!(d >= Duration::from_secs(10));
+    // Without the floor (standalone default), attempt 0 stays sub-second.
+    let d0 = zoder_core::backoff_delay(0, None, None);
+    assert!(d0 < Duration::from_secs(1));
+    // Sanity on the shared Retry-After parser: numeric + capped.
+    assert_eq!(retry_after_value("2"), Some(Duration::from_secs(2)));
+    assert_eq!(retry_after_value("999"), Some(Duration::from_secs(60)));
+}
+
+#[test]
+fn http_date_retry_after_is_parsed_and_capped() {
+    use chrono::Utc;
+    use zoder_core::retry_after_value;
+    // HTTP-date form: 10 s in the future.
+    let future = (Utc::now() + chrono::Duration::seconds(10)).to_rfc2822();
+    let d = retry_after_value(&future).expect("HTTP-date Retry-After must parse");
+    assert!(
+        (7..=11).contains(&d.as_secs()),
+        "expected ~10s, got {d:?}"
+    );
+    // A far-future HTTP-date is capped at 60 s.
+    let far = (Utc::now() + chrono::Duration::hours(2)).to_rfc2822();
+    assert_eq!(retry_after_value(&far), Some(Duration::from_secs(60)));
+    // A past HTTP-date means "wait 0" (still honored, not ignored).
+    let past = (Utc::now() - chrono::Duration::seconds(30)).to_rfc2822();
+    assert_eq!(retry_after_value(&past), Some(Duration::from_secs(0)));
+    // Garbage is rejected (the legacy numeric path stays).
+    assert_eq!(retry_after_value("soon"), None);
+    assert_eq!(retry_after_value(""), None);
+}
+
+#[tokio::test]
+async fn http_date_retry_after_survives_the_wire() {
+    use chrono::Utc;
+    let server = MockServer::start().await;
+    let future = (Utc::now() + chrono::Duration::seconds(10)).to_rfc2822();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", &future))
+        .mount(&server)
+        .await;
+    let err = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::RateLimit);
+    let ra = err.retry_after.expect("HTTP-date Retry-After must be honored");
+    assert!((7..=11).contains(&ra.as_secs()), "got {ra:?}");
+}
+
+#[tokio::test]
+async fn overload_503_529_flag_drives_the_backoff_floor_in_the_retry_loop() {
+    // A 529 marks the error `overload`, so the retry loop can apply the
+    // provider's floor to it (same as a 503).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(529))
+        .mount(&server)
+        .await;
+    let err = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrKind::Server);
+    assert!(err.overload, "529 must be marked overload");
+    assert!(err.retryable());
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server2)
+        .await;
+    let err2 = provider(&server2.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert!(err2.overload, "503 must be marked overload");
+
+    // A 429 is a rate limit, not an overload: the floor must not apply to it.
+    let server3 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server3)
+        .await;
+    let err3 = provider(&server3.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert!(!err3.overload, "429 is not an overload");
+
+}
+
+#[tokio::test]
+async fn anthropic_overloaded_error_frame_is_retryable_overload() {
+    // The Anthropic wire surfaces a 529-equivalent as a mid-stream error
+    // frame inside a 200. It must carry `overload: true` and be retryable,
+    // exactly like the header-borne 503/529 (pre-fix it was ErrKind::Http
+    // and not retryable).
+    let server = MockServer::start().await;
+    let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let cfg = Provider {
+        id: "disc-anthropic".into(),
+        engine_provider_ref: None,
+        base_url: server.uri(),
+        kind: "anthropic".into(),
+        auth: Auth::None,
+        paid: false,
+        billing: BillingMode::Metered,
+        subscription: None,
+        serves: Vec::new(),
+        azure_api_version: None,
+        max_context_tokens: None,
+        overload_backoff_min_s: Some(5),
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
+        model_aliases: Vec::new(),
+    };
+    let p = OpenAiProvider::new(&cfg).unwrap();
+    let err = p
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert!(err.overload, "overloaded_error frame must be marked overload");
+    assert!(
+        err.retryable(),
+        "an overloaded_error frame is transient: it must be retryable"
+    );
+}
+
+#[tokio::test]
+async fn first_token_timeout_fires_on_hanging_stream_not_on_streaming_token() {
+    use zoder_core::ErrKind::Timeout;
+    // A raw TCP server that sends headers, then nothing: the first-token
+    // budget must abort the call as a retryable timeout. (wiremock sends
+    // headers+body together, so it cannot model a hung body.)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Consume the request until the blank header line.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+        let _ = socket.write_all(header.as_bytes()).await;
+        // Headers sent, then nothing: hold the connection open.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let p = provider_discipline(&uri, None, Some(1), None, None, None, None);
+    // Shrink the overall request budget so the test is fast if the budget
+    // regresses to being the only bound.
+    let p = p.with_request_timeout_s(10).unwrap();
+    let started = std::time::Instant::now();
+    let err = p
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, Timeout);
+    assert!(
+        err.message.contains("first-token timeout"),
+        "expected first-token timeout, got: {}",
+        err.message
+    );
+    assert!(err.retryable());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    task.abort();
+
+    // A stream that emits a token promptly must NOT trip the budget.
+    let server2 = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server2)
+        .await;
+    let p2 = provider_discipline(&server2.uri(), None, Some(1), None, None, None, None);
+    let res = p2.stream_chat(&req("m", true), None).await.unwrap();
+    assert_eq!(res.content, "hi");
+}
+
+#[tokio::test]
+async fn per_provider_stream_key_forces_streaming_wire_and_records_first_token() {
+    // With `stream = true` on the provider, a non-streaming ChatRequest goes
+    // out as `stream: true` and first-token time is measured.
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"streamed\"}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let p = provider_discipline(&server.uri(), None, None, Some(true), None, None, None);
+    let res = p
+        .stream_chat(&req("m", false), None) // caller says non-streaming
+        .await
+        .unwrap();
+    assert_eq!(res.content, "streamed");
+    assert!(
+        res.telemetry.first_token_ms.is_some(),
+        "forced-stream call must record first-token time"
+    );
+}
+
+#[tokio::test]
+async fn per_provider_stream_key_false_keeps_non_streaming_wire() {
+    // `stream = false` (explicit) must keep today's non-streaming behaviour.
+    let server = MockServer::start().await;
+    let ok_body =
+        r#"{"id":"1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"full"},"finish_reason":"stop"}]}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id":"1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"full"},"finish_reason":"stop"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let p = provider_discipline(&server.uri(), None, None, Some(false), None, None, None);
+    let res = p
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap();
+    assert_eq!(res.content, "full");
+    assert!(
+        res.telemetry.first_token_ms.is_none(),
+        "non-streaming call must not record first-token time"
     );
 }

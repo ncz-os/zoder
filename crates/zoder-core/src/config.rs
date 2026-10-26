@@ -6842,6 +6842,57 @@ auth = { type = "env", var = "FLEET_KEY" }
     }
 
     #[test]
+    #[test]
+    fn validate_rejects_bad_client_discipline_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        let p = cfg.providers.first_mut().unwrap();
+        p.overload_backoff_min_s = Some(0);
+        p.first_token_timeout_s = Some(0);
+        p.max_concurrent = Some(0);
+        p.max_requests_per_minute = Some(0);
+        p.rate_limit_group = Some("   ".into());
+        let errs = cfg.validate().join("\n");
+        assert!(errs.contains("overload_backoff_min_s"), "{errs}");
+        assert!(errs.contains("first_token_timeout_s"), "{errs}");
+        assert!(errs.contains("max_concurrent"), "{errs}");
+        assert!(errs.contains("max_requests_per_minute"), "{errs}");
+        assert!(errs.contains("rate_limit_group"), "{errs}");
+
+        // The same keys with sane values validate clean.
+        let mut ok = Config::default_provider(dir.path());
+        let p = ok.providers.first_mut().unwrap();
+        p.overload_backoff_min_s = Some(5);
+        p.first_token_timeout_s = Some(60);
+        p.max_concurrent = Some(4);
+        p.max_requests_per_minute = Some(30);
+        p.rate_limit_group = Some("shared-endpoint".into());
+        assert!(
+            ok.validate().is_empty(),
+            "{:?}",
+            ok.validate()
+        );
+    }
+
+    #[test]
+    fn client_discipline_keys_default_to_unlimited() {
+        // A config without the keys behaves exactly as today: unlimited,
+        // no budget, group == provider id.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+        let p = cfg.providers.first().unwrap();
+        assert_eq!(p.overload_backoff_min_s, None);
+        assert_eq!(p.first_token_timeout_s, None);
+        assert_eq!(p.stream, None);
+        assert_eq!(p.rate_limit_group, None);
+        assert_eq!(p.max_concurrent, None);
+        assert_eq!(p.max_requests_per_minute, None);
+        let (group, conc, rpm) = cfg.provider_call_budget(p);
+        assert_eq!(group, p.id);
+        assert_eq!(conc, 0);
+        assert_eq!(rpm, 0);
+    }
+
     fn validate_rejects_non_finite_budget_and_routing_percentages() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default_provider(dir.path());
