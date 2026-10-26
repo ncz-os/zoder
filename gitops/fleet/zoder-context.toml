@@ -37,8 +37,11 @@
 # is 200 K while a review chunk is 48 K, and it publishes no cache counter,
 # so the saving has to come from the volume and not from the hit rate.
 #
+#   [deployment]
+#   mode = "fleet"          # selects the fleet defaults, including context
+#
 #   [context]
-#   profile = "fleet"
+#   profile = "fleet"       # optional: the deployment profile supplies it
 #
 #   [context.profiles.deepseek]
 #   tool_output_cap_bytes = 16384

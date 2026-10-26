@@ -39,6 +39,11 @@ conservative cost backstop, and context limits. `config.fleet.toml` is only a
 profile selector; the fleet's providers and tuning come from the fleet's own
 configuration repository and are layered on top at deploy time.
 
+A fleet deployment must select the profile once (`[deployment] mode = "fleet"`,
+or use the fleet template above). Without it the deployment is standalone by
+definition, so fleet-only defaults (context levers, runner job-id emission, the
+tighter cancel budget) are not applied.
+
 ## What the profile changes
 
 Fleet values below are the current tuned behaviour. A fleet config does not
