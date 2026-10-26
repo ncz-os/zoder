@@ -1609,7 +1609,7 @@ mod configure_tests {
         std::fs::write(
             dir.path().join("config.standalone.toml"),
             r#"
-[model_families]
+[not_a_real_table]
 "provider-a/*" = "provider-a"
 "#,
         )

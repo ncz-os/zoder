@@ -191,6 +191,37 @@ fn the_standalone_template_loads_and_selects_its_own_profile() {
 }
 
 #[test]
+fn standalone_template_has_no_model_families_and_keeps_default_family_answers() {
+    let overlay: VendorOverlay =
+        toml::from_str(STANDALONE_TEMPLATE).expect("standalone template parses");
+    assert!(
+        overlay.model_families.is_empty(),
+        "the shipped standalone template must not ask for fleet families"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("config.standalone.toml"),
+        STANDALONE_TEMPLATE,
+    )
+    .expect("write template");
+    let cfg = Config::load_unvalidated_from(dir.path()).expect("template loads");
+
+    assert!(cfg.model_families.is_empty(), "{:?}", cfg.model_families);
+    assert_eq!(cfg.model_family("openai/gpt-oss-120b"), "openai");
+    assert_eq!(cfg.model_family("Qwen/Qwen3-Coder"), "qwen");
+    assert_eq!(cfg.model_family("MiniMax-M3"), "minimax");
+    assert_eq!(cfg.model_family("provider-a/model-x"), "provider-a");
+    assert_eq!(cfg.model_family("mystery-model"), "mystery-model");
+
+    let serialized = serde_json::to_value(&cfg).expect("config serializes");
+    assert!(
+        serialized.get("model_families").is_none(),
+        "an empty families map must stay out of the serialized config: {serialized}"
+    );
+}
+
+#[test]
 fn a_fleet_only_overlay_makes_context_inherit_fleet() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(

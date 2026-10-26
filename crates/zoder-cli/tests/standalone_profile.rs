@@ -168,7 +168,7 @@ fn config_validate_fails_on_a_broken_overlay_but_plain_config_still_reports_it()
     fs::write(
         dir.path().join("config.fleet.toml"),
         r#"
-[model_families]
+[not_a_real_table]
 "provider-a/*" = "provider-a"
 
 [[providers]]
@@ -210,6 +210,49 @@ auth = { type = "env", var = "FLEET_KEY" }
         out.contains("config.fleet.toml") && out.contains("unknown field"),
         "the diagnostic report must show the ignored overlay:\n{out}"
     );
+}
+
+#[test]
+fn config_validate_rejects_invalid_overlay_model_families_and_accepts_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overlay = dir.path().join("config.fleet.toml");
+
+    for (body, key) in [
+        ("[model_families]\n\"\" = \"family-a\"\n", "\"\""),
+        ("[model_families]\n\"*\" = \"family-a\"\n", "\"*\""),
+    ] {
+        fs::write(&overlay, body).expect("write invalid overlay");
+        let output = run(zoder(dir.path()).args(["config", "--validate"]));
+        assert!(
+            !output.status.success(),
+            "config --validate must exit non-zero for {body:?}\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let out = stdout(&output);
+        assert!(!out.contains("config:      VALID"), "stdout:\n{out}");
+        assert!(out.contains("PROBLEM(S)"), "stdout:\n{out}");
+        assert!(
+            out.contains("model_families"),
+            "the problem must name the map:\n{out}"
+        );
+        assert!(
+            out.contains(key),
+            "the problem must name the key {key}:\n{out}"
+        );
+    }
+
+    // A valid families-only overlay (no [[providers]]) is meaningful and
+    // validates cleanly.
+    fs::write(
+        &overlay,
+        "[model_families]\n\"provider-a/*\" = \"provider-a\"\n\"provider-a/model-x\" = \"shared-family\"\n",
+    )
+    .expect("write valid overlay");
+    let output = run(zoder(dir.path()).args(["config", "--validate"]));
+    assert_ok(&output, "config --validate with a valid families overlay");
+    let out = stdout(&output);
+    assert!(out.contains("config:      VALID"), "stdout:\n{out}");
 }
 
 #[test]

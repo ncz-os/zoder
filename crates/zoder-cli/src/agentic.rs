@@ -14153,6 +14153,20 @@ mod reviewer_chain_dispatch_tests {
         std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
     }
 
+    /// Write a families-only `config.<vendor>.toml` overlay, leaving
+    /// `config.json` without any `[model_families]` table.
+    fn write_overlay_model_families(home: &Path, families: serde_json::Value) {
+        let mut body = String::from("[model_families]\n");
+        for (key, family) in families.as_object().expect("families must be an object") {
+            body.push_str(&format!(
+                "{key:?} = {family:?}\n",
+                key = key,
+                family = family.as_str().expect("family name is a string"),
+            ));
+        }
+        std::fs::write(home.join("config.fleet.toml"), body).unwrap();
+    }
+
     /// A reviewer reply for wiremock that carries FINDINGS: `approve` with one
     /// located finding (title with doubled spaces and mixed case, so the
     /// fingerprint normalization is exercised from a real parse).
@@ -14523,6 +14537,51 @@ mod reviewer_chain_dispatch_tests {
             .skipped
             .iter()
             .any(|s| s.model == "broken-model/reviewer" && s.reason == "family_excluded"));
+    }
+
+    #[test]
+    fn overlay_model_families_drive_reviewer_family_exclusion() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/other",
+            ],
+        );
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "broken-model/reviewer,working-model/other",
+        );
+        // `write_config` never writes `model_families`; the only source is the
+        // vendor overlay, as on a host configured solely through overlays.
+        write_overlay_model_families(
+            home,
+            json!({
+                "broken-model/*": "family-a",
+                "working-model/*": "family-b",
+            }),
+        );
+        assert!(
+            !std::fs::read_to_string(home.join("config.json"))
+                .unwrap()
+                .contains("model_families"),
+            "config.json must not carry the families this test is about"
+        );
+
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let authors = vec!["broken-model/coder".to_string()];
+        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        assert_eq!(plan.candidates, vec!["working-model/other"]);
+        assert_eq!(plan.author_families, vec!["family-a"]);
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|s| { s.model == "broken-model/reviewer" && s.reason == "family_excluded" }));
     }
 
     #[test]
