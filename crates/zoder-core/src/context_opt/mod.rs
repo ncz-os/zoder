@@ -3,7 +3,7 @@
 //!
 //! Measured problem (DeepSeek console export, 30 days to 2026-10-25):
 //! `$79.79` on 10.6B input tokens against 50.1M output — **212:1**. One `zoder
-//! loop` on CERBERUS spent 32.9M input tokens for 110K output: roughly 250
+//! loop` on one host spent 32.9M input tokens for 110K output: roughly 250
 //! model calls, every one of them resending the whole growing conversation at
 //! a full 128K window. The only lever in the fleet was `max_context_tokens`
 //! per profile, and nothing was known about what a call actually contained.
@@ -915,7 +915,7 @@ impl Levers {
         compact_after_tokens: 32_000,
         keep_recent_turns: 6,
     };
-    /// Every other provider (local vLLM, EIH, gateways whose cache shape is
+    /// Every other provider (local vLLM, hosted gateways whose cache shape is
     /// `CachedSubset`). Caps and elision on, compaction off: a local model has
     /// no per-token bill and a summarised history is pure quality risk.
     pub const OTHER: Levers = Levers {

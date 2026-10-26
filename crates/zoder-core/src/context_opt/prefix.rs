@@ -431,15 +431,15 @@ mod tests {
     #[test]
     fn a_cwd_in_the_system_prompt_is_reported_as_a_leak() {
         let volatile = Volatile {
-            cwd: Some("/home/jasonperlow/hive-workspaces/job".into()),
+            cwd: Some("/home/operator/workspace/job".into()),
             ..Default::default()
         };
         let good = Prefix::new("You are the AUTHOR.");
         assert!(check_stability(&good, &volatile).is_stable());
-        let bad = Prefix::new("cwd: /home/jasonperlow/hive-workspaces/job\nYou are the AUTHOR.");
+        let bad = Prefix::new("cwd: /home/operator/workspace/job\nYou are the AUTHOR.");
         match check_stability(&bad, &volatile) {
             Stability::Leaked { value, offset } => {
-                assert!(value.starts_with("/home/jasonperlow"));
+                assert!(value.starts_with("/home/operator"));
                 assert!(offset < bad.max_volatile_offset());
             }
             Stability::Stable => panic!("a cwd in the system prompt must be caught"),
@@ -449,10 +449,10 @@ mod tests {
     #[test]
     fn a_session_id_in_the_system_prompt_is_reported_as_a_leak() {
         let volatile = Volatile {
-            session_id: Some("01a17566-722e-7c9f".into()),
+            session_id: Some("job-7c9f-session".into()),
             ..Default::default()
         };
-        let bad = Prefix::new("session: 01a17566-722e-7c9f\nreview the diff");
+        let bad = Prefix::new("session: job-7c9f-session\nreview the diff");
         assert!(!check_stability(&bad, &volatile).is_stable());
     }
 
@@ -493,16 +493,16 @@ mod tests {
         // A cwd embedded in a tool description breaks the cache exactly as badly
         // as one in the system prompt, so it must be reported.
         let volatile = Volatile {
-            cwd: Some("/home/jasonperlow/hive-workspaces/job".into()),
+            cwd: Some("/home/operator/workspace/job".into()),
             ..Default::default()
         };
         let leaky = Prefix::new("You are the AUTHOR.").with_tool(
             "file_read",
-            r#"{"description":"read files under /home/jasonperlow/hive-workspaces/job"}"#,
+            r#"{"description":"read files under /home/operator/workspace/job"}"#,
         );
         match check_stability(&leaky, &volatile) {
             Stability::Leaked { value, offset } => {
-                assert!(value.starts_with("/home/jasonperlow"));
+                assert!(value.starts_with("/home/operator"));
                 assert!(
                     offset > leaky.tools_offset(),
                     "the leak is in the schema block"
@@ -515,8 +515,8 @@ mod tests {
     #[test]
     fn the_volatile_tail_is_not_a_leak() {
         let volatile = Volatile {
-            cwd: Some("/home/jasonperlow/hive-workspaces/job".into()),
-            session_id: Some("01a17566-722e".into()),
+            cwd: Some("/home/operator/workspace/job".into()),
+            session_id: Some("job-722e-session".into()),
             ..Default::default()
         };
         let p = prefix();

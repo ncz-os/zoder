@@ -113,8 +113,8 @@ fn body(kind: Kind, path: &str, bytes: usize) -> String {
 fn jobs() -> Vec<Job> {
     vec![
         Job {
-            name: "riskyeats-small-fix",
-            brief: "Fix the RiskyEats order-total rounding: the split between diners truncates \
+            name: "order-total-fix",
+            brief: "Fix the order-total rounding: the split between diners truncates \
                     instead of rounding half-up, so a $10.00 bill split three ways charges \
                     $9.99. Add a regression test.",
             plan: vec![
