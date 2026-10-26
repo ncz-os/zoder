@@ -118,6 +118,39 @@ cli-surface:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
 
+# Public-tree guard: fails on an internal identifier in any tracked file or in
+# a commit message unique to the branch. The denylist stores only salted
+# digests; see `docs/PUBLIC-TREE-GUARD.md`. Cheap (no compile), so it runs on
+# every push and merge request.
+public-repo-guard:
+  stage: check
+  image: python:3.12
+  needs: []
+  cache: {}
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+  script:
+    - python3 scripts/ci/public-repo-guard.py --self-test
+    - |
+      base="${CI_MERGE_REQUEST_DIFF_BASE_SHA:-${CI_COMMIT_BEFORE_SHA:-}}"
+      case "$base" in
+        ""|0000000000000000000000000000000000000000)
+          if git rev-parse --verify -q "origin/${CI_DEFAULT_BRANCH:-main}" >/dev/null; then
+            base="origin/${CI_DEFAULT_BRANCH:-main}"
+          fi
+          ;;
+      esac
+      if [ -n "$base" ]; then
+        python3 scripts/ci/public-repo-guard.py --base "$base"
+      else
+        python3 scripts/ci/public-repo-guard.py
+      fi
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\""
+
 # RUSTSEC advisory scan. Runs on schedules and manual web pipelines, not on
 # every push, so newly-published advisories surface without unexpectedly
 # blocking ordinary merge work.
