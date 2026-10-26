@@ -46,6 +46,7 @@ non-zero exit by `corpus-freshness-check.py`, so the two scripts together
 keep the "publish" decision in exactly one place.
 """
 from __future__ import annotations
+
 import argparse
 import json
 import shutil

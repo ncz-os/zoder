@@ -32,6 +32,7 @@ keeps the historic, single-gate behaviour, so the older report files and
 their tests keep working.
 """
 from __future__ import annotations
+
 import argparse
 import json
 import os
