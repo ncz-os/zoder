@@ -754,6 +754,11 @@ pub struct Corpus {
     /// was deployed keeps resolving those names after the overlay file is gone.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
+    /// Full RFC3339 generation timestamp (with `Z`) when the writer had one.
+    /// Read-only metadata: `None` round-trips as absent so files without it
+    /// stay byte-identical. Wins over `arena_date` in `data_date`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
 }
 
 /// Wire shape for [`Corpus`] deserialization. Separated from `Corpus` so
@@ -773,6 +778,8 @@ struct CorpusWire {
     count: usize,
     #[serde(default)]
     models: Vec<ModelEntry>,
+    #[serde(default)]
+    generated_at: Option<String>,
 }
 
 impl From<CorpusWire> for Corpus {
@@ -784,6 +791,7 @@ impl From<CorpusWire> for Corpus {
             count: wire.count,
             models: wire.models,
             aliases: BTreeMap::new(),
+            generated_at: wire.generated_at,
         };
         corpus.rebuild_aliases_from_models();
         corpus
@@ -1066,6 +1074,10 @@ impl Corpus {
             count: models.len(),
             models,
             aliases: BTreeMap::new(),
+            generated_at: root
+                .get("generated_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         };
         // Includes the legitimately-empty `{"models":[]}` path: rebuilding an
         // empty set is a no-op, but every Corpus that leaves this parser has
@@ -1672,6 +1684,15 @@ impl Corpus {
     /// the dir with a half-written file a later reader could pick up. Mirrors the
     /// `write_atomic` pattern in `crates/model-health/src/lib.rs` (kept
     /// self-contained here — no cross-crate dependency).
+    /// The corpus's own data date, by the same rules as
+    /// [`crate::pricing::data_date`]: the top-level `generated` field (or the
+    /// `arena_date` the corpus has always carried) for the date, and
+    /// `generated_at` (RFC3339 with `Z`) when present. Never the file's
+    /// modification time.
+    pub fn data_date(&self) -> Option<chrono::NaiveDate> {
+        crate::pricing::data_date(&self.arena_date, self.generated_at.as_deref().unwrap_or(""))
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -3261,5 +3282,80 @@ mod staleness_tests {
     fn rfc3339_timestamps_are_accepted() {
         let c = corpus("2026-10-18T04:05:06Z", "");
         assert_eq!(Some(8), c.age_days(day("2026-10-26")));
+    }
+}
+
+#[cfg(test)]
+mod corpus_source_metadata_tests {
+    use super::*;
+
+    /// A corpus file that predates the `generated_at` field must load and
+    /// re-save WITHOUT the loader inventing the new top-level key. (Full
+    /// byte-equality is not asserted: the loader normalizes model rows,
+    /// which is pre-existing behavior — the regression this test pins is
+    /// the new field.)
+    #[test]
+    fn corpus_file_without_new_fields_round_trips_without_new_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        let original = br#"{
+    "source": "public: test",
+    "arena_date": "2026-10-13",
+    "count": 1,
+    "models": [
+        { "id": "prov-a/model-1", "kind": "chat", "free": true }
+    ]
+}"#;
+        std::fs::write(&path, original).unwrap();
+        // load_without_overlay so the ambient overlay cannot perturb the rows.
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert!(c.generated_at.is_none());
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap())
+        );
+        c.save(&path).unwrap();
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&resaved).unwrap();
+        assert!(
+            root.get("generated_at").is_none(),
+            "save must not invent a generated_at key the corpus never had: {resaved}"
+        );
+        assert_eq!(
+            root.get("arena_date").and_then(|v| v.as_str()),
+            Some("2026-10-13"),
+            "existing keys must survive"
+        );
+        assert_eq!(
+            root.get("count").and_then(|v| v.as_u64()),
+            Some(1),
+            "existing keys must survive"
+        );
+    }
+
+    #[test]
+    fn corpus_generated_at_wins_over_arena_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"arena_date": "2026-01-01", "generated_at": "2026-10-14T05:00:00Z", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+        assert!(!crate::pricing::file_is_managed(&path));
+        // managed marker in the corpus file:
+        std::fs::write(
+            &path,
+            r#"{"managed": true, "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        assert!(crate::pricing::file_is_managed(&path));
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(c.data_date(), None);
     }
 }
