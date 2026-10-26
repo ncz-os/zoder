@@ -4118,38 +4118,35 @@ fn build_review_users(
     prepared: &crate::review_diff::PreparedDiff,
     context_for: &dyn Fn(&str) -> String,
 ) -> Vec<String> {
-    let chunk_count = prepared.chunks.len();
-    prepared
-        .chunks
-        .iter()
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let portion = if chunk_count == 1 {
-                format!("{label} diff")
-            } else {
-                format!("{label} diff, chunk {}/{}", idx + 1, chunk_count)
-            };
-            let focus = if focus_txt.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" Focus especially on: {focus_txt}.")
-            };
-            // A multi-chunk review gets the cross-chunk map prepended so a
-            // symbol defined in another chunk is never reported as missing.
-            let map = prepared.diff_map.as_ref().map_or(String::new(), |map| {
-                format!(
-                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; \
-the chunk under review is {}/{}). Before reporting a symbol as undefined, \
-redefined, or recursively calling a missing function, check it against this map:\n{}",
-                    idx + 1,
-                    chunk_count,
-                    map
-                )
-            });
-            let context = context_for(chunk);
-            format!("Review the following {portion}.{focus} Report only concrete defects visible in this portion; do not infer missing code from other chunks.{map}{context}\n\n```diff\n{chunk}\n```")
-        })
-        .collect()
+    // A chunked review is a fan of independent calls over one diff, so it is
+    // the one place a prompt cache pays for itself many times over — if the
+    // leading bytes are identical on every call. `review_baton` hoists the
+    // constant head (system prompt aside, which travels in the `system` slot,
+    // plus the diff map, the partial-diff notice and the focus line) and any
+    // byte-identical per-chunk context header into one shared prefix, then
+    // appends only the part banner and the chunk. Before it, the diff map was
+    // repeated on all 16 calls of a 16-chunk review.
+    let chunks: Vec<String> = prepared.chunks.clone();
+    let map = prepared.diff_map.clone().unwrap_or_default();
+    let wrapped_map = if map.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Diff map (deterministic; covers ALL chunks of this diff). Before reporting a symbol \
+as undefined, redefined, or recursively calling a missing function, check it against this map:\n{map}"
+        )
+    };
+    let rendered = crate::review_baton::render_review(
+        // The reviewer system prompt is passed separately to `complete_once`;
+        // the baton only needs the *body* prefix it must keep byte-stable.
+        "",
+        &wrapped_map,
+        label,
+        focus_txt,
+        &chunks,
+        &|idx| context_for(chunks.get(idx).map(String::as_str).unwrap_or_default()),
+    );
+    rendered.prompts
 }
 
 /// `--dry-run`: one line per reviewer slot with the chunk plan it would use.

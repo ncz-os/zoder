@@ -43,7 +43,9 @@
 //! never asserted — [`CacheTelemetry::hit_share`] returns `None` rather than a
 //! fabricated 0%.
 
+pub mod measure;
 pub mod prefix;
+pub mod review;
 
 use serde::{Deserialize, Serialize};
 
