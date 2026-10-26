@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
 mod child_env;
+mod context_opt;
 mod evals;
 mod exec_safety;
 mod goose;
@@ -6009,6 +6010,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let mut used_provider_id = provider_cfg.id.clone();
     let mut used_latency_ms = 0.0f64;
     let mut outcome: Option<ChatResult> = None;
+    // The messages the WINNING call carried, so the per-call telemetry can
+    // attribute the prompt's bytes.
+    let mut winning_messages: Vec<Message> = Vec::new();
     let mut winning_reservation: Option<BillableReservation> = None;
     let mut last_err: Option<ProviderError> = None;
     // Every failed attempt, named by model and provider, so the terminal
@@ -6118,9 +6122,28 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // id rather than the alias key so it works whichever alias resolved
         // here. Absent config keeps the previous behaviour exactly.
         let model_cfg = eng.cfg.model_entry_for(model_id);
+        // The context levers bound the conversation THIS call carries: the
+        // prior session transcript plus the new prompt. They are resolved per
+        // model, because the lever profile is per provider.
+        let context_levers = crate::context_opt::levers_for(&eng.cfg, model_id);
+        let request_messages = match context_levers.as_ref() {
+            Some(levers) => crate::context_opt::apply_levers(&messages, levers),
+            None => messages.clone(),
+        };
+        // The window is a hard ceiling. A conversation that does not fit is
+        // REFUSED for this link, never truncated: the levers have already
+        // bounded the working set, and what is left is either the brief and
+        // the system prompt (which must not be cut) or a provider whose
+        // window is too small for the task.
+        let context_window =
+            crate::context_opt::window_for(&eng.cfg, &pid, model_id, context_levers.as_ref());
+        if let Err(e) = crate::context_opt::fit_messages(&request_messages, context_window) {
+            attempt_failures.push(format!("{model_id} via {pid}: {e}"));
+            continue;
+        }
         let req = ChatRequest {
             model: model_id.clone(),
-            messages: messages.clone(),
+            messages: request_messages.clone(),
             max_tokens: cli.max_tokens,
             // 0.2 stays the default. Models that publish their own
             // recommendation (NVIDIA specifies 1.0 / 0.95 for Nemotron 3.5)
@@ -6185,6 +6208,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 used_provider_id = pid.clone();
                 used_latency_ms = model_started.elapsed().as_millis() as f64;
                 outcome = Some(res);
+                winning_messages = request_messages.clone();
                 winning_reservation = Some(reservation);
                 break;
             }
@@ -6223,6 +6247,17 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
 
+    // The per-call record: prompt tokens, cache hits, cache misses and
+    // completion tokens, plus how the prompt was composed. The provider's own
+    // usage wins; a provider that publishes no cache counter leaves the cache
+    // fields unset rather than reporting a fabricated zero.
+    if let Some(res) = outcome.as_ref() {
+        crate::context_opt::record_call(
+            "oneshot",
+            &crate::context_opt::segments_for_messages(&winning_messages),
+            res,
+        );
+    }
     let Some(res) = outcome else {
         save_health(&health);
         let fallback = last_err
@@ -6383,8 +6418,15 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "headers_ms": res.telemetry.headers_ms,
                 "first_token_ms": res.telemetry.first_token_ms,
                 "skipped_unhealthy": crate::provider_health::take_skipped(),
+                // The per-call context telemetry: prompt tokens, cache hits,
+                // cache misses, completion tokens, and the prompt's
+                // composition. A provider that publishes no cache counter
+                // leaves the cache fields null rather than reporting a
+                // fabricated zero.
+                "context": crate::context_opt::payload(),
             })
         );
+        crate::context_opt::flush(&eng.cfg);
         if substituted && !cli.quiet {
             eprintln!(
                 "[zoder] WARNING: requested {requested} but served {served} \
