@@ -1091,6 +1091,59 @@ builder functions). The fixture records behaviour, it does not set policy — a
 rule worth changing is argued in review, and changing it means changing the
 fixture and the pipeline together.
 
+### Staleness alerts
+
+The daily sync is only useful if someone notices when it stops. From
+2026-10-14 to 2026-10-26 it failed every day and nobody noticed for 13 days:
+the published corpus and pricing catalog stayed at 2026-10-13, and every client
+kept routing on a two-week-old index. Two independent channels now close that
+gap.
+
+**A tracked issue, opened and closed automatically.** A `.post` job
+([`corpus-sync-alert`](.gitlab-ci.yml)) runs after every *scheduled* pipeline,
+even when the sync failed (`when: always`), and reads the `corpus/freshness.json`
+report the sync job publishes as an artifact. It opens exactly **one** open
+issue labelled `corpus-sync` — title `corpus-sync: scheduled data sync is
+failing or stale` — when either:
+
+- the `corpus-sync` job failed in this pipeline **and** in the previous
+  scheduled pipeline on the default branch (two consecutive failures), or
+- the report says the benchmark overlay is more than 7 days old, flagged
+  stale, or prices are not `ok`.
+
+While the problem persists it adds a note to the same issue (never a second
+one); on the first scheduled run with fresh prices and a current overlay it
+adds a final note and **closes the issue itself**, so no one has to remember.
+
+It authenticates with a masked project variable **`CORPUS_ALERT_TOKEN`**
+(`api` scope — it must create issues and post notes; `GITLAB_PUSH_TOKEN` is the
+fallback). Create it under *Settings → CI/CD → Variables*, masked, and never
+commit a token. If no token is set, or the API call fails, the job prints
+`corpus-sync-alert: ALERT NOT DELIVERED: <reason>` and exits non-zero — the job
+is `allow_failure`, so this shows as a warning rather than silently passing.
+`python3 scripts/ci/corpus-sync-alert.py --dry-run` prints the decision and the
+API calls it *would* make without performing any of them. The decision logic
+has offline tests (`python3 scripts/tests/corpus-sync-alert-tests.py`) that fake
+the GitLab API, so the alert path is exercised without a token or a network.
+
+**GitLab's own failure notifications are a second channel worth enabling.**
+Email/Slack notifications for failed pipelines (*Settings → Integrations*, or
+your user notification settings) catch any scheduled job, not just this one,
+and they keep working if the alert job itself is broken. Point them at the
+schedule's owner — a red pipeline nobody is subscribed to is not monitoring.
+
+**The client warns you too.** `zoder` checks the age of the data it actually
+loaded: `zoder config`, `zoder models` and `zoder pricing refresh` print a
+one-line `warning: model corpus is N days old (generated YYYY-MM-DD) …` on
+**stderr** (never stdout, so scripts parsing the output are unaffected) when
+the corpus or pricing catalog is more than **7 days** old, naming the command
+that fixes it. The threshold is `$ZODER_CORPUS_STALE_DAYS`; `0` disables the
+warning, and an unparsable value falls back to 7. This never fails a command —
+an old corpus is a nudge, not an error. `zoder pricing refresh --json` carries
+`pricing_age_days` / `pricing_stale` (and the same text in `pricing_warning`)
+instead of the text; `zoder models --json` keeps its bare array of model
+objects (scripts parse it), so its warning stays on stderr.
+
 ---
 
 ## Enterprise memory & persistence
