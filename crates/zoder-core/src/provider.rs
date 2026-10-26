@@ -383,6 +383,16 @@ const DEFAULT_IDLE_TIMEOUT_S: u64 = 25;
 /// Default interval for "still waiting for the first token" notices.
 const DEFAULT_WAIT_NOTICE_S: u64 = 30;
 
+/// Post-`finish_reason` read grace (seconds) for the chat-completions
+/// stream reader: once a choice carries `finish_reason`, the provider may
+/// still send the usage-only chunk that `stream_options.include_usage`
+/// promises (plus the final `data: [DONE]`) before closing. We keep
+/// reading for up to this long with no new bytes; on a keep-alive
+/// connection that sends neither, the stream ends as a success — the
+/// answer is already complete. Override in tests via
+/// [`OpenAiProvider::with_post_finish_grace`].
+const POST_FINISH_GRACE_S: u64 = 2;
+
 /// Error text for an idle-stall timeout. Keeps the stable `stream stalled:`
 /// prefix that callers and health classification match on, and says whether
 /// the stall happened while the model was still reasoning (no answer text
@@ -1329,6 +1339,9 @@ pub struct OpenAiProvider {
     /// silently for the whole request budget. Off by default; CLI callers
     /// opt in via [`OpenAiProvider::with_wait_notices`].
     wait_notice_interval: Option<Duration>,
+    /// Test-only override for the post-`finish_reason` read grace
+    /// (see [`Self::post_finish_grace`]); `None` in production.
+    post_finish_grace_override: Option<Duration>,
     /// Resolved Azure OpenAI Data Plane `api-version` for
     /// `kind == "azure-openai"` providers. Populated at construction time
     /// from the precedence documented on [`crate::config::Provider::azure_api_version`]:
@@ -1418,6 +1431,7 @@ impl OpenAiProvider {
             ),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
             wait_notice_interval: None,
+            post_finish_grace_override: None,
             azure_api_version,
         })
     }
@@ -1463,7 +1477,35 @@ impl OpenAiProvider {
     /// Read step for a stream loop: the idle budget once generation began;
     /// before that, the remaining request budget, sliced by the notice
     /// interval when notices are on.
-    fn stream_read_step(&self, saw_generation: bool, remaining: Duration) -> Duration {
+    /// The post-`finish_reason` read grace (see [`POST_FINISH_GRACE_S`]);
+    /// tests can shorten it with [`Self::with_post_finish_grace`].
+    fn post_finish_grace(&self) -> Duration {
+        self.post_finish_grace_override
+            .unwrap_or_else(|| Duration::from_secs(POST_FINISH_GRACE_S))
+    }
+
+    /// Test-only: override the post-`finish_reason` read grace.
+    pub fn with_post_finish_grace(mut self, grace: Duration) -> Self {
+        self.post_finish_grace_override = Some(grace);
+        self
+    }
+
+    /// Read step for a stream loop: the idle budget once generation began;
+    /// before that, the remaining request budget, sliced by the notice
+    /// interval when notices are on. `post_finish` (the chat-completions
+    /// reader, once `finish_reason` was seen) caps the step on the
+    /// post-finish grace: the model is no longer generating, so waiting
+    /// for the trailing usage chunk should not hold the connection open
+    /// for the idle budget.
+    fn stream_read_step(
+        &self,
+        saw_generation: bool,
+        post_finish: bool,
+        remaining: Duration,
+    ) -> Duration {
+        if post_finish {
+            return self.post_finish_grace().min(remaining);
+        }
         if saw_generation {
             self.idle_timeout.min(remaining)
         } else if let Some(every) = self.wait_notice_interval {
@@ -1579,7 +1621,9 @@ impl OpenAiProvider {
             let next = timeout(remaining, stream.next()).await.map_err(|_| {
                 ProviderError::new(ErrKind::Timeout, format!("request timeout reading {label}"))
             })?;
-            let Some(chunk) = next else { break };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk.map_err(classify_reqwest)?;
             if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
                 return Err(ProviderError::new(
@@ -2377,6 +2421,14 @@ impl OpenAiProvider {
         let mut saw_generation = false;
         let loop_started = Instant::now();
         let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
+        // Armed when a `finish_reason` frame is seen: the post-finish
+        // grace (see `POST_FINISH_GRACE_S`) then bounds the follow-up
+        // reads that wait for the include_usage chunk + `[DONE]`.
+        let post_finish_grace = self.post_finish_grace();
+        let mut post_finish_deadline: Option<Instant> = None;
+        // `data: [DONE]` is the end of the stream: stop reading at once
+        // instead of waiting for the connection to close.
+        let mut saw_done_marker = false;
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -2392,7 +2444,13 @@ impl OpenAiProvider {
             // Prompt prefill/queue latency is covered by the overall request
             // budget. The idle guard applies once generation begins — which
             // includes a stream that has so far emitted only reasoning.
-            let step = self.stream_read_step(saw_generation, remaining);
+            let step = match post_finish_deadline {
+                // Measured from when `finish_reason` was seen, not per read:
+                // the total post-finish wait is bounded by the grace.
+                Some(d) => d.saturating_duration_since(Instant::now()),
+                None => self.stream_read_step(saw_generation, false, remaining),
+            }
+            .min(remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2407,6 +2465,13 @@ impl OpenAiProvider {
                         self.wait_notice(loop_started.elapsed() + headers_wait);
                         continue;
                     }
+                    // Post-`finish_reason`: the grace expired without a
+                    // `[DONE]` or a usage frame (a keep-alive connection
+                    // that never closes). The answer is complete — end the
+                    // stream as a success instead of failing the call.
+                    if done {
+                        break;
+                    }
                     return Err(fail(
                         ErrKind::Timeout,
                         stream_stall_message(self.idle_timeout, saw_content),
@@ -2414,7 +2479,9 @@ impl OpenAiProvider {
                     ));
                 }
             };
-            let Some(chunk) = next else { break };
+            let Some(chunk) = next else {
+                break;
+            };
             let bytes = chunk.map_err(|e| {
                 let mut pe = classify_reqwest(e);
                 pe.emitted = emitted;
@@ -2460,7 +2527,59 @@ impl OpenAiProvider {
                 let payload = payload.trim();
                 if payload == "[DONE]" {
                     done = true;
+                    saw_done_marker = true;
                     break;
+                }
+                // Post-`finish_reason`: the model is done generating. Only
+                // `data: [DONE]` (handled above) and the usage-only chunk
+                // an `include_usage` provider sends matter now. A content
+                // frame arriving here is provider misbehavior — log it and
+                // drop it (never appended to the answer); a
+                // `{"error":...}` frame is still a hard error; malformed
+                // post-finish JSON is ignored (the answer is complete and
+                // the stream ends at `[DONE]`, EOF, or the grace).
+                if done {
+                    let val: Option<serde_json::Value> = serde_json::from_str(payload).ok();
+                    tracing::debug!(?val, "post-finish frame parsed");
+                    if let Some(err) = val.as_ref().and_then(|v| v.get("error")) {
+                        return Err(fail(
+                            ErrKind::Http,
+                            format!("provider stream error: {}", redact(&err.to_string())),
+                            emitted,
+                        ));
+                    }
+                    if let Some(parsed) = val
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value::<StreamChunk>(v.clone()).ok())
+                    {
+                        if parsed.choices.iter().any(|c| {
+                            c.delta.content.as_deref().is_some_and(|t| !t.is_empty())
+                                || c.delta
+                                    .reasoning_content
+                                    .as_deref()
+                                    .is_some_and(|t| !t.is_empty())
+                                || c.delta.reasoning.as_deref().is_some_and(|t| !t.is_empty())
+                        }) {
+                            tracing::debug!(
+                                "ignoring content-bearing stream frame after finish_reason"
+                            );
+                        }
+                        if let Some(u) = parsed.usage {
+                            if u.prompt_tokens.is_some() {
+                                prompt_tokens = u.prompt_tokens;
+                            }
+                            if u.completion_tokens.is_some() {
+                                completion_tokens = u.completion_tokens;
+                            }
+                            if let Some(cached) = u.cached_prompt_tokens() {
+                                cached_prompt_tokens = Some(cached);
+                            }
+                            if let Some(miss) = u.cache_miss_tokens() {
+                                cache_miss_tokens = Some(miss);
+                            }
+                        }
+                    }
+                    continue;
                 }
                 let val: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
                     fail(
@@ -2508,6 +2627,9 @@ impl OpenAiProvider {
                 // incorrectly flagged as truncated/incomplete.
                 if parsed.choices.iter().any(|c| c.finish_reason.is_some()) {
                     done = true;
+                    if post_finish_deadline.is_none() {
+                        post_finish_deadline = Some(Instant::now() + post_finish_grace);
+                    }
                 }
                 // Every successful frame must advance one of the two pieces of
                 // stream state we understand: completion choices, or concrete
@@ -2598,20 +2720,18 @@ impl OpenAiProvider {
                     }
                 }
             }
-            // `[DONE]` (or a terminal error) ends the whole stream — break the
-            // outer read loop so a keep-alive connection doesn't stall to EOF.
-            if done {
+            if saw_done_marker {
                 break;
             }
         }
-        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
-            return Err(fail(
-                ErrKind::Decode,
-                "stream ended with an incomplete SSE frame".to_string(),
-                emitted,
-            ));
-        }
         if !done {
+            if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+                return Err(fail(
+                    ErrKind::Decode,
+                    "stream ended with an incomplete SSE frame".to_string(),
+                    emitted,
+                ));
+            }
             // NOTE: The error message deliberately names `[DONE]` specifically.
             // `finish_reason` is also accepted as a terminal signal on each
             // individual SSE chunk (see the Y-2 guard above that sets `done =
@@ -2761,7 +2881,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.stream_read_step(saw_generation, remaining);
+            let step = self.stream_read_step(saw_generation, done, remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2783,7 +2903,9 @@ impl OpenAiProvider {
                     ));
                 }
             };
-            let Some(chunk) = next else { break };
+            let Some(chunk) = next else {
+                break;
+            };
             let bytes = chunk.map_err(|e| {
                 let mut pe = classify_reqwest(e);
                 pe.emitted = emitted;
@@ -3129,7 +3251,7 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.stream_read_step(saw_generation, remaining);
+            let step = self.stream_read_step(saw_generation, done, remaining);
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -3151,7 +3273,9 @@ impl OpenAiProvider {
                     ));
                 }
             };
-            let Some(chunk) = next else { break };
+            let Some(chunk) = next else {
+                break;
+            };
             let bytes = chunk.map_err(|e| {
                 let mut pe = classify_reqwest(e);
                 pe.emitted = emitted;
