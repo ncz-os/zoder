@@ -316,8 +316,11 @@ The output is unchanged on disk; re-read the file (or re-run the command) if it 
 ///
 /// `cap_bytes` below [`MIN_CAP_BYTES`] is raised to it: a cap smaller than the
 /// stub it has to carry would consume the whole result to say it dropped
-/// nothing. The returned turn's `content` never exceeds `cap_bytes` plus the
-/// stub, and the stub's omitted count is always the true byte delta.
+/// nothing. A result no longer than the effective cap — including one between
+/// the requested cap and `MIN_CAP_BYTES` — is returned untouched, because
+/// honouring a sub-floor cap is not possible without losing more to the stub
+/// than is saved. When a cut IS made, `head + tail == cap` and the stub's
+/// omitted count is the exact byte delta, so `kept + omitted == original len`.
 pub fn cap_tool_output(turn: &Turn, cap_bytes: usize) -> Turn {
     if cap_bytes == 0 || turn.content.len() <= cap_bytes {
         return turn.clone();
@@ -418,6 +421,9 @@ pub struct Digest {
     pub turns: usize,
     /// Bytes those turns occupied before folding.
     pub bytes_before: u64,
+    /// Earlier digests absorbed by this one (0 on a first pass). Reported so a
+    /// reader knows the lists also describe work folded in previous passes.
+    pub absorbed_digests: usize,
 }
 
 impl Digest {
@@ -432,6 +438,13 @@ again. Do not redo what is listed as decided.",
             self.turns,
             self.bytes_before as f64 / 1024.0
         ));
+        if self.absorbed_digests > 0 {
+            out.push_str(&format!(
+                " It absorbs {} earlier digest(s); their file, decision and todo lists are \
+merged below.",
+                self.absorbed_digests
+            ));
+        }
         let mut list = |label: &str, items: &[String]| {
             if items.is_empty() {
                 return;
@@ -666,13 +679,25 @@ pub fn compact(
         .cloned()
         .collect();
     let mut digest = digest_turns(&fresh, max_files, max_lines);
+    // Carry a previous digest forward. Its LISTS are merged, but its
+    // `turns`/`bytes_before` are its own historical accounting for turns that
+    // are no longer present and are already reflected in the rendered header of
+    // the digest this one replaces. Adding them to the fresh counts would make
+    // the header claim more turns and bytes than this pass ever saw, growing
+    // without bound across passes. The merged digest reports this pass's span
+    // plus the number of earlier digests it absorbed.
+    let mut absorbed = 0usize;
     for prior_digest in prior {
         let carried = digest_from_render(&prior_digest.content);
         digest.files = merge_capped(digest.files, carried.files, max_files);
         digest.decisions = merge_capped(digest.decisions, carried.decisions, max_lines);
         digest.open_todos = merge_capped(digest.open_todos, carried.open_todos, max_lines);
-        digest.turns = digest.turns.saturating_add(carried.turns);
-        digest.bytes_before = digest.bytes_before.saturating_add(carried.bytes_before);
+        absorbed += 1;
+    }
+    if absorbed > 0 {
+        // The rendered header notes the absorption so the count is honest
+        // rather than silently omitting work that really did happen.
+        digest.absorbed_digests = absorbed;
     }
     // Order: pinned system prompt and brief, then the digest, then the recent
     // turns verbatim.
@@ -683,7 +708,9 @@ pub fn compact(
     let bytes_after: u64 = out.iter().map(Turn::bytes).sum();
     Compacted {
         turns: out,
-        folded: foldable.len(),
+        // Turns actually folded INTO the digest: the folded span minus any
+        // digest it absorbed (that one was replaced, not folded).
+        folded: digest.turns,
         bytes_before,
         bytes_after,
     }
@@ -719,10 +746,11 @@ fn digest_from_render(text: &str) -> Digest {
     };
     if let Some(head) = text.strip_prefix(COMPACT_MARKER) {
         // " A structured digest of N earlier turn(s) (x KiB) that were ..."
+        // split_whitespace yields ["A","structured","digest","of","N",...], so
+        // the count is the FIRST numeric word. Finding it rather than indexing a
+        // fixed position keeps this working if the sentence is reworded.
         let words: Vec<&str> = head.split_whitespace().collect();
-        if let Some(n) = words.get(3).and_then(|w| w.parse::<usize>().ok()) {
-            out.turns = n;
-        } else if let Some(n) = words.get(5).and_then(|w| w.parse::<usize>().ok()) {
+        if let Some(n) = words.iter().find_map(|w| w.parse::<usize>().ok()) {
             out.turns = n;
         }
     }
@@ -733,6 +761,16 @@ fn digest_from_render(text: &str) -> Digest {
             out.decisions = v;
         } else if let Some(v) = field(line, "Open todos: ") {
             out.open_todos = v;
+        }
+    }
+    // " It absorbs N earlier digest(s); ..."
+    if let Some(rest) = text.split("It absorbs ").nth(1) {
+        if let Some(n) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.parse::<usize>().ok())
+        {
+            out.absorbed_digests = n;
         }
     }
     out

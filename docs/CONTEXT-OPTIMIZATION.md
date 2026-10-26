@@ -60,8 +60,13 @@ rate. These are **exclusive**: cached tokens are a subset of the prompt, so a
 reported `prompt_cache_miss_tokens` larger than `prompt - hit` (which DeepSeek
 returns when it re-bills a broken prefix, and which includes the re-read schema
 block) must not be *added* to the hit count — that would charge for tokens the
-request never carried. A test pins this: 1 000 prompt tokens with 900 hits and a
-reported miss of 250 bills 900 × cache rate + 100 × miss rate, not 1 150 tokens.
+request never carried.
+
+Pinned by `context_opt::tests::cost_never_bills_more_tokens_than_the_prompt_carried`:
+1 000 prompt tokens with 900 hits and a reported miss of 250 bills
+900 × cache rate + 100 × miss rate, not 1 150 tokens. The uncached case is
+pinned by `cost_with_no_cache_counter_bills_every_token_at_the_miss_rate`, and
+the 30-day totals by `cost_bills_the_cached_tokens_once_at_the_cache_rate`.
 
 `PromptComposition` reports what fraction of the prompt is prefix, history, tool
 output and task. That is the number that says *which* lever to pull: a run at
@@ -187,7 +192,9 @@ Be explicit about this when reviewing:
 
 `gitops/fleet/zoder-config.patch` in this repository adds the per-provider lever
 profiles to the FleetOps gitops config. It is **not** applied and **not**
-pushed; the orchestrator deploys after review.
+pushed; the orchestrator deploys after review. The hunk is a real unified diff
+with explicit line ranges and has been verified to apply cleanly against the
+current `fleet/zoder-config/config.toml` with `patch -p1 --dry-run`.
 
 `max_context_tokens` is deliberately left unchanged in this patch. The levers
 make a large window affordable by keeping the *working set* small; shrinking the
@@ -196,6 +203,10 @@ Right-sizing it is the final step of the brief, after the measurements exist.
 
 ## Test counts
 
-- `zoder-core` lib: **685 passed, 0 failed**.
-- `context_opt` alone: **48 tests**.
+Measured at commit `88bda37`'s successor on `feat/context-optimization-20261025`
+(the review round added parser, char-boundary and inflation tests). Re-derive with
+`cargo test -p zoder-core --lib`; the numbers will drift as tests are added.
+
+- `zoder-core` lib: **689 passed, 0 failed**.
+- `context_opt` alone: **52 tests**.
 - `cargo clippy -p zoder-core --all-targets`: **0 warnings**.

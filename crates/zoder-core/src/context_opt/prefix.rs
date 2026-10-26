@@ -92,8 +92,13 @@ impl Prefix {
     /// the tools section marker, i.e. everything before it is prefix. This is
     /// the bound `place_volatile` enforces and the tests assert against.
     pub fn max_volatile_offset(&self) -> usize {
-        let system_part = format!("{}\n{}\n", sys_marker(), self.system.trim_end());
-        system_part.len()
+        // Derived from the rendered prefix, not re-formatted by hand: if
+        // `render` ever changes layout, this bound moves with it instead of
+        // silently accepting values past the real prefix end.
+        let rendered = self.render();
+        rendered
+            .find(&tools_marker())
+            .unwrap_or(rendered.len())
     }
 }
 
@@ -192,18 +197,16 @@ pub fn render_first_message(prefix: &Prefix, volatile: &Volatile, body: &str) ->
 pub fn volatile_offsets(text: &str, volatile: &Volatile) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     for value in volatile.values() {
-        if value.len() >= MIN_DISTINCTIVE_LEN {
-            if let Some(pos) = text.find(&value) {
-                out.push((value, pos));
-            }
+        // Values shorter than MIN_DISTINCTIVE_LEN are skipped entirely: a bare
+        // iteration number occurs by chance in any prompt, and `v1` is part of
+        // the constant marker. Searching a truncated prefix of a short value
+        // would both panic on a multi-byte boundary and report an offset that
+        // does not correspond to the value it names.
+        if value.len() < MIN_DISTINCTIVE_LEN {
             continue;
         }
-        // Short values: only a subdirectory of the cwd is worth chasing, and
-        // only when it is long enough to be unambiguous.
-        if value.len() > 8 {
-            if let Some(pos) = text.find(&value[..8]) {
-                out.push((value, pos));
-            }
+        if let Some(pos) = text.find(&value) {
+            out.push((value, pos));
         }
     }
     out
@@ -289,11 +292,15 @@ mod tests {
             .with_tool("b", "{}")
             .render();
         assert_eq!(a, b, "tools must serialize in name order, not insertion order");
-        assert_eq!(a, prefix_bytes_twice());
-    }
-
-    fn prefix_bytes_twice() -> String {
-        Prefix::new("sys").with_tool("a", "{}").with_tool("b", "{}").render()
+        // Pin the exact layout: a literal, so a change to the markers or the
+        // separator fails here rather than silently changing the cache key.
+        assert_eq!(
+            a,
+            "[zoder-prefix:system v1]\nsys\n[zoder-prefix:tools v1]\na\t{}\nb\t{}\n",
+            "the prefix layout is part of the cache key and must not drift"
+        );
+        // Repeated rendering is stable.
+        assert_eq!(a, Prefix::new("sys").with_tool("a", "{}").with_tool("b", "{}").render());
     }
 
     #[test]
@@ -400,6 +407,22 @@ mod tests {
         };
         assert!(check_stability(&prefix(), &volatile).is_stable());
         assert!(volatile_offsets(&prefix().render(), &volatile).is_empty());
+    }
+
+    #[test]
+    fn a_non_ascii_volatile_value_does_not_panic() {
+        // A cwd or alias with a multi-byte character must be handled on a char
+        // boundary; the old 8-byte prefix slice panicked here.
+        for cwd in ["/tmp/日本", "aaaaaaa日", "/home/日本/project"] {
+            let volatile = Volatile {
+                cwd: Some(cwd.to_string()),
+                ..Default::default()
+            };
+            // Both branches: present in the prefix (a leak) and absent (stable).
+            let leaking = Prefix::new(format!("cwd: {cwd}\nYou are the AUTHOR."));
+            assert!(!check_stability(&leaking, &volatile).is_stable());
+            assert!(check_stability(&prefix(), &volatile).is_stable());
+        }
     }
 
     #[test]
