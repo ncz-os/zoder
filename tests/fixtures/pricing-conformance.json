@@ -127,7 +127,7 @@
         "entries": {
           "claude-opus-4-8": {
             "free": false,
-            "gated_reason": "listed $0 in public feed but vendor is paid-only — not auto-routed",
+            "gated_reason": "listed $0 in public feed but vendor is paid-only \u2014 not auto-routed",
             "paid": true,
             "route_candidate": false
           }
@@ -276,7 +276,7 @@
         "entries": {
           "example/unpriced": {
             "free": false,
-            "gated_reason": "unpriced in public feed — not auto-routed (run a local classify/refresh)",
+            "gated_reason": "unpriced in public feed \u2014 not auto-routed (run a local classify/refresh)",
             "paid": false,
             "route_candidate": false
           }

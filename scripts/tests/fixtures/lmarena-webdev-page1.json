@@ -1,0 +1,182 @@
+{
+ "features": [
+  {
+   "feature_idx": 0,
+   "name": "model_name",
+   "type": {
+    "dtype": "string",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 1,
+   "name": "organization",
+   "type": {
+    "dtype": "string",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 2,
+   "name": "license",
+   "type": {
+    "dtype": "string",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 3,
+   "name": "rating",
+   "type": {
+    "dtype": "float64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 4,
+   "name": "rating_lower",
+   "type": {
+    "dtype": "float64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 5,
+   "name": "rating_upper",
+   "type": {
+    "dtype": "float64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 6,
+   "name": "variance",
+   "type": {
+    "dtype": "float64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 7,
+   "name": "vote_count",
+   "type": {
+    "dtype": "int64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 8,
+   "name": "rank",
+   "type": {
+    "dtype": "int64",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 9,
+   "name": "category",
+   "type": {
+    "dtype": "string",
+    "_type": "Value"
+   }
+  },
+  {
+   "feature_idx": 10,
+   "name": "leaderboard_publish_date",
+   "type": {
+    "dtype": "string",
+    "_type": "Value"
+   }
+  }
+ ],
+ "rows": [
+  {
+   "row_idx": 5,
+   "row": {
+    "model_name": "Claude Fable 5.1 (Max)",
+    "organization": "anthropic",
+    "license": "Proprietary",
+    "rating": 1742.454511159061,
+    "rating_lower": 1733.70537253876,
+    "rating_upper": 1751.2036497793615,
+    "variance": 19.926655515574236,
+    "vote_count": 8098,
+    "rank": 5,
+    "category": "overall",
+    "leaderboard_publish_date": "2026-10-23"
+   },
+   "truncated_cells": []
+  },
+  {
+   "row_idx": 6,
+   "row": {
+    "model_name": "Muse Wonder Full (Max)",
+    "organization": "meta",
+    "license": "Proprietary",
+    "rating": 1725.8721507519322,
+    "rating_lower": 1711.9906701307577,
+    "rating_upper": 1739.7536313731066,
+    "variance": 50.16206426526876,
+    "vote_count": 2253,
+    "rank": 6,
+    "category": "overall",
+    "leaderboard_publish_date": "2026-10-23"
+   },
+   "truncated_cells": []
+  },
+  {
+   "row_idx": 7,
+   "row": {
+    "model_name": "Claude Sonnet 5.5 (High)",
+    "organization": "anthropic",
+    "license": "Proprietary",
+    "rating": 1709.231500483586,
+    "rating_lower": 1699.6199740268285,
+    "rating_upper": 1718.8430269403434,
+    "variance": 24.04853081628389,
+    "vote_count": 5632,
+    "rank": 7,
+    "category": "overall",
+    "leaderboard_publish_date": "2026-10-23"
+   },
+   "truncated_cells": []
+  },
+  {
+   "row_idx": 8,
+   "row": {
+    "model_name": "Kimi K3.1 Pro (Max)",
+    "organization": "moonshot",
+    "license": "Proprietary",
+    "rating": 1691.6445753473818,
+    "rating_lower": 1678.1387582796046,
+    "rating_upper": 1705.1503924151584,
+    "variance": 47.48380841299583,
+    "vote_count": 2451,
+    "rank": 8,
+    "category": "overall",
+    "leaderboard_publish_date": "2026-10-23"
+   },
+   "truncated_cells": []
+  },
+  {
+   "row_idx": 9,
+   "row": {
+    "model_name": "Claude Opus 5 (Max)",
+    "organization": "anthropic",
+    "license": "Proprietary",
+    "rating": 1690.7311672394576,
+    "rating_lower": 1684.5420362280938,
+    "rating_upper": 1696.9202982508214,
+    "variance": 9.97156144677946,
+    "vote_count": 18995,
+    "rank": 9,
+    "category": "overall",
+    "leaderboard_publish_date": "2026-10-23"
+   },
+   "truncated_cells": []
+  }
+ ],
+ "num_rows_total": 9,
+ "num_rows_per_page": 5,
+ "partial": false
+}
