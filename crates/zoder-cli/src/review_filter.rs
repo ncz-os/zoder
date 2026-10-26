@@ -563,8 +563,13 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
                 if STOPWORDS.contains(&w.as_str()) {
                     continue;
                 }
-                // Accept any token that looks like an identifier name.
-                if w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                // Accept any token that looks like an identifier name. Norm
+                // words are already punctuation-trimmed, but strip again here
+                // so a stray comma/period on a token can never block the
+                // claim.
+                let clean = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                if clean.len() >= 2 && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
                     add(words[idx]);
                 }
             }
@@ -2983,6 +2988,35 @@ pub(crate) mod tests {
         )
         .expect("Alpha is defined at the head");
         assert_eq!(record["symbol"], "Alpha");
+    }
+
+    /// Punctuated type lists (commas, periods, sentence ends) claim every
+    /// listed name: trailing punctuation on a token must not prevent the
+    /// claim.
+    #[test]
+    fn punctuated_unresolved_type_lists_claim_every_name() {
+        for (title, body) in [
+            (
+                "Unresolved types: Alpha, Beta, Gamma",
+                "The diff references these types. Unresolved types: Alpha, Beta, Gamma.",
+            ),
+            (
+                "Unresolved types: Alpha, Beta, Gamma.",
+                "Unresolved types: Alpha, Beta, Gamma.",
+            ),
+            (
+                "Unresolved types: Alpha Beta Gamma",
+                "Unresolved types: Alpha Beta Gamma",
+            ),
+        ] {
+            let syms = claimed_symbols(title, body);
+            for name in ["Alpha", "Beta", "Gamma"] {
+                assert!(
+                    syms.iter().any(|s| s == name),
+                    "{title} / {body}: {name} not claimed: {syms:?}"
+                );
+            }
+        }
     }
 
     /// "none of these helpers are imported" names NOTHING: it must never drop
