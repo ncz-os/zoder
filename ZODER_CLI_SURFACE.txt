@@ -4268,6 +4268,9 @@ Reconcile the model corpus against the live served-model list
 Usage: zoder refresh [OPTIONS]
 
 Options:
+      --force
+          Override a `file` pricing source (env `ZODER_PRICING_SOURCE`, `[pricing] source = "file"` in config, or `"managed": true` in the corpus file) and save the reconciled corpus anyway
+
   -m, --model <MODEL>
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 

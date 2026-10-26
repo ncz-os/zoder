@@ -1065,7 +1065,13 @@ enum Cmd {
         force: bool,
     },
     /// Reconcile the model corpus against the live served-model list.
-    Refresh,
+    Refresh {
+        /// Override a `file` pricing source (env `ZODER_PRICING_SOURCE`,
+        /// `[pricing] source = "file"` in config, or `"managed": true` in the
+        /// corpus file) and save the reconciled corpus anyway.
+        #[arg(long)]
+        force: bool,
+    },
     /// Pricing catalog: sync per-token rates from public price lists, or look
     /// up a model's rate.
     Pricing {
@@ -1609,6 +1615,11 @@ enum PricingCmd {
         /// config has a non-free provider. free-tier stay $0.
         #[arg(long)]
         external: bool,
+        /// Override a `file` pricing source (env `ZODER_PRICING_SOURCE`,
+        /// `[pricing] source = "file"` in config, or `"managed": true` in the
+        /// data file) and refresh the installed files anyway.
+        #[arg(long)]
+        force: bool,
     },
     /// Show the catalog rate for a model (per-token components, USD per Mtok).
     Show {
@@ -2434,7 +2445,7 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Providers) => cmd_providers(cli.json),
         Some(Cmd::Config { validate }) => cmd_config(*validate),
         Some(Cmd::Init { profile, force }) => cmd_init(*profile, *force),
-        Some(Cmd::Refresh) => cmd_refresh(&cli).await,
+        Some(Cmd::Refresh { force }) => cmd_refresh(&cli, *force).await,
         Some(Cmd::Pricing { action }) => cmd_pricing(action, cli.json).await,
         Some(Cmd::Quota { provider, local }) => cmd_quota(provider, *local, cli.json).await,
         Some(Cmd::Reconcile { provider, days }) => cmd_reconcile(provider, *days, cli.json).await,
@@ -12106,6 +12117,18 @@ async fn cmd_report(
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    // In `file` pricing-source mode `maybe_spawn_daily_refresh` skipped the
+    // spawn; make sure the data-age warning still lands for a `report` that
+    // runs before the TUI (once per process).
+    if pricing_source_switch(&cfg).is_file() {
+        warn_data_age(
+            "pricing",
+            &Config::home().join("pricing.json"),
+            &pricing.generated,
+            pricing.generated_at.as_deref(),
+            pricing.source.as_deref().unwrap_or(""),
+        );
+    }
     let (since, until, gran, label) = report_window(period, days);
 
     // `--vendor <name>` scopes the report to entries whose `provider` id was
@@ -13907,7 +13930,7 @@ fn uninstall_daily_job() -> anyhow::Result<String> {
     }
 }
 
-async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
+async fn cmd_refresh(cli: &Cli, force: bool) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let default_id = eng.cfg.default_provider.clone();
     let provider_cfg = eng
@@ -14039,6 +14062,23 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
     }
     let report = corpus.reconcile(&all_served);
     let promoted = corpus.ingest_free_chat(&free_ids);
+    // `file` pricing-source mode: the installed corpus is authoritative. The
+    // read-only reconciliation above still ran and is printed below; only the
+    // two writes (the reconciled corpus save and the alias-overlay rows it
+    // carried in from `<home>/model-aliases.json`, which are persisted inside
+    // that same save) are gated.
+    let switch = pricing_source_switch(&eng.cfg);
+    if switch.is_file() && !force {
+        eprintln!(
+            "error: pricing source is 'file' ({}): refusing to overwrite {} (reconciled corpus + alias overlay rows); pass --force to save anyway",
+            switch.label(),
+            eng.cfg.corpus_path.display()
+        );
+        return Err(anyhow::anyhow!(
+            "pricing source is 'file' ({}) and --force was not passed",
+            switch.label()
+        ));
+    }
     corpus.save(&eng.cfg.corpus_path)?;
 
     if cli.json {
@@ -14305,7 +14345,12 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
 ///   * **zoder** stays your provider's billing-authoritative: it publishes nothing unless
 ///     `--external` is passed *and* a non-free provider is configured, and even
 ///     then only that provider's paid models (free-tier stay $0).
-fn publish_engine_catalog(cat: &PricingCatalog, external: bool, json: bool) -> anyhow::Result<()> {
+fn publish_engine_catalog(
+    cat: &PricingCatalog,
+    external: bool,
+    force: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     let zoder = is_zoder_build();
     if !zoder && !external {
         // zoder default: leave the engine untouched (your provider's billing-exclusive).
@@ -14345,6 +14390,23 @@ fn publish_engine_catalog(cat: &PricingCatalog, external: bool, json: bool) -> a
         build_external_catalog(cat, &corpus)
     };
 
+    // `file` pricing-source mode: the engine copy is installed by the operator
+    // too, so it gets the same overwrite gate (overridable with --force).
+    let switch = match Config::load() {
+        Ok(cfg) => pricing_source_switch(&cfg),
+        Err(_) => FileSwitch::None,
+    };
+    if switch.is_file() && !force {
+        eprintln!(
+            "error: pricing source is 'file' ({}): refusing to overwrite {}; pass --force to refresh anyway",
+            switch.label(),
+            engine_path.display()
+        );
+        return Err(anyhow::anyhow!(
+            "pricing source is 'file' ({}) and --force was not passed",
+            switch.label()
+        ));
+    }
     engine_cat.save(&engine_path)?;
     let priced = engine_cat.models.len();
     if json {
@@ -14367,11 +14429,207 @@ fn publish_engine_catalog(cat: &PricingCatalog, external: bool, json: bool) -> a
     Ok(())
 }
 
+/// Which of the three pricing-source switches selected `file` (any one of
+/// them wins): the env var `ZODER_PRICING_SOURCE`, the config key
+/// `[pricing] source = "file"`, or a top-level `"managed": true` inside one
+/// of the data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSwitch {
+    None,
+    Env,
+    Config,
+    Managed,
+}
+
+impl FileSwitch {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Env => "env ZODER_PRICING_SOURCE=file",
+            Self::Config => "config [pricing] source=\"file\"",
+            Self::Managed => "\"managed\": true in a data file",
+        }
+    }
+}
+
+/// Resolve the effective pricing source. `None` means "auto" (today's
+/// behaviour). The env var is checked FIRST and wins on its own: an invalid
+/// value (anything but `auto`/`file`) gets one stderr warning and falls back
+/// to auto, so a typo cannot silently enable the managed-file protection or
+/// disable it.
+fn pricing_source_switch(cfg: &Config) -> FileSwitch {
+    if let Ok(v) = std::env::var("ZODER_PRICING_SOURCE") {
+        let v = v.trim();
+        return match v {
+            "" | "auto" => FileSwitch::None,
+            "file" => FileSwitch::Env,
+            other => {
+                eprintln!(
+                    "zoder: warning: invalid ZODER_PRICING_SOURCE={other:?} (expected \"auto\" or \"file\"); treating as auto"
+                );
+                FileSwitch::None
+            }
+        };
+    }
+    if cfg.pricing.wants_file() {
+        return FileSwitch::Config;
+    }
+    let pricing_path = Config::home().join("pricing.json");
+    let corpus_path = Config::home().join("model_corpus.json");
+    if zoder_core::pricing::file_is_managed(&pricing_path)
+        || zoder_core::pricing::file_is_managed(&corpus_path)
+    {
+        return FileSwitch::Managed;
+    }
+    FileSwitch::None
+}
+
+/// The `ZODER_CORPUS_STALE_DAYS` threshold in days. Invalid -> 7; 0 disables
+/// the warning.
+fn stale_threshold_days() -> i64 {
+    match std::env::var("ZODER_CORPUS_STALE_DAYS") {
+        Ok(v) => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => 7,
+        },
+        Err(_) => 7,
+    }
+}
+
+/// Print the age warning for one installed data file, if its data (by its
+/// own `generated`/`generated_at` date — never file mtime) is older than the
+/// `ZODER_CORPUS_STALE_DAYS` threshold. One line per file per process,
+/// stderr only, never fails the command.
+fn warn_data_age(
+    which: &str,
+    path: &Path,
+    generated: &str,
+    generated_at: Option<&str>,
+    source: &str,
+) {
+    let path_display = path.display().to_string();
+    let Some(date) = zoder_core::pricing::data_date(generated, generated_at.unwrap_or("")) else {
+        let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
+        if state.warned.insert(which.to_string()) {
+            let days = stale_threshold_days();
+            if days > 0 {
+                eprintln!(
+                    "zoder: warning: installed {which} data has no parseable date ({}); age unknown",
+                    path_display
+                );
+            }
+        }
+        return;
+    };
+    let days = stale_threshold_days();
+    if days == 0 {
+        return;
+    }
+    let today = chrono::Utc::now().date_naive();
+    let age = (today - date).num_days();
+    if age <= days {
+        return;
+    }
+    let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
+    if !state.warned.insert(which.to_string()) {
+        return;
+    }
+    let src = source.to_string();
+    let hint = if pricing_source_is_file() {
+        "it is installed by your installer and zoder will not re-pull it while the pricing source is 'file' — update it there"
+    } else {
+        "run `zoder pricing refresh` to update it"
+    };
+    eprintln!(
+        "zoder: warning: installed {which} data is {age} days old (generated {date}, source {src}); {hint}"
+    );
+}
+
+/// Process-lifetime set of files already age-warned about, so each file
+/// warns at most once per process even when several commands print it.
+struct DataAgeState {
+    warned: std::collections::HashSet<String>,
+}
+
+static DATA_AGE_STATE: std::sync::OnceLock<std::sync::Mutex<DataAgeState>> =
+    std::sync::OnceLock::new();
+
+/// The process-lifetime warning guard (lazy, locked per call).
+fn data_age_state() -> &'static std::sync::Mutex<DataAgeState> {
+    DATA_AGE_STATE.get_or_init(|| {
+        std::sync::Mutex::new(DataAgeState {
+            warned: std::collections::HashSet::new(),
+        })
+    })
+}
+
+/// Cheap process-lifetime flag: has any `warn_data_age` call already seen
+/// file mode, so callers that build the `hint` text stay consistent without
+/// re-resolving the config.
+fn pricing_source_is_file() -> bool {
+    static IS_FILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_FILE.get_or_init(|| {
+        let cfg = Config::load().ok();
+        cfg.map(|c| pricing_source_switch(&c).is_file())
+            .unwrap_or(false)
+    })
+}
+
+impl FileSwitch {
+    fn is_file(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Verdict for the daily auto-refresh, factored out of
+/// [`maybe_spawn_daily_refresh`] so it is testable without spawning:
+/// `file` mode never spawns; `auto` mode spawns when the engine copy is
+/// missing or its mtime is older than 24h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshDecision {
+    /// No spawn, no warning.
+    Skip,
+    /// Spawn the detached `pricing refresh` (auto mode).
+    Spawn,
+    /// Do not spawn (file mode); print the age warning instead.
+    Warn,
+}
+
+/// The `path` and `data_date_age_days` parameters are part of the decision's
+/// signature so the caller hands over what it already gathered; the current
+/// verdict only needs the mtime for `auto` mode and the switch for `file`
+/// mode (the age warning is a separate step, emitted by the caller).
+fn daily_refresh_decision(
+    zoder_build: bool,
+    switch: FileSwitch,
+    _path: &Path,
+    mtime_age_secs: Option<i64>,
+    _data_date_age_days: Option<i64>,
+) -> RefreshDecision {
+    if !zoder_build {
+        return RefreshDecision::Skip;
+    }
+    if switch.is_file() {
+        return RefreshDecision::Warn;
+    }
+    // Auto mode: today's behaviour — stale (missing or >24h mtime) => spawn.
+    let stale = mtime_age_secs.map(|a| a > 24 * 60 * 60).unwrap_or(true);
+    if stale {
+        RefreshDecision::Spawn
+    } else {
+        RefreshDecision::Skip
+    }
+}
+
 /// Keep the pricing feed fresh without a daemon-side fetch or an external
 /// scheduler: when the engine catalog is missing or older than 24h, spawn a
 /// detached `pricing refresh` so the *next* run (and the ephemeral daemon it
 /// starts) sees current rates. Non-blocking and network-tolerant — a failed
 /// refresh just leaves the prior file in place.
+///
+/// In `file` pricing-source mode (env/config/managed marker) it never spawns:
+/// the installed files are authoritative and only their installer may update
+/// them; it prints the data-age warning instead.
 ///
 /// zoder-only by design: the public feed is zoder's sole cost source. zoder
 /// is your provider's billing-authoritative and never auto-fetches the public feed; its
@@ -14382,23 +14640,50 @@ fn maybe_spawn_daily_refresh() {
         return;
     }
     let path = zeroclaw_data_dir().join("pricing.json");
-    let stale = match std::fs::metadata(&path).and_then(|m| m.modified()) {
-        Ok(modified) => modified
-            .elapsed()
-            .map(|age| age > std::time::Duration::from_secs(24 * 60 * 60))
-            .unwrap_or(true),
-        Err(_) => true,
+    let mtime_age_secs = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age.as_secs() as i64);
+    // The engine copy carries the same metadata as the report copy when the
+    // daily refresh wrote it; fall back to the report copy's date for the
+    // warning so an operator sees the age of the data they installed.
+    let report_path = Config::home().join("pricing.json");
+    let cat = PricingCatalog::load(&report_path);
+    let data_date_age_days =
+        zoder_core::pricing::data_date(&cat.generated, cat.generated_at.as_deref().unwrap_or(""))
+            .map(|d| (chrono::Utc::now().date_naive() - d).num_days());
+    let switch = match Config::load() {
+        Ok(cfg) => pricing_source_switch(&cfg),
+        Err(_) => FileSwitch::None,
     };
-    if !stale {
-        return;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
-            .args(["pricing", "refresh"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+    match daily_refresh_decision(
+        is_zoder_build(),
+        switch,
+        &path,
+        mtime_age_secs,
+        data_date_age_days,
+    ) {
+        RefreshDecision::Skip => {}
+        RefreshDecision::Spawn => {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe)
+                    .args(["pricing", "refresh"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+        RefreshDecision::Warn => {
+            warn_data_age(
+                "pricing",
+                &report_path,
+                &cat.generated,
+                cat.generated_at.as_deref(),
+                cat.source.as_deref().unwrap_or(""),
+            );
+        }
     }
 }
 
@@ -14409,11 +14694,49 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             source,
             baseline,
             external,
+            force,
         } => {
             let sources = PricingSource::parse_list(source);
-            let (cat, stats) = sync_catalog(&sources, Some(baseline)).await?;
+            // `file` pricing-source mode: the installed files are authoritative
+            // and only their installer may update them. Refuse to overwrite
+            // (both the report catalog and, via the caller, the engine copy)
+            // unless `--force`.
+            let switch = match Config::load() {
+                Ok(cfg) => pricing_source_switch(&cfg),
+                Err(_) => FileSwitch::None,
+            };
+            if switch.is_file() && !*force {
+                eprintln!(
+                    "error: pricing source is 'file' ({}): refusing to overwrite {}; pass --force to refresh anyway",
+                    switch.label(),
+                    path.display()
+                );
+                return Err(anyhow::anyhow!(
+                    "pricing source is 'file' ({}) and --force was not passed",
+                    switch.label()
+                ));
+            }
+            let (mut cat, stats) = sync_catalog(&sources, Some(baseline)).await?;
+            // In `file` mode the installed file's provenance is what its
+            // installer gave it: even an explicit `--force` re-pull must not
+            // silently drop the file's `source`/`generated`/`managed` marker
+            // (a public repull would relabel it and unmanage the file).
+            // Carry the installed values into the refreshed catalog.
+            if switch.is_file() {
+                let installed = PricingCatalog::load(&path);
+                if let Some(src) = installed.source.clone() {
+                    cat.source = Some(src);
+                }
+                if installed.generated_at.is_some() {
+                    cat.generated_at = installed.generated_at.clone();
+                }
+                if !installed.generated.is_empty() {
+                    cat.generated = installed.generated.clone();
+                }
+                cat.managed = installed.managed;
+            }
             cat.save(&path)?;
-            publish_engine_catalog(&cat, *external, json)?;
+            publish_engine_catalog(&cat, *external, *force, json)?;
             // How current is the catalog we just wrote? A refresh can still
             // land on an old build date (a partial sync, a cached source), and
             // stale prices mis-state spend silently.
@@ -14475,6 +14798,21 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
         }
         PricingCmd::Show { model } => {
             let cat = PricingCatalog::load(&path);
+            // Data-age warning for the installed catalog (file mode only; once
+            // per process, stderr only).
+            let switch = match Config::load() {
+                Ok(cfg) => pricing_source_switch(&cfg),
+                Err(_) => FileSwitch::None,
+            };
+            if switch.is_file() {
+                warn_data_age(
+                    "pricing",
+                    &path,
+                    &cat.generated,
+                    cat.generated_at.as_deref(),
+                    cat.source.as_deref().unwrap_or(""),
+                );
+            }
             match cat.lookup(model) {
                 Some(p) if json => println!("{}", serde_json::to_string_pretty(p)?),
                 Some(p) => {
@@ -21080,6 +21418,325 @@ mod ledger_call_cost_tests {
         assert!(!p.is_flat_plan());
         p.billing = BillingMode::Subscription;
         assert!(p.is_flat_plan());
+    }
+}
+
+#[cfg(test)]
+mod pricing_source_file_tests {
+    //! Offline regression tests for the `file` pricing-source switch (env
+    //! `ZODER_PRICING_SOURCE`, config `[pricing] source = "file"`, or the
+    //! `"managed": true` marker inside the installed data files). Everything
+    //! runs against a `tempfile` `$ZODER_HOME`; nothing touches the real home.
+
+    use super::*;
+
+    /// Minimal valid config.json with a placeholder-free provider.
+    const CONFIG_JSON: &str = r#"{
+        "providers": [
+            {
+                "id": "prov-a",
+                "base_url": "https://api.example.com/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "paid": false,
+                "billing": "free",
+                "serves": ["prov-a-"]
+            }
+        ],
+        "default_provider": "prov-a",
+        "corpus_path": "/tmp/corpus.json",
+        "ledger_path": "/tmp/ledger.jsonl",
+        "health_path": "/tmp/health.json"
+    }"#;
+
+    fn write_pricing(home: &Path, body: &str) {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(home.join("pricing.json"), body).unwrap();
+    }
+
+    fn with_env_home<F: FnOnce()>(home: &Path, extra: &[(&str, &str)], f: F) {
+        let _lock = test_env::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_home = std::env::var("ZODER_HOME").ok();
+        let prev_extra: Vec<_> = extra
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        std::env::set_var("ZODER_HOME", home);
+        for (k, v) in extra {
+            std::env::set_var(k, v);
+        }
+        std::env::remove_var("ZODER_PRICING_SOURCE");
+        if let Some(v) = extra.iter().find(|(k, _)| *k == "ZODER_PRICING_SOURCE") {
+            std::env::set_var("ZODER_PRICING_SOURCE", v.1);
+        }
+        std::env::remove_var("ZODER_CORPUS_STALE_DAYS");
+        if let Some(v) = extra.iter().find(|(k, _)| *k == "ZODER_CORPUS_STALE_DAYS") {
+            std::env::set_var("ZODER_CORPUS_STALE_DAYS", v.1);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev_home {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        for (k, v) in prev_extra {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn daily_refresh_decision_auto_spawns_when_mtime_stale() {
+        let p = Path::new("/tmp/none/pricing.json");
+        // Missing file -> stale -> Spawn (auto mode).
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, p, None, Some(1)),
+            RefreshDecision::Spawn
+        );
+        // Fresh mtime (1h old) -> Skip even though data is a day old.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, p, Some(3600), Some(1)),
+            RefreshDecision::Skip
+        );
+        // >24h mtime -> Spawn.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), Some(1)),
+            RefreshDecision::Spawn
+        );
+        // Non-zoder build never spawns.
+        assert_eq!(
+            daily_refresh_decision(false, FileSwitch::None, p, None, None),
+            RefreshDecision::Skip
+        );
+    }
+
+    #[test]
+    fn daily_refresh_decision_file_mode_never_spawns() {
+        let p = Path::new("/tmp/none/pricing.json");
+        for switch in [FileSwitch::Env, FileSwitch::Config, FileSwitch::Managed] {
+            assert_eq!(
+                daily_refresh_decision(true, switch, p, None, Some(1)),
+                RefreshDecision::Warn,
+                "file mode ({switch:?}) must never spawn, even with a stale mtime"
+            );
+            // Fresh mtime still means no spawn.
+            assert_eq!(
+                daily_refresh_decision(true, switch, p, Some(60), None),
+                RefreshDecision::Warn
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_source_switch_from_env_file() {
+        let home = tempfile::tempdir().unwrap();
+        with_env_home(home.path(), &[("ZODER_PRICING_SOURCE", "file")], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(pricing_source_switch(&cfg), FileSwitch::Env);
+        });
+    }
+
+    #[test]
+    fn pricing_source_switch_env_auto_or_unset_is_auto() {
+        let home = tempfile::tempdir().unwrap();
+        with_env_home(home.path(), &[("ZODER_PRICING_SOURCE", "auto")], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(pricing_source_switch(&cfg), FileSwitch::None);
+        });
+        // unset:
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(pricing_source_switch(&cfg), FileSwitch::None);
+        });
+    }
+
+    #[test]
+    fn pricing_source_switch_from_config_file() {
+        let home = tempfile::tempdir().unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(CONFIG_JSON).unwrap();
+        body["pricing"] = serde_json::json!({ "source": "file" });
+        std::fs::write(home.path().join("config.json"), body.to_string()).unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(pricing_source_switch(&cfg), FileSwitch::Config);
+        });
+    }
+
+    #[test]
+    fn pricing_source_switch_from_managed_marker() {
+        let home = tempfile::tempdir().unwrap();
+        write_pricing(
+            home.path(),
+            r#"{"managed": true, "generated": "2026-10-14", "models": {}}"#,
+        );
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(pricing_source_switch(&cfg), FileSwitch::Managed);
+        });
+    }
+
+    #[test]
+    fn pricing_refresh_refuses_in_file_mode_and_leaves_files_identical() {
+        let home = tempfile::tempdir().unwrap();
+        let pricing = home.path().join("pricing.json");
+        std::fs::write(
+            &pricing,
+            r#"{"managed": true, "generated": "2026-10-14", "models": {}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&pricing).unwrap();
+        with_env_home(home.path(), &[], || {
+            // Simulate the gate exactly as cmd_pricing does: resolve the
+            // switch, then refuse before any network call or write.
+            let cfg = Config::load_unvalidated().unwrap();
+            let switch = pricing_source_switch(&cfg);
+            assert!(switch.is_file());
+            let refused = switch.is_file(); // no --force passed
+            assert!(
+                refused,
+                "file mode without --force must refuse the overwrite"
+            );
+        });
+        assert_eq!(
+            std::fs::read(&pricing).unwrap(),
+            before,
+            "the managed file must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn pricing_refresh_force_overrides_the_gate() {
+        let home = tempfile::tempdir().unwrap();
+        write_pricing(
+            home.path(),
+            r#"{"managed": true, "generated": "2026-10-14", "models": {}}"#,
+        );
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            let switch = pricing_source_switch(&cfg);
+            let force = true;
+            let refused = switch.is_file() && !force;
+            assert!(!refused, "--force must override the gate");
+        });
+    }
+
+    /// A forced re-pull in file mode must keep the installed file's
+    /// provenance (source / generated date / managed marker): the refreshed
+    /// catalog replaces the *data* (the model rows) but the file keeps the
+    /// identity its installer gave it. Without this the `--force` save would
+    /// relabel a managed file as public data and unmanage it.
+    #[test]
+    fn pricing_refresh_force_keeps_installed_provenance() {
+        let home = tempfile::tempdir().unwrap();
+        let pricing = home.path().join("pricing.json");
+        let installed = r#"{
+            "managed": true,
+            "generated": "2026-10-14",
+            "source": "an internal price database",
+            "models": {}
+        }"#;
+        std::fs::write(&pricing, installed).unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            let switch = pricing_source_switch(&cfg);
+            assert!(switch.is_file());
+            // Simulate the exact carry step of the forced save: a fresh
+            // public catalog (as `sync_catalog` builds one) is what would be
+            // written; in file mode the installed provenance wins.
+            let installed_cat = zoder_core::PricingCatalog::load(&pricing);
+            assert!(installed_cat.managed);
+            let mut cat = zoder_core::PricingCatalog {
+                generated: "2026-10-26T00:00:00Z".into(),
+                window: "live".into(),
+                ..zoder_core::PricingCatalog::default()
+            };
+            if switch.is_file() {
+                let installed = zoder_core::PricingCatalog::load(&pricing);
+                if let Some(src) = installed.source.clone() {
+                    cat.source = Some(src);
+                }
+                if installed.generated_at.is_some() {
+                    cat.generated_at = installed.generated_at.clone();
+                }
+                if !installed.generated.is_empty() {
+                    cat.generated = installed.generated.clone();
+                }
+                cat.managed = installed.managed;
+            }
+            assert!(
+                cat.managed,
+                "the managed marker must survive the forced re-pull"
+            );
+            assert_eq!(
+                cat.source.as_deref(),
+                Some("an internal price database"),
+                "the installer's source label must survive"
+            );
+            assert_eq!(
+                cat.generated, "2026-10-14",
+                "the file's own date must survive, not the pull date"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_days_threshold_invalid_falls_back_to_seven() {
+        let home = tempfile::tempdir().unwrap();
+        with_env_home(
+            home.path(),
+            &[("ZODER_CORPUS_STALE_DAYS", "garbage")],
+            || {
+                assert_eq!(stale_threshold_days(), 7);
+            },
+        );
+        with_env_home(home.path(), &[], || {
+            assert_eq!(stale_threshold_days(), 7);
+        });
+    }
+
+    #[test]
+    fn stale_days_zero_disables_the_warning() {
+        let home = tempfile::tempdir().unwrap();
+        with_env_home(home.path(), &[("ZODER_CORPUS_STALE_DAYS", "0")], || {
+            assert_eq!(stale_threshold_days(), 0);
+            // Even a 100-day-old date must not warn.
+            warn_data_age("pricing", home.path(), "2026-01-01", None, "");
+        });
+    }
+
+    #[test]
+    fn config_validation_rejects_bad_pricing_source() {
+        let home = tempfile::tempdir().unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(CONFIG_JSON).unwrap();
+        body["pricing"] = serde_json::json!({ "source": "bogus" });
+        std::fs::write(home.path().join("config.json"), body.to_string()).unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            let problems = cfg.validate();
+            assert!(
+                problems.iter().any(|p| p.contains("pricing.source")),
+                "validate() must reject a bad pricing.source, got {problems:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn config_validation_accepts_file_source() {
+        let home = tempfile::tempdir().unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(CONFIG_JSON).unwrap();
+        body["pricing"] = serde_json::json!({ "source": "file" });
+        std::fs::write(home.path().join("config.json"), body.to_string()).unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert!(
+                !cfg.validate().iter().any(|p| p.contains("pricing.source")),
+                "validate() must accept source = \"file\""
+            );
+        });
     }
 }
 

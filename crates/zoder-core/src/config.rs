@@ -2119,6 +2119,42 @@ pub struct HealthConfig {
     pub providers: Vec<String>,
 }
 
+/// `[pricing]` block from `config.json`.
+///
+/// Controls where the installed price/corpus data files come from:
+///
+/// ```toml
+/// [pricing]
+/// source = "auto"   # default: the daily auto-refresh may re-pull public data
+/// # source = "file" # installed files are authoritative; never re-pull or
+/// #                # overwrite them (update them via your installer)
+/// ```
+///
+/// `auto` is exactly today's behaviour and MUST stay the default. `file`
+/// additionally honors the env var `ZODER_PRICING_SOURCE=file` and a
+/// top-level `"managed": true` flag inside `pricing.json` /
+/// `model_corpus.json` — any ONE of the three switches selecting `file`
+/// wins, so an installer can mark its files without a config change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PricingConfig {
+    /// Where the installed price/corpus data comes from: `auto` (default)
+    /// or `file`.
+    #[serde(default = "PricingConfig::default_source")]
+    pub source: String,
+}
+
+impl PricingConfig {
+    pub fn default_source() -> String {
+        "auto".to_string()
+    }
+
+    /// `true` only when the operator explicitly asked for `file`.
+    pub fn wants_file(&self) -> bool {
+        self.source.eq_ignore_ascii_case("file")
+    }
+}
+
 impl HealthConfig {
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
@@ -2513,6 +2549,15 @@ pub struct Config {
     /// (`RoutingConfig::active()`), preserving the legacy free-only behavior.
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// `[pricing]` block: where the installed price/corpus data comes from.
+    /// Absent => `auto` (today's behaviour: the daily auto-refresh may
+    /// re-pull public data). `file` means the installed files are
+    /// authoritative — never re-pull or overwrite them. The env var
+    /// `ZODER_PRICING_SOURCE=file` or a top-level `"managed": true` inside
+    /// the data file itself also selects `file`; any one of them wins.
+    /// See [`PricingConfig`].
+    #[serde(default)]
+    pub pricing: PricingConfig,
     /// OS-level sandbox backend selection for the loop's `--check` execution.
     /// Default (`backend = None`) is byte-for-byte identical to the prior
     /// behavior — the loop consults the string denylist only. Selecting
@@ -3866,6 +3911,7 @@ impl Config {
             models: BTreeMap::new(),
             budget: crate::budget::Budget::default(),
             routing: RoutingConfig::default(),
+            pricing: PricingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
             review: ReviewConfig::default(),
             model_families: BTreeMap::new(),
@@ -4612,6 +4658,20 @@ impl Config {
             } else {
                 normalized_family_keys.insert(normalized_key, (key.as_str(), normalized_family));
             }
+        }
+        // `[pricing] source` may only be `auto` or `file` (case-insensitive);
+        // any other value is a typo that would silently disable the managed
+        // file protection, so `--validate` must reject it.
+        if !self.pricing.source.is_empty()
+            && !matches!(
+                self.pricing.source.to_ascii_lowercase().as_str(),
+                "auto" | "file"
+            )
+        {
+            errs.push(format!(
+                "pricing.source must be \"auto\" or \"file\" (got {:?})",
+                self.pricing.source
+            ));
         }
         // A config file that exists but was skipped is a problem, not a
         // warning: the providers (or review caps) it contributes are silently
