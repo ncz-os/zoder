@@ -88,17 +88,22 @@ impl Prefix {
         self.system.trim().is_empty() && self.tools.is_empty()
     }
 
-    /// Highest byte offset at which a volatile value MAY appear: the offset of
-    /// the tools section marker, i.e. everything before it is prefix. This is
-    /// the bound `place_volatile` enforces and the tests assert against.
+    /// Highest byte offset at which a volatile value MAY appear: the length of
+    /// the whole rendered prefix (system AND tool schemas), since both are
+    /// cache-stable and a cwd or session id inside a tool description breaks
+    /// the cache exactly as badly as one in the system prompt.
+    ///
+    /// Derived from `render`, not re-formatted by hand, so the bound moves with
+    /// the layout instead of silently accepting values past the real prefix end.
     pub fn max_volatile_offset(&self) -> usize {
-        // Derived from the rendered prefix, not re-formatted by hand: if
-        // `render` ever changes layout, this bound moves with it instead of
-        // silently accepting values past the real prefix end.
+        self.render().len()
+    }
+
+    /// Offset at which the tool-schema section begins. Useful for diagnostics;
+    /// NOT a boundary for the leak check (the schema block is prefix too).
+    pub fn tools_offset(&self) -> usize {
         let rendered = self.render();
-        rendered
-            .find(&tools_marker())
-            .unwrap_or(rendered.len())
+        rendered.find(&tools_marker()).unwrap_or(rendered.len())
     }
 }
 
@@ -187,8 +192,10 @@ pub fn render_first_message(prefix: &Prefix, volatile: &Volatile, body: &str) ->
     out
 }
 
-/// Byte offsets of volatile values inside `text`, in order. Used by the leak
-/// check: any offset strictly inside the prefix is a cache break.
+/// The FIRST byte offset of each volatile value found in `text`, in value
+/// order. Used by the leak check: any offset inside the prefix is a cache break,
+/// so the first occurrence is the one that matters. Later occurrences are not
+/// reported — this is not a counting or redaction helper.
 ///
 /// Only values long enough to be distinctive are searched. A bare iteration
 /// number (`"3"`) occurs in any prompt by chance, and flagging it would make the
@@ -231,11 +238,30 @@ impl Stability {
     }
 }
 
-/// Check that no volatile value leaked into the prefix.
+/// Check that no volatile value leaked into the CACHE-STABLE PREFIX — the
+/// system prompt and the tool schemas, both of which are part of the cache key.
+///
+/// Scope: this inspects `prefix.render()` only. A value in the volatile tail
+/// that [`render_first_message`] appends after the prefix is expected and is not
+/// examined here. To check an assembled message for a leak before a given
+/// offset, use [`check_message_stability`].
 pub fn check_stability(prefix: &Prefix, volatile: &Volatile) -> Stability {
     let rendered = prefix.render();
-    let bound = prefix.max_volatile_offset();
-    for (value, offset) in volatile_offsets(&rendered, volatile) {
+    check_text_stability(&rendered, prefix.max_volatile_offset(), volatile)
+}
+
+/// Check an assembled first message: any volatile value appearing before the
+/// prefix ends is a cache break, wherever the caller put it.
+pub fn check_message_stability(
+    prefix: &Prefix,
+    message: &str,
+    volatile: &Volatile,
+) -> Stability {
+    check_text_stability(message, prefix.max_volatile_offset(), volatile)
+}
+
+fn check_text_stability(text: &str, bound: usize, volatile: &Volatile) -> Stability {
+    for (value, offset) in volatile_offsets(text, volatile) {
         if offset < bound {
             return Stability::Leaked { value, offset };
         }
@@ -390,11 +416,52 @@ mod tests {
     }
 
     #[test]
-    fn max_volatile_offset_covers_only_the_system_section() {
+    fn the_leak_check_covers_the_whole_prefix_including_tool_schemas() {
         let p = prefix();
         let rendered = p.render();
-        assert!(p.max_volatile_offset() < rendered.len());
-        assert!(rendered[p.max_volatile_offset()..].starts_with("[zoder-prefix:tools v1]"));
+        // The bound is the end of the whole rendered prefix: the schema block is
+        // cache-stable too.
+        assert_eq!(p.max_volatile_offset(), rendered.len());
+        assert!(p.tools_offset() < p.max_volatile_offset());
+    }
+
+    #[test]
+    fn a_volatile_value_inside_a_tool_schema_is_a_leak() {
+        // A cwd embedded in a tool description breaks the cache exactly as badly
+        // as one in the system prompt, so it must be reported.
+        let volatile = Volatile {
+            cwd: Some("/home/jasonperlow/hive-workspaces/job".into()),
+            ..Default::default()
+        };
+        let leaky = Prefix::new("You are the AUTHOR.").with_tool(
+            "file_read",
+            r#"{"description":"read files under /home/jasonperlow/hive-workspaces/job"}"#,
+        );
+        match check_stability(&leaky, &volatile) {
+            Stability::Leaked { value, offset } => {
+                assert!(value.starts_with("/home/jasonperlow"));
+                assert!(offset > leaky.tools_offset(), "the leak is in the schema block");
+            }
+            Stability::Stable => panic!("a cwd in a tool schema must be caught"),
+        }
+    }
+
+    #[test]
+    fn the_volatile_tail_is_not_a_leak() {
+        let volatile = Volatile {
+            cwd: Some("/home/jasonperlow/hive-workspaces/job".into()),
+            session_id: Some("01a17566-722e".into()),
+            ..Default::default()
+        };
+        let p = prefix();
+        let msg = render_first_message(&p, &volatile, "do the task");
+        // Legitimate placement: after the prefix.
+        assert!(check_message_stability(&p, &msg, &volatile).is_stable());
+        assert!(check_stability(&p, &volatile).is_stable());
+        // Same value moved into the prefix: caught.
+        let bad = Prefix::new(format!("cwd: {}\nsys", volatile.cwd.clone().unwrap()));
+        let bad_msg = render_first_message(&bad, &volatile, "task");
+        assert!(!check_message_stability(&bad, &bad_msg, &volatile).is_stable());
     }
 
     #[test]

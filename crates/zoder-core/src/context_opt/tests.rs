@@ -135,6 +135,23 @@ fn cost_never_bills_more_tokens_than_the_prompt_carried() {
 }
 
 #[test]
+fn an_inconsistent_split_is_not_reported_as_a_zero_percent_hit_rate() {
+    // 0 hits AND 0 misses for a non-empty prompt cannot be a real split; it is
+    // a broken report, not evidence of a cache miss.
+    let t = CacheTelemetry {
+        prompt_tokens: 5_000,
+        cache_hit_tokens: 0,
+        completion_tokens: 10,
+        reported_cache_miss: Some(0),
+    };
+    assert_eq!(t.hit_share_raw(), None);
+    assert_eq!(
+        classify(ProviderCacheShape::Split, &t, DEFAULT_CACHE_HIT_FLOOR),
+        CacheVerdict::Unknown
+    );
+}
+
+#[test]
 fn cost_with_no_cache_counter_bills_every_token_at_the_miss_rate() {
     let t = CacheTelemetry {
         prompt_tokens: 1_000,
@@ -589,6 +606,41 @@ fn is_brief_is_bounds_safe() {
     assert!(!is_brief(&[], 0));
     let digest = Turn::new("system", Digest::default().render());
     assert!(!is_brief(&[digest], 0));
+}
+
+#[test]
+fn squash_never_exceeds_its_budget() {
+    let long = "word ".repeat(200);
+    let out = squash(&long);
+    assert!(out.len() <= SQUASH_MAX, "{} bytes", out.len());
+    assert!(out.ends_with("..."));
+    // A single word longer than the budget is cut, not dropped.
+    let one = squash(&"x".repeat(500));
+    assert!(one.len() <= SQUASH_MAX);
+    assert!(one.ends_with("..."));
+    // Multi-byte content is cut on a char boundary and still bounded.
+    let jp = squash(&"日本語".repeat(200));
+    assert!(jp.len() <= SQUASH_MAX);
+    assert!(std::str::from_utf8(jp.as_bytes()).is_ok());
+    // Short lines pass through unchanged.
+    assert_eq!(squash("  short   line "), "short line");
+}
+
+#[test]
+fn a_digest_in_the_verbatim_tail_is_absorbed_not_duplicated() {
+    // keep_recent large enough that an existing digest lands in the tail.
+    let mut turns = conversation(30, 4_000);
+    turns.push(Turn::new("system", digest_for(&["src/tail.rs"], &["TODO: tail"])));
+    for i in 0..10 {
+        let name = format!("src/t{i}.rs");
+        let body = format!("diff --git a/{name} b/{name}\n+++ b/{name}\n{}", "m".repeat(4_000));
+        turns.push(Turn::tool_result(&name, body));
+    }
+    let out = compact(&turns, 1, 100, 256, 256);
+    let digests = out.turns.iter().filter(|t| is_digest(t)).count();
+    assert_eq!(digests, 1, "exactly one digest after absorption");
+    let d = digest_from_render(&out.turns.iter().find(|t| is_digest(t)).unwrap().content);
+    assert!(d.files.iter().any(|f| f == "src/tail.rs"), "tail digest carried");
 }
 
 // --- lever profiles --------------------------------------------------------

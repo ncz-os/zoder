@@ -19,9 +19,15 @@ From the DeepSeek console export for the 30 days to 2026-10-25:
 | Input tokens | 10.6 B |
 | Output tokens | 50.1 M |
 | Input:output ratio | **212:1** |
-| Cache hits | 98.9% of input (10.49 B at $0.003/M ≈ $31) |
-| Cache misses | 114 M ($17) |
-| Output | $30 |
+| Cache hits | 98.9% of input — 10.49 B at $0.003/M ≈ $31.5 |
+| Cache misses | 114 M at $0.15/M ≈ $17.1 |
+| Output | 50.1 M at $0.60/M ≈ $30.1 |
+
+Summing those three derived lines gives ≈ $78.7 against the $79.79 total; the
+remainder is rounding in the export plus the output rate's exact value. The
+rates used are the ones the operator's pricing config carries for
+deepseek-flash ($0.003 / $0.15 / $0.60 per M). If a review finds the miss rate
+is not $0.15/M, the derived dollar figures above are the lines to correct.
 
 One `zoder` loop on CERBERUS used **32.9 M input tokens for 110 K output** —
 roughly 250 calls each resending a full 128 K window. Every agent turn resends
@@ -61,6 +67,13 @@ reported `prompt_cache_miss_tokens` larger than `prompt - hit` (which DeepSeek
 returns when it re-bills a broken prefix, and which includes the re-read schema
 block) must not be *added* to the hit count — that would charge for tokens the
 request never carried.
+
+That makes `cost_usd` a **lower bound**: it does not use `reported_cache_miss`
+at all, because the two candidate readings (the prompt was re-billed in full, or
+the reported figure is the truth) cannot be told apart from the response. A
+prefix break is instead reported as `CacheVerdict::PrefixBreak` by `classify`,
+and when reconciling a month every call classified as a break should be costed
+at `prompt × miss_rate`. This is the open cost-model item below.
 
 Pinned by `context_opt::tests::cost_never_bills_more_tokens_than_the_prompt_carried`:
 1 000 prompt tokens with 900 hits and a reported miss of 250 bills
@@ -147,11 +160,14 @@ window is 200 K and whose metering is by tokens.
 
 ### Profiles
 
-| | `tool_output_cap_bytes` | `elide_after_turns` | `compact_after_tokens` |
-|---|---|---|---|
-| `Levers::DEEPSEEK` | 16 384 | 8 | 48 000 |
-| `Levers::MINIMAX` | 12 288 | 6 | 32 000 |
-| `Levers::OTHER` | 16 384 | 8 | 0 (disabled) |
+| | `tool_output_cap_bytes` | `elide_after_turns` | `elide_min_bytes` | `compact_after_tokens` | `keep_recent_turns` |
+|---|---|---|---|---|---|
+| `Levers::DEEPSEEK` | 16 384 | 8 | 2 048 | 48 000 | 6 |
+| `Levers::MINIMAX` | 12 288 | 6 | 2 048 | 32 000 | 6 |
+| `Levers::OTHER` | 16 384 | 8 | 2 048 | 0 (disabled) | 6 |
+
+`elide_min_bytes` is the floor below which a stale tool result is not worth
+replacing: a `git status` line costs nothing and a stub would cost more.
 
 `OTHER` caps and elides but never compacts. A local vLLM model has no
 per-token bill, so a summarised history is pure quality risk for no saving.
@@ -207,6 +223,6 @@ Measured at commit `88bda37`'s successor on `feat/context-optimization-20261025`
 (the review round added parser, char-boundary and inflation tests). Re-derive with
 `cargo test -p zoder-core --lib`; the numbers will drift as tests are added.
 
-- `zoder-core` lib: **689 passed, 0 failed**.
-- `context_opt` alone: **52 tests**.
+- `zoder-core` lib: **694 passed, 0 failed**.
+- `context_opt` alone: **57 tests**.
 - `cargo clippy -p zoder-core --all-targets`: **0 warnings**.

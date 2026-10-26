@@ -121,7 +121,13 @@ impl CacheTelemetry {
         if self.prompt_tokens == 0 {
             return Some(1.0);
         }
+        // Nothing published at all: no claim to make.
         if self.cache_hit_tokens == 0 && self.reported_cache_miss.is_none() {
+            return None;
+        }
+        // A split that does not add up (0 hits AND 0 misses for a non-empty
+        // prompt) is not a 0% hit rate; it is an inconsistent report.
+        if self.cache_hit_tokens == 0 && self.reported_cache_miss == Some(0) {
             return None;
         }
         Some(self.cache_read_tokens() as f64 / self.prompt_tokens as f64)
@@ -135,6 +141,15 @@ impl CacheTelemetry {
     /// the remainder at the full rate), so a reported miss larger than the
     /// remainder is clamped. Billing both in full would charge the operator for
     /// tokens that were never sent.
+    ///
+    /// `reported_cache_miss` is deliberately NOT used here, and this is the one
+    /// place it would change the answer. When DeepSeek breaks a prefix it
+    /// re-bills the schema block and reports a miss larger than `prompt - hit`;
+    /// the true cost of that break is the whole prompt at the miss rate. Rather
+    /// than guess which of the two figures the invoice used, this bills the
+    /// lower bound (`prompt - hit`) and the break is reported separately by
+    /// [`classify`] as a [`CacheVerdict::PrefixBreak`]. Treat any call classified
+    /// as a break as costing `prompt x miss_rate` when reconciling a month.
     pub fn cost_usd(&self, hit_rate: f64, miss_rate: f64, output_rate: f64) -> f64 {
         let hit = if self.cache_hit_tokens == 0 {
             0
@@ -319,8 +334,10 @@ The output is unchanged on disk; re-read the file (or re-run the command) if it 
 /// nothing. A result no longer than the effective cap — including one between
 /// the requested cap and `MIN_CAP_BYTES` — is returned untouched, because
 /// honouring a sub-floor cap is not possible without losing more to the stub
-/// than is saved. When a cut IS made, `head + tail == cap` and the stub's
-/// omitted count is the exact byte delta, so `kept + omitted == original len`.
+/// than is saved. When a cut IS made, the kept head+tail is at most `cap` (it can
+/// be a few bytes less when a multi-byte character straddles a boundary, since
+/// both cuts snap inward on a char boundary), and the stub's omitted count is the
+/// exact byte delta, so `kept + omitted == original len` always holds.
 pub fn cap_tool_output(turn: &Turn, cap_bytes: usize) -> Turn {
     if cap_bytes == 0 || turn.content.len() <= cap_bytes {
         return turn.clone();
@@ -542,9 +559,18 @@ fn strip_todo_tail(s: &str) -> String {
     s.to_string()
 }
 
-fn squash(s: &str) -> String {    let mut out = String::with_capacity(s.len().min(160));
+/// Longest a squashed digest line may be, INCLUDING the ellipsis.
+const SQUASH_MAX: usize = 160;
+
+/// Collapse whitespace and bound a line to [`SQUASH_MAX`] bytes on a char
+/// boundary. The ellipsis is reserved out of the budget, so the result never
+/// exceeds the cap.
+fn squash(s: &str) -> String {
+    let mut out = String::with_capacity(SQUASH_MAX.min(s.len()));
+    let budget = SQUASH_MAX - 3; // room for "..."
     for w in s.split_whitespace() {
-        if out.len() + w.len() + 1 > 160 {
+        let extra = if out.is_empty() { w.len() } else { w.len() + 1 };
+        if out.len() + extra > budget {
             out.push_str("...");
             break;
         }
@@ -552,6 +578,15 @@ fn squash(s: &str) -> String {    let mut out = String::with_capacity(s.len().mi
             out.push(' ');
         }
         out.push_str(w);
+    }
+    // A single word longer than the budget is cut, not dropped.
+    if out.is_empty() && !s.trim().is_empty() {
+        let mut cut = budget.min(s.trim().len());
+        while cut > 0 && !s.trim().is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.push_str(&s.trim()[..cut]);
+        out.push_str("...");
     }
     out
 }
@@ -576,9 +611,20 @@ fn reread_path(line: &str) -> Option<String> {
 }
 
 fn is_decision_line(lower: &str) -> bool {
-    ["we decided", "i decided", " will ", " must ", "because", "instead of", "chose ", "plan:"]
-        .iter()
-        .any(|k| lower.contains(k))
+    // Phrases that read as a settled decision. Matched on word boundaries
+    // (`" will "` alone would miss "Will refactor…" at the start of a line and
+    // "…we must" at the end, silently dropping those from the digest).
+    const PHRASES: [&str; 7] = [
+        "we decided",
+        "i decided",
+        " will ",
+        " must ",
+        "because",
+        "instead of",
+        "plan:",
+    ];
+    let padded = format!(" {lower} ");
+    PHRASES.iter().any(|k| padded.contains(k)) || lower.starts_with("will ") || lower.ends_with(" must")
 }
 
 /// Result of one compaction pass.
@@ -665,13 +711,10 @@ pub fn compact(
     // would otherwise fold "a summary of the earlier turns" into a summary of a
     // summary, and every later pass would nest one level deeper. The digest is
     // already pinned out of the foldable tail; fold it in from `pinned` too.
-    // An existing digest may sit anywhere in the span — typically just after
-    // the brief, inside what is now `foldable`. Collect it from both parts.
-    let prior: Vec<&Turn> = pinned
-        .iter()
-        .chain(foldable.iter())
-        .filter(|t| is_digest(t))
-        .collect();
+    // An existing digest may sit anywhere — typically just after the brief,
+    // but a large `keep_recent` can leave one inside the verbatim tail. Scan the
+    // WHOLE conversation so a second pass can never end up with two digests.
+    let prior: Vec<&Turn> = turns.iter().filter(|t| is_digest(t)).collect();
     let fresh: Vec<Turn> = pinned
         .iter()
         .chain(foldable.iter())
@@ -700,11 +743,12 @@ pub fn compact(
         digest.absorbed_digests = absorbed;
     }
     // Order: pinned system prompt and brief, then the digest, then the recent
-    // turns verbatim.
+    // turns verbatim. Digests are filtered out of BOTH the pinned head and the
+    // verbatim tail, since every one of them has just been absorbed above.
     let mut out: Vec<Turn> = Vec::with_capacity(pinned.len() + recent.len() + 1);
     out.extend(pinned.iter().filter(|t| !is_digest(t)).cloned());
     out.push(Turn::new("system", digest.render()));
-    out.extend_from_slice(recent);
+    out.extend(recent.iter().filter(|t| !is_digest(t)).cloned());
     let bytes_after: u64 = out.iter().map(Turn::bytes).sum();
     Compacted {
         turns: out,
