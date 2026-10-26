@@ -462,6 +462,88 @@ fn a_carried_digest_keeps_its_files_and_todos() {
     assert!(digest.contains("src/new"), "new work folded in: {digest}");
 }
 
+#[test]
+fn a_rendered_digest_round_trips_through_the_parser() {
+    // `digest_from_render` must recover what `render` wrote, or a carried
+    // digest silently loses its lists and its turn count.
+    let d = Digest {
+        files: vec!["src/a.rs".into(), "src/b.rs".into()],
+        decisions: vec!["We decided to clamp".into()],
+        open_todos: vec!["TODO: rerun".into()],
+        turns: 37,
+        bytes_before: 102_400,
+        absorbed_digests: 0,
+    };
+    let back = digest_from_render(&d.render());
+    assert_eq!(back.files, d.files);
+    assert_eq!(back.decisions, d.decisions);
+    assert_eq!(back.open_todos, d.open_todos);
+    assert_eq!(back.turns, 37, "the turn count is at index 4, not 3 or 5");
+}
+
+#[test]
+fn carrying_a_digest_does_not_inflate_the_reported_span() {
+    // The carried digest's own turns/bytes describe work that is no longer in
+    // the conversation. Adding them to the fresh counts makes the header claim
+    // more than this pass saw, unbounded across passes.
+    let mut turns = conversation(20, 4_000);
+    turns.push(Turn::new("system", digest_for_count(&["src/deep.rs"], 100, 900_000)));
+    for i in 0..30 {
+        let name = format!("src/new{i}.rs");
+        let body = format!("diff --git a/{name} b/{name}\n+++ b/{name}\n{}", "m".repeat(4_000));
+        turns.push(Turn::tool_result(&name, body));
+        turns.push(Turn::new("assistant", "We must keep going."));
+    }
+    let out = compact(&turns, 48_000, 6, 256, 256);
+    let digest = out.turns.iter().find(|t| is_digest(t)).unwrap();
+    let parsed = digest_from_render(&digest.content);
+    // This pass folded 60 turns; the carried digest claimed 100 of its own.
+    assert_eq!(
+        parsed.turns, out.folded,
+        "the header reports this pass's span, not the prior digest's history"
+    );
+    assert!(
+        parsed.bytes_before < 900_000,
+        "the prior digest's byte total is not added in"
+    );
+    assert_eq!(parsed.absorbed_digests, 1, "the absorption is disclosed");
+    // The lists still carry the earlier work.
+    assert!(parsed.files.iter().any(|f| f == "src/deep.rs"));
+}
+
+#[test]
+fn repeated_passes_do_not_grow_the_digest_header() {
+    let turns = conversation(120, 4_000);
+    let first = compact(&turns, 48_000, 6, 256, 256);
+    let d1 = digest_from_render(
+        &first.turns.iter().find(|t| is_digest(t)).unwrap().content,
+    );
+    let mut second_in = first.turns.clone();
+    second_in.push(Turn::new("assistant", "z".repeat(200_000)));
+    let second = compact(&second_in, 1, 6, 256, 256);
+    let d2 = digest_from_render(
+        &second.turns.iter().find(|t| is_digest(t)).unwrap().content,
+    );
+    assert!(
+        d2.turns <= d1.turns + 2,
+        "a second pass must not inflate the count: {} -> {}",
+        d1.turns,
+        d2.turns
+    );
+}
+
+fn digest_for_count(files: &[&str], turns: usize, bytes: u64) -> String {
+    Digest {
+        files: files.iter().map(|s| s.to_string()).collect(),
+        decisions: vec![],
+        open_todos: vec![],
+        turns,
+        bytes_before: bytes,
+        absorbed_digests: 0,
+    }
+    .render()
+}
+
 fn digest_for(files: &[&str], todos: &[&str]) -> String {
     Digest {
         files: files.iter().map(|s| s.to_string()).collect(),
@@ -469,6 +551,7 @@ fn digest_for(files: &[&str], todos: &[&str]) -> String {
         open_todos: todos.iter().map(|s| s.to_string()).collect(),
         turns: 12,
         bytes_before: 48_000,
+        absorbed_digests: 0,
     }
     .render()
 }
