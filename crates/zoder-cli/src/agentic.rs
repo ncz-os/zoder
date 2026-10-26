@@ -2082,9 +2082,12 @@ async fn dispatch_reviewer_for_model(
     // every direct chat builder uses (explicit --reasoning > zoder model
     // entry > engine profile for the selected agent > engine reviewer profile
     // > first engine profile serving the model).
-    let direct = eng
-        .engine_models
-        .request_settings_for(model, cli.agent.as_deref(), cli.reasoning.as_deref(), model_cfg);
+    let direct = eng.engine_models.request_settings_for(
+        model,
+        cli.agent.as_deref(),
+        cli.reasoning.as_deref(),
+        model_cfg,
+    );
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -19497,5 +19500,214 @@ mod loop_review_base_tests {
             .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
             .map(|l| l[1..].to_string())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer direct-request regression guard.
+//
+// The reviewer builder and the oneshot builder now share ONE resolver
+// (`EngineModelRegistry::request_settings_for`). The reviewer's exact
+// precedence is a contract the loop's review pipeline relies on, so this
+// module pins it: explicit `--reasoning` > zoder model entry > engine
+// profile for the selected agent > engine reviewer profile > first engine
+// profile serving the model, with the same chain for
+// `chat_template_kwargs`. These tests run `dispatch_reviewer_for_model`
+// end-to-end against a wiremock provider and assert the fields on the
+// wire, so any future drift in the shared resolver shows up here.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reviewer_request_settings_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "rv-model";
+
+    /// Engine `config.toml` with a reviewer profile serving `MODEL` that
+    /// pins `provider_extra = { reasoning_effort = "none" }`. The profile's
+    /// provider identity (openai-chat kind + endpoint) must match the
+    /// zoder-side `local` provider, which binds to it via
+    /// `engine_provider_ref`, so `bind_engine_provider_refs` passes.
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+provider_extra = {{ reasoning_effort = "none" }}
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    fn write_home(home: &std::path::Path, mock_uri: &str, models_json: Option<serde_json::Value>) {
+        let mut body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [MODEL],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        if let Some(models) = models_json {
+            body["models"] = models;
+        }
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [{"id": MODEL, "free": true, "routable": true}],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn received_reviewer_body(server: &MockServer) -> serde_json::Value {
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .find(|r| r.method.as_str() == "POST")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).expect("body is JSON"))
+            .expect("reviewer sent a chat request")
+    }
+
+    /// Run the reviewer dispatch end-to-end. The wiremock reply carries the
+    /// verdict so the policy verify (free model, no substitution) passes.
+    async fn run_reviewer(
+        server: &MockServer,
+        extra_cli: &[&str],
+        home: &std::path::Path,
+        engine_path: &std::path::Path,
+        models_json: Option<serde_json::Value>,
+    ) -> Result<Completion, ReviewerError> {
+        let reply = serde_json::json!({
+            "verdict": "approve",
+            "summary": "ok",
+            "findings": [],
+        })
+        .to_string();
+        // The reviewer call is non-streaming (`stream: false`): the provider
+        // parses the whole body as one chat-completion object.
+        let body = format!(
+            r#"{{"model":"{MODEL}","choices":[{{"message":{{"content":{:?}}}}}]}}"#,
+            reply
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+        write_home(home, &server.uri(), models_json);
+        let _guard = EnvGuard::new(home);
+        let _socket = std::env::var("ZEROCLAW_SOCKET").ok();
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", home.join("engine-cfg"));
+
+        let mut argv = vec!["zoder", "--quiet"];
+        argv.extend_from_slice(extra_cli);
+        let cli = crate::Cli::try_parse_from(argv).expect("reviewer arguments parse");
+        dispatch_reviewer_for_model(
+            &cli,
+            MODEL,
+            MODEL,
+            "system prompt",
+            "diff",
+            4096,
+            Some(engine_path),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn reviewer_sends_engine_profile_reasoning_effort() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        let engine_toml = engine_toml(&server.uri());
+        std::fs::write(&engine_path, engine_toml).unwrap();
+        let result = run_reviewer(&server, &[], dir.path(), &engine_path, None).await;
+        let _ = dir;
+        let _completion = result.expect("reviewer call succeeds");
+        let body = received_reviewer_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none"),
+            "the reviewer must still send the engine profile's reasoning_effort: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_cli_reasoning_still_overrides_engine_profile() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        let engine_toml = engine_toml(&server.uri());
+        std::fs::write(&engine_path, engine_toml).unwrap();
+        let result = run_reviewer(
+            &server,
+            &["--reasoning", "low"],
+            dir.path(),
+            &engine_path,
+            None,
+        )
+        .await;
+        let _ = dir;
+        let _completion = result.expect("reviewer call succeeds");
+        let body = received_reviewer_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low"),
+            "an explicit --reasoning flag must still win in the reviewer: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_zoder_model_entry_still_wins_over_engine_profile() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        let engine_toml = engine_toml(&server.uri());
+        std::fs::write(&engine_path, engine_toml).unwrap();
+        let models = serde_json::json!({
+            "local.test": { "model": MODEL, "reasoning_effort": "high" },
+        });
+        let result = run_reviewer(&server, &[], dir.path(), &engine_path, Some(models)).await;
+        let _ = dir;
+        let _completion = result.expect("reviewer call succeeds");
+        let body = received_reviewer_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high"),
+            "the zoder model entry must still win in the reviewer: {body}"
+        );
     }
 }
