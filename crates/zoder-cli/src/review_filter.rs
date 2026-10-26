@@ -1256,7 +1256,16 @@ fn range_binding_evidence(
         }) {
             continue;
         }
-        let evidence = name_evidence(path, &full, &name, Some(start + 1), &|_| None)?;
+        // One unbound name is enough to keep the finding: return `None` (the
+        // caller keeps it unchanged) rather than collecting partial evidence.
+        // Written as an explicit match so the no-panic contract is visible:
+        // `name_evidence` answers `None` for every name the file does not
+        // bind, and this never unwraps or panics.
+        #[allow(clippy::question_mark)] // explicit `None` documents the no-panic contract
+        let evidence = match name_evidence(path, &full, &name, Some(start + 1), &|_| None) {
+            Some(evidence) => evidence,
+            None => return None,
+        };
         out.push((name, evidence.0, evidence.1));
     }
     if out.is_empty() {
@@ -2210,5 +2219,54 @@ pub(crate) mod tests {
             claimed_symbols("Missing import of the re package", ""),
             vec!["re"]
         );
+    }
+    /// An unbound identifier in the cited range must make the function return
+    /// `None` (never panic), whatever combination of bound and unbound names
+    /// the range uses.
+    #[test]
+    fn an_unbound_name_in_the_range_returns_none_without_panicking() {
+        let lines = [
+            "import json",
+            "MAX_ROWS = 10",
+            "def run(path):",
+            "    rows = json.loads(path)",
+            "    return rows[:UNDEFINED_LIMIT]",
+        ];
+        // Every name `range_binding_evidence` collects, checked one at a time:
+        // the bound ones prove, the unbound one only ever answers `None`.
+        assert!(range_binding_evidence("tools/report.py", &lines, (4, 5)).is_none());
+        assert!(range_binding_evidence("tools/report.py", &lines, (3, 5)).is_none());
+        // A range whose names are all bound still proves.
+        assert!(range_binding_evidence("tools/report.py", &lines, (2, 2)).is_some());
+        // An empty or out-of-file range is not a range at all.
+        assert!(range_binding_evidence("tools/report.py", &lines, (9, 12)).is_none());
+        assert!(range_binding_evidence("tools/report.py", &lines, (3, 3)).is_none());
+    }
+
+    /// The same through the public entry point: the filter keeps the finding
+    /// and does not panic when the range mixes bound and unbound names.
+    #[test]
+    fn a_range_with_a_mixed_boundness_keeps_the_finding() {
+        let source = format!(
+            "{}\n",
+            [
+                "import json",
+                "MAX_ROWS = 10",
+                "def run(path):",
+                "    rows = json.loads(path)",
+                "    return rows[:UNDEFINED_LIMIT]",
+            ]
+            .join("\n")
+        );
+        let read = move |path: &str| (path == "tools/report.py").then(|| source.clone());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "lines 4-5 use UNDEFINED_LIMIT and the json module.",
+            "tools/report.py",
+            Some("tools/report.py:4-5"),
+            Some(4),
+            &read,
+        )
+        .is_none());
     }
 }
