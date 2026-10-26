@@ -433,6 +433,97 @@ def test_a_schema_1_report_is_still_accepted() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _undefined_names(path: Path) -> list[tuple[str, str]]:
+    """Names a module's code references but never binds.
+
+    Uses the stdlib `symtable` module: a name is "global" in a function scope
+    when it is neither local nor free, so if it is neither a module-level
+    binding nor a builtin it is a NameError waiting to happen.
+
+    A module-level name counts as BOUND only when it is assigned or
+    imported. A name that is merely REFERENCED at module scope (e.g. an
+    `import json` that was deleted, leaving `json.loads(...)`) is itself
+    undefined and must be reported.
+
+    This exists because a DIFF-ONLY reader (a reviewer that sees the changed
+    hunks but not the file header) cannot tell an unchanged import or an
+    unchanged helper from a missing one. This test makes that distinction
+    mechanical: it reads the WHOLE file.
+    """
+    import builtins
+    import symtable
+
+    source = path.read_text()
+    table = symtable.symtable(source, str(path), "exec")
+    bound = {
+        s.get_name() for s in table.get_symbols()
+        if s.is_assigned() or s.is_imported()
+    }
+    builtins_names = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+    problems: list[tuple[str, str]] = []
+
+    def walk(scope, is_module: bool):
+        for sym in scope.get_symbols():
+            name = sym.get_name()
+            if name in bound or name in builtins_names:
+                continue
+            if is_module:
+                # At module scope a name must be bound somewhere in the
+                # module (or be a builtin) to be usable.
+                if sym.is_referenced():
+                    problems.append((scope.get_name(), name))
+            elif sym.is_global() and sym.is_referenced():
+                problems.append((scope.get_name(), name))
+        for child in scope.get_children():
+            walk(child, False)
+
+    walk(table, True)
+    return problems
+
+
+def test_no_script_references_an_undefined_name() -> None:
+    """Every script in the corpus pipeline must be self-contained.
+
+    A missing import or an undefined helper is a runtime NameError that the
+    behavioural tests would catch only on the path they happen to exercise.
+    This check is static and total: it reads the whole module.
+    """
+    for path in (FETCH_SCRIPT, CHECK_SCRIPT, BUILD_SCRIPT):
+        problems = _undefined_names(path)
+        if problems:
+            fail_(f"{path.name} references undefined name(s): {problems}")
+        else:
+            pass_(f"{path.name} references no undefined name")
+
+
+def test_the_check_script_wires_up_every_gate_helper() -> None:
+    """The gate helpers must be DEFINED and CALLED, not merely present.
+
+    A helper that is defined but never invoked is dead code: the gate would
+    silently pass everything. This asserts the definitions exist AND that
+    `main()` reaches them.
+    """
+    check = _load(CHECK_SCRIPT, "corpus_freshness_check")
+    for name in ("_paths", "_price_gate", "_failing_sources", "_count_scored",
+                 "_check_schema1", "_check_schema2"):
+        if callable(getattr(check, name, None)):
+            pass_(f"corpus-freshness-check.py defines {name}()")
+        else:
+            fail_(f"corpus-freshness-check.py does not define {name}()")
+
+    source = CHECK_SCRIPT.read_text()
+    for name in ("_price_gate", "_failing_sources", "_check_schema2", "_check_schema1"):
+        # A call site is `name(` that is NOT the `def name(` line.
+        call_sites = [
+            line for line in source.splitlines()
+            if f"{name}(" in line and not line.lstrip().startswith("def ")
+        ]
+        if call_sites:
+            pass_(f"corpus-freshness-check.py calls {name}()")
+        else:
+            fail_(f"corpus-freshness-check.py never calls {name}()")
+
+
 def test_the_openrouter_status_entry_is_updated_in_place() -> None:
     """The run status' NESTED "openrouter" entry must be filled in.
 
@@ -483,6 +574,8 @@ def main() -> int:
     _run_one(test_a_shrinking_catalog_blocks_the_prices)
     _run_one(test_a_schema_1_report_is_still_accepted)
     _run_one(test_the_openrouter_status_entry_is_updated_in_place)
+    _run_one(test_no_script_references_an_undefined_name)
+    _run_one(test_the_check_script_wires_up_every_gate_helper)
     print(f"\n{PASSES} passed; {FAILS} failed")
     return 0 if FAILS == 0 else 1
 
