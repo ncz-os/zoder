@@ -384,6 +384,16 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// Is this provider a FLAT PLAN (a monthly subscription)?
+    ///
+    /// A flat plan is paid for monthly, so the marginal cost of one more
+    /// call is $0: the tokens are recorded, but the call is not billed at
+    /// the catalog's list price. A metered provider bills per call; a free
+    /// route costs nothing to serve.
+    pub fn is_flat_plan(&self) -> bool {
+        self.billing == BillingMode::Subscription
+    }
+
     /// Is this provider a SELF-HOSTED (local) route?
     ///
     /// A local route (a vllm/sglang/llamacpp server on this machine or LAN, or a

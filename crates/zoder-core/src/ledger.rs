@@ -35,6 +35,12 @@ pub struct FinOpsTags {
     pub tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_ratio: Option<f64>,
+    /// The input tokens the provider served from its prompt cache. A subset
+    /// of the call's total input count, which includes the hits. Recorded
+    /// next to the ratio because a ratio cannot be turned back into the
+    /// exact hit count, and the hit count is what a row is re-priced with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_tokens: Option<u64>,
 }
 
 /// Maximum number of consecutive non-UTF-8 bytes we'll tolerate in a
@@ -1468,6 +1474,7 @@ mod tests {
         let led = Ledger::new(&dir.path().join("ledger.jsonl"));
         let mut e = entry("2026-07-01 10:00:00", "m1", 1.0, 100, 200, 1);
         e.tags = FinOpsTags {
+            cache_hit_tokens: None,
             caller: Some("ci-job-42".into()),
             task: Some("summarize".into()),
             tier: Some("explicit".into()),

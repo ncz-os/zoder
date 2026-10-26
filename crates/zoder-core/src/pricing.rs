@@ -9,11 +9,12 @@
 //! report a billed cost itself, and it powers the avoided-spend headline in
 //! `zoder report`.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Monotonic per-process nonce so two overlapping `save()` calls in the same
 /// process never collide on the temp path. Combined with `std::process::id()`
@@ -22,6 +23,58 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// over the live catalog. Mirrors `write_atomic` in `crates/model-health` and
 /// `Corpus::save` (C5-4) -- self-contained, no cross-crate dependency.
 static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// The price list shipped with zoder, embedded in the binary.
+///
+/// The runtime catalog (`~/.zoder/pricing.json`) is the live source: it
+/// tracks the provider's current prices and is refreshed daily. It can be
+/// missing (a host that has never run the refresh), stale (written by an
+/// older build), or missing an entry (the loader skips a malformed one).
+/// In each of those cases a PAID model must not fall through to "unknown":
+/// an unknown cost fails the budget gate closed and a $0 cost is a lie. The
+/// shipped list is the floor -- the published list prices -- so a model it
+/// knows is priced rather than unknown, and a model it does not know is
+/// still unknown.
+const BUNDLED_CATALOG_JSON: &str = include_str!("../../../pricing/catalog.json");
+
+/// The shipped price list, as raw JSON.
+///
+/// The runtime builds its catalog from the public feeds, and the shipped
+/// list is the fallback when they cannot be fetched. Exposing the raw JSON
+/// lets a caller compare the two without reaching into this module.
+pub fn bundled_catalog_json() -> &'static str {
+    BUNDLED_CATALOG_JSON
+}
+
+/// The shipped price list, parsed once per process. A lookup only reaches it
+/// when the runtime catalog does not know the model, so the parse is paid
+/// for at most once and only when it is needed.
+static BUNDLED_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
+
+/// The shipped price list, parsed on first use.
+fn bundled_catalog() -> &'static PricingCatalog {
+    BUNDLED_CATALOG.get_or_init(|| {
+        match serde_json::from_str::<PricingCatalog>(BUNDLED_CATALOG_JSON) {
+            Ok(cat) => cat,
+            Err(e) => {
+                eprintln!("zoder: warning: the shipped price list could not be read ({e})");
+                PricingCatalog::default()
+            }
+        }
+    })
+}
+
+/// The token counts of one call, split the way the provider reports them.
+///
+/// `tokens_in` is the provider's TOTAL input count, which INCLUDES the
+/// cache hits; `cache_hit_tokens` is the subset of it that was served from
+/// the provider's prompt cache. The misses are the difference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallTokens {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_hit_tokens: u64,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPrice {
@@ -50,6 +103,11 @@ pub struct ModelPrice {
     /// UTC time is inside the window, the off-peak rate bills instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off_peak: Option<OffPeak>,
+    /// Optional peak (time-of-day) rates plus the UTC windows they apply in.
+    /// A call served inside one of the windows bills the peak rates instead
+    /// of the standard ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak: Option<Peak>,
 }
 
 /// Off-peak (time-of-day) rates + the UTC window they apply in.
@@ -64,6 +122,11 @@ pub struct OffPeak {
     pub input_usd_per_mtok: f64,
     #[serde(default)]
     pub output_usd_per_mtok: f64,
+    /// The cache-read rate inside the window. When it is absent the cache
+    /// hits are charged at the window's input rate: overcharging a call is
+    /// recoverable, undercharging it is not.
+    #[serde(default)]
+    pub cache_read_usd_per_mtok: f64,
     /// Minute-of-day UTC at which the off-peak window starts, inclusive.
     /// Range: `[0, 1439]`.
     #[serde(default)]
@@ -73,6 +136,64 @@ pub struct OffPeak {
     /// `(0, 1440)` covers the full day including minute 1439 (23:59 UTC).
     #[serde(default)]
     pub window_end_utc_min: u32,
+}
+
+/// A UTC time-of-day window. `window_start_utc_min` is inclusive and
+/// `window_end_utc_min` is exclusive, both minutes since midnight UTC; a
+/// start greater than the end wraps past midnight.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TimeWindow {
+    #[serde(default)]
+    pub window_start_utc_min: u32,
+    #[serde(default)]
+    pub window_end_utc_min: u32,
+    /// When true the window applies only on weekdays (Monday to Friday, UTC).
+    #[serde(default)]
+    pub weekdays_only: bool,
+}
+
+impl TimeWindow {
+    /// True when `utc_min` (minutes-of-day UTC) falls in this window,
+    /// handling a window that wraps past midnight.
+    pub fn active_at(&self, utc_min: u32) -> bool {
+        let (s, e) = (self.window_start_utc_min, self.window_end_utc_min);
+        if s <= e {
+            utc_min >= s && utc_min < e
+        } else {
+            utc_min >= s || utc_min < e
+        }
+    }
+}
+
+/// Peak (time-of-day) rates plus the windows they apply in.
+///
+/// A provider that bills a premium during busy hours lists the premium rates
+/// here and the windows they cover; a call served inside a window bills the
+/// premium, every other call the standard rates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Peak {
+    /// The rate for input tokens inside a peak window.
+    #[serde(default)]
+    pub input_usd_per_mtok: f64,
+    /// The rate for output tokens inside a peak window.
+    #[serde(default)]
+    pub output_usd_per_mtok: f64,
+    /// The rate for cache-hit input tokens inside a peak window.
+    #[serde(default)]
+    pub cache_read_usd_per_mtok: f64,
+    /// The windows the premium applies in.
+    #[serde(default)]
+    pub windows: Vec<TimeWindow>,
+}
+
+impl Peak {
+    /// True when the call was served inside one of the peak windows.
+    /// `weekday` is 0 = Monday .. 6 = Sunday (UTC).
+    pub fn active_at(&self, utc_min: u32, weekday: u32) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.active_at(utc_min) && (!w.weekdays_only || weekday < 5))
+    }
 }
 
 impl OffPeak {
@@ -139,6 +260,112 @@ impl ModelPrice {
             }
         }
         self.cost_io(tokens_in, tokens_out)
+    }
+
+    /// Cost for an input/output split where part of the input was served from
+    /// the provider's prompt cache.
+    ///
+    /// `tokens_in` is the provider's TOTAL input count, which INCLUDES the
+    /// cache hits; `cache_hit_tokens` is the subset served from the cache.
+    /// The hits bill at the cache-read rate and the rest at the miss rate. A
+    /// catalog entry without a cache rate charges the hits at the miss rate:
+    /// overcharging a call is recoverable, undercharging it is not.
+    pub fn cost_io_with_cache(
+        &self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_hit_tokens: u64,
+    ) -> f64 {
+        if tokens_in == 0 && tokens_out == 0 {
+            return 0.0;
+        }
+        if self.input_usd_per_mtok > 0.0 || self.output_usd_per_mtok > 0.0 {
+            self.cost_with_rates(
+                tokens_in,
+                tokens_out,
+                cache_hit_tokens,
+                self.input_usd_per_mtok,
+                self.output_usd_per_mtok,
+                self.cache_read_usd_per_mtok,
+            )
+        } else {
+            // Blended rate is per-token; convert the token total via u128
+            // first so an overflow on the sum can't wrap and silently bill
+            // $0 for a u64::MAX-sized call.
+            let total = (tokens_in as u128).saturating_add(tokens_out as u128);
+            self.usd_per_mtok * (total as f64) / 1_000_000.0
+        }
+    }
+
+    /// The shared arithmetic: the miss tokens at `in_rate`, the cache hits at
+    /// `cache_rate` (the input rate when the catalog carries none) and the
+    /// output tokens at `out_rate`.
+    fn cost_with_rates(
+        &self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_hit_tokens: u64,
+        in_rate: f64,
+        out_rate: f64,
+        cache_rate: f64,
+    ) -> f64 {
+        // A provider can only report hits it actually served, so the hit
+        // count is clamped to the input count.
+        let hits = cache_hit_tokens.min(tokens_in);
+        let misses = tokens_in - hits;
+        let hit_rate = if cache_rate > 0.0 {
+            cache_rate
+        } else {
+            in_rate
+        };
+        let in_part = (misses as u128) as f64 * in_rate + (hits as u128) as f64 * hit_rate;
+        let out_part = (tokens_out as u128) as f64 * out_rate;
+        (in_part + out_part) / 1_000_000.0
+    }
+
+    /// Cost for an input/output split served at a given time, honoring the
+    /// peak and off-peak windows and the cache-read rate.
+    pub fn cost_io_at_ts(
+        &self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_hit_tokens: u64,
+        ts: DateTime<Utc>,
+    ) -> f64 {
+        let utc_min = ts.hour() * 60 + ts.minute();
+        if let Some(peak) = &self.peak {
+            // A peak window needs both component rates (> 0), for the same
+            // reason the off-peak branch does: a partial pair would zero the
+            // missing component's charge inside the window.
+            let weekday = ts.weekday().num_days_from_monday();
+            if peak.active_at(utc_min, weekday)
+                && peak.input_usd_per_mtok > 0.0
+                && peak.output_usd_per_mtok > 0.0
+            {
+                return self.cost_with_rates(
+                    tokens_in,
+                    tokens_out,
+                    cache_hit_tokens,
+                    peak.input_usd_per_mtok,
+                    peak.output_usd_per_mtok,
+                    peak.cache_read_usd_per_mtok,
+                );
+            }
+        }
+        if let Some(op) = &self.off_peak {
+            if op.active_at(utc_min) && op.input_usd_per_mtok > 0.0 && op.output_usd_per_mtok > 0.0
+            {
+                return self.cost_with_rates(
+                    tokens_in,
+                    tokens_out,
+                    cache_hit_tokens,
+                    op.input_usd_per_mtok,
+                    op.output_usd_per_mtok,
+                    op.cache_read_usd_per_mtok,
+                );
+            }
+        }
+        self.cost_io_with_cache(tokens_in, tokens_out, cache_hit_tokens)
     }
 }
 
@@ -309,6 +536,7 @@ fn validate_model_price(
             price.off_peak = Some(OffPeak {
                 input_usd_per_mtok: op_input,
                 output_usd_per_mtok: op_output,
+                cache_read_usd_per_mtok: num("cache_read_usd_per_mtok"),
                 window_start_utc_min: clamp_window_min(
                     op,
                     model_id,
@@ -326,7 +554,80 @@ fn validate_model_price(
             });
         }
     }
+    // Optional peak (time-of-day) block: the premium rates plus the windows
+    // they apply in. Absent/malformed -> no peak.
+    if let Some(pk) = obj.get("peak").and_then(|v| v.as_object()) {
+        let num = |k: &str| pk.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        let mut windows: Vec<TimeWindow> = Vec::new();
+        if let Some(ws) = pk.get("windows").and_then(|v| v.as_array()) {
+            for w in ws.iter().filter_map(|w| w.as_object()) {
+                windows.push(TimeWindow {
+                    window_start_utc_min: clamp_peak_window_min(
+                        w,
+                        model_id,
+                        "window_start_utc_min",
+                        1439,
+                        warn,
+                    ),
+                    window_end_utc_min: clamp_peak_window_min(
+                        w,
+                        model_id,
+                        "window_end_utc_min",
+                        1440,
+                        warn,
+                    ),
+                    weekdays_only: w
+                        .get("weekdays_only")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+        }
+        if !windows.is_empty() {
+            price.peak = Some(Peak {
+                input_usd_per_mtok: num("input_usd_per_mtok"),
+                output_usd_per_mtok: num("output_usd_per_mtok"),
+                cache_read_usd_per_mtok: num("cache_read_usd_per_mtok"),
+                windows,
+            });
+        }
+    }
     Some(price)
+}
+
+/// Clamp one window minute field of a peak block to its allowed range,
+/// warning on out-of-range values instead of silently swallowing them.
+///
+/// The raw value is read as `u64` (JSON integers are arbitrary-width), so it
+/// is compared against the allowed range BEFORE it is narrowed to `u32`: a
+/// naive `as u32` cast would silently truncate a value above `u32::MAX` into
+/// the valid range and bypass the warning entirely.
+fn clamp_peak_window_min(
+    block: &serde_json::Map<String, serde_json::Value>,
+    model_id: &str,
+    key: &str,
+    max: u32,
+    warn: &mut dyn FnMut(String),
+) -> u32 {
+    let Some(raw_u64) = block.get(key).and_then(|v| v.as_u64()) else {
+        // Absent, non-numeric, or negative -- treat as 0.
+        return 0;
+    };
+    if raw_u64 > u32::MAX as u64 {
+        warn(format!(
+            "model \"{model_id}\": peak.{key}={raw_u64} exceeds u32::MAX ({}), out of range; clamping to {max}",
+            u32::MAX
+        ));
+        return max;
+    }
+    let raw = raw_u64 as u32;
+    if raw > max {
+        warn(format!(
+            "model \"{model_id}\": peak.{key}={raw} > {max} (out of range), clamping to {max}"
+        ));
+        return max;
+    }
+    raw
 }
 
 /// Returns true when `model_id` is a known OpenRouter meta-routing alias that
@@ -568,6 +869,51 @@ impl PricingCatalog {
 
     /// Look up a model price, tolerating id vs display-name drift: exact,
     /// then case-insensitive, then leaf/suffix match (`host/leaf` -> `leaf`).
+    /// The price for `model`, falling back to the price list shipped with
+    /// zoder when the runtime catalog does not know it.
+    ///
+    /// The runtime catalog always wins: it is the live source. The shipped
+    /// list is the floor, so a host whose runtime catalog is missing, stale
+    /// or missing an entry still prices a paid model instead of reporting it
+    /// unknown (which fails the budget gate closed) or free (which is a lie).
+    pub fn lookup_with_fallback(&self, model: &str) -> Option<&ModelPrice> {
+        if let Some(price) = self.lookup(model) {
+            return Some(price);
+        }
+        bundled_catalog().lookup(model)
+    }
+
+    /// Classify the cost of one call, with the cache-hit tokens the provider
+    /// reported.
+    ///
+    /// `cache_hit_tokens` is a subset of `tokens_in`: the provider's total
+    /// input count, which includes the hits. The hits bill at the cache-read
+    /// rate and the rest at the miss rate, so a cache-heavy call is not
+    /// billed as if every token had missed the cache.
+    pub fn classify_cost_with_cache(
+        &self,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_hit_tokens: u64,
+        ts: Option<DateTime<Utc>>,
+    ) -> CostVerdict {
+        let Some(price) = self.lookup_with_fallback(model) else {
+            return CostVerdict::Unknown;
+        };
+        if !price.is_priced() {
+            return CostVerdict::Free;
+        }
+        let cost = match ts {
+            Some(t) => price.cost_io_at_ts(tokens_in, tokens_out, cache_hit_tokens, t),
+            None => price.cost_io_with_cache(tokens_in, tokens_out, cache_hit_tokens),
+        };
+        if !cost.is_finite() || cost < 0.0 {
+            return CostVerdict::Unknown;
+        }
+        CostVerdict::Priced(cost)
+    }
+
     pub fn lookup(&self, model: &str) -> Option<&ModelPrice> {
         if let Some(p) = self.models.get(model) {
             return Some(p);
@@ -677,6 +1023,7 @@ mod tests {
             off_peak: Some(OffPeak {
                 input_usd_per_mtok: 0.14,
                 output_usd_per_mtok: 0.21,
+                cache_read_usd_per_mtok: 0.07,
                 window_start_utc_min: 990, // 16:30 UTC
                 window_end_utc_min: 30,    // 00:30 UTC (wraps midnight)
             }),
@@ -1226,6 +1573,7 @@ mod tests {
             off_peak: Some(OffPeak {
                 input_usd_per_mtok: 0.50,
                 output_usd_per_mtok: 0.0, // partial: output missing
+                cache_read_usd_per_mtok: 0.0,
                 window_start_utc_min: 0,
                 window_end_utc_min: 1440,
             }),
@@ -1279,5 +1627,79 @@ mod tests {
             "must return the MAX-rate (azure) match, got {}",
             seen.unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_aware_pricing_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn price(input: f64, output: f64, cache: f64) -> ModelPrice {
+        ModelPrice {
+            input_usd_per_mtok: input,
+            output_usd_per_mtok: output,
+            cache_read_usd_per_mtok: cache,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_hits_bill_at_the_cache_rate_not_the_miss_rate() {
+        let p = price(0.15, 0.60, 0.003);
+        // 406,422,272 hits at $0.003/M, 5,927,864 misses at $0.15/M and
+        // 1,482,797 output at $0.60/M: one day's bill as the provider
+        // invoices it.
+        let cost = p.cost_io_with_cache(406_422_272 + 5_927_864, 1_482_797, 406_422_272);
+        assert!((cost - 2.998_124_616).abs() < 1e-9, "cost was {cost}");
+        // The same split priced as if every token missed the cache bills far
+        // more -- this is the overcharge the ledger used to record.
+        let naive = p.cost_io(406_422_272 + 5_927_864, 1_482_797);
+        assert!(naive > cost * 10.0, "naive {naive} vs cache-aware {cost}");
+    }
+
+    #[test]
+    fn a_catalog_without_a_cache_rate_never_undercharges() {
+        let p = price(0.15, 0.60, 0.0);
+        let cost = p.cost_io_with_cache(1_000_000, 0, 1_000_000);
+        assert!((cost - 0.15).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[test]
+    fn the_hit_count_cannot_exceed_the_input_count() {
+        let p = price(0.15, 0.60, 0.003);
+        let cost = p.cost_io_with_cache(1_000_000, 0, 5_000_000);
+        assert!((cost - 0.003).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[test]
+    fn a_peak_window_bills_the_peak_rates() {
+        let mut p = price(0.15, 0.60, 0.003);
+        p.peak = Some(Peak {
+            input_usd_per_mtok: 0.30,
+            output_usd_per_mtok: 1.20,
+            cache_read_usd_per_mtok: 0.006,
+            windows: vec![TimeWindow {
+                window_start_utc_min: 60,
+                window_end_utc_min: 240,
+                weekdays_only: true,
+            }],
+        });
+        // Tuesday 02:00 UTC is inside the window.
+        let peak_ts = Utc.with_ymd_and_hms(2026, 10, 27, 2, 0, 0).unwrap();
+        let cost = p.cost_io_at_ts(1_000_000, 1_000_000, 0, peak_ts);
+        assert!((cost - 1.50).abs() < 1e-12, "cost was {cost}");
+        // The same minute on a Sunday is outside it: weekdays only.
+        let weekend_ts = Utc.with_ymd_and_hms(2026, 10, 25, 2, 0, 0).unwrap();
+        let cost = p.cost_io_at_ts(1_000_000, 1_000_000, 0, weekend_ts);
+        assert!((cost - 0.75).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[test]
+    fn the_shipped_price_list_prices_a_model_the_runtime_catalog_does_not_know() {
+        let empty = PricingCatalog::default();
+        // The runtime catalog on a host that has never run the refresh.
+        assert!(empty.lookup("deepseek-flash").is_none());
+        assert!(empty.lookup_with_fallback("deepseek-flash").is_some());
     }
 }
