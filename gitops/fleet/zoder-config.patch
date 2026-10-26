@@ -11,8 +11,9 @@ as well is a behaviour change that should wait for the benchmark.
 
 Not applied, not pushed: the orchestrator deploys after review.
 
-The hunk below is a real unified diff against the current
-`fleet/zoder-config/config.toml`. From the FleetOps repo root:
+The hunk below is a real unified diff. It was dry-run clean against
+fleet/zoder-config/config.toml as of 2026-10-25; if that file has changed since,
+regenerate with `diff -u` rather than forcing the patch. From the FleetOps repo root:
 
     git apply <path-to>/zoder-config.patch
 

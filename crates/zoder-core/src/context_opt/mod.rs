@@ -337,7 +337,7 @@ The output is unchanged on disk; re-read the file (or re-run the command) if it 
 /// than is saved. When a cut IS made, the kept head+tail is at most `cap` (it can
 /// be a few bytes less when a multi-byte character straddles a boundary, since
 /// both cuts snap inward on a char boundary), and the stub's omitted count is the
-/// exact byte delta, so `kept + omitted == original len` always holds.
+/// exact size of the dropped MIDDLE, so `kept + omitted == original len` holds.
 pub fn cap_tool_output(turn: &Turn, cap_bytes: usize) -> Turn {
     if cap_bytes == 0 || turn.content.len() <= cap_bytes {
         return turn.clone();
@@ -715,13 +715,14 @@ pub fn compact(
     // but a large `keep_recent` can leave one inside the verbatim tail. Scan the
     // WHOLE conversation so a second pass can never end up with two digests.
     let prior: Vec<&Turn> = turns.iter().filter(|t| is_digest(t)).collect();
-    let fresh: Vec<Turn> = pinned
+    let foldable_fresh: Vec<Turn> = foldable
         .iter()
-        .chain(foldable.iter())
         .filter(|t| !is_digest(t))
         .cloned()
         .collect();
-    let mut digest = digest_turns(&fresh, max_files, max_lines);
+    // The digest describes the turns it replaces: the foldable span, not the
+    // pinned head it is rendered alongside.
+    let mut digest = digest_turns(&foldable_fresh, max_files, max_lines);
     // Carry a previous digest forward. Its LISTS are merged, but its
     // `turns`/`bytes_before` are its own historical accounting for turns that
     // are no longer present and are already reflected in the rendered header of
@@ -752,9 +753,11 @@ pub fn compact(
     let bytes_after: u64 = out.iter().map(Turn::bytes).sum();
     Compacted {
         turns: out,
-        // Turns actually folded INTO the digest: the folded span minus any
-        // digest it absorbed (that one was replaced, not folded).
-        folded: digest.turns,
+        // Turns actually REMOVED from the conversation and replaced by the
+        // digest: the foldable span only. The pinned system prompt and brief are
+        // still present verbatim, and an absorbed digest was replaced rather
+        // than folded, so neither is counted.
+        folded: foldable.iter().filter(|t| !is_digest(t)).count(),
         bytes_before,
         bytes_after,
     }

@@ -209,8 +209,10 @@ Be explicit about this when reviewing:
 `gitops/fleet/zoder-config.patch` in this repository adds the per-provider lever
 profiles to the FleetOps gitops config. It is **not** applied and **not**
 pushed; the orchestrator deploys after review. The hunk is a real unified diff
-with explicit line ranges and has been verified to apply cleanly against the
-current `fleet/zoder-config/config.toml` with `patch -p1 --dry-run`.
+with explicit line ranges. It was dry-run clean against the
+`fleet/zoder-config/config.toml` as of 2026-10-25; if that file has changed in its
+first lines the patch will need regenerating (re-run `diff -u` against the
+current file).
 
 `max_context_tokens` is deliberately left unchanged in this patch. The levers
 make a large window affordable by keeping the *working set* small; shrinking the
@@ -219,10 +221,10 @@ Right-sizing it is the final step of the brief, after the measurements exist.
 
 ## Test counts
 
-Measured at commit `88bda37`'s successor on `feat/context-optimization-20261025`
-(the review round added parser, char-boundary and inflation tests). Re-derive with
-`cargo test -p zoder-core --lib`; the numbers will drift as tests are added.
+Snapshot "at time of writing" on branch `feat/context-optimization-20261025`;
+re-derive with `cargo test -p zoder-core --lib`. These are a snapshot, not a
+durable claim — the numbers drift as tests are added.
 
-- `zoder-core` lib: **694 passed, 0 failed**.
-- `context_opt` alone: **57 tests**.
+- `zoder-core` lib: **697 passed, 0 failed**.
+- `context_opt` alone: **60 tests**.
 - `cargo clippy -p zoder-core --all-targets`: **0 warnings**.

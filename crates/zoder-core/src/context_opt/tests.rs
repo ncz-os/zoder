@@ -643,6 +643,22 @@ fn a_digest_in_the_verbatim_tail_is_absorbed_not_duplicated() {
     assert!(d.files.iter().any(|f| f == "src/tail.rs"), "tail digest carried");
 }
 
+#[test]
+fn folded_counts_only_the_turns_actually_removed() {
+    // The pinned system prompt and the brief stay in the conversation verbatim,
+    // so they must not be counted as folded.
+    let turns = conversation(60, 4_000);
+    let out = compact(&turns, 48_000, 6, 64, 40);
+    let removed = turns.len() - out.turns.len() + 1; // +1 for the digest added
+    assert_eq!(
+        out.folded, removed,
+        "folded must equal the turns removed, not the span including pinned turns"
+    );
+    // And the digest header agrees with `folded`.
+    let d = digest_from_render(&out.turns.iter().find(|t| is_digest(t)).unwrap().content);
+    assert_eq!(d.turns, out.folded, "header and field must not disagree");
+}
+
 // --- lever profiles --------------------------------------------------------
 
 #[test]
