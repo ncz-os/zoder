@@ -939,6 +939,18 @@ def test_a_stale_report_cannot_carry_a_degraded_overlay() -> None:
         fail_(f"degraded overlay passed under a stale report (rc={rc})")
 
 
+def test_an_unreadable_schema_gets_the_strict_gate() -> None:
+    """A damaged schema value must not fall back to the price-blind schema-1 gate."""
+    root = _setup(_scratch(), overlay_count=191)
+    (root / "corpus" / "freshness.json").write_text(json.dumps(
+        {"schema": "two", "sources": [], "overlay_stale": False}))
+    rc, out = _run_check(root)
+    if rc == 1 and "PRICE SOURCE DEGRADED" in out:
+        pass_("an unreadable schema value is checked by the schema-2 price gate")
+    else:
+        fail_(f"an unreadable schema value bypassed the price gate (rc={rc})")
+
+
 def main() -> int:
     _run_one(test_one_bench_source_failing_keeps_the_committed_overlay)
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
@@ -960,6 +972,7 @@ def main() -> int:
     _run_one(test_a_multi_output_source_needs_every_lkg_file)
     _run_one(test_lkg_fallback_is_off_without_the_flag)
     _run_one(test_a_stale_report_cannot_carry_a_degraded_overlay)
+    _run_one(test_an_unreadable_schema_gets_the_strict_gate)
     print(f"\n{PASSES} passed; {FAILS} failed")
     return 0 if FAILS == 0 else 1
 

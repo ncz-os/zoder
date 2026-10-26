@@ -223,7 +223,11 @@ def main() -> int:
     try:
         schema = int(schema)
     except (TypeError, ValueError):
-        schema = 1
+        # A present but unreadable schema value is a damaged report, not an
+        # old one: read it with the stricter schema-2 gate (price gate first).
+        print("corpus-freshness: WARNING - unreadable schema value; applying the schema-2 gate",
+              file=sys.stderr)
+        schema = 2
 
     if schema >= 2:
         return _check_schema2(cur, corpus, overlay, last_path, n_ok, n_total)
