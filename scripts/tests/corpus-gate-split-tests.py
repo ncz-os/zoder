@@ -17,6 +17,7 @@ injected, so no network call is ever made.
 Run: `python3 scripts/tests/corpus-gate-split-tests.py`
 """
 from __future__ import annotations
+
 import importlib.util
 import json
 import os

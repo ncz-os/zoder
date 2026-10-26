@@ -438,7 +438,7 @@ def main():
     # gate can report it instead of guessing.
     try:
         litellm_raw = fetch_json(LITELLM_URL)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         status["litellm"] = {"ok": False, "models": 0, "reason": str(e)[:300]}
         _write_status()
         print(f"  litellm fetch failed: {e}", file=sys.stderr)
