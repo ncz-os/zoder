@@ -33,13 +33,35 @@ const CLAIM_PHRASES: &[&str] = &[
     "no definition",
     "cannot find",
     "can't find",
-    "does not exist",
     "not in scope",
     "unknown symbol",
     "undefined name",
 ];
 
 const STOPWORDS: &[&str] = &[
+    "which",
+    "chunk",
+    "chunks",
+    "diff",
+    "hunk",
+    "part",
+    "here",
+    "there",
+    "scope",
+    "context",
+    "anywhere",
+    "codebase",
+    "statement",
+    "path",
+    "shown",
+    "visible",
+    "see",
+    "new",
+    "but",
+    "in",
+    "with",
+    "by",
+    "as",
     "the",
     "a",
     "an",
@@ -125,15 +147,60 @@ const STOPWORDS: &[&str] = &[
     "info",
 ];
 
+/// Uses of "undefined" that describe runtime behaviour, not a missing name.
+/// A use-after-free or an off-by-one finding routinely says "undefined
+/// behaviour"; it is not a claim that a symbol is missing.
+const NOT_A_CLAIM: &[&str] = &[
+    "undefined behaviour",
+    "undefined behavior",
+    "undefined-behaviour",
+    "undefined-behavior",
+];
+
+fn without_non_claims(lower: &str) -> String {
+    let mut out = lower.to_string();
+    for phrase in NOT_A_CLAIM {
+        out = out.replace(phrase, " ");
+    }
+    out
+}
+
 fn claims_undefined(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let lower = without_non_claims(&text.to_ascii_lowercase());
     CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
-fn identifiers(text: &str) -> Vec<&str> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|w| !w.is_empty())
-        .collect()
+/// Source-file extensions: a token ending in one is a path, and its stem
+/// (`main` in `src/main.rs`) is not a symbol the finding is talking about.
+const SOURCE_EXTENSIONS: &[&str] = &[
+    ".rs", ".py", ".c", ".h", ".cc", ".cpp", ".hpp", ".go", ".js", ".ts", ".tsx", ".jsx", ".sh",
+    ".java", ".kt", ".rb", ".toml", ".json", ".yaml", ".yml", ".md",
+];
+
+fn is_path_like(raw: &str) -> bool {
+    let w = raw
+        .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | ';' | '(' | ')' | '.'))
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    w.contains('/')
+        || w.contains('\\')
+        || SOURCE_EXTENSIONS
+            .iter()
+            .any(|ext| w.len() > ext.len() && w.ends_with(ext))
+}
+
+/// A token that reads as code rather than prose: snake_case, an upper-case
+/// letter, a digit, `::`, a call or a backtick.
+fn code_shaped(raw: &str) -> bool {
+    raw.contains('_')
+        || raw.contains("::")
+        || raw.contains('(')
+        || raw.contains('`')
+        || raw
+            .chars()
+            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 fn looks_like_symbol(word: &str) -> bool {
@@ -150,67 +217,81 @@ fn looks_like_symbol(word: &str) -> bool {
     has_upper || snake || has_lower
 }
 
-/// Symbols a finding could be calling undefined: backticked/quoted names,
-/// constant-shaped and snake_case identifiers, and the nearest identifier to
-/// each claim phrase.
+/// Symbols a finding claims are undefined, unbound or not imported.
+///
+/// Only names tied to the claim count: a quoted or backticked name in a
+/// sentence that makes the claim, or a name right next to the claim phrase
+/// ("`x` is not defined", "undefined function verify_sig"). Every other
+/// identifier in the finding (the function a defect sits in, a file path, a
+/// name in another sentence) is NOT a claimed symbol: treating it as one let a
+/// defined neighbour disprove a finding about a name that really is missing.
 pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
     let text = format!("{title}\n{body}");
     let mut out: Vec<String> = Vec::new();
     let mut add = |raw: &str| {
+        if is_path_like(raw) {
+            return;
+        }
         let raw = raw
             .trim()
             .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | '.' | ':' | ';'));
         let raw = raw.split(['(', '[', '<']).next().unwrap_or(raw);
+        let raw = raw.rsplit("::").next().unwrap_or(raw);
         let raw = raw.rsplit('.').next().unwrap_or(raw);
         if raw.len() >= 2
+            && looks_like_symbol(raw)
             && !STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
             && !out.iter().any(|w| w == raw)
         {
             out.push(raw.to_string());
         }
     };
-    // Anything quoted or backticked is a deliberate symbol reference.
-    for (quote, rest) in [
-        ('`', text.as_str()),
-        ('\'', text.as_str()),
-        ('"', text.as_str()),
-    ] {
-        let mut parts = rest.split(quote);
-        let _ = parts.next();
-        for inner in parts.step_by(2) {
-            if inner.len() <= 80 && looks_like_symbol(inner.trim()) {
-                add(inner);
-            }
-        }
-    }
-    // Unquoted identifiers: constants, snake_case names, and camel case.
-    for word in identifiers(&text) {
-        if looks_like_symbol(word) {
-            add(word);
-        }
-    }
-    // Names next to a claim phrase ("undefined helper_build", "`x` is not
-    // defined") even when they are short lower-case words.
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for (i, word) in words.iter().enumerate() {
-        let lower = word
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .to_ascii_lowercase();
-        if !CLAIM_PHRASES
-            .iter()
-            .any(|p| lower == *p || lower.contains(p))
-        {
+    let sentences = text
+        .replace(". ", ".\n")
+        .replace("; ", ";\n")
+        .replace("? ", "?\n")
+        .replace("! ", "!\n");
+    for sentence in sentences.lines() {
+        let lower = without_non_claims(&sentence.to_ascii_lowercase());
+        if !CLAIM_PHRASES.iter().any(|p| lower.contains(p)) {
             continue;
         }
-        for j in [i.saturating_sub(1), i.saturating_sub(2), i + 1, i + 2] {
-            if let Some(candidate) = words.get(j) {
-                let candidate =
-                    candidate.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-                if candidate.len() >= 2
-                    && looks_like_symbol(candidate)
-                    && !STOPWORDS.contains(&candidate.to_ascii_lowercase().as_str())
-                {
-                    add(candidate);
+        // Quoted or backticked names in a claiming sentence.
+        for quote in ['`', '\'', '"'] {
+            let mut parts = sentence.split(quote);
+            let _ = parts.next();
+            for inner in parts.step_by(2) {
+                if inner.len() <= 80 && looks_like_symbol(inner.trim()) {
+                    add(inner);
+                }
+            }
+        }
+        // Names right next to the claim phrase.
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        let norm: Vec<String> = words
+            .iter()
+            .map(|w| {
+                w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        for phrase in CLAIM_PHRASES {
+            let pw: Vec<&str> = phrase.split(' ').collect();
+            if pw.len() > norm.len() {
+                continue;
+            }
+            for start in 0..=norm.len() - pw.len() {
+                if !pw.iter().zip(&norm[start..]).all(|(p, w)| p == w) {
+                    continue;
+                }
+                let end = start + pw.len();
+                for word in &words[start.saturating_sub(3)..start] {
+                    add(word);
+                }
+                for word in words.iter().skip(end).take(3) {
+                    if code_shaped(word) {
+                        add(word);
+                    }
                 }
             }
         }
@@ -448,21 +529,24 @@ pub(crate) fn false_undefined_record_at(
     }
     let path = path.trim().trim_start_matches("./");
     let source = read(path)?;
-    for symbol in claimed_symbols(title, body) {
-        if let Some((reason, evidence)) =
-            definition_evidence_at(path, &source, &symbol, target_line, read)
-        {
-            return Some(json!({
-                "severity": "",
-                "title": title,
-                "location": path,
-                "symbol": symbol,
-                "reason": reason,
-                "evidence": evidence,
-            }));
-        }
+    let symbols = claimed_symbols(title, body);
+    // Every claimed name must be disproved. One name the file really lacks
+    // keeps the finding: dropping it would hide a real defect.
+    let mut disproved: Vec<(String, String, String)> = Vec::new();
+    for symbol in &symbols {
+        let (reason, evidence) = definition_evidence_at(path, &source, symbol, target_line, read)?;
+        disproved.push((symbol.clone(), reason, evidence));
     }
-    None
+    let (symbol, reason, evidence) = disproved.first().cloned()?;
+    Some(json!({
+        "severity": "",
+        "title": title,
+        "location": path,
+        "symbol": symbol,
+        "symbols": symbols,
+        "reason": reason,
+        "evidence": evidence,
+    }))
 }
 
 #[cfg(test)]
@@ -638,5 +722,92 @@ mod tests {
             &read,
         )
         .is_none());
+    }
+
+    /// The seeded benchmark: a reviewer correctly reported `verify_sig` as
+    /// undefined in `src/main.rs`, and the filter dropped it because `main`
+    /// (from the file path and from "the main function") is defined.
+    #[test]
+    fn a_real_undefined_call_is_kept_even_when_its_neighbours_are_defined() {
+        let source = "use crate::crypto;\n\nfn main() {\n    let (blob, sig) = load();\n    if verify_sig(blob, sig) {\n        run();\n    }\n}\n";
+        let read = read_from(vec![("src/main.rs", source)]);
+        for (title, body) in [
+            (
+                "Missing verify_sig function",
+                "src/main.rs calls verify_sig which is not defined or imported. The intended function is crypto::verify_signature, but the call was changed incorrectly.",
+            ),
+            (
+                "Missing import for verify_sig in main.rs",
+                "The main function calls verify_sig directly, but the function is defined in another module. Without a use statement or fully-qualified path, this will not compile.",
+            ),
+            (
+                "Undefined function verify_sig in main.rs",
+                "src/main.rs calls verify_sig, which is not defined anywhere in the codebase, leading to a compile error.",
+            ),
+        ] {
+            assert!(
+                false_undefined_record_at(title, body, "src/main.rs", Some(5), &read).is_none(),
+                "a real undefined call was filtered: {title}"
+            );
+        }
+    }
+
+    /// "Undefined behaviour" describes a memory-safety defect, not a missing
+    /// name: a use-after-free or an off-by-one finding must never be filtered.
+    #[test]
+    fn undefined_behaviour_is_not_an_undefined_symbol_claim() {
+        let source = "size_t parse_len_and_release(char *buf) {\n    xfree(buf);\n    return strlen(buf);\n}\n";
+        let read = read_from(vec![("src/parser.c", source)]);
+        for (title, body) in [
+            (
+                "Undefined behavior in parse_len_and_release()",
+                "src/parser.c calls strlen on a pointer after freeing it, which is undefined behavior.",
+            ),
+            (
+                "parse_len_and_release uses freed pointer",
+                "`strlen(buf)` is called after `xfree(buf)`. The pointer is no longer valid, leading to undefined behaviour.",
+            ),
+        ] {
+            assert!(false_undefined_record_at(title, body, "src/parser.c", Some(3), &read).is_none());
+        }
+    }
+
+    /// A race finding that says a FILE "does not exist" is not a claim about
+    /// a symbol.
+    #[test]
+    fn a_missing_file_is_not_a_missing_symbol() {
+        let source = "import os\n\ndef write_unique(path, data):\n    if not os.path.exists(path):\n        open(path, 'w').write(data)\n";
+        let read = read_from(vec![("lib/paths.py", source)]);
+        assert!(false_undefined_record_at(
+            "write_unique race condition",
+            "write_unique checks os.path.exists before opening the file, which is not atomic. It drops O_EXCL, removing the guarantee that the file is created only if it does not exist.",
+            "lib/paths.py",
+            Some(4),
+            &read,
+        )
+        .is_none());
+    }
+
+    /// Two claimed names, one defined and one not: the finding stays.
+    #[test]
+    fn one_real_missing_name_keeps_the_finding() {
+        let read = read_from(vec![("pkg/mod.py", "MAX_RETRIES = 3\n")]);
+        assert!(false_undefined_record(
+            "Undefined names",
+            "`MAX_RETRIES` and `MISSING_LIMIT` are not defined.",
+            "pkg/mod.py",
+            &read,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_path_stem_is_never_a_claimed_symbol() {
+        let got = claimed_symbols(
+            "Undefined function verify_sig in main.rs",
+            "src/main.rs calls verify_sig, which is not defined.",
+        );
+        assert!(got.contains(&"verify_sig".to_string()), "{got:?}");
+        assert!(!got.iter().any(|w| w == "main" || w == "rs"), "{got:?}");
     }
 }
