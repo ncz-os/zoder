@@ -19,6 +19,9 @@ use crate::review_context::{bindings_in, const_name, imported_names, is_def_line
 
 /// Phrases that make a finding a claim about a missing definition/import.
 const CLAIM_PHRASES: &[&str] = &[
+    "does not import or define",
+    "does not define",
+    "nameerror",
     "undefined",
     "not defined",
     "isn't defined",
@@ -39,6 +42,15 @@ const CLAIM_PHRASES: &[&str] = &[
 ];
 
 const STOPWORDS: &[&str] = &[
+    "if",
+    "then",
+    "argument",
+    "option",
+    "runtime",
+    "raise",
+    "raises",
+    "cause",
+    "will",
     "which",
     "chunk",
     "chunks",
@@ -194,12 +206,14 @@ fn is_path_like(raw: &str) -> bool {
 /// A token that reads as code rather than prose: snake_case, an upper-case
 /// letter, a digit, `::`, a call or a backtick.
 fn code_shaped(raw: &str) -> bool {
+    let word = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     raw.contains('_')
         || raw.contains("::")
         || raw.contains('(')
         || raw.contains('`')
-        || raw
+        || word
             .chars()
+            .skip(1)
             .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
@@ -239,6 +253,7 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
         let raw = raw.rsplit("::").next().unwrap_or(raw);
         let raw = raw.rsplit('.').next().unwrap_or(raw);
         if raw.len() >= 2
+            && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             && looks_like_symbol(raw)
             && !STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
             && !out.iter().any(|w| w == raw)
@@ -285,18 +300,206 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
                     continue;
                 }
                 let end = start + pw.len();
-                for word in &words[start.saturating_sub(3)..start] {
-                    add(word);
+                // A predicate's subject can be a plain lowercase name (rglob,
+                // gzip). Do not collect arbitrary neighbours or the subject of
+                // "does not define", which is the defining code, not the name.
+                if !phrase.starts_with("does not") && *phrase != "nameerror" {
+                    let mut subject = start;
+                    while subject > 0
+                        && start - subject < 3
+                        && STOPWORDS.contains(&norm[subject - 1].as_str())
+                    {
+                        subject -= 1;
+                    }
+                    while subject > 0 {
+                        let word = words[subject - 1];
+                        if code_shaped(word) || word.chars().all(|c| c.is_ascii_lowercase()) {
+                            add(word);
+                        }
+                        subject -= 1;
+                        if subject > 0 && ["and", "or"].contains(&norm[subject - 1].as_str()) {
+                            subject -= 1;
+                        } else if subject == 0 || !words[subject - 1].ends_with(',') {
+                            break;
+                        }
+                    }
                 }
-                for word in words.iter().skip(end).take(3) {
+                let mut named = false;
+                for word in words.iter().skip(end) {
+                    let plain = word
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                        .to_ascii_lowercase();
+                    if ["in", "from", "at", "when", "by"].contains(&plain.as_str()) {
+                        break;
+                    }
+                    if STOPWORDS.contains(&plain.as_str()) {
+                        if named && !["and", "or"].contains(&plain.as_str()) {
+                            break;
+                        }
+                        continue;
+                    }
                     if code_shaped(word) {
                         add(word);
+                        named = true;
+                    } else {
+                        break;
                     }
                 }
             }
         }
     }
     out
+}
+
+/// Option tokens only count in sentences that explicitly claim rejection or
+/// absence. All options claimed in such a sentence must have definitions.
+fn claimed_options(title: &str, body: &str) -> Vec<String> {
+    let mut options = Vec::new();
+    for sentence in format!("{title}\n{body}").replace(". ", "\n").lines() {
+        let lower = sentence.to_ascii_lowercase();
+        if ![
+            "missing",
+            "not defined",
+            "does not define",
+            "not accepted",
+            "not recognized",
+            "not recognised",
+            "unrecognized",
+            "unrecognised",
+            "unknown option",
+            "unknown argument",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        {
+            continue;
+        }
+        for token in sentence.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        {
+            let valid = token.strip_prefix("--").is_some_and(|s| {
+                !s.is_empty() && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            }) || (token.len() == 2
+                && token.starts_with('-')
+                && token.as_bytes()[1].is_ascii_alphanumeric());
+            if valid && !options.iter().any(|o| o == token) {
+                options.push(token.to_string());
+            }
+        }
+    }
+    options
+}
+
+/// A small lexical scanner keeps comments and string contents out of call
+/// recognition. Only consecutive positional string literals immediately after
+/// an option-definition call are evidence; keyword values such as help are not.
+fn option_evidence(path: &str, source: &str, option: &str) -> Option<String> {
+    #[derive(Debug)]
+    enum Token<'a> {
+        Word(&'a str),
+        String(&'a str),
+        Punct(u8),
+    }
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let mut line = 1;
+    while i < bytes.len() {
+        let start = i;
+        let start_line = line;
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+            }
+            quote @ (b'\'' | b'"') => {
+                let triple = bytes.get(i..i + 3).is_some_and(|s| s == [quote; 3]);
+                let width = if triple { 3 } else { 1 };
+                i += width;
+                let content = i;
+                let mut escaped = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        escaped = true;
+                        i += 1;
+                        if bytes.get(i) == Some(&b'\n') {
+                            line += 1;
+                        }
+                        i = (i + 1).min(bytes.len());
+                        continue;
+                    }
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                    }
+                    if bytes
+                        .get(i..i + width)
+                        .is_some_and(|s| s.iter().all(|b| *b == quote))
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Triple strings and escapes are deliberately not evidence.
+                let value = if !triple && !escaped && i < bytes.len() {
+                    &source[content..i]
+                } else {
+                    ""
+                };
+                tokens.push((Token::String(value), start_line));
+                i = (i + width).min(bytes.len());
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                tokens.push((Token::Word(&source[start..i]), start_line));
+            }
+            b => {
+                tokens.push((Token::Punct(b), line));
+                i += 1;
+            }
+        }
+    }
+    for (idx, (token, defining_line)) in tokens.iter().enumerate() {
+        let Token::Word(name) = token else {
+            continue;
+        };
+        let method = matches!(*name, "add_argument" | "add_option")
+            && idx > 0
+            && matches!(tokens[idx - 1].0, Token::Punct(b'.'));
+        let click = *name == "option"
+            && idx >= 2
+            && matches!(tokens[idx - 1].0, Token::Punct(b'.'))
+            && matches!(tokens[idx - 2].0, Token::Word("click"));
+        if !(method || click) || !matches!(tokens.get(idx + 1), Some((Token::Punct(b'('), _))) {
+            continue;
+        }
+        let mut arg = idx + 2;
+        while let Some((Token::String(value), _)) = tokens.get(arg) {
+            if !matches!(tokens.get(arg + 1), Some((Token::Punct(b',' | b')'), _))) {
+                break;
+            }
+            if *value == option {
+                return Some(format!(
+                    "{path}:{defining_line}: {}",
+                    source.lines().nth(defining_line - 1)?.trim()
+                ));
+            }
+            if !matches!(tokens.get(arg + 1), Some((Token::Punct(b','), _))) {
+                break;
+            }
+            arg += 2;
+        }
+    }
+    None
 }
 
 fn line_evidence(
@@ -322,6 +525,9 @@ fn line_evidence(
                 return Some(format!("{path}:{}: {}", idx + 1, line.trim()));
             }
         }
+    }
+    if lines.is_empty() {
+        return None;
     }
     let target = target_line?;
     let target_idx = target.saturating_sub(1).min(lines.len().saturating_sub(1));
@@ -524,17 +730,28 @@ pub(crate) fn false_undefined_record_at(
     target_line: Option<usize>,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Value> {
-    if path.trim().is_empty() || !claims_undefined(&format!("{title}\n{body}")) {
+    let options = claimed_options(title, body);
+    if path.trim().is_empty()
+        || (!claims_undefined(&format!("{title}\n{body}")) && options.is_empty())
+    {
         return None;
     }
     let path = path.trim().trim_start_matches("./");
     let source = read(path)?;
-    let symbols = claimed_symbols(title, body);
+    let mut symbols = claimed_symbols(title, body);
+    symbols.extend(options);
     // Every claimed name must be disproved. One name the file really lacks
     // keeps the finding: dropping it would hide a real defect.
     let mut disproved: Vec<(String, String, String)> = Vec::new();
     for symbol in &symbols {
-        let (reason, evidence) = definition_evidence_at(path, &source, symbol, target_line, read)?;
+        let (reason, evidence) = if symbol.starts_with('-') {
+            (
+                "option is defined in the file at the reviewed head".to_string(),
+                option_evidence(path, &source, symbol)?,
+            )
+        } else {
+            definition_evidence_at(path, &source, symbol, target_line, read)?
+        };
         disproved.push((symbol.clone(), reason, evidence));
     }
     let (symbol, reason, evidence) = disproved.first().cloned()?;
@@ -550,8 +767,198 @@ pub(crate) fn false_undefined_record_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn gap_fixture(
+        case: usize,
+        defined: bool,
+    ) -> (&'static str, &'static str, &'static str, String, usize) {
+        let (title, body, location, count, line, definition) = match case {
+            0 => ("Missing import for looks_like_tar", "The function payload_kind calls looks_like_tar(head) to detect plain tar archives, but the code does not import or define looks_like_tar in this file. If looks_like_tar is not imported from another module, this will raise a NameError at runtime when scanning payloads. The test suite references this function, so it must be available.", "tools/scan.py:line 70", 2406, 1682, "def looks_like_tar(data: bytes) -> bool:"),
+            1 => ("Missing --receipt argument", "The test script passes a --receipt option to the scanner, but the main() function does not define this argument. As a result, argparse will raise an error and the command will fail before any scanning logic runs. The receipt file is actually used by receipt_variant() which reads <img>.receipt.json, so the flag is unnecessary for functionality but required for compatibility with the test harness.", "tools/scan.py:2175-2185", 2406, 2239, "    ap.add_argument(\"--receipt\", help=\"write the JSON receipt here\")"),
+            _ => ("rglob used but not defined in scan_server_payload", "The scan_server_payload function calls rglob() multiple times (lines 1830, 1840, 1845) but rglob is not defined in the diff. The context shows rglob used elsewhere (line 2058) but its definition is not in the provided diff. If rglob is not imported or defined in the module, this will cause NameError.", "tools/provenance.py:1830", 2100, 82, "def rglob(root, pattern):"),
+        };
+        let mut lines = vec!["# filler"; count];
+        if defined {
+            lines[line - 1] = definition;
+        }
+        if case == 0 {
+            lines[2072] = "def payload_kind(path: str) -> str:";
+        }
+        if case == 1 {
+            lines[2226] = "def main(argv=None) -> int:";
+            lines[2227] = "    ap = argparse.ArgumentParser()";
+        }
+        if case == 2 {
+            lines[1828] = "def scan_server_payload():";
+        }
+        (title, body, location, lines.join("\n"), line)
+    }
+
+    fn assert_gap(case: usize) {
+        for defined in [false, true] {
+            let (title, body, location, source, line) = gap_fixture(case, defined);
+            let path = location.split(':').next().unwrap();
+            let read = |p: &str| (p == path).then(|| source.clone());
+            let record = false_undefined_record_at(title, body, path, Some(70), &read);
+            assert_eq!(record.is_some(), defined, "{title}: {record:?}");
+            if let Some(record) = record {
+                assert!(
+                    record["evidence"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("{path}:{line}:")),
+                    "{record}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gap_long_module_definition() {
+        assert_gap(0);
+    }
+    #[test]
+    fn gap_receipt_option() {
+        assert_gap(1);
+    }
+    #[test]
+    fn gap_rglob_definition() {
+        assert_gap(2);
+    }
+
+    #[test]
+    fn gap_prose_is_not_a_symbol() {
+        assert_eq!(
+            claimed_symbols(
+                "",
+                "If helper_name is not imported or defined in the module."
+            ),
+            vec!["helper_name"]
+        );
+    }
+
+    #[test]
+    fn option_definitions_require_exact_positional_literals() {
+        for definition in [
+            "ap.add_argument(\"--receipt\", help=\"write receipt\")",
+            "ap.add_argument(\"-r\", \"--receipt\", help=\"write receipt\")",
+            "ap.add_option('--receipt')",
+            "@click.option('--receipt')",
+            "click.option('--receipt')",
+            "ap.add_argument(\n    '-r',\n    '--receipt',\n    help='write receipt'\n)",
+        ] {
+            let source = format!("# heading\n{definition}\n");
+            let read = |_: &str| Some(source.clone());
+            let record =
+                false_undefined_record("Missing --receipt argument", "", "tools/scan.py", &read)
+                    .unwrap();
+            assert!(
+                record["evidence"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("tools/scan.py:2:"),
+                "{record}"
+            );
+        }
+        for source in [
+            "ap.add_argument('--receipt-dir')",
+            "ap.add_argument('--other', help=\"--receipt\")",
+            "# ap.add_argument('--receipt')",
+            "log('--receipt')",
+            "text = \"ap.add_argument('--receipt')\"",
+            "text = '''\nap.add_argument('--receipt')\n'''",
+            "ap.add_argument(help='--receipt')",
+            "ap.add_argument('--receipt' + suffix)",
+            "ap.add_argument('--receipt' '-dir')",
+            "import helpers",
+            "",
+        ] {
+            let read = |path: &str| {
+                Some(
+                    if path == "tools/scan.py" {
+                        source
+                    } else {
+                        "ap.add_argument('--receipt')"
+                    }
+                    .to_string(),
+                )
+            };
+            assert!(
+                false_undefined_record("Missing --receipt argument", "", "tools/scan.py", &read)
+                    .is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn option_claims_keep_missing_names_and_unrelated_findings() {
+        let read = |_: &str| Some("ap.add_argument('-r', '--receipt')\n".to_string());
+        for title in [
+            "-r is not accepted",
+            "--receipt is not recognised",
+            "Unrecognized option --receipt",
+        ] {
+            assert!(
+                false_undefined_record(title, "", "tools/scan.py", &read).is_some(),
+                "{title}"
+            );
+        }
+        for (title, body) in [
+            ("Missing --receipt and --other options", ""),
+            (
+                "Missing --receipt argument",
+                "`missing_name` is not defined.",
+            ),
+            (
+                "Race writing --receipt",
+                "The receipt file does not exist when checked.",
+            ),
+            (
+                "Undefined behavior with --receipt",
+                "A buffer is freed twice.",
+            ),
+        ] {
+            assert!(
+                false_undefined_record(title, body, "tools/scan.py", &read).is_none(),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unquoted_claimed_name_must_be_disproved() {
+        let read = |_: &str| Some("def defined_name(): pass\n".to_string());
+        for title in [
+            "missing_name and defined_name are not defined",
+            "defined_name and missing_name are not defined",
+            "Undefined functions defined_name and missing_name",
+            "Undefined functions missing_name and defined_name",
+        ] {
+            assert!(
+                false_undefined_record(title, "", "tools/scan.py", &read).is_none(),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_name_claim_phrases_and_prose_guards() {
+        for text in [
+            "The code does not import or define helper_name.",
+            "The code does not define helper_name.",
+            "helper_name is not imported or defined.",
+            "NameError: `helper_name`",
+            "If helper_name is not defined in the module.",
+            "However helper_name is not imported in the module.",
+        ] {
+            assert_eq!(claimed_symbols(text, ""), vec!["helper_name"], "{text}");
+        }
+        assert!(claimed_symbols("Undefined behavior in helper_name()", "").is_empty());
+        assert!(claimed_symbols("The file does not exist", "").is_empty());
+    }
 
     fn read_from(files: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> Option<String> {
         move |path: &str| {

@@ -6659,15 +6659,26 @@ fn finding_location_line(location: &str) -> Option<usize> {
         parts.pop();
     }
     let line = parts.pop()?;
-    let line = line.strip_prefix('L').unwrap_or(line);
+    let line = line_spec_numbers(line);
     line.split('-').next()?.parse().ok()
 }
 
 /// A trailing `line`, `Lline`, or `start-end` segment (an empty tail, from a
 /// dangling `path:`, counts too).
-fn is_line_spec(tail: &str) -> bool {
+fn line_spec_numbers(tail: &str) -> &str {
     let t = tail.trim();
-    let t = t.strip_prefix(['L', 'l']).unwrap_or(t);
+    for prefix in ["lines ", "line "] {
+        if t.get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        {
+            return t[prefix.len()..].trim();
+        }
+    }
+    t.strip_prefix(['L', 'l']).unwrap_or(t)
+}
+
+fn is_line_spec(tail: &str) -> bool {
+    let t = line_spec_numbers(tail);
     t.is_empty()
         || (t.chars().any(|c| c.is_ascii_digit())
             && t.chars()
@@ -9843,6 +9854,41 @@ mod tests {
     }
 
     // ---- B: request_changes must be located ----
+
+    #[test]
+    fn gap_false_undefined_findings_end_to_end() {
+        for case in 0..3 {
+            for defined in [false, true] {
+                let (title, body, location, source, line) =
+                    crate::review_filter::tests::gap_fixture(case, defined);
+                let path = location.split(':').next().unwrap();
+                let read = |p: &str| (p == path).then(|| source.clone());
+                let mut review = ReviewOutput {
+                    verdict: "request_changes".into(),
+                    findings: vec![Finding {
+                        title: title.into(),
+                        body: body.into(),
+                        location: Some(location.into()),
+                        severity: "high".into(),
+                        disposition: None,
+                    }],
+                    ..Default::default()
+                };
+                filter_false_undefined_findings(&mut review, &read);
+                assert_eq!(
+                    review.findings.len(),
+                    usize::from(!defined),
+                    "{title}: {review:?}"
+                );
+                if defined {
+                    assert!(review.filtered_findings[0]["evidence"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("{path}:{line}:")));
+                }
+            }
+        }
+    }
 
     fn finding(title: &str, severity: &str) -> Finding {
         Finding {
@@ -17175,6 +17221,13 @@ model_provider = "custom.nemotron35"
     fn finding_location_path_drops_only_trailing_line_specs() {
         let p = |s: &str| finding_location_path(&Some(s.to_string()));
         assert_eq!(p("src/lib.rs:42"), "src/lib.rs");
+        for suffix in ["line 70", "lines 70-80", "Line 70"] {
+            assert_eq!(p(&format!("tools/scan.py:{suffix}")), "tools/scan.py");
+            assert_eq!(
+                finding_location_line(&format!("tools/scan.py:{suffix}")),
+                Some(70)
+            );
+        }
         assert_eq!(p("src/lib.rs:42:7"), "src/lib.rs");
         assert_eq!(p("src/lib.rs:10-20"), "src/lib.rs");
         assert_eq!(p("src/lib.rs:L42"), "src/lib.rs");
