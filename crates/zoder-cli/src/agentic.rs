@@ -9520,8 +9520,8 @@ mod tests {
     use std::path::PathBuf;
     use zoder_core::Config;
 
-    /// Regression test (2026-10-26 Codex Hive job, ACHILLES): inside
-    /// Codex's workspace-write sandbox `~/.zoder` is read-only, so
+    /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
+    /// `~/.zoder` read-only, so
     /// `RoutingContext::load` failed at `open_lock_file` before any model
     /// ran, and the reviewer chain's fatal message printed ONLY the
     /// outermost anyhow context — `loading routing context: loading
