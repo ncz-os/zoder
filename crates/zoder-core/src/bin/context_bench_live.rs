@@ -692,9 +692,13 @@ async fn run_one(
             .prompt_tokens
             .unwrap_or_else(|| estimate_tokens(segments.iter().map(|s| s.text.len() as u64).sum()));
         run.completion_tokens += res.completion_tokens.unwrap_or(res.tokens_out);
+        // A call carried cache telemetry when the provider reported EITHER
+        // counter: some providers publish only the hit side, some both.
+        if res.cached_prompt_tokens.is_some() || res.cache_miss_tokens.is_some() {
+            run.cache_reported_calls += 1;
+        }
         if let Some(hit) = res.cached_prompt_tokens {
             run.cache_hit_tokens += hit;
-            run.cache_reported_calls += 1;
         }
         if let Some(miss) = res.cache_miss_tokens {
             run.cache_miss_tokens += miss;

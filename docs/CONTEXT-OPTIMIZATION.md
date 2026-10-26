@@ -237,45 +237,53 @@ compaction"*, not *"the agent can still do the task"*.
 ### Results
 
 Three task shapes, each run with the levers off and then on, against two
-hosted providers. Token counts are the provider's own `usage` numbers; cost is
-the benchmark's estimate at the listed per-token rates (the DeepSeek run fell
-inside its weekday busy-hours window, and a flat-plan provider's real marginal
-cost is lower than its list price).
+hosted providers (three calls per run). Token counts are the provider's own
+`usage` numbers; cost is the benchmark's estimate at the listed per-token rates
+(a flat-plan provider's real marginal cost is lower than its list price).
+"Succeeded" means the final answer, after any `</think>` reasoning, states the
+decision recorded early in the conversation (a token only the decision
+contains; a test proves none of them appears anywhere else in the transcript).
 
-| provider (model) | task | levers | calls | prompt tokens | cache hit | hit share | completion | cost (USD) | succeeded |
-|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| DeepSeek (deepseek-flash) | order-total-fix | off | 3 | 235,746 | 188,032 | 80% | 1,741 | 0.0088 | yes |
-| DeepSeek (deepseek-flash) | order-total-fix | on | 3 | 49,151 | 16,256 | 33% | 1,684 | 0.0060 | yes |
-| DeepSeek (deepseek-flash) | config-fixture-fix | off | 3 | 235,367 | 187,776 | 80% | 1,604 | 0.0087 | yes |
-| DeepSeek (deepseek-flash) | config-fixture-fix | on | 3 | 48,874 | 16,128 | 33% | 750 | 0.0054 | yes |
-| DeepSeek (deepseek-flash) | review-diff-defect | off | 3 | 234,511 | 187,008 | 80% | 3,633 | 0.0099 | yes |
-| DeepSeek (deepseek-flash) | review-diff-defect | on | 3 | 49,275 | 16,512 | 34% | 1,321 | 0.0058 | yes |
-| MiniMax (MiniMax-M3) | order-total-fix | off | 3 | 230,854 | 137,816 | 60% | 5,711 | 0.0761 | yes |
-| MiniMax (MiniMax-M3) | order-total-fix | on | 3 | 18,349 | 582 | 3% | 679 | 0.0063 | yes |
-| MiniMax (MiniMax-M3) | config-fixture-fix | off | 3 | 230,475 | 137,564 | 60% | 1,137 | 0.0705 | yes |
-| MiniMax (MiniMax-M3) | config-fixture-fix | on | 3 | 18,187 | 558 | 3% | 670 | 0.0063 | yes |
-| MiniMax (MiniMax-M3) | review-diff-defect | off | 3 | 227,312 | 135,456 | 60% | 10,582 | 0.0809 | yes |
-| MiniMax (MiniMax-M3) | review-diff-defect | on | 3 | 18,384 | 556 | 3% | 2,234 | 0.0082 | yes |
+| provider (model) | task | levers | prompt tokens | cache hit | hit share | completion | cost (USD) | succeeded |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| DeepSeek (deepseek-flash) | order-total-fix | off | 235,746 | 235,008 | 100% | 2,753 | 0.0025 | no |
+| DeepSeek (deepseek-flash) | order-total-fix | on | 49,151 | 48,512 | 99% | 2,013 | 0.0014 | yes |
+| DeepSeek (deepseek-flash) | config-fixture-fix | off | 235,367 | 234,748 | 100% | 1,404 | 0.0016 | yes |
+| DeepSeek (deepseek-flash) | config-fixture-fix | on | 48,874 | 48,254 | 99% | 721 | 0.0007 | yes |
+| DeepSeek (deepseek-flash) | review-diff-defect | off | 234,511 | 233,856 | 100% | 5,850 | 0.0043 | yes |
+| DeepSeek (deepseek-flash) | review-diff-defect | on | 49,275 | 48,763 | 99% | 1,376 | 0.0010 | yes |
+| MiniMax (MiniMax-M3) | order-total-fix | off | 230,854 | 137,816 | 60% | 5,711 | 0.0761 | no |
+| MiniMax (MiniMax-M3) | order-total-fix | on | 18,349 | 582 | 3% | 679 | 0.0063 | yes |
+| MiniMax (MiniMax-M3) | config-fixture-fix | off | 230,475 | 137,564 | 60% | 1,137 | 0.0705 | yes |
+| MiniMax (MiniMax-M3) | config-fixture-fix | on | 18,187 | 558 | 3% | 670 | 0.0063 | yes |
+| MiniMax (MiniMax-M3) | review-diff-defect | off | 227,312 | 135,456 | 60% | 10,582 | 0.0809 | no |
+| MiniMax (MiniMax-M3) | review-diff-defect | on | 18,384 | 556 | 3% | 2,234 | 0.0082 | yes |
 
 | provider | levers | prompt tokens (3 tasks) | cost (USD) | tasks succeeded |
 |---|---|---:|---:|---|
-| DeepSeek (deepseek-flash) | off | 705,624 | 0.0273 | 3/3 |
-| DeepSeek (deepseek-flash) | on | 147,300 | 0.0172 | 3/3 |
-| MiniMax (MiniMax-M3) | off | 688,641 | 0.2275 | 3/3 |
+| DeepSeek (deepseek-flash) | off | 705,624 | 0.0084 | 2/3 |
+| DeepSeek (deepseek-flash) | on | 147,300 | 0.0032 | 3/3 |
+| MiniMax (MiniMax-M3) | off | 688,641 | 0.2275 | 1/3 |
 | MiniMax (MiniMax-M3) | on | 54,920 | 0.0208 | 3/3 |
 
-DeepSeek (deepseek-flash): prompt tokens -79%, cost -37%
-MiniMax (MiniMax-M3): prompt tokens -92%, cost -91%
-
-Every task that succeeded with the levers off also succeeded with them on
-(6/6 per provider). The whole live benchmark cost well under $1.
+Task success did not drop with the levers on: 3/3 for both providers, against
+2/3 (DeepSeek) and 1/3 (MiniMax) with them off. In the levers-off runs the
+split-bill answer chose a different rounding scheme than the one recorded, and
+one MiniMax answer described the routing defect correctly in words the strict
+check does not match (checked by hand). The MiniMax answers were recorded once
+and scored with the strict check afterwards. The DeepSeek runs followed an
+earlier run on the same prompts, so its provider cache was already warm, which
+is why its levers-off hit share is close to 100%. The whole live benchmark cost
+well under $1.
 
 ### What the numbers say
 
 - The **volume** of the prompt is what the levers change: the same
   conversation costs a fraction of the prompt tokens.
-- The **cache hit share goes DOWN** with the levers, and that is not a
-  regression in the cache — it is a consequence of the compaction digest.
+- On a cold cache (the MiniMax run) the **cache hit share goes DOWN** with
+  the levers; on a warm one (the DeepSeek rerun, after an identical earlier
+  run) it stays high because the digests were already cached. The drop is not
+  a regression in the cache — it is a consequence of the compaction digest.
   The digest is rebuilt on every call and its content changes as the folded
   span grows, so the bytes after the pinned head differ on every call and
   the cache cannot serve them. The saving comes from the volume, not from
@@ -285,7 +293,7 @@ Every task that succeeded with the levers off also succeeded with them on
   appended to) would keep the cache warm. Until then, a compacted prompt is
   mostly billed at the miss rate.
 - **Task success does not drop.** Every task that succeeded with the levers
-  off also succeeded with them on.
+  off also succeeded with them on (see the results above).
 
 ## What is still open
 
