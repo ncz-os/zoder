@@ -488,12 +488,16 @@ pub struct ProviderError {
     ///
     /// `Some` only when the Anthropic SSE parser surfaced an inline error
     /// frame; `None` for every other path (HTTP headers, OpenAI-style
-    /// envelopes, network failures, etc.).
-    pub anthropic_error_body: Option<String>,
+    /// envelopes, network failures, etc.). Boxed for the same size reason
+    /// as `reasoning`.
+    pub anthropic_error_body: Option<Box<String>>,
     /// Reasoning returned without a final answer. Kept separate so callers
     /// may diagnose or persist an incomplete response without promoting
-    /// private reasoning to successful answer content.
-    pub reasoning: Option<String>,
+    /// private reasoning to successful answer content. Boxed: the reasoning
+    /// text can be large (a full reasoning trace), and `ProviderError` sits
+    /// at the `result_large_err` size boundary — an inline `String` would
+    /// push it over.
+    pub reasoning: Option<Box<String>>,
     /// True when the provider reported `finish_reason: "length"` for a
     /// completion whose choice carries NO final answer content: the model
     /// spent the whole `max_tokens` budget (typically on hidden reasoning)
@@ -2172,7 +2176,7 @@ the model spent the whole {}-token budget before producing any content",
                         req.max_tokens
                     ),
                 );
-                error.reasoning = reasoning;
+                error.reasoning = reasoning.map(Box::new);
                 error.length_exhausted = Some(EmptyLengthUsage {
                     prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
                     completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
@@ -2183,7 +2187,7 @@ the model spent the whole {}-token budget before producing any content",
                 ErrKind::Decode,
                 "malformed chat-completion response: empty completion choice/message",
             );
-            error.reasoning = reasoning;
+            error.reasoning = reasoning.map(Box::new);
             return Err(error);
         }
         let msg = choice
@@ -2826,7 +2830,7 @@ the model spent the whole {}-token budget before producing any content",
         // caller's classification pipeline unchanged. Using a `Cell` lets
         // the existing 3-arg `fail` closure shape pick up the typed body
         // without having to retrofit the signature at every call site.
-        let anthropic_error_body: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let anthropic_error_body: std::cell::Cell<Option<Box<String>>> = std::cell::Cell::new(None);
         let fail = |kind: ErrKind, msg: String, emitted: bool| ProviderError {
             anthropic_error_body: anthropic_error_body.take(),
             message: msg,
@@ -2983,7 +2987,7 @@ the model spent the whole {}-token budget before producing any content",
                     if current_event.as_deref() == Some("error")
                         || val.get("type").and_then(|t| t.as_str()) == Some("error")
                     {
-                        anthropic_error_body.set(Some(payload.to_string()));
+                        anthropic_error_body.set(Some(Box::new(payload.to_string())));
                         return Err(fail(
                             ErrKind::Http,
                             format!("anthropic stream error: {}", redact(payload)),

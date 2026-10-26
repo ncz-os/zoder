@@ -6514,7 +6514,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                             .unwrap_or_default();
                         let reasoning = e
                             .reasoning
-                            .as_deref()
+                            .as_ref()
+                            .map(|b| b.as_str())
                             .map(str::trim)
                             .filter(|r| !r.is_empty())
                             .map(|r| {
