@@ -272,10 +272,18 @@ def _lkg(count: int) -> dict:
 def test_coverage_increase_of_26_percent_passes() -> None:
     """The 2026-10-25 corpus-sync outage.
 
-    LKG had 191 scored models and the run produced 241 — a +26.2% INCREASE
-    that the gate printed as "coverage delta vs LKG = -26.2%", i.e. reported
-    as a drop. Growing coverage is never an outage: it must exit 0, and it
-    must say +26.2%.
+    NOTE: 241 is a SYNTHETIC number, not a measurement. No run ever produced
+    241 scored models: every run since 2026-10-14 produced 141, because
+    terminal-bench and arena stopped fetching. The real event was a DROP
+    (191 -> 141, -26.2%) caused by those failing sources; the confusing
+    part was only the SIGN the gate printed, because the old formula
+    `(last - cur) / last` turned a drop into "+26.2%" and it read like
+    growth.
+
+    This test therefore pins the SIGN RULE on a synthetic growth case:
+    an LKG of 191 and a current run of 241 (a +26.2% increase) must exit
+    0, and it must say +26.2%. The mirror case (141 = a real -26.2% drop)
+    is pinned by `test_coverage_drop_of_26_percent_fails`.
 
     What the OLD code got wrong here was the NUMBER, not the verdict. With
     `(last - cur) / last` the growth comes out as -0.262, which is NOT
@@ -383,7 +391,11 @@ def test_the_gate_agrees_with_a_signed_delta_table() -> None:
     written as a table so the sign of every case is visible in one place.
 
     Measured (2026-10-25) from the pre-fix script as committed, reproduced in
-    this test from the vendored, digest-pinned copy PREFIX_GATE:
+    this test from the vendored, digest-pinned copy PREFIX_GATE.
+
+    The 241 row is SYNTHETIC: no real run ever produced 241 scored models.
+    Every run since 2026-10-14 produced 141 because terminal-bench and arena
+    stopped fetching. The table below is a sign table, not an incident log.
 
         cur   real delta   pre-fix prints   pre-fix exit
         241      +26.2%        -26.2%            0
