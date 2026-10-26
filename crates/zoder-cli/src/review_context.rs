@@ -500,11 +500,19 @@ pub(crate) fn imported_names(line: &str) -> Vec<String> {
             add_python_target(name.trim_matches(['(', ')', '[', ']']), &mut out);
         }
     } else if let Some(rest) = t.strip_prefix("import ") {
+        // `import a.b` binds `a` and `a.b`; `import a.b as c` also binds `c`.
+        // The trailing segment (`b`) is NOT a binding in Python, so a dotted
+        // target contributes only its prefixes. A JS import list
+        // (`import { build, run as go } from './x'`) is braced, and there the
+        // named bindings (including `as` aliases) all count.
+        let braced = rest.contains('{');
         for target in rest.split(',') {
             add_python_target(target, &mut out);
         }
-        for word in identifiers(rest) {
-            push_unique(&mut out, word);
+        if braced {
+            for word in identifiers(rest) {
+                push_unique(&mut out, word);
+            }
         }
     } else if let Some(rest) = t.strip_prefix("#include") {
         let rest = rest.trim().trim_matches(['<', '>', '"']);

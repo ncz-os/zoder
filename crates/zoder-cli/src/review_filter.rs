@@ -205,6 +205,15 @@ fn claims_missing_import(lower: &str) -> bool {
     }
     // `<something> ... import` as a noun object of "missing": "missing
     // return and urllib.request import", "a missing urllib.request import".
+    // "<fn> missing return" / "<fn> has no return": a claim about the
+    // function's body, disproved by a `return` statement.
+    if lower.contains("missing return")
+        || lower.contains("no return")
+        || lower.contains("does not return")
+        || lower.contains("never returns")
+    {
+        return true;
+    }
     let has_import_noun = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| word == "import" || word == "imports");
@@ -213,6 +222,14 @@ fn claims_missing_import(lower: &str) -> bool {
     }
     lower.contains("not imported") || lower.contains("isn't imported")
 }
+
+/// Words a claim uses that are never the symbol: auxiliaries, the claim's own
+/// nouns, and generic code nouns a reviewer's prose is built from.
+const CLAIM_NOUNS: &[&str] = &[
+    "has", "have", "had", "is", "does", "did", "was", "were", "missing", "return", "returns",
+    "value", "body", "code", "function", "method", "line", "lines", "file", "chunk", "diff", "the",
+    "and", "or", "no", "not", "never",
+];
 
 /// Words that name the KIND of a symbol, not the symbol: "missing import of
 /// json module" names `json`, not `module`.
@@ -432,7 +449,12 @@ fn add_one(raw: &str, out: &mut Vec<String>) {
     let raw = raw.split(['(', '[', '<']).next().unwrap_or(raw);
     let raw = raw.rsplit("::").next().unwrap_or(raw);
     let raw = strip_symbol_kind(raw);
-    if raw.is_empty() || is_path_like(raw) || STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
+    // Auxiliary verbs and the claim's own nouns are never symbols
+    // ("build_rows has no return" names `build_rows`, not `has`).
+    if raw.is_empty()
+        || is_path_like(raw)
+        || STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
+        || CLAIM_NOUNS.contains(&raw.to_ascii_lowercase().as_str())
     {
         return;
     }
@@ -1041,6 +1063,25 @@ pub(crate) fn false_undefined_record_with_location(
                 .collect::<Vec<_>>(),
         }));
     }
+    // A finding whose ONLY part is "<fn> missing return" has no symbol to
+    // disprove, but `extra` disproves it: the function returns. Every part is
+    // disproved, so the finding is dropped with the return line as evidence.
+    if disproved.is_empty() {
+        let functions = claimed_missing_return(title, body);
+        if functions.is_empty() || extra.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "severity": "",
+            "title": title,
+            "location": path,
+            "symbol": functions[0],
+            "symbols": functions,
+            "reason": "function returns a value in the file at the reviewed head",
+            "evidence": extra[0],
+            "evidence_lines": extra,
+        }));
+    }
     let (symbol, reason, evidence) = disproved.first().cloned()?;
     let mut record = json!({
         "severity": "",
@@ -1052,7 +1093,10 @@ pub(crate) fn false_undefined_record_with_location(
         "evidence": evidence,
     });
     if !extra.is_empty() {
-        record["evidence_lines"] = json!(extra);
+        // The import/name evidence first, then the return lines.
+        let mut lines = vec![json!(evidence)];
+        lines.extend(extra.iter().map(|line| json!(line)));
+        record["evidence_lines"] = json!(lines);
     }
     Some(record)
 }
@@ -1317,8 +1361,6 @@ const PY_BUILTINS: &[&str] = &[
     "None",
     "True",
     "False",
-    "os",
-    "sys",
 ];
 
 /// The function a "<fn> missing return" / "<fn> has no return" claim names.
@@ -1345,7 +1387,11 @@ fn claimed_missing_return(title: &str, body: &str) -> Vec<String> {
             // The subject is the token before the claim ("_fetch_json missing
             // return"); the verb "has" ("_fetch_json has no return") is skipped.
             let mut subject = at - 1;
-            while subject > 0 && STOPWORDS.contains(&norm[subject - 1].as_str()) {
+            while subject > 0
+                && (STOPWORDS.contains(&norm[subject - 1].as_str())
+                    || ["has", "have", "had", "is", "does", "did"]
+                        .contains(&norm[subject - 1].as_str()))
+            {
                 subject -= 1;
             }
             if subject == 0 {
@@ -2330,5 +2376,67 @@ pub(crate) mod tests {
             &read,
         )
         .is_none());
+    }
+    /// A finding whose only part is "<fn> missing return" is dropped when the
+    /// function returns; kept when it really does not.
+    #[test]
+    fn a_return_only_claim_is_disproved_by_a_return_statement() {
+        let source = "def build_rows(path):\n    return load(path)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+        let record = false_undefined_record_with_location(
+            "build_rows has no return",
+            "The helper binds a loader and never returns a value.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .expect("the function returns");
+        assert_eq!(record["symbol"], "build_rows");
+        assert!(record["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("return load(path)"));
+
+        let bare = "def build_rows(path):\n    load(path)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "build_rows has no return",
+            "The helper binds a loader and never returns a value.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+
+    /// A stdlib module is bound only by an import, never by the builtin list:
+    /// an unimported `os.path` in the range keeps the finding.
+    #[test]
+    fn a_stdlib_module_is_not_treated_as_a_builtin() {
+        let unimported = "def run():\n    return os.path.join(\"a\", \"b\")\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| unimported.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the os module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .is_none());
+
+        let imported = "import os\n\ndef run():\n    return os.path.join(\"a\", \"b\")\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| imported.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the os module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:3-4"),
+            None,
+            &read,
+        )
+        .is_some());
     }
 }
