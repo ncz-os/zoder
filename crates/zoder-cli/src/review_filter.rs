@@ -2269,4 +2269,30 @@ pub(crate) mod tests {
         )
         .is_none());
     }
+    /// The wrapper that passes no location (`false_undefined_record_at`) takes
+    /// the no-symbol path with `cited_range == None`. It must return `None`
+    /// (keep the finding) and never panic.
+    #[test]
+    fn a_no_location_no_symbol_claim_returns_none_and_never_panics() {
+        let source = "import json\nMAX_ROWS = 10\n";
+        let read = read_from(vec![("tools/report.py", source)]);
+        assert!(false_undefined_record_at(
+            "Undefined constants and missing imports",
+            "the module uses names nothing defines.",
+            "tools/report.py",
+            None,
+            &read,
+        )
+        .is_none());
+        // And with a location but no range at all.
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the module uses names nothing defines.",
+            "tools/report.py",
+            Some("tools/report.py"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
 }
