@@ -2444,9 +2444,15 @@ async fn dispatch_reviewer_for_model(
         res.telemetry.cost_usd,
         &pricing,
         model,
+        // No usage block: price nothing (a metered call then records
+        // cost unknown); the estimated output count is still recorded.
         zoder_core::pricing::CallTokens {
             tokens_in,
-            tokens_out,
+            tokens_out: if res.prompt_tokens.is_some() {
+                tokens_out
+            } else {
+                0
+            },
             cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
         },
         Some(Utc::now()),
