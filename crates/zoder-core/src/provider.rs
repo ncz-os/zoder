@@ -504,17 +504,45 @@ pub struct ProviderError {
     ///
     /// `Some` only when the Anthropic SSE parser surfaced an inline error
     /// frame; `None` for every other path (HTTP headers, OpenAI-style
-    /// envelopes, network failures, etc.).
-    pub anthropic_error_body: Option<String>,
+    /// envelopes, network failures, etc.). Boxed for the same size reason
+    /// as `reasoning`.
+    pub anthropic_error_body: Option<Box<String>>,
     /// Reasoning returned without a final answer. Kept separate so callers
     /// may diagnose or persist an incomplete response without promoting
-    /// private reasoning to successful answer content.
-    pub reasoning: Option<String>,
+    /// private reasoning to successful answer content. Boxed: the reasoning
+    /// text can be large (a full reasoning trace), and `ProviderError` sits
+    /// at the `result_large_err` size boundary — an inline `String` would
+    /// push it over.
+    pub reasoning: Option<Box<String>>,
     /// True when the failure is a provider overload: an HTTP 503, an HTTP
     /// 529, or an Anthropic-style `overloaded_error` SSE frame carried by a
     /// 200 response. Retry loops honour the provider's `overload_backoff_min_s`
     /// floor for these.
     pub overload: bool,
+    /// True when the provider reported `finish_reason: "length"` for a
+    /// completion whose choice carries NO final answer content: the model
+    /// spent the whole `max_tokens` budget (typically on hidden reasoning)
+    /// and the response was cut off before any answer appeared. This is a
+    /// BUDGET problem, not malformed wire data — the body parsed cleanly
+    /// and the stream terminated on purpose — so it must not be lumped in
+    /// with schema-invalid 2xx traffic. Callers that control the budget
+    /// (the reviewer doubled-budget repair) can retry once with a larger
+    /// `max_tokens`; every other path surfaces the message as-is.
+    pub length_exhausted: Option<EmptyLengthUsage>,
+}
+
+/// Usage carried by a completion that ended empty at `finish_reason:
+/// "length"`. Fields are `None` when the provider published no usage block
+/// (or published an empty one): the caller then records the call with
+/// unknown usage, exactly as for any other failed call.
+///
+/// This type must stay small: `ProviderError` carries it inline, and the
+/// provider's error type is already large enough that clippy's
+/// `result_large_err` threshold sits right at its boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmptyLengthUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 impl ProviderError {
@@ -530,6 +558,7 @@ impl ProviderError {
             anthropic_error_body: None,
             reasoning: None,
             overload: false,
+            length_exhausted: None,
         }
     }
     /// Transient and safe to retry on the same model (nothing emitted yet).
@@ -540,7 +569,13 @@ impl ProviderError {
     /// `Http` — retrying it (with the overload backoff floor) is exactly the
     /// behaviour the header-borne 503/529 gets.
     pub fn retryable(&self) -> bool {
+        // A budget exhaustion is a Truncation by kind, but a blind same-model
+        // retry repeats the failure: the model needs MORE budget, not another
+        // shot at the same budget. The budget-aware call site (the reviewer
+        // doubled-budget repair) retries deliberately; everything else must
+        // surface the clear "spent the whole budget" message instead.
         !self.emitted
+            && self.length_exhausted.is_none()
             && (matches!(
                 self.kind,
                 ErrKind::Timeout
@@ -894,6 +929,12 @@ struct CompletionChoice {
     // no-op.
     #[serde(default)]
     message: Option<CompletionMessage>,
+    /// The provider's terminal signal for this choice (`"stop"`,
+    /// `"length"`, `"content_filter"`, …). Read on the empty-answer guard:
+    /// an empty choice that finished at `length` is a budget exhaustion,
+    /// not a malformed body.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct CompletionMessage {
@@ -1780,6 +1821,7 @@ impl OpenAiProvider {
                 anthropic_error_body: None,
                 reasoning: None,
                 overload: status.as_u16() == 503 || status.as_u16() == 529,
+                length_exhausted: None,
             });
         }
         let body = self.read_limited_body(resp, "models list").await?;
@@ -2169,6 +2211,7 @@ impl OpenAiProvider {
                 anthropic_error_body: None,
                 reasoning: None,
                 overload: code == 503 || code == 529,
+                length_exhausted: None,
             });
         }
         if effective_stream {
@@ -2217,7 +2260,7 @@ impl OpenAiProvider {
     /// parse; the chat-completions path relies on the 429 status.
     async fn consume_full(
         &self,
-        _req: &ChatRequest,
+        req: &ChatRequest,
         resp: reqwest::Response,
         mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
@@ -2260,11 +2303,43 @@ impl OpenAiProvider {
                     .clone()
                     .or_else(|| msg.reasoning.clone())
             });
+            // A choice that finished at `length` without any answer content
+            // is NOT malformed wire data: the body parsed cleanly, the
+            // choice is well-formed, and the provider terminated on purpose
+            // because the `max_tokens` budget ran out (typically after the
+            // model spent it all on hidden reasoning). Rejecting it as
+            // "malformed" would hide the budget cause AND make the
+            // reviewer's doubled-budget repair unreachable — that repair
+            // only runs on an invalid-verdict completion, and this error
+            // used to abort the chunk before the verdict parser could run.
+            // Surface it as a distinct, non-retryable truncation so
+            // budget-aware callers can retry once with a bigger budget
+            // while every other path (oneshot exec, health probes) sees a
+            // clear "spent the whole budget" message. A choice with NO
+            // `finish_reason` is schema-invalid for the same reason as
+            // before: keep the Decode error.
+            if choice.finish_reason.as_deref() == Some("length") {
+                let usage = parsed.usage.filter(Usage::is_meaningful);
+                let mut error = ProviderError::new(
+                    ErrKind::Truncation,
+                    format!(
+                        "completion ended at finish_reason \"length\" with no answer: \
+the model spent the whole {}-token budget before producing any content",
+                        req.max_tokens
+                    ),
+                );
+                error.reasoning = reasoning.map(Box::new);
+                error.length_exhausted = Some(EmptyLengthUsage {
+                    prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
+                    completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
+                });
+                return Err(error);
+            }
             let mut error = ProviderError::new(
                 ErrKind::Decode,
                 "malformed chat-completion response: empty completion choice/message",
             );
-            error.reasoning = reasoning;
+            error.reasoning = reasoning.map(Box::new);
             return Err(error);
         }
         let msg = choice
@@ -2502,9 +2577,14 @@ impl OpenAiProvider {
             anthropic_error_body: None,
             reasoning: None,
             overload: false,
+            length_exhausted: None,
         };
         let mut done = false;
         let mut saw_choice = false;
+        // True once a choice frame reported `finish_reason: "length"`. Like
+        // `saw_choice`, the value is only read at the bottom of the
+        // function, after the last frame has been consumed.
+        let mut saw_length_finish = false;
         // Z-9: a stream that yields one or more `choices` frames but never
         // pushes a non-empty content delta must NOT be reconciled as a
         // successful completion — the billable reservation would otherwise
@@ -2814,6 +2894,9 @@ impl OpenAiProvider {
                 }
                 if let Some(choice) = parsed.choices.into_iter().next() {
                     saw_choice = true;
+                    if choice.finish_reason.as_deref() == Some("length") {
+                        saw_length_finish = true;
+                    }
                     let StreamChoice { delta, .. } = choice;
                     // Arm the idle guard on the first non-empty delta of any
                     // kind — answer content or reasoning. See
@@ -2914,7 +2997,30 @@ impl OpenAiProvider {
         // non-streaming path. The `emitted` flag stays at its
         // accumulated value so the caller (and the retry/fallback
         // classifier) can tell whether any bytes reached the sink.
+        // The one exception: a stream that reported `finish_reason:
+        // "length"` on an empty choice is the streaming analogue of the
+        // non-streaming budget exhaustion — the provider terminated ON
+        // PURPOSE because the `max_tokens` budget ran out (typically
+        // after hidden reasoning). It is not malformed wire data; the
+        // caller must be able to tell it apart so a budget-aware call
+        // site can retry once with a bigger budget.
         if !saw_content {
+            if saw_length_finish {
+                let mut error = fail(
+                    ErrKind::Truncation,
+                    format!(
+                        "completion ended at finish_reason \"length\" with no answer: \
+the model spent the whole {}-token budget before producing any content",
+                        req.max_tokens
+                    ),
+                    emitted,
+                );
+                error.length_exhausted = Some(EmptyLengthUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                });
+                return Err(error);
+            }
             return Err(fail(
                 ErrKind::Decode,
                 "malformed completion stream: empty completion choice (no content delta)"
@@ -2994,7 +3100,7 @@ impl OpenAiProvider {
         // caller's classification pipeline unchanged. Using a `Cell` lets
         // the existing 3-arg `fail` closure shape pick up the typed body
         // without having to retrofit the signature at every call site.
-        let anthropic_error_body: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let anthropic_error_body: std::cell::Cell<Option<Box<String>>> = std::cell::Cell::new(None);
         // The Anthropic wire carries 529-equivalent rejections as a mid-stream
         // `event: error` frame with `type: "overloaded_error"`. Mark that frame
         // so the error surfaces with `overload: true` and retry loops apply the
@@ -3012,6 +3118,7 @@ impl OpenAiProvider {
             token_plan_resets_at: None,
             reasoning: None,
             overload: overload_flag.get(),
+            length_exhausted: None,
         };
         let mut done = false;
         let mut saw_text = false;
@@ -3203,7 +3310,7 @@ impl OpenAiProvider {
                         {
                             overload_flag.set(true);
                         }
-                        anthropic_error_body.set(Some(payload.to_string()));
+                        anthropic_error_body.set(Some(Box::new(payload.to_string())));
                         return Err(fail(
                             ErrKind::Http,
                             format!("anthropic stream error: {}", redact(payload)),
@@ -3433,6 +3540,7 @@ impl OpenAiProvider {
             anthropic_error_body: None,
             reasoning: None,
             overload: false,
+            length_exhausted: None,
         };
         let mut done = false;
         let mut saw_text = false;
@@ -4080,6 +4188,7 @@ mod tests {
             anthropic_error_body: None,
             reasoning: None,
             overload: false,
+            length_exhausted: None,
         };
         assert!(
             err.retryable(),
@@ -4100,6 +4209,7 @@ mod tests {
             anthropic_error_body: None,
             reasoning: None,
             overload: false,
+            length_exhausted: None,
         };
         assert!(
             !err.retryable(),

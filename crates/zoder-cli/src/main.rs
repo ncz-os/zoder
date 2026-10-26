@@ -6575,7 +6575,43 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 break;
             }
             Err((e, fatal)) => {
-                attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
+                // A budget exhaustion (finish_reason "length" with no answer)
+                // is a real, explainable outcome, not a provider error to
+                // bury under "failed": the model spent the whole
+                // max_tokens thinking and produced nothing. Name it, with
+                // the model's reasoning text when the provider sent some —
+                // the oneshot path deliberately does NOT double the budget
+                // (that is a reviewer-only repair; a one-shot exec that
+                // retried would just bill the same reasoning again).
+                let message = e
+                    .length_exhausted
+                    .as_ref()
+                    .map(|usage| {
+                        let used = usage
+                            .completion_tokens
+                            .map(|t| format!(" ({t} completion tokens used)"))
+                            .unwrap_or_default();
+                        let reasoning = e
+                            .reasoning
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .map(str::trim)
+                            .filter(|r| !r.is_empty())
+                            .map(|r| {
+                                let truncated: String = r.chars().take(120).collect();
+                                format!(
+                                    " — its reasoning ended: \"{truncated}…\" (full text with --show-reasoning)"
+                                )
+                            })
+                            .unwrap_or_default();
+                        format!(
+                            "model spent its whole {}-token budget{used} and returned no answer{reasoning}; \
+raise --max-tokens or lower its reasoning effort",
+                            req.max_tokens
+                        )
+                    })
+                    .unwrap_or_else(|| e.message.clone());
+                attempt_failures.push(format!("{model_id} via {pid}: {message}"));
                 if link_gated {
                     crate::provider_health::record_call_error(
                         &eng.cfg.health_path,
@@ -16056,6 +16092,149 @@ mod probe_skip_class_tests {
              even if the sweep later errors"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod oneshot_empty_length_tests {
+    // Regression: a reasoning model that spends the whole `--max-tokens`
+    // budget and returns `finish_reason: "length"` with an EMPTY answer used
+    // to surface from the oneshot exec path as the generic provider
+    // diagnostic (pre-fix: "malformed chat-completion response: empty
+    // completion choice/message"). The oneshot path must surface a clear,
+    // budget-naming error instead — and it must NOT double the budget:
+    // exactly one request reaches the provider.
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn write_oneshot_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [
+                {
+                    "id": "wiremock-working",
+                    "base_url": format!("{mock_uri}"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["local/"],
+                    "max_context_tokens": 8192,
+                }
+            ],
+            "default_provider": "wiremock-working",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": "local/coder", "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oneshot_empty_length_completion_surfaces_the_budget_error() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = crate::test_env::EnvGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "spinning wheels"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 32, "total_tokens": 35}
+            })))
+            .mount(&server)
+            .await;
+        write_oneshot_home(home, &server.uri());
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--oneshot",
+            "-m",
+            "local/coder",
+            "--max-tokens",
+            "32",
+            "--retries",
+            "0",
+            "--no-stream",
+        ])
+        .unwrap();
+        let err = cmd_exec_oneshot(&cli, Some("hi".to_string()))
+            .await
+            .expect_err("an empty at-length completion must fail the run");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("local/coder"),
+            "the diagnostic must name the model: {chain}"
+        );
+        assert!(
+            chain.contains("32-token budget"),
+            "the diagnostic must name the exhausted budget: {chain}"
+        );
+        assert!(
+            chain.contains("returned no answer"),
+            "the diagnostic must say there was no answer: {chain}"
+        );
+        assert!(
+            !chain.contains("malformed"),
+            "a budget exhaustion must not be reported as malformed wire data: {chain}"
+        );
+        // No automatic budget doubling: the provider saw exactly one
+        // request, at the requested budget.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "oneshot exec must not retry a budget exhaustion with a bigger budget"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(32),
+            "the single request ran at the requested budget"
+        );
+        // The failed call was ledgered with the usage the provider
+        // published (as unknown cost: no pricing catalog in the test home).
+        let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
+        let row: serde_json::Value = serde_json::from_str(
+            ledger
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("{}"),
+        )
+        .unwrap();
+        assert_eq!(
+            row.get("model").and_then(|v| v.as_str()),
+            Some("local/coder"),
+            "the ledger row must name the model: {row}"
+        );
+        // The oneshot path records the failed call via its armed
+        // reservation, which lands as an unknown-cost row naming the
+        // model: it EXISTS (spend happened) even though no pricing
+        // catalog exists in the test home to turn the published usage
+        // into a cost.
+        assert_eq!(
+            row.get("cost_unknown").and_then(|v| v.as_bool()),
+            Some(true),
+            "the failed call is recorded as unknown-cost, not dropped: {row}"
+        );
     }
 }
 

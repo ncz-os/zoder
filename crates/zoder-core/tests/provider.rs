@@ -396,7 +396,7 @@ async fn non_streaming_reasoning_only_is_decode_error_for_both_display_settings(
             "show_reasoning={show_reasoning}"
         );
         assert_eq!(
-            error.reasoning.as_deref(),
+            error.reasoning.as_ref().map(|b| b.as_str()),
             Some("thinking aloud"),
             "show_reasoning={show_reasoning}"
         );
@@ -2862,4 +2862,265 @@ async fn per_provider_stream_key_false_keeps_non_streaming_wire() {
         res.telemetry.first_token_ms.is_none(),
         "non-streaming call must not record first-token time"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a reasoning model that spends the whole `max_tokens` budget and
+// returns `finish_reason: "length"` with NO answer content is a BUDGET
+// exhaustion, not a malformed body. It must surface as a distinct,
+// non-retryable Truncation carrying the reasoning text (when present) and the
+// usage (when present), so the reviewer's doubled-budget repair can run while
+// every other path (oneshot exec, health probes) sees a clear "spent the
+// whole budget" message.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_streaming_empty_length_choice_is_budget_truncation_not_malformed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning_content": "long hidden reasoning"},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 16, "total_tokens": 23}
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        ErrKind::Truncation,
+        "an empty finish_reason=length choice is a budget exhaustion, not malformed wire data: {error}"
+    );
+    assert!(
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
+        "the diagnostic must name the cause, got: {error}"
+    );
+    assert!(
+        error.message.contains("16-token budget"),
+        "the diagnostic must name the exhausted budget, got: {error}"
+    );
+    assert_eq!(
+        error.reasoning.as_ref().map(|b| b.as_str()),
+        Some("long hidden reasoning"),
+        "private reasoning must ride along for triage"
+    );
+    assert_eq!(
+        error.length_exhausted,
+        Some(zoder_core::EmptyLengthUsage {
+            prompt_tokens: Some(7),
+            completion_tokens: Some(16),
+        }),
+        "the usage the provider published must be carried on the error"
+    );
+    assert!(
+        !error.emitted && !error.retryable(),
+        "nothing was emitted and a same-model blind retry is not a fix: the \
+         budget must be raised by the caller"
+    );
+}
+
+/// The `content: null` variant: an explicit null answer plus
+/// `finish_reason: "length"` is the same budget exhaustion.
+#[tokio::test]
+async fn non_streaming_null_content_length_choice_is_budget_truncation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 16}
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Truncation, "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
+        "got: {error}"
+    );
+    assert!(error.reasoning.is_none(), "no reasoning was published");
+    assert_eq!(
+        error.length_exhausted,
+        Some(zoder_core::EmptyLengthUsage {
+            prompt_tokens: Some(4),
+            completion_tokens: Some(16),
+        })
+    );
+}
+
+/// No usage block at all: the flag is still set (the `finish_reason` proves
+/// the budget ran) and the usage fields stay `None` so the caller records
+/// the call as unknown-usage, as for any other failed call.
+#[tokio::test]
+async fn non_streaming_empty_length_choice_without_usage_carries_none_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "length"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Truncation, "got: {error}");
+    assert_eq!(
+        error.length_exhausted,
+        Some(zoder_core::EmptyLengthUsage {
+            prompt_tokens: None,
+            completion_tokens: None,
+        }),
+        "flag set, usage absent -> None fields"
+    );
+}
+
+/// Streaming variant: a frame with `finish_reason: "length"` on an empty
+/// choice (reasoning deltas only) plus `[DONE]` is the same budget
+/// exhaustion, with the streamed usage carried on the error.
+#[tokio::test]
+async fn streaming_empty_length_choice_is_budget_truncation() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":16}}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        ErrKind::Truncation,
+        "a stream that ends at finish_reason length with no content delta is a \
+         budget exhaustion, not malformed: {error}"
+    );
+    assert!(
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
+        "got: {error}"
+    );
+    assert_eq!(
+        error.length_exhausted,
+        Some(zoder_core::EmptyLengthUsage {
+            prompt_tokens: Some(3),
+            completion_tokens: Some(16),
+        }),
+        "the streamed usage must be carried on the error"
+    );
+    assert!(
+        !error.emitted && !error.retryable(),
+        "nothing reached the sink and a blind same-model retry would just repeat \
+         the exhaustion"
+    );
+}
+
+// Regression guard: an empty choice with NO finish_reason (and an empty
+// choices array) is still schema-invalid traffic — keep today's Decode
+// "malformed" errors verbatim.
+
+#[tokio::test]
+async fn non_streaming_empty_choice_without_finish_reason_stays_malformed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": ""}}]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("malformed chat-completion response: empty completion choice/message"),
+        "the pre-existing malformed diagnostic must survive, got: {error}"
+    );
+    assert!(
+        error.length_exhausted.is_none(),
+        "a body without finish_reason carries no budget signal"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_no_choices_stays_malformed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": []
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", false), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("malformed chat-completion response: no completion choices"),
+        "the pre-existing no-choices diagnostic must survive, got: {error}"
+    );
+    assert!(error.length_exhausted.is_none());
+}
+
+#[tokio::test]
+async fn streaming_empty_choice_without_finish_reason_stays_malformed() {
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let error = provider(&server.uri())
+        .stream_chat(&req("m", true), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("malformed completion stream: empty completion choice"),
+        "got: {error}"
+    );
+    assert!(error.length_exhausted.is_none());
 }
