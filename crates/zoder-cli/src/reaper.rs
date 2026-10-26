@@ -856,55 +856,70 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
                 }
                 return;
             }
-            match zoder_core::cancel_session(socket, &id, remaining).await {
-                Ok(()) => {
-                    eprintln!("[zoder] cancelled agent session {id}");
-                    // Only a cancel that actually went out is marked. Marking a
-                    // failed one hides it from the blocking path and the later
-                    // teardown rounds, and a session nobody cancelled is a
-                    // session still editing the tree.
-                    mark_cancelled(&id);
-                }
-                Err(e) => match classify_cancel_error(&e) {
-                    CancelFailure::EngineUnreachable => {
-                        // No engine, no cancel, and above all no live turn: the
-                        // session died with the daemon that owned it. Retire it
-                        // so no later pass or teardown round asks again, and so
-                        // the reap is free to conclude the workspace is quiet.
-                        // Said once — an absent socket is a fact about the run,
-                        // not about the attempt.
-                        if mark_unreachable(&id) {
-                            eprintln!(
-                                "[zoder] session {id} not cancelled: the engine at {} is \
-                                 unreachable ({e:#}); it cannot be cancelled from here and may \
-                                 still run in a daemon that lost its socket; whatever it \
-                                 leaves in the workspace is still reaped",
-                                socket.display()
-                            );
-                        }
-                    }
-                    CancelFailure::NotConfirmed => {
-                        // One attempt is not an answer: the daemon may be slow,
-                        // may have already exited, or the turn may already have
-                        // settled (a settled turn never acknowledges a cancel).
-                        // Retry briefly, then treat it as best-effort and say
-                        // exactly why — never as a reason to stop the run.
-                        //
-                        // The retries share what is LEFT of the phase budget
-                        // rather than a fixed per-attempt cap: this loop is
-                        // itself deadline-bounded, and a retry sequence that
-                        // outlives the deadline is cut off mid-flight, which
-                        // leaves the cancel unsettled — the state this path
-                        // exists to prevent.
-                        let left = deadline.saturating_duration_since(Instant::now());
-                        let per_attempt = retry_attempt_budget(left);
-                        let settled =
-                            retry_unconfirmed_cancel_within(socket, &id, per_attempt).await;
-                        settle_unconfirmed_cancel(socket, &id, settled, &format!("{e:#}"));
-                    }
-                },
-            }
+            cancel_session_with_retries(socket, &id, deadline).await;
         }
+    }
+}
+
+/// Cancel one session, and retry it while the phase budget allows when the
+/// daemon does not confirm the cancel.
+///
+/// The retry sequence is handed what is LEFT of the phase budget, and the plan
+/// (retry count, backoff, per-attempt cap) is derived from that same number:
+/// the sequence that runs is therefore the sequence that was planned. Handing
+/// it a per-attempt slice of the remainder instead re-plans the sequence from a
+/// much smaller number and asks the daemon fewer times than the plan promised
+/// — silently, with nothing in the log to show for it.
+async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    match zoder_core::cancel_session(socket, id, remaining).await {
+        Ok(()) => {
+            eprintln!("[zoder] cancelled agent session {id}");
+            // Only a cancel that actually went out is marked. Marking a
+            // failed one hides it from the blocking path and the later
+            // teardown rounds, and a session nobody cancelled is a
+            // session still editing the tree.
+            mark_cancelled(id);
+        }
+        Err(e) => match classify_cancel_error(&e) {
+            CancelFailure::EngineUnreachable => {
+                // No engine, no cancel, and above all no live turn: the
+                // session died with the daemon that owned it. Retire it
+                // so no later pass or teardown round asks again, and so
+                // the reap is free to conclude the workspace is quiet.
+                // Said once — an absent socket is a fact about the run,
+                // not about the attempt.
+                if mark_unreachable(id) {
+                    eprintln!(
+                        "[zoder] session {id} not cancelled: the engine at {} is \
+                         unreachable ({e:#}); it cannot be cancelled from here and may \
+                         still run in a daemon that lost its socket; whatever it \
+                         leaves in the workspace is still reaped",
+                        socket.display()
+                    );
+                }
+            }
+            CancelFailure::NotConfirmed => {
+                // One attempt is not an answer: the daemon may be slow,
+                // may have already exited, or the turn may already have
+                // settled (a settled turn never acknowledges a cancel).
+                // Retry briefly, then treat it as best-effort and say
+                // exactly why — never as a reason to stop the run.
+                //
+                // The retries share what is LEFT of the phase budget
+                // rather than a fixed per-attempt cap: this loop is
+                // itself deadline-bounded, and a retry sequence that
+                // outlives the deadline is cut off mid-flight, which
+                // leaves the cancel unsettled — the state this path
+                // exists to prevent.
+                let left = deadline.saturating_duration_since(Instant::now());
+                let settled = retry_unconfirmed_cancel_within(socket, id, left).await;
+                settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
+            }
+        },
     }
 }
 
@@ -997,10 +1012,11 @@ impl DaemonRecordState {
 /// an attempt with no time to reach the wire "confirms" nothing: it would report
 /// the daemon silent when it was never asked.
 ///
-/// `left` is the per-attempt cap the caller wants honoured as an upper bound
-/// (normally [`CANCEL_RETRY_BUDGET`], but a caller with less time left passes
-/// less), so passing the remaining phase budget makes the whole sequence fit
-/// inside the caller's deadline instead of being cut off mid-flight.
+/// `left` is the TOTAL time the whole sequence may take: normally the whole
+/// phase budget, or what is left of it. The plan -- retry count, backoff and
+/// per-attempt cap -- is derived from that one number, so the sequence that is
+/// planned is the sequence that runs, and it fits inside the caller's deadline
+/// instead of being cut off mid-flight.
 fn retry_plan(left: Duration) -> (usize, Vec<Duration>, Duration) {
     let nominal_backoff: Duration = CANCEL_RETRY_BACKOFF.iter().copied().sum();
     // How many retries can each get at least the floor of attempt time plus its
@@ -1033,6 +1049,12 @@ fn retry_plan(left: Duration) -> (usize, Vec<Duration>, Duration) {
 }
 
 /// The per-attempt budget [`retry_plan`] would use for `left`.
+///
+/// The caller does NOT hand the retry sequence this number: a per-attempt
+/// slice re-plans the sequence from a much smaller one, so the daemon would be
+/// asked fewer times than the plan promised. It is kept for the tests that pin
+/// the split.
+#[cfg_attr(not(test), allow(dead_code))]
 fn retry_attempt_budget(left: Duration) -> Duration {
     retry_plan(left).2
 }
@@ -1048,18 +1070,24 @@ pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> Unconfi
     retry_unconfirmed_cancel_within(socket, id, CANCEL_RETRY_BUDGET).await
 }
 
-/// The same sequence, with the per-attempt budget supplied by the caller.
+/// The same sequence, with the budget supplied by the caller.
 ///
 /// [`retry_unconfirmed_cancel_within`] exists because the caller knows how much
 /// of the phase budget is left: a retry that outlives it is cut off by the
 /// caller mid-flight, which leaves the cancel unsettled instead of settled. The
 /// sequence therefore never spends more than the budget it is given.
+///
+/// `budget` is the TOTAL time the whole sequence may take, not a per-attempt
+/// cap: the plan (retry count, backoff, per-attempt timeout) is derived from
+/// it, so the sequence that runs is the sequence that was planned. Handing it a
+/// per-attempt slice instead re-plans the sequence from a much smaller number,
+/// and the daemon is then asked fewer times than the plan promised.
 pub(crate) async fn retry_unconfirmed_cancel_within(
     socket: &Path,
     id: &str,
-    per_attempt: Duration,
+    budget: Duration,
 ) -> UnconfirmedCancelOutcome {
-    let (retries, backoff, per_attempt) = retry_plan(per_attempt);
+    let (retries, backoff, per_attempt) = retry_plan(budget);
     for attempt in 0..retries {
         let delay = backoff
             .get(attempt)
@@ -1112,7 +1140,7 @@ pub(crate) struct UnconfirmedCancel {
 /// incident lost a job's edits because an unconfirmed cancel aborted the loop
 /// before the tree was captured and committed: the worktree is the product, the
 /// cancel is cleanup, and cleanup does not get a veto over the product.
-pub(crate) fn settle_unconfirmed_cancel(
+pub(crate) async fn settle_unconfirmed_cancel(
     socket: &Path,
     id: &str,
     outcome: UnconfirmedCancelOutcome,
@@ -1134,10 +1162,16 @@ pub(crate) fn settle_unconfirmed_cancel(
         daemon_stopped: false,
         reason: String::new(),
     };
-    // Whatever happened, this process must not ask again: the answer is now a
-    // fact about the run, and the log carries one line per session.
-    mark_cancelled(id);
+    // A session counts as cancelled only when nothing of it can still be
+    // running: the daemon acknowledged the cancel, the daemon that owned it is
+    // gone, or it was stopped by exact pid. A daemon that is still live and
+    // never acknowledged the cancel must stay pending, so the final sweep
+    // reports it — "we cancelled everything" must never be claimed when it is
+    // not true.
+    let mut daemon_still_running = false;
     if let UnconfirmedCancelOutcome::Confirmed(attempts) = outcome {
+        // The daemon answered, so this session is settled: do not ask again.
+        mark_cancelled(id);
         settled.reason = format!(
             "session {id} cancel confirmed on retry {attempts} of a previously unconfirmed one"
         );
@@ -1162,18 +1196,27 @@ pub(crate) fn settle_unconfirmed_cancel(
         if signal_if_same_process(pid, expected, libc_sigterm()) {
             let deadline = Instant::now() + DAEMON_EXIT_GRACE;
             while alive(pid) && Instant::now() < deadline {
-                std::thread::sleep(POLL);
+                tokio::time::sleep(POLL).await;
             }
             // Escalate only to the SAME process that ignored the SIGTERM.
             if alive(pid) {
                 signal_if_same_process(pid, expected, libc_sigkill());
             }
             settled.daemon_stopped = !alive(pid);
+            // A daemon that is still alive after SIGKILL is still running the
+            // turn: the session is NOT settled and must stay pending.
+            daemon_still_running = !settled.daemon_stopped;
         } else {
             // The pid was recycled before the signal: nothing was sent, so
             // nothing was stopped and nothing may be claimed.
             settled.daemon_stopped = false;
         }
+    }
+    // The daemon that owned the session is gone — no record, a recycled pid,
+    // or a daemon we stopped — so nothing of it can still be running and the
+    // session is done. A daemon that is still live keeps the session pending.
+    if !daemon_still_running {
+        mark_cancelled(id);
     }
     // Every arm yields the operator-facing cause as a String so the record and
     // the log carry the same text.
@@ -3397,6 +3440,126 @@ mod tests {
         forget_session("async-unreachable-probe");
     }
 
+    /// A daemon that refuses the handshake.
+    ///
+    /// Every connection is counted and the initialize request is answered with
+    /// an error, so a cancel fails at once instead of burning the whole settle
+    /// budget. The phase budget therefore survives the first attempt, which is
+    /// what makes the retry sequence the only thing that decides how many
+    /// times the daemon is asked.
+    fn spawn_refusing_cancel_daemon(
+        socket: &Path,
+    ) -> (
+        SilentCancelDaemon,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = UnixListener::bind(socket).expect("bind the refusing daemon");
+        listener
+            .set_nonblocking(true)
+            .expect("make the refusing daemon listener non-blocking");
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = connections.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stopping.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        {
+                            use std::io::Write;
+                            let _ = stream.write_all(
+                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"error\":{\"code\":-32000,\"message\":\"refused\"}}\n",
+                            );
+                            let _ = stream.flush();
+                        }
+                        // Give the client time to read the refusal before the
+                        // socket goes away: a closed connection would look like
+                        // a crash, not a refusal.
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (
+            SilentCancelDaemon {
+                handle: Some(handle),
+                stop,
+            },
+            connections,
+        )
+    }
+
+    /// The retry sequence that RUNS must be the sequence that was PLANNED for
+    /// the budget the caller had left.
+    ///
+    /// The caller used to hand the sequence a per-attempt SLICE of what was
+    /// left, so the plan was re-derived from a much smaller number and the
+    /// daemon was asked fewer times than the plan promised -- silently, with
+    /// nothing anywhere to show for it. This pins the two to each other.
+    #[tokio::test]
+    async fn the_executed_cancel_sequence_is_the_planned_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (daemon, connections) = spawn_refusing_cancel_daemon(&socket);
+
+        // A budget whose plan asks for more than one retry: with a small budget
+        // both the old handoff and the new one plan a single retry, so the
+        // difference cannot be seen.
+        let budget = Duration::from_millis(2000);
+        let (planned_retries, _, _) = retry_plan(budget);
+        assert!(
+            planned_retries > 1,
+            "the probe needs a budget whose plan has more than one retry: {planned_retries}"
+        );
+
+        let started = Instant::now();
+        cancel_session_with_retries(&socket, "planned-sequence-probe", started + budget).await;
+        let elapsed = started.elapsed();
+
+        // The caller's own attempt, then exactly the planned retries.
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1 + planned_retries,
+            "the loop must ask the daemon exactly as many times as the plan promised"
+        );
+        // And the whole sequence still fits inside the budget it was given.
+        assert!(
+            elapsed <= budget + DAEMON_EXIT_GRACE,
+            "the cancel sequence must fit inside the budget it was handed: took {elapsed:?}"
+        );
+
+        drop(daemon);
+    }
+
+    /// The budget the retry sequence is handed must be the WHOLE remainder, not
+    /// a per-attempt slice of it.
+    ///
+    /// This is the difference between a plan and the sequence that runs: a
+    /// slice re-plans the sequence from a much smaller number, and the daemon
+    /// is then asked fewer times than the plan promised.
+    #[test]
+    fn the_retry_budget_is_the_whole_remaining_budget() {
+        let left = Duration::from_millis(2000);
+        let (planned, _, _) = retry_plan(left);
+        assert_eq!(planned, 3, "a two-second remainder plans three retries");
+        // The per-attempt slice of that remainder re-plans a SHORTER sequence:
+        // this is exactly what the caller used to hand over, and it is why the
+        // daemon was asked fewer times than the plan promised.
+        let (shortened, _, _) = retry_plan(retry_attempt_budget(left));
+        assert!(
+            shortened < planned,
+            "a per-attempt slice must re-plan a shorter sequence: {shortened} < {planned}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // the lost-work incident: a `zoder loop`
     // died with `session <id> cancel not confirmed (daemon did not ...)`. The
@@ -3413,6 +3576,12 @@ mod tests {
     /// full per-attempt budget) retried inside a budget that has actually run
     /// out, which is the tightest the sequence ever gets.
     #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
     async fn the_retry_sequence_fits_the_phase_budget_it_is_given() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3430,7 +3599,10 @@ mod tests {
             "no single retry may claim more than the whole budget: {per_attempt:?} > {given:?}"
         );
         let started = Instant::now();
-        let _ = retry_unconfirmed_cancel_within(&socket, "budget-probe", per_attempt).await;
+        // The sequence is handed the WHOLE remaining budget, not a slice of it:
+        // the plan is derived from that number, so the sequence that runs is
+        // the sequence that was planned.
+        let _ = retry_unconfirmed_cancel_within(&socket, "budget-probe", given).await;
         let elapsed = started.elapsed();
         assert!(
             elapsed <= given + DAEMON_EXIT_GRACE,
@@ -3687,6 +3859,12 @@ mod tests {
     /// best-effort with a reason that names the retries AND the missing
     /// acknowledgement, and the session is retired so nothing re-asks.
     #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
     async fn an_unconfirmed_cancel_is_retried_then_settled_best_effort() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3703,7 +3881,8 @@ mod tests {
             "unconfirmed-probe",
             outcome,
             "daemon did not acknowledge session/cancel within 1.5s",
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -3760,6 +3939,12 @@ mod tests {
     /// A daemon that answers a LATER attempt (slow, not dead) is confirmed, and
     /// the session is reported as stopped rather than as unconfirmed.
     #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
     async fn a_slow_daemon_is_confirmed_on_a_bounded_retry() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3772,7 +3957,8 @@ mod tests {
 
         let outcome = retry_unconfirmed_cancel(&socket, "slow-daemon-probe").await;
         let settled =
-            settle_unconfirmed_cancel(&socket, "slow-daemon-probe", outcome, "first not confirmed");
+            settle_unconfirmed_cancel(&socket, "slow-daemon-probe", outcome, "first not confirmed")
+                .await;
 
         assert_eq!(
             outcome,
@@ -3806,6 +3992,12 @@ mod tests {
     /// three more attempts against a path that does not exist (the 01a163c9
     /// lesson, applied to the retry path).
     #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
     async fn a_daemon_that_exited_during_the_retries_is_reported_as_gone() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3823,7 +4015,8 @@ mod tests {
             "exited-daemon-probe",
             outcome,
             "first not confirmed",
-        );
+        )
+        .await;
 
         assert_eq!(outcome, UnconfirmedCancelOutcome::DaemonGone);
         assert!(
@@ -3851,6 +4044,16 @@ mod tests {
     /// EXACT pid, and the report says so — the session cannot outlive the
     /// daemon that owns it.
     #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
+    // The stand-in daemon is a real process that this test stops BY EXACT PID,
+    // on purpose: waiting for it is not what the test is about, and the child
+    // is gone by the time the pid is checked.
+    #[allow(clippy::zombie_processes)]
     async fn a_silent_daemon_is_stopped_by_exact_pid_as_the_last_resort() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3882,7 +4085,8 @@ mod tests {
             "settled-session-probe",
             outcome,
             "first not confirmed",
-        );
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -3943,8 +4147,14 @@ mod tests {
     /// is stale and that no daemon was stopped, instead of claiming "no live
     /// daemon pid is recorded ... so it is left running", which states the
     /// opposite of what happened.
-    #[test]
-    fn a_stale_daemon_record_is_reported_as_stale_not_absent() {
+    #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stale_daemon_record_is_reported_as_stale_not_absent() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
@@ -3968,7 +4178,8 @@ mod tests {
             "stale-record-probe",
             UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
             "first not confirmed",
-        );
+        )
+        .await;
 
         assert!(
             settled.reason.contains("record is stale"),
@@ -3992,8 +4203,14 @@ mod tests {
     }
 
     /// An ABSENT record says exactly that, and differs from the stale case.
-    #[test]
-    fn an_absent_daemon_record_is_reported_as_absent() {
+    #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
+    async fn an_absent_daemon_record_is_reported_as_absent() {
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
@@ -4005,7 +4222,8 @@ mod tests {
             "absent-record-probe",
             UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
             "first not confirmed",
-        );
+        )
+        .await;
         assert!(
             settled.reason.contains("no daemon record exists"),
             "an absent record must be named as absent: {}",
