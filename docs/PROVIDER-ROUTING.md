@@ -125,3 +125,35 @@ Run it after wiring a new free provider:
 zoder refresh           # adds the free open-weight models; prints how many were promoted
 zoder route "..."       # confirm MiniMax-M3 leads, the free models fall back
 ```
+
+## 4. `model_families` — reviewer cross-family enforcement
+
+The reviewer refuses a candidate from the same model family as the author, so
+a second opinion actually comes from a different model lineage. A
+`[model_families]` table maps a served model id or a `*`/`?` glob to a family
+name; matching is case-insensitive, an exact id wins over a glob, and an
+unmatched id falls back to its vendor prefix (or its own id when it has no
+prefix).
+
+```toml
+# config.example.toml — generic ids; use your own served ids.
+[model_families]
+"provider-a/*" = "provider-a"
+"provider-b/model-x" = "shared-family"
+```
+
+The table may live in `config.json` or in a vendor overlay, which is what lets a
+host with no `config.json` configure families at all. It is merged per key: an
+overlay entry wins over the base map for the same key, and a later
+`config.<vendor>.toml` wins over an earlier one. Keys that exist only in the
+base survive.
+
+`zoder config --validate` rejects an entry that cannot do useful work: an empty
+or whitespace-only key or family, a key made only of wildcards (which would put
+every model in one family and silently disable cross-family review), and two
+keys that differ only in letter case but map to different families (the answer
+would depend on map order).
+
+A binary older than this change rejects the whole overlay when it meets an
+unknown `[model_families]` table, dropping every provider in that file. Deploy
+the new binary before adding the table to an overlay.
