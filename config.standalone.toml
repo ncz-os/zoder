@@ -81,8 +81,9 @@ max_context_tokens = 131072
 # bill at the catalog's cache rate, cache misses at the input rate, and a
 # provider's busy-hours band is priced from the same source. Caps gate PAID
 # calls only; set them to 0 or remove a cap to disable it. Hosted models are
-# metered, so they also need an explicit `--allow-paid` (there is no persistent
-# config-wide bypass; the caps below are the spend backstop).
+# metered, so they also need an explicit `--allow-paid`. Without that flag a
+# capped estimate is gated by the same confirmation; `--allow-paid` is the
+# per-invocation bypass, not a persistent config-wide setting.
 [budget]
 max_cost_per_call_usd = 1.00
 monthly_cap_usd = 50.00

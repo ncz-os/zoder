@@ -81,10 +81,11 @@ regardless of profile.
 
 Hosted routes are metered. Paid calls require an explicit opt-in:
 `--allow-paid` on the command line, or interactive confirmation. There is no
-persistent "always allow paid" switch; the `[budget]` caps
-(`max_cost_per_call_usd`, `monthly_cap_usd`) are the spend backstop and gate a
-paid call the same way. A local OpenAI-compatible endpoint is `$0` marginal and
-does not need the opt-in.
+persistent "always allow paid" switch. The `[budget]` caps
+(`max_cost_per_call_usd`, `monthly_cap_usd`) gate a capped estimate the same
+way while `--allow-paid` is absent; `--allow-paid` is the per-invocation
+bypass, not a config-wide setting. A local OpenAI-compatible endpoint is `$0`
+marginal and does not need the opt-in.
 
 ## Fleet configuration
 
