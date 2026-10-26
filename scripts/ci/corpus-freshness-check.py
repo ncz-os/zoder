@@ -122,6 +122,41 @@ def _failing_sources(freshness: dict) -> list[str]:
     return names
 
 
+def _stale_flag(value) -> bool:
+    """Read a stale flag that may be a bool, a number or a string.
+
+    A JSON report is written by a script, but it can be hand-edited or
+    produced by an older writer, so the flag may arrive as the string
+    "false" or "0". Python's `bool("false")` is True, which would read a
+    stale overlay as FRESH - the unsafe direction. So the strings are
+    decoded explicitly, and anything that is not recognisably false counts
+    as stale: the safe reading wins.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "none")
+    # None means "the flag was not written", which is not stale. Anything
+    # else (an unexpected type) counts as stale, the safe reading.
+    return value is not None
+
+
+def _stale_flag_from(report: dict, overlay_meta: dict) -> bool:
+    """The overlay is stale if EITHER spelling says so.
+
+    A report carries the staleness twice: the top-level "overlay_stale"
+    and the nested "overlay.stale". They are written together, but they
+    can disagree in a hand-edited or truncated report. When they
+    disagree, the SAFE reading wins: treating a stale overlay as fresh
+    would advance the baseline from a stale overlay and could let a
+    degraded overlay be published, while treating a fresh overlay as
+    stale only costs a warning.
+    """
+    return _stale_flag(report.get("overlay_stale")) or _stale_flag(overlay_meta.get("stale"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--force-publish", action="store_true",
@@ -153,8 +188,19 @@ def main() -> int:
         print("corpus-freshness: freshness.json is not an object", file=sys.stderr)
         return 2
 
-    cur_sources = cur.get("sources") or []
-    n_ok = sum(1 for s in cur_sources if isinstance(s, dict) and s.get("ok"))
+    # "sources" must be a list of dicts. A malformed report (a truncated
+    # write, a hand edit, a number where a list belongs) must not crash
+    # the gate with a TypeError: it is reported and treated as "no
+    # sources", which the price gate then evaluates on its own merits.
+    raw_sources = cur.get("sources")
+    if isinstance(raw_sources, list):
+        cur_sources = [s for s in raw_sources if isinstance(s, dict)]
+    else:
+        if raw_sources is not None:
+            print("corpus-freshness: WARNING - freshness.json 'sources' is not a list; "
+                  "ignoring it", file=sys.stderr)
+        cur_sources = []
+    n_ok = sum(1 for s in cur_sources if s.get("ok"))
     n_total = len(cur_sources)
     print(f"corpus-freshness: current run {n_ok}/{n_total} sources fetched fresh", file=sys.stderr)
 
@@ -181,12 +227,9 @@ def _check_schema2(cur: dict, corpus: Path, overlay: Path, last_path: Path,
 
     # ---- OVERLAY gate (never blocks prices) ----------------------------
     overlay_meta = cur.get("overlay") if isinstance(cur.get("overlay"), dict) else {}
-    # The two spellings of "the overlay is stale" must agree. When they
-    # disagree, the SAFE reading wins: treating a stale overlay as fresh
-    # would advance the baseline from a stale overlay and could let a
-    # degraded overlay be published, while treating a fresh overlay as
-    # stale only costs a warning. So stale is the OR of both.
-    stale = bool(cur.get("overlay_stale")) or bool(overlay_meta.get("stale"))
+    # The two spellings of "the overlay is stale" must agree; if they
+    # disagree, the SAFE reading wins (see _stale_flag_from).
+    stale = _stale_flag_from(cur, overlay_meta)
     age = cur.get("overlay_age_days")
     if age is None:
         age = overlay_meta.get("age_days", 0)

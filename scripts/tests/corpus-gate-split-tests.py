@@ -382,6 +382,96 @@ def test_a_disagreeing_stale_flag_is_read_as_stale() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_a_malformed_sources_list_does_not_crash_the_gate() -> None:
+    """A report whose "sources" is not a list must not crash the gate.
+
+    `cur.get("sources")` could be a number, a string or a dict in a
+    truncated or hand-edited report. Iterating it blindly raised a
+    TypeError and the script died with a traceback instead of a verdict,
+    so the CI job failed for the wrong reason. A malformed list is now
+    reported and ignored.
+    """
+    root = _scratch()
+    try:
+        _setup(root, overlay_count=191)
+        _run_fetch(root, failing=[], candidate=191)
+        report_path = root / "corpus" / "freshness.json"
+        report = json.loads(report_path.read_text())
+        report["sources"] = 5          # not a list at all
+        report_path.write_text(json.dumps(report))
+
+        code, out = _run_check(root)
+        if code in (0, 1):
+            pass_(f"a malformed 'sources' does not crash the gate (exit {code})")
+        else:
+            fail_(f"a malformed 'sources' crashed the gate (exit {code})")
+        if "TypeError" not in out and "Traceback" not in out:
+            pass_("a malformed 'sources' produces no traceback")
+        else:
+            fail_("a malformed 'sources' produced a traceback")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_string_false_stale_flag_is_read_as_not_stale() -> None:
+    """A stale flag written as the STRING "false" must not read as stale.
+
+    `bool("false")` is True in Python, so a report that carried the flag
+    as a string would be read as stale by a naive check. The flags are
+    decoded explicitly instead: the recognisably-false spellings are
+    false, and anything else counts as stale, because treating a stale
+    overlay as fresh can publish degraded routing scores.
+    """
+    check = _load(CHECK_SCRIPT, "corpus_freshness_check")
+    for value, expected in ((False, False), (True, True), (0, False), (1, True),
+                            ("false", False), ("False", False), ("0", False),
+                            ("no", False), ("true", True), ("yes", True),
+                            (None, False), ("", False), ("weird", True)):
+        got = check._stale_flag(value)
+        if got is expected:
+            pass_(f"_stale_flag({value!r}) is {expected}")
+        else:
+            fail_(f"_stale_flag({value!r}) is {got}, expected {expected}")
+
+    # The two spellings are combined with OR.
+    for report, meta, expected in (({"overlay_stale": True}, {}, True),
+                                   ({}, {"stale": True}, True),
+                                   ({"overlay_stale": False}, {"stale": True}, True),
+                                   ({"overlay_stale": True}, {"stale": False}, True),
+                                   ({"overlay_stale": False}, {"stale": False}, False),
+                                   ({}, {}, False)):
+        got = check._stale_flag_from(report, meta)
+        if got is expected:
+            pass_(f"_stale_flag_from({report}, {meta}) is {expected}")
+        else:
+            fail_(f"_stale_flag_from({report}, {meta}) is {got}, expected {expected}")
+
+    # The gate must actually USE the decoder, not a naive bool(). This is
+    # the behavioural half: a report whose flag is the string "false" must
+    # not be treated as stale, because the naive bool("false") is True.
+    root = _scratch()
+    try:
+        _setup(root, overlay_count=191)
+        _run_fetch(root, failing=[], candidate=191)
+        report_path = root / "corpus" / "freshness.json"
+        report = json.loads(report_path.read_text())
+        report["overlay_stale"] = "false"
+        report["overlay"]["stale"] = "false"
+        report_path.write_text(json.dumps(report))
+
+        code, out = _run_check(root)
+        if code == 0:
+            pass_('a stale flag spelled "false" exits 0')
+        else:
+            fail_(f'a stale flag spelled "false" exited {code}, expected 0')
+        if "STALE" not in out:
+            pass_('a stale flag spelled "false" is NOT read as stale')
+        else:
+            fail_('a stale flag spelled "false" WAS read as stale')
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_every_script_starts_as_a_real_process() -> None:
     """Each script must RUN, not just import.
 
@@ -410,6 +500,37 @@ def test_every_script_starts_as_a_real_process() -> None:
                   f"{(proc.stderr or '').strip().splitlines()[-1:]}")
 
 
+def _registers_force_publish(script: Path) -> bool:
+    """True when the script adds a `--force-publish` store_true flag.
+
+    Parsed with `ast` rather than matched as text: a substring check for
+    `action="store_true"` breaks the moment the source uses single
+    quotes, and it would happily match a mention inside a comment. The
+    AST answer is the same on every quoting style.
+    """
+    import ast
+
+    tree = ast.parse(script.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "add_argument"):
+            continue
+        option = None
+        is_store_true = False
+        for arg in node.args:
+            if (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                    and option is None):
+                option = arg.value
+        for kw in node.keywords:
+            if kw.arg == "action" and isinstance(kw.value, ast.Constant):
+                is_store_true = kw.value.value == "store_true"
+        if option == "--force-publish" and is_store_true:
+            return True
+    return False
+
+
 def test_force_publish_is_still_wired_up() -> None:
     """`--force-publish` must be registered AND its branch must exist.
 
@@ -427,7 +548,7 @@ def test_force_publish_is_still_wired_up() -> None:
     check = _load(CHECK_SCRIPT, "corpus_freshness_check")
     source = CHECK_SCRIPT.read_text()
 
-    if '"--force-publish"' in source and 'action="store_true"' in source:
+    if _registers_force_publish(CHECK_SCRIPT):
         pass_("corpus-freshness-check.py registers --force-publish")
     else:
         fail_("corpus-freshness-check.py does not register --force-publish")
@@ -744,6 +865,8 @@ def main() -> int:
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
     _run_one(test_fresh_candidate_overlay_is_published)
     _run_one(test_openrouter_failure_blocks_the_prices)
+    _run_one(test_a_malformed_sources_list_does_not_crash_the_gate)
+    _run_one(test_a_string_false_stale_flag_is_read_as_not_stale)
     _run_one(test_every_script_starts_as_a_real_process)
     _run_one(test_a_disagreeing_stale_flag_is_read_as_stale)
     _run_one(test_force_publish_is_still_wired_up)
