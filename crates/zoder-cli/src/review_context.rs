@@ -141,7 +141,7 @@ pub(crate) fn const_name(line: &str) -> Option<String> {
 
 /// Identifiers bound by one source line inside a function: Rust `let` and
 /// `for` patterns, Python assignments / `for` / `with ... as`.
-fn bindings_in(line: &str) -> Vec<String> {
+pub(crate) fn bindings_in(line: &str) -> Vec<String> {
     let t = line.trim_start();
     let idents = |s: &str| -> Vec<String> {
         s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -207,7 +207,7 @@ fn bindings_in(line: &str) -> Vec<String> {
 
 /// Parameter names from a definition line `fn f(a: T, b: U)` / `def f(a, b=1)`
 /// / `int f(int a, char *b)`.
-fn params_of(def_line: &str) -> Vec<String> {
+pub(crate) fn params_of(def_line: &str) -> Vec<String> {
     let Some(open) = def_line.find('(') else {
         return Vec::new();
     };
@@ -262,7 +262,7 @@ fn enclosing_def(lines: &[&str], at: usize) -> Option<usize> {
 /// `class`, `impl`, ...) after optional qualifiers, or a C-style function
 /// signature at column 0. Deliberately stricter than the diff map's
 /// extractor, which also matches calls such as `return Ok(())`.
-fn is_def_line(line: &str) -> bool {
+pub(crate) fn is_def_line(line: &str) -> bool {
     let mut t = line.trim_start();
     if t.starts_with(['/', '*', '#', '"', '\'', '}']) {
         return false;

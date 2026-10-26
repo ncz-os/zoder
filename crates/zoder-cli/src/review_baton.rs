@@ -9,13 +9,13 @@
 //!
 //! * the constant head — system prompt, diff map, partial-diff notice, focus —
 //!   is hoisted into one prefix that every chunk shares byte for byte;
-//! * when every chunk carries a byte-identical cross-file context header, that
-//!   header is hoisted too, so it is cached once instead of repeated per call;
-//! * only the part banner, the chunk's own (unhoisted) context and the chunk
-//!   itself vary, and they come last.
+//! * each chunk's cross-file context remains in that chunk's variable tail;
+//!   it is never placed in the shared head;
+//! * only the part banner, the chunk's context and the chunk itself vary, and
+//!   they come last.
 //!
-//! Nothing is dropped: the hoisted header is still in every prompt, just once
-//! and up front. That matters because the header exists to stop small reviewers
+//! Nothing is dropped: the per-chunk header remains in every applicable prompt.
+//! That matters because the header exists to stop small reviewers
 //! reporting names bound in another chunk as undefined — a review that is cheap
 //! because it has less evidence is a worse review, not an optimised one.
 //!
@@ -23,9 +23,7 @@
 //! a reviewer that turns out to dislike the reordering. The two layouts carry
 //! the same evidence; only the byte order differs.
 
-use zoder_core::context_opt::review::{
-    chunk_prompt, hoistable_context, ChunkMessage, ReviewPrefix,
-};
+use zoder_core::context_opt::review::{chunk_prompt, ChunkMessage, ReviewPrefix};
 
 /// Whether the cache-stable review layout is enabled (default on).
 pub fn stable_prefix_enabled() -> bool {
@@ -70,32 +68,21 @@ pub(crate) fn render_review(
     if !stable {
         return render_review_legacy(label, focus_txt, chunks, diff_map, preamble, context_for);
     }
-    // The chunk ids are unique, so a shared header can only emerge from a
-    // closure that really returned the same bytes for two chunks — which is
-    // the condition under which hoisting is byte-identical.
-    // The per-chunk headers are built ONCE and reused for the hoist check and
-    // for the chunk bodies, so the two can never disagree about the bytes.
+    // Build each header once. Context is intentionally not hoisted: it is
+    // hunk-specific evidence and belongs in the variable tail.
     let headers: Vec<String> = (0..chunks.len()).map(context_for).collect();
-    let hoisted = hoistable_context(&headers);
     let prefix = ReviewPrefix {
         system: system.to_string(),
         focus: focus_sentence(focus_txt),
         diff_map: diff_map.to_string(),
         head: head_sentence(label, chunks.len()),
-        context: hoisted.clone().unwrap_or_default(),
+        context: String::new(),
     };
     let prompts = chunks
         .iter()
         .enumerate()
         .map(|(i, chunk)| {
-            // The hoisted header is already in the prefix; repeating it here
-            // would put the large, identical block back on every call, which is
-            // the duplication this layout exists to remove.
-            let ctx = if hoisted.is_some() {
-                String::new()
-            } else {
-                context_for(i)
-            };
+            let ctx = headers.get(i).cloned().unwrap_or_default();
             chunk_prompt(
                 &prefix,
                 &ChunkMessage {
@@ -113,7 +100,7 @@ pub(crate) fn render_review(
         prefix_bytes: rendered.len(),
         prompts,
         prefix: rendered,
-        hoisted_context: hoisted.is_some(),
+        hoisted_context: false,
     }
 }
 
@@ -264,13 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_context_header_is_hoisted_and_still_reaches_every_chunk() {
-        // One header, three chunks: hoisted into the prefix and therefore sent
-        // once per prompt instead of once per chunk body.
+    fn a_shared_context_header_stays_in_each_chunk_tail() {
+        // One header, three chunks: each tail carries its own copy.
         let shared = render_review("SYS", MAP, "branch", "", &chunks(3), "", &|_| {
             "Context from the full post-change files: use std::io;".to_string()
         });
-        assert!(shared.hoisted_context);
+        assert!(!shared.hoisted_context);
+        assert!(!shared
+            .prefix
+            .contains("Context from the full post-change files"));
         for p in &shared.prompts {
             assert_eq!(
                 p.matches("Context from the full post-change files").count(),

@@ -93,12 +93,12 @@ fn only_the_variable_tail_differs_between_chunks() {
 }
 
 #[test]
-fn an_identical_per_chunk_context_is_hoisted_into_the_prefix_once() {
+fn an_identical_per_chunk_context_stays_in_each_variable_tail() {
     let ctx = "Context from the full post-change files (NOT part of the diff):\nuse std::io;\n"
         .to_string();
     let contexts = vec![ctx.clone(), ctx.clone(), ctx.clone()];
     let plan = prefix_for(&contexts);
-    assert_eq!(plan.context, ctx);
+    assert!(plan.context.is_empty());
     let prompts = review_prompts(&plan, &chunks(3), &contexts, "");
     for p in &prompts {
         assert_eq!(

@@ -15,7 +15,7 @@
 
 use serde_json::{json, Value};
 
-use crate::review_context::{definition_index, imported_names};
+use crate::review_context::{bindings_in, const_name, imported_names, is_def_line, params_of};
 
 /// Phrases that make a finding a claim about a missing definition/import.
 const CLAIM_PHRASES: &[&str] = &[
@@ -218,11 +218,53 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
     out
 }
 
-fn line_evidence(path: &str, source: &str, symbol: &str) -> Option<String> {
+fn line_evidence(
+    path: &str,
+    source: &str,
+    symbol: &str,
+    target_line: Option<usize>,
+) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
-    let index = definition_index(&lines);
-    let &idx = index.get(symbol)?;
-    Some(format!("{path}:{}: {}", idx + 1, lines[idx].trim()))
+    // Imports and top-level definitions are file-wide bindings. Local
+    // assignments are only evidence when the finding supplies a line and the
+    // assignment is in that line's enclosing definition; a same-named local
+    // in another function must not disprove an undefined-name claim.
+    for (idx, line) in lines.iter().enumerate() {
+        if is_import_line(line) && imported_names(line).iter().any(|name| name == symbol) {
+            return Some(format!("{path}:{}: {}", idx + 1, line.trim()));
+        }
+        if line.trim_start() == *line && !line.trim().is_empty() {
+            let mut defined = crate::review_diff::extract_defs(line)
+                .into_iter()
+                .chain(const_name(line));
+            if defined.any(|name| name == symbol) {
+                return Some(format!("{path}:{}: {}", idx + 1, line.trim()));
+            }
+        }
+    }
+    let target = target_line?;
+    let target_idx = target.saturating_sub(1).min(lines.len().saturating_sub(1));
+    let target_indent = lines[target_idx].len() - lines[target_idx].trim_start().len();
+    let scope_idx = (0..target_idx).rev().find(|&idx| {
+        is_def_line(lines[idx])
+            && (lines[idx].len() - lines[idx].trim_start().len()) < target_indent
+    })?;
+    for (idx, line) in lines
+        .iter()
+        .enumerate()
+        .take(target_idx + 1)
+        .skip(scope_idx)
+    {
+        let names = if idx == scope_idx {
+            params_of(line)
+        } else {
+            bindings_in(line)
+        };
+        if names.iter().any(|name| name == symbol) {
+            return Some(format!("{path}:{}: {}", idx + 1, line.trim()));
+        }
+    }
+    None
 }
 
 fn is_import_line(line: &str) -> bool {
@@ -346,13 +388,14 @@ fn import_mentions(line: &str, symbol: &str) -> bool {
 
 /// Look for `symbol` in the file itself, then in modules the file imports.
 /// Returns a one-line evidence string naming the defining/importing line.
-pub(crate) fn definition_evidence(
+pub(crate) fn definition_evidence_at(
     path: &str,
     source: &str,
     symbol: &str,
+    target_line: Option<usize>,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(String, String)> {
-    if let Some(evidence) = line_evidence(path, source, symbol) {
+    if let Some(evidence) = line_evidence(path, source, symbol, target_line) {
         return Some((
             "symbol is defined or imported in the file at the reviewed head".to_string(),
             evidence,
@@ -369,7 +412,7 @@ pub(crate) fn definition_evidence(
             let Some(text) = read(&candidate) else {
                 continue;
             };
-            if let Some(evidence) = line_evidence(&candidate, &text, symbol) {
+            if let Some(evidence) = line_evidence(&candidate, &text, symbol, None) {
                 return Some((
                     "symbol is defined in a module the file imports at the reviewed head"
                         .to_string(),
@@ -383,10 +426,21 @@ pub(crate) fn definition_evidence(
 
 /// Decide whether a finding is a false "undefined symbol" claim. `path` is the
 /// repo-relative file from the finding's location. `None` keeps the finding.
-pub(crate) fn false_undefined_record(
+#[cfg(test)]
+fn false_undefined_record(
     title: &str,
     body: &str,
     path: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<Value> {
+    false_undefined_record_at(title, body, path, None, read)
+}
+
+pub(crate) fn false_undefined_record_at(
+    title: &str,
+    body: &str,
+    path: &str,
+    target_line: Option<usize>,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Value> {
     if path.trim().is_empty() || !claims_undefined(&format!("{title}\n{body}")) {
@@ -395,7 +449,9 @@ pub(crate) fn false_undefined_record(
     let path = path.trim().trim_start_matches("./");
     let source = read(path)?;
     for symbol in claimed_symbols(title, body) {
-        if let Some((reason, evidence)) = definition_evidence(path, &source, &symbol, read) {
+        if let Some((reason, evidence)) =
+            definition_evidence_at(path, &source, &symbol, target_line, read)
+        {
             return Some(json!({
                 "severity": "",
                 "title": title,
@@ -530,5 +586,57 @@ mod tests {
         );
         assert!(got.contains(&"MAX_RETRIES".to_string()), "{got:?}");
         assert!(got.contains(&"helper_build".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn multi_chunk_python_context_stops_stub_undefined_findings() {
+        let source = "import os\nimport json\n\ndef build():\n    local = {'ok': True}\n    return os.path.join(json.dumps(local), 'x')\n";
+        let chunk = "diff --git a/pkg/mod.py b/pkg/mod.py\n--- a/pkg/mod.py\n+++ b/pkg/mod.py\n@@ -6,1 +6,1 @@\n-    return old(local)\n+    return os.path.join(json.dumps(local), 'x')\n";
+        let read = read_from(vec![("pkg/mod.py", source)]);
+        // The old stub reviewer saw the use sites but no file-wide bindings,
+        // so it reported all three names as undefined.
+        let old_findings = ["os", "json", "local"];
+        assert_eq!(old_findings.len(), 3);
+        let context = crate::review_context::chunk_context(chunk, &read, 3000);
+        let new_findings: Vec<&str> = old_findings
+            .into_iter()
+            .filter(|name| !context.contains(name))
+            .collect();
+        assert!(
+            new_findings.is_empty(),
+            "new context-free stub findings: {new_findings:?}"
+        );
+        for name in ["os", "json", "local"] {
+            assert!(
+                context.contains(name),
+                "{name} missing from context: {context}"
+            );
+            assert!(
+                false_undefined_record_at(
+                    &format!("{name} is undefined"),
+                    &format!("The chunk cannot see `{name}`."),
+                    "pkg/mod.py",
+                    Some(6),
+                    &read,
+                )
+                .is_some(),
+                "the full-file verifier should record the disproved stub finding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_in_another_function_does_not_disprove_a_finding() {
+        let source =
+            "def first():\n    local = 1\n    return local\n\ndef second():\n    return local\n";
+        let read = read_from(vec![("pkg/mod.py", source)]);
+        assert!(false_undefined_record_at(
+            "local is undefined",
+            "the name is used here",
+            "pkg/mod.py",
+            Some(6),
+            &read,
+        )
+        .is_none());
     }
 }
