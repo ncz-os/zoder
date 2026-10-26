@@ -2167,8 +2167,6 @@ async fn dispatch_reviewer_for_model(
     // the repair can derive its doubled budget from the budget the model
     // ACTUALLY burned, not the chunk budget that may differ after a
     // replan for a fallback reviewer.
-    let mut served_max_tokens = max_tokens;
-
     // Optional host-wide cap on concurrent reviewer calls per provider
     // (ZODER_PROVIDER_CONCURRENCY); unlimited by default. A queue timeout is
     // a capacity signal, so the next reviewer candidate may take over.
@@ -2242,9 +2240,7 @@ async fn dispatch_reviewer_for_model(
                 // chunk walker can hand it back as an empty Completion and
                 // run the doubled-budget repair — the one place a same-model
                 // retry is deliberately allowed.
-                if e.length_exhausted.is_some() {
-                    served_max_tokens = req.max_tokens;
-                    let usage = e.length_exhausted.unwrap();
+                if let Some(usage) = e.length_exhausted {
                     // Reconcile the armed reservation with a real ledger row
                     // naming the model and carrying the usage the provider
                     // published (when it did): the exhausted call is
@@ -2264,10 +2260,9 @@ async fn dispatch_reviewer_for_model(
                         tags: crate::finops_tags(cli, usage.prompt_tokens.unwrap_or(0), None),
                     };
                     let mut health = HealthStore::load(&eng.cfg.health_path);
-                    crate::record_turn_entry(ledger_reservation, &entry, "reviewer turn")
-                        .map_err(|err| {
-                            ReviewerError::fatal(format!("reconciling ledger entry: {err}"))
-                        })?;
+                    crate::record_turn_entry(ledger_reservation, &entry, "reviewer turn").map_err(
+                        |err| ReviewerError::fatal(format!("reconciling ledger entry: {err}")),
+                    )?;
                     // Not a policy success: the call spent real tokens and
                     // produced no verdict, so record it as a failure the
                     // way the generic error paths do.
@@ -2511,7 +2506,7 @@ async fn dispatch_reviewer_for_model(
         cost_usd: cost,
         chunks: 1,
         length_exhausted: false,
-        max_tokens: served_max_tokens,
+        max_tokens,
         receipts: vec![json!({
             "requested_model": model,
             "response_model": res.telemetry.response_model,
@@ -4858,12 +4853,10 @@ did not satisfy the review schema."
                 // never above what the model can hold.
                 let doubled = reviewer_retry_budget(completion.max_tokens);
                 let capped = if let Ok(eng) = crate::Engine::load() {
-                    let provider_id = crate::RoutingContext::load(&eng.cfg)
-                        .ok()
-                        .and_then(|r| {
-                            r.real_provider_for_model(&eng.cfg, &completion.model)
-                                .map(|p| p.id.clone())
-                        });
+                    let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
+                        r.real_provider_for_model(&eng.cfg, &completion.model)
+                            .map(|p| p.id.clone())
+                    });
                     let window = crate::context_opt::window_for(
                         &eng.cfg,
                         provider_id.as_deref().unwrap_or(""),
@@ -17368,14 +17361,19 @@ model_provider = "custom.nemotron35"
         .await
         .expect("a budget exhaustion repaired with the doubled budget succeeds");
         // The verdict came back (on the repair) — the review is complete.
-        let review = strict_review(&completion.content)
-            .expect("the repair's verdict must parse");
+        let review = strict_review(&completion.content).expect("the repair's verdict must parse");
         assert_eq!(review.verdict, "approve");
-        assert!(!report.chunks[0].structured,
-            "a verdict that only appeared on the repair is not first-attempt structured");
+        assert!(
+            !report.chunks[0].structured,
+            "a verdict that only appeared on the repair is not first-attempt structured"
+        );
         // EXACTLY two requests: the empty first call + one repair.
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "the model must receive exactly two requests");
+        assert_eq!(
+            requests.len(),
+            2,
+            "the model must receive exactly two requests"
+        );
         let first_tokens: u64 = requests[0]
             .body_json::<serde_json::Value>()
             .ok()
@@ -17398,9 +17396,14 @@ model_provider = "custom.nemotron35"
         // the usage the provider published).
         let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
         let rows: Vec<&str> = ledger.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(rows.len(), 2, "both calls must be recorded in the ledger: {ledger}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both calls must be recorded in the ledger: {ledger}"
+        );
         assert!(
-            rows.iter().all(|r| r.contains("\"model\":\"working-model/reviewer\"")),
+            rows.iter()
+                .all(|r| r.contains("\"model\":\"working-model/reviewer\"")),
             "every ledger row must name the served model: {ledger}"
         );
     }
@@ -17448,8 +17451,7 @@ model_provider = "custom.nemotron35"
             "the diagnostic must name the model: {chain}"
         );
         assert!(
-            chain.contains("spent its whole 2048-token budget")
-                && chain.contains("(twice)"),
+            chain.contains("spent its whole 2048-token budget") && chain.contains("(twice)"),
             "the diagnostic must name the budget and that it happened twice: {chain}"
         );
         assert!(
@@ -17470,7 +17472,11 @@ model_provider = "custom.nemotron35"
         // Both calls were ledgered.
         let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
         let rows: Vec<&str> = ledger.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(rows.len(), 2, "both calls must be recorded in the ledger: {ledger}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both calls must be recorded in the ledger: {ledger}"
+        );
     }
 
     /// The `content: null` variant of the same regression: an explicit
@@ -17710,10 +17716,8 @@ data: [DONE]\n\n";
         let path = home.join("config.json");
         let mut body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        body["providers"][0]["base_url"] =
-            serde_json::json!(format!("{}/broken", server2.uri()));
-        body["providers"][1]["base_url"] =
-            serde_json::json!(format!("{}/working", server2.uri()));
+        body["providers"][0]["base_url"] = serde_json::json!(format!("{}/broken", server2.uri()));
+        body["providers"][1]["base_url"] = serde_json::json!(format!("{}/working", server2.uri()));
         for provider in body["providers"].as_array_mut().unwrap() {
             provider["max_context_tokens"] = serde_json::json!(3072);
         }

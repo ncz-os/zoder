@@ -2561,7 +2561,9 @@ async fn non_streaming_empty_length_choice_is_budget_truncation_not_malformed() 
         "an empty finish_reason=length choice is a budget exhaustion, not malformed wire data: {error}"
     );
     assert!(
-        error.message.contains("finish_reason \"length\" with no answer"),
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
         "the diagnostic must name the cause, got: {error}"
     );
     assert!(
@@ -2610,7 +2612,12 @@ async fn non_streaming_null_content_length_choice_is_budget_truncation() {
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Truncation, "got: {error}");
-    assert!(error.message.contains("finish_reason \"length\" with no answer"), "got: {error}");
+    assert!(
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
+        "got: {error}"
+    );
     assert!(error.reasoning.is_none(), "no reasoning was published");
     assert_eq!(
         error.length_exhausted,
@@ -2679,7 +2686,9 @@ async fn streaming_empty_length_choice_is_budget_truncation() {
          budget exhaustion, not malformed: {error}"
     );
     assert!(
-        error.message.contains("finish_reason \"length\" with no answer"),
+        error
+            .message
+            .contains("finish_reason \"length\" with no answer"),
         "got: {error}"
     );
     assert_eq!(
@@ -2718,7 +2727,9 @@ async fn non_streaming_empty_choice_without_finish_reason_stays_malformed() {
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
     assert!(
-        error.message.contains("malformed chat-completion response: empty completion choice/message"),
+        error
+            .message
+            .contains("malformed chat-completion response: empty completion choice/message"),
         "the pre-existing malformed diagnostic must survive, got: {error}"
     );
     assert!(
@@ -2744,7 +2755,9 @@ async fn non_streaming_no_choices_stays_malformed() {
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
     assert!(
-        error.message.contains("malformed chat-completion response: no completion choices"),
+        error
+            .message
+            .contains("malformed chat-completion response: no completion choices"),
         "the pre-existing no-choices diagnostic must survive, got: {error}"
     );
     assert!(error.length_exhausted.is_none());
@@ -2766,7 +2779,9 @@ async fn streaming_empty_choice_without_finish_reason_stays_malformed() {
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Decode, "got: {error}");
     assert!(
-        error.message.contains("malformed completion stream: empty completion choice"),
+        error
+            .message
+            .contains("malformed completion stream: empty completion choice"),
         "got: {error}"
     );
     assert!(error.length_exhausted.is_none());
