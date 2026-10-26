@@ -14428,7 +14428,11 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_config(validate: bool) -> anyhow::Result<()> {
-    let mut cfg = Config::load()?;
+    // Load unvalidated so this command remains the diagnostic tool: without
+    // `--validate` it must still print home/providers and the problem list
+    // (including any ignored overlay) and exit 0; `--validate` is what turns
+    // those problems into a non-zero exit.
+    let mut cfg = Config::load_unvalidated()?;
     let engine_models = EngineModelRegistry::load_from(&engine_config_path())?;
     cfg.bind_engine_provider_refs(&engine_models)
         .with_context(|| {
