@@ -2846,7 +2846,6 @@ async fn per_provider_stream_key_forces_streaming_wire_and_records_first_token()
 async fn per_provider_stream_key_false_keeps_non_streaming_wire() {
     // `stream = false` (explicit) must keep today's non-streaming behaviour.
     let server = MockServer::start().await;
-    let ok_body = r#"{"id":"1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"full"},"finish_reason":"stop"}]}"#;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(

@@ -29,7 +29,6 @@
 //! returns immediately, so a config without these keys behaves exactly as
 //! before.
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -181,14 +180,16 @@ fn rate_admit(path: &Path, limit: u32, now_ms: u128) -> std::io::Result<bool> {
     file.lock_exclusive()?;
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut file, &mut raw).unwrap_or_default();
-    let mut stamps: BTreeSet<u128> = serde_json::from_str(&raw).unwrap_or_default();
+    // A list, not a set: two admissions in the same millisecond are two
+    // requests and must both count against the window.
+    let mut stamps: Vec<u128> = serde_json::from_str(&raw).unwrap_or_default();
     let cutoff = now_ms.saturating_sub(WINDOW.as_millis());
     // A stamp is fresh while it is strictly inside the window; exactly one
     // window old it has just expired.
     stamps.retain(|ts| *ts > cutoff);
     let admit = (stamps.len() as u32) < limit;
     if admit {
-        stamps.insert(now_ms);
+        stamps.push(now_ms);
     }
     use std::io::{Seek, Write};
     file.set_len(0)?;
@@ -498,5 +499,17 @@ mod tests {
         assert_eq!(a.limit, 0);
         assert_eq!(a.rate_limit, 0);
         assert!(a.waited < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn two_admissions_in_the_same_millisecond_both_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate.json");
+        assert!(rate_admit(&path, 2, 1_000_000).unwrap());
+        assert!(rate_admit(&path, 2, 1_000_000).unwrap());
+        assert!(
+            !rate_admit(&path, 2, 1_000_000).unwrap(),
+            "a third request in the same window must wait"
+        );
     }
 }
