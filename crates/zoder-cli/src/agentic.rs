@@ -1483,6 +1483,15 @@ async fn dispatch_reviewer_for_model(
     }
 
     let ledger_path = eng.cfg.ledger_path.clone();
+    // The context window is a hard ceiling the prompt has to fit inside. A
+    // prompt that does not fit is REFUSED here rather than sent and rejected
+    // by the provider, and never truncated: a review that saw less of the
+    // diff would be a worse review, not an optimised one.
+    let context_levers = crate::context_opt::levers_for(&eng.cfg, model);
+    let context_window =
+        crate::context_opt::window_for(&eng.cfg, &provider_cfg.id, model, context_levers.as_ref());
+    crate::context_opt::fit_prompt(system, user, context_window)
+        .map_err(|e| ReviewerError::fatal(format!("reviewer {model}: {e}")))?;
     let messages = vec![Message::new("system", system), Message::new("user", user)];
     // Per-model sampling from zoder's vendor overlay, matched on model id.
     // The engine's `config.toml` is deliberately excluded from Config::load,
@@ -1709,6 +1718,16 @@ async fn dispatch_reviewer_for_model(
     if gated {
         crate::provider_health::record_success(&eng.cfg.health_path, &provider_cfg.id, model);
     }
+    // The per-call record: what this call actually carried — prompt tokens,
+    // cache hits, cache misses, completion tokens — plus how the prompt was
+    // composed. The provider's own usage wins; a provider that publishes no
+    // cache counter leaves the cache fields unset rather than reporting a
+    // fabricated zero.
+    crate::context_opt::record_call(
+        "review",
+        &crate::context_opt::segments_for(system, user),
+        &res,
+    );
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
@@ -4820,6 +4839,11 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     // the slot that needed one either fell back (its receipt names the
     // serving model) or failed, which keeps the review incomplete.
     payload["skipped_unhealthy"] = json!(crate::provider_health::take_skipped());
+    // The per-call context telemetry for this review: prompt tokens, cache
+    // hits, cache misses, completion tokens, and the prompt's composition.
+    // For a chunked review this is the whole point — it says how much each
+    // chunk cost and how much of it the provider served from cache.
+    payload["context"] = json!(crate::context_opt::payload());
     // Always present, so a consumer can read `substituted == false` rather than
     // having to treat an absent field as success.
     payload["substituted"] = json!(receipts_show_substitution(aggregate.receipts));
