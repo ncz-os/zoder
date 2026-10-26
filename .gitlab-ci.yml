@@ -88,6 +88,11 @@ rust-gate:
     - cargo fmt --all -- --check
     - cargo clippy --workspace --all-targets --all-features -- -D warnings
     - cargo test --workspace --locked --all-features
+    # Single-host profile smoke: init the template, validate it with each
+    # hosted key, and resolve an exec route. Runs against the just-built
+    # zoder binary only (the full bundle is covered by the release pipeline).
+    - cargo build --locked --bin zoder
+    - scripts/install-smoke.sh --zoder-only --profile standalone "${CARGO_TARGET_DIR:-target}/debug"
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
@@ -147,6 +152,20 @@ public-repo-guard:
       else
         python3 scripts/ci/public-repo-guard.py
       fi
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
+    - if: "$CI_PIPELINE_SOURCE == \"push\""
+
+# Standalone-profile guard: the same hashed public-tree denylist pointed at the
+# single-host starter templates and runtime-default modules, plus a generic
+# RFC1918 check. Cheap (no compile); runs on every push and merge request.
+standalone-profile-guard:
+  stage: check
+  image: python:3.12
+  needs: []
+  cache: {}
+  script:
+    - scripts/ci/standalone-profile-guard.sh
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""

@@ -15,6 +15,9 @@ Usage
     # Scan the working tree and every commit message unique to this branch.
     python3 scripts/ci/public-repo-guard.py --base origin/main
 
+    # Scan specific files only (used by the standalone-profile guard).
+    python3 scripts/ci/public-repo-guard.py --path config.standalone.toml
+
     # Prove that a known-bad sample is detected (the test term is synthetic and
     # is never present in the tree as a contiguous string).
     python3 scripts/ci/public-repo-guard.py --self-test
@@ -51,6 +54,9 @@ SALT = b"zoder-public-tree-guard-v1-3f6d2c8a"
 DENYLIST = Path(__file__).resolve().parent / "public-repo-denylist.txt"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 IPV4_RE = re.compile(r"(?:\d{1,3}\.){1,3}\d{1,3}")
+FULL_IPV4_RE = re.compile(
+    r"(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])"
+)
 URL_HOST_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#]+)")
 SCP_HOST_RE = re.compile(r"(?<![\w.-])[\w.-]+@([A-Za-z0-9][A-Za-z0-9.-]*):")
 SSH_CMD_RE = re.compile(r"(?:^|[\s;&|()])ssh(?=\s|$)")
@@ -220,6 +226,23 @@ def scan_text(
     return hits
 
 
+def private_address_hits(text: str, where: str) -> set[tuple[str, int, str]]:
+    """RFC1918 addresses in text. Never prints the address, only its line."""
+    hits: set[tuple[str, int, str]] = set()
+    for match in FULL_IPV4_RE.finditer(text):
+        octets = [int(group) for group in match.groups()]
+        if any(octet > 255 for octet in octets):
+            continue
+        first, second = octets[0], octets[1]
+        if (
+            first == 10
+            or (first == 172 and 16 <= second <= 31)
+            or (first == 192 and second == 168)
+        ):
+            hits.add((where, _line_of(text, match.start()), "private-address"))
+    return hits
+
+
 def tracked_files(root: Path) -> list[str]:
     output = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-z"],
@@ -291,6 +314,16 @@ def self_test(rules: dict[str, set[str]]) -> int:
         raise SystemExit("public-repo-guard self-test: clean text was flagged")
     if not scan_text(f"pre {term} post", rules, "self-test"):
         raise SystemExit("public-repo-guard self-test: tree text was not flagged")
+
+    private = private_address_hits("host 10.2.3.4 and 172.16.0.9", "self-test")
+    if {line for _, line, kind in private if kind == "private-address"} != {1}:
+        raise SystemExit(
+            "public-repo-guard self-test: RFC1918 addresses were not flagged"
+        )
+    if private_address_hits("10.6B tokens, 172.16 is documentation", "self-test"):
+        raise SystemExit(
+            "public-repo-guard self-test: non-address text was flagged as RFC1918"
+        )
 
     two_lines = (
         f"first https://{term}.example.invalid/a\n"
@@ -383,6 +416,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--hash-host", metavar="HOST", help="print a host digest")
     parser.add_argument("--self-test", action="store_true", help="prove the guard fires")
+    parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="scan only these files (repeatable); does not scan the whole tree",
+    )
+    parser.add_argument(
+        "--reject-private-addresses",
+        action="store_true",
+        help="with --path, also reject RFC1918 addresses",
+    )
     args = parser.parse_args(argv)
 
     if args.hash is not None or args.hash_prefix is not None or args.hash_host is not None:
@@ -392,6 +437,29 @@ def main(argv: list[str] | None = None) -> int:
     rules = load_denylist()
     if args.self_test:
         return self_test(rules)
+
+    if args.path:
+        hits: set[tuple[str, int, str]] = set()
+        for raw in args.path:
+            path = Path(raw)
+            if not path.is_file():
+                raise SystemExit(f"public-repo-guard: no such file: {raw}")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            hits |= scan_text(text, rules, raw)
+            if args.reject_private_addresses:
+                hits |= private_address_hits(text, raw)
+        if hits:
+            print("public-repo-guard: blocked identifier found", file=sys.stderr)
+            for where, line, kind in sorted(hits):
+                print(f"  {where}:{line}: {kind}", file=sys.stderr)
+            return 1
+        print(f"public-repo-guard: clean ({len(args.path)} path(s))")
+        return 0
+
+    if args.reject_private_addresses:
+        raise SystemExit(
+            "public-repo-guard: --reject-private-addresses requires --path"
+        )
 
     hits = scan_tree(root, rules)
     hits |= scan_branch(root, rules, args.base)
