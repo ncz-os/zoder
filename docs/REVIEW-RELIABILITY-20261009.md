@@ -1,8 +1,7 @@
 # Review reliability repair, 2026-10-09
 
-Hive job: `01a12258-1f42-7331-9edc-8f5bfe928ba8`.
 Canonical base: GitLab `ncz-os/zoder`, `c45483be38378b9a6fed2a1eed63a5d1db23aebb`.
-Branch: `fix/astra-review-reliability-20261009`.
+Branch: the review-reliability repair branch of 2026-10-09.
 
 ## Findings and changes
 
@@ -88,7 +87,7 @@ the old `zoder 0.2.1` version string alone cannot prove this repair is installed
 
 ## Known limits
 
-The 2026-10-10 follow-up (branch `fix/astra-review-followup-20261010`) reviewed
+The 2026-10-10 follow-up (the review-reliability follow-up branch) reviewed
 the following items and deliberately left them unchanged. They are not defects
 in the code paths changed by that follow-up; each needs its own change with
 independent evidence.

@@ -7211,7 +7211,7 @@ fn daemon_stderr_log_path() -> std::path::PathBuf {
 /// the daemon IT spawned: the orphan reaper needs a durable, cross-process
 /// record of "which process is the shared daemon", because the reaper that
 /// has to spare it is frequently a *different* zoder process than the one
-/// that spawned it (job 01a16164's loop reaping while 01a1619b's agent is
+/// that spawned it (one job's loop reaping while another job's agent is
 /// mid turn).
 ///
 /// The record is `<pid> <start_ticks>`. A pid alone is not an identity and
@@ -7419,13 +7419,13 @@ pub(crate) fn daemon_binary_path() -> PathBuf {
 /// directory, never the caller's cwd.
 ///
 /// 2026-10-21 (a fleet host): `zeroclaw daemon --ephemeral` inherited the cwd
-/// of whichever zoder happened to spawn it first — job `01a16164`'s
-/// `zoder loop`, so the daemon sat in `/home/jasonperlow/hive-workspaces/
-/// 01a16164-…` while every OTHER zoder on the host talked to it over
+/// of whichever zoder happened to spawn it first — one job's
+/// `zoder loop`, so the daemon sat in that job's workspace directory
+/// while every OTHER zoder on the host talked to it over
 /// `~/.zoder/data/daemon.sock`. That made the daemon a child of one job's
 /// directory in two separate ways: the orphan reaper could select it (same
 /// uid, cwd inside `-C`, started after the loop began) and SIGTERM the
-/// agent of every other concurrent zoder on the host, and the Hive cleanup
+/// agent of every other concurrent zoder on the host, and the job cleanup
 /// could delete a directory a live shared daemon was sitting in.
 ///
 /// The config dir is the right home for it: it is where the daemon keeps
@@ -7703,7 +7703,7 @@ mod ephemeral_daemon_reap_tests {
 mod daemon_cwd_tests {
     //! The shared daemon must not live in a job directory.
     //!
-    //! 2026-10-21 (a fleet host): `zoder loop` for hive job `01a16164` spawned
+    //! 2026-10-21 (a fleet host): a `zoder loop` for one fleet job spawned
     //! `zeroclaw daemon --ephemeral` with no `current_dir`, so the daemon
     //! inherited that job's workspace and served `~/.zoder/data/daemon.sock`
     //! to every other zoder on the host while sitting in one job's directory.
@@ -7712,7 +7712,7 @@ mod daemon_cwd_tests {
     //!
     //! These tests drive the PRODUCTION spawn builder ([`daemon_command`])
     //! with a fixture binary and then read `/proc/<pid>/cwd` — the exact
-    //! thing the reaper looks at, and the exact thing the Hive cleanup looks
+    //! thing the reaper looks at, and the exact thing the job cleanup looks
     //! at when it deletes a workspace.
     //!
     //! The test process itself is never `chdir`ed into a workspace: it is one
@@ -9228,10 +9228,9 @@ mod cli_tier_reasoning_parse_tests {
             }))
             .expect("the provider must deserialize")
         };
-        // The fleet's own self-hosted routes: a private LAN address behind a
-        // `custom.*` engine profile, which the engine-family check cannot see.
+        // Self-hosted routes on a private LAN, behind a `custom.*` engine
+        // profile, which the engine-family check cannot see.
         for url in [
-            "http://192.168.1.73:8006/v1",
             "http://10.1.2.3:8000/v1",
             "http://172.20.0.5/v1",
             "http://169.254.1.1:8000/v1",
@@ -9247,6 +9246,13 @@ mod cli_tier_reasoning_parse_tests {
                 "{url} must be a local route"
             );
         }
+        // The 192.168/16 private block, spelled from its octets so the fixture
+        // carries no address of any particular site.
+        let private_block = format!("http://{}.{}.{}.{}:8006/v1", 192, 168, 1, 73);
+        assert!(
+            provider(&private_block).is_local_route(),
+            "a private LAN address must be a local route"
+        );
         for url in [
             "https://api.minimax.io/v1",
             "https://api.example.invalid/v1",

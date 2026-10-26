@@ -411,7 +411,7 @@ impl Provider {
     /// Loopback, private (RFC 1918), link-local and unique-local addresses,
     /// `localhost`, `.local` / `.lan` names and single-label hostnames are
     /// all treated as the local network. This is what puts a model served
-    /// from a LAN GPU box (`http://192.168.x.x:8000/v1`) on the local
+    /// from a LAN GPU box (`http://gpu-box.local:8000/v1`) on the local
     /// route, where a loopback-only check would classify it as hosted and
     /// hand it the short window. A public hostname or address is never local.
     fn base_url_is_local_network(&self) -> bool {

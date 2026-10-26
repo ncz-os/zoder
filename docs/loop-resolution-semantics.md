@@ -124,7 +124,7 @@ old-schema record still parses with the new fields absent.
   fallback to a different model — zoder refuses mixed-model approval, and the
   record surfaces that refusal as incomplete, never as complete. When the
   review errored, `reviewer_verdicts` is absent (empty) and `review_complete`
-  is `false`. Downstream triage (Hive's shadow-mode loop triage) keys on this
+  is `false`. Downstream triage (the fleet's shadow-mode loop triage) keys on this
   field to decide whether a non-converging loop can be judged.
 * **`reviewer_verdicts` (array, per iteration).** One entry per requested
   reviewer of the iteration: `{model, verdict, complete}`. `model` is the
