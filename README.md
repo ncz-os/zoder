@@ -916,6 +916,12 @@ Rules the loader enforces (fail loud, don't silently merge):
 - **An overlay with no `[[providers]]` and no `[profile].default` is an
   error.** A file that does nothing is almost certainly a half-finished
   template — delete it instead of leaving it on disk.
+- **An overlay that cannot be parsed is a load error.** A plain `zoder config`
+  still loads it as a diagnostic and prints the warning, but
+  `zoder config --validate` and every normal startup fail with the file name
+  and the parse error instead of silently running without its providers. This
+  usually means the file uses a key the binary does not know (unknown keys are
+  rejected, never ignored).
 
 Adding a new vendor is a copy-paste exercise:
 

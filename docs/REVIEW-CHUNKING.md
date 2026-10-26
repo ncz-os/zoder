@@ -178,10 +178,12 @@ max_hunk_bytes = 64000
 Use `review.toml`, not the vendor overlay. A `[review]` table inside
 `config.<vendor>.toml` is read by current builds, but builds that predate it
 **ignore the whole overlay file** (every provider in it) when they meet the
-unknown table, while `config --validate` still says VALID. `review.toml` is
-never opened by older builds, so it can be deployed independently of the
-binary. It is merged after the overlays and wins over an overlay `[review]`.
-A malformed `review.toml` is ignored with a warning.
+unknown table. Current builds record that skip, so `config --validate` reports
+the ignored file instead of saying VALID. `review.toml` is never opened by
+older builds, so it can be deployed independently of the binary. It is merged
+after the overlays and wins over an overlay `[review]`. A malformed
+`review.toml` is ignored with a warning at load, and `config --validate`
+reports it as a problem.
 
 `zoder loop` uses the same planner for its review phase (per-route caps are
 resolved for the reviewer that will serve the head slot), so a loop review is

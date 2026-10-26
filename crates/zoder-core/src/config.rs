@@ -2441,6 +2441,40 @@ pub struct Config {
     /// were before the 2026-10-25 study. See [`crate::context_opt`].
     #[serde(default, skip_serializing_if = "ContextConfig::is_empty")]
     pub context: ContextConfig,
+    /// Config files that exist on disk but were ignored while loading: an
+    /// overlay `config.<vendor>.toml` that failed to parse, or a `review.toml`
+    /// that could not be read or parsed. Loading still prints a warning and
+    /// keeps going (so `zoder config` can show what is wrong), but
+    /// [`Config::validate`] reports every entry, which makes both
+    /// `zoder config --validate` and normal [`Config::load`] startup fail
+    /// loudly instead of silently running without the file's providers.
+    /// Never serialized.
+    #[serde(skip)]
+    pub ignored_config_files: Vec<IgnoredConfigFile>,
+}
+
+/// A config file that exists but was ignored during load, with the reason
+/// (the read or TOML parse error text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredConfigFile {
+    /// What the file is, for the problem message: `overlay` or
+    /// `review config`.
+    pub kind: String,
+    pub path: PathBuf,
+    /// The read/parse error text, as printed in the load warning.
+    pub error: String,
+}
+
+impl IgnoredConfigFile {
+    /// One-line `validate()` problem naming the file and the error.
+    fn problem(&self) -> String {
+        format!(
+            "{} {} was ignored: {}",
+            self.kind,
+            self.path.display(),
+            self.error
+        )
+    }
 }
 
 /// `[context]` block from `config.json` / an overlay TOML.
@@ -3370,10 +3404,18 @@ impl Config {
     /// default) and then layer every `config.<vendor>.toml` in the same
     /// directory on top. See module docs for the layered-config model.
     pub fn load() -> anyhow::Result<Self> {
-        let cfg = Self::load_unvalidated()?;
+        let home = Self::resolve_home()?;
+        Self::load_from(&home)
+    }
+
+    /// [`Config::load`] against an explicit home directory. Split out so tests
+    /// can verify the validate-and-bail path without touching the
+    /// process-global `ZODER_HOME` env var.
+    fn load_from(home: &std::path::Path) -> anyhow::Result<Self> {
+        let cfg = Self::load_unvalidated_from(home)?;
         // Fail loud on a misconfigured merge (duplicate ids, missing
-        // default_provider, bad base_urls, …) rather than discovering it at
-        // call time.
+        // default_provider, bad base_urls, an ignored overlay, …) rather than
+        // discovering it at call time.
         let problems = cfg.validate();
         if !problems.is_empty() {
             anyhow::bail!(
@@ -3700,6 +3742,7 @@ impl Config {
             review: ReviewConfig::default(),
             model_families: BTreeMap::new(),
             context: ContextConfig::default(),
+            ignored_config_files: Vec::new(),
         }
     }
 
@@ -4352,6 +4395,14 @@ impl Config {
                 }
             }
         }
+        // A config file that exists but was skipped is a problem, not a
+        // warning: the providers (or review caps) it contributes are silently
+        // missing, so `--validate` must never call that VALID.
+        errs.extend(
+            self.ignored_config_files
+                .iter()
+                .map(IgnoredConfigFile::problem),
+        );
         errs
     }
 }
@@ -4562,11 +4613,15 @@ fn apply_overlays(cfg: &mut Config, home: &Path) -> anyhow::Result<()> {
 ///
 /// Why a separate file: a build that predates `[review]` support in vendor
 /// overlays ignores the WHOLE `config.<vendor>.toml` when it meets an unknown
-/// `[review]` table -- every provider in it disappears while
-/// `config --validate` still reports VALID. Builds that do not know this
-/// file never open it, so review sizing can be deployed to a host before or
-/// after its binary is upgraded without breaking routing. Merged after the
-/// overlays, so it wins over an overlay `[review]`.
+/// `[review]` table -- every provider in it disappears. (Current builds now
+/// record that ignored overlay and `config --validate` reports it, but they
+/// still cannot read the table.) Builds that do not know this file never open
+/// it, so review sizing can be deployed to a host before or after its binary
+/// is upgraded without breaking routing. Merged after the overlays, so it
+/// wins over an overlay `[review]`. A `review.toml` that cannot be read or
+/// parsed is likewise recorded as an ignored file and reported by
+/// [`Config::validate`], while the load itself keeps the older warn-and-skip
+/// behaviour so `zoder config` can still diagnose it.
 pub const REVIEW_CONFIG_FILE: &str = "review.toml";
 
 fn apply_review_file(cfg: &mut Config, home: &Path) {
@@ -4582,12 +4637,24 @@ fn apply_review_file(cfg: &mut Config, home: &Path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             eprintln!("[zoder] warning: ignoring {}: {e}", path.display());
+            cfg.ignored_config_files.push(IgnoredConfigFile {
+                kind: "review config".into(),
+                path,
+                error: e.to_string(),
+            });
             return;
         }
     };
     match toml::from_str::<ReviewFile>(&raw) {
         Ok(file) => merge_review_config(&mut cfg.review, &file.review),
-        Err(e) => eprintln!("[zoder] warning: ignoring {}: {e}", path.display()),
+        Err(e) => {
+            eprintln!("[zoder] warning: ignoring {}: {e}", path.display());
+            cfg.ignored_config_files.push(IgnoredConfigFile {
+                kind: "review config".into(),
+                path,
+                error: e.to_string(),
+            });
+        }
     }
 }
 
@@ -4596,7 +4663,11 @@ fn apply_overlays_filtered(
     home: &Path,
     only_vendor: Option<&str>,
 ) -> anyhow::Result<()> {
-    let overlays = collect_overlays(home, only_vendor)?;
+    let (overlays, ignored) = collect_overlays(home, only_vendor)?;
+    // Record unparseable overlays on the config before merging so `validate()`
+    // (and therefore `--validate` / a normal load) can report them even when
+    // every overlay was dropped.
+    cfg.ignored_config_files.extend(ignored);
     if overlays.is_empty() {
         return Ok(());
     }
@@ -4780,10 +4851,11 @@ fn merge_review_config(base: &mut ReviewConfig, overlay: &ReviewConfig) {
     }
 }
 
-fn collect_overlays(
-    home: &Path,
-    only_vendor: Option<&str>,
-) -> anyhow::Result<Vec<(String, VendorOverlay)>> {
+/// Parsed overlays plus the files that were skipped because they could not be
+/// parsed.
+type CollectedOverlays = (Vec<(String, VendorOverlay)>, Vec<IgnoredConfigFile>);
+
+fn collect_overlays(home: &Path, only_vendor: Option<&str>) -> anyhow::Result<CollectedOverlays> {
     // Distinguish the legitimate "no overlay directory yet" case (`NotFound` —
     // normal first run before `ZODER_HOME` has been created, or a fresh
     // install) from any OTHER `read_dir` error (permission denied, the path
@@ -4794,7 +4866,7 @@ fn collect_overlays(
     // (non-overlaid) provider set — quietly wrong routing with no warning.
     let rd = match std::fs::read_dir(home) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
                 "enumerating vendor overlays under {}",
@@ -4848,25 +4920,29 @@ fn collect_overlays(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = Vec::with_capacity(entries.len());
+    let mut ignored = Vec::new();
     for (vendor, path) in entries {
         // Same bounded, regular-file-only guard as the primary config read:
         // a FIFO or an oversized overlay would otherwise block or OOM the
         // process on every config load, before any validation runs.
         let raw = read_bounded_regular_file(&path, Config::MAX_CONFIG_BYTES)?;
-        // Unknown keys WARN, they do not abort. The structs carry
-        // `deny_unknown_fields` so a typo is caught rather than silently
-        // ignored -- that is the point of ncz-os/zoder#15 -- but a strict
-        // parse that refuses to start is the wrong end of the trade: an
-        // operator with one stale key in one overlay loses the whole tool,
-        // including the `zoder config` command they would use to find it.
-        //
-        // So: report the key, drop that overlay, and keep going. Errors are
-        // reserved for `--strict` / `zoder config --validate`, where the
-        // caller has asked to be blocked.
+        // A parse failure warns and drops THIS overlay so `zoder config`
+        // (which loads unvalidated) can still run and show the problem, but it
+        // is also recorded on the Config. `Config::validate` reports every
+        // recorded file, so `zoder config --validate` and normal startup
+        // (`Config::load`) fail loudly instead of silently running without
+        // this overlay's providers. The structs still carry
+        // `deny_unknown_fields`, so an unknown key is what usually triggers
+        // this; an accepted key set is unchanged.
         let overlay: VendorOverlay = match toml::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[zoder] warning: ignoring overlay {}: {e}", path.display());
+                ignored.push(IgnoredConfigFile {
+                    kind: "overlay".into(),
+                    path,
+                    error: e.to_string(),
+                });
                 continue;
             }
         };
@@ -4889,7 +4965,7 @@ fn collect_overlays(
         }
         out.push((vendor, overlay));
     }
-    Ok(out)
+    Ok((out, ignored))
 }
 
 #[cfg(test)]
@@ -6128,7 +6204,22 @@ auth = { type = "env", var = "K" }
         std::fs::write(dir.path().join(REVIEW_CONFIG_FILE), "[review]\nbogus = 1\n").unwrap();
         let mut cfg = Config::default_provider(dir.path());
         apply_overlays(&mut cfg, dir.path()).unwrap();
+        // Runtime still ignores the bad content ...
         assert!(cfg.review.route_defaults.is_empty());
+        // ... but it is recorded, so validate() (and therefore --validate /
+        // normal startup) reports it instead of calling the config VALID.
+        assert_eq!(cfg.ignored_config_files.len(), 1, "{cfg:?}");
+        assert_eq!(
+            cfg.ignored_config_files[0].path.file_name().unwrap(),
+            REVIEW_CONFIG_FILE
+        );
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(REVIEW_CONFIG_FILE) && p.contains("unknown field")),
+            "validate() must report the ignored review file: {problems:?}"
+        );
     }
 
     #[test]
@@ -6303,6 +6394,93 @@ auth = { type = "env", var = "ACME_KEY" }
         assert!(
             msg.contains("parsing zoder config at"),
             "error should name the parse step + path: {msg}"
+        );
+    }
+
+    #[test]
+    fn unparseable_overlay_is_recorded_and_fails_validation_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("config.fleet.toml");
+        std::fs::write(
+            &overlay,
+            r#"
+[model_families]
+"provider-a/*" = "provider-a"
+
+[[providers]]
+id = "fleet-provider"
+base_url = "https://gw.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "FLEET_KEY" }
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_unvalidated_from(dir.path())
+            .expect("an ignored overlay must not turn the unvalidated load into an Err");
+        assert_eq!(cfg.ignored_config_files.len(), 1, "{cfg:?}");
+        assert_eq!(
+            cfg.ignored_config_files[0].path.file_name().unwrap(),
+            "config.fleet.toml"
+        );
+        assert!(
+            cfg.ignored_config_files[0].error.contains("unknown field"),
+            "the recorded error must keep the parse text: {:?}",
+            cfg.ignored_config_files[0].error
+        );
+        // The overlay's provider was dropped, exactly as before; the point of
+        // the change is that this is no longer silent.
+        assert!(cfg.providers.iter().all(|p| p.id != "fleet-provider"));
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("config.fleet.toml") && p.contains("unknown field")),
+            "validate() must report the ignored overlay: {problems:?}"
+        );
+
+        // Normal startup (`Config::load`) bails on the same problem.
+        let err = Config::load_from(dir.path())
+            .expect_err("normal startup must fail when an overlay is ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("config.fleet.toml") && msg.contains("unknown field"),
+            "the load error must name the file and the parse error: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_overlay_is_recorded_and_fails_validation_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.fleet.toml"),
+            "[[providers]\nid = \"fleet-provider\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_unvalidated_from(dir.path())
+            .expect("a syntax-broken overlay must not turn the unvalidated load into an Err");
+        assert_eq!(cfg.ignored_config_files.len(), 1, "{cfg:?}");
+        assert!(
+            cfg.ignored_config_files[0]
+                .error
+                .contains("TOML parse error"),
+            "the recorded error must keep the parse text: {:?}",
+            cfg.ignored_config_files[0].error
+        );
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("config.fleet.toml") && p.contains("TOML parse error")),
+            "validate() must report the ignored overlay: {problems:?}"
+        );
+
+        let err = Config::load_from(dir.path())
+            .expect_err("normal startup must fail when an overlay is ignored");
+        assert!(
+            format!("{err:#}").contains("config.fleet.toml"),
+            "the load error must name the file: {err:#}"
         );
     }
 

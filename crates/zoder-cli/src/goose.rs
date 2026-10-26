@@ -1601,6 +1601,43 @@ mod configure_tests {
     }
 
     #[test]
+    fn configure_reports_an_ignored_overlay_and_validate_exits_nonzero() {
+        // An overlay that fails to parse is dropped at load (so the command is
+        // still usable) but must appear in the problem list, and --validate
+        // must exit non-zero.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.standalone.toml"),
+            r#"
+[model_families]
+"provider-a/*" = "provider-a"
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_unvalidated_from(dir.path());
+        assert!(
+            loaded.is_ok(),
+            "the ignored overlay must not turn the load into an Err"
+        );
+        let problems = configure_problems(loaded.as_ref());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("config.standalone.toml") && p.contains("unknown field")),
+            "configure must report the ignored overlay: {problems:?}"
+        );
+        match configure_exit_decision(&problems, true) {
+            ConfigureOutcome::Exit(code) => assert_eq!(code, 1),
+            other => panic!("--validate with an ignored overlay must exit nonzero, got {other:?}"),
+        }
+        assert_eq!(
+            configure_exit_decision(&problems, false),
+            ConfigureOutcome::Ok,
+            "without --validate configure still returns success"
+        );
+    }
+
+    #[test]
     fn malformed_json_config_is_reported_gracefully() {
         // C3-2: a trailing comma makes config.json unparseable. It must come
         // back as ONE readable problem (mirroring `mcp list`), not a bail.

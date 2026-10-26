@@ -161,6 +161,58 @@ fn the_standalone_template_validates_with_either_provider_key() {
 }
 
 #[test]
+fn config_validate_fails_on_a_broken_overlay_but_plain_config_still_reports_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An unknown table makes the whole overlay unparseable, so every provider
+    // in it is dropped. That must never be reported as VALID again.
+    fs::write(
+        dir.path().join("config.fleet.toml"),
+        r#"
+[model_families]
+"provider-a/*" = "provider-a"
+
+[[providers]]
+id = "fleet-provider"
+base_url = "https://gw.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "FLEET_KEY" }
+"#,
+    )
+    .expect("write broken overlay");
+
+    let output = run(zoder(dir.path()).args(["config", "--validate"]));
+    assert!(
+        !output.status.success(),
+        "config --validate must exit non-zero when an overlay was ignored\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        !out.contains("config:      VALID"),
+        "an ignored overlay must never validate as VALID:\n{out}"
+    );
+    assert!(out.contains("PROBLEM(S)"), "stdout:\n{out}");
+    assert!(
+        out.contains("config.fleet.toml") && out.contains("unknown field"),
+        "the problem must name the file and the parse error:\n{out}"
+    );
+
+    // Without --validate the command stays the diagnostic tool: exit 0, print
+    // the normal report, and still show the problem.
+    let output = run(zoder(dir.path()).args(["config"]));
+    assert_ok(&output, "config without --validate");
+    let out = stdout(&output);
+    assert!(out.contains("home:"), "stdout:\n{out}");
+    assert!(out.contains("default:     default"), "stdout:\n{out}");
+    assert!(out.contains("PROBLEM(S)"), "stdout:\n{out}");
+    assert!(
+        out.contains("config.fleet.toml") && out.contains("unknown field"),
+        "the diagnostic report must show the ignored overlay:\n{out}"
+    );
+}
+
+#[test]
 fn exec_dry_run_resolves_a_route_with_either_provider_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_corpus(dir.path());
