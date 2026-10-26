@@ -815,10 +815,11 @@ fn plan_loop_review(
         !prepared.emptied_by_exclusion,
         "review diff is non-empty but exclusions removed every file; refusing to approve an unreviewed diff"
     );
-    let mut users = build_review_users(label, "", &prepared, context_for);
-    for u in &mut users {
-        *u = format!("{preamble}{u}");
-    }
+    // The preamble goes INSIDE the baton, after the cache-stable head. It used
+    // to be prepended to every chunk prompt, which put the task text and the
+    // validation output — both of which change on every review — in front of
+    // the constant head, so no chunk of a review ever shared a cache prefix.
+    let users = build_review_users(label, "", preamble, &prepared, context_for);
     let max_tokens = caps.max_tokens_floor.map_or(base_tokens, |floor| {
         base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
     });
@@ -3962,13 +3963,28 @@ async fn complete_review_chunks(
     };
     let mut idx = 0usize;
     while idx < users.len() {
-        let user = format!(
-            "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
+        // The "this is review part N of M" statement and the partial-diff
+        // notice live INSIDE the chunk prompt: the notice is constant, so it
+        // belongs to the cache-stable head, and the part number varies, so it
+        // belongs to the variable tail. Prepending the whole sentence here
+        // put the varying part number in FRONT of the head, so the leading
+        // bytes of chunk N+1 were never the leading bytes of chunk N and the
+        // cache could not hit at all.
+        //
+        // The historical layout (behind ZODER_REVIEW_STABLE_PREFIX=0) keeps
+        // the notice in front, because that layout has no cache-stable head
+        // to protect.
+        let user = if crate::review_baton::stable_prefix_enabled() {
+            users[idx].clone()
+        } else {
+            format!(
+                "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
 Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
 is not evidence of a defect. Report only defects established by the supplied code; do not \
 invent missing integration or compiler failures from omitted context.\n\n{}",
-            idx + 1, users.len(), users[idx]
-        );
+                idx + 1, users.len(), users[idx]
+            )
+        };
         let mut completion = complete_once(
             cli,
             served_model.as_deref().or(model_override),
@@ -4114,9 +4130,16 @@ struct ReviewPlan {
 }
 
 /// Build the per-chunk reviewer prompts for a prepared diff.
+///
+/// `preamble` is the per-review context block (the task under review, the
+/// validation output). It is placed AFTER the cache-stable head, never
+/// before it: a prefix cache is keyed on the leading bytes, so anything that
+/// varies per review and sits in front of the head breaks the cache on every
+/// review and re-bills the whole head.
 fn build_review_users(
     label: &str,
     focus_txt: &str,
+    preamble: &str,
     prepared: &crate::review_diff::PreparedDiff,
     context_for: &dyn Fn(&str) -> String,
 ) -> Vec<String> {
@@ -4126,8 +4149,8 @@ fn build_review_users(
     // constant head (system prompt aside, which travels in the `system` slot,
     // plus the diff map, the partial-diff notice and the focus line) and any
     // byte-identical per-chunk context header into one shared prefix, then
-    // appends only the part banner and the chunk. Before it, the diff map was
-    // repeated on all 16 calls of a 16-chunk review.
+    // appends the preamble, the part banner and the chunk. Before it, the diff
+    // map was repeated on all 16 calls of a 16-chunk review.
     let chunks: Vec<String> = prepared.chunks.clone();
     let map = prepared.diff_map.clone().unwrap_or_default();
     let wrapped_map = if map.is_empty() {
@@ -4146,6 +4169,7 @@ as undefined, redefined, or recursively calling a missing function, check it aga
         label,
         focus_txt,
         &chunks,
+        preamble,
         &|idx| context_for(chunks.get(idx).map(String::as_str).unwrap_or_default()),
     );
     rendered.prompts
@@ -4416,7 +4440,7 @@ unbound, or missing imports:\n{context}"
             caps.max_chunks,
             opts.split_hunks,
         )?;
-        let users = build_review_users(&label, &focus_txt, &prepared, &context_for);
+        let users = build_review_users(&label, &focus_txt, "", &prepared, &context_for);
         Ok(ReviewPlan {
             caps,
             prepared,

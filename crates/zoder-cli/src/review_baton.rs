@@ -45,6 +45,10 @@ pub(crate) struct RenderedReview {
     /// The constant head, exactly as it leads every prompt, so a caller can
     /// fingerprint it (cache-stability evidence) without re-deriving it.
     pub prefix: String,
+    /// Byte length of the constant head at the front of every prompt. A
+    /// caller that wants to attribute bytes (the telemetry layer) needs to
+    /// know where the head ends and the variable tail begins.
+    pub prefix_bytes: usize,
     /// Whether a shared per-chunk context header was hoisted into the prefix.
     pub hoisted_context: bool,
 }
@@ -59,29 +63,25 @@ pub(crate) fn render_review(
     label: &str,
     focus_txt: &str,
     chunks: &[String],
+    preamble: &str,
     context_for: &dyn Fn(usize) -> String,
 ) -> RenderedReview {
     let stable = stable_prefix_enabled();
+    if !stable {
+        return render_review_legacy(label, focus_txt, chunks, diff_map, preamble, context_for);
+    }
     // The chunk ids are unique, so a shared header can only emerge from a
     // closure that really returned the same bytes for two chunks — which is
     // the condition under which hoisting is byte-identical.
     // The per-chunk headers are built ONCE and reused for the hoist check and
     // for the chunk bodies, so the two can never disagree about the bytes.
     let headers: Vec<String> = (0..chunks.len()).map(context_for).collect();
-    let hoisted = if stable {
-        hoistable_context(&headers)
-    } else {
-        None
-    };
+    let hoisted = hoistable_context(&headers);
     let prefix = ReviewPrefix {
         system: system.to_string(),
-        focus: if stable {
-            String::new()
-        } else {
-            focus_sentence(focus_txt)
-        },
+        focus: focus_sentence(focus_txt),
         diff_map: diff_map.to_string(),
-        head: head_sentence(label, focus_txt, chunks.len(), stable),
+        head: head_sentence(label, chunks.len()),
         context: hoisted.clone().unwrap_or_default(),
     };
     let prompts = chunks
@@ -101,16 +101,75 @@ pub(crate) fn render_review(
                 &ChunkMessage {
                     part: i + 1,
                     parts: chunks.len(),
+                    preamble: preamble.to_string(),
                     context: ctx,
                     chunk: chunk.clone(),
                 },
             )
         })
         .collect();
+    let rendered = prefix.render();
+    RenderedReview {
+        prefix_bytes: rendered.len(),
+        prompts,
+        prefix: rendered,
+        hoisted_context: hoisted.is_some(),
+    }
+}
+
+/// The historical layout, kept behind `ZODER_REVIEW_STABLE_PREFIX=0`.
+///
+/// This is the byte-for-byte pre-baton shape: the per-chunk portion label
+/// first, the cross-chunk diff map and the per-chunk context repeated on
+/// every chunk, and the "this is review part N of M" statement in front of
+/// all of it. It has no cache-stable head at all — the leading bytes differ
+/// on every chunk — which is exactly why it is opt-out rather than the
+/// default.
+///
+/// It exists for a reviewer that turns out to dislike the reordering, not as
+/// a cheaper or a better layout.
+fn render_review_legacy(
+    label: &str,
+    focus_txt: &str,
+    chunks: &[String],
+    diff_map: &str,
+    preamble: &str,
+    context_for: &dyn Fn(usize) -> String,
+) -> RenderedReview {
+    let chunk_count = chunks.len();
+    let focus = focus_sentence(focus_txt);
+    let prompts = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let portion = if chunk_count == 1 {
+                format!("{label} diff")
+            } else {
+                format!("{label} diff, chunk {}/{}", i + 1, chunk_count)
+            };
+            let map = if diff_map.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nDiff map (deterministic; covers ALL chunks of this diff; the chunk under \
+review is {}/{}).\n{diff_map}",
+                    i + 1,
+                    chunk_count
+                )
+            };
+            let context = context_for(i);
+            format!(
+                "{preamble}Review the following {portion}.{focus} Report only concrete defects \
+visible in this portion; do not infer missing code from other chunks.{map}{context}\n\n\
+```diff\n{chunk}\n```"
+            )
+        })
+        .collect();
     RenderedReview {
         prompts,
-        prefix: prefix.render(),
-        hoisted_context: hoisted.is_some(),
+        prefix: String::new(),
+        prefix_bytes: 0,
+        hoisted_context: false,
     }
 }
 
@@ -127,23 +186,15 @@ fn focus_sentence(focus_txt: &str) -> String {
 /// Single-chunk reviews keep the historical wording verbatim. The multi-chunk
 /// wording is constant per review (the *part* number moved into the variable
 /// banner, where it cannot break the prefix).
-fn head_sentence(label: &str, focus_txt: &str, n: usize, stable: bool) -> String {
-    if !stable {
-        // Historical layout: the CLI's own wording, kept for the escape hatch.
-        return format!(
-            "Review the following {label} diff{}.",
-            if focus_txt.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" Focus especially on: {focus_txt}.")
-            }
-        );
-    }
-    let focus = focus_sentence(focus_txt);
+///
+/// The focus line is NOT repeated here: it is already a section of the
+/// prefix, and saying it twice would put the same sentence in the prompt
+/// twice.
+fn head_sentence(label: &str, n: usize) -> String {
     if n <= 1 {
-        format!("Review the following {label} diff.{focus}")
+        format!("Review the following {label} diff.")
     } else {
-        format!("Review the following {label} diff, one part at a time.{focus}")
+        format!("Review the following {label} diff, one part at a time.")
     }
 }
 
@@ -160,7 +211,7 @@ mod tests {
     const MAP: &str = "Diff map (deterministic; covers ALL chunks of this diff):\nf a.rs +1 -1";
 
     fn render(n: usize, ctx: impl Fn(usize) -> String) -> RenderedReview {
-        render_review("SYS", MAP, "branch", "", &chunks(n), &ctx)
+        render_review("SYS", MAP, "branch", "", &chunks(n), "", &ctx)
     }
 
     #[test]
@@ -182,7 +233,7 @@ mod tests {
         assert!(!r.prefix.contains("Part 1/3"));
         for (i, p) in r.prompts.iter().enumerate() {
             assert!(
-                p.contains(&format!("Part {}/3 of this review.", i + 1)),
+                p.contains(&format!("This is review part {} of 3.", i + 1)),
                 "{p}"
             );
         }
@@ -197,9 +248,15 @@ mod tests {
 
     #[test]
     fn the_focus_line_is_constant_and_in_the_prefix() {
-        let r = render_review("SYS", MAP, "branch", "error handling", &chunks(2), &|_| {
-            String::new()
-        });
+        let r = render_review(
+            "SYS",
+            MAP,
+            "branch",
+            "error handling",
+            &chunks(2),
+            "",
+            &|_| String::new(),
+        );
         assert!(r.prefix.contains("Focus especially on: error handling."));
         for p in &r.prompts {
             assert_eq!(p.matches("Focus especially on").count(), 1);
@@ -210,7 +267,7 @@ mod tests {
     fn a_shared_context_header_is_hoisted_and_still_reaches_every_chunk() {
         // One header, three chunks: hoisted into the prefix and therefore sent
         // once per prompt instead of once per chunk body.
-        let shared = render_review("SYS", MAP, "branch", "", &chunks(3), &|_| {
+        let shared = render_review("SYS", MAP, "branch", "", &chunks(3), "", &|_| {
             "Context from the full post-change files: use std::io;".to_string()
         });
         assert!(shared.hoisted_context);
@@ -245,6 +302,46 @@ mod tests {
         let r = render(3, |_| String::new());
         for (i, p) in r.prompts.iter().enumerate() {
             assert_eq!(p.matches(&format!("+y{}", i + 1)).count(), 1, "{p}");
+        }
+    }
+
+    /// The regression that matters: the leading bytes of the prompt that
+    /// actually goes on the wire must be identical for every chunk.
+    ///
+    /// The baton built a constant head, but the CLI used to PREPEND a
+    /// "this is review part N of M" sentence to every chunk prompt and the
+    /// loop review prepended its preamble (the task text and the validation
+    /// output) on top of that. Both put a varying value in front of the
+    /// head, so no two chunks of a review ever shared a cache prefix and the
+    /// cache-stable layout bought nothing.
+    #[test]
+    fn every_chunk_still_starts_with_the_same_bytes_when_a_preamble_is_present() {
+        let r = render_review(
+            "SYS",
+            MAP,
+            "branch",
+            "",
+            &chunks(3),
+            "TASK: fix it\n",
+            &|_| String::new(),
+        );
+        let head = &r.prefix;
+        for p in &r.prompts {
+            assert!(
+                p.starts_with(head),
+                "the preamble must come AFTER the cache-stable head, not before it:\n{p}"
+            );
+        }
+        // The preamble still reaches the reviewer.
+        assert!(r.prompts[0].contains("TASK: fix it"));
+    }
+
+    #[test]
+    fn the_part_number_never_leads_the_prompt() {
+        let r = render_review("SYS", MAP, "branch", "", &chunks(3), "", &|_| String::new());
+        for (i, p) in r.prompts.iter().enumerate() {
+            assert!(p.starts_with(&r.prefix), "{p}");
+            assert!(p.contains(&format!("This is review part {} of 3.", i + 1)));
         }
     }
 
