@@ -999,7 +999,7 @@ impl DaemonRecordState {
 /// caller gets here.
 ///
 /// An ENOENT/ECONNREFUSED retry ends the sequence immediately: a socket with no
-/// listener is a fact no further attempt can change (the 01a163c9 lesson), so
+/// listener is a fact no further attempt can change (a stale socket path), so
 /// asking again would only burn the budget.
 /// The number of retries, the backoff delays, and the per-attempt budget for a
 /// sequence given `left` of its phase budget.
@@ -1345,7 +1345,7 @@ fn mark_cancelled(id: &str) {
 ///
 /// Returns the sessions this call found the engine unreachable for, so the
 /// teardown can report "the engine was gone" from data instead of from the log.
-/// A missing socket is no longer a silent `continue`: it is the
+/// A missing socket is no longer a silent `continue`: it is the absent-socket
 /// condition, and the operator needs to see it stated once rather than inferred
 /// from an absence. A session that was already retired is not even attempted,
 /// so this list holds each id at most once per process.
@@ -3989,8 +3989,8 @@ mod tests {
 
     /// The daemon EXITED between the first cancel and the retries. The socket
     /// entry is gone, so the session died with it: that is a fact to report, not
-    /// three more attempts against a path that does not exist (the 01a163c9
-    /// lesson, applied to the retry path).
+    /// three more attempts against a path that does not exist (a stale socket
+    /// path, applied to the retry path).
     #[tokio::test]
     // The suite lock is held across an await on purpose: the reaper reads
     // the PROCESS-WIDE session list, so without it this test could pick up a
