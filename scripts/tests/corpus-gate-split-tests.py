@@ -860,6 +860,66 @@ def test_the_openrouter_status_entry_is_updated_in_place() -> None:
         fail_(f"the nested openrouter status was not filled on success: {status['openrouter']}")
 
 
+def test_a_multi_output_source_needs_every_lkg_file() -> None:
+    """arena writes two files: one surviving LKG file must not count as cover."""
+    root = _setup(_scratch(), overlay_count=191)
+    lkg = root / "bench" / "raw" / ".lkg"
+    lkg.mkdir(parents=True, exist_ok=True)
+    (lkg / "arena-webdev.json").write_text(json.dumps({"models": []}))
+    fresh = _run_fetch(root, failing=["fetch-arena.py"], candidate=191)
+    arena = next(s for s in fresh["sources"] if s["name"] == "fetch-arena.py")
+    if arena["lkg"] is False and fresh["overlay_stale"] is True:
+        pass_("a two-output source with only one LKG file is not reported as covered")
+    else:
+        fail_(f"partial LKG counted as cover: lkg={arena['lkg']} stale={fresh['overlay_stale']}")
+    if (root / "bench" / "raw" / "arena-webdev.json").exists():
+        pass_("the output that did have an LKG file is still restored")
+    else:
+        fail_("the available LKG output was not restored")
+
+    root2 = _setup(_scratch(), overlay_count=191)
+    lkg2 = root2 / "bench" / "raw" / ".lkg"
+    lkg2.mkdir(parents=True, exist_ok=True)
+    for name in ("arena-webdev.json", "arena-agent.json"):
+        (lkg2 / name).write_text(json.dumps({"models": []}))
+    fresh2 = _run_fetch(root2, failing=["fetch-arena.py"], candidate=191)
+    arena2 = next(s for s in fresh2["sources"] if s["name"] == "fetch-arena.py")
+    if arena2["lkg"] is True and fresh2["overlay_stale"] is False:
+        pass_("a source whose every output has an LKG file counts as covered")
+    else:
+        fail_(f"full LKG not counted: lkg={arena2['lkg']} stale={fresh2['overlay_stale']}")
+
+
+def test_lkg_fallback_is_off_without_the_flag() -> None:
+    """Without --allow-lkg-fallback a failed source is never backfilled."""
+    root = _setup(_scratch(), overlay_count=191)
+    lkg = root / "bench" / "raw" / ".lkg"
+    lkg.mkdir(parents=True, exist_ok=True)
+    (lkg / "terminal-bench.json").write_text(json.dumps({"models": ["lkg"]}))
+    module = _load(FETCH_SCRIPT, "corpus_fetch_and_overlay")
+    module.run_pipeline(
+        root,
+        fetch_one=_fake_fetcher(["fetch-terminal-bench.py"]),
+        overlay_builder=_fake_overlay_builder(191),
+        corpus_builder=_fake_corpus_builder(),
+        now_iso="2026-10-26T12:00:00Z",
+        allow_lkg_fallback=False,
+    )
+    fresh = json.loads((root / "corpus" / "freshness.json").read_text())
+    tb = next(s for s in fresh["sources"] if s["name"] == "fetch-terminal-bench.py")
+    restored = (root / "bench" / "raw" / "terminal-bench.json").exists()
+    if tb["lkg"] is False and fresh["overlay_stale"] is True and not restored:
+        pass_("without the flag a failed source is unavailable and the overlay is kept stale")
+    else:
+        fail_(f"LKG used without the flag: lkg={tb['lkg']} stale={fresh['overlay_stale']} restored={restored}")
+
+    src = FETCH_SCRIPT.read_text()
+    if "allow_lkg_fallback=args.allow_lkg_fallback" in src:
+        pass_("main() passes --allow-lkg-fallback through to the pipeline")
+    else:
+        fail_("main() ignores --allow-lkg-fallback")
+
+
 def main() -> int:
     _run_one(test_one_bench_source_failing_keeps_the_committed_overlay)
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
@@ -878,6 +938,8 @@ def main() -> int:
     _run_one(test_the_openrouter_status_entry_is_updated_in_place)
     _run_one(test_no_script_references_an_undefined_name)
     _run_one(test_the_check_script_wires_up_every_gate_helper)
+    _run_one(test_a_multi_output_source_needs_every_lkg_file)
+    _run_one(test_lkg_fallback_is_off_without_the_flag)
     print(f"\n{PASSES} passed; {FAILS} failed")
     return 0 if FAILS == 0 else 1
 

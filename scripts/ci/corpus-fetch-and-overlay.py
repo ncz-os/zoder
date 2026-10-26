@@ -148,17 +148,20 @@ def snapshot_lkg(raw: Path, lkg: Path) -> None:
 def restore_lkg_for(entry: dict, raw: Path, lkg: Path) -> bool:
     """Restore a failed source's LKG bytes into RAW.
 
-    Returns True when a per-source LKG file existed locally (so the source
-    is covered by last-known-good data rather than missing).
+    Returns True only when EVERY output of the source had a local LKG file,
+    so a multi-output source (arena writes two files) is never reported as
+    covered while one of its outputs is missing. Outputs that do have an LKG
+    file are restored either way.
     """
-    restored = False
-    for outfile in entry.get("outputs", []):
+    outputs = entry.get("outputs", [])
+    restored = 0
+    for outfile in outputs:
         lkg_file = lkg / outfile
         if lkg_file.exists():
             raw.mkdir(parents=True, exist_ok=True)
             shutil.copy2(lkg_file, raw / outfile)
-            restored = True
-    return restored
+            restored += 1
+    return bool(outputs) and restored == len(outputs)
 
 
 def decide_overlay(source_entries: list[dict], candidate_scored: int,
@@ -296,7 +299,8 @@ def carried_built_at(freshness_path: Path) -> str:
 
 
 def run_pipeline(root: Path, *, fetch_one=run_source, overlay_builder=run_overlay_builder,
-                 corpus_builder=run_corpus_builder, now_iso: str | None = None) -> int:
+                 corpus_builder=run_corpus_builder, now_iso: str | None = None,
+                 allow_lkg_fallback: bool = True) -> int:
     """Fetch, build the candidate overlay, decide, and rebuild the corpus.
 
     `root` is the checkout the run operates on. The three runner arguments
@@ -317,7 +321,7 @@ def run_pipeline(root: Path, *, fetch_one=run_source, overlay_builder=run_overla
     entries = fetch_sources(root, fetch_one)
     failed = [e for e in entries if not e["ok"]]
     for entry in failed:
-        entry["lkg"] = restore_lkg_for(entry, raw, lkg)
+        entry["lkg"] = restore_lkg_for(entry, raw, lkg) if allow_lkg_fallback else False
     if failed:
         print(
             f"corpus-fetch: {len(failed)} source(s) failed -> "
@@ -422,11 +426,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--allow-lkg-fallback", action="store_true",
                     help="recover from per-source fetch failures by reading last-known-good raw bytes")
-    # The flag is kept for compatibility with the CI job: LKG recovery is
-    # now unconditional and harmless (it only applies to sources that
-    # actually failed and only when a local LKG file exists).
-    ap.parse_args()
-    return run_pipeline(REPO_ROOT)
+    args = ap.parse_args()
+    # Without the flag a failed source is never backfilled from LKG bytes:
+    # it counts as unavailable, so the committed overlay is kept stale.
+    return run_pipeline(REPO_ROOT, allow_lkg_fallback=args.allow_lkg_fallback)
 
 
 if __name__ == "__main__":
