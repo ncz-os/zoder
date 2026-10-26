@@ -348,10 +348,10 @@ fn main() {
         println!("  {}", ledger_line(r));
     }
     let summary = summarise(&records);
-    let composition = compose(&[Segment::new(
-        Part::Prefix,
-        "x".repeat(prefix_bytes as usize),
-    )]);
+    // The composition of the LAST call: the prefix is the system prompt and
+    // never grows, so its byte count is the same on every call, and the
+    // growing parts are what the levers are asked to bound.
+    let composition = compose(&segments);
     println!(
         "  calls={} prompt_tokens={} completion_tokens={} peak_prompt={} resend_share={:.0}% prefix_bytes={}",
         summary.calls,
