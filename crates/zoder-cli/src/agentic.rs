@@ -10206,52 +10206,123 @@ must reap the direct shell on the timeout branch)"
         );
     }
 
+    /// The author-phase error must carry the unconfirmed marker even when the
+    /// cancel closure's own error does not.
+    ///
+    /// The closure's error is the BEST-EFFORT reason ("author cancel
+    /// UNCONFIRMED: ..."); the phase wrapper is what turns it into the
+    /// UNCONFIRMED form the loop's detectors look for. The two are different
+    /// strings, so this deserves a test of its own: a wrapper that stopped
+    /// adding the marker would leave an exhausted retry looking like an
+    /// ordinary timed-out turn, and the loop would review a tree the daemon
+    /// may still be writing.
+    #[tokio::test]
+    async fn the_author_phase_error_carries_the_unconfirmed_marker() {
+        let err = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async {
+                Err(anyhow::Error::msg(format!(
+                    "{AUTHOR_CANCEL_BEST_EFFORT_MARKER} session x was not acknowledged"
+                )))
+            },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a turn that never finishes must fail the phase");
+
+        assert!(
+            err.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
+            "the phase error must carry the marker the detectors look for: {err}"
+        );
+        assert!(
+            err.contains(AUTHOR_CANCEL_BEST_EFFORT_MARKER),
+            "the phase error must keep the best-effort detail: {err}"
+        );
+    }
+
     /// A daemon that answers the handshake and then, for every
     /// `session/cancel`, either confirms it or says nothing.
     ///
     /// `confirm` decides which of the two shapes this is: a daemon that
     /// acknowledges the cancel, or one that never answers it.
-    fn spawn_cancel_daemon(socket: &std::path::Path, confirm: bool) -> std::thread::JoinHandle<()> {
+    fn spawn_cancel_daemon(socket: &std::path::Path, confirm: bool) -> CancelDaemonFixture {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = UnixListener::bind(socket).expect("bind the fake daemon");
         listener
             .set_nonblocking(true)
             .expect("make the fake daemon listener non-blocking");
-        std::thread::spawn(move || loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let mut writer = stream.try_clone().expect("clone the stream");
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                        let frame: serde_json::Value =
-                            serde_json::from_str(line.trim()).unwrap_or_default();
-                        let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                        if method == "initialize" {
-                            let _ = writer.write_all(
-                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n",
-                            );
-                            let _ = writer.flush();
-                        } else if method == "session/cancel" && confirm {
-                            let _ = writer.write_all(
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stopping.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // The read times out, so the thread is never stuck on a
+                        // client that has gone quiet.
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                        let mut writer = stream.try_clone().expect("clone the stream");
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        loop {
+                            if stopping.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                            let frame: serde_json::Value =
+                                serde_json::from_str(line.trim()).unwrap_or_default();
+                            let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                            if method == "initialize" {
+                                let _ = writer.write_all(
+                                    b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n",
+                                );
+                                let _ = writer.flush();
+                            } else if method == "session/cancel" && confirm {
+                                let _ = writer.write_all(
                                     b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\"}}\n",
                                 );
-                            let _ = writer.flush();
+                                let _ = writer.flush();
+                            }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(_) => return,
             }
-        })
+        });
+        CancelDaemonFixture {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    /// The fake daemon's thread, stopped and joined on drop so no test can
+    /// leak it. A leaked thread keeps its socket bound for the rest of the
+    /// test binary's life.
+    struct CancelDaemonFixture {
+        handle: Option<std::thread::JoinHandle<()>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CancelDaemonFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                // Bounded: the thread polls and its reads time out, so it can
+                // never be blocked on a client that has gone quiet.
+                let _ = handle.join();
+            }
+        }
     }
 
     /// `cancel_author_session_best_effort` must NEVER report success for a
