@@ -180,17 +180,23 @@ fn without_non_claims(lower: &str) -> String {
 
 fn claims_undefined(text: &str) -> bool {
     let lower = without_non_claims(&text.to_ascii_lowercase());
+    // A "missing return" phrase alone is NOT an undefined-name claim: it is a
+    // claim about a function's body, checked by `claimed_missing_return` +
+    // `function_return_evidence` alone. Only a real undefined-name phrase or
+    // a missing-import phrase makes the finding an undefined-name claim.
     CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase)) || claims_missing_import(&lower)
 }
 
-/// True when the finding's ONLY claim is a missing return: no undefined-name
-/// or missing-import phrase at all, but a "missing return" family phrase is
-/// present. Such a finding is never dropped by the range check and never
-/// contributes an extracted symbol; it is disproved only by
+/// True when the finding's ONLY claim is a missing return: a "missing return"
+/// family phrase is present and there is NO undefined-name phrase and NO
+/// missing-import phrase. Such a finding is never dropped by the range check
+/// and never contributes an extracted symbol; it is disproved only by
 /// `function_return_evidence` for a code-shaped function it names.
 fn claims_return_only(text: &str) -> bool {
     let lower = without_non_claims(&text.to_ascii_lowercase());
-    claims_missing_return(&lower) && !claims_undefined(text)
+    claims_missing_return(&lower)
+        && !CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase))
+        && !claims_missing_import(&lower)
 }
 
 /// True when `lower` makes a claim that a function is missing its return:
@@ -343,7 +349,10 @@ fn code_shaped(raw: &str) -> bool {
         || raw.contains("::")
         || raw.contains('(')
         || raw.contains('`')
-        || word.contains('.')
+        // Check `raw` for a dot: `trim_matches` strips edge punctuation, so
+        // `word.contains('.')` would miss a leading or trailing dot
+        // (".rs" or "main.rs" style tokens).
+        || raw.contains('.')
         || word
             .chars()
             .skip(1)
@@ -574,10 +583,14 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
                 }
             }
         }
-        // "None of these helpers are imported" names none: nothing to claim.
-        // The phrase still makes the sentence an import claim (see
-        // `claims_missing_import`), which the no-symbol range check may then
-        // disprove — the finding is never dropped by this sentence alone.
+        // "none of these helpers are imported" / "none of these ... are
+        // imported" names NOTHING: no collector below extracts a symbol from
+        // this shape (the names are indefinite — "these"), so the symbol set
+        // stays empty. The phrase still makes the sentence an import claim
+        // (see `claims_missing_import`), which the no-symbol range check may
+        // then disprove when every identifier in the cited range is bound.
+        // The finding is never dropped by this sentence alone: with no range
+        // the check has nothing to look at.
         // "<fn> missing return and X import": the import noun ends the
         // sentence and its module is the name right before it.
         collect_before_import_noun(&words, &norm, &mut add);
@@ -2777,6 +2790,41 @@ pub(crate) mod tests {
     }
 
     // ---- round 2: new claim shapes, non-code tokens, attributes, returns ---
+
+    /// A finding whose ONLY claim is about a missing return must never be
+    /// `claims_return_only` must be true exactly when the finding makes a
+    /// missing-return claim and NO undefined-name / missing-import claim.
+    /// This pins the gate that keeps return-only findings out of the
+    /// no-symbol range check.
+    #[test]
+    fn claims_return_only_is_true_only_for_pure_return_claims() {
+        // Pure return claim: no undefined-name or missing-import phrase.
+        assert!(claims_return_only("build_rows has no return"), "no return");
+        assert!(
+            claims_return_only("_fetch_json missing return"),
+            "missing return"
+        );
+        assert!(
+            claims_return_only("The helper never returns a value."),
+            "never returns"
+        );
+        assert!(
+            claims_return_only("build_rows does not return a value"),
+            "does not return"
+        );
+        // Mixed claim: a real import claim too -> NOT return-only.
+        assert!(
+            !claims_return_only("_fetch_json missing return and urllib.request import"),
+            "mixed return + import"
+        );
+        assert!(
+            !claims_return_only("build_rows has no return; json is not imported"),
+            "return + not imported"
+        );
+        // No return phrase at all -> not return-only.
+        assert!(!claims_return_only("json is not imported"));
+        assert!(!claims_return_only("build_rows is undefined"));
+    }
 
     /// A finding whose ONLY claim is about a missing return must never be
     /// dropped by the range check, even when it cites a range and every
