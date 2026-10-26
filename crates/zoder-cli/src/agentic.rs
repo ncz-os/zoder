@@ -1945,6 +1945,17 @@ fn no_reviewer_provider_text(model: &str, routes: &[(String, String)], served: &
     msg
 }
 
+/// Format the fatal message for a failed `RoutingContext::load` on the
+/// reviewer dispatch path. `{e:#}` (the alternate anyhow form) prints the
+/// WHOLE cause chain, not just the outermost context — otherwise a lock
+/// open failure under a read-only `$ZODER_HOME` surfaces as `loading
+/// routing context: loading quota-routing ledger from <home>/ledger.jsonl`
+/// and the actual cause (`opening ledger lock at <home>/ledger.jsonl.lock:
+/// ... Read-only file system / Is a directory`) never reaches the user.
+fn routing_context_load_message(e: &anyhow::Error) -> String {
+    format!("loading routing context: {e:#}")
+}
+
 /// Run the single-model reviewer dispatch for an explicit model id. The
 /// caller is responsible for selecting the model (this helper just runs
 /// it). The return type mirrors `try_model` in the author path: success
@@ -1991,11 +2002,7 @@ async fn dispatch_reviewer_for_model(
     // provider — otherwise a reviewer model could be sent to the wrong endpoint.
     let routing = match crate::RoutingContext::load(&eng.cfg) {
         Ok(r) => r,
-        Err(e) => {
-            return Err(ReviewerError::fatal(format!(
-                "loading routing context: {e}"
-            )))
-        }
+        Err(e) => return Err(ReviewerError::fatal(routing_context_load_message(&e))),
     };
     let provider_cfg = match routing.real_provider_for_model(&eng.cfg, model) {
         Some(p) => p,
@@ -9503,6 +9510,61 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::path::PathBuf;
+
+    /// Regression test (2026-10-26 Codex Hive job, ACHILLES): inside
+    /// Codex's workspace-write sandbox `~/.zoder` is read-only, so
+    /// `RoutingContext::load` failed at `open_lock_file` before any model
+    /// ran, and the reviewer chain's fatal message printed ONLY the
+    /// outermost anyhow context — `loading routing context: loading
+    /// quota-routing ledger from <home>/ledger.jsonl` — dropping the real
+    /// cause (`opening ledger lock at <home>/ledger.jsonl.lock: ... Is a
+    /// directory / Read-only file system`).
+    ///
+    /// The failure is made portably, even as root, by placing a DIRECTORY
+    /// at `<ledger_path>.lock`: opening a directory for writing fails with
+    /// EISDIR no matter which user the test runs as. The lock path is
+    /// derived exactly as the ledger derives it (`ledger.jsonl` + `.lock`).
+    ///
+    /// Fails on the old `{e}` formatting (outer context only) and passes
+    /// with `{e:#}` (full cause chain).
+    #[test]
+    fn reviewer_routing_load_failure_keeps_the_full_cause_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let lock_path = dir.path().join("ledger.jsonl.lock");
+
+        // A directory at the lock path: open(O_RDWR|O_CREAT) -> EISDIR,
+        // for root included. chmod is not involved and not needed.
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.ledger_path = ledger_path.clone();
+
+        // Prove the fixture produces the failure we intend to format: a
+        // real `RoutingContext::load` error whose deepest cause is the
+        // lock open.
+        let err = crate::RoutingContext::load(&cfg)
+            .err()
+            .expect("RoutingContext::load must fail when the ledger lock path is a directory");
+
+        // What the reviewer chain (dispatch_reviewer_for_model) prints.
+        let message = routing_context_load_message(&err);
+        assert!(
+            message.contains("loading quota-routing ledger"),
+            "outer routing context missing from: {message}"
+        );
+        assert!(
+            message.contains("opening ledger lock"),
+            "full cause chain missing — the lock path/OS error was dropped:\n{message}"
+        );
+
+        // The outermost context alone (what `{e}` printed) must NOT
+        // contain the cause — this is the property the fix changes.
+        assert!(
+            !err.to_string().contains("opening ledger lock"),
+            "outermost context unexpectedly carries the cause: {err:#}"
+        );
+    }
 
     #[test]
     fn review_prompts_do_not_offer_template_verdicts() {
