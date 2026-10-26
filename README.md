@@ -886,6 +886,14 @@ optionally, a `[profile]` table that selects a `default_provider`. The TOMLs
 are the source of truth for what counts as a given org's spend
 in `zoder report --vendor <name>`.
 
+An overlay may contain `[profile]`, `[deployment]`, `[context]`, `[budget]`,
+`[review]`, `[model_families]`, `[theme]`, `[health]`, and `[[providers]]`
+tables. `[model_families]` maps a served model id or `*`/`?` glob to a family
+name for cross-family reviewer exclusion; it is merged per key over the base
+map, with a later `config.<vendor>.toml` winning a key two overlays share. A
+binary older than this change rejects an overlay that contains
+`[model_families]`, so deploy the new binary before adding the table.
+
 ```toml
 # config.enterprise.toml — an Enterprise gateway profile.
 [[providers]]
@@ -901,6 +909,11 @@ billing = "metered"
 [profile]
 name = "enterprise"
 # default = false   # leave config.json's default_provider alone
+
+# Optional cross-family reviewer families (generic ids).
+# An overlay entry wins over config.json for the same key.
+# [model_families]
+# "provider-a/*" = "provider-a"
 ```
 
 Rules the loader enforces (fail loud, don't silently merge):
@@ -914,8 +927,10 @@ Rules the loader enforces (fail loud, don't silently merge):
   contributes.** Otherwise the routed default would point at a non-existent
   provider.
 - **An overlay with no `[[providers]]` and no `[profile].default` is an
-  error.** A file that does nothing is almost certainly a half-finished
-  template — delete it instead of leaving it on disk.
+  error unless it carries another table such as `[deployment]`, `[context]`,
+  `[budget]`, `[review]`, or `[model_families]`.** A file that does nothing is
+  almost certainly a half-finished template — delete it instead of leaving it
+  on disk.
 - **An overlay that cannot be parsed is a load error.** A plain `zoder config`
   still loads it as a diagnostic and prints the warning, but
   `zoder config --validate` and every normal startup fail with the file name
