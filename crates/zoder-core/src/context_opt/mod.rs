@@ -957,6 +957,36 @@ impl Levers {
     }
 }
 
+impl Levers {
+    /// Look a profile up by name, case-insensitively. `None` for a name that
+    /// is not a built-in, so a config typo falls back to [`Levers::OTHER`]
+    /// rather than to an arbitrary provider's numbers.
+    pub fn named(name: &str) -> Option<Levers> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "deepseek" => Some(Levers::DEEPSEEK),
+            "minimax" => Some(Levers::MINIMAX),
+            "other" => Some(Levers::OTHER),
+            _ => None,
+        }
+    }
+
+    /// Sniff a model id for its provider family (`deepseek-flash`,
+    /// `MiniMax-M3`, `azure_ai/FW-DeepSeek-V4-Flash`) and return that profile.
+    /// Anything else is [`Levers::OTHER`] — caps and elision, no compaction,
+    /// because a local model has no per-token bill and a summarised history is
+    /// pure quality risk for no saving.
+    pub fn for_model(model: &str) -> Levers {
+        let needle = model.to_ascii_lowercase();
+        if needle.contains("deepseek") {
+            Levers::DEEPSEEK
+        } else if needle.contains("minimax") {
+            Levers::MINIMAX
+        } else {
+            Levers::OTHER
+        }
+    }
+}
+
 impl Default for Levers {
     fn default() -> Self {
         Self::OTHER

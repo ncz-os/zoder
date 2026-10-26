@@ -2127,6 +2127,144 @@ pub struct Config {
     /// excludes nothing, so default behavior is unchanged.
     #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
     pub review: ReviewConfig,
+    /// `[context]` block: the context-optimisation levers (tool-output caps,
+    /// stale elision, history compaction) and their per-provider profiles.
+    /// An absent block changes nothing — the levers stay off, exactly as they
+    /// were before the 2026-10-25 study. See [`crate::context_opt`].
+    #[serde(default, skip_serializing_if = "ContextConfig::is_empty")]
+    pub context: ContextConfig,
+}
+
+/// `[context]` block from `config.json` / an overlay TOML.
+///
+/// The 2026-10-25 DeepSeek export billed 10.6B input tokens against 50.1M
+/// output, and one `zoder loop` spent 32.9M input tokens for 110K output by
+/// resending a full window on every turn. These are the knobs that bound that
+/// resend. They are **opt-in**: with no `[context]` block the loop behaves
+/// exactly as it did before, because silently shortening an agent's history is
+/// a quality change, not a cost optimisation.
+///
+/// ```toml
+/// [context]
+/// enabled = true
+/// # Which built-in profile a model gets when no explicit entry matches.
+/// # "deepseek" / "minimax" / "other"; the model id is sniffed when omitted.
+/// # default_profile = "deepseek"
+///
+/// [context.profiles.deepseek]          # matched against the model id
+/// tool_output_cap_bytes = 16384        # 0 disables the cap
+/// elide_after_turns = 8                # 0 disables elision
+/// elide_min_bytes = 2048
+/// compact_after_tokens = 48000         # 0 disables compaction
+/// keep_recent_turns = 6
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextConfig {
+    /// Master switch. `false` (the default) leaves every lever off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-provider lever profiles, keyed by a lower-case substring of the
+    /// model id (`deepseek`, `minimax`) or by `other`. The first key whose
+    /// name appears in the model id wins; `other` is the catch-all.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ContextLeverProfile>,
+    /// Profile to use when no `profiles` key matches the model id. When unset,
+    /// the model id is sniffed (`deepseek` / `minimax`, else [`Levers::OTHER`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+}
+
+impl ContextConfig {
+    fn is_empty(&self) -> bool {
+        !self.enabled && self.profiles.is_empty() && self.default_profile.is_none()
+    }
+
+    /// Resolve the levers for `model`. Returns `None` when the block is off,
+    /// so a caller cannot apply a half-configured lever set by accident.
+    ///
+    /// Matching is by lower-case substring on the model id, longest key first,
+    /// so `deepseek-v4-flash` matches a `deepseek` profile regardless of the
+    /// provider namespace in front of it (`azure_ai/FW-DeepSeek-V4-Flash`).
+    pub fn levers_for(&self, model: &str) -> Option<crate::context_opt::Levers> {
+        if !self.enabled {
+            return None;
+        }
+        let needle = model.to_ascii_lowercase();
+        let mut keys: Vec<&String> = self.profiles.keys().collect();
+        // Longest key first: a future `deepseek-v4` entry beats `deepseek`.
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        for key in keys {
+            if !key.eq_ignore_ascii_case("other") && needle.contains(&key.to_ascii_lowercase()) {
+                return Some(self.profiles[key].to_levers(key));
+            }
+        }
+        if let Some(profile) = self.default_profile.as_deref() {
+            if let Some(entry) = self.profiles.get(profile) {
+                return Some(entry.to_levers(profile));
+            }
+            if let Some(base) = crate::context_opt::Levers::named(profile) {
+                return Some(base);
+            }
+        }
+        if let Some(entry) = self.profiles.get("other") {
+            return Some(entry.to_levers("other"));
+        }
+        Some(crate::context_opt::Levers::for_model(model))
+    }
+
+    /// Whether a per-call context record should be written even when the
+    /// levers themselves are off — measurement is free and is the only way to
+    /// prove a lever helped.
+    pub fn measure(&self, model: &str) -> bool {
+        // With `[context]` present at all, measurement is on; with it absent
+        // the caller decides. `enabled` alone does not gate this: the point of
+        // the block is that an operator can turn measurement on without
+        // turning the levers on.
+        self.levers_for(model).is_some()
+            || self.default_profile.is_some()
+            || !self.profiles.is_empty()
+    }
+}
+
+/// One provider's lever profile inside `[context.profiles.<key>]`. Every field
+/// is optional and falls back to the built-in profile for `key`
+/// ([`crate::context_opt::Levers::named`]), so an operator can change one
+/// number without restating the rest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLeverProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output_cap_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elide_after_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elide_min_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_after_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_recent_turns: Option<usize>,
+}
+
+impl ContextLeverProfile {
+    /// Materialise the profile, filling unset fields from the built-in profile
+    /// `name` ([`crate::context_opt::Levers::named`]; anything unknown means
+    /// [`crate::context_opt::Levers::OTHER`]).
+    pub fn to_levers(&self, name: &str) -> crate::context_opt::Levers {
+        let base =
+            crate::context_opt::Levers::named(name).unwrap_or(crate::context_opt::Levers::OTHER);
+        crate::context_opt::Levers {
+            tool_output_cap_bytes: self
+                .tool_output_cap_bytes
+                .unwrap_or(base.tool_output_cap_bytes),
+            elide_after_turns: self.elide_after_turns.unwrap_or(base.elide_after_turns),
+            elide_min_bytes: self.elide_min_bytes.unwrap_or(base.elide_min_bytes),
+            compact_after_tokens: self
+                .compact_after_tokens
+                .unwrap_or(base.compact_after_tokens),
+            keep_recent_turns: self.keep_recent_turns.unwrap_or(base.keep_recent_turns),
+        }
+    }
 }
 
 /// `[review]` block from `config.json` / an overlay TOML. Every field is
@@ -3117,6 +3255,7 @@ impl Config {
             routing: RoutingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
             review: ReviewConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 
