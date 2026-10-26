@@ -27,7 +27,7 @@ fn prefix_for(contexts: &[String]) -> ReviewPrefix {
 #[test]
 fn every_chunk_prompt_starts_with_one_byte_identical_prefix() {
     let plan = prefix_for(&[]);
-    let prompts = review_prompts(&plan, &chunks(16), &[]);
+    let prompts = review_prompts(&plan, &chunks(16), &[], "");
     let want = plan.render();
     for (i, p) in prompts.iter().enumerate() {
         assert!(
@@ -57,7 +57,7 @@ fn the_prefix_fingerprint_is_identical_across_chunks_and_sessions() {
 #[test]
 fn a_single_chunk_review_still_places_its_body_in_the_prefix() {
     let plan = review_prefix(SYSTEM, "", "", "branch diff", &[]);
-    let prompts = review_prompts(&plan, &chunks(1), &[]);
+    let prompts = review_prompts(&plan, &chunks(1), &[], "");
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].starts_with(&plan.render()));
     assert!(prompts[0].contains("```diff"));
@@ -66,12 +66,12 @@ fn a_single_chunk_review_still_places_its_body_in_the_prefix() {
 #[test]
 fn only_the_variable_tail_differs_between_chunks() {
     let plan = prefix_for(&[]);
-    let prompts = review_prompts(&plan, &chunks(3), &[]);
+    let prompts = review_prompts(&plan, &chunks(3), &[], "");
     let bound = plan.render().len();
     let tails: Vec<&str> = prompts.iter().map(|p| split_at(p, bound).1).collect();
-    assert!(tails[0].contains("Part 1/3"));
-    assert!(tails[1].contains("Part 2/3"));
-    assert!(tails[2].contains("Part 3/3"));
+    assert!(tails[0].contains("This is review part 1 of 3."));
+    assert!(tails[1].contains("This is review part 2 of 3."));
+    assert!(tails[2].contains("This is review part 3 of 3."));
     // The part banner is the first line of the tail and nothing else about the
     // chunk's position leaks into it; a byte count or timestamp there would
     // make the tail (not the prefix) the only thing that differs, which is the
@@ -83,7 +83,7 @@ fn only_the_variable_tail_differs_between_chunks() {
         // joins it there.
         assert_eq!(
             tail.trim_start_matches('\n').lines().next(),
-            Some(format!("Part {}/3 of this review.", i + 1).as_str())
+            Some(format!("This is review part {} of 3.", i + 1).as_str())
         );
     }
     // Every tail carries exactly one chunk.
@@ -99,7 +99,7 @@ fn an_identical_per_chunk_context_is_hoisted_into_the_prefix_once() {
     let contexts = vec![ctx.clone(), ctx.clone(), ctx.clone()];
     let plan = prefix_for(&contexts);
     assert_eq!(plan.context, ctx);
-    let prompts = review_prompts(&plan, &chunks(3), &contexts);
+    let prompts = review_prompts(&plan, &chunks(3), &contexts, "");
     for p in &prompts {
         assert_eq!(
             p.matches("Context from the full post-change").count(),
@@ -114,7 +114,7 @@ fn a_context_left_unhoisted_stays_with_its_own_chunk() {
     let contexts = vec!["ctx-a".to_string(), "ctx-b".to_string()];
     let plan = prefix_for(&contexts);
     assert!(plan.context.is_empty());
-    let prompts = review_prompts(&plan, &chunks(2), &contexts);
+    let prompts = review_prompts(&plan, &chunks(2), &contexts, "");
     assert!(prompts[0].contains("ctx-a") && !prompts[0].contains("ctx-b"));
     assert!(prompts[1].contains("ctx-b") && !prompts[1].contains("ctx-a"));
 }
@@ -164,6 +164,7 @@ fn a_cwd_leaked_into_a_per_chunk_header_breaks_stability() {
     let msg = ChunkMessage {
         part: 1,
         parts: 1,
+        preamble: String::new(),
         context: String::new(),
         chunk: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b /home/jasonperlow/Projects/zoder\n".into(),
     };
@@ -195,6 +196,7 @@ fn the_chunk_body_is_fenced_even_when_it_lacks_a_trailing_newline() {
     let msg = ChunkMessage {
         part: 1,
         parts: 1,
+        preamble: String::new(),
         context: String::new(),
         chunk: "+x".into(),
     };
@@ -217,5 +219,5 @@ fn split_at_never_splits_a_multibyte_code_point() {
 #[test]
 fn a_review_of_zero_chunks_yields_no_prompts() {
     let plan = prefix_for(&[]);
-    assert!(review_prompts(&plan, &[], &[]).is_empty());
+    assert!(review_prompts(&plan, &[], &[], "").is_empty());
 }

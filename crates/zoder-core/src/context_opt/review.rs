@@ -106,6 +106,17 @@ pub struct ChunkMessage {
     /// 1-based part number and total.
     pub part: usize,
     pub parts: usize,
+    /// Per-review context that is NOT part of the cache-stable head: the
+    /// task under review, the validation output, anything else that is
+    /// constant WITHIN one review and varies ACROSS reviews.
+    ///
+    /// It belongs here, after the prefix, for exactly the reason the part
+    /// number does: a prefix cache is keyed on the LEADING bytes. Anything
+    /// that varies per review and is placed BEFORE the prefix breaks the
+    /// cache on every review, so the whole head is re-billed each time.
+    /// Nothing is lost by moving it after the prefix — the reviewer still
+    /// reads the same text, in the same review.
+    pub preamble: String,
     /// This chunk's own cross-file context header (empty when the header was
     /// hoisted into [`ReviewPrefix::context`] or when context is disabled).
     pub context: String,
@@ -131,8 +142,13 @@ impl ChunkMessage {
 
     /// The part banner a reviewer sees. It lives in the variable block, not the
     /// prefix, precisely because it changes per chunk.
+    ///
+    /// It also carries the "this is review part N of M" statement that the
+    /// CLI used to prepend to every chunk: that sentence has a variable part
+    /// number in it, so a prefix that carried it would differ on every chunk
+    /// and the cache would never hit.
     pub fn banner(&self) -> String {
-        format!("Part {}/{} of this review.", self.part, self.parts)
+        format!("This is review part {} of {}.", self.part, self.parts)
     }
 }
 
@@ -194,10 +210,19 @@ pub fn hoistable_context_with<T: PartialEq, F: Fn(&T) -> String>(
     Some(rendered)
 }
 
-/// Assemble one chunk prompt: `prefix + banner + (context) + chunk`.
+/// Assemble one chunk prompt: `prefix + preamble + banner + (context) + chunk`.
+///
+/// The order is the contract: the CONSTANT head leads, so the leading bytes
+/// of chunk N+1 are byte-identical to the leading bytes of chunk N. The
+/// preamble (constant within a review, varying across reviews) and the part
+/// banner (varying within a review) both follow it.
 pub fn chunk_prompt(prefix: &ReviewPrefix, msg: &ChunkMessage) -> String {
     let mut out = prefix.render();
     out.push('\n');
+    if !msg.preamble.trim().is_empty() {
+        out.push_str(msg.preamble.trim_end());
+        out.push('\n');
+    }
     out.push_str(&msg.banner());
     out.push('\n');
     out.push_str(&msg.render());
@@ -209,10 +234,15 @@ pub fn chunk_prompt(prefix: &ReviewPrefix, msg: &ChunkMessage) -> String {
 /// `contexts[i]` is chunk `i`'s header. A header that was hoisted is not
 /// repeated in the chunk block; the prompt it produces is byte-for-byte the
 /// same review, minus the duplication.
+///
+/// `preamble` is the per-review context block (the task under review, the
+/// validation output). It is placed after the prefix so the cache-stable
+/// leading bytes stay identical across reviews.
 pub fn review_prompts(
     prefix: &ReviewPrefix,
     chunks: &[String],
     contexts: &[String],
+    preamble: &str,
 ) -> Vec<String> {
     let hoisted = !prefix.context.is_empty();
     chunks
@@ -228,6 +258,7 @@ pub fn review_prompts(
                 &ChunkMessage {
                     part: i + 1,
                     parts: chunks.len(),
+                    preamble: preamble.to_string(),
                     context,
                     chunk: chunk.clone(),
                 },
