@@ -184,6 +184,12 @@ impl CallRecord {
     }
 
     /// Cache-hit share, `None` when the provider reported no cache counter.
+    ///
+    /// A call with no prompt tokens has no ratio to report: `Some(1.0)` here
+    /// is the vacuous "everything that was sent was cached" reading, and
+    /// [`classify`](super::classify) treats the same case as
+    /// [`CacheVerdict::Unknown`](super::CacheVerdict::Unknown) rather than as
+    /// a prefix break.
     pub fn hit_share(&self) -> Option<f64> {
         let hit = self.cache_hit_tokens?;
         if self.prompt_tokens == 0 {
@@ -192,7 +198,14 @@ impl CallRecord {
         Some((hit as f64 / self.prompt_tokens as f64).clamp(0.0, 1.0))
     }
 
-    /// Estimated tokens spent on the next call's resend of this call's prompt.
+    /// Estimated tokens the NEXT call on this surface spends re-sending text
+    /// that was already sent.
+    ///
+    /// `next_prompt_tokens` is the next call's PROMPT size, so the overlap
+    /// with this call is the smaller of the two: the next call cannot re-send
+    /// more than this call sent, and a next prompt that is SMALLER than this
+    /// one (a compaction) re-sends at most itself. That is why the value is
+    /// clamped, and why it is an estimate and not a measurement.
     pub fn resend_tokens(&self) -> Option<u64> {
         self.next_prompt_tokens
             .map(|next| next.min(self.prompt_tokens))

@@ -1,0 +1,77 @@
+# Fleet deployment of the context levers.
+#
+# Merge this into the fleet's zoder config (`$ZODER_HOME/config.json` and/or
+# the `config.<vendor>.toml` overlay). It is a snippet, not a patch: the
+# numbers themselves live in zoder, in the built-in `fleet` deployment
+# profile, so there is nothing to regenerate when a number changes — only
+# the two lines below.
+#
+# The same block is what a single operator would set to `profile =
+# "standalone"`, which leaves the levers OFF and keeps the working set much
+# looser. The gate is deliberate: a shared, metered deployment pays for
+# every resent token, so its defaults are tight; one operator's own machine
+# has no such bill, and shortening an agent's history there is a quality
+# change with no fleet-scale saving to pay for it.
+#
+# Numbers, and why (zoder's docs/CONTEXT-OPTIMIZATION.md):
+#
+#   tool_output_cap_bytes  16 KiB  a tool result keeps its head and its tail
+#                                   and names what it dropped
+#   elide_after_turns       8      a stale tool result becomes a re-readable
+#                                   stub
+#   elide_min_bytes         2 KiB  below this a stub costs more than it saves
+#   compact_after_tokens    48 K   the history is folded into a digest above
+#                                   this; 1.7x the measured ~28 K prompt
+#   keep_recent_turns       6      the live turns are never folded
+#   max_context_tokens      128 K  the provider's window: the levers bound
+#                                   the WORKING SET, this is the ceiling it
+#                                   has to fit inside
+#
+# `max_context_tokens` also belongs on the PROVIDER entry (and, when one
+# provider serves models with different windows, on the model entry, which
+# wins). zoder refuses a prompt that does not fit the window rather than
+# truncating it: a review that saw less of the diff would be a worse
+# review, not an optimised one.
+#
+# The MiniMax profile is tighter on purpose: it meters by tokens, its window
+# is 200 K while a review chunk is 48 K, and it publishes no cache counter,
+# so the saving has to come from the volume and not from the hit rate.
+#
+#   [context]
+#   profile = "fleet"
+#
+#   [context.profiles.deepseek]
+#   tool_output_cap_bytes = 16384
+#   elide_after_turns = 8
+#   elide_min_bytes = 2048
+#   compact_after_tokens = 48000
+#   keep_recent_turns = 6
+#   max_context_tokens = 131072
+#
+#   [context.profiles.minimax]
+#   tool_output_cap_bytes = 12288
+#   elide_after_turns = 6
+#   elide_min_bytes = 2048
+#   compact_after_tokens = 32000
+#   keep_recent_turns = 6
+#   max_context_tokens = 204800
+#
+# Every other provider keeps the fleet defaults: caps and elision on,
+# compaction off. A local model has no per-token bill, so a summarised
+# history is pure quality risk for no saving. To pin it explicitly:
+#
+#   [context.profiles.other]
+#   tool_output_cap_bytes = 16384
+#   elide_after_turns = 8
+#   elide_min_bytes = 2048
+#   compact_after_tokens = 0        # 0 disables compaction
+#   keep_recent_turns = 6
+#
+# And on the provider entry itself:
+#
+#   [[providers]]
+#   id = "provider-a"
+#   base_url = "https://api.example.invalid/v1"
+#   kind = "openai-chat"
+#   auth = { type = "env", var = "PROVIDER_A_KEY" }
+#   max_context_tokens = 131072

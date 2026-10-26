@@ -236,11 +236,19 @@ fn measure(job: &Job, levers: Levers) -> Savings {
 /// 250 calls each resent a full window. A single call's prompt is the metric
 /// that hid the problem; the sum is the one that matches the bill.
 fn resend_total(turns: &[Turn]) -> u64 {
-    let mut running = 0u64;
-    for t in turns {
-        running += estimate_tokens(t.bytes());
+    // The triangular sum the doc comment describes: call `i` resends every
+    // turn up to and including `i`, so turn `j` is sent on every call from
+    // `j` onwards — `n - j` times.
+    //
+    // `sum(tokens) * n` is NOT that: it charges every turn for every call,
+    // including the calls that happened before the turn existed. It
+    // over-counts, and it over-counts more the longer the conversation is.
+    let mut total = 0u64;
+    for (j, turn) in turns.iter().enumerate() {
+        let calls_that_send_it = (turns.len() - j) as u64;
+        total += estimate_tokens(turn.bytes()) * calls_that_send_it;
     }
-    running * turns.len() as u64
+    total
 }
 
 fn pct(after: u64, before: u64) -> f64 {

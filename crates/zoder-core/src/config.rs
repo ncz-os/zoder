@@ -530,6 +530,15 @@ pub struct ModelEntry {
     /// Provider base URL for this model entry (optional, for informational).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// The provider id that serves this model entry.
+    ///
+    /// The alias map is global, so one model id can be served by more than
+    /// one provider — and two providers can give it different context
+    /// windows. Naming the provider here scopes the per-model settings to
+    /// it; an entry that names no provider keeps the historical
+    /// "matches any provider" behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Sampling temperature to send for this model. `None` leaves the field
     /// off the wire so the model uses its own default.
     ///
@@ -3559,10 +3568,18 @@ impl Config {
     /// as a window of zero: the caller must not trim a prompt to fit a
     /// window nobody published.
     pub fn max_context_tokens_for(&self, provider_id: &str, model: &str) -> Option<u64> {
+        // The per-model entry is scoped to the provider: an entry that names
+        // a provider only answers for that provider, so a model id served by
+        // two providers cannot pick up the other one's window. An entry that
+        // names no provider matches any (the historical behaviour).
         let per_model = self
             .models
             .values()
             .filter(|entry| entry.model.as_deref() == Some(model))
+            .filter(|entry| match entry.provider.as_deref() {
+                Some(owner) => owner == provider_id,
+                None => true,
+            })
             .find_map(|entry| entry.max_context_tokens);
         per_model.or_else(|| {
             self.provider(provider_id)

@@ -312,3 +312,47 @@ max_context_tokens = 64000
     let bare = config_from(minimal());
     assert_eq!(bare.max_context_tokens_for("p", "any"), None);
 }
+
+/// The per-model window is scoped to the provider that serves it: one model
+/// id can be served by two providers, and the two can give it different
+/// windows. An entry that names no provider matches any, which is the
+/// historical behaviour.
+#[test]
+fn a_per_model_window_is_scoped_to_its_provider() {
+    let cfg = config_from(
+        r#"
+default_provider = "p"
+corpus_path = "/nonexistent/corpus.json"
+ledger_path = "/nonexistent/ledger.jsonl"
+health_path = "/nonexistent/health.json"
+[[providers]]
+id = "p"
+base_url = "https://api.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "none" }
+max_context_tokens = 131072
+
+[[providers]]
+id = "q"
+base_url = "https://api2.example.invalid/v1"
+kind = "openai-chat"
+auth = { type = "none" }
+max_context_tokens = 32768
+
+[models.owned]
+model = "some-model"
+provider = "q"
+max_context_tokens = 16384
+
+[models.unowned]
+model = "other-model"
+max_context_tokens = 8192
+"#,
+    );
+    // The entry names its provider: it answers for that provider only.
+    assert_eq!(cfg.max_context_tokens_for("q", "some-model"), Some(16_384));
+    assert_eq!(cfg.max_context_tokens_for("p", "some-model"), Some(131_072));
+    // The entry names no provider: it answers for any.
+    assert_eq!(cfg.max_context_tokens_for("p", "other-model"), Some(8_192));
+    assert_eq!(cfg.max_context_tokens_for("q", "other-model"), Some(8_192));
+}

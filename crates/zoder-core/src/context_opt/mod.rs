@@ -13,9 +13,7 @@
 //! 1. [`CacheTelemetry`] / [`classify`] — per-call prompt composition and the
 //!    provider-side cache split (DeepSeek reports `prompt_cache_hit_tokens` /
 //!    `prompt_cache_miss_tokens`; OpenAI-shaped gateways report
-//!    `prompt_tokens_details.cached_tokens`; MiniMax reports neither, so its
-//!    shape is [`ProviderCacheShape::None`] and its saving is prefix reuse the
-//!    provider does not bill back).
+//!    `prompt_tokens_details.cached_tokens`).
 //! 2. [`prefix`] — one byte-identical system prompt + tool-schema block per
 //!    provider/model, so the provider's prefix cache keeps hitting.
 //! 3. [`cap_tool_output`] — a per-call cap on a single tool result.
@@ -35,11 +33,10 @@
 //! | DeepSeek direct | yes, disk KV prefix cache (64-token blocks) | `prompt_cache_hit_tokens`, `prompt_cache_miss_tokens` |
 //! | OpenAI-compatible gateways (LiteLLM, OpenRouter, vLLM) | implementation-defined | `prompt_tokens_details.cached_tokens` |
 //! | Anthropic-shaped gateways | yes | `cache_read_input_tokens` |
-//! | MiniMax (`api.minimax.io`) | yes, server-side prefix reuse | **nothing in `usage`** — no hit/miss split to verify |
+//! | MiniMax | yes, server-side prefix reuse | `prompt_tokens_details.cached_tokens` (MEASURED 2026-10-26; the 2026-10-25 study recorded this provider as publishing nothing, and that was wrong) |
 //!
-//! A provider that reports nothing can still be *saving* (MiniMax bills reused
-//! prompt tokens at a discount without telling the caller), but the saving is
-//! unverifiable from the response, so the cache-hit share of a MiniMax call is
+//! A provider that reports nothing can still be *saving*, but the saving is
+//! unverifiable from the response, so the cache-hit share of such a call is
 //! never asserted — [`CacheTelemetry::hit_share`] returns `None` rather than a
 //! fabricated 0%.
 
@@ -337,7 +334,10 @@ The output is unchanged on disk; re-read the file (or re-run the command) if it 
 /// than is saved. When a cut IS made, the kept head+tail is at most `cap` (it can
 /// be a few bytes less when a multi-byte character straddles a boundary, since
 /// both cuts snap inward on a char boundary), and the stub's omitted count is the
-/// exact size of the dropped MIDDLE, so `kept + omitted == original len` holds.
+/// exact size of the dropped MIDDLE, so `kept + omitted == original len` holds
+/// — where `kept` is the head and tail bytes and NOT the returned turn, which
+/// also carries the stub and is therefore LONGER than the original by the
+/// stub's length.
 pub fn cap_tool_output(turn: &Turn, cap_bytes: usize) -> Turn {
     // One comparison against the EFFECTIVE cap. `cap_bytes` is raised to the
     // floor before the length test, so a result between the requested cap and
@@ -966,7 +966,8 @@ impl Levers {
         keep_recent_turns: 6,
         max_context_tokens: 131_072,
     };
-    /// MiniMax-M3 / M3.1-Flash (subscription-metered, no usage cache counter).
+    /// MiniMax-M3 / M3.1-Flash (metered by tokens; publishes the OpenAI-shaped
+    /// cached-token subset, so its hit share IS measurable).
     /// A tighter working set: the plan meters by tokens, and the M3 window is
     /// 200K while a review chunk is 48K, so mid-30K keeps author turns off
     /// the top of the window.
@@ -978,9 +979,9 @@ impl Levers {
         keep_recent_turns: 6,
         max_context_tokens: 204_800,
     };
-    /// Every other provider (local vLLM, hosted gateways whose cache shape is
-    /// `CachedSubset`). Caps and elision on, compaction off: a local model has
-    /// no per-token bill and a summarised history is pure quality risk.
+    /// Every other provider (local vLLM, hosted gateways). Caps and elision on,
+    /// compaction off: a local model has no per-token bill and a summarised
+    /// history is pure quality risk.
     pub const OTHER: Levers = Levers {
         tool_output_cap_bytes: 16_384,
         elide_after_turns: 8,
@@ -1191,6 +1192,13 @@ pub fn fit_to_window(turns: &[Turn], max_context_tokens: u64) -> WindowFit {
     }
     // Step 2: fold the history into a digest. The pinned head and the brief
     // survive, so this is the last thing that can shrink.
+    //
+    // The threshold (1 token) and the keep-window (2 turns) are DELIBERATELY
+    // far more aggressive than the caller's lever profile: this is the hard
+    // ceiling path, and a prompt that does not fit the window is not sent at
+    // all. A caller that wants the configured aggressiveness should run its
+    // own levers first (they do, in the CLI) and only fall back to this when
+    // the window is still exceeded.
     let compacted = compact(&elided, 1, 2, 64, 40);
     let compacted_tokens = tokens_of(&compacted.turns);
     if compacted.turns.len() < elided.len() && compacted_tokens <= max_context_tokens {

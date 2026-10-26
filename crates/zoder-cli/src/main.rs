@@ -6426,7 +6426,6 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 "context": crate::context_opt::payload(),
             })
         );
-        crate::context_opt::flush(&eng.cfg);
         if substituted && !cli.quiet {
             eprintln!(
                 "[zoder] WARNING: requested {requested} but served {served} \
@@ -6454,6 +6453,10 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             eprintln!("[zoder] {used_model}  {tokens_out} tok  {cost_label}  {elapsed_ms:.0}ms");
         }
     }
+    // The per-call records belong to the RUN, not to the JSON-output
+    // branch: a run that printed prose still made calls, and those calls
+    // must land in the telemetry file.
+    crate::context_opt::flush(&eng.cfg);
     // Surface substitution status to callers. The exit-code decision is
     // delegated to `cmd_exec_oneshot_exit_code` (pure, unit-tested) so the
     // "75 on fallback substitution" contract is enforced consistently
