@@ -264,6 +264,12 @@ mod agentic_utilization_tests {
             serves: vec!["gpt-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -294,6 +300,12 @@ mod agentic_utilization_tests {
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -2128,7 +2140,9 @@ async fn dispatch_reviewer_for_model(
             model,
         )),
     ) {
-        Ok(p) => p.with_wait_notices(!cli.quiet),
+        Ok(p) => p
+            .with_wait_notices(!cli.quiet)
+            .with_request_stream(provider_cfg.stream),
         Err(e) => return Err(ReviewerError::fatal(format!("constructing provider: {e}"))),
     };
 
@@ -2153,10 +2167,18 @@ async fn dispatch_reviewer_for_model(
     // An explicit env spec always wins. With no spec, the deployment profile
     // supplies the default (unlimited on both profiles today; the hook is what
     // keeps a future fleet slot map out of the standalone path).
+    // The configured per-endpoint-group budget (shared across ALL zoder
+    // processes and across provider entries that point at the same endpoint
+    // via `rate_limit_group`), and the env-only reviewer slot limit.
+    let (group, cfg_conc, cfg_rpm) = eng.cfg.provider_call_budget(provider_cfg);
     let concurrency_spec = std::env::var("ZODER_PROVIDER_CONCURRENCY").ok();
     let slot_limit = match concurrency_spec.as_deref() {
-        Some(spec) => crate::provider_slots::limit_for(Some(spec), &provider_cfg.id),
-        None => eng.cfg.profile_defaults().provider_concurrency_default(),
+        Some(spec) => crate::provider_slots::limit_for(Some(spec), &provider_cfg.id).max(cfg_conc),
+        None => eng
+            .cfg
+            .profile_defaults()
+            .provider_concurrency_default()
+            .max(cfg_conc),
     };
     let slot = match crate::provider_slots::acquire(
         &Config::home(),
@@ -2176,6 +2198,48 @@ async fn dispatch_reviewer_for_model(
             })
         }
     };
+    // The group budget uses the SAME flock slot files (same directory when
+    // group == provider id), so a slot taken above IS the group slot when the
+    // ids match — re-acquiring would deadlock against our own lock. When the
+    // group differs (two provider ids sharing one endpoint), take a group
+    // slot and the sliding-window rate turn on top.
+    let _group_guard = if group != provider_cfg.id {
+        match zoder_core::provider_rate::wait_for_slot(
+            &Config::home(),
+            &group,
+            cfg_conc,
+            crate::provider_slots::queue_timeout_from_env(),
+            cli.quiet,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Err(ReviewerError::FallbackWorthy {
+                    message: format!("reviewer {model}: {e}"),
+                    kind: zoder_core::ErrKind::RateLimit,
+                    status: None,
+                })
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(e) = zoder_core::provider_rate::wait_for_rate_turn(
+        &Config::home(),
+        &group,
+        cfg_rpm,
+        crate::provider_slots::queue_timeout_from_env(),
+        cli.quiet,
+    )
+    .await
+    {
+        return Err(ReviewerError::FallbackWorthy {
+            message: format!("reviewer {model}: {e}"),
+            kind: zoder_core::ErrKind::RateLimit,
+            status: None,
+        });
+    }
 
     let mut attempt = 0u32;
     let mut server_failures = 0u32;
@@ -2237,7 +2301,11 @@ async fn dispatch_reviewer_for_model(
                     return Err(ReviewerError::fallback_worthy_from(e));
                 }
                 if e.retryable() && attempt < cli.retries {
-                    let delay = zoder_core::backoff_delay(attempt, e.retry_after);
+                    let delay = zoder_core::backoff_delay(
+                        attempt,
+                        e.retry_after,
+                        e.overload.then(|| provider.overload_backoff_min()).flatten(),
+                    );
                     if !cli.quiet {
                         eprintln!(
                             "[zoder] reviewer {model}: {} (retry {}/{} in {:.1}s)",

@@ -398,6 +398,64 @@ pub struct Provider {
     /// not a "no limit" spelling — omit the key for that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
+    /// Floor, in seconds, for the client retry delay after a provider
+    /// overload — an HTTP 503 "service unavailable" burst, an HTTP 529
+    /// "overloaded", or an Anthropic-style `overloaded_error` stream frame.
+    /// A free shared endpoint that is overloaded stays overloaded for
+    /// seconds, so the default exponential backoff (500 ms base) retries it
+    /// too fast and bursts it into more 503s. `None` (the default) keeps the
+    /// historical behaviour: backoff starts at the 500 ms base. The floor is
+    /// applied in every retry loop through one shared helper; it never
+    /// overrides a server-provided `Retry-After`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload_backoff_min_s: Option<u64>,
+    /// Cap, in seconds, on the time to the first token (answer or reasoning)
+    /// for streamed calls to this provider. When set and no generation delta
+    /// arrives within the window, the call aborts as a retryable timeout
+    /// instead of riding the whole request budget. Reasoning models on a
+    /// shared free endpoint can sit in the provider queue for tens of
+    /// seconds before their first token (measured p90 up to ~34 s). `None`
+    /// (the default) keeps the historical behaviour — only the overall
+    /// request budget bounds the wait for the first token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_s: Option<u64>,
+    /// When true, zoder sends `stream: true` on OpenAI-compatible chat
+    /// requests to this provider even on call paths that build their request
+    /// non-streaming (reviewer, health probe). This makes time-to-first-token
+    /// measurable there and lets the client cut the call short while the
+    /// provider is still queuing. `None` (the default) keeps today's
+    /// behaviour — each call path sends whatever it always sent. Anthropic
+    /// wire requests always stream and ignore this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// The shared-endpoint group this provider's call budget belongs to.
+    /// Several `[[providers]]` entries pointing at the SAME hosted endpoint
+    /// (e.g. the same free API behind two provider ids) default to separate
+    /// concurrency/rate budgets — set the same `rate_limit_group` on both to
+    /// make them share one `max_concurrent` / `max_requests_per_minute`
+    /// budget host-wide. Default: the provider's own `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_group: Option<String>,
+    /// Host-wide cap on the number of IN-FLIGHT requests to this provider's
+    /// endpoint (counted across ALL zoder processes on the host, via
+    /// `flock`-ed slot files under `<zoder home>/state/slots/`). `0` or
+    /// absent (the default) means unlimited — today's behaviour. A waiting
+    /// call sleeps (bounded by its queue timeout, `ZODER_QUEUE_TIMEOUT_S`)
+    /// and prints a stderr notice after ~10 s. The limit is PER HOST: divide
+    /// the account's limit by the number of hosts that share the account.
+    /// The `ZODER_PROVIDER_CONCURRENCY` env var (reviewer-only, per provider
+    /// id) still works and takes precedence for reviewer calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+    /// Host-wide cap on requests per sliding 60-second window to this
+    /// provider's endpoint (counted across ALL zoder processes on the host,
+    /// via a locked timestamp file under `<zoder home>/state/rate/`). `0` or
+    /// absent (the default) means unlimited — today's behaviour. A waiting
+    /// call sleeps for its turn (bounded by `ZODER_QUEUE_TIMEOUT_S`) and
+    /// prints a stderr notice after ~10 s. The limit is PER HOST: divide the
+    /// account's limit by the number of hosts that share the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_minute: Option<u32>,
 }
 
 impl Provider {
@@ -3640,6 +3698,12 @@ impl Config {
                 serves: vec![engine_provider.model.clone()],
                 azure_api_version: None,
                 max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
             });
         }
         Ok(())
@@ -3717,6 +3781,12 @@ impl Config {
                 serves: Vec::new(),
                 azure_api_version: None,
                 max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
             }],
             deployment: DeploymentConfig::default(),
             default_provider: "default".into(),
@@ -3748,6 +3818,22 @@ impl Config {
 
     pub fn provider(&self, id: &str) -> Option<&Provider> {
         self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Resolve the shared-endpoint call-budget parameters for a provider:
+    /// the `rate_limit_group` (default: the provider id), the host-wide
+    /// `max_concurrent` cap, and the host-wide `max_requests_per_minute`
+    /// cap. All three are `0`/absent by default — unlimited, i.e. today's
+    /// behaviour.
+    pub fn provider_call_budget(&self, p: &Provider) -> (String, usize, u32) {
+        let group = p
+            .rate_limit_group
+            .clone()
+            .filter(|g| !g.trim().is_empty())
+            .unwrap_or_else(|| p.id.clone());
+        let max_concurrent = p.max_concurrent.unwrap_or(0) as usize;
+        let max_rpm = p.max_requests_per_minute.unwrap_or(0);
+        (group, max_concurrent, max_rpm)
     }
 
     /// Resolve a served model id to its configured family.
@@ -4203,6 +4289,41 @@ impl Config {
                             p.id, w.name
                         ));
                     }
+                }
+            }
+            // Client-discipline keys for a shared, rate-limited endpoint.
+            // Zero is not a cap: with a 0 floor the backoff starts at the
+            // 500 ms base and a 0 cap would admit nothing, so both reject 0.
+            if p.overload_backoff_min_s.is_some_and(|s| s == 0) {
+                errs.push(format!(
+                    "provider {}: overload_backoff_min_s must be greater than zero",
+                    p.id
+                ));
+            }
+            if p.first_token_timeout_s.is_some_and(|s| s == 0) {
+                errs.push(format!(
+                    "provider {}: first_token_timeout_s must be greater than zero",
+                    p.id
+                ));
+            }
+            if p.max_concurrent == Some(0) {
+                errs.push(format!(
+                    "provider {}: max_concurrent must be greater than zero (omit the key for unlimited)",
+                    p.id
+                ));
+            }
+            if p.max_requests_per_minute == Some(0) {
+                errs.push(format!(
+                    "provider {}: max_requests_per_minute must be greater than zero (omit the key for unlimited)",
+                    p.id
+                ));
+            }
+            if let Some(group) = p.rate_limit_group.as_deref() {
+                if group.trim().is_empty() {
+                    errs.push(format!(
+                        "provider {}: rate_limit_group must not be empty (omit the key to use the provider id)",
+                        p.id
+                    ));
                 }
             }
         }
@@ -5760,6 +5881,12 @@ model_provider = "custom.primary"
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -5774,6 +5901,12 @@ model_provider = "custom.primary"
             serves: vec!["enterprise/".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         // Prefix match wins, in config order.
         assert_eq!(cfg.provider_for_model("MiniMax-M3").unwrap().id, "minimax");
@@ -5835,6 +5968,12 @@ model_provider = "custom.primary"
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -5854,6 +5993,12 @@ model_provider = "custom.primary"
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         // Empty catalog: explicit `windows` on the subscription resolve
         // directly, no preset lookup needed. (Passing an empty catalog is
@@ -6917,6 +7062,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["gpt-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -6936,6 +7087,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.default_provider = "openai-codex".into();
         let errs = cfg.validate();
@@ -7061,6 +7218,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -7080,6 +7243,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.default_provider = "minimax-personal".into();
 
@@ -7161,6 +7330,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -7175,6 +7350,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.default_provider = "minimax-x".into();
 
@@ -7229,6 +7410,12 @@ auth = { type = "env", var = "FLEET_KEY" }
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.default_provider = "minimax-legacy".into();
 
@@ -7530,6 +7717,12 @@ azure_api_version = "2024-10-21"
             serves: Vec::new(),
             azure_api_version: Some("2024-10-21".into()),
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         })
         .expect("serialize");
         assert!(
@@ -7568,6 +7761,12 @@ azure_api_version = "2024-10-21"
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.default_provider = "azure-legacy".into();
 
@@ -7643,6 +7842,12 @@ billing = "metered"
                 serves: Vec::new(),
                 azure_api_version: Some((*v).to_string()),
                 max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
             });
         }
         // Set the default_provider so the validate() step doesn't
