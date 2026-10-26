@@ -38,7 +38,9 @@ static RECORDS: Mutex<Vec<CallRecord>> = Mutex::new(Vec::new());
 /// The levers for `model`, or `None` when the `[context]` block is off (or
 /// absent).
 pub(crate) fn levers_for(cfg: &Config, model: &str) -> Option<Levers> {
-    cfg.context.levers_for(model)
+    // Resolve through the GLOBAL deployment profile so `[deployment] mode`
+    // supplies the default when `[context] profile` is unset.
+    cfg.context_levers_for(model)
 }
 
 /// The context window for a (provider, model), in tokens.

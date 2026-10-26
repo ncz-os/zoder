@@ -1,0 +1,19 @@
+# config.fleet.toml — fleet deployment profile (TEMPLATE).
+#
+# `zoder init --profile fleet` writes this file into $ZODER_HOME only when no
+# zoder configuration exists yet. It selects the fleet deployment; it does NOT
+# contain providers, endpoints, host names, or private addresses. Those come
+# from the fleet's own configuration repository, which is layered on top of
+# this file at deploy time.
+#
+# Use the standalone profile (`zoder init --profile standalone`) for a single
+# host. See docs/PROFILES.md.
+
+[deployment]
+mode = "fleet"
+
+# Fleet tuning, including the stricter context levers. The global deployment
+# profile also supplies this default; it is explicit here so a fleet operator
+# can see what is active without consulting another file.
+[context]
+profile = "fleet"
