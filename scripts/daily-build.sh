@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # Daily trio build — runs on the host that can build a given target NATIVELY,
 # then publishes the versioned tarballs to the configured release host.
-# Cron-driven (see docs/DAILY-BUILDS.md). Target mapping (each builds where it
-# is native, so we never fight cross-from-macOS toolchain breakage):
+# Cron-driven (see docs/DAILY-BUILDS.md). Supported roles (auto-detected from
+# the platform, or set explicitly in ~/.zoder-build.env):
 #
-#   macOS arm64 host   -> aarch64-apple-darwin       (native cargo)
-#                         aarch64-unknown-linux-gnu   (native arm64 Docker)
-#   x86_64 Linux host  -> x86_64-unknown-linux-gnu  (amd64 Docker)
-#   arm64 Linux host   -> aarch64-unknown-linux-gnu (native arm64 Docker)
+#   macos-arm64  (Apple Silicon macOS)
+#                -> aarch64-apple-darwin       (native cargo)
+#                   aarch64-unknown-linux-gnu   (native arm64 Docker)
+#   linux-amd64  (x86_64 Linux)
+#                -> x86_64-unknown-linux-gnu  (amd64 Docker)
+#   linux-arm64  (arm64 Linux)
+#                -> aarch64-unknown-linux-gnu (native arm64 Docker)
+#
+# Intel macOS (Darwin:x86_64) is deliberately unsupported: the macOS leg only
+# produces the arm64 Darwin binary. Auto-detection on an Intel macOS host exits
+# with an unsupported-platform error; set ZODER_BUILD_ROLE explicitly only for
+# one of the three roles above.
 #
 # Linux targets build inside a pinned `rust:1.94` container so the release
 # toolchain matches the GitLab quality gate exactly, regardless of the host's
@@ -44,17 +52,26 @@ log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 # (set in ~/.zoder-build.env) or derive it from the platform; no host names are
 # involved.
 host_short="$(hostname -s 2>/dev/null || hostname)"
+platform="$(uname -s):$(uname -m)"
 MODE="${ZODER_BUILD_ROLE:-}"
 if [ -z "$MODE" ]; then
-  case "$(uname -s):$(uname -m)" in
+  case "$platform" in
     Darwin:arm64)              MODE="macos-arm64" ;;
+    Darwin:x86_64)
+      log "ERROR: unsupported platform '$platform' on host '$host_short': Intel macOS is not supported (the macOS leg only builds the arm64 Darwin binary). Use a supported host, or set ZODER_BUILD_ROLE explicitly to macos-arm64, linux-amd64, or linux-arm64 only if that role is correct for this machine."
+      exit 2
+      ;;
     Linux:x86_64|Linux:amd64)  MODE="linux-amd64" ;;
     Linux:aarch64|Linux:arm64) MODE="linux-arm64" ;;
   esac
 fi
+if [ -z "$MODE" ]; then
+  log "ERROR: cannot infer a build role on host '$host_short' for platform '$platform'; accepted ZODER_BUILD_ROLE values: macos-arm64, linux-amd64, linux-arm64. Update ~/.zoder-build.env and set ZODER_BUILD_ROLE to one of these values."
+  exit 2
+fi
 case "$MODE" in
   macos-arm64|linux-amd64|linux-arm64) ;;
-  *) log "ERROR: no daily-build role for host '$host_short' (set ZODER_BUILD_ROLE=macos-arm64|linux-amd64|linux-arm64 in ~/.zoder-build.env)"; exit 2 ;;
+  *) log "ERROR: unknown ZODER_BUILD_ROLE '$MODE' on host '$host_short'; accepted values: macos-arm64, linux-amd64, linux-arm64. Update ~/.zoder-build.env and set ZODER_BUILD_ROLE to one of these values."; exit 2 ;;
 esac
 
 mkdir -p "$WORK"
