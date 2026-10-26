@@ -6496,7 +6496,42 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 break;
             }
             Err((e, fatal)) => {
-                attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
+                // A budget exhaustion (finish_reason "length" with no answer)
+                // is a real, explainable outcome, not a provider error to
+                // bury under "failed": the model spent the whole
+                // max_tokens thinking and produced nothing. Name it, with
+                // the model's reasoning text when the provider sent some —
+                // the oneshot path deliberately does NOT double the budget
+                // (that is a reviewer-only repair; a one-shot exec that
+                // retried would just bill the same reasoning again).
+                let message = e
+                    .length_exhausted
+                    .as_ref()
+                    .map(|usage| {
+                        let used = usage
+                            .completion_tokens
+                            .map(|t| format!(" ({t} completion tokens used)"))
+                            .unwrap_or_default();
+                        let reasoning = e
+                            .reasoning
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|r| !r.is_empty())
+                            .map(|r| {
+                                let truncated: String = r.chars().take(120).collect();
+                                format!(
+                                    " — its reasoning ended: \"{truncated}…\" (full text with --show-reasoning)"
+                                )
+                            })
+                            .unwrap_or_default();
+                        format!(
+                            "model spent its whole {}-token budget{used} and returned no answer{reasoning}; \
+raise --max-tokens or lower its reasoning effort",
+                            req.max_tokens
+                        )
+                    })
+                    .unwrap_or_else(|| e.message.clone());
+                attempt_failures.push(format!("{model_id} via {pid}: {message}"));
                 if link_gated {
                     crate::provider_health::record_call_error(
                         &eng.cfg.health_path,

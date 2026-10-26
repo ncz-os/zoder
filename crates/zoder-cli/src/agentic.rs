@@ -496,6 +496,15 @@ struct Completion {
     /// re-plan for a fallback model, so this is NOT always the initial plan's
     /// length; the loop records this value as evidence of what was reviewed.
     chunks: usize,
+    /// True when the provider's response ended at `finish_reason: "length"`
+    /// with no answer content: the model spent the whole budget (typically on
+    /// hidden reasoning) before emitting a verdict. The chunk walker treats
+    /// this like the truncated-before-verdict case — one doubled-budget
+    /// repair, capped by the same ceiling — instead of a "malformed" abort.
+    length_exhausted: bool,
+    /// The `max_tokens` this completion was requested with; the repair
+    /// derives its doubled budget from it.
+    max_tokens: u32,
 }
 
 /// One reviewer candidate the chain skipped, and why. Reasons are the
@@ -2153,6 +2162,19 @@ async fn dispatch_reviewer_for_model(
     // An explicit env spec always wins. With no spec, the deployment profile
     // supplies the default (unlimited on both profiles today; the hook is what
     // keeps a future fleet slot map out of the standalone path).
+    // The budget the dispatch loop (and, on a budget exhaustion, the chunk
+    // walker's repair) ran this call with. Carried on the `Completion` so
+    // the repair can derive its doubled budget from the budget the model
+    // ACTUALLY burned, not the chunk budget that may differ after a
+    // replan for a fallback reviewer.
+    let mut served_max_tokens = max_tokens;
+
+    // Optional host-wide cap on concurrent reviewer calls per provider
+    // (ZODER_PROVIDER_CONCURRENCY); unlimited by default. A queue timeout is
+    // a capacity signal, so the next reviewer candidate may take over.
+    // An explicit env spec always wins. With no spec, the deployment profile
+    // supplies the default (unlimited on both profiles today; the hook is what
+    // keeps a future fleet slot map out of the standalone path).
     let concurrency_spec = std::env::var("ZODER_PROVIDER_CONCURRENCY").ok();
     let slot_limit = match concurrency_spec.as_deref() {
         Some(spec) => crate::provider_slots::limit_for(Some(spec), &provider_cfg.id),
@@ -2215,6 +2237,53 @@ async fn dispatch_reviewer_for_model(
         match provider.stream_chat(&req, None).await {
             Ok(r) => break (r, ledger_reservation),
             Err(e) => {
+                // Capture a budget exhaustion BEFORE dropping the error:
+                // nothing is "emitted" (there was no answer content), so the
+                // chunk walker can hand it back as an empty Completion and
+                // run the doubled-budget repair — the one place a same-model
+                // retry is deliberately allowed.
+                if e.length_exhausted.is_some() {
+                    served_max_tokens = req.max_tokens;
+                    let usage = e.length_exhausted.unwrap();
+                    // Reconcile the armed reservation with a real ledger row
+                    // naming the model and carrying the usage the provider
+                    // published (when it did): the exhausted call is
+                    // recorded exactly like any other failed call, unknown
+                    // cost included.
+                    let entry = Entry {
+                        ts_utc: Utc::now(),
+                        provider: provider_cfg.id.clone(),
+                        model: model.to_string(),
+                        host: zoder_core::ledger::host_of_model(model),
+                        tokens_in: usage.prompt_tokens.unwrap_or(0),
+                        tokens_out: usage.completion_tokens.unwrap_or(0),
+                        cost_usd: 0.0,
+                        cost_unknown: true,
+                        calls: 1,
+                        violation: None,
+                        tags: crate::finops_tags(cli, usage.prompt_tokens.unwrap_or(0), None),
+                    };
+                    let mut health = HealthStore::load(&eng.cfg.health_path);
+                    crate::record_turn_entry(ledger_reservation, &entry, "reviewer turn")
+                        .map_err(|err| {
+                            ReviewerError::fatal(format!("reconciling ledger entry: {err}"))
+                        })?;
+                    // Not a policy success: the call spent real tokens and
+                    // produced no verdict, so record it as a failure the
+                    // way the generic error paths do.
+                    health.record_failure(model, "budget exhausted, no answer");
+                    let _ = health.save();
+                    return Ok(Completion {
+                        requested_model: requested.to_string(),
+                        model: model.to_string(),
+                        content: String::new(),
+                        cost_usd: 0.0,
+                        chunks: 1,
+                        length_exhausted: true,
+                        max_tokens: req.max_tokens,
+                        receipts: Vec::new(),
+                    });
+                }
                 drop(ledger_reservation);
                 if e.kind == zoder_core::ErrKind::Server {
                     server_failures = server_failures.saturating_add(1);
@@ -2441,6 +2510,8 @@ async fn dispatch_reviewer_for_model(
         content: res.content,
         cost_usd: cost,
         chunks: 1,
+        length_exhausted: false,
+        max_tokens: served_max_tokens,
         receipts: vec![json!({
             "requested_model": model,
             "response_model": res.telemetry.response_model,
@@ -4764,10 +4835,51 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
             if let Some(review) = strict_review(&completion.content) {
                 break (completion, review, true);
             }
+            // A completion that ended at `finish_reason: "length"` with no
+            // answer content is NOT a verdict at all — the model spent the
+            // whole budget on hidden reasoning. Treat it exactly like the
+            // truncated-before-verdict case: one same-model repair with the
+            // doubled budget (capped by the same ceiling and context
+            // window). The dispatch loop's transient-retry path already saw
+            // this error and did NOT retry it — `retryable()` is false for a
+            // budget exhaustion, since a blind same-budget retry repeats the
+            // failure — so this repair is the ONLY retry of this model and
+            // the two never stack.
+            let budget_exhausted = completion.length_exhausted;
             let repair_user = format!(
                 "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
 did not satisfy the review schema."
             );
+            let repair_max_tokens = if budget_exhausted {
+                // The model burned `completion.max_tokens` (the budget it
+                // actually ran with) and came back empty; give it the
+                // doubled budget, capped by the reviewer ceiling AND by the
+                // model's configured context window when one is stated —
+                // never above what the model can hold.
+                let doubled = reviewer_retry_budget(completion.max_tokens);
+                let capped = if let Ok(eng) = crate::Engine::load() {
+                    let provider_id = crate::RoutingContext::load(&eng.cfg)
+                        .ok()
+                        .and_then(|r| {
+                            r.real_provider_for_model(&eng.cfg, &completion.model)
+                                .map(|p| p.id.clone())
+                        });
+                    let window = crate::context_opt::window_for(
+                        &eng.cfg,
+                        provider_id.as_deref().unwrap_or(""),
+                        &completion.model,
+                        None,
+                    );
+                    window
+                        .and_then(|w| u32::try_from(w).ok())
+                        .map_or(doubled, |w| doubled.min(w))
+                } else {
+                    doubled
+                };
+                capped
+            } else {
+                reviewer_retry_budget(max_tokens)
+            };
             let repaired = complete_once_tracked(
                 cli,
                 Some(&completion.model),
@@ -4776,7 +4888,7 @@ did not satisfy the review schema."
                 &[],
                 system,
                 &repair_user,
-                reviewer_retry_budget(max_tokens),
+                repair_max_tokens,
                 None,
                 true,
             )
@@ -4789,6 +4901,27 @@ did not satisfy the review schema."
                     forced_family_conflict |= repair.forced;
                     if let Some(review) = strict_review(&repair.completion.content) {
                         break (repair.completion, review, false);
+                    }
+                    if budget_exhausted && repair.completion.length_exhausted {
+                        // Exhausted the budget TWICE: the model cannot
+                        // produce a verdict in this budget. Fail with a
+                        // message that names the model and both budgets,
+                        // and stop — no third request, no chain advance
+                        // pretending a verdict was attempted.
+                        let first = completion.max_tokens;
+                        let second = repair.completion.max_tokens;
+                        if first == second {
+                            anyhow::bail!(
+                                "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                                completion.model
+                            );
+                        }
+                        anyhow::bail!(
+                            "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                            completion.model
+                        );
                     }
                 }
                 Err(failure) => {
@@ -4873,6 +5006,12 @@ did not satisfy the review schema."
         cost_usd,
         receipts,
         chunks: users.len(),
+        // The merged content is zoder's own JSON, never a raw provider
+        // completion, so no raw budget-exhaustion flag rides on it.
+        length_exhausted: false,
+        // `max_tokens` may have been re-planned for a fallback reviewer;
+        // the final value is the one every chunk ran at.
+        max_tokens,
     };
     Ok((completion, report))
 }
@@ -14378,6 +14517,19 @@ mod reviewer_chain_dispatch_tests {
     /// shaped chat completion under the URL path
     /// `<mock_uri>/working/v1/chat/completions` — the exact URL shape
     /// `endpoint_url` produces for the `wiremock-working` provider.
+    /// State a context window on the wiremock providers written by
+    /// [`write_config`]. The window is per-provider, and it caps the
+    /// reviewer repair's doubled `max_tokens`.
+    fn write_config_max_context(home: &Path, tokens: u64) {
+        let path = home.join("config.json");
+        let mut body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for provider in body["providers"].as_array_mut().unwrap() {
+            provider["max_context_tokens"] = serde_json::json!(tokens);
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+    }
+
     /// Body shape matches the real OpenAI non-streaming response so
     /// the existing parser in `OpenAiProvider::stream_chat` produces
     /// a real `Completion`.
@@ -17146,6 +17298,450 @@ model_provider = "custom.nemotron35"
             server.received_requests().await.unwrap().len(),
             1,
             "the substituted reviewer call is the only one that ran"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regression: an empty completion at finish_reason "length" (a
+    // reasoning model that spent the whole max_tokens budget) used to be
+    // rejected as "malformed ... empty completion" by the provider parser
+    // and never reached the chunk walker's doubled-budget repair. Now:
+    // one repair with the doubled (capped) budget, a clear failure when
+    // the model comes back empty the second time, and the ledger records
+    // both calls.
+    // ------------------------------------------------------------------
+
+    /// First response: the reasoning model returns an empty answer at
+    /// `finish_reason: "length"` (with reasoning_content and usage).
+    /// Second response: a valid verdict JSON. The review must succeed,
+    /// the mock must have seen EXACTLY two requests, and the second one
+    /// must carry the doubled (capped) max_tokens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_empty_length_completion_gets_one_doubled_budget_repair() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                let max_tokens = value.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if max_tokens > 2048 {
+                    // The repair call (doubled budget): answer with a verdict.
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"content": r#"{"verdict":"approve","summary":"ok on repair","findings":[],"next_steps":[]}"#},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35}
+                    }))
+                } else {
+                    // First call: the whole 2048 budget burned on reasoning,
+                    // no answer.
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "", "reasoning_content": "long hidden reasoning"},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let (completion, report) = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("a budget exhaustion repaired with the doubled budget succeeds");
+        // The verdict came back (on the repair) — the review is complete.
+        let review = strict_review(&completion.content)
+            .expect("the repair's verdict must parse");
+        assert_eq!(review.verdict, "approve");
+        assert!(!report.chunks[0].structured,
+            "a verdict that only appeared on the repair is not first-attempt structured");
+        // EXACTLY two requests: the empty first call + one repair.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "the model must receive exactly two requests");
+        let first_tokens: u64 = requests[0]
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("max_tokens").and_then(|v| v.as_u64()))
+            .unwrap();
+        let second_tokens: u64 = requests[1]
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("max_tokens").and_then(|v| v.as_u64()))
+            .unwrap();
+        assert_eq!(first_tokens, 2048, "the first call ran at the chunk budget");
+        assert_eq!(
+            second_tokens,
+            reviewer_retry_budget(2048) as u64,
+            "the repair must carry the doubled budget"
+        );
+        // Both calls were ledgered (cost unknown rows are acceptable: the
+        // provider is free-billed and the catalog is absent in the test
+        // home, so the rows land as cost_unknown — they still EXIST, with
+        // the usage the provider published).
+        let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
+        let rows: Vec<&str> = ledger.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(rows.len(), 2, "both calls must be recorded in the ledger: {ledger}");
+        assert!(
+            rows.iter().all(|r| r.contains("\"model\":\"working-model/reviewer\"")),
+            "every ledger row must name the served model: {ledger}"
+        );
+    }
+
+    /// Both responses come back empty at `finish_reason: "length"`: the
+    /// review must fail with a message that names the model and the
+    /// budget, and the mock must have seen exactly two requests (the
+    /// repair runs at most once — never a third).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_empty_length_completion_twice_fails_with_budget_message() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "still thinking"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+            })))
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let err = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect_err("two consecutive budget exhaustions must fail the review");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("working-model/reviewer"),
+            "the diagnostic must name the model: {chain}"
+        );
+        assert!(
+            chain.contains("spent its whole 2048-token budget")
+                && chain.contains("(twice)"),
+            "the diagnostic must name the budget and that it happened twice: {chain}"
+        );
+        assert!(
+            chain.contains("doubled 4096-token budget"),
+            "the diagnostic must name the repair budget too: {chain}"
+        );
+        assert!(
+            chain.contains("lower its reasoning effort or raise max_tokens"),
+            "the diagnostic must carry the operator remedy: {chain}"
+        );
+        // Exactly two requests: first attempt + the single repair. No
+        // third call, no chain-advance retry of the same model.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "the repair runs at most once"
+        );
+        // Both calls were ledgered.
+        let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
+        let rows: Vec<&str> = ledger.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(rows.len(), 2, "both calls must be recorded in the ledger: {ledger}");
+    }
+
+    /// The `content: null` variant of the same regression: an explicit
+    /// null answer at `finish_reason: "length"` must take the identical
+    /// doubled-budget repair path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_null_content_length_completion_gets_the_same_repair() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                let max_tokens = value.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if max_tokens > 2048 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"content": r#"{"verdict":"approve","summary":"ok on repair","findings":[],"next_steps":[]}"#},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": null},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let (completion, _) = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("content:null at length takes the same repair path");
+        assert!(
+            strict_review(&completion.content).is_some(),
+            "the repair's verdict must parse: {}",
+            completion.content
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// Streaming variant: the reviewer runs with `stream: false` in
+    /// production, so the streaming parser's empty-at-length shape is
+    /// exercised at the provider layer (zoder-core tests) — this test
+    /// pins that the CHUNK WALKER treats a streaming-dispatched empty
+    /// completion identically: one repair, doubled budget, success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_streaming_empty_length_completion_gets_the_same_repair() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                let wants_stream = value
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let max_tokens = value.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if !wants_stream && max_tokens > 2048 {
+                    // The repair call: a normal non-stream verdict.
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"content": r#"{"verdict":"approve","summary":"ok on repair","findings":[],"next_steps":[]}"#},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35}
+                    }))
+                } else if wants_stream {
+                    // The first call as a STREAM: a reasoning-only stream that
+                    // ends at finish_reason length with no content deltas.
+                    let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2048}}\n\
+data: [DONE]\n\n";
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(body)
+                } else {
+                    // The first call as a non-stream empty-at-length body.
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "", "reasoning_content": "hmm"},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let (completion, _) = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("a streaming empty-at-length first call takes the same repair");
+        assert!(
+            strict_review(&completion.content).is_some(),
+            "the repair's verdict must parse: {}",
+            completion.content
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// Context-window cap: with `max_context_tokens = 6144` configured for
+    /// the model, the doubled budget (4096 for a 2048 first call) fits
+    /// under the window and is used as-is; with a window BELOW the doubled
+    /// budget, the repair is capped at the window (it can never exceed
+    /// what the model can hold).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_repair_budget_is_capped_by_the_configured_context_window() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                let max_tokens = value.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if max_tokens > 2048 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"content": r#"{"verdict":"approve","summary":"ok on repair","findings":[],"next_steps":[]}"#},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+        // Window 6144 > doubled 4096: the cap must NOT shrink the repair.
+        write_config_max_context(home, 6144);
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let (completion, _) = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("repair under the window succeeds");
+        assert!(strict_review(&completion.content).is_some());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_tokens: u64 = requests[1]
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("max_tokens").and_then(|v| v.as_u64()))
+            .unwrap();
+        assert_eq!(
+            second_tokens,
+            reviewer_retry_budget(2048) as u64,
+            "a window larger than the doubled budget must not cap it"
+        );
+
+        // Window 3072 < doubled 4096: the repair must be capped at 3072.
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                let max_tokens = value.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if max_tokens > 2048 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"content": r#"{"verdict":"approve","summary":"ok on repair","findings":[],"next_steps":[]}"#},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2048, "total_tokens": 2053}
+                    }))
+                }
+            })
+            .mount(&server2)
+            .await;
+        // Re-point the config at server2 (same home, new base URL) and set
+        // the small window.
+        let path = home.join("config.json");
+        let mut body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        body["providers"][0]["base_url"] =
+            serde_json::json!(format!("{}/broken", server2.uri()));
+        body["providers"][1]["base_url"] =
+            serde_json::json!(format!("{}/working", server2.uri()));
+        for provider in body["providers"].as_array_mut().unwrap() {
+            provider["max_context_tokens"] = serde_json::json!(3072);
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        let (completion, _) = complete_review_chunks(
+            &cli,
+            Some("working-model/reviewer"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["chunk one".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("repair capped by the window still succeeds");
+        assert!(strict_review(&completion.content).is_some());
+        let requests = server2.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_tokens: u64 = requests[1]
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("max_tokens").and_then(|v| v.as_u64()))
+            .unwrap();
+        assert_eq!(
+            second_tokens, 3072,
+            "the repair must never exceed the model's configured context window"
         );
     }
 
