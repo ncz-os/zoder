@@ -7407,12 +7407,13 @@ fn read_daemon_identity(pid: u32) -> Option<DaemonIdentity> {
 /// so the two cannot drift: if this returns a path, that is the file the
 /// daemon is started from, and `/proc/<pid>/exe` for a daemon this zoder
 /// spawned names the same file. When it resolves nothing there is no daemon
-/// binary on this host and the executable arm simply does not fire — the
-/// other two arms (the pid this process spawned, and the record beside the
-/// socket) are identity-based and still spare a running daemon.
-pub(crate) fn daemon_binary_path() -> PathBuf {
+/// binary on this host, and the exemption then has NO target: an invented
+/// path names no file, so the executable arm could only ever fail to match,
+/// silently, and in a way that reads like a working exemption. The other two
+/// arms (the pid this process spawned, and the record beside the socket) are
+/// identity-based and still spare a running daemon.
+pub(crate) fn daemon_binary_path() -> Option<PathBuf> {
     locate_sibling("zeroclaw")
-        .unwrap_or_else(|| PathBuf::from("zeroclaw").join("unresolved-daemon-binary"))
 }
 
 /// The working directory for the spawned daemon: a stable, NEUTRAL
@@ -7842,22 +7843,37 @@ mod daemon_cwd_tests {
     fn the_exempted_binary_is_the_one_the_spawn_resolves() {
         // Host-independent: whatever `locate_sibling` resolves (or fails to),
         // the exemption is pointed at exactly that, so the two cannot drift.
-        let resolved = super::daemon_binary_path();
+        // When nothing resolves there is no daemon binary on this host, and
+        // the exemption has NO target: it must not invent one.
         assert_eq!(
-            Some(resolved.clone()),
+            super::daemon_binary_path(),
             super::locate_sibling("zeroclaw"),
-            "the exemption must target exactly what the spawn resolves"
+            "the exemption must target exactly what the spawn resolves, and invent nothing"
         );
-        // When this host HAS the binary, it is the install name zoder looks
-        // for; a host without one is supported and gets the sentinel, not a
-        // panic and not an exemption.
-        if super::locate_sibling("zeroclaw").is_some() {
-            assert!(
-                resolved.ends_with("zeroclaw"),
-                "the exemption must target the install name: {}",
-                resolved.display()
-            );
-        }
+    }
+
+    /// The resolution the exemption depends on is hermetic: a controlled path
+    /// resolves to exactly the file on it, and a path with no daemon binary
+    /// on it resolves to nothing at all. The second case is the one a CI
+    /// runner is in, and it must leave the exemption without a target rather
+    /// than with a made-up one.
+    #[test]
+    fn the_exemption_resolves_against_a_controlled_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installed = dir.path().join("zeroclaw");
+        std::fs::write(&installed, b"#!/bin/sh\nexit 0\n").expect("fixture binary");
+        let empty = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            super::resolve_sibling(None, &[], &[dir.path().to_path_buf()], "zeroclaw"),
+            Some(installed.clone()),
+            "a controlled path must resolve to the file on it"
+        );
+        assert_eq!(
+            super::resolve_sibling(None, &[], &[empty.path().to_path_buf()], "zeroclaw"),
+            None,
+            "a path with no daemon binary on it must resolve to nothing"
+        );
     }
 
     /// The cross-process record is published atomically. `fs::write` on the

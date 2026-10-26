@@ -277,7 +277,7 @@ fn daemon_exemption(
     pid: u32,
     recorded: &mut Option<Option<crate::DaemonIdentity>>,
     pid_file: &Path,
-    daemon_binary: &Path,
+    daemon_binary: Option<&Path>,
 ) -> Option<DaemonExemption> {
     if spawned_daemon_still_matches(pid) {
         return Some(DaemonExemption::Spawned);
@@ -290,8 +290,10 @@ fn daemon_exemption(
             return Some(DaemonExemption::Recorded);
         }
     }
-    if let Some(exe) = process_executable(pid) {
-        if executable_is_zeroclaw(&exe, daemon_binary) {
+    // No target means no executable arm: with no daemon binary on this host
+    // there is no file to match, and the arm must not fall back to the name.
+    if let (Some(exe), Some(binary)) = (process_executable(pid), daemon_binary) {
+        if executable_is_zeroclaw(&exe, binary) {
             return Some(DaemonExemption::Executable);
         }
     }
@@ -548,8 +550,10 @@ struct ReapPlan {
     /// ("zeroclaw")`). The executable exemption matches this exact file, not
     /// a name and not a directory: a copy an agent drops in the workspace
     /// being reaped is not the daemon, and neither is anything else that
-    /// happens to be called `zeroclaw`.
-    daemon_binary: PathBuf,
+    /// happens to be called `zeroclaw`. `None` when nothing resolves: there
+    /// is no daemon binary on this host, so there is no file to match and the
+    /// executable arm cannot fire.
+    daemon_binary: Option<PathBuf>,
 }
 
 impl ReapPlan {
@@ -566,7 +570,7 @@ impl ReapPlan {
         cwd: &Path,
         temp_base: &Path,
         daemon_pid_file: PathBuf,
-        daemon_binary: PathBuf,
+        daemon_binary: Option<PathBuf>,
     ) -> Option<Self> {
         // Order matters: the boot-tick boundary is read FIRST and the pid
         // snapshot second, so every process that existed before the boundary
@@ -702,7 +706,7 @@ impl ReapGuard {
         tmp: &Path,
         enabled: bool,
         daemon_pid_file: PathBuf,
-        daemon_binary: PathBuf,
+        daemon_binary: Option<PathBuf>,
     ) -> Self {
         let plan = enabled
             .then(|| ReapPlan::new(cwd, tmp, daemon_pid_file, daemon_binary))
@@ -1669,7 +1673,7 @@ fn scan(plan: &ReapPlan) -> Vec<Candidate> {
             pid,
             &mut recorded_daemon,
             &plan.daemon_pid_file,
-            &plan.daemon_binary,
+            plan.daemon_binary.as_deref(),
         ) {
             report_spared_daemon(pid, exemption);
             continue;
@@ -1906,7 +1910,7 @@ mod tests {
                 &self.tmp_root,
                 true,
                 self.daemon_pid_file(),
-                self.daemon_binary(),
+                Some(self.daemon_binary()),
             )
         }
     }
@@ -2220,7 +2224,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         let stubborn = spawn_sigterm_ignoring(&ws.cd);
@@ -2267,7 +2271,7 @@ mod tests {
             &ws.tmp_root,
             false,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         );
         assert!(!guard.armed(), "--no-reap must not arm a plan");
         let leaked = spawn_sleeper(&ws.cd);
@@ -2441,7 +2445,7 @@ mod tests {
             &ws.tmp_root,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         assert!(
@@ -2628,7 +2632,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         // A parent that forks one child, then forks another ~200ms later —
@@ -2859,7 +2863,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("a reap plan for a real workspace");
         let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
@@ -2901,7 +2905,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("a reap plan for a real workspace");
         let report = teardown_rounds(&plan, Duration::from_millis(50), &socket);
@@ -3051,7 +3055,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("a reap plan for a real workspace");
         let leftover = spawn_sleeper(&ws.cd);
@@ -3109,7 +3113,7 @@ mod tests {
                 Path::new("/"),
                 Path::new("/"),
                 PathBuf::from("/nonexistent/daemon.pid"),
-                PathBuf::from("/nonexistent/zeroclaw"),
+                Some(PathBuf::from("/nonexistent/zeroclaw")),
             )
             .is_none(),
             "a / root must not produce a reap plan"
@@ -3125,7 +3129,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         assert!(plan.owns_cwd(&ws.cd.join("src/lib.rs")));
@@ -3183,7 +3187,7 @@ mod tests {
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         let outcome = reap(&plan, Duration::from_millis(50));
@@ -3319,13 +3323,18 @@ mod tests {
         // does not exist. A fixture that predates a scope is excluded by the
         // start-time rule whatever the record says, so both scopes have to be
         // open before the fixture is spawned or the assertions prove nothing.
-        let plan =
-            ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone(), ws.daemon_binary()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            Some(ws.daemon_binary()),
+        )
+        .expect("plan");
         let without_record = ReapPlan::new(
             &ws.cd,
             &ws.tmp_root,
             ws.daemon_pid_file(),
-            ws.daemon_binary(),
+            Some(ws.daemon_binary()),
         )
         .expect("plan");
         let daemon = spawn_sleeper(&ws.cd);
@@ -3366,8 +3375,13 @@ mod tests {
         // The scope opens FIRST: a process that already existed when it did
         // would be spared by the start-time rule, and this test would prove
         // nothing about the stale record.
-        let plan =
-            ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone(), ws.daemon_binary()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            Some(ws.daemon_binary()),
+        )
+        .expect("plan");
         let stranger = spawn_sleeper(&ws.cd);
         wait_until(|| alive(stranger), "the fixture to be running");
         let live = live_start_ticks(stranger).expect("a live fixture has a start time");
@@ -3399,8 +3413,13 @@ mod tests {
         let pidfile = ws.root().join("daemon.pid");
         // Scope first, fixture second, so the fixture is reapable for the
         // reason under test and not because it predates the run.
-        let plan =
-            ReapPlan::new(&ws.cd, &ws.tmp_root, pidfile.clone(), ws.daemon_binary()).expect("plan");
+        let plan = ReapPlan::new(
+            &ws.cd,
+            &ws.tmp_root,
+            pidfile.clone(),
+            Some(ws.daemon_binary()),
+        )
+        .expect("plan");
         let leftover = spawn_sleeper(&ws.cd);
         wait_until(|| alive(leftover), "the fixture to be running");
         let live = live_start_ticks(leftover).expect("a live fixture has a start time");
@@ -3583,5 +3602,40 @@ mod tests {
         assert!(!executable_is_zeroclaw(&other, &installed));
         assert!(!executable_is_zeroclaw(Path::new("zeroclaw"), &installed));
         assert!(!executable_is_zeroclaw(Path::new("/"), &installed));
+    }
+
+    /// The executable arm spares the daemon by the exact file the spawn
+    /// resolves. With no target there is nothing to spare it BY: the arm
+    /// must not fall back to the name, and it must spare nothing at all.
+    #[test]
+    fn the_executable_arm_needs_a_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installed = install_fake_zeroclaw(dir.path(), "/bin/sh");
+        let (mut daemon, helper) = spawn_fake_daemon(
+            &installed,
+            dir.path(),
+            dir.path(),
+            &dir.path().join("helper.pid"),
+        );
+        let pid = daemon.id();
+        let absent = dir.path().join("absent-daemon.pid");
+
+        let mut recorded = None;
+        assert_eq!(
+            daemon_exemption(pid, &mut recorded, &absent, Some(&installed)),
+            Some(DaemonExemption::Executable),
+            "the executable arm must spare the daemon binary itself"
+        );
+
+        let mut recorded = None;
+        assert_eq!(
+            daemon_exemption(pid, &mut recorded, &absent, None),
+            None,
+            "an exemption with no target must spare nothing by path"
+        );
+
+        kill_exact(helper);
+        let _ = daemon.kill();
+        let _ = daemon.wait();
     }
 }
