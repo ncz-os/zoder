@@ -1025,6 +1025,25 @@ until then use the commands above or re-run the installer.)
 > may be free for *you* though they carry a list price — `zoder refresh` against
 > your own endpoint, plus local config, is what marks those routable for you.
 
+### Price and name-matching conformance
+
+The exact rules the pipeline applies — how a raw id is split into provider and
+model, which LiteLLM and OpenRouter rows count as priced (and which missing or
+zero prices mean), what makes a model free, how names are matched across
+sources, how peak/off-peak rates are derived, and which corpus fields are
+hand-curated rather than fetched — are recorded as executable cases in
+[`tests/fixtures/pricing-conformance.json`](tests/fixtures/pricing-conformance.json).
+The fixture is self-describing: each rule carries a plain description and the
+function that implements it, and each case states its input, the expected
+result, and whether it is `enforced` today, a `spec` requirement the public
+pipeline does not yet implement, or `unresolved`. It is the single contract an
+independent pricing implementation tests against, so the two agree by
+construction rather than by coincidence. Run it with
+`python3 scripts/tests/pricing-conformance-tests.py` (offline; it calls the real
+builder functions). The fixture records behaviour, it does not set policy — a
+rule worth changing is argued in review, and changing it means changing the
+fixture and the pipeline together.
+
 ---
 
 ## Enterprise memory & persistence

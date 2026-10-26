@@ -1,0 +1,1406 @@
+{
+  "rules": {
+    "canon_key": "Cross-source name matching: every corpus id and every leaderboard/arena name is reduced to one comparable key so provider/region/effort/snapshot variants of the same model merge while distinct base models stay distinct. The leaf is taken after the LAST slash (so an org-less catalog id 'MiniMax-M3' and the prefixed 'together_ai/MiniMaxAI/MiniMax-M3' both become 'minimax-m3'); a leading 'vendor.' dotted namespace is dropped when the head is a known vendor ('zai.glm-5.2' -> 'glm-5-2'); parentheticals such as '(max)' and multi-word decorators ('claude code') are removed; version dots become dashes ('5.2' -> '5-2', 'DeepSeek-V3.2' -> 'deepseek-v3-2'); trailing decorator tokens and snapshot dates (YYYYMMDD / YYYY / MMDD) are stripped from the end. Note the colon of a ':free' suffix is NOT a separator, so it survives tokenization as a '-free' tail. Implemented in scripts/corpus_match.py, function canon_key.",
+    "classify": "Classification projects the economics into the routing verdict. free = an explicit zero price AND the id is not a closed-weight commercial vendor (the _COMMERCIAL_PAID_ONLY marker list; the open-weight gpt-oss family is exempt), because a $0 price for a paid-only vendor is a placeholder, not a free tier; such a row keeps free=false, paid=true and gets the gated_reason 'listed $0 in public feed but vendor is paid-only (U+2014 em dash) not auto-routed'. free is decided by the PRICE, never by a ':free' name suffix, so a ':free' id with a non-zero price is not free. route_candidate == free. paid == priced and not free. The other gated_reason values are 'paid (non-zero public price)' and 'unpriced in public feed (em dash) not auto-routed'; a routable free model has gated_reason null. Implemented in scripts/build-public-corpus.py, function build_corpus.",
+    "known_good": "bench/known-good-swe.json (version 3) is the corpus's only curated quality dimension. Its patterns array is ordered and the FIRST pattern with any 'match' substring in the model id (case-insensitive) wins. A hit contributes capability.swe_verified {acc: swe, source: 'ncz-known-good', harness: 'curated'}, agentic_score = w_swe = round(swe/100, 3), and workflows {single_pass, grind}; it applies to paid and free models alike. build_corpus applies known-good FIRST and the measured bench overlay SECOND, so an overlay entry overrides the curated capability and agentic_score/w_swe, while the curated workflows tags (which no benchmark provides) survive. Provenance therefore splits cleanly: HAND-CURATED = workflows.single_pass, workflows.grind and capability.swe_verified with source 'ncz-known-good'; FETCHED = capability entries whose source is a leaderboard (vals.ai, aider, scale-seal, terminal-bench), preference.arena_webdev / preference.arena_agent, arena_webdev_elo / arena_coding_elo, and agentic_score / w_swe when they come from the overlay - and a refresh may only ever rewrite the fetched ones. Implemented in scripts/build-public-corpus.py, functions match_known_good and build_corpus.",
+    "litellm_ingest": "LiteLLM rows become priced economics only when they are real, fully-priced chat rows. The row's mode must be 'chat'; keys carrying an enterprise-SKU or placeholder marker (the substrings 'commitment', '*', '/container', 'sample_spec', 'predibase') are dropped; BOTH input_cost_per_token and output_cost_per_token must be present, because a missing key means LiteLLM does not track that price (unpriced, excluded) and never means 0.0; the retained per-token values are multiplied by 1e6 to get USD per 1M tokens; cache_read_input_token_cost is folded in as the sibling cache_read_usd_per_mtok (multiplied by 1e6 the same way); a row whose two required keys are both present and both zero is flagged as an explicit zero (a real $0 row, not an unpriced placeholder). Tiered/surcharge keys such as input_cost_per_token_above_200k_tokens are ignored: the base tier is the only rate recorded. Implemented in scripts/build-public-corpus.py, function from_litellm.",
+    "openrouter_ingest": "OpenRouter is a gap-fill only. Its pricing.prompt / pricing.completion are decimal STRINGS of USD per token; each is parsed as a float and multiplied by 1e6 to get USD per 1M tokens. Rows with a missing prompt or completion price are skipped rather than treated as free. A model id already present from LiteLLM is never overwritten: LiteLLM wins because it is the authoritative price list. A ':free' OpenRouter id whose prices parse to zero is recorded as an explicit zero ($0 row). Implemented in scripts/build-public-corpus.py, function overlay_openrouter.",
+    "overlay_composite": "bench/overlay.json is built from the raw per-source rows keyed by canon_key. Each solve-rate feed (vals-swebench, aider-polyglot, scale-seal, terminal-bench) becomes capability.<field> {acc, source, [date, harness, cost_per_test, latency_s]}; arena webdev rows become preference.arena_webdev {rating, rank, votes, source 'arena.ai'} plus arena_webdev_elo and arena_coding_elo; arena agent rows become preference.arena_agent {score, rank, source}. When several variants collapse to one key, the best run is kept for each field (highest acc, highest rating, highest score). agentic_score is a weighted blend of 0.65 solve-rate (mean acc/100), 0.25 webdev Elo ((rating-1100)/600 clamped to 0..1) and 0.10 arena agent (score/0.18 clamped), re-weighted over whichever parts are present and rounded to 3 places; w_swe = 0.5 + 0.5 * max(present parts), rounded to 3 places. Implemented in scripts/build-bench-overlay.py, function build_overlay.",
+    "peak_pricing": "The public LiteLLM row for a peak-priced model lists the PEAK rate, not the standard rate. pricing/peak-pricing.json carries, for matching ids, peak windows plus base_mult and window_mult. When a model matches a peak window, the published price is treated as the in-window rate (window_mult) and the catalog's standard input/output/cache_read rates become the published rate scaled by base_mult (so at base_mult 0.5 the standard rate is half the listed rate); the 'peak' block carries the published rate plus one window entry per matching window, as UTC minutes since midnight, with weekdays_only when the overlay says so. Implemented in scripts/build-public-corpus.py, function build_pricing (with _match_peak / _hhmm_to_min).",
+    "spec": "Contract requirements the shared fixture records but zoder's PUBLIC pipeline does NOT implement, because each needs a data source zoder does not read. A direct provider price list beats LiteLLM for the same model when one is available (a direct DeepSeek list of 0.15/0.60/0.003 versus the LiteLLM 0.30/1.20/0.006 row); a flat-subscription model listed at 0.0 means 'subscription', not free, and an unknown price is null, never 0.0; models served free from a provider's public API catalog are $0 under that provider; local alias names map to providers (minimax-m2 -> minimax, deepseek-flash -> deepseek, fireworks -> fireworks_ai, arcee-trinity-large -> arcee, and the local alias prefix for provider-hosted models -> that provider), i.e. the alias namespace is a HOST, which is what split_id already implies but no code asserts; and a tiered price above a context threshold is a separate tier, not the base rate. These vectors are asserted only for well-formedness plus a note naming the gap.",
+    "split_id": "Every corpus row is decomposed into host / leaf / family from its raw id. An id containing '/', is split at the FIRST slash: the segment before it is the host (the provider), the remainder is the leaf (the model as the provider names it), and the family is the host. An id with no '/' has an empty host, the whole id as leaf and family. There is no special case for ids that carry an extra org segment: in a reseller row such as '<reseller>/nvidia/<model>' or '<reseller>/deepseek-ai/<model>' the provider is the HOST segment (the reseller) and the 'nvidia' / 'deepseek-ai' org prefix is part of the leaf, so the row must never be filed under the model vendor's family. Same rule as zoder-core ModelEntry::from_served_id; implemented in scripts/build-public-corpus.py, function split_id.",
+    "unresolved": "Cases where the correct answer is not yet known by any public source zoder reads, so no outcome is asserted. Each carries a note naming the evidence that would settle it."
+  },
+  "units": {
+    "litellm_input": "USD per token",
+    "openrouter_input": "USD per token, decimal string",
+    "price": "USD per 1M tokens"
+  },
+  "vectors": [
+    {
+      "expect": {
+        "individual": {
+          "gpt-5": "gpt-5",
+          "gpt-5.5": "gpt-5-5"
+        }
+      },
+      "id": "canon_key/distinct-versions-stay-distinct",
+      "input": {
+        "names": [
+          "gpt-5",
+          "gpt-5.5"
+        ]
+      },
+      "note": "Normalization must not over-merge: gpt-5 and gpt-5.5 are different models with different prices and scores.",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "individual": {
+          "Fable-5 (Claude Code) xHigh": "fable-5",
+          "gpt-5 (high)": "gpt-5"
+        }
+      },
+      "id": "canon_key/effort-and-harness-variants",
+      "input": {
+        "names": [
+          "gpt-5 (high)",
+          "Fable-5 (Claude Code) xHigh"
+        ]
+      },
+      "note": "Effort decorators and the 'claude code' harness parenthetical merge into the parent model, because a benchmark row names the variant and the corpus names the base.",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "individual": {
+          "nvidia/nemotron-3.5-lightning:free": "nemotron-3-5-lightning-free"
+        }
+      },
+      "id": "canon_key/free-suffix-is-not-a-separator",
+      "input": {
+        "names": [
+          "nvidia/nemotron-3.5-lightning:free"
+        ]
+      },
+      "note": "Recorded as-is: the colon in a ':free' suffix is not a token separator, so OpenRouter's free tier never shares a canon_key with the paid row of the same model and cannot inherit its bench score. The fixture records today's behaviour; the question of whether a ':free' suffix SHOULD merge is written up in the report.",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models (all 17 ':free' ids keep the '-free' tail)",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "all_equal": "minimax-m3"
+      },
+      "id": "canon_key/org-less-vs-prefixed",
+      "input": {
+        "names": [
+          "MiniMax-M3",
+          "together_ai/MiniMaxAI/MiniMax-M3"
+        ]
+      },
+      "note": "An org-less catalog id and a fully-prefixed reseller id are the SAME model; without this every leaderboard row misses every reseller row of the same model.",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models (minimax/minimax-m3) + litellm org-prefixed ids",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "individual": {
+          "Claude Fable 5 (High)": "claude-fable-5",
+          "claude-opus-4-8-20251001": "claude-opus-4-8",
+          "claude-opus-4.8": "claude-opus-4-8"
+        }
+      },
+      "id": "canon_key/snapshot-date-and-version-dots",
+      "input": {
+        "names": [
+          "claude-opus-4-8-20251001",
+          "claude-opus-4.8",
+          "Claude Fable 5 (High)"
+        ]
+      },
+      "note": "A snapshot date suffix is decoration and version dots are dashes, so a dated id and a dotted id resolve together; display-cased arena names normalize too.",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "all_equal": "glm-5-2"
+      },
+      "id": "canon_key/vendor-dotted-prefix-dropped",
+      "input": {
+        "names": [
+          "zai.glm-5.2",
+          "glm-5.2 (max)",
+          "cloudflare/@cf/zai-org/glm-5.2"
+        ]
+      },
+      "note": "A 'vendor.' namespace, a provider path and an effort parenthetical all reduce to one key. The parenthetical arrives from benchmark/arena rows, not from corpus ids.",
+      "rule": "canon_key",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "claude-opus-4-8": {
+            "free": false,
+            "gated_reason": "listed $0 in public feed but vendor is paid-only — not auto-routed",
+            "paid": true,
+            "route_candidate": false
+          }
+        }
+      },
+      "id": "classify/commercial-zero-row-is-paid-only",
+      "input": {
+        "bench": {},
+        "econ": {
+          "claude-opus-4-8": {
+            "_explicit_zero": true,
+            "_priced": true,
+            "input_usd_per_mtok": 0.0,
+            "output_usd_per_mtok": 0.0,
+            "source": "litellm"
+          }
+        },
+        "known_good": []
+      },
+      "note": "A closed-weight commercial vendor can never have a $0 public API, so a zero row is a placeholder: not free, not routed, and gated with the paid-only reason.",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "recursive/flint-v1.0:free": {
+            "free": false,
+            "gated_reason": "paid (non-zero public price)",
+            "paid": true,
+            "route_candidate": false
+          }
+        }
+      },
+      "id": "classify/free-suffix-NONZERO-price-is-not-free",
+      "input": {
+        "bench": {},
+        "econ": {
+          "recursive/flint-v1.0:free": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "input_usd_per_mtok": 0.35,
+            "output_usd_per_mtok": 0.35,
+            "source": "openrouter"
+          }
+        },
+        "known_good": []
+      },
+      "note": "The price decides, not the name: a ':free' suffix with a non-zero price is a paid model. Trusting the suffix would bill the operator for a model advertised as free.",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "ollama/gpt-oss:120b-cloud": {
+            "free": true,
+            "gated_reason": null,
+            "paid": false,
+            "route_candidate": true
+          }
+        }
+      },
+      "id": "classify/gpt-oss-exempt-from-commercial-list",
+      "input": {
+        "bench": {},
+        "econ": {
+          "ollama/gpt-oss:120b-cloud": {
+            "_explicit_zero": true,
+            "_priced": true,
+            "input_usd_per_mtok": 0.0,
+            "output_usd_per_mtok": 0.0,
+            "source": "litellm"
+          }
+        },
+        "known_good": []
+      },
+      "note": "The open-weight gpt-oss family is exempt from the paid-only list even though the id carries an OpenAI-style vendor token, so a real $0 row still routes.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (ollama/gpt-oss:120b-cloud)",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "zai/glm-4.7-flash": {
+            "free": true,
+            "gated_reason": null,
+            "paid": false,
+            "route_candidate": true
+          }
+        }
+      },
+      "id": "classify/real-free-row-routes",
+      "input": {
+        "bench": {},
+        "econ": {
+          "zai/glm-4.7-flash": {
+            "_explicit_zero": true,
+            "_priced": true,
+            "input_usd_per_mtok": 0.0,
+            "output_usd_per_mtok": 0.0,
+            "source": "litellm"
+          }
+        },
+        "known_good": []
+      },
+      "note": "A real $0 open-weight chat row is free, paid=false, and routes; gated_reason is null.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (zai/glm-4.7-flash)",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "nebius/nvidia/Llama-3.1-Nemotron-Ultra-253B-v1": {
+            "family": "nebius",
+            "free": false,
+            "host": "nebius",
+            "leaf": "nvidia/Llama-3.1-Nemotron-Ultra-253B-v1",
+            "paid": true
+          }
+        }
+      },
+      "id": "classify/split_id-feeds-family-on-reseller-row",
+      "input": {
+        "bench": {},
+        "econ": {
+          "nebius/nvidia/Llama-3.1-Nemotron-Ultra-253B-v1": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "input_usd_per_mtok": 0.6,
+            "output_usd_per_mtok": 1.8,
+            "source": "litellm"
+          }
+        },
+        "known_good": []
+      },
+      "note": "The corpus row carries the split_id verdict: a priced reseller row is paid and filed under the reseller, not under the model vendor.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (nebius/nvidia/Llama-3.1-Nemotron-Ultra-253B-v1)",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "example/unpriced": {
+            "free": false,
+            "gated_reason": "unpriced in public feed — not auto-routed (run a local classify/refresh)",
+            "paid": false,
+            "route_candidate": false
+          }
+        }
+      },
+      "id": "classify/unpriced-row-gated-unpriced",
+      "input": {
+        "bench": {},
+        "econ": {
+          "example/unpriced": {
+            "_priced": false,
+            "input_usd_per_mtok": null,
+            "output_usd_per_mtok": null
+          }
+        },
+        "known_good": []
+      },
+      "note": "An unpriced row is neither free nor paid; it is gated with the unpriced reason that points at the local classify/refresh escape hatch.",
+      "rule": "classify",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "agentic_score": 0.58,
+          "capability": {
+            "swe_verified": {
+              "acc": 58.0,
+              "source": "ncz-known-good"
+            }
+          },
+          "workflows": {
+            "grind": 0.62,
+            "single_pass": 0.76
+          }
+        }
+      },
+      "id": "known_good/applies-to-paid-and-free",
+      "input": {
+        "id": "zai/glm-4.7-flash",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "A $0 model gets the same curated score as a paid one: the overlay is about quality, not price, and known-good is applied even when the row is free.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (zai/glm-4.7-flash)",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "fetched_paths": [],
+        "hand_curated_paths": [
+          "workflows.single_pass",
+          "workflows.grind",
+          "capability.swe_verified.acc",
+          "capability.swe_verified.harness",
+          "capability.swe_verified.source"
+        ],
+        "literals": {
+          "capability": {
+            "swe_verified": {
+              "harness": "curated",
+              "source": "ncz-known-good"
+            }
+          }
+        }
+      },
+      "id": "known_good/curated-vs-fetched-provenance",
+      "input": {
+        "id": "anthropic/claude-sonnet-4-6",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "A curated-only row touches exactly the hand-curated paths and nothing fetched; a refresh may rewrite every fetched path and must not touch these five.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "agentic_score": 0.76,
+          "capability": {
+            "swe_verified": {
+              "acc": 76.0,
+              "source": "ncz-known-good"
+            }
+          },
+          "workflows": {
+            "grind": 0.94,
+            "single_pass": 0.95
+          }
+        }
+      },
+      "id": "known_good/first-match-wins-codex-over-gpt-5",
+      "input": {
+        "id": "openai/gpt-5-codex",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "The codex pattern precedes the plain gpt-5 pattern; a first-match miss would score the same model 74 instead of 76.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "agentic_score": 0.71,
+          "capability": {
+            "swe_verified": {
+              "acc": 71.0,
+              "harness": "curated",
+              "source": "ncz-known-good"
+            }
+          },
+          "w_swe": 0.71,
+          "workflows": {
+            "grind": 0.9,
+            "single_pass": 0.88
+          }
+        }
+      },
+      "id": "known_good/first-match-wins-sonnet-over-claude",
+      "input": {
+        "id": "deepseek/deepseek-reasoner",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "The 'deepseek-r1'/'deepseek-reasoner' pattern (swe 71) sits BEFORE the catch-all 'deepseek' pattern (swe 68), so order decides the score. Reordering the list silently re-ranks every model.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": null
+      },
+      "id": "known_good/no-match-means-no-score",
+      "input": {
+        "id": "example/unknown-model-9000",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "No pattern matches, so match_known_good returns None and the corpus adds no capability and no score; an unknown model is never scored by accident.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "entries": {
+          "deepseek/deepseek-flash": {
+            "agentic_score": 0.61,
+            "capability": {
+              "swe_verified": {
+                "acc": 72.5,
+                "harness": "500-task",
+                "source": "vals.ai"
+              }
+            },
+            "w_swe": 0.725,
+            "workflows": {
+              "grind": 0.83,
+              "single_pass": 0.87
+            }
+          }
+        }
+      },
+      "id": "known_good/overlay-overrides-capability-but-not-workflows",
+      "input": {
+        "bench": {
+          "deepseek-flash": {
+            "agentic_score": 0.61,
+            "capability": {
+              "swe_verified": {
+                "acc": 72.5,
+                "date": "2026-10-20",
+                "harness": "500-task",
+                "source": "vals.ai"
+              }
+            },
+            "w_swe": 0.725
+          }
+        },
+        "econ": {
+          "deepseek/deepseek-flash": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "input_usd_per_mtok": 0.3,
+            "output_usd_per_mtok": 1.2,
+            "source": "litellm"
+          }
+        },
+        "known_good": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "The measured overlay replaces the curated swe (72.5 vs 68) and the curated agentic_score/w_swe, while the curated workflows survive because no benchmark provides them. This merge order is what keeps a refresh from erasing a judgement.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "provenance": {
+          "curated_marker": {
+            "capability.swe_verified.source": "ncz-known-good"
+          },
+          "fetched": [],
+          "fetched_field_evidence": [
+            "capability.*.source is a leaderboard: vals.ai, aider, scale-seal, terminal-bench",
+            "preference.arena_webdev, preference.arena_agent (source arena.ai)",
+            "arena_webdev_elo, arena_coding_elo",
+            "agentic_score / w_swe when bench-overlay-derived"
+          ],
+          "hand_curated": [
+            "workflows.single_pass",
+            "workflows.grind",
+            "capability.swe_verified.acc",
+            "capability.swe_verified.source",
+            "capability.swe_verified.harness"
+          ]
+        }
+      },
+      "id": "known_good/provenance-markers-are-exact",
+      "input": {
+        "id": "anthropic/claude-sonnet-4-6",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "Pins the fix-and-forget list so an engineer adding a new scored field has to classify it in the fixture, not guess.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "agentic_score": 0.69,
+          "capability": {
+            "swe_verified": {
+              "acc": 69.0
+            }
+          },
+          "w_swe": 0.69,
+          "workflows": {
+            "grind": 0.82,
+            "single_pass": 0.89
+          }
+        }
+      },
+      "id": "known_good/swe-to-score-and-w_swe",
+      "input": {
+        "id": "qwen/qwen3-coder-480b-a35b",
+        "patterns": "bench/known-good-swe.json v3 patterns (first match wins); the fixture reads the committed file, it does not copy the list"
+      },
+      "note": "swe is a 0..100 solve-rate; agentic_score and w_swe are swe/100 rounded to 3 places. Storing 69.0 as a 0..1 score would rank this model 69x too high.",
+      "rule": "known_good",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": null,
+          "keys": [
+            "zai/glm-4.7-flash"
+          ]
+        }
+      },
+      "id": "litellm_ingest/enterprise-sku-and-placeholder-filtered",
+      "input": {
+        "rows": {
+          "azure/container": {
+            "input_cost_per_token": 0.0,
+            "mode": "chat",
+            "output_cost_per_token": 0.0
+          },
+          "bedrock/*/6-month-commitment/cohere.command-text-v14": {
+            "input_cost_per_token": 1.65e-06,
+            "mode": "chat",
+            "output_cost_per_token": 1.65e-06
+          },
+          "predibase/llama-3-8b": {
+            "input_cost_per_token": 0.0,
+            "mode": "chat",
+            "output_cost_per_token": 0.0
+          },
+          "sample_spec": {
+            "input_cost_per_token": 0.0,
+            "mode": "chat",
+            "output_cost_per_token": 0.0
+          },
+          "zai/glm-4.7-flash": {
+            "input_cost_per_token": 0.0,
+            "mode": "chat",
+            "output_cost_per_token": 0.0
+          }
+        }
+      },
+      "note": "Commitment SKUs, '/container' rows, predibase and the sample_spec template are all dropped as noise; a genuine $0 chat row in the same batch survives. The commitment row is a real LiteLLM key today.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": {
+            "zai/glm-4.7-flash": {
+              "_explicit_zero": true,
+              "_priced": true,
+              "cache_read_usd_per_mtok": 0.0,
+              "input_usd_per_mtok": 0.0,
+              "output_usd_per_mtok": 0.0
+            }
+          },
+          "keys": [
+            "zai/glm-4.7-flash"
+          ]
+        }
+      },
+      "id": "litellm_ingest/explicit-zero-row",
+      "input": {
+        "rows": {
+          "zai/glm-4.7-flash": {
+            "cache_read_input_token_cost": 0.0,
+            "input_cost_per_token": 0.0,
+            "mode": "chat",
+            "output_cost_per_token": 0.0
+          }
+        }
+      },
+      "note": "Both keys present and zero is an explicit zero: a real $0 model, distinct from an absent price. This is the only path to free.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (zai/glm-4.7-flash)",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "keys": []
+        }
+      },
+      "id": "litellm_ingest/missing-output-key-is-unpriced-not-zero",
+      "input": {
+        "rows": {
+          "inception/mercury-2": {
+            "input_cost_per_token": 2.5e-07,
+            "mode": "chat"
+          },
+          "inception/mercury-3": {
+            "mode": "chat",
+            "output_cost_per_token": 3.5e-07
+          }
+        }
+      },
+      "note": "A missing input OR output cost key means LiteLLM does not price the model; the row is excluded. Treating a missing key as 0.0 is exactly the bug that floods the pool with unpriced placeholders marked free.",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "keys": []
+        }
+      },
+      "id": "litellm_ingest/non-chat-mode-filtered",
+      "input": {
+        "rows": {
+          "voyage/voyage-3-large": {
+            "input_cost_per_token": 1.2e-07,
+            "mode": "embedding",
+            "output_cost_per_token": 0.0
+          }
+        }
+      },
+      "note": "A priced embedding row is not a chat model and must not enter the routing corpus.",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": {
+            "deepseek/deepseek-flash": {
+              "_explicit_zero": false,
+              "_priced": true,
+              "cache_read_usd_per_mtok": 0.006,
+              "input_usd_per_mtok": 0.3,
+              "output_usd_per_mtok": 1.2,
+              "source": "litellm"
+            }
+          },
+          "keys": [
+            "deepseek/deepseek-flash"
+          ]
+        }
+      },
+      "id": "litellm_ingest/real-chat-row-per-token-to-per-mtok",
+      "input": {
+        "rows": {
+          "deepseek/deepseek-flash": {
+            "cache_read_input_token_cost": 6e-09,
+            "input_cost_per_token": 3e-07,
+            "mode": "chat",
+            "output_cost_per_token": 1.2e-06
+          }
+        }
+      },
+      "note": "The real DeepSeek Flash row today: per-token 3e-7 / 1.2e-6 becomes 0.30 / 1.20 USD per 1M and the cache-read rate 6e-9 becomes 0.006. Exact literals, no tolerance: any drift in the x1e6 factor is a billing error of six orders of magnitude.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (deepseek/deepseek-flash)",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "absent_keys": {
+            "anthropic.claude-sonnet-4-20250514-v1:0": [
+              "input_cost_per_token_above_200k_tokens",
+              "input_usd_per_mtok_above_200k_tokens",
+              "output_usd_per_mtok_above_200k_tokens",
+              "cache_read_usd_per_mtok_above_200k_tokens"
+            ]
+          },
+          "contains": {
+            "anthropic.claude-sonnet-4-20250514-v1:0": {
+              "cache_read_usd_per_mtok": 0.3,
+              "input_usd_per_mtok": 3.0,
+              "output_usd_per_mtok": 15.0
+            }
+          },
+          "keys": [
+            "anthropic.claude-sonnet-4-20250514-v1:0"
+          ]
+        }
+      },
+      "id": "litellm_ingest/tiered-keys-ignored-base-tier-only",
+      "input": {
+        "rows": {
+          "anthropic.claude-sonnet-4-20250514-v1:0": {
+            "cache_creation_input_token_cost": 3.75e-06,
+            "cache_read_input_token_cost": 3e-07,
+            "cache_read_input_token_cost_above_200k_tokens": 6e-07,
+            "input_cost_per_token": 3e-06,
+            "input_cost_per_token_above_200k_tokens": 6e-06,
+            "mode": "chat",
+            "output_cost_per_token": 1.5e-05,
+            "output_cost_per_token_above_200k_tokens": 2.25e-05
+          }
+        }
+      },
+      "note": "Real tiered row: above 200k tokens the same model bills 6.00 / 22.50. Only the base tier is recorded (3.00 / 15.00, cache 0.30) and no above-threshold rate leaks into the economics block, because a per-mtok figure cannot express a tier boundary.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (anthropic.claude-sonnet-4-20250514-v1:0)",
+      "rule": "litellm_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": {
+            "minimax/minimax-m3.1-flash": {
+              "_explicit_zero": false,
+              "input_usd_per_mtok": 0.15,
+              "output_usd_per_mtok": 0.6,
+              "source": "openrouter"
+            }
+          },
+          "keys": [
+            "minimax/minimax-m3.1-flash"
+          ]
+        }
+      },
+      "id": "openrouter_ingest/decimal-string-gap-fill",
+      "input": {
+        "existing": {},
+        "rows": [
+          {
+            "id": "minimax/minimax-m3.1-flash",
+            "pricing": {
+              "completion": "0.0000006",
+              "prompt": "0.00000015"
+            }
+          }
+        ]
+      },
+      "note": "OpenRouter prices are decimal strings per token; 1.5e-7 / 6e-7 parse to 0.15 / 0.60 per 1M. A '0.00000015' string compared lexically, or left unscaled, would misprice by 1e6.",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models (minimax/minimax-m3.1-flash)",
+      "rule": "openrouter_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": {
+            "nvidia/nemotron-3.5-lightning:free": {
+              "_explicit_zero": true,
+              "input_usd_per_mtok": 0.0,
+              "output_usd_per_mtok": 0.0,
+              "source": "openrouter"
+            }
+          },
+          "keys": [
+            "nvidia/nemotron-3.5-lightning:free"
+          ]
+        }
+      },
+      "id": "openrouter_ingest/free-suffix-explicit-zero",
+      "input": {
+        "existing": {},
+        "rows": [
+          {
+            "id": "nvidia/nemotron-3.5-lightning:free",
+            "pricing": {
+              "completion": "0",
+              "prompt": "0"
+            }
+          }
+        ]
+      },
+      "note": "A real ':free' id whose prices parse to zero is an explicit zero, so the row is eligible for free classification (the id is kept verbatim, suffix included).",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models (nvidia/nemotron-3.5-lightning:free)",
+      "rule": "openrouter_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "contains": {
+            "deepseek/deepseek-v4-pro": {
+              "input_usd_per_mtok": 1.32,
+              "output_usd_per_mtok": 3.96,
+              "source": "litellm"
+            }
+          },
+          "keys": [
+            "deepseek/deepseek-v4-pro"
+          ]
+        }
+      },
+      "id": "openrouter_ingest/litellm-wins-no-overwrite",
+      "input": {
+        "existing": {
+          "deepseek/deepseek-v4-pro": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "cache_read_usd_per_mtok": 0.044,
+            "input_usd_per_mtok": 1.32,
+            "output_usd_per_mtok": 3.96,
+            "source": "litellm"
+          }
+        },
+        "rows": [
+          {
+            "id": "deepseek/deepseek-v4-pro",
+            "pricing": {
+              "completion": "0.000001514148",
+              "prompt": "0.000000757074"
+            }
+          }
+        ]
+      },
+      "note": "A model priced by both feeds keeps the LiteLLM row: OpenRouter's 0.757074 / 1.514148 does not overwrite it. Precedence must be explicit, not arrival order.",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models + litellm model_prices_and_context_window.json (deepseek/deepseek-v4-pro)",
+      "rule": "openrouter_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "keys": []
+        }
+      },
+      "id": "openrouter_ingest/missing-price-skipped",
+      "input": {
+        "existing": {},
+        "rows": [
+          {
+            "id": "example/missing-prompt",
+            "pricing": {
+              "completion": "0.000001"
+            }
+          },
+          {
+            "id": "example/missing-completion",
+            "pricing": {
+              "prompt": "0.000001"
+            }
+          },
+          {
+            "id": "example/no-pricing"
+          }
+        ]
+      },
+      "note": "A row without both prices is skipped, never stored at 0.0. Absent must not decay into free.",
+      "rule": "openrouter_ingest",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "key": "mini-model",
+        "literals": {
+          "agentic_score": 0.0,
+          "w_swe": 0.5
+        }
+      },
+      "id": "overlay_composite/clamp-bounds",
+      "input": {
+        "raw_rows": {
+          "arena-webdev.json": [
+            {
+              "model": "example/mini-model",
+              "rating": 1080.0
+            }
+          ]
+        }
+      },
+      "note": "Below the 1100 floor the Elo part clamps to 0.0 rather than going negative; an unclamped (rating-1100)/600 would give a negative score and reorder the whole tier.",
+      "rule": "overlay_composite",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "key": "glm-5-2",
+        "literals": {
+          "agentic_score": 0.643,
+          "arena_webdev_elo": 1520.0,
+          "w_swe": 1.0
+        }
+      },
+      "id": "overlay_composite/reweight-over-present-parts",
+      "input": {
+        "raw_rows": {
+          "arena-agent.json": [
+            {
+              "model": "glm-5.2 (max)",
+              "score": 0.09
+            }
+          ],
+          "arena-webdev.json": [
+            {
+              "model": "zai.glm-5.2",
+              "rating": 1520.0
+            }
+          ]
+        }
+      },
+      "note": "No solve-rate: weights renormalize over 0.25/0.10 (0.714/0.286), so 1.0/0.5 -> 0.643. The Elo part clamps at 1.0 (1520 is past the 1700 top of the ramp), which is what pins w_swe to 1.0.",
+      "rule": "overlay_composite",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "key": "kimi-k2",
+        "literals": {
+          "agentic_score": 0.45,
+          "w_swe": 0.725
+        }
+      },
+      "id": "overlay_composite/solve-rate-is-mean-of-fields",
+      "input": {
+        "raw_rows": {
+          "terminal-bench.json": [
+            {
+              "accuracy": 30.0,
+              "model": "baseten/moonshotai/kimi-k2-instruct-0905"
+            }
+          ],
+          "vals-swebench.json": [
+            {
+              "accuracy": 60.0,
+              "model": "moonshotai/Kimi-K2-Thinking"
+            }
+          ]
+        }
+      },
+      "note": "Two solve-rate fields on one key average (60+30)/2/100; taking the max instead would inflate the model. w_swe anchors on the same 0.45 mean.",
+      "rule": "overlay_composite",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "key": "deepseek-flash",
+        "literals": {
+          "agentic_score": 0.71,
+          "w_swe": 0.855
+        }
+      },
+      "id": "overlay_composite/w_swe-is-half-plus-half-max",
+      "input": {
+        "raw_rows": {
+          "vals-swebench.json": [
+            {
+              "accuracy": 71.0,
+              "model": "deepseek/deepseek-flash"
+            }
+          ]
+        }
+      },
+      "note": "With only a solve-rate present the blend collapses to it, but w_swe is 0.5 + 0.5*0.71 = 0.855, not 0.71. Confusing the two is a ranking bug.",
+      "rule": "overlay_composite",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "key": "deepseek-v4-flash",
+        "literals": {
+          "agentic_score": 0.593,
+          "arena_coding_elo": 1290.5,
+          "capability": {
+            "aider_polyglot": {
+              "acc": 62.0,
+              "source": "aider"
+            },
+            "swe_verified": {
+              "acc": 74.5,
+              "source": "vals.ai"
+            }
+          },
+          "preference": {
+            "arena_agent": {
+              "score": 0.126,
+              "source": "arena.ai"
+            },
+            "arena_webdev": {
+              "rating": 1290.5,
+              "source": "arena.ai"
+            }
+          },
+          "w_swe": 0.85
+        }
+      },
+      "id": "overlay_composite/weighted-blend-with-all-parts",
+      "input": {
+        "raw_rows": {
+          "aider-polyglot.json": [
+            {
+              "accuracy": 62.0,
+              "model": "deepseek/deepseek-v4-flash"
+            }
+          ],
+          "arena-agent.json": [
+            {
+              "model": "DeepSeek V4 Flash",
+              "rank": 12,
+              "score": 0.126
+            }
+          ],
+          "arena-webdev.json": [
+            {
+              "model": "DeepSeek V4 Flash (high)",
+              "rank": 9,
+              "rating": 1290.5,
+              "votes": 4200
+            },
+            {
+              "model": "deepseek/deepseek-v4-flash",
+              "rank": 22,
+              "rating": 1195.0,
+              "votes": 900
+            }
+          ],
+          "scale-seal.json": [],
+          "terminal-bench.json": [],
+          "vals-swebench.json": [
+            {
+              "accuracy": 74.5,
+              "date": "2026-10-20",
+              "harness": "500-task",
+              "model": "together_ai/DeepSeek-ai/DeepSeek-V4-Flash"
+            },
+            {
+              "accuracy": 71.0,
+              "cost_per_test": 0.42,
+              "date": "2026-10-18",
+              "harness": "500-task",
+              "latency_s": 93.1,
+              "model": "deepseek/deepseek-v4-flash"
+            }
+          ]
+        }
+      },
+      "note": "All three parts present: solve-rate mean (74.5+62.0)/2/100, webdev (1290.5-1100)/600, agent 0.126/0.18 -> 0.593. Best run per field is kept when variants collapse to one key (74.5 beats 71.0; 1290.5 beats 1195.0).",
+      "rule": "overlay_composite",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "peak": {
+            "windows": [
+              {
+                "weekdays_only": true,
+                "window_end_utc_min": 240,
+                "window_start_utc_min": 60
+              },
+              {
+                "weekdays_only": true,
+                "window_end_utc_min": 600,
+                "window_start_utc_min": 360
+              }
+            ]
+          }
+        },
+        "model": "deepseek/deepseek-flash"
+      },
+      "id": "peak_pricing/both-weekday-utc-windows",
+      "input": {
+        "econ": {
+          "deepseek/deepseek-flash": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "cache_read_usd_per_mtok": 0.006,
+            "input_usd_per_mtok": 0.3,
+            "output_usd_per_mtok": 1.2,
+            "source": "litellm"
+          }
+        },
+        "peak_windows_file": "pricing/peak-pricing.json"
+      },
+      "note": "Both daily windows are carried (UTC 01:00-04:00 and 06:00-10:00, as minutes since midnight, weekdays only). Recording only the first would silently charge standard rates inside the second window.",
+      "rule": "peak_pricing",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "cache_read_usd_per_mtok": 0.003,
+          "input_usd_per_mtok": 0.15,
+          "output_usd_per_mtok": 0.6,
+          "peak": {
+            "cache_read_usd_per_mtok": 0.006,
+            "input_usd_per_mtok": 0.3,
+            "output_usd_per_mtok": 1.2
+          }
+        },
+        "literals_absent": [
+          "off_peak"
+        ],
+        "model": "deepseek/deepseek-flash"
+      },
+      "id": "peak_pricing/listed-rate-is-peak-standard-is-half",
+      "input": {
+        "econ": {
+          "deepseek/deepseek-flash": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "cache_read_usd_per_mtok": 0.006,
+            "input_usd_per_mtok": 0.3,
+            "output_usd_per_mtok": 1.2,
+            "source": "litellm"
+          }
+        },
+        "peak_windows_file": "pricing/peak-pricing.json"
+      },
+      "note": "The LiteLLM row lists the PEAK rate (0.30 / 1.20 / 0.006). With base_mult 0.5 the catalog standard rate is half of it; charging the listed rate around the clock double-bills every off-peak token. It is a peak overlay, so no off_peak block.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (deepseek/deepseek-flash)",
+      "rule": "peak_pricing",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "input_usd_per_mtok": 0.0,
+          "output_usd_per_mtok": 0.0
+        },
+        "literals_absent": [
+          "off_peak",
+          "peak"
+        ],
+        "model": "zai/glm-4.7-flash"
+      },
+      "id": "peak_pricing/no-window-no-overlay",
+      "input": {
+        "econ": {
+          "zai/glm-4.7-flash": {
+            "_explicit_zero": true,
+            "_priced": true,
+            "input_usd_per_mtok": 0.0,
+            "output_usd_per_mtok": 0.0,
+            "source": "litellm"
+          }
+        },
+        "peak_windows_file": "pricing/peak-pricing.json"
+      },
+      "note": "A model that matches no window gets no time-of-day block at all, so a consumer never sees a phantom discount.",
+      "rule": "peak_pricing",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "literals": {
+          "input_usd_per_mtok": 0.28,
+          "off_peak": {
+            "cache_read_usd_per_mtok": 0.014,
+            "input_usd_per_mtok": 0.14,
+            "output_usd_per_mtok": 0.21,
+            "window_end_utc_min": 30,
+            "window_start_utc_min": 990
+          },
+          "output_usd_per_mtok": 0.42
+        },
+        "literals_absent": [
+          "peak"
+        ],
+        "model": "deepseek/deepseek-chat"
+      },
+      "id": "peak_pricing/off-peak-window-on-chat-row",
+      "input": {
+        "econ": {
+          "deepseek/deepseek-chat": {
+            "_explicit_zero": false,
+            "_priced": true,
+            "cache_read_usd_per_mtok": 0.028,
+            "input_usd_per_mtok": 0.28,
+            "output_usd_per_mtok": 0.42,
+            "source": "litellm"
+          }
+        },
+        "peak_windows_file": "pricing/peak-pricing.json"
+      },
+      "note": "The other direction: for an off-peak row the listed price IS standard, and the off_peak block holds the discounted rate (input_mult 0.5) plus the wrapping 16:30-00:30 UTC window. The standard rate is untouched.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json (deepseek/deepseek-chat)",
+      "rule": "peak_pricing",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "host_for": {
+          "arcee-trinity-large": "arcee",
+          "deepseek-flash": "deepseek",
+          "fireworks": "fireworks_ai",
+          "minimax-m2": "minimax",
+          "nemotron-ultra": "nvidia"
+        }
+      },
+      "id": "spec/alias-prefix-is-the-host",
+      "input": {
+        "aliases": {
+          "arcee-trinity-large": "arcee",
+          "deepseek-flash": "deepseek",
+          "fireworks": "fireworks_ai",
+          "minimax-m2": "minimax",
+          "nemotron-ultra": "nvidia"
+        }
+      },
+      "note": "GAP: an alias namespace is a HOST, and split_id already treats it that way, but no code asserts the alias -> provider map, so a local alias row could be filed under the model family instead of the provider that serves it.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "mtok": {
+          "cache_read": 0.003,
+          "input": 0.15,
+          "output": 0.6
+        },
+        "selected": "direct_provider"
+      },
+      "id": "spec/direct-provider-beats-litellm",
+      "input": {
+        "direct_provider_mtok": {
+          "cache_read": 0.003,
+          "input": 0.15,
+          "output": 0.6
+        },
+        "litellm_mtok": {
+          "cache_read": 0.006,
+          "input": 0.3,
+          "output": 1.2
+        },
+        "model": "deepseek-chat"
+      },
+      "note": "GAP: zoder reads no direct provider list, so the LiteLLM aggregate wins by default. A direct list, when one is available, is authoritative and should replace the aggregate rate rather than compete with it.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "price_state": "subscription"
+      },
+      "id": "spec/flat-subscription-zero-is-subscription",
+      "input": {
+        "billing_mode": "flat_subscription",
+        "listed_mtok": 0.0,
+        "model": "vendor/seat-model"
+      },
+      "note": "GAP: a 0.0 list price on a flat-subscription plan means 'included in the plan', not 'free to call'. zoder's classifier currently sees only the number and would call it free; the price state needs a third value.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "mtok": {
+          "input": 0.0,
+          "output": 0.0
+        },
+        "price_state": "free"
+      },
+      "id": "spec/provider-catalog-free-is-zero",
+      "input": {
+        "listed_mtok": 0.0,
+        "provider": "nvidia",
+        "source": "public model catalog"
+      },
+      "note": "GAP: a model served free from a provider's own public API catalog is $0 under that provider, and zoder does not read that catalog, so the model is only free if some other feed happens to list it at zero.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "is_base": false,
+        "tier_rate": {
+          "input": 0.5,
+          "output": 2.5
+        }
+      },
+      "id": "spec/tiered-price-is-a-separate-tier",
+      "input": {
+        "above_threshold": {
+          "input": 0.5,
+          "output": 2.5,
+          "threshold_tokens": 100000
+        },
+        "base_mtok": {
+          "input": 0.1,
+          "output": 0.5
+        }
+      },
+      "note": "GAP: zoder flattens every row to its base tier (litellm_ingest vector records that). Above the threshold the same model bills 0.50/2.50, so the long-context surcharge is a separate tier that must not be written back over the base rate.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "price_state": "unknown",
+        "serialized": null
+      },
+      "id": "spec/unknown-price-is-null-never-zero",
+      "input": {
+        "listed_mtok": null,
+        "model": "vendor/price-not-published"
+      },
+      "note": "GAP: an unknown price must serialize as null. If a consumer coerces null to 0.0 the model silently becomes free, which is the exact failure the missing-key rule prevents on the ingest side.",
+      "rule": "spec",
+      "status": "spec"
+    },
+    {
+      "expect": {
+        "family": "deepseek-v3-2-251201",
+        "host": "",
+        "leaf": "deepseek-v3-2-251201"
+      },
+      "id": "split_id/bare-id",
+      "input": {
+        "id": "deepseek-v3-2-251201"
+      },
+      "note": "An id with no slash is a bare model: empty host, and the leaf doubles as the family.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json",
+      "rule": "split_id",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "family": "openrouter",
+        "host": "openrouter",
+        "leaf": "openai/gpt-4o-mini"
+      },
+      "id": "split_id/openrouter-vendor-model",
+      "input": {
+        "id": "openrouter/openai/gpt-4o-mini"
+      },
+      "note": "Splits on the FIRST slash only, so a gateway-routed id keeps its inner vendor path in the leaf. Used here with a public OpenAI name.",
+      "rule": "split_id",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "family": "together_ai",
+        "host": "together_ai",
+        "leaf": "deepseek-ai/DeepSeek-V3"
+      },
+      "id": "split_id/reseller-deepseek-ai-not-filed-under-deepseek",
+      "input": {
+        "id": "together_ai/deepseek-ai/DeepSeek-V3"
+      },
+      "note": "Same rule for a deepseek-ai org-prefixed reseller row: host together_ai, leaf keeps the org segment. The model vendor is not the provider.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json",
+      "rule": "split_id",
+      "status": "enforced"
+    },
+    {
+      "expect": {
+        "family": "nebius",
+        "host": "nebius",
+        "leaf": "nvidia/Llama-3.1-Nemotron-Ultra-253B-v1"
+      },
+      "id": "split_id/reseller-nvidia-not-filed-under-nvidia",
+      "input": {
+        "id": "nebius/nvidia/Llama-3.1-Nemotron-Ultra-253B-v1"
+      },
+      "note": "Reseller row: the provider is the HOST segment (nebius), never the model-id org prefix (nvidia). Filing it under the model vendor would credit NVIDIA with another vendor's price.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json",
+      "rule": "split_id",
+      "status": "enforced"
+    },
+    {
+      "expect": {},
+      "id": "unresolved/deepseek-v4-pro-list-vs-billing",
+      "input": {
+        "litellm_mtok": {
+          "input": 1.32,
+          "output": 3.96
+        },
+        "model": "deepseek-v4-pro",
+        "openrouter_mtok": {
+          "input": 0.757074,
+          "output": 1.514148
+        }
+      },
+      "note": "Three public figures disagree: LiteLLM lists 1.32/3.96 (twice 0.66/1.98, the same peak-rate pattern as the flash row), another public catalog lists 0.66/1.98, OpenRouter lists about 0.76/1.51, and the provider is reported to bill this model at its Flash rates. Evidence that would settle it: the provider's own billing console for a known token volume. Until then no source is authoritative and no vector asserts an outcome.",
+      "observed": "2026-10-26 litellm model_prices_and_context_window.json + openrouter.ai/api/v1/models (deepseek/deepseek-v4-pro)",
+      "rule": "unresolved",
+      "status": "unresolved"
+    },
+    {
+      "expect": {},
+      "id": "unresolved/free-suffix-collapse",
+      "input": {
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "paid_sibling": "nvidia/nemotron-3-ultra-550b-a55b"
+      },
+      "note": "OpenRouter's ':free' rows do not share a canon_key with the paid row of the same model, so a free tier never inherits the paid model's bench score. That may be intended (a free tier can be rate-limited or quantized differently) or a gap. Evidence that would settle it: a provider statement on whether the ':free' endpoint serves the same weights and context window as the paid one.",
+      "observed": "2026-10-26 openrouter.ai/api/v1/models",
+      "rule": "unresolved",
+      "status": "unresolved"
+    }
+  ],
+  "version": 1
+}
