@@ -287,3 +287,26 @@ fn container_base_images_are_digest_pinned() {
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }
+
+#[test]
+fn installer_selects_a_deployment_profile_and_initializes_it() {
+    let src = read_install_sh();
+
+    assert!(
+        src.contains("--profile"),
+        "install.sh must expose a --profile standalone|fleet option"
+    );
+    assert!(
+        src.contains("ZODER_PROFILE:-standalone"),
+        "the standalone profile must be the default for fresh installs"
+    );
+    assert!(
+        src.contains("init --profile \"$PROFILE\""),
+        "install.sh must hand the selected profile to `zoder init`, which is \
+         responsible for never overwriting an existing config"
+    );
+    assert!(
+        src.contains("standalone | fleet)"),
+        "install.sh must reject an unknown deployment profile"
+    );
+}

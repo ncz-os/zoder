@@ -85,6 +85,7 @@ REQUIRED_SUBS=(
   finops
   providers
   config
+  init
   refresh
   pricing
   reconcile

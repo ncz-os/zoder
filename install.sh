@@ -27,6 +27,8 @@ set -eu
 #   ZODER_HOST      / --host <host>     GitLab host              (default: gitlab.com)
 #   ZODER_NO_VERIFY / --no-verify       skip checksum verify     (not recommended)
 #   ZODER_NO_CORPUS / --no-corpus       don't seed corpus + pricing
+#   ZODER_PROFILE   / --profile <name>  standalone (default) or fleet starter
+#                                       config written when none exists
 #                     --dry-run         show actions, change nothing
 #                     --help
 
@@ -37,6 +39,7 @@ BIN_DIR="${ZODER_BIN_DIR:-$HOME/.local/bin}"
 NO_VERIFY="${ZODER_NO_VERIFY:-0}"
 ZODER_HOME="${ZODER_HOME:-$HOME/.zoder}"
 NO_CORPUS="${ZODER_NO_CORPUS:-0}"
+PROFILE="${ZODER_PROFILE:-standalone}"
 DRY_RUN=false
 
 # zoder is the product. zerocode + zeroclaw (the TUI trio) are installed too
@@ -87,6 +90,8 @@ Options:
   --host <host>     GitLab host (default: gitlab.com)
   --no-verify       Skip SHA256 checksum verification (not recommended)
   --no-corpus       Don't seed the routing corpus + pricing catalog
+  --profile <name>  Starter config: standalone (default) or fleet.
+                    Only written when no zoder config exists.
   --dry-run         Print what would happen, install nothing
   --help            Show this help
 
@@ -107,11 +112,17 @@ while [ $# -gt 0 ]; do
   --host) HOST="${2:?--host needs a host}"; shift 2 ;;
   --no-verify) NO_VERIFY=1; shift ;;
   --no-corpus) NO_CORPUS=1; shift ;;
+  --profile) PROFILE="${2:?--profile needs standalone or fleet}"; shift 2 ;;
   --dry-run) DRY_RUN=true; shift ;;
   -h | --help) usage; exit 0 ;;
   *) die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+case "$PROFILE" in
+  standalone | fleet) ;;
+  *) die "unknown --profile '$PROFILE' (expected standalone or fleet)" ;;
+esac
 
 # ── Downloader ────────────────────────────────────────────────────
 
@@ -266,6 +277,7 @@ if [ "$DRY_RUN" = true ]; then
   info "[dry-run] would verify against ${pkg_base}/zoder-${triple}.sha256 (if published)"
   info "[dry-run] would install zoder to ${BIN_DIR}"
   [ "$NO_CORPUS" = "1" ] || info "[dry-run] would seed corpus + pricing from ${CORPUS_BASE} into ${ZODER_HOME}"
+  info "[dry-run] would write a ${PROFILE} starter config into ${ZODER_HOME} if none exists"
   exit 0
 fi
 
@@ -489,6 +501,16 @@ if [ "$smoke_failed" -eq 1 ]; then
   die "zoder --version check failed after install; install was rolled back"
 fi
 info "Smoke verified: ${BIN_DIR}/zoder reports a version"
+
+# Write a starter config for the selected deployment profile. `zoder init`
+# is idempotent and refuses to touch an existing configuration, so a re-install
+# or an upgrade never overwrites the operator's working routes.
+if ZODER_HOME="$ZODER_HOME" "${BIN_DIR}/zoder" init --profile "$PROFILE"; then
+  info "Deployment profile: ${PROFILE}"
+else
+  warn "could not write a ${PROFILE} starter config; run 'zoder init --profile ${PROFILE}' after install"
+fi
+
 # Commit only after every post-install operation and the smoke test succeed.
 # Until this point EXIT/INT/TERM/HUP all restore the previous binary set.
 transaction_active=0

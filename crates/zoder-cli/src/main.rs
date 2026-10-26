@@ -737,6 +737,149 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+/// Deployment profile selected by `zoder init --profile`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum InitProfile {
+    Standalone,
+    Fleet,
+}
+
+impl InitProfile {
+    fn name(self) -> &'static str {
+        match self {
+            InitProfile::Standalone => "standalone",
+            InitProfile::Fleet => "fleet",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            InitProfile::Standalone => "config.standalone.toml",
+            InitProfile::Fleet => "config.fleet.toml",
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            InitProfile::Standalone => STANDALONE_TEMPLATE,
+            InitProfile::Fleet => FLEET_TEMPLATE,
+        }
+    }
+}
+
+/// Embedded starter templates, shipped with the binary so `zoder init` works
+/// offline and install.sh does not have to fetch a second artifact.
+const STANDALONE_TEMPLATE: &str = include_str!("../../../config.standalone.toml");
+const FLEET_TEMPLATE: &str = include_str!("../../../config.fleet.toml");
+
+/// Render the standalone template for the provider key the operator has.
+///
+/// The shipped template defaults to DeepSeek because a hosted author route
+/// must be pinned. If ONLY a MiniMax key is present, flip the author/reviewer
+/// pins so one key is genuinely enough to start. A keyless or two-key init
+/// leaves the template exactly as written.
+fn render_standalone(deepseek_key: bool, minimax_key: bool) -> String {
+    let template = STANDALONE_TEMPLATE;
+    if deepseek_key || !minimax_key {
+        return template.to_string();
+    }
+    let swapped = template
+        .replace(
+            "default_provider = \"deepseek\"",
+            "default_provider = \"minimax\"",
+        )
+        .replace(
+            "primary_model = \"deepseek-chat\"",
+            "primary_model = \"MiniMax-M3\"",
+        )
+        .replace(
+            "reviewer_model = \"MiniMax-M3,deepseek-chat\"",
+            "reviewer_model = \"deepseek-chat,MiniMax-M3\"",
+        );
+    format!("# init: only MINIMAX_API_KEY is set; this copy defaults to MiniMax.\n{swapped}")
+}
+
+/// Names of zoder-owned configuration files already in `home`. The engine's
+/// own `config.toml` is deliberately not one of them (it has a different
+/// schema and zoder never reads it as a vendor overlay).
+fn existing_zoder_configs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_json = name == "config.json";
+            let is_overlay = name
+                .strip_prefix("config.")
+                .and_then(|rest| rest.strip_suffix(".toml"))
+                .is_some_and(|stem| !stem.is_empty() && !stem.contains('.'));
+            (is_json || is_overlay).then(|| entry.path())
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Write the selected starter config. Never overwrites an existing zoder
+/// configuration unless `force` is set; never overwrites another profile's
+/// config at all unless it is the same target and `force` is set.
+fn cmd_init(profile: InitProfile, force: bool) -> anyhow::Result<()> {
+    let home = zoder_core::config::Config::resolve_home()?;
+    std::fs::create_dir_all(&home)
+        .with_context(|| format!("creating zoder home {}", home.display()))?;
+    let target = home.join(profile.file_name());
+    let existing = existing_zoder_configs(&home);
+    if !force {
+        if target.exists() {
+            println!(
+                "zoder config already exists at {}; leaving it untouched (use --force to replace it)",
+                target.display()
+            );
+            return Ok(());
+        }
+        if !existing.is_empty() {
+            println!(
+                "existing zoder configuration found ({}); leaving it untouched (use --force to install the {} template)",
+                existing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                profile.name()
+            );
+            return Ok(());
+        }
+    }
+
+    let body = match profile {
+        InitProfile::Standalone => render_standalone(
+            std::env::var_os("DEEPSEEK_API_KEY").is_some_and(|v| !v.is_empty()),
+            std::env::var_os("MINIMAX_API_KEY").is_some_and(|v| !v.is_empty()),
+        ),
+        InitProfile::Fleet => profile.template().to_string(),
+    };
+    let tmp = home.join(format!(
+        ".{}.tmp.{}",
+        profile.file_name(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, body)
+        .with_context(|| format!("writing starter config {}", tmp.display()))?;
+    if let Err(error) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error)
+            .with_context(|| format!("installing starter config {}", target.display()));
+    }
+    println!(
+        "wrote {} deployment profile to {}",
+        profile.name(),
+        target.display()
+    );
+    Ok(())
+}
+
 /// Named reporting windows for `zoder report` (all period-to-date).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ReportPeriod {
@@ -904,6 +1047,19 @@ enum Cmd {
         /// Exit non-zero if the configuration is invalid.
         #[arg(long)]
         validate: bool,
+    },
+    /// Write a starter configuration into $ZODER_HOME.
+    ///
+    /// Does nothing when a zoder configuration already exists unless --force
+    /// is given, so an installer or a re-run never overwrites an operator's
+    /// working config.
+    Init {
+        /// Deployment profile to write: standalone (default) or fleet.
+        #[arg(long, value_enum, default_value = "standalone")]
+        profile: InitProfile,
+        /// Replace an existing config file with the template.
+        #[arg(long)]
+        force: bool,
     },
     /// Reconcile the model corpus against the live served-model list.
     Refresh,
@@ -2152,6 +2308,7 @@ async fn run() -> anyhow::Result<()> {
         }) => cmd_finops(sub, since.as_deref(), until.as_deref(), *window_days, *json).await,
         Some(Cmd::Providers) => cmd_providers(cli.json),
         Some(Cmd::Config { validate }) => cmd_config(*validate),
+        Some(Cmd::Init { profile, force }) => cmd_init(*profile, *force),
         Some(Cmd::Refresh) => cmd_refresh(&cli).await,
         Some(Cmd::Pricing { action }) => cmd_pricing(action, cli.json).await,
         Some(Cmd::Reconcile { provider, days }) => cmd_reconcile(provider, *days, cli.json).await,
