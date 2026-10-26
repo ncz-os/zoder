@@ -98,6 +98,7 @@ fn _force_imports_used() {
         subscription: None,
         serves: vec!["test-model".into()],
         azure_api_version: None,
+        max_context_tokens: None,
     };
     let _quota_unit: QuotaUnit = QuotaUnit::Requests;
     let _theme: Theme = Theme {

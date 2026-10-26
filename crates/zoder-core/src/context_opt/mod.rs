@@ -874,6 +874,57 @@ fn is_brief(turns: &[Turn], idx: usize) -> bool {
     }
 }
 
+/// Which deployment the built-in lever defaults are for.
+///
+/// The two deployments have genuinely different incentives. A shared,
+/// metered deployment pays for every resent token on every call, so its
+/// defaults are tuned tight: the working set is bounded well below the
+/// provider's window and the history is compacted early. A single
+/// operator's own machine has no such bill, and a shortened history is a
+/// quality change with no fleet-scale saving to pay for it, so its
+/// defaults are loose: bigger caps, later compaction, more of the recent
+/// turns kept verbatim.
+///
+/// The defaults are gated on this, never on the provider alone, so an
+/// operator gets the conservative set unless the deployment profile says
+/// otherwise. An explicit per-provider profile in the config still wins
+/// over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextProfile {
+    /// One operator's own machine. Conservative by default.
+    #[default]
+    Standalone,
+    /// A shared, metered deployment. Tuned tight.
+    Fleet,
+}
+
+impl ContextProfile {
+    /// Parse a profile name, case-insensitively. `None` for an unknown name,
+    /// so a config typo falls back to the default rather than silently
+    /// picking the other deployment's numbers.
+    pub fn named(name: &str) -> Option<ContextProfile> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "standalone" => Some(ContextProfile::Standalone),
+            "fleet" => Some(ContextProfile::Fleet),
+            _ => None,
+        }
+    }
+
+    /// Whether the levers are ON when the operator did not say.
+    ///
+    /// The fleet turns them on because the bill is the point; standalone
+    /// leaves them off because shortening an agent's history is a quality
+    /// change and a single operator is not paying a fleet-scale bill for
+    /// it. An explicit `enabled` in the config overrides this either way.
+    pub fn default_enabled(self) -> bool {
+        match self {
+            ContextProfile::Standalone => false,
+            ContextProfile::Fleet => true,
+        }
+    }
+}
+
 /// Provider-model tunables resolved from config. Numbers here are the
 /// measured defaults from the 2026-10-25 DeepSeek study; see
 /// `docs/CONTEXT-OPTIMIZATION.md`.
@@ -889,6 +940,16 @@ pub struct Levers {
     pub compact_after_tokens: u64,
     /// Turns kept verbatim on the tail of a compaction.
     pub keep_recent_turns: usize,
+    /// The provider's context window, in tokens. 0 means "no window
+    /// configured", which is different from a window of zero: nothing is
+    /// refused, and no prompt is trimmed to fit it.
+    ///
+    /// This is the hard ceiling the other levers are measured against. A
+    /// provider that publishes no window (a local model with an unknown
+    /// limit, a gateway that does not say) leaves it at 0, and the
+    /// working-set levers still apply — they bound the prompt, they do
+    /// not need to know the ceiling to do it.
+    pub max_context_tokens: u64,
 }
 
 impl Levers {
@@ -903,6 +964,7 @@ impl Levers {
         elide_min_bytes: 2_048,
         compact_after_tokens: 48_000,
         keep_recent_turns: 6,
+        max_context_tokens: 131_072,
     };
     /// MiniMax-M3 / M3.1-Flash (subscription-metered, no usage cache counter).
     /// A tighter working set: the plan meters by tokens, and the M3 window is
@@ -914,6 +976,7 @@ impl Levers {
         elide_min_bytes: 2_048,
         compact_after_tokens: 32_000,
         keep_recent_turns: 6,
+        max_context_tokens: 204_800,
     };
     /// Every other provider (local vLLM, hosted gateways whose cache shape is
     /// `CachedSubset`). Caps and elision on, compaction off: a local model has
@@ -924,6 +987,47 @@ impl Levers {
         elide_min_bytes: 2_048,
         compact_after_tokens: 0,
         keep_recent_turns: 6,
+        max_context_tokens: 0,
+    };
+
+    /// The fleet defaults for DeepSeek.
+    pub const FLEET_DEEPSEEK: Levers = Levers::DEEPSEEK;
+    /// The fleet defaults for MiniMax.
+    pub const FLEET_MINIMAX: Levers = Levers::MINIMAX;
+    /// The fleet defaults for every other provider.
+    pub const FLEET_OTHER: Levers = Levers::OTHER;
+
+    /// The standalone defaults for DeepSeek: a single operator has no
+    /// fleet-scale token bill to amortize, so the working set is kept much
+    /// looser. The caps are twice the fleet's, the elision floor is
+    /// doubled, compaction waits until 2x the fleet's trigger, and twice
+    /// as many recent turns are kept verbatim.
+    pub const STANDALONE_DEEPSEEK: Levers = Levers {
+        tool_output_cap_bytes: 32_768,
+        elide_after_turns: 12,
+        elide_min_bytes: 4_096,
+        compact_after_tokens: 96_000,
+        keep_recent_turns: 10,
+        max_context_tokens: 131_072,
+    };
+    /// The standalone defaults for MiniMax.
+    pub const STANDALONE_MINIMAX: Levers = Levers {
+        tool_output_cap_bytes: 24_576,
+        elide_after_turns: 10,
+        elide_min_bytes: 4_096,
+        compact_after_tokens: 64_000,
+        keep_recent_turns: 10,
+        max_context_tokens: 204_800,
+    };
+    /// The standalone defaults for every other provider. Still no
+    /// compaction: a local model has no per-token bill either way.
+    pub const STANDALONE_OTHER: Levers = Levers {
+        tool_output_cap_bytes: 32_768,
+        elide_after_turns: 12,
+        elide_min_bytes: 4_096,
+        compact_after_tokens: 0,
+        keep_recent_turns: 10,
+        max_context_tokens: 0,
     };
 
     /// Bytes a conversation would occupy after every lever ran, in order.
@@ -958,31 +1062,51 @@ impl Levers {
 }
 
 impl Levers {
-    /// Look a profile up by name, case-insensitively. `None` for a name that
-    /// is not a built-in, so a config typo falls back to [`Levers::OTHER`]
-    /// rather than to an arbitrary provider's numbers.
-    pub fn named(name: &str) -> Option<Levers> {
+    /// Look a provider-family profile up by name, case-insensitively, under
+    /// a deployment profile. `None` for a name that is not a built-in, so a
+    /// config typo falls back to [`Levers::OTHER`] rather than to an
+    /// arbitrary provider's numbers.
+    pub fn named(profile: ContextProfile, name: &str) -> Option<Levers> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "deepseek" => Some(Levers::DEEPSEEK),
-            "minimax" => Some(Levers::MINIMAX),
-            "other" => Some(Levers::OTHER),
+            "deepseek" => Some(match profile {
+                ContextProfile::Fleet => Levers::FLEET_DEEPSEEK,
+                ContextProfile::Standalone => Levers::STANDALONE_DEEPSEEK,
+            }),
+            "minimax" => Some(match profile {
+                ContextProfile::Fleet => Levers::FLEET_MINIMAX,
+                ContextProfile::Standalone => Levers::STANDALONE_MINIMAX,
+            }),
+            "other" => Some(match profile {
+                ContextProfile::Fleet => Levers::FLEET_OTHER,
+                ContextProfile::Standalone => Levers::STANDALONE_OTHER,
+            }),
             _ => None,
         }
     }
 
     /// Sniff a model id for its provider family (`deepseek-flash`,
-    /// `MiniMax-M3`, `azure_ai/FW-DeepSeek-V4-Flash`) and return that profile.
-    /// Anything else is [`Levers::OTHER`] — caps and elision, no compaction,
-    /// because a local model has no per-token bill and a summarised history is
-    /// pure quality risk for no saving.
-    pub fn for_model(model: &str) -> Levers {
+    /// `MiniMax-M3`, `azure_ai/FW-DeepSeek-V4-Flash`) and return that
+    /// profile for the given deployment profile. Anything else is
+    /// [`Levers::OTHER`] — caps and elision, no compaction, because a local
+    /// model has no per-token bill and a summarised history is pure quality
+    /// risk for no saving.
+    pub fn for_model(profile: ContextProfile, model: &str) -> Levers {
         let needle = model.to_ascii_lowercase();
         if needle.contains("deepseek") {
-            Levers::DEEPSEEK
+            match profile {
+                ContextProfile::Fleet => Levers::FLEET_DEEPSEEK,
+                ContextProfile::Standalone => Levers::STANDALONE_DEEPSEEK,
+            }
         } else if needle.contains("minimax") {
-            Levers::MINIMAX
+            match profile {
+                ContextProfile::Fleet => Levers::FLEET_MINIMAX,
+                ContextProfile::Standalone => Levers::STANDALONE_MINIMAX,
+            }
         } else {
-            Levers::OTHER
+            match profile {
+                ContextProfile::Fleet => Levers::FLEET_OTHER,
+                ContextProfile::Standalone => Levers::STANDALONE_OTHER,
+            }
         }
     }
 }
@@ -990,6 +1114,96 @@ impl Levers {
 impl Default for Levers {
     fn default() -> Self {
         Self::OTHER
+    }
+}
+
+/// The result of fitting a conversation to a provider's context window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFit {
+    /// The turns that fit, in wire order.
+    pub turns: Vec<Turn>,
+    /// Estimated prompt tokens after the fit.
+    pub tokens: u64,
+    /// How the prompt was brought under the window.
+    pub action: WindowAction,
+}
+
+/// How a prompt was brought under the provider's context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowAction {
+    /// It already fit; nothing was changed.
+    AlreadyFits,
+    /// Tool outputs were replaced by re-readable stubs until it fit.
+    Elided,
+    /// The history was folded into a digest until it fit.
+    Compacted,
+    /// Even the pinned head and the brief alone exceed the window.
+    TooLarge,
+}
+
+/// Fit a conversation to a provider's context window.
+///
+/// The levers in [`Levers`] bound the *working set*; this is the hard
+/// ceiling underneath them. Order of preference, cheapest first:
+///
+/// 1. tool outputs are replaced by re-readable stubs (the agent can
+///    re-read them, and the stub names the source);
+/// 2. only then is the history folded into a digest.
+///
+/// The pinned head (the system prompt) and the brief are never dropped:
+/// a prompt that has lost the task is not a smaller task, it is a
+/// different one. When even those alone exceed the window the fit
+/// FAILS, and the caller must refuse the call rather than send a prompt
+/// the provider will reject — or silently truncate the brief.
+///
+/// `max_context_tokens` of 0 means "no window configured": the turns are
+/// returned unchanged and the action is
+/// [`WindowAction::AlreadyFits`].
+pub fn fit_to_window(turns: &[Turn], max_context_tokens: u64) -> WindowFit {
+    let tokens_of = |t: &[Turn]| estimate_tokens(t.iter().map(Turn::bytes).sum());
+    if max_context_tokens == 0 {
+        return WindowFit {
+            turns: turns.to_vec(),
+            tokens: tokens_of(turns),
+            action: WindowAction::AlreadyFits,
+        };
+    }
+    let current = turns.to_vec();
+    if tokens_of(&current) <= max_context_tokens {
+        let tokens = tokens_of(&current);
+        return WindowFit {
+            turns: current,
+            tokens,
+            action: WindowAction::AlreadyFits,
+        };
+    }
+    // Step 1: elide every eligible tool output, oldest first.
+    let mut elided = current.clone();
+    elide_stale(&mut elided, 0, 0);
+    if tokens_of(&elided) <= max_context_tokens {
+        let tokens = tokens_of(&elided);
+        return WindowFit {
+            turns: elided,
+            tokens,
+            action: WindowAction::Elided,
+        };
+    }
+    // Step 2: fold the history into a digest. The pinned head and the brief
+    // survive, so this is the last thing that can shrink.
+    let compacted = compact(&elided, 1, 2, 64, 40);
+    let compacted_tokens = tokens_of(&compacted.turns);
+    if compacted.turns.len() < elided.len() && compacted_tokens <= max_context_tokens {
+        return WindowFit {
+            turns: compacted.turns,
+            tokens: compacted_tokens,
+            action: WindowAction::Compacted,
+        };
+    }
+    WindowFit {
+        turns: compacted.turns,
+        tokens: compacted_tokens,
+        action: WindowAction::TooLarge,
     }
 }
 
