@@ -1020,7 +1020,8 @@ fn plan_loop_review(
     caps: crate::review_diff::ReviewCaps,
     zoderignore: &[String],
     config_excludes: &[String],
-    context_for: &dyn Fn(&str) -> String,
+    context_on: bool,
+    context_for: &dyn Fn(&str, usize) -> String,
     base_tokens: u32,
 ) -> anyhow::Result<LoopReviewPlan> {
     // `run_git_diff` caps acquisition at 1 MiB and marks the tail. Reviewing
@@ -1030,13 +1031,26 @@ fn plan_loop_review(
         !diff.contains("[git diff truncated during acquisition"),
         "review diff was truncated during acquisition; refusing to approve an incomplete view"
     );
+    // Definition context is paid for inside the per-route chunk budget: the
+    // chunk cap is reduced by the context share, and the context builder gets
+    // that same share as its hard ceiling.
+    let context_budget = if context_on {
+        crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+    } else {
+        0
+    };
+    let chunk_cap = if context_on {
+        crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
+    } else {
+        caps.max_hunk_bytes
+    };
     let prepared = crate::review_diff::prepare_review_diff_with_chunks(
         zoderignore,
         diff,
         &[],
         config_excludes,
         caps.max_diff_bytes,
-        caps.max_hunk_bytes,
+        chunk_cap,
         caps.max_chunks,
         true,
     )?;
@@ -1050,7 +1064,7 @@ fn plan_loop_review(
     // to be prepended to every chunk prompt, which put the task text and the
     // validation output — both of which change on every review — in front of
     // the constant head, so no chunk of a review ever shared a cache prefix.
-    let users = build_review_users(label, "", preamble, &prepared, context_for);
+    let users = build_review_users(label, "", preamble, &prepared, context_budget, context_for);
     let max_tokens = caps.max_tokens_floor.map_or(base_tokens, |floor| {
         base_tokens.max(floor.min(REVIEW_MAX_TOKENS_CEILING))
     });
@@ -1098,16 +1112,12 @@ async fn run_loop_review_once(
     // feed the post-change file context so a name defined in another chunk is
     // not reported as missing. Loop work lives in the working tree.
     let context_on = crate::review_context::enabled();
-    let context_for = |chunk: &str| -> String {
+    let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
         let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
-        let context = crate::review_context::chunk_context(
-            chunk,
-            &read,
-            crate::review_context::CONTEXT_BUDGET_BYTES,
-        );
+        let context = crate::review_context::chunk_context(chunk, &read, budget);
         if context.is_empty() {
             context
         } else {
@@ -1125,6 +1135,7 @@ unbound, or missing imports:\n{context}"
         caps_for(caps_model),
         zoderignore,
         config_excludes,
+        context_on,
         &context_for,
         base_tokens,
     )?;
@@ -1139,6 +1150,7 @@ unbound, or missing imports:\n{context}"
             caps_for(Some(served)),
             zoderignore,
             config_excludes,
+            context_on,
             &context_for,
             base_tokens,
         )
@@ -1169,6 +1181,11 @@ unbound, or missing imports:\n{context}"
     })?;
     review.escalation_reason = reviewer_report.escalation_reason.clone();
     review.forced_family_conflict = reviewer_report.forced_family_conflict;
+    // Deterministic false-positive filter: a finding that calls a symbol
+    // undefined is dropped when the reviewed working tree defines or imports
+    // it. The evidence is kept in `filtered_findings` for the loop record.
+    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    filter_false_undefined_findings(&mut review, &read_worktree);
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -2545,6 +2562,11 @@ pub(crate) struct ReviewOutput {
     /// makes the same conflict visible to a machine reader of the verdict.
     #[serde(default, skip_serializing_if = "is_false")]
     forced_family_conflict: bool,
+    /// Findings removed by the deterministic false-"undefined" filter, with
+    /// the defining/importing line that disproved them. Additive and absent
+    /// from the reviewer's own schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    filtered_findings: Vec<serde_json::Value>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2719,6 +2741,7 @@ fn parse_review_json_only(raw: &str) -> Option<ReviewOutput> {
                     summary: r.summary,
                     findings: r.findings,
                     next_steps: r.next_steps,
+                    filtered_findings: r.filtered_findings,
                     ..Default::default()
                 });
             }
@@ -4438,6 +4461,61 @@ fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usi
     }
     merged.findings.extend(review.findings);
     merged.next_steps.extend(review.next_steps);
+    merged.filtered_findings.extend(review.filtered_findings);
+}
+
+/// Drop findings that claim a symbol is undefined/missing/unimported when the
+/// symbol is in fact defined or imported at the reviewed head. `read` returns
+/// the post-change text of a repo-relative path (HEAD for branch review, the
+/// working tree for a loop).
+///
+/// The false finding is removed from `findings` and preserved, with the line
+/// that disproves it, in `filtered_findings`. When it was the only finding on
+/// an explicit blocking verdict, the verdict becomes `comment` (never
+/// `approve`): the reviewer's stated blocker has been disproved by source, so
+/// it must not keep a loop unresolved, but a review that only produced a false
+/// finding is not evidence of correctness either.
+fn filter_false_undefined_findings(
+    review: &mut ReviewOutput,
+    read: &dyn Fn(&str) -> Option<String>,
+) {
+    if review.findings.is_empty() {
+        return;
+    }
+    let mut kept: Vec<Finding> = Vec::with_capacity(review.findings.len());
+    let mut filtered: Vec<serde_json::Value> = Vec::new();
+    for finding in review.findings.drain(..) {
+        let path = finding_location_path(&finding.location);
+        match crate::review_filter::false_undefined_record(
+            &finding.title,
+            &finding.body,
+            &path,
+            read,
+        ) {
+            Some(mut record) => {
+                if let Some(obj) = record.as_object_mut() {
+                    obj.insert("severity".into(), json!(finding.severity));
+                    obj.insert("location".into(), json!(finding.location));
+                    obj.insert("body".into(), json!(finding.body));
+                }
+                filtered.push(record);
+            }
+            None => kept.push(finding),
+        }
+    }
+    let removed = filtered.len();
+    review.findings = kept;
+    review.filtered_findings.extend(filtered);
+    if removed > 0 && review.findings.is_empty() && is_block_verdict(&review.verdict) {
+        review.verdict = "comment".into();
+        if !review.summary.is_empty() {
+            review.summary.push(' ');
+        }
+        review.summary.push_str(&format!(
+            "{removed} false undefined finding(s) disproved by the reviewed head; \
+             verdict downgraded to comment."
+        ));
+    }
 }
 
 /// Per-chunk completion record kept by [`complete_review_chunks`]: which model
@@ -4777,7 +4855,8 @@ fn build_review_users(
     focus_txt: &str,
     preamble: &str,
     prepared: &crate::review_diff::PreparedDiff,
-    context_for: &dyn Fn(&str) -> String,
+    context_budget: usize,
+    context_for: &dyn Fn(&str, usize) -> String,
 ) -> Vec<String> {
     // A chunked review is a fan of independent calls over one diff, so it is
     // the one place a prompt cache pays for itself many times over — if the
@@ -4806,7 +4885,12 @@ as undefined, redefined, or recursively calling a missing function, check it aga
         focus_txt,
         &chunks,
         preamble,
-        &|idx| context_for(chunks.get(idx).map(String::as_str).unwrap_or_default()),
+        &|idx| {
+            context_for(
+                chunks.get(idx).map(String::as_str).unwrap_or_default(),
+                context_budget,
+            )
+        },
     );
     rendered.prompts
 }
@@ -5047,15 +5131,11 @@ pub(crate) async fn cmd_review(
         }
     };
     let context_on = crate::review_context::enabled();
-    let context_for = |chunk: &str| -> String {
+    let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
-        let context = crate::review_context::chunk_context(
-            chunk,
-            &read_post_image,
-            crate::review_context::CONTEXT_BUDGET_BYTES,
-        );
+        let context = crate::review_context::chunk_context(chunk, &read_post_image, budget);
         if context.is_empty() {
             context
         } else {
@@ -5067,17 +5147,36 @@ unbound, or missing imports:\n{context}"
         }
     };
     let build_plan = |caps: crate::review_diff::ReviewCaps| -> anyhow::Result<ReviewPlan> {
+        // Definition context is part of this route's per-chunk budget, not an
+        // extra allowance on top of it.
+        let context_budget = if context_on {
+            crate::review_context::context_budget_for_chunk_cap(caps.max_hunk_bytes)
+        } else {
+            0
+        };
+        let chunk_cap = if context_on {
+            crate::review_context::chunk_cap_for_context(caps.max_hunk_bytes)
+        } else {
+            caps.max_hunk_bytes
+        };
         let prepared = crate::review_diff::prepare_review_diff_with_chunks(
             &zoderignore,
             &diff,
             &opts.excludes,
             &config_excludes,
             caps.max_diff_bytes,
-            caps.max_hunk_bytes,
+            chunk_cap,
             caps.max_chunks,
             opts.split_hunks,
         )?;
-        let users = build_review_users(&label, &focus_txt, "", &prepared, &context_for);
+        let users = build_review_users(
+            &label,
+            &focus_txt,
+            "",
+            &prepared,
+            context_budget,
+            &context_for,
+        );
         Ok(ReviewPlan {
             caps,
             prepared,
@@ -5244,6 +5343,7 @@ unbound, or missing imports:\n{context}"
                 let mut review = parse_review(&c.content);
                 review.escalation_reason = report.escalation_reason;
                 review.forced_family_conflict = report.forced_family_conflict;
+                filter_false_undefined_findings(&mut review, &read_post_image);
                 reviews.push(ReviewerSlot::Ok {
                     model: c.model,
                     review,
@@ -5391,7 +5491,7 @@ fn aggregate_review(
     }
     .to_string();
 
-    let payload = json!({
+    let mut payload = json!({
         "verdict": agg,
         "complete": !all_failed && failed_models == 0 && ok_models == requested,
         "requested": requested,
@@ -5403,12 +5503,20 @@ fn aggregate_review(
             "verdict": slot.display_verdict(),
             "summary": slot.display_summary(),
             "findings": slot.review().map(|r| r.findings.clone()).unwrap_or_default(),
+            "filtered_findings": slot.review().map(|r| r.filtered_findings.clone()).unwrap_or_default(),
             "next_steps": slot.review().map(|r| r.next_steps.clone()).unwrap_or_default(),
             "ok": slot.is_ok(),
             "escalation_reason": slot.review().and_then(|r| r.escalation_reason.clone()),
             "forced_family_conflict": slot.review().is_some_and(|r| r.forced_family_conflict),
         })).collect::<Vec<_>>(),
     });
+    // One top-level list so a consumer does not have to walk the panel. Each
+    // record names the symbol, the reason, and the defining/importing line.
+    payload["filtered_findings"] = json!(reviews
+        .iter()
+        .filter_map(ReviewerSlot::review)
+        .flat_map(|r| r.filtered_findings.clone())
+        .collect::<Vec<_>>());
 
     (agg, all_failed, payload)
 }
@@ -6540,6 +6648,7 @@ comment-with-no-evidence, NOT as a blocking defect. Original summary: {}",
         ),
         findings: r.findings.clone(),
         next_steps: r.next_steps.clone(),
+        filtered_findings: r.filtered_findings.clone(),
         ..Default::default()
     }
 }
@@ -8129,6 +8238,7 @@ or comment.\n"
             // `disposition` is only an explicitly recorded value (default
             // `open`), never inferred.
             "findings": review.findings.iter().map(finding_record).collect::<Vec<_>>(),
+            "filtered_findings": review.filtered_findings,
             "cost_usd_cumulative": total_cost,
             "commit_author_enforcement": commit_author_enforcement_to_json(
                 commit_author_enforcement.as_ref()
@@ -8524,6 +8634,10 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         // carries. A run that never reviewed (empty `log`) has no findings —
         // the field is absent, never fabricated.
         "findings": iterations.last().and_then(|it| it.get("findings")).cloned(),
+        "filtered_findings": iterations
+            .last()
+            .and_then(|it| it.get("filtered_findings"))
+            .cloned(),
     });
 
     if let Some(dir) = active_job_dir() {
@@ -9584,6 +9698,71 @@ mod tests {
     }
 
     // ---- B: request_changes must be located ----
+
+    fn finding(title: &str, severity: &str) -> Finding {
+        Finding {
+            severity: severity.into(),
+            title: title.into(),
+            body: format!("{title} is not defined in this chunk."),
+            location: Some("pkg/mod.py:120".into()),
+            disposition: None,
+        }
+    }
+
+    /// The reported false positive: a constant defined earlier in the file is
+    /// reported as undefined by the reviewer. The old path surfaced it as a
+    /// blocking finding; the deterministic filter drops it and records the
+    /// defining line. A genuinely missing symbol is still kept.
+    #[test]
+    fn false_undefined_findings_are_dropped_and_real_ones_are_kept() {
+        let source = "RETRY_LIMIT = 3\nQUIRK_ID = 0x1234\n\n\ndef run():\n    return RETRY_LIMIT + QUIRK_ID\n";
+        let read = |path: &str| (path == "pkg/mod.py").then(|| source.to_string());
+        let mut review = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "one false finding and one real finding".into(),
+            findings: vec![
+                finding("RETRY_LIMIT is undefined", "critical"),
+                finding("MISSING_LIMIT is undefined", "critical"),
+            ],
+            next_steps: vec![],
+            filtered_findings: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(review.findings.len(), 2, "old behaviour flags both");
+        filter_false_undefined_findings(&mut review, &read);
+        assert_eq!(review.findings.len(), 1, "{review:?}");
+        assert_eq!(review.findings[0].title, "MISSING_LIMIT is undefined");
+        assert_eq!(review.filtered_findings.len(), 1);
+        let record = &review.filtered_findings[0];
+        assert_eq!(record["symbol"], "RETRY_LIMIT");
+        assert!(record["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("RETRY_LIMIT = 3"));
+        // One real blocker remains, so the verdict stays blocking.
+        assert_eq!(review.verdict, "request_changes");
+    }
+
+    /// When the only finding was the false undefined claim, the loop must not
+    /// stay blocked on it. The verdict becomes `comment`, never `approve`.
+    #[test]
+    fn a_lone_false_undefined_finding_downgrades_a_block_to_comment() {
+        let source = "RETRY_LIMIT = 3\n";
+        let read = |path: &str| (path == "pkg/mod.py").then(|| source.to_string());
+        let mut review = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "only the false finding".into(),
+            findings: vec![finding("RETRY_LIMIT is undefined", "critical")],
+            next_steps: vec![],
+            filtered_findings: Vec::new(),
+            ..Default::default()
+        };
+        filter_false_undefined_findings(&mut review, &read);
+        assert!(review.findings.is_empty());
+        assert_eq!(review.verdict, "comment");
+        assert!(review.summary.contains("false undefined finding"));
+        assert_eq!(review.filtered_findings.len(), 1);
+    }
 
     fn review_with(verdict: &str, findings: Vec<Finding>) -> ReviewOutput {
         ReviewOutput {
@@ -16091,7 +16270,8 @@ model_provider = "custom.nemotron35"
             review_caps(400, 100_000),
             &[],
             &[],
-            &|_| String::new(),
+            false,
+            &|_, _| String::new(),
             8192,
         )
         .expect("a diff under the total cap must chunk");
@@ -16118,7 +16298,8 @@ model_provider = "custom.nemotron35"
             review_caps(500, 200),
             &[],
             &[],
-            &|_| String::new(),
+            false,
+            &|_, _| String::new(),
             8192,
         )
         .expect_err("over-cap diff must be refused, not truncated");
@@ -16134,7 +16315,8 @@ model_provider = "custom.nemotron35"
             review_caps(9_000, 120_000),
             &[],
             &["*.txt".to_string()],
-            &|_| String::new(),
+            false,
+            &|_, _| String::new(),
             8192,
         )
         .expect_err("an exclusion-emptied diff must not become an empty approve");
@@ -16152,7 +16334,8 @@ model_provider = "custom.nemotron35"
             review_caps(9_000, 120_000),
             &[],
             &[],
-            &|_| String::new(),
+            false,
+            &|_, _| String::new(),
             8192,
         )
         .expect_err("a truncated diff must not be approved");

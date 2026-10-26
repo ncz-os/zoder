@@ -21,6 +21,7 @@ mod reaper;
 mod review_baton;
 mod review_context;
 mod review_diff;
+mod review_filter;
 mod reviewer_pool;
 mod sop;
 mod utilization;
