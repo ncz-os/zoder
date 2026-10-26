@@ -3620,6 +3620,13 @@ async fn cmd_models(
 ) -> anyhow::Result<()> {
     let mut eng = Engine::load()?;
 
+    // The corpus this command works from may be weeks old (the daily sync
+    // broke for 13 days in October 2026 and every client kept routing on the
+    // stale index). Say so on stderr. The `--json` payload is a bare array of
+    // model objects that scripts parse, so the warning stays on stderr there
+    // too instead of changing the JSON schema.
+    print_staleness_warning(&corpus_staleness_warning(&eng.corpus));
+
     // Live catalog enrichment: ask the running zeroclaw daemon for its
     // current `config/catalog-models` and fold the answer into the
     // corpus before display. The RPC is best-effort with its own
@@ -14215,6 +14222,13 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             let (cat, stats) = sync_catalog(&sources, Some(baseline)).await?;
             cat.save(&path)?;
             publish_engine_catalog(&cat, *external, json)?;
+            // How current is the catalog we just wrote? A refresh can still
+            // land on an old build date (a partial sync, a cached source), and
+            // stale prices mis-state spend silently.
+            let today = chrono::Local::now().date_naive();
+            let age_days = cat.age_days(today);
+            let stale_warning = cat.staleness_warning(today, stale_threshold_days());
+            let stale = stale_warning.is_some();
             if json {
                 println!(
                     "{}",
@@ -14226,6 +14240,11 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                         "baseline_usd_per_mtok": cat.baseline_usd_per_mtok,
                         "errors": stats.errors,
                         "path": path.display().to_string(),
+                        "pricing_age_days": age_days,
+                        "pricing_stale": stale,
+                        // The same warning the text mode prints, so a JSON
+                        // consumer can surface it without re-deriving it.
+                        "pricing_warning": stale_warning,
                     })
                 );
             } else {
@@ -14233,6 +14252,12 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                 println!("  litellm    : {} models", stats.litellm);
                 println!("  openrouter : {} models", stats.openrouter);
                 println!("  total      : {} models", stats.total);
+                match age_days {
+                    Some(days) => {
+                        println!("  age        : {days} day(s) (generated {})", cat.generated)
+                    }
+                    None => println!("  age        : unknown (no usable date)"),
+                }
                 if cat.baseline_usd_per_mtok > 0.0 {
                     println!(
                         "  baseline   : {} (${:.2}/Mtok blended)",
@@ -14246,6 +14271,12 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                 }
                 for e in &stats.errors {
                     eprintln!("  warning: {e}");
+                }
+                // In `--json` mode the age is reported as `pricing_age_days` /
+                // `pricing_stale` instead of this text, so a JSON parser never
+                // sees a warning.
+                if let Some(warning) = &stale_warning {
+                    eprintln!("{warning}");
                 }
             }
             Ok(())
@@ -14825,6 +14856,30 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The staleness threshold in days for the corpus and the pricing catalog.
+///
+/// `$ZODER_CORPUS_STALE_DAYS` overrides the default (7); `0` disables the
+/// warning and an unparsable value falls back to the default.
+fn stale_threshold_days() -> i64 {
+    zoder_core::corpus::stale_threshold_from_env()
+}
+
+/// The warning for a model corpus that is older than the threshold, if any.
+fn corpus_staleness_warning(corpus: &Corpus) -> Option<String> {
+    let today = chrono::Local::now().date_naive();
+    corpus.staleness_warning(today, stale_threshold_days())
+}
+
+/// Print a warning on stderr, if there is one.
+///
+/// stderr, never stdout: scripts parse the stdout of these commands, and an
+/// old corpus must never break a script (or the command) - it is a nudge.
+fn print_staleness_warning(warning: &Option<String>) {
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+}
+
 fn cmd_config(validate: bool) -> anyhow::Result<()> {
     // Load unvalidated so this command remains the diagnostic tool: without
     // `--validate` it must still print home/providers and the problem list
@@ -14848,13 +14903,16 @@ fn cmd_config(validate: bool) -> anyhow::Result<()> {
 
     let problems = cfg.validate();
     match Corpus::load(&cfg.corpus_path) {
-        Ok(c) => {
-            let free = c.free_chat().count();
+        Ok(corpus) => {
+            let free = corpus.free_chat().count();
             println!(
                 "corpus OK:   {} models, {} free chat route-candidates",
-                c.models.len(),
+                corpus.models.len(),
                 free
             );
+            // An old corpus is a nudge, not an error: it goes to stderr (stdout
+            // here is parsed by scripts) and never changes the exit code.
+            print_staleness_warning(&corpus_staleness_warning(&corpus));
         }
         Err(e) => println!("corpus ERROR: {e}"),
     }
@@ -20831,5 +20889,122 @@ model = "m"
             Some(true),
             "the zoder model entry must win over the engine profile: {body}"
         );
+    }
+}
+
+#[cfg(test)]
+mod staleness_warning_tests {
+    //! The client-side half of the 2026-10-13 outage: the published corpus was
+    //! 13 days old and no command said so. These pin the CLI's threshold
+    //! handling (the `$ZODER_CORPUS_STALE_DAYS` override) and the shape of the
+    //! warning the commands print.
+    //!
+    //! The env var is process-global, so every test restores it before it
+    //! returns and the assertions inside one test are serialized.
+    use super::*;
+    use zoder_core::corpus::STALE_DAYS_ENV;
+
+    /// The env var is process-global, so the tests that touch it are
+    /// serialized: without this they race and read each other's value.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("valid test date")
+    }
+
+    fn with_env(value: Option<&str>) -> Option<String> {
+        let saved = std::env::var(STALE_DAYS_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(STALE_DAYS_ENV, v),
+            None => std::env::remove_var(STALE_DAYS_ENV),
+        }
+        saved
+    }
+
+    fn restore(saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(STALE_DAYS_ENV, v),
+            None => std::env::remove_var(STALE_DAYS_ENV),
+        }
+    }
+
+    #[test]
+    fn env_zero_silences_even_a_very_old_corpus() {
+        let _guard = env_lock();
+        let saved = with_env(Some("0"));
+        assert_eq!(0, stale_threshold_days());
+        let corpus = Corpus {
+            generated: "2020-01-01".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            corpus
+                .staleness_warning(day("2026-10-26"), stale_threshold_days())
+                .is_none(),
+            "0 must disable the warning"
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn a_garbage_env_value_falls_back_to_the_default() {
+        let _guard = env_lock();
+        let saved = with_env(Some("not-a-number"));
+        assert_eq!(
+            zoder_core::corpus::DEFAULT_STALE_DAYS,
+            stale_threshold_days()
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn an_unset_env_value_uses_the_default() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        assert_eq!(
+            zoder_core::corpus::DEFAULT_STALE_DAYS,
+            stale_threshold_days()
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn an_old_corpus_warns_with_the_age_and_the_fix() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        let corpus = Corpus {
+            generated: "2026-10-18".to_string(),
+            ..Default::default()
+        };
+        let warning = corpus
+            .staleness_warning(day("2026-10-26"), stale_threshold_days())
+            .expect("warning");
+        assert!(
+            warning.starts_with("warning: model corpus is 8 days old"),
+            "{warning}"
+        );
+        assert!(warning.contains("generated 2026-10-18"), "{warning}");
+        assert!(warning.contains("model_corpus.json"), "{warning}");
+        restore(saved);
+    }
+
+    #[test]
+    fn a_fresh_corpus_does_not_warn() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        let corpus = Corpus {
+            generated: "2026-10-26".to_string(),
+            ..Default::default()
+        };
+        assert!(corpus
+            .staleness_warning(day("2026-10-26"), stale_threshold_days())
+            .is_none());
+        restore(saved);
     }
 }
