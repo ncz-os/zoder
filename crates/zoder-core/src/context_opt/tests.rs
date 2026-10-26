@@ -1049,3 +1049,29 @@ fn fitting_to_the_window_never_grows_the_prompt() {
         );
     }
 }
+
+#[test]
+fn folding_a_single_turn_that_fits_is_a_fit_not_too_large() {
+    // One oversized turn sits between the pinned head and the live tail, so
+    // the fold replaces exactly ONE turn with its digest: the turn count is
+    // unchanged, yet the prompt now fits. That is a fit, and refusing it as
+    // too large would refuse a call the provider would accept.
+    let turns = vec![
+        Turn::new("system", "You are the author."),
+        Turn::new("user", "Fix the failing test."),
+        Turn::new("assistant", "I read the whole module. ".repeat(4_000)),
+        Turn::new("assistant", "Next I will run the tests."),
+        Turn::new("user", "What did you decide?"),
+    ];
+    let before = estimate_tokens(turns.iter().map(Turn::bytes).sum());
+    let window = 4_000;
+    assert!(before > window, "the fixture must start over the window");
+    let fit = fit_to_window(&turns, window);
+    assert_eq!(fit.turns.len(), turns.len(), "one turn became one digest");
+    assert!(
+        fit.tokens <= window,
+        "the folded prompt fits: {}",
+        fit.tokens
+    );
+    assert_eq!(fit.action, WindowAction::Compacted);
+}
