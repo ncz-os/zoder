@@ -2304,7 +2304,9 @@ async fn dispatch_reviewer_for_model(
                     let delay = zoder_core::backoff_delay(
                         attempt,
                         e.retry_after,
-                        e.overload.then(|| provider.overload_backoff_min()).flatten(),
+                        e.overload
+                            .then(|| provider.overload_backoff_min())
+                            .flatten(),
                     );
                     if !cli.quiet {
                         eprintln!(
