@@ -14,15 +14,46 @@
 //! in it. The header is labelled as context, not diff, so it is never
 //! reviewed itself.
 
+use std::collections::BTreeMap;
+
 use crate::review_diff::extract_defs;
 
 /// Default byte budget for one chunk's context header.
 pub(crate) const CONTEXT_BUDGET_BYTES: usize = 3000;
+/// Smallest context budget, for reviewers whose per-chunk cap is tiny.
+pub(crate) const CONTEXT_MIN_BYTES: usize = 512;
+/// Context may never take more than this fraction of the per-route chunk cap.
+pub(crate) const CONTEXT_SHARE_DENOMINATOR: usize = 4;
+/// Bytes reserved for the wrapper sentence the CLI puts around the header.
+pub(crate) const CONTEXT_WRAPPER_RESERVE_BYTES: usize = 320;
+/// Files at or below this size can be supplied whole instead of as a list of
+/// defining lines.
+const WHOLE_FILE_THRESHOLD_BYTES: usize = 4096;
 const MAX_IMPORTS_PER_FILE: usize = 25;
 const MAX_DEFS_PER_FILE: usize = 60;
 const MAX_BINDINGS_PER_HUNK: usize = 30;
+/// Cap on how many referenced symbols are resolved per chunk.
+const MAX_REFERENCED_SYMBOLS: usize = 80;
+/// Lines of context printed around a defining line.
+const DEF_CONTEXT_LINES: usize = 2;
 /// How far above a hunk to look for its enclosing definition.
 const MAX_SCOPE_LOOKBACK: usize = 400;
+
+/// The context budget for a reviewer whose per-route chunk cap is
+/// `chunk_cap`. The header is capped at a quarter of the chunk budget (never
+/// above [`CONTEXT_BUDGET_BYTES`], never below [`CONTEXT_MIN_BYTES`]).
+pub(crate) fn context_budget_for_chunk_cap(chunk_cap: usize) -> usize {
+    (chunk_cap / CONTEXT_SHARE_DENOMINATOR).clamp(CONTEXT_MIN_BYTES, CONTEXT_BUDGET_BYTES)
+}
+
+/// The effective diff-chunk cap when definition context is enabled: reserve
+/// the context share plus its wrapper inside the per-route chunk budget, so
+/// `chunk + context` stays within `route_cap`. A small cap keeps at least half
+/// of its bytes for the diff.
+pub(crate) fn chunk_cap_for_context(route_cap: usize) -> usize {
+    let reserve = context_budget_for_chunk_cap(route_cap) + CONTEXT_WRAPPER_RESERVE_BYTES;
+    route_cap.saturating_sub(reserve).max(route_cap / 2).max(1)
+}
 
 /// One file section of a chunk: post-image path and new-side hunk starts.
 fn chunk_files(chunk: &str) -> Vec<(String, Vec<usize>)> {
@@ -75,7 +106,7 @@ fn is_import(trimmed: &str) -> bool {
 
 /// Top-level constant-like names: `const X`, `static X`, `#define X`, and
 /// Python/shell `UPPER_CASE = ...` at column 0.
-fn const_name(line: &str) -> Option<String> {
+pub(crate) fn const_name(line: &str) -> Option<String> {
     let t = line.trim_start();
     let ident = |s: &str| -> Option<String> {
         let name: String = s
@@ -324,6 +355,262 @@ fn is_code_path(path: &str) -> bool {
     )
 }
 
+/// Identifiers in `s`, in source order.
+fn identifiers(s: &str) -> Vec<&str> {
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Language keywords and common builtin/type names that are never useful as a
+/// definition or a cross-chunk reference.
+fn is_noise_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "self"
+            | "this"
+            | "mut"
+            | "ref"
+            | "let"
+            | "var"
+            | "const"
+            | "static"
+            | "pub"
+            | "use"
+            | "from"
+            | "import"
+            | "as"
+            | "fn"
+            | "def"
+            | "class"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "impl"
+            | "mod"
+            | "type"
+            | "interface"
+            | "function"
+            | "func"
+            | "return"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "match"
+            | "case"
+            | "in"
+            | "not"
+            | "and"
+            | "or"
+            | "is"
+            | "none"
+            | "true"
+            | "false"
+            | "int"
+            | "char"
+            | "void"
+            | "long"
+            | "short"
+            | "float"
+            | "double"
+            | "unsigned"
+            | "signed"
+            | "bool"
+            | "string"
+            | "str"
+            | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "f32"
+            | "f64"
+            | "crate"
+            | "super"
+            | "std"
+            | "core"
+            | "alloc"
+    )
+}
+
+/// Names imported by one line: Rust `use` (including braces and `as`),
+/// Python/JS `import`/`from ... import`, and C `#include` stems.
+pub(crate) fn imported_names(line: &str) -> Vec<String> {
+    let t = line.trim().trim_end_matches(';');
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |word: &str| {
+        if word.len() >= 2 && !is_noise_symbol(word) && !out.iter().any(|w| w == word) {
+            out.push(word.to_string());
+        }
+    };
+    if let Some(rest) = t
+        .strip_prefix("pub use ")
+        .or_else(|| t.strip_prefix("use "))
+        .or_else(|| t.strip_prefix("extern crate "))
+    {
+        for word in identifiers(rest) {
+            add(word);
+        }
+    } else if let Some(rest) = t.strip_prefix("from ") {
+        let (module, names) = rest.split_once(" import ").unwrap_or((rest, ""));
+        for word in identifiers(module) {
+            add(word);
+        }
+        for word in identifiers(names) {
+            add(word);
+        }
+    } else if let Some(rest) = t.strip_prefix("import ") {
+        for word in identifiers(rest) {
+            add(word);
+        }
+    } else if let Some(rest) = t.strip_prefix("#include") {
+        let rest = rest.trim().trim_matches(['<', '>', '"']);
+        let stem = rest.rsplit('/').next().unwrap_or(rest);
+        let stem = stem.split('.').next().unwrap_or(stem);
+        add(stem);
+    } else if let Some(rest) = t.strip_prefix("using ") {
+        for word in identifiers(rest) {
+            add(word);
+        }
+    }
+    out
+}
+
+/// Map every symbol defined or imported in `lines` to the 0-based line that
+/// defines it. Used both for the chunk header and for the false-undefined
+/// post-filter.
+pub(crate) fn definition_index(lines: &[&str]) -> BTreeMap<String, usize> {
+    let mut map = BTreeMap::new();
+    let mut note = |name: String, line: usize| {
+        if name.len() >= 2 && !is_noise_symbol(&name) {
+            map.entry(name).or_insert(line);
+        }
+    };
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty()
+            || t.starts_with(['/', '*'])
+            || (t.starts_with('#') && !t.starts_with("#define") && !t.starts_with("#include"))
+        {
+            continue;
+        }
+        for name in extract_defs(line).into_iter().chain(const_name(line)) {
+            note(name, i);
+        }
+        for name in bindings_in(line) {
+            note(name, i);
+        }
+        if is_import(t) {
+            for name in imported_names(line) {
+                note(name, i);
+            }
+        }
+    }
+    map
+}
+
+/// Symbols a chunk mentions: identifiers from its added, removed and context
+/// lines, excluding diff headers. Sorted and de-duplicated so the header does
+/// not vary with hunk order.
+fn referenced_symbols(chunk: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in chunk.lines() {
+        if line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("@@")
+            || line.starts_with("\\ No newline")
+        {
+            continue;
+        }
+        let code = match line.as_bytes().first() {
+            Some(b'+' | b'-' | b' ') => &line[1..],
+            _ => line,
+        };
+        let code = code.trim_start();
+        if code.is_empty() || code.starts_with(['#', '/', '*', ';']) {
+            continue;
+        }
+        for word in identifiers(code) {
+            if word.len() < 2
+                || is_noise_symbol(word)
+                || word.starts_with(|c: char| c.is_ascii_digit())
+            {
+                continue;
+            }
+            if !out.iter().any(|w| w == word) {
+                out.push(word.to_string());
+                if out.len() >= MAX_REFERENCED_SYMBOLS {
+                    return out;
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The defining line for `symbol`, plus a few lines of context, as header
+/// lines. `None` when the symbol is not defined or imported in `lines`.
+fn definition_lines(
+    path: &str,
+    lines: &[&str],
+    index: &BTreeMap<String, usize>,
+    symbol: &str,
+) -> Vec<String> {
+    let Some(&idx) = index.get(symbol) else {
+        return Vec::new();
+    };
+    let mut out = vec![format!(
+        "- {path}:{}: {symbol} is defined or imported at the reviewed head: {}",
+        idx + 1,
+        clip(lines[idx], 120)
+    )];
+    let start = idx.saturating_sub(1);
+    let end = (idx + 1 + DEF_CONTEXT_LINES).min(lines.len());
+    for (j, line) in lines.iter().enumerate().take(end).skip(start) {
+        if j == idx {
+            continue;
+        }
+        let text = line.trim_end();
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(format!("    {path}:{}: {}", j + 1, clip(text, 120)));
+    }
+    out
+}
+
+/// Whole-file context, when the file is small enough to send verbatim. Line
+/// numbers are included so the reviewer can relate the file to the diff.
+fn whole_file_lines(path: &str, text: &str, budget: usize) -> Option<Vec<String>> {
+    if text.len() > WHOLE_FILE_THRESHOLD_BYTES || text.len() > budget {
+        return None;
+    }
+    let mut out = vec![format!(
+        "- {path}: whole file at the reviewed head ({} bytes; not part of the diff):",
+        text.len()
+    )];
+    for (i, line) in text.lines().enumerate() {
+        out.push(format!("    {:>4}: {}", i + 1, clip(line, 160)));
+    }
+    Some(out)
+}
+
 /// Per-hunk scope lines for one file: enclosing definition plus the names
 /// bound earlier in it.
 fn hunk_scopes(path: &str, lines: &[&str], hunk_starts: &[usize]) -> Vec<String> {
@@ -424,17 +711,38 @@ pub(crate) fn chunk_context(
         }
     }
     // Most specific first: every file's per-hunk scope lines, then the
-    // file-wide lists. Truncation drops the least specific information.
+    // defining lines of the symbols this chunk mentions, then the file-wide
+    // lists. Truncation drops the least specific information.
+    let refs = referenced_symbols(chunk);
+    let per_file_budget = budget / files.len().max(1);
     let mut scope: Vec<String> = Vec::new();
+    let mut defined: Vec<String> = Vec::new();
     let mut wide: Vec<String> = Vec::new();
     for (path, starts) in &files {
         if let Some(text) = read(path) {
             let lines: Vec<&str> = text.lines().collect();
             scope.extend(hunk_scopes(path, &lines, starts));
-            wide.extend(file_wide(path, &lines));
+            // A small file is cheaper and clearer as a whole than as a list
+            // of individual definitions.
+            if let Some(whole) = whole_file_lines(path, &text, per_file_budget) {
+                wide.extend(whole);
+                // Keep the compact import/definition summary as well: it is
+                // the part the existing reviewers were tuned against, and it
+                // costs a few hundred bytes on a small file.
+                wide.extend(file_wide(path, &lines));
+                continue;
+            }
+            let index = definition_index(&lines);
+            let before = defined.len();
+            for symbol in &refs {
+                defined.extend(definition_lines(path, &lines, &index, symbol));
+            }
+            if defined.len() == before {
+                wide.extend(file_wide(path, &lines));
+            }
         }
     }
-    let lines: Vec<String> = scope.into_iter().chain(wide).collect();
+    let lines: Vec<String> = scope.into_iter().chain(defined).chain(wide).collect();
     if lines.is_empty() {
         return String::new();
     }
@@ -575,5 +883,72 @@ mod tests {
             params_of("static int h(struct s *st, char *buf)"),
             vec!["st", "buf"]
         );
+    }
+    /// The reported regression: two constants defined near the top of a
+    /// ~1000-line module were flagged as undefined in a late chunk. The chunk
+    /// must carry their defining lines, not just a list of names.
+    #[test]
+    fn referenced_constants_defined_early_reach_a_late_chunk() {
+        let mut src = String::from("import os\n\nRETRY_LIMIT = 3\nQUIRK_ID = 0x1234\n");
+        for i in 0..900 {
+            src.push_str(&format!("def filler_{i}():\n    return {i}\n"));
+        }
+        src.push_str("def run():\n    return RETRY_LIMIT + QUIRK_ID\n");
+        assert!(src.len() > WHOLE_FILE_THRESHOLD_BYTES);
+        let n = src.lines().count();
+        let chunk = format!(
+            "+++ b/pkg/mod.py\n@@ -{0},1 +{0},1 @@\n+    return RETRY_LIMIT + QUIRK_ID\n",
+            n
+        );
+        let read = |p: &str| (p == "pkg/mod.py").then(|| src.clone());
+        let header = chunk_context(&chunk, &read, 2000);
+        assert!(
+            header.contains("RETRY_LIMIT is defined or imported"),
+            "{header}"
+        );
+        assert!(header.contains("RETRY_LIMIT = 3"), "{header}");
+        assert!(
+            header.contains("QUIRK_ID is defined or imported"),
+            "{header}"
+        );
+        assert!(header.contains("QUIRK_ID = 0x1234"), "{header}");
+    }
+
+    /// A file below the threshold is supplied whole, so the reviewer can see
+    /// the definition in place instead of a summary line.
+    #[test]
+    fn a_small_file_is_supplied_whole() {
+        let src = "import os\n\nPATCH_PATH = 'x'\n\ndef load():\n    return open(PATCH_PATH)\n";
+        let chunk = "+++ b/tool.py\n@@ -6,1 +6,1 @@\n+    return open(PATCH_PATH)\n";
+        let read = |p: &str| (p == "tool.py").then(|| src.to_string());
+        let header = chunk_context(chunk, &read, CONTEXT_BUDGET_BYTES);
+        assert!(
+            header.contains("whole file at the reviewed head"),
+            "{header}"
+        );
+        assert!(header.contains("PATCH_PATH = 'x'"), "{header}");
+    }
+
+    /// Context is a capped share of the per-route chunk budget, and the chunk
+    /// cap is reduced so `chunk + context` stays inside that budget.
+    #[test]
+    fn context_share_is_capped_by_the_route_chunk_budget() {
+        assert_eq!(context_budget_for_chunk_cap(9_000), 2_250);
+        assert_eq!(context_budget_for_chunk_cap(64_000), CONTEXT_BUDGET_BYTES);
+        assert_eq!(context_budget_for_chunk_cap(1_000), CONTEXT_MIN_BYTES);
+        for cap in [2_000usize, 9_000, 16_000, 32_000, 64_000] {
+            let context = context_budget_for_chunk_cap(cap);
+            let chunk = chunk_cap_for_context(cap);
+            assert!(chunk + context + CONTEXT_WRAPPER_RESERVE_BYTES <= cap);
+            assert!(chunk >= cap / 2);
+        }
+    }
+
+    #[test]
+    fn imported_names_cover_the_supported_import_styles() {
+        assert!(imported_names("use crate::limits::MAX_RETRIES;").contains(&"MAX_RETRIES".into()));
+        assert!(imported_names("from helpers import LIMIT, OTHER").contains(&"LIMIT".into()));
+        assert!(imported_names("import { build, run as go } from './x'").contains(&"go".into()));
+        assert!(imported_names("#include \"limits.h\"").contains(&"limits".into()));
     }
 }

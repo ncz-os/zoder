@@ -45,6 +45,60 @@ refused as a mixed-model review, as before.
 Consecutive hunks of one file in one chunk share a single file header, so a
 fragment-heavy diff is no longer inflated by a repeated header per hunk.
 
+## Definition context and false undefined findings
+
+When chunk context is enabled (the default; set `ZODER_REVIEW_CONTEXT=0` to
+disable it), each chunk gets a bounded post-change context tail. For each
+changed file this includes imports, top-level definitions/constants, the
+enclosing definition for each changed hunk, and defining lines for referenced
+symbols that are outside the chunk. Files below the small-file threshold are
+shown whole. The context is appended after the cache-stable review head and is
+charged against the route's `max_hunk_bytes` budget; it is never placed in the
+shared head.
+
+If a structured finding says a symbol is undefined, missing, or not imported,
+the deterministic post-filter checks the reviewed file and the sibling modules
+named by its imports. A disproved finding is removed from `findings` and
+recorded in `filtered_findings` with its symbol, reason, and evidence line. A
+lone blocking finding of this kind becomes `comment`, not `approve`, because
+disproving a finding is not proof that the change is correct. Findings without
+source evidence remain unchanged.
+
+The regression fixtures cover both sides: a constant defined in an earlier
+chunk is supplied to the later chunk and is filtered if falsely reported, while
+a genuinely absent name remains a finding. They also cover definitions in an
+imported sibling module.
+
+## Context cost measurement
+
+The following deterministic sizing measurements use three multi-file commits
+from this repository's history, the built-in 9,000-byte route cap, and an
+approximately four-characters-per-token estimate for input tokens. “Before”
+counts a 9,000-byte diff slice; “after” adds the maximum reserved context tail
+and wrapper. They are an upper-bound budget measurement (the actual context
+builder often emits less), not provider billing telemetry.
+They are sizing measurements, not provider billing telemetry.
+
+| History diff | Chunks | Before input tokens/chunk | After input tokens/chunk | Change |
+|---|---:|---:|---:|---:|
+| `7b4d4ea` (11 files, 57,102 diff bytes) | 7 | 776–2,250 | 1,050–2,893 | up to +29% |
+| `f965acb` (3 files, 21,544 diff bytes) | 3 | 886–2,250 | 1,188–2,893 | up to +34% |
+| `4fea8b7` (5 files, 11,363 diff bytes) | 2 | 591–2,250 | 819–2,893 | up to +39% |
+
+The route cap remains the hard ceiling: the implementation reserves at most a
+quarter for definition context (plus the fixed wrapper allowance), reducing
+the diff portion when necessary.
+
+## Default reviewer benchmark
+
+The requested seeded benchmark against the current local reviewer model at
+9,000, 16,000, and 32,000-byte chunks, with and without definition context,
+could not be run in this sandbox because no local OpenAI-compatible reviewer
+endpoint was reachable. No recall, false-positive, or false-undefined result
+is claimed here; the orchestrator should run that matrix and choose the route
+default from the observed data. The prior dense-model result below remains
+historical evidence only.
+
 ## Where to put it: `~/.zoder/review.toml`
 
 ```toml
