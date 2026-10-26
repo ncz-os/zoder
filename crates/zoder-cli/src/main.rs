@@ -151,22 +151,86 @@ fn finops_tags(
     }
 }
 
+/// The billing posture of the serving provider, which is authoritative for
+/// marginal billing. A metered provider is priced from the catalog; anything
+/// else (a flat-fee subscription, or a route configured
+/// `paid = false, billing = "free"`) costs $0 to call no matter what the
+/// catalog says for the model id it happened to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BillingPosture {
+    /// Pay-as-you-go API: the call is priced from the catalog.
+    Metered,
+    /// Flat-fee subscription: the marginal cost of one more call is $0.
+    Subscription,
+    /// A route configured `paid = false, billing = "free"`: $0 marginal.
+    Free,
+}
+
+impl BillingPosture {
+    /// `true` for the two $0-marginal postures: a flat plan is paid for
+    /// monthly and a free route costs nothing to serve, so in both cases
+    /// charging the catalog's list price would overstate spend.
+    pub(crate) fn is_cost_neutral(self) -> bool {
+        matches!(self, Self::Subscription | Self::Free)
+    }
+
+    /// The `billing` value recorded on ledger rows written for this posture.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Metered => "metered",
+            Self::Subscription => "subscription",
+            Self::Free => "free",
+        }
+    }
+}
+
+impl From<&Provider> for BillingPosture {
+    fn from(provider: &Provider) -> Self {
+        match provider.billing {
+            BillingMode::Subscription => Self::Subscription,
+            BillingMode::Free => {
+                if provider.paid {
+                    // A `paid = true` free-labeled route is a contradiction
+                    // in config: the operator marked the route as
+                    // incurring real spend, so price it from the catalog
+                    // rather than assuming $0.
+                    Self::Metered
+                } else {
+                    Self::Free
+                }
+            }
+            BillingMode::Metered => Self::Metered,
+        }
+    }
+}
+
 /// The resolved provider is authoritative for marginal billing. Catalog model
 /// prices are only relevant when the serving provider is actually metered.
 /// The cost to record for one call, and whether the cost is unknown.
 ///
-/// The provider's own telemetry wins when it reports a charge: it is what
-/// the provider actually billed. Otherwise a FLAT PLAN provider records
-/// $0: the plan is paid for monthly, so the marginal cost of one more call
-/// is zero, and charging the catalog's list price would overstate the
-/// spend and trip the month-to-date cap on a plan that is already paid for.
-/// The tokens are recorded either way.
+/// The provider's own cost telemetry wins when it reports a charge: it is
+/// what the provider actually billed, and it applies to a cost-neutral
+/// route too (an overage past a free tier is a real charge that must feed
+/// the paid guard). Otherwise:
 ///
-/// Every other provider is priced from the catalog: the cache hits at the
-/// cache-read rate, the misses at the input rate and the output tokens at
-/// the output rate, with the peak window that was in effect at the time.
+/// - a COST-NEUTRAL provider (a flat plan or a free route) records $0: the
+///   plan is paid for monthly and the free route costs nothing to serve, so
+///   charging the catalog's list price would overstate spend. A catalog
+///   entry for the model id never prices a free route;
+/// - a METERED provider is priced from the catalog: the cache hits at the
+///   cache-read rate, the misses at the input rate and the output tokens at
+///   the output rate, with the peak window that was in effect at the time.
+///   An explicit all-zero catalog entry records $0; an entry the catalog
+///   cannot price records `cost_unknown` (the numeric field stays 0 as a
+///   placeholder that reports must not treat as a verified-free call).
+///
+/// `tokens_in` is the AUTHORITATIVE prompt count. When the response carried
+/// no usage at all it must be 0 (the `prompt_tokens` field was `None`),
+/// never a guess: pricing a metered call from a fabricated input count
+/// would bill tokens the call may not have used, and a metered provider
+/// with no usage record is unknown, not $0.
 pub(crate) fn ledger_call_cost(
-    flat_plan: bool,
+    posture: BillingPosture,
     telemetry_cost_usd: Option<f64>,
     pricing: &PricingCatalog,
     model: &str,
@@ -174,11 +238,11 @@ pub(crate) fn ledger_call_cost(
     ts: Option<DateTime<Utc>>,
 ) -> (f64, bool) {
     if let Some(cost) = telemetry_cost_usd {
-        if cost.is_finite() && cost >= 0.0 {
+        if cost.is_finite() && cost > 0.0 {
             return (cost, false);
         }
     }
-    if flat_plan {
+    if posture.is_cost_neutral() {
         return (0.0, false);
     }
     match pricing.classify_cost_with_cache(
@@ -195,7 +259,7 @@ pub(crate) fn ledger_call_cost(
 }
 
 fn is_cost_neutral_provider(provider: &Provider) -> bool {
-    !provider.paid && provider.billing != BillingMode::Metered
+    BillingPosture::from(provider).is_cost_neutral()
 }
 
 /// Persist a completed turn before it can be reported as successful. Ledger
@@ -6574,19 +6638,26 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // a policy violation is a failure.
     let verify = gate.verify_free(&entry, &res.telemetry);
 
-    // M4: honest token accounting from real usage when available.
+    // M4: honest token accounting from real usage when available. A response
+    // that carried no usage block at all has NO authoritative prompt count:
+    // record 0, never a guess. A metered provider priced from a fabricated
+    // input count would bill tokens the call may not have used, and the
+    // missing-usage row must come out `cost_unknown`, not a known $0.
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     // Cost: trust live telemetry first; otherwise price from the provider-derived
     // catalog (free-tier models resolve to $0 chargeback, paid models to their
     // rate). `cost_at` is time-of-day aware so a DeepSeek call at 20:00 UTC
     // uses the configured off-peak rate, not peak — Finding #23.
+    let posture = eng
+        .cfg
+        .provider(&used_provider_id)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
     let (cost, unknown_cost) = ledger_call_cost(
-        eng.cfg
-            .provider(&used_provider_id)
-            .is_some_and(|p| p.is_flat_plan()),
+        posture,
         res.telemetry.cost_usd,
         &pricing,
         &used_model,
@@ -6633,6 +6704,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         calls: 1,
         violation,
         tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         winning_reservation.ok_or_else(|| {
@@ -8558,11 +8630,12 @@ async fn agentic_cost(
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
     alias: &str,
+    posture: BillingPosture,
 ) -> AgenticCostReport {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..AGENTIC_COST_MAX_ATTEMPTS {
         match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
-            Ok(sum) => return classify_agentic_cost_summary(&sum),
+            Ok(sum) => return classify_agentic_cost_summary(&sum, posture),
             Err(e) => {
                 last_err = Some(e);
                 // Don't sleep after the final attempt — the next call
@@ -8602,7 +8675,10 @@ async fn agentic_cost(
 /// as `cost_unknown` for any longer.
 const AGENTIC_COST_MAX_ATTEMPTS: u32 = 3;
 
-fn classify_agentic_cost_summary(sum: &zoder_core::EngineCostSummary) -> AgenticCostReport {
+fn classify_agentic_cost_summary(
+    sum: &zoder_core::EngineCostSummary,
+    posture: BillingPosture,
+) -> AgenticCostReport {
     let cost = sum.window_cost_usd();
     // Pick the dominant model in the window for attribution.
     let model = sum
@@ -8623,11 +8699,35 @@ fn classify_agentic_cost_summary(sum: &zoder_core::EngineCostSummary) -> Agentic
     // An empty successful query only proves that the engine found no
     // rows in the requested slice. It does not authoritatively price
     // the turn, so never turn it into a known $0 ledger entry.
-    if sum.request_count > 0 && !sum.by_model.is_empty() && cost.is_finite() && cost >= 0.0 {
-        (cost, tin, tout, model, true, calls)
-    } else {
-        (0.0, tin, tout, model, false, calls)
+    if sum.request_count > 0 && !sum.by_model.is_empty() {
+        // A positive, finite engine cost is the engine's own ledger for the
+        // window: record it as authoritative, whatever the posture.
+        if cost.is_finite() && cost > 0.0 {
+            return (cost, tin, tout, model, true, calls);
+        }
+        // cost == 0.0 (or a query that came back with no priced row) needs
+        // the posture to decide what it means. A cost-neutral provider
+        // (subscription or a free route) legitimately costs $0: the engine's
+        // $0 — like a failed, overlapped, or empty query — is a known $0.
+        if posture.is_cost_neutral() {
+            return (0.0, tin, tout, model, true, calls);
+        }
+        // A METERED provider with real traffic but a $0 total is the engine
+        // saying "I priced this as free" — which it only does for an id it
+        // has no price row for. Do NOT re-price the tokens from zoder's own
+        // catalog: the engine summary carries no cache-hit counts, so every
+        // cached token would be billed at the miss rate. Record unknown; the
+        // pre-dispatch budget gate already priced the reservation.
+        if tin + tout > 0 {
+            let name = model.as_deref().unwrap_or("<unknown model>");
+            eprintln!(
+                "zoder: engine reported $0 for metered model {name}; its price \
+                 catalog has no row for it; recorded as cost unknown"
+            );
+        }
+        return (0.0, tin, tout, model, false, calls);
     }
+    (0.0, tin, tout, model, false, calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -8758,7 +8858,8 @@ mod agentic_cost_tests {
     #[test]
     fn empty_successful_cost_query_is_unknown_not_known_zero() {
         let summary = zoder_core::EngineCostSummary::default();
-        let (cost, tin, tout, model, known, calls) = classify_agentic_cost_summary(&summary);
+        let (cost, tin, tout, model, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert_eq!((cost, tin, tout), (0.0, 0, 0));
         assert_eq!(
             model, None,
@@ -8790,7 +8891,10 @@ mod agentic_cost_tests {
         let daemon_model = live_registry.model_for_agent("author");
         assert_eq!(daemon_model, Some("stale-model"));
 
-        let empty = classify_agentic_cost_summary(&zoder_core::EngineCostSummary::default());
+        let empty = classify_agentic_cost_summary(
+            &zoder_core::EngineCostSummary::default(),
+            BillingPosture::Metered,
+        );
         let failed = unavailable_agentic_cost(AgenticCostGap::QueryFailed);
         let overlapped = unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped);
         for (state, report) in [
@@ -8839,9 +8943,98 @@ mod agentic_cost_tests {
                 cost_usd: 0.25,
             },
         );
-        let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary);
+        let (_, _, _, _, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert!(known);
         assert_eq!(calls, 3);
+    }
+
+    fn summary_with_model(model: &str, tin: u64, tout: u64, cost: f64) -> zoder_core::EngineCostSummary {
+        let mut summary = zoder_core::EngineCostSummary {
+            request_count: 1,
+            ..Default::default()
+        };
+        summary.by_model.insert(
+            model.to_string(),
+            zoder_core::EngineModelStats {
+                model: model.to_string(),
+                request_count: 1,
+                input_tokens: tin,
+                output_tokens: tout,
+                total_tokens: tin + tout,
+                cost_usd: cost,
+            },
+        );
+        summary
+    }
+
+    /// The live-bug fix: a metered engine that served real traffic but
+    /// reports $0 has priced it from a catalog with no row for the id.
+    /// That $0 is NOT authoritative: the ledger row must be `cost_unknown`,
+    /// so reports never sum an unpriced metered call as a verified-free
+    /// one.
+    #[test]
+    fn a_metered_engine_zero_with_tokens_is_unknown_not_known_zero() {
+        let summary = summary_with_model("deepseek-flash", 57_043_226, 211_229, 0.0);
+        let (cost, tin, tout, model, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
+        assert_eq!((cost, tin, tout, model.as_deref()), (0.0, 57_043_226, 211_229, Some("deepseek-flash")));
+        assert!(!known, "a metered $0 with real traffic must be cost_unknown");
+        assert_eq!(calls, 1);
+    }
+
+    /// A cost-neutral engine legitimately costs $0: the engine's $0 — like
+    /// a failed or overlapped query — is a KNOWN $0, so the row is clean and
+    /// the free guard never fires on it.
+    #[test]
+    fn a_cost_neutral_engine_zero_is_known_zero() {
+        let summary = summary_with_model("MiniMax-M3", 1_000, 500, 0.0);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Free);
+        assert_eq!(cost, 0.0);
+        assert!(known, "a free route's $0 is known");
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Subscription);
+        assert_eq!(cost, 0.0);
+        assert!(known, "a flat plan's $0 is known");
+    }
+
+    /// A free route whose engine cost query FAILED (or overlapped) is still
+    /// a known $0: the posture alone proves the call cost nothing.
+    #[test]
+    fn a_cost_neutral_provider_query_failure_is_known_zero() {
+        for (name, report) in [
+            ("query failed", unavailable_agentic_cost(AgenticCostGap::QueryFailed)),
+            ("scope overlapped", unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped)),
+            ("scope unavailable", unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable)),
+        ] {
+            let (cost, _, _, _, known, _) = report;
+            assert_eq!(cost, 0.0);
+            // The report from an unavailable query is unknown-agnostic; the
+            // CALL SITE turns it into a known $0 for a cost-neutral
+            // provider. The classification of an engine-reported $0 is what
+            // the posture decides:
+            let summary = summary_with_model("MiniMax-M3", 10, 5, 0.0);
+            let (_, _, _, _, known2, _) =
+                classify_agentic_cost_summary(&summary, BillingPosture::Free);
+            let _ = (name, known);
+            assert!(known2, "free route: engine $0 is a known $0");
+        }
+    }
+
+    /// A positive engine cost is recorded as authoritative, whatever the
+    /// posture (an overage past a free tier is a real charge).
+    #[test]
+    fn a_positive_engine_cost_is_recorded() {
+        let summary = summary_with_model("deepseek-flash", 1_000, 500, 0.31);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
+        assert!((cost - 0.31).abs() < 1e-9);
+        assert!(known);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Free);
+        assert!((cost - 0.31).abs() < 1e-9);
+        assert!(known, "a billed free-route overage is recorded, feeding the paid guard");
     }
 
     #[test]
@@ -11250,11 +11443,22 @@ pub(crate) async fn agentic_turn(
     // comment), so a fallback to a different alias is a known minor
     // accounting miss — closing it requires the engine to accept a
     // scope key from the caller.
+    // The serving provider is resolved up front: the engine $0 classification
+    // (metered + $0 + real traffic = unknown; cost-neutral = known $0) needs
+    // the posture while the cost query is being interpreted, and the ledger
+    // row, the paid gate and the unknown-cost check all reuse the same
+    // resolution below.
+    let posture = routing
+        .real_provider_for_model(&eng.cfg, &used_primary)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let (cost, tokens_in, tokens_out, cost_model, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             match cost_scope.and_then(|scope| scope.finish().ok()) {
-                Some((from, to, false)) => agentic_cost(&socket2, from, to, &used_alias).await,
+                Some((from, to, false)) => {
+                    agentic_cost(&socket2, from, to, &used_alias, posture).await
+                }
                 Some((_, _, true)) => unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
                 None => unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
             }
@@ -11292,10 +11496,14 @@ pub(crate) async fn agentic_turn(
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    // Lifted out of the closure below: the unknown-cost check needs it too.
-    let provider_cost_neutral = routing
+    // The engine may have run a different model than the requested one; the
+    // serving provider for THAT model is authoritative for billing posture.
+    let posture = routing
         .real_provider_for_model(&eng.cfg, &model_used)
-        .is_some_and(is_cost_neutral_provider);
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
+    // Lifted out of the closure below: the unknown-cost check needs it too.
+    let provider_cost_neutral = posture.is_cost_neutral();
     let paid_failure = (engine_kind == EngineKind::Zeroclaw)
         .then(|| {
             paid_without_opt_in(
@@ -11351,6 +11559,7 @@ pub(crate) async fn agentic_turn(
         calls: request_count,
         violation,
         tags: finops_tags(cli, tokens_in, None),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         ledger_reservation,
@@ -12931,12 +13140,15 @@ fn reconcile_probe_success(
 ) -> anyhow::Result<()> {
     let tokens_in = result.prompt_tokens.unwrap_or(0);
     let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
+    let posture = eng
+        .cfg
+        .provider(provider_id)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = Utc::now();
     let (cost, cost_unknown) = ledger_call_cost(
-        eng.cfg
-            .provider(provider_id)
-            .is_some_and(|p| p.is_flat_plan()),
+        posture,
         result.telemetry.cost_usd,
         &pricing,
         model_id,
@@ -12952,9 +13164,7 @@ fn reconcile_probe_success(
         model_entry.and_then(|model| gate.verify_free(model, &result.telemetry).err());
     let paid_failure = paid_without_opt_in(
         cli.allow_paid,
-        eng.cfg
-            .provider(provider_id)
-            .is_some_and(is_cost_neutral_provider),
+        posture.is_cost_neutral(),
         "health probe",
         model_id,
         model_entry.is_some_and(|model| !model.free),
@@ -12985,6 +13195,7 @@ fn reconcile_probe_success(
         calls: 1,
         violation,
         tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         reservation,
@@ -14310,9 +14521,12 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // ledger at ingestion time — a DeepSeek call recorded at 20:00 UTC
     // is reconciled at its off-peak rate, not peak.
     let entries = ledger.entries_in(Some(since), None)?;
-    let flat_plan = cfg.provider(provider).is_some_and(|p| p.is_flat_plan());
+    let posture = cfg
+        .provider(provider)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let (local_known, local_cost_unknown) =
-        reconciliation_local_cost(&entries, provider, &pricing, flat_plan);
+        reconciliation_local_cost(&entries, provider, &pricing, posture);
     let local = (!local_cost_unknown).then_some(local_known);
     let delta = local.map(|value| res.billed_usd - value);
 
@@ -14353,7 +14567,7 @@ fn reconciliation_local_cost(
     entries: &[Entry],
     provider: &str,
     pricing: &PricingCatalog,
-    flat_plan: bool,
+    posture: BillingPosture,
 ) -> (f64, bool) {
     let mut known = 0.0;
     let mut unknown = false;
@@ -14361,11 +14575,10 @@ fn reconciliation_local_cost(
         .iter()
         .filter(|entry| entry.provider.eq_ignore_ascii_case(provider))
     {
-        // A flat plan is paid for monthly: the marginal cost of one more
-        // call is $0, which is what the ledger row records. Re-pricing it
-        // at the catalog's list price here would report a spend the
-        // provider never charged.
-        if flat_plan {
+        // A cost-neutral provider (flat plan or free route) records $0, which
+        // is what its ledger rows carry. Re-pricing it at the catalog's list
+        // price here would report a spend the provider never charged.
+        if posture.is_cost_neutral() {
             continue;
         }
         match pricing.classify_cost_with_cache(
@@ -14402,10 +14615,48 @@ mod reconciliation_cost_tests {
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
         };
-        let (known, unknown) =
-            reconciliation_local_cost(&[entry], "openai", &PricingCatalog::default(), false);
+        let (known, unknown) = reconciliation_local_cost(
+            &[entry],
+            "openai",
+            &PricingCatalog::default(),
+            BillingPosture::Metered,
+        );
         assert_eq!(known, 0.0);
         assert!(unknown, "missing pricing must not become authoritative $0");
+    }
+
+    /// A cost-neutral provider reconciles to $0: its ledger rows record $0
+    /// and re-pricing them at the catalog's list price would report a spend
+    /// the provider never charged — even for a model the catalog prices.
+    #[test]
+    fn a_cost_neutral_provider_reconciles_to_zero() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "priced/model-alpha".to_string(),
+            zoder_core::pricing::ModelPrice {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        let entry = Entry {
+            ts_utc: chrono::Utc::now(),
+            provider: "openai".into(),
+            model: "priced/model-alpha".into(),
+            host: "api.openai.com".into(),
+            tokens_in: 1_000_000,
+            tokens_out: 1_000_000,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+            billing: Some("free".into()),
+        };
+        let (known, unknown) =
+            reconciliation_local_cost(&[entry], "openai", &cat, BillingPosture::Free);
+        assert_eq!(known, 0.0);
+        assert!(!unknown, "a free route is $0, not unknown");
     }
 }
 
@@ -20415,6 +20666,23 @@ mod ledger_call_cost_tests {
     use super::*;
     use zoder_core::pricing::{CallTokens, ModelPrice, PricingCatalog};
 
+    fn metered_provider(billing: BillingMode, paid: bool) -> Provider {
+        Provider {
+            model_aliases: Vec::new(),
+            id: "p".into(),
+            engine_provider_ref: None,
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid,
+            billing,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: None,
+            max_context_tokens: None,
+        }
+    }
+
     /// A catalog with one model priced the way a metered provider bills it:
     /// a cache read is cheaper than a miss, and the output costs more.
     fn catalog() -> PricingCatalog {
@@ -20438,7 +20706,7 @@ mod ledger_call_cost_tests {
     fn the_cache_hits_bill_at_the_cache_rate() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "priced/model-alpha",
@@ -20460,7 +20728,7 @@ mod ledger_call_cost_tests {
     fn a_call_without_cache_hits_bills_at_the_input_rate() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "priced/model-alpha",
@@ -20482,7 +20750,29 @@ mod ledger_call_cost_tests {
     fn a_flat_plan_provider_records_zero_not_the_list_price() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            true,
+            BillingPosture::Subscription,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 1_000_000,
+                cache_hit_tokens: 900_000,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert_eq!(cost, 0.0);
+    }
+
+    /// A route configured `paid = false, billing = "free"` costs $0 to
+    /// serve: the row records $0 even though the catalog prices the model
+    /// it happened to serve. The catalog must never price a free route.
+    #[test]
+    fn a_free_route_records_zero_even_with_a_catalog_price() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Free,
             None,
             &cat,
             "priced/model-alpha",
@@ -20498,13 +20788,13 @@ mod ledger_call_cost_tests {
     }
 
     /// The provider's own telemetry wins: it is what the provider actually
-    /// billed, and it applies to a flat plan too (an overage past the plan
-    /// is a real charge).
+    /// billed, and it applies to a free route too (an overage past the free
+    /// tier is a real charge that must feed the paid guard).
     #[test]
     fn the_provider_telemetry_wins_over_the_catalog() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             Some(0.25),
             &cat,
             "priced/model-alpha",
@@ -20519,6 +20809,28 @@ mod ledger_call_cost_tests {
         assert!((cost - 0.25).abs() < 1e-9, "cost was {cost}");
     }
 
+    /// Positive telemetry on a COST-NEUTRAL route is still recorded: a
+    /// "free" route that bills is a real charge (and the paid guard sees
+    /// it).
+    #[test]
+    fn a_free_route_telemetry_charge_is_recorded() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Free,
+            Some(0.07),
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert!((cost - 0.07).abs() < 1e-9, "cost was {cost}");
+    }
+
     /// A model the catalog does not know is unknown, never $0: an unknown
     /// cost fails the month-to-date gate closed, while a $0 cost would let
     /// a paid call through unpriced.
@@ -20526,7 +20838,7 @@ mod ledger_call_cost_tests {
     fn an_unpriced_model_is_unknown_not_free() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "unpriced/model-omega",
@@ -20541,13 +20853,14 @@ mod ledger_call_cost_tests {
         assert_eq!(cost, 0.0);
     }
 
-    /// A flat plan's cost is known (it is $0), so it does not fail the
-    /// month-to-date gate closed the way an unknown price does.
+    /// A cost-neutral provider's cost is known (it is $0), so it does not
+    /// fail the month-to-date gate closed the way an unknown price does —
+    /// even for a model the catalog does not know.
     #[test]
     fn a_flat_plan_cost_is_known() {
         let cat = catalog();
         let (_, unknown) = ledger_call_cost(
-            true,
+            BillingPosture::Subscription,
             None,
             &cat,
             "unpriced/model-omega",
@@ -20561,28 +20874,27 @@ mod ledger_call_cost_tests {
         assert!(!unknown);
     }
 
-    /// A provider on a flat plan reports `billing = subscription`; a metered
-    /// or free one does not.
+    /// The posture is derived from the provider's billing mode: a flat plan
+    /// is Subscription, an unpaid `billing = "free"` route is Free, and
+    /// metered stays metered. A `paid = true` free-labeled route is a
+    /// config contradiction that must still be priced, not assumed $0.
     #[test]
-    fn only_a_subscription_provider_is_a_flat_plan() {
-        let mut p = Provider {
-            model_aliases: Vec::new(),
-            id: "p".into(),
-            engine_provider_ref: None,
-            base_url: "https://gw.example/v1".into(),
-            kind: "openai-chat".into(),
-            auth: zoder_core::Auth::None,
-            paid: false,
-            billing: BillingMode::Metered,
-            subscription: None,
-            serves: Vec::new(),
-            azure_api_version: None,
-            max_context_tokens: None,
-        };
-        assert!(!p.is_flat_plan());
-        p.billing = BillingMode::Free;
-        assert!(!p.is_flat_plan());
-        p.billing = BillingMode::Subscription;
-        assert!(p.is_flat_plan());
+    fn the_posture_is_derived_from_the_billing_mode() {
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Metered, false)),
+            BillingPosture::Metered
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Subscription, false)),
+            BillingPosture::Subscription
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Free, false)),
+            BillingPosture::Free
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Free, true)),
+            BillingPosture::Metered
+        );
     }
 }

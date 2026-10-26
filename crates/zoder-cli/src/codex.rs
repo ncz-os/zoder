@@ -102,9 +102,10 @@ async fn complete_once(
 
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
+    let posture = crate::BillingPosture::from(provider_cfg);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let (cost, cost_unknown) = crate::ledger_call_cost(
-        provider_cfg.is_flat_plan(),
+        posture,
         res.telemetry.cost_usd,
         &pricing,
         &model,
@@ -139,6 +140,8 @@ async fn complete_once(
         cost_unknown,
         calls: 1,
         violation: violation.clone(),
+        tags: Default::default(),
+        billing: Some(posture.as_str().to_string()),
     });
 
     // Feed the breaker: reviewer/panel calls previously bypassed health entirely,
