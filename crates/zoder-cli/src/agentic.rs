@@ -10004,7 +10004,12 @@ mod tests {
     #[test]
     fn import_shape_false_findings_are_filtered_end_to_end() {
         let source = crate::review_filter::tests::report_module(true);
-        let read = |p: &str| (p == "tools/report.py").then(|| source.clone());
+        let read = |p: &str| {
+            // A path the fixture does not know means the filter reads no file
+            // and keeps every finding: fail loudly instead of passing empty.
+            assert_eq!(p, "tools/report.py", "fixture path changed");
+            (p == "tools/report.py").then(|| source.clone())
+        };
         let findings: Vec<Finding> = crate::review_filter::tests::import_shapes()
             .into_iter()
             .map(|(title, body, location)| Finding {
@@ -10040,7 +10045,10 @@ mod tests {
 
         // With the imports removed the same findings are kept.
         let bare = crate::review_filter::tests::report_module(false);
-        let read = |p: &str| (p == "tools/report.py").then(|| bare.clone());
+        let read = |p: &str| {
+            assert_eq!(p, "tools/report.py", "fixture path changed");
+            (p == "tools/report.py").then(|| bare.clone())
+        };
         let mut review = ReviewOutput {
             verdict: "request_changes".into(),
             summary: "four import complaints".into(),
