@@ -86,6 +86,8 @@ corpus-tests:
   script:
     - python3 scripts/tests/corpus-freshness-tests.py
     - python3 scripts/tests/corpus-gate-split-tests.py
+    - python3 scripts/tests/bench-fetchers-tests.py
+    - python3 scripts/tests/pricing-conformance-tests.py
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
