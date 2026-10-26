@@ -6787,9 +6787,15 @@ raise --max-tokens or lower its reasoning effort",
         res.telemetry.cost_usd,
         &pricing,
         &used_model,
+        // No usage block: price nothing (a metered call then records
+        // cost unknown); the estimated output count is still recorded.
         zoder_core::pricing::CallTokens {
             tokens_in,
-            tokens_out,
+            tokens_out: if res.prompt_tokens.is_some() {
+                tokens_out
+            } else {
+                0
+            },
             cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
         },
         Some(ts_utc),
@@ -12249,6 +12255,13 @@ pub(crate) async fn agentic_turn(
         }
         EngineKind::Goose => (0.0, run.input_tokens, 0, None, false, 1),
     };
+    // A cost-neutral route (free or flat plan) costs $0 even when the engine's
+    // cost query failed or overlapped another turn: there is nothing to price.
+    let (cost, cost_known) = if !cost_known && posture.is_cost_neutral() {
+        (0.0, true)
+    } else {
+        (cost, cost_known)
+    };
 
     // Defense in depth: pre-dispatch resolution already proves `-m` maps to
     // this agent against the daemon's live config. A racing config reload or
@@ -13936,9 +13949,15 @@ fn reconcile_probe_success(
         result.telemetry.cost_usd,
         &pricing,
         model_id,
+        // No usage block: price nothing (a metered call then records
+        // cost unknown); the estimated output count is still recorded.
         zoder_core::pricing::CallTokens {
             tokens_in,
-            tokens_out,
+            tokens_out: if result.prompt_tokens.is_some() {
+                tokens_out
+            } else {
+                0
+            },
             cache_hit_tokens: result.cached_prompt_tokens.unwrap_or(0),
         },
         Some(ts_utc),
