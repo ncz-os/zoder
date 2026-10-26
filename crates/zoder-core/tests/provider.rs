@@ -19,6 +19,7 @@ fn provider(base_url: &str) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -823,6 +824,7 @@ fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -1476,6 +1478,7 @@ fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
@@ -1906,6 +1909,7 @@ fn azure_provider(base_url: &str, auth: Auth, azure_api_version: Option<&str>) -
         serves: Vec::new(),
         azure_api_version: azure_api_version.map(|s| s.to_string()),
         max_context_tokens: None,
+        model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
 }
