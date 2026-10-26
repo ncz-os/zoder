@@ -999,7 +999,9 @@ enum Cmd {
     },
     /// Model health / circuit-breaker status.
     Health {
-        /// Actively ping every free model and record the result.
+        /// Actively ping the free models the default provider serves and
+        /// record the result. With `-m`, probe only that exact model on the
+        /// providers configured to serve it (the same scope as `--all -m`).
         #[arg(long)]
         probe: bool,
         /// Probe every configured provider's live model catalog (not just
@@ -12886,11 +12888,7 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
         // of the sweep (e.g. a mid-sweep ledger/reconcile failure) lost
         // every partial in-memory result that had already been probed.
         // Capture the probe result, save first, THEN propagate the error.
-        let probe_result = if opts.all {
-            run_probe_all(cli, &eng, &mut health, cli.quiet, cli.json).await
-        } else {
-            run_probe_default(cli, &eng, &mut health, cli.quiet).await
-        };
+        let probe_result = run_health_probe(cli, &eng, &mut health, opts.all).await;
         save_health(&health);
         probe_result?;
     }
@@ -12998,9 +12996,50 @@ fn reconcile_probe_success(
     )
 }
 
-/// Backward-compatible probe: default provider only, free chat candidates.
-/// Preserved unchanged for `--probe` without `--all` so existing scripts
-/// keep their narrow, fast behavior.
+/// Pick the probe for `health --probe`.
+///
+/// `-m` names one exact model, so it always takes the `--all` planner, which
+/// probes that model only on the providers whose `serves` list claims it and
+/// fails when none does. Before this, `--probe -m X` without `--all` ignored
+/// `-m` and pinged every free corpus model on the default provider.
+async fn run_health_probe(
+    cli: &Cli,
+    eng: &Engine,
+    health: &mut HealthStore,
+    all: bool,
+) -> anyhow::Result<()> {
+    if all || cli.model.is_some() {
+        run_probe_all(cli, eng, health, cli.quiet, cli.json).await
+    } else {
+        run_probe_default(cli, eng, health, cli.quiet).await
+    }
+}
+
+/// Free chat candidates the default probe may ping on `provider`: only the
+/// corpus models the provider claims through a non-empty `serves` prefix.
+///
+/// Routing never sends a model to a provider that does not serve it, so a
+/// probe of an unserved id measures nothing. It is still a real request, and
+/// its failed-call ledger row names a model the provider never ran, which
+/// reads later as if that model had served a call.
+fn default_probe_targets(
+    provider: &zoder_core::config::Provider,
+    corpus: &zoder_core::Corpus,
+) -> Vec<String> {
+    corpus
+        .free_chat()
+        .filter(|m| {
+            provider
+                .serves
+                .iter()
+                .any(|prefix| !prefix.is_empty() && m.id.starts_with(prefix.as_str()))
+        })
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+/// Default probe: the default provider only, and only the free chat
+/// candidates that provider serves (see [`default_probe_targets`]).
 async fn run_probe_default(
     cli: &Cli,
     eng: &Engine,
@@ -13033,9 +13072,23 @@ async fn run_probe_default(
     )?;
     let strict_free = (eng.cfg.strict_free && !cli.lenient_telemetry) || cli.require_free;
     let gate = PolicyGate::new(&eng.cfg, cli.allow_paid, strict_free);
-    let targets: Vec<String> = eng.corpus.free_chat().map(|m| m.id.clone()).collect();
+    let targets = default_probe_targets(provider_cfg, &eng.corpus);
+    if targets.is_empty() {
+        if !quiet {
+            eprintln!(
+                "[zoder] no free corpus model is served by default provider '{}'; nothing \
+                 probed. Use `health --probe --all` to probe every provider's live catalog.",
+                provider_cfg.id
+            );
+        }
+        return Ok(());
+    }
     if !quiet {
-        eprintln!("[zoder] probing {} free models...", targets.len());
+        eprintln!(
+            "[zoder] probing {} free models served by {}...",
+            targets.len(),
+            provider_cfg.id
+        );
     }
     for id in &targets {
         let model_entry = eng
@@ -15776,6 +15829,171 @@ mod probe_skip_class_tests {
              even if the sweep later errors"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod default_probe_scope_tests {
+    // `health --probe` used to ping every free corpus model on the default
+    // provider and ignore `-m`. A provider that serves one model answered
+    // every other id with 404, and each failed ping left a ledger row naming
+    // a model the provider never ran. A job runner that read the ledger then
+    // credited the run's work to the first of those names.
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zoder_core::{Corpus, ModelEntry, Provider};
+
+    const SERVED: &str = "local-coder";
+    const UNSERVED: &str = "vendor/free-model:free";
+
+    fn free_chat(id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            kind: "chat".into(),
+            free: true,
+            route_candidate: true,
+            ..Default::default()
+        }
+    }
+
+    fn corpus() -> Corpus {
+        let models = vec![free_chat(UNSERVED), free_chat(SERVED)];
+        Corpus {
+            source: "test".into(),
+            arena_date: "2026-07-09".into(),
+            count: models.len(),
+            models,
+            ..Default::default()
+        }
+    }
+
+    fn provider(base_url: &str, serves: &[&str]) -> Provider {
+        Provider {
+            model_aliases: Vec::new(),
+            id: "local".into(),
+            engine_provider_ref: None,
+            base_url: base_url.into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: serves.iter().map(|s| s.to_string()).collect(),
+            azure_api_version: None,
+            max_context_tokens: None,
+        }
+    }
+
+    /// A provider that knows no model at all: every request gets a 404, the
+    /// answer a single-model server gives for an id it does not serve.
+    async fn not_found_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string(r#"{"error":{"message":"model does not exist","code":404}}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn requested_models(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter_map(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    fn ledger_models(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .filter_map(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    async fn probe(
+        args: &[&str],
+        serves: &[&str],
+    ) -> (anyhow::Result<()>, Vec<String>, Vec<String>) {
+        let server = not_found_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers = vec![provider(&format!("{}/v1", server.uri()), serves)];
+        cfg.default_provider = "local".into();
+        let eng = Engine::from_parts(cfg, corpus());
+        let mut argv = vec!["zoder", "--quiet", "health", "--probe"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).expect("health probe arguments parse");
+        let all = args.contains(&"--all");
+        let mut health = HealthStore::load(&dir.path().join("health.json"));
+        let result = run_health_probe(&cli, &eng, &mut health, all).await;
+        let requested = requested_models(&server).await;
+        let ledger = ledger_models(&dir.path().join("ledger.jsonl"));
+        (result, requested, ledger)
+    }
+
+    #[test]
+    fn default_targets_are_only_the_models_the_provider_serves() {
+        let served = provider("https://gw.example/v1", &[SERVED]);
+        assert_eq!(default_probe_targets(&served, &corpus()), vec![SERVED]);
+        // An empty prefix claims nothing, exactly as routing treats it.
+        let empty = provider("https://gw.example/v1", &[""]);
+        assert!(default_probe_targets(&empty, &corpus()).is_empty());
+        let none = provider("https://gw.example/v1", &[]);
+        assert!(default_probe_targets(&none, &corpus()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_probe_never_sends_an_unserved_model_to_the_default_provider() {
+        let (result, requested, ledger) = probe(&[], &[SERVED]).await;
+        result.expect("a 404 probe is recorded, not an error");
+        assert_eq!(requested, vec![SERVED], "only the served model is pinged");
+        assert!(
+            !ledger.iter().any(|m| m == UNSERVED),
+            "no ledger row may name a model the provider does not serve: {ledger:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_with_model_pings_only_that_model() {
+        let (result, requested, ledger) = probe(&["-m", SERVED], &[SERVED]).await;
+        result.expect("a 404 probe is recorded, not an error");
+        assert_eq!(requested, vec![SERVED]);
+        assert!(!ledger.iter().any(|m| m == UNSERVED), "{ledger:?}");
+    }
+
+    #[tokio::test]
+    async fn probe_with_an_unserved_model_fails_before_any_request() {
+        let (result, requested, ledger) = probe(&["-m", UNSERVED], &[SERVED]).await;
+        let err = result.expect_err("no provider serves the model");
+        assert!(
+            err.to_string().contains("no configured provider serves"),
+            "{err}"
+        );
+        assert!(requested.is_empty(), "{requested:?}");
+        assert!(ledger.is_empty(), "{ledger:?}");
+    }
+
+    #[tokio::test]
+    async fn default_probe_with_no_served_free_model_sends_nothing() {
+        let (result, requested, ledger) = probe(&[], &["other/"]).await;
+        result.expect("nothing to probe is not an error");
+        assert!(requested.is_empty(), "{requested:?}");
+        assert!(ledger.is_empty(), "{ledger:?}");
     }
 }
 

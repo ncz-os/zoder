@@ -1993,7 +1993,7 @@ Options:
           Pin a model id: skips routing and selects the engine agent configured for that exact model. If zeroclaw has no matching agent route, execution fails before the turn instead of substituting another model. `-m` supersedes `--agent` configuration when both are specified. Use `--agent <alias>` to select through the agent's direct model or model_provider route
 
       --probe
-          Actively ping every free model and record the result
+          Actively ping the free models the default provider serves and record the result. With `-m`, probe only that exact model on the providers configured to serve it (the same scope as `--all -m`)
 
       --all
           Probe every configured provider's live model catalog (not just the default provider / free chat candidates). With `-m`, probe only that exact model on providers configured to serve it. Discovery calls `GET /v1/models` per provider; if that fails, falls back to the provider's declared model. Output is a per-provider report with model/status/latency rows
