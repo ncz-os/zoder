@@ -12,9 +12,13 @@ as well is a behaviour change that should wait for the benchmark.
 Not applied, not pushed: the orchestrator deploys after review.
 
 The hunk below is a real unified diff against the current
-fleet/zoder-config/config.toml. Apply from the FleetOps repo root with
-`git apply gitops-fleet-config.patch`, or `git am` this file after adding it
-to that repo.
+`fleet/zoder-config/config.toml`. From the FleetOps repo root:
+
+    git apply <path-to>/zoder-config.patch
+
+where <path-to> is wherever this file lives (in zoder it is
+gitops/fleet/zoder-config.patch). Use `git am` instead if you want the commit
+message above.
 
 ---
 --- a/fleet/zoder-config/config.toml
@@ -63,7 +67,7 @@ to that repo.
 +# A local vLLM model has no per-token bill, so a summarised history is pure
 +# quality risk for no saving. To pin it explicitly:
 +#
-+# [profiles.<other>.context_levers]
++# [profiles.OTHER.context_levers]
 +# tool_output_cap_bytes = 16384
 +# elide_after_turns = 8
 +# elide_min_bytes = 2048
