@@ -88,6 +88,7 @@ fn _force_imports_used() {
     let _budget: Budget = Budget::default();
     let _config: Config = Config::default_provider(std::path::Path::new("/tmp"));
     let _provider: Provider = Provider {
+        model_aliases: Vec::new(),
         id: "x".into(),
         engine_provider_ref: None,
         base_url: "https://example.invalid/v1".into(),

@@ -1434,6 +1434,7 @@ mod test_helpers {
             // because every free model is filtered out by the empty-backed
             // set.
             cfg.providers.push(Provider {
+                model_aliases: Vec::new(),
                 id: "test-alpha".into(),
                 engine_provider_ref: None,
                 base_url: "https://alpha.example/v1".into(),
@@ -1447,6 +1448,7 @@ mod test_helpers {
                 max_context_tokens: None,
             });
             cfg.providers.push(Provider {
+                model_aliases: Vec::new(),
                 id: "test-beta".into(),
                 engine_provider_ref: None,
                 base_url: "https://beta.example/v1".into(),

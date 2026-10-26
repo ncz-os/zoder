@@ -2384,6 +2384,7 @@ async fn drive_live_arm(
     // Build the provider pointed at the wiremock server (matches the
     // live arm behavior).
     let cfg = Provider {
+        model_aliases: Vec::new(),
         id: "test".into(),
         engine_provider_ref: None,
         base_url: server.uri(),

@@ -32,6 +32,7 @@ use zoder_core::{
 
 fn provider() -> Provider {
     Provider {
+        model_aliases: Vec::new(),
         id: "minimax".into(),
         engine_provider_ref: Some("custom.minimax".into()),
         base_url: "http://localhost".into(),

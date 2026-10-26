@@ -247,6 +247,7 @@ mod agentic_utilization_tests {
 
     fn test_provider() -> zoder_core::config::Provider {
         zoder_core::config::Provider {
+            model_aliases: Vec::new(),
             id: "openai".into(),
             engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
@@ -268,6 +269,7 @@ mod agentic_utilization_tests {
 
     fn minimax_counter_provider() -> zoder_core::config::Provider {
         zoder_core::config::Provider {
+            model_aliases: Vec::new(),
             id: "minimax".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -293,6 +295,49 @@ mod agentic_utilization_tests {
             azure_api_version: None,
             max_context_tokens: None,
         }
+    }
+
+    #[test]
+    fn reviewer_provenance_accepts_only_same_provider_alias_groups() {
+        let mut provider = test_provider();
+        provider.model_aliases = vec![vec![
+            "role-reviewer".into(),
+            "gpt-oss-20b".into(),
+            "role-narrator".into(),
+        ]];
+        assert!(reviewer_provenance_matches(
+            &provider,
+            "role-reviewer",
+            "gpt-oss-20b"
+        ));
+        assert!(reviewer_provenance_matches(
+            &provider,
+            "role-reviewer",
+            "role-narrator"
+        ));
+        assert!(!reviewer_provenance_matches(
+            &provider,
+            "role-reviewer",
+            "other-model"
+        ));
+
+        let other_provider = minimax_counter_provider();
+        assert!(!reviewer_provenance_matches(
+            &other_provider,
+            "role-reviewer",
+            "gpt-oss-20b"
+        ));
+        let strict_provider = test_provider();
+        assert!(!reviewer_provenance_matches(
+            &strict_provider,
+            "role-reviewer",
+            "gpt-oss-20b"
+        ));
+        assert!(reviewer_provenance_matches(
+            &strict_provider,
+            "gpt-oss-20b",
+            "gpt-oss-20b"
+        ));
     }
 
     #[test]
@@ -453,6 +498,51 @@ struct Completion {
     chunks: usize,
 }
 
+/// One reviewer candidate the chain skipped, and why. Reasons are the
+/// escalation vocabulary: `unavailable`, `timeout`, `invalid_verdict`,
+/// `family_excluded`, `high_risk`, `disputed`, `forced`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SkippedReviewCandidate {
+    pub model: String,
+    pub reason: String,
+}
+
+/// Ordered reviewer plan plus the filtering evidence.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReviewerPlan {
+    pub candidates: Vec<String>,
+    pub skipped: Vec<SkippedReviewCandidate>,
+    /// The operator's explicit `--reviewer` was in an author family and was
+    /// kept anyway. The caller surfaces this as a warning plus a verdict flag.
+    pub forced: bool,
+    /// The author families whose reviewers were excluded.
+    pub author_families: Vec<String>,
+}
+
+/// One successful reviewer-chain walk.
+#[derive(Debug)]
+struct ChainCompletion {
+    completion: Completion,
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+}
+
+/// A reviewer chain that produced no completion. Carries the skip trail so the
+/// caller can still report why every candidate was rejected.
+#[derive(Debug)]
+struct ChainFailure {
+    message: String,
+    skipped: Vec<SkippedReviewCandidate>,
+    forced: bool,
+}
+
+impl ChainFailure {
+    fn into_anyhow(self) -> anyhow::Error {
+        anyhow!(self.message)
+    }
+}
+
 /// Internal reviewer chain dispatch result. Carries enough information to
 /// distinguish a fallback-worthy error (a stale or transient backend problem
 /// on this specific model — try the next candidate in the chain) from a
@@ -596,6 +686,7 @@ fn provider_error_is_model_unavailable(
 /// and the loser resolves the alias registry from the winner's config —
 /// an intermittent, genuinely confusing failure. See
 /// `crate::child_env` for the wider story.
+#[allow(dead_code)]
 async fn complete_once(
     cli: &crate::Cli,
     model_override: Option<&str>,
@@ -605,6 +696,48 @@ async fn complete_once(
     max_tokens: u32,
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Completion> {
+    complete_once_tracked(
+        cli,
+        model_override,
+        reviewer_chain,
+        &[],
+        &[],
+        system,
+        user,
+        max_tokens,
+        engine_config,
+        false,
+    )
+    .await
+    .map(|c| c.completion)
+    .map_err(ChainFailure::into_anyhow)
+}
+
+/// The reviewer-chain walk with the family filter and skip evidence.
+///
+/// `author_models` are the model ids that authored the loop's work (the
+/// coder/fixer that actually ran, plus any fallback author candidates the
+/// route could have used). Their families are excluded from every reviewer
+/// source. `skip_models` carries candidates an earlier call already rejected
+/// (for example a model that returned an invalid verdict twice); each entry is
+/// `(model, reason)`.
+///
+/// `exact_pin` truncates the chain to `model_override`, used by the
+/// same-model verdict repair re-ask: a repair must not silently turn into a
+/// different reviewer.
+#[allow(clippy::too_many_arguments)]
+async fn complete_once_tracked(
+    cli: &crate::Cli,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    skip_models: &[(String, String)],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    engine_config: Option<&Path>,
+    exact_pin: bool,
+) -> Result<ChainCompletion, ChainFailure> {
     // Build the ordered candidate list the dispatch loop walks. The shape
     // is `head, rest…` — the SAME model-resolution rules `complete_once`
     // already had, just lifted into a list so we can fall through to the
@@ -612,16 +745,74 @@ async fn complete_once(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut candidates =
-        build_reviewer_candidates(cli, model_override, reviewer_chain, engine_config)?;
+    let mut plan = build_reviewer_plan(
+        cli,
+        model_override,
+        reviewer_chain,
+        author_models,
+        engine_config,
+    )
+    .map_err(|e| ChainFailure {
+        message: e.to_string(),
+        skipped: Vec::new(),
+        forced: false,
+    })?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
-    candidates = enforce_exact_model_pin(candidates, cli.model.as_deref(), model_override);
-    if candidates.is_empty() {
+    plan.candidates =
+        enforce_exact_model_pin(plan.candidates, cli.model.as_deref(), model_override);
+    let mut skipped = plan.skipped.clone();
+    let forced = plan.forced;
+    if exact_pin && model_override.is_some() {
+        plan.candidates.truncate(1);
+    }
+    if !skip_models.is_empty() {
+        for (model, reason) in skip_models {
+            let before = plan.candidates.len();
+            plan.candidates.retain(|candidate| candidate != model);
+            if plan.candidates.len() != before {
+                skipped.push(SkippedReviewCandidate {
+                    model: model.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
+    if plan.candidates.is_empty() {
         // Empty head — original behavior preserved: no candidates means
-        // no model was resolvable, bail without fabricating a review.
-        anyhow::bail!("no reviewer model resolved (check `--reviewer`, `[agents.X].reviewer_model`, or `Config::reviewer_model`)");
+        // no model was resolvable, bail without fabricating a review. When
+        // family filtering removed every candidate, say so explicitly.
+        let trail = skipped
+            .iter()
+            .map(|s| format!("{} ({})", s.model, s.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let family_excluded = skipped.iter().any(|s| s.reason == "family_excluded");
+        let invalid_verdict = skipped.iter().any(|s| s.reason == "invalid_verdict");
+        let message = if family_excluded && !plan.author_families.is_empty() {
+            format!(
+                "no reviewer candidate remains after excluding the author model families ({}); \
+                 refusing a same-family review (candidates skipped: {trail})",
+                plan.author_families.join(", "),
+            )
+        } else if invalid_verdict {
+            format!(
+                "reviewer returned invalid JSON twice and no further reviewer candidate remains; \
+                 review incomplete (candidates skipped: {trail})"
+            )
+        } else if !skipped.is_empty() {
+            format!(
+                "reviewer chain exhausted without a candidate answering (candidates skipped: {trail})"
+            )
+        } else {
+            "no reviewer model resolved (check `--reviewer`, `[agents.X].reviewer_model`, or `Config::reviewer_model`)".to_string()
+        };
+        return Err(ChainFailure {
+            message,
+            skipped,
+            forced,
+        });
     }
 
     // Walk head-first; record health for fallback-worthy errors so the
@@ -632,11 +823,11 @@ async fn complete_once(
     // message — the same fail-closed surface the existing single-model
     // reviewer path already produced.
     let mut last_err_msg: Option<String> = None;
-    for (idx, model) in candidates.iter().enumerate() {
+    for (idx, model) in plan.candidates.iter().enumerate() {
         if idx > 0 && !cli.quiet {
             eprintln!(
                 "[zoder] reviewer {prev} failed; falling back to {model}",
-                prev = candidates[idx - 1]
+                prev = plan.candidates[idx - 1]
             );
         }
         match dispatch_reviewer_for_model(
@@ -650,7 +841,15 @@ async fn complete_once(
         )
         .await
         {
-            Ok(c) => return Ok(c),
+            Ok(c) => {
+                let escalation_reason = skipped.first().map(|s| s.reason.clone());
+                return Ok(ChainCompletion {
+                    completion: c,
+                    skipped,
+                    escalation_reason,
+                    forced,
+                });
+            }
             Err(ReviewerError::FallbackWorthy {
                 message,
                 kind,
@@ -728,12 +927,20 @@ async fn complete_once(
                 // diagnostic a CI maintainer needs to triage a chain-
                 // wide failure.
                 last_err_msg = Some(format!("reviewer {model}: {message}"));
+                skipped.push(SkippedReviewCandidate {
+                    model: model.clone(),
+                    reason: reviewer_skip_reason(kind, &message).to_string(),
+                });
             }
             Err(ReviewerError::Skipped { message }) => {
                 if !cli.quiet {
                     eprintln!("[zoder] {message}");
                 }
                 last_err_msg = Some(format!("reviewer {model}: {message}"));
+                skipped.push(SkippedReviewCandidate {
+                    model: model.clone(),
+                    reason: "unavailable".to_string(),
+                });
             }
             Err(ReviewerError::Fatal { message }) => {
                 // A non-fallback-worthy error MUST halt the chain — these
@@ -741,7 +948,11 @@ async fn complete_once(
                 // config, ledger failure, token gating, etc.) where the
                 // next candidate would either reproduce the same failure
                 // or mask a real config error. Surface verbatim.
-                return Err(anyhow!(message));
+                return Err(ChainFailure {
+                    message,
+                    skipped,
+                    forced,
+                });
             }
         }
     }
@@ -758,7 +969,27 @@ async fn complete_once(
         "no reviewer model produced a completion (chain exhausted without a candidate answering)"
             .to_string()
     });
-    Err(anyhow!(msg))
+    Err(ChainFailure {
+        message: msg,
+        skipped,
+        forced,
+    })
+}
+
+/// Map a provider failure to the escalation vocabulary. Timeouts are called
+/// out separately because an operator triaging "why did this reviewer take a
+/// second model?" needs to tell a slow endpoint from a dead one.
+fn reviewer_skip_reason(kind: zoder_core::ErrKind, message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if matches!(kind, zoder_core::ErrKind::Timeout)
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline")
+    {
+        "timeout"
+    } else {
+        "unavailable"
+    }
 }
 
 /// A prepared `zoder loop` review: one prompt per chunk plus the sizing it was
@@ -839,10 +1070,11 @@ fn plan_loop_review(
 /// standalone review path: [`strict_review`] on every chunk, and the aggregate
 /// verdict is the most blocking chunk verdict (see [`append_chunk_review`]).
 #[allow(clippy::too_many_arguments)]
-async fn run_loop_review(
+async fn run_loop_review_once(
     cli: &crate::Cli,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
+    author_models: &[String],
     system: &str,
     diff: &str,
     label: &str,
@@ -917,6 +1149,7 @@ unbound, or missing imports:\n{context}"
         cli,
         reviewer_override,
         reviewer_chain,
+        author_models,
         system,
         &plan.users,
         plan.max_tokens,
@@ -928,12 +1161,14 @@ unbound, or missing imports:\n{context}"
     // 500 ...`) into one message: the loop's per-iteration `review_error` and
     // summary must name the provider failure, not just the chunk wrapper.
     .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-    let review = strict_review(&completion.content).ok_or_else(|| {
+    let mut review = strict_review(&completion.content).ok_or_else(|| {
         anyhow::anyhow!(
             "review incomplete: aggregated verdict from {} was not a structured JSON review",
             completion.model
         )
     })?;
+    review.escalation_reason = reviewer_report.escalation_reason.clone();
+    review.forced_family_conflict = reviewer_report.forced_family_conflict;
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -962,6 +1197,9 @@ unbound, or missing imports:\n{context}"
         "model": reviewer_report.served_model.clone().unwrap_or_default(),
         "verdict": review.verdict,
         "complete": chunk_complete,
+        "escalation_reason": reviewer_report.escalation_reason,
+        "forced_family_conflict": reviewer_report.forced_family_conflict,
+        "skipped_candidates": reviewer_report.skipped,
     })];
     Ok((
         review,
@@ -970,6 +1208,195 @@ unbound, or missing imports:\n{context}"
         chunks,
         reviewer_verdicts,
     ))
+}
+
+/// Run one loop review, adding the high-risk second reviewer when
+/// `[review.escalate].paths` matches a changed path.
+///
+/// The ordinary review is unchanged: one reviewer, family-filtered, with the
+/// skip trail. A high-risk diff additionally requires the chain's first
+/// non-local reviewer (a route `Provider::is_local_route` says is hosted).
+/// That second review is a real independent call, and its verdict is
+/// aggregated with the first by worst verdict so a blocking second opinion
+/// can never be dropped.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review(
+    cli: &crate::Cli,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    root: &Path,
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
+    let first = run_loop_review_once(
+        cli,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        root,
+    )
+    .await?;
+
+    let Some(second_model) = high_risk_second_reviewer(
+        cli,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        review_cfg,
+        diff,
+        first.1.as_deref(),
+    )?
+    else {
+        return Ok(first);
+    };
+
+    let second = run_loop_review_once(
+        cli,
+        Some(&second_model),
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        root,
+    )
+    .await?;
+
+    let (mut review, model, first_cost, first_chunks, mut verdicts) = first;
+    let (second_review, _second_served, second_cost, second_chunks, second_verdicts) = second;
+    let disputed = !review
+        .verdict
+        .trim()
+        .eq_ignore_ascii_case(second_review.verdict.trim());
+    let reason = if disputed { "disputed" } else { "high_risk" };
+    if verdict_rank(&second_review.verdict) > verdict_rank(&review.verdict) {
+        review.verdict = second_review.verdict.clone();
+    }
+    review.findings.extend(second_review.findings);
+    review.next_steps.extend(second_review.next_steps);
+    review.summary = format!(
+        "{}\n\nHigh-risk second reviewer {second_model}: {}",
+        review.summary, second_review.summary
+    );
+    review.escalation_reason = Some(reason.to_string());
+    for verdict in &second_verdicts {
+        let mut verdict = verdict.clone();
+        if let Some(object) = verdict.as_object_mut() {
+            object.insert("escalation_reason".into(), json!(reason));
+            object.insert("high_risk_reviewer".into(), json!(true));
+        }
+        verdicts.push(verdict);
+    }
+    Ok((
+        review,
+        model,
+        first_cost + second_cost,
+        first_chunks + second_chunks,
+        verdicts,
+    ))
+}
+
+/// Return the first HIGH-RISK, NON-LOCAL reviewer candidate, or `None` when
+/// the diff does not touch `[review.escalate].paths`. A high-risk diff with
+/// no non-local candidate fails closed: the additional review was required,
+/// and silently skipping it would leave the escalation claim false.
+fn high_risk_second_reviewer(
+    cli: &crate::Cli,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    diff: &str,
+    first_model: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(cfg) = review_cfg else {
+        return Ok(None);
+    };
+    if cfg.escalate.paths.is_empty() {
+        return Ok(None);
+    }
+    let paths = diff_changed_paths(diff);
+    if !paths.iter().any(|path| {
+        cfg.escalate
+            .paths
+            .iter()
+            .any(|pattern| crate::review_diff::glob_match(pattern, path))
+    }) {
+        return Ok(None);
+    }
+    let eng = Engine::load()?;
+    let routing = crate::RoutingContext::load(&eng.cfg)?;
+    let plan = build_reviewer_plan(cli, reviewer_override, reviewer_chain, author_models, None)?;
+    for model in plan.candidates {
+        if first_model.is_some_and(|first| first == model) {
+            continue;
+        }
+        let Some(provider) = routing.real_provider_for_model(&eng.cfg, &model) else {
+            continue;
+        };
+        if !provider.is_local_route() {
+            return Ok(Some(model));
+        }
+    }
+    anyhow::bail!(
+        "high-risk review: the diff touches [review.escalate].paths but the reviewer chain has \
+         no non-local candidate distinct from the first reviewer ({})",
+        first_model.unwrap_or("none")
+    )
+}
+
+/// Repo-relative paths changed by a unified diff. Reads `+++ b/PATH` and, when
+/// present, the post-image side of `diff --git a/A b/B`.
+fn diff_changed_paths(diff: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in diff.lines() {
+        let candidate = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest.trim_start_matches("b/").trim().to_string()
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            let halves: Vec<&str> = rest.split_whitespace().collect();
+            halves
+                .get(1)
+                .and_then(|side| side.strip_prefix("b/"))
+                .or_else(|| halves.first().and_then(|side| side.strip_prefix("a/")))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            continue;
+        };
+        if !candidate.is_empty()
+            && candidate != "/dev/null"
+            && !paths.iter().any(|known| known == &candidate)
+        {
+            paths.push(candidate);
+        }
+    }
+    paths
 }
 
 /// Build the ordered reviewer candidate list `complete_once` walks.
@@ -1001,6 +1428,25 @@ pub(crate) fn build_reviewer_candidates(
     reviewer_chain: &[String],
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
+    Ok(build_reviewer_plan(cli, model_override, reviewer_chain, &[], engine_config)?.candidates)
+}
+
+/// Build the ordered reviewer plan for an AUTHOR-AWARE review.
+///
+/// Same precedence as [`build_reviewer_candidates`], then drops every
+/// candidate whose model family matches any author model used in the loop.
+/// The explicit operator `--reviewer` is the one exception: a conflict is
+/// kept (the operator asked for it) but flagged, so the caller can warn
+/// loudly and record it in the verdict. If filtering removes every
+/// candidate, the plan fails closed with an error naming the excluded
+/// families; it never silently falls back to a same-family review.
+pub(crate) fn build_reviewer_plan(
+    cli: &crate::Cli,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    engine_config: Option<&Path>,
+) -> anyhow::Result<ReviewerPlan> {
     let eng = Engine::load_with_engine_config(engine_config)?;
 
     // Resolve the reviewer-model-side channel: any per-agent or profile-
@@ -1183,7 +1629,82 @@ pub(crate) fn build_reviewer_candidates(
         }
     }
 
-    Ok(out)
+    // Cross-family enforcement. "Cross-family" means "not the family of any
+    // model that authored this loop" — configured chains, per-agent/profile
+    // pins, the scenario tail and the verified secondary pool are all
+    // filtered alike. Without author models (standalone review, or a caller
+    // that has not run an author turn) this is a no-op, preserving legacy
+    // behaviour.
+    let mut author_families: Vec<String> = Vec::new();
+    for model in author_models {
+        let family = eng.cfg.model_family(model);
+        if !family.is_empty()
+            && !author_families
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&family))
+        {
+            author_families.push(family);
+        }
+    }
+    let mut skipped: Vec<SkippedReviewCandidate> = Vec::new();
+    let mut forced = false;
+    if !author_families.is_empty() {
+        let mut kept = Vec::with_capacity(out.len());
+        for model in out.drain(..) {
+            let family = eng.cfg.model_family(&model);
+            let same_family = author_families
+                .iter()
+                .any(|author_family| author_family.eq_ignore_ascii_case(&family));
+            if !same_family {
+                kept.push(model);
+                continue;
+            }
+            let explicit = resolved_override
+                .as_deref()
+                .is_some_and(|candidate| candidate == model);
+            if explicit {
+                // The operator explicitly asked for this reviewer. Keep it,
+                // but never quietly: warn and flag the verdict so a
+                // same-family review is unmistakable in the record.
+                forced = true;
+                if !cli.quiet {
+                    eprintln!(
+                        "[zoder] WARNING: explicit reviewer {model} is in the author's model \
+family `{family}` (author families: {}); keeping it because --reviewer is an explicit \
+operator pin",
+                        author_families.join(", ")
+                    );
+                }
+                kept.push(model);
+            } else {
+                skipped.push(SkippedReviewCandidate {
+                    model,
+                    reason: "family_excluded".to_string(),
+                });
+            }
+        }
+        let removed_every_candidate = kept.is_empty();
+        out = kept;
+        if removed_every_candidate {
+            anyhow::bail!(
+                "no reviewer candidate remains outside the author model families ({}); refusing \
+                 a same-family review (excluded: {})",
+                author_families.join(", "),
+                skipped
+                    .iter()
+                    .map(|s| format!("{} ({})", s.model, s.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    Ok(ReviewerPlan {
+        candidates: out,
+        skipped,
+        forced,
+        author_families,
+    })
 }
 
 /// Pure reviewer-candidate ordering (no I/O), so the precedence seam is
@@ -1766,7 +2287,7 @@ async fn dispatch_reviewer_for_model(
     // hash in x-litellm-model-id. Reject a reported substitution even when
     // both providers are free: an exact reviewer pin is an identity promise.
     if let Some(served) = res.telemetry.response_model.as_deref() {
-        if served != model {
+        if !reviewer_provenance_matches(provider_cfg, model, served) {
             let mismatch =
                 format!("reviewer provenance mismatch: requested {model}, response model {served}");
             policy_failure = Some(match policy_failure {
@@ -1879,6 +2400,17 @@ async fn dispatch_reviewer_for_model(
             "first_token_ms": res.telemetry.first_token_ms,
         })],
     })
+}
+
+fn reviewer_provenance_matches(
+    provider: &zoder_core::config::Provider,
+    requested: &str,
+    served: &str,
+) -> bool {
+    requested == served
+        || provider.model_aliases.iter().any(|group| {
+            group.iter().any(|id| id == requested) && group.iter().any(|id| id == served)
+        })
 }
 
 #[cfg(test)]
@@ -1998,6 +2530,21 @@ pub(crate) struct ReviewOutput {
     findings: Vec<Finding>,
     #[serde(default)]
     next_steps: Vec<String>,
+    /// Why the reviewer chain escalated away from its first candidate.
+    /// `None` when the first candidate answered. One of `unavailable`,
+    /// `timeout`, `invalid_verdict`, `family_excluded`, `high_risk`,
+    /// `disputed`, or `forced`. Never inferred from the verdict text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escalation_reason: Option<String>,
+    /// The operator's explicit reviewer pin was in an author family and was
+    /// kept anyway. A loud warning is printed at resolution time; this flag
+    /// makes the same conflict visible to a machine reader of the verdict.
+    #[serde(default, skip_serializing_if = "is_false")]
+    forced_family_conflict: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One reviewer slot in the panel. C5-1: the outcome (a real completion vs a
@@ -2168,6 +2715,7 @@ fn parse_review_json_only(raw: &str) -> Option<ReviewOutput> {
                     summary: r.summary,
                     findings: r.findings,
                     next_steps: r.next_steps,
+                    ..Default::default()
                 });
             }
         }
@@ -2204,6 +2752,7 @@ fn parse_review(raw: &str) -> ReviewOutput {
             disposition: None,
         }],
         next_steps: vec![],
+        ..Default::default()
     }
 }
 
@@ -2285,6 +2834,7 @@ fn parse_standalone_review(raw: &str) -> ReviewOutput {
             disposition: None,
         }],
         next_steps: vec![],
+        ..Default::default()
     })
 }
 
@@ -2446,6 +2996,7 @@ fn try_parse_verdict_from_prose(raw: &str) -> Option<ReviewOutput> {
             disposition: None,
         }],
         next_steps: vec![],
+        ..Default::default()
     })
 }
 
@@ -3923,6 +4474,13 @@ struct ReviewerChunkReport {
     served_model: Option<String>,
     /// One entry per chunk of the review, in chunk order.
     chunks: Vec<ChunkCompletion>,
+    /// Reviewer candidates skipped before the served candidate answered.
+    skipped: Vec<SkippedReviewCandidate>,
+    /// `None` when the first candidate answered; otherwise why the chain
+    /// escalated to another candidate.
+    escalation_reason: Option<String>,
+    /// The operator's explicit reviewer was in an author family and kept.
+    forced_family_conflict: bool,
 }
 
 /// Re-plans review chunks for a fallback reviewer: returns that reviewer's
@@ -3944,6 +4502,7 @@ async fn complete_review_chunks(
     cli: &crate::Cli,
     model_override: Option<&str>,
     reviewer_chain: &[String],
+    author_models: &[String],
     system: &str,
     users: &[String],
     max_tokens: u32,
@@ -3980,6 +4539,13 @@ async fn complete_review_chunks(
         verdict: "approve".into(),
         ..ReviewOutput::default()
     };
+    // Reviewer-chain evidence accumulated across chunks. The loop dispatches
+    // one reviewer per review, so this is the record of how that reviewer was
+    // reached: candidates skipped before it answered, why, and whether an
+    // explicit operator pin was kept despite a family conflict.
+    let mut skipped_candidates: Vec<SkippedReviewCandidate> = Vec::new();
+    let mut escalation_reason: Option<String> = None;
+    let mut forced_family_conflict = false;
     let mut idx = 0usize;
     while idx < users.len() {
         // The "this is review part N of M" statement and the partial-diff
@@ -4004,80 +4570,124 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 idx + 1, users.len(), users[idx]
             )
         };
-        let mut completion = complete_once(
-            cli,
-            served_model.as_deref().or(model_override),
-            reviewer_chain,
-            system,
-            &user,
-            max_tokens,
-            None,
-        )
-        .await
-        .with_context(|| format!("review chunk {}/{}", idx + 1, users.len()))?;
-        cost_usd += completion.cost_usd;
-        receipts.extend(completion.receipts.clone());
-        if idx == 0 && !replanned && served_model.is_none() {
-            if let Some(planned) = planned_model.as_deref() {
-                if completion.model != planned {
-                    if let Some((new_users, new_tokens)) = replan(&completion.model) {
-                        if new_users != users || new_tokens != max_tokens {
-                            if !cli.quiet {
-                                eprintln!(
-                                    "[zoder] reviewer {} served the first chunk instead of {planned}; \
-                                     re-planning chunks for it ({} -> {} chunk(s))",
-                                    completion.model,
-                                    users.len(),
-                                    new_users.len()
-                                );
+        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
+        // verdict gets one same-model repair; if the repair is still not a
+        // structured verdict, the candidate is recorded as `invalid_verdict`
+        // and the chain ADVANCES instead of failing the whole review (as long
+        // as another candidate remains). Transport failures inside
+        // `complete_once_tracked` already advance the chain and leave their
+        // own skip trail.
+        let mut invalid_models: Vec<(String, String)> = Vec::new();
+        let (completion, review, chunk_structured) = loop {
+            let outcome = complete_once_tracked(
+                cli,
+                served_model.as_deref().or(model_override),
+                reviewer_chain,
+                author_models,
+                &invalid_models,
+                system,
+                &user,
+                max_tokens,
+                None,
+                false,
+            )
+            .await
+            .map_err(|failure: ChainFailure| {
+                anyhow!(
+                    "review chunk {}/{}: {}",
+                    idx + 1,
+                    users.len(),
+                    failure.message
+                )
+            })?;
+            cost_usd += outcome.completion.cost_usd;
+            receipts.extend(outcome.completion.receipts.clone());
+            skipped_candidates.extend(outcome.skipped);
+            if escalation_reason.is_none() {
+                escalation_reason = outcome.escalation_reason;
+            }
+            forced_family_conflict |= outcome.forced;
+            let completion = outcome.completion;
+            if idx == 0 && !replanned && served_model.is_none() {
+                if let Some(planned) = planned_model.as_deref() {
+                    if completion.model != planned {
+                        if let Some((new_users, new_tokens)) = replan(&completion.model) {
+                            if new_users != users || new_tokens != max_tokens {
+                                if !cli.quiet {
+                                    eprintln!(
+                                        "[zoder] reviewer {} served the first chunk instead of {planned}; \
+                                         re-planning chunks for it ({} -> {} chunk(s))",
+                                        completion.model,
+                                        users.len(),
+                                        new_users.len()
+                                    );
+                                }
+                                users = new_users;
+                                max_tokens = new_tokens;
+                                replanned = true;
+                                // Do NOT capture the model here: the
+                                // re-dispatched first chunk goes through the
+                                // loop's single model capture below.
+                                continue;
                             }
-                            users = new_users;
-                            max_tokens = new_tokens;
-                            replanned = true;
-                            // Do NOT capture the model here: the re-dispatched
-                            // first chunk goes through the loop's single model
-                            // capture below, exactly like the no-replan path.
-                            // Capturing at replan time would key the review on
-                            // a dispatch that never produced a chunk.
-                            continue;
                         }
                     }
                 }
             }
-        }
-        // Record the chunk's first-attempt outcome BEFORE any repair or
-        // re-dispatch can mutate `completion`: which model was requested,
-        // which actually served it, and whether a structured verdict was
-        // present on the very first response. A chunk whose verdict only
-        // appeared on the repair retry keeps `structured: false` — a
-        // repaired verdict is not a first-attempt structured verdict.
-        let chunk_structured = strict_review(&completion.content).is_some();
+            // A chunk whose verdict only appeared on the repair retry keeps
+            // `structured: false`: a repaired verdict is not a first-attempt
+            // structured verdict.
+            if let Some(review) = strict_review(&completion.content) {
+                break (completion, review, true);
+            }
+            let repair_user = format!(
+                "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
+did not satisfy the review schema."
+            );
+            let repaired = complete_once_tracked(
+                cli,
+                Some(&completion.model),
+                &[],
+                author_models,
+                &[],
+                system,
+                &repair_user,
+                reviewer_retry_budget(max_tokens),
+                None,
+                true,
+            )
+            .await;
+            match repaired {
+                Ok(repair) => {
+                    cost_usd += repair.completion.cost_usd;
+                    receipts.extend(repair.completion.receipts.clone());
+                    skipped_candidates.extend(repair.skipped);
+                    forced_family_conflict |= repair.forced;
+                    if let Some(review) = strict_review(&repair.completion.content) {
+                        break (repair.completion, review, false);
+                    }
+                }
+                Err(failure) => {
+                    // A transport failure on the repair is not a verdict at
+                    // all; keep its skip trail and let the chain advance.
+                    skipped_candidates.extend(failure.skipped);
+                    forced_family_conflict |= failure.forced;
+                }
+            }
+            // Invalid twice (or the repair could not run): advance the chain.
+            skipped_candidates.push(SkippedReviewCandidate {
+                model: completion.model.clone(),
+                reason: "invalid_verdict".to_string(),
+            });
+            if escalation_reason.is_none() {
+                escalation_reason = Some("invalid_verdict".to_string());
+            }
+            invalid_models.push((completion.model.clone(), "invalid_verdict".to_string()));
+        };
         let record = ChunkCompletion {
             requested_model: completion.requested_model.clone(),
             served_model: completion.model.clone(),
             structured: chunk_structured,
-        };
-        let review = match strict_review(&completion.content) {
-            Some(review) => review,
-            None => {
-                let repair_user = format!("{user}\n\nReturn ONLY the complete JSON verdict object; your previous response did not satisfy the review schema.");
-                completion = complete_once(
-                    cli,
-                    Some(&completion.model),
-                    &[],
-                    system,
-                    &repair_user,
-                    reviewer_retry_budget(max_tokens),
-                    None,
-                )
-                .await?;
-                cost_usd += completion.cost_usd;
-                receipts.extend(completion.receipts.clone());
-                strict_review(&completion.content).ok_or_else(|| anyhow!(
-                    "review chunk {}/{}: reviewer {} returned invalid JSON twice; review incomplete",
-                    idx + 1, users.len(), completion.model
-                ))?
-            }
         };
         // No `served != requested` check here: `complete_once` dispatches each
         // candidate with the same id as both the requested and the dispatched
@@ -4125,6 +4735,9 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
         requested_model,
         served_model,
         chunks: chunk_records,
+        skipped: skipped_candidates,
+        escalation_reason,
+        forced_family_conflict,
     };
     let completion = Completion {
         requested_model: report.requested_model.clone().unwrap_or_default(),
@@ -4329,6 +4942,7 @@ pub(crate) async fn cmd_review(
             summary: format!("No changes to review ({label})."),
             findings: vec![],
             next_steps: vec![],
+            ..Default::default()
         };
         emit_reviews(
             cli,
@@ -4591,6 +5205,7 @@ unbound, or missing imports:\n{context}"
             cli,
             m.as_deref(),
             &reviewer_chain,
+            &[],
             system,
             &plan.users,
             tokens_for(&plan.caps),
@@ -4618,13 +5233,16 @@ unbound, or missing imports:\n{context}"
     let mut receipts = Vec::new();
     for r in results {
         match r {
-            Ok((c, _report)) => {
+            Ok((c, report)) => {
                 ok_models += 1;
                 total_cost += c.cost_usd;
                 receipts.extend(c.receipts);
+                let mut review = parse_review(&c.content);
+                review.escalation_reason = report.escalation_reason;
+                review.forced_family_conflict = report.forced_family_conflict;
                 reviews.push(ReviewerSlot::Ok {
                     model: c.model,
-                    review: parse_review(&c.content),
+                    review,
                 });
             }
             Err(e) => {
@@ -4783,6 +5401,8 @@ fn aggregate_review(
             "findings": slot.review().map(|r| r.findings.clone()).unwrap_or_default(),
             "next_steps": slot.review().map(|r| r.next_steps.clone()).unwrap_or_default(),
             "ok": slot.is_ok(),
+            "escalation_reason": slot.review().and_then(|r| r.escalation_reason.clone()),
+            "forced_family_conflict": slot.review().is_some_and(|r| r.forced_family_conflict),
         })).collect::<Vec<_>>(),
     });
 
@@ -5908,6 +6528,7 @@ comment-with-no-evidence, NOT as a blocking defect. Original summary: {}",
         ),
         findings: r.findings.clone(),
         next_steps: r.next_steps.clone(),
+        ..Default::default()
     }
 }
 
@@ -5972,6 +6593,7 @@ loop stays unresolved (reviewer_unavailable)."
             disposition: None,
         }],
         next_steps: vec![],
+        ..Default::default()
     }
 }
 
@@ -6750,6 +7372,9 @@ async fn cmd_loop_run(
     // Auto must never switch to an unrelated branch diff after a commit.
     let mut task_journal = PatchJournal::new();
     task_journal.record_baseline(cwd);
+    // Every model that has actually authored a turn in this loop. Reviewer
+    // candidates from these models' families are excluded on every review.
+    let mut author_models: Vec<String> = Vec::new();
     for i in 1..=max_iters {
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
@@ -6902,6 +7527,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     agent_alias: t.alias.clone(),
                     session_id: t.run.session_id.clone(),
                 });
+                if !author_models.iter().any(|known| known == &t.model) {
+                    author_models.push(t.model.clone());
+                }
                 total_cost += t.cost_usd;
                 Some(t)
             }
@@ -7206,6 +7834,28 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
             }
             Err(_) => (Vec::new(), None, reviewer.clone()),
         };
+        // Author families to exclude from the reviewer chain: every model
+        // that actually authored a turn, plus the author route's fallback
+        // candidates (a fallback author is still an author for this rule).
+        let review_author_models = {
+            let mut models = author_models.clone();
+            if let Ok(eng) = Engine::load() {
+                if let Some(primary) = crate::resolve_effective_primary(cli, &eng) {
+                    if !models.contains(&primary) {
+                        models.push(primary);
+                    }
+                }
+                let health = HealthStore::load(&eng.cfg.health_path);
+                if let Ok(routes) = crate::resolve_chain(cli, &eng, &health) {
+                    for model in routes.primary {
+                        if !models.contains(&model) {
+                            models.push(model);
+                        }
+                    }
+                }
+            }
+            models
+        };
         let config_excludes = review_cfg
             .as_ref()
             .map(|r| r.exclude.clone())
@@ -7258,6 +7908,7 @@ diff is not a finished turn"
                         cli,
                         reviewer.as_deref(),
                         &reviewer_chain,
+                        &review_author_models,
                         ADVERSARIAL_SYSTEM,
                         &review_diff,
                         &label,
@@ -7327,6 +7978,7 @@ or comment.\n"
                     cli,
                     reviewer.as_deref(),
                     &reviewer_chain,
+                    &review_author_models,
                     ADVERSARIAL_SYSTEM,
                     &review_diff,
                     &label,
@@ -7409,6 +8061,13 @@ or comment.\n"
         // because no identity was configured, or some other terminal
         // outcome — so the iter record is the single source of truth
         // for what (if anything) the loop had to fix on disk.
+        let reviewer_skips: Vec<serde_json::Value> = reviewer_verdicts
+            .iter()
+            .filter_map(|verdict| verdict.get("skipped_candidates"))
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .cloned()
+            .collect();
         iterations.push(json!({
             "iter": i,
             "author_model": author_model,
@@ -7444,6 +8103,7 @@ or comment.\n"
             // the incomplete-Err path it is absent (empty), never a lone
             // `false` that a JSON parser would read as the field's value.
             "reviewer_verdicts": reviewer_verdicts,
+            "reviewer_skips": reviewer_skips,
             "verdict": review.verdict,
             "blocking_findings": blocking,
             "review_unlocated_no_evidence": review_unlocated_no_evidence,
@@ -7680,6 +8340,7 @@ approve)…"
                             cli,
                             reviewer.as_deref(),
                             &reviewer_chain,
+                            &review_author_models,
                             ADVERSARIAL_SYSTEM,
                             &review_diff,
                             &label,
@@ -8909,6 +9570,7 @@ mod tests {
             summary: "summary".into(),
             findings,
             next_steps: vec![],
+            ..Default::default()
         }
     }
 
@@ -11395,6 +12057,7 @@ not run to max_iters"
             summary: String::new(),
             findings: vec![],
             next_steps: vec![],
+            ..Default::default()
         }
     }
 
@@ -11932,6 +12595,7 @@ mod loop_resolution_tests {
                 disposition: None,
             }],
             next_steps: vec![],
+            ..Default::default()
         };
         let signals = loop_signals_from_review(
             DiffSubstance::Substantive,
@@ -12529,6 +13193,7 @@ mod loop_resolution_tests {
             summary: "mixed-case explicit block".into(),
             findings: vec![],
             next_steps: vec![],
+            ..Default::default()
         };
         let signals = loop_signals_from_review(
             DiffSubstance::Substantive,
@@ -13132,6 +13797,17 @@ mod reviewer_chain_dispatch_tests {
         .unwrap();
     }
 
+    /// Merge a `[model_families]` map into the config written by
+    /// [`write_config`]. Keeps family tests from repeating the provider
+    /// boilerplate.
+    fn write_model_families(home: &Path, families: serde_json::Value) {
+        let path = home.join("config.json");
+        let mut body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        body["model_families"] = families;
+        std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+    }
+
     /// A reviewer reply for wiremock that carries FINDINGS: `approve` with one
     /// located finding (title with doubled spaces and mixed case, so the
     /// fingerprint normalization is exercised from a real parse).
@@ -13407,6 +14083,355 @@ mod reviewer_chain_dispatch_tests {
             .unwrap_err()
             .to_string()
             .contains("requires --reviewer-allowed-routes"));
+    }
+
+    // ---- Task H: author-family-aware reviewer chain ---------------------
+
+    #[test]
+    fn author_family_excludes_configured_chain_pin_and_pool() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/other",
+            ],
+        );
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "broken-model/reviewer,working-model/other",
+        );
+        write_model_families(
+            home,
+            json!({
+                "broken-model/*": "family-a",
+                "working-model/*": "family-b",
+            }),
+        );
+        let authors = vec!["broken-model/coder".to_string()];
+
+        // Configured chain: the same-family reviewer is dropped, the
+        // cross-family tail remains, and the skip is recorded.
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        assert_eq!(plan.candidates, vec!["working-model/other"]);
+        assert_eq!(plan.author_families, vec!["family-a"]);
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|s| { s.model == "broken-model/reviewer" && s.reason == "family_excluded" }));
+
+        // Explicit operator pin: kept, flagged, and warned about — not
+        // silently dropped.
+        let pinned =
+            build_reviewer_plan(&cli, Some("broken-model/reviewer"), &[], &authors, None).unwrap();
+        assert!(pinned.forced, "an explicit same-family pin must be flagged");
+        assert_eq!(
+            pinned.candidates.first().map(String::as_str),
+            Some("broken-model/reviewer"),
+            "the explicit pin must head the chain even when forced"
+        );
+        assert!(
+            !pinned
+                .candidates
+                .contains(&"working-model/other".to_string())
+                || pinned
+                    .candidates
+                    .iter()
+                    .filter(|m| *m == "working-model/other")
+                    .count()
+                    == 1,
+            "the cross-family tail remains available as a fallback"
+        );
+
+        // Verified secondary pool: a same-family pool member is filtered
+        // just like a configured candidate.
+        HealthStore::mutate_locked(&home.join("health.json"), |health| {
+            health.record_classified_success(
+                "working-model/other",
+                100.0,
+                "wiremock-working",
+                zoder_core::Classification::Reachable,
+            );
+        })
+        .unwrap();
+        let pool_cli = Cli::try_parse_from([
+            "zoder",
+            "review",
+            "-m",
+            "broken-model/coder",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/coder,wiremock-broken=broken-model/reviewer,wiremock-working=working-model/other",
+            "--reviewer-allowed-routes",
+            "wiremock-broken=broken-model/reviewer,wiremock-working=working-model/other",
+            "--reviewer-pool-routes",
+            "wiremock-working=working-model/other",
+        ])
+        .unwrap();
+        let pooled = build_reviewer_plan(&pool_cli, None, &[], &authors, None).unwrap();
+        assert_eq!(pooled.candidates, vec!["working-model/other"]);
+        assert!(pooled
+            .skipped
+            .iter()
+            .any(|s| s.model == "broken-model/reviewer" && s.reason == "family_excluded"));
+    }
+
+    #[test]
+    fn empty_after_family_filter_fails_closed_naming_families() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["broken-model/coder", "broken-model/reviewer"]);
+        write_config(home, "http://127.0.0.1:9", "broken-model/reviewer");
+        write_model_families(home, json!({"broken-model/*": "family-a"}));
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let err = build_reviewer_plan(&cli, None, &[], &["broken-model/coder".to_string()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no reviewer candidate remains outside the author model families"),
+            "{err}"
+        );
+        assert!(err.contains("family-a"), "{err}");
+        assert!(err.contains("family_excluded"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_verdict_advances_the_reviewer_chain() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "I could not review this diff."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
+            })))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(home, &["broken-model/reviewer", "working-model/reviewer"]);
+        write_config(
+            home,
+            &server.uri(),
+            "broken-model/reviewer,working-model/reviewer",
+        );
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let (completion, report) = complete_review_chunks(
+            &cli,
+            None,
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            &["diff".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("the second candidate must review after an invalid verdict");
+        assert_eq!(completion.model, "working-model/reviewer");
+        assert_eq!(
+            report.escalation_reason.as_deref(),
+            Some("invalid_verdict"),
+            "the chain must record WHY it advanced"
+        );
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| { s.model == "broken-model/reviewer" && s.reason == "invalid_verdict" }));
+    }
+
+    #[test]
+    fn reviewer_skip_reason_distinguishes_timeout_from_unavailable() {
+        assert_eq!(
+            reviewer_skip_reason(zoder_core::ErrKind::Timeout, "request deadline"),
+            "timeout"
+        );
+        assert_eq!(
+            reviewer_skip_reason(zoder_core::ErrKind::Http, "provider HTTP 503"),
+            "unavailable"
+        );
+        assert_eq!(
+            reviewer_skip_reason(zoder_core::ErrKind::Network, "connect timed out"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn high_risk_paths_are_globs_over_the_changed_files() {
+        let diff = "diff --git a/src/security/auth.rs b/src/security/auth.rs\n\
+--- a/src/security/auth.rs\n\
++++ b/src/security/auth.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+        assert_eq!(diff_changed_paths(diff), vec!["src/security/auth.rs"]);
+        let cfg = zoder_core::config::ReviewConfig {
+            escalate: zoder_core::config::ReviewEscalateConfig {
+                paths: vec!["src/security/**".into()],
+            },
+            ..Default::default()
+        };
+        assert!(cfg
+            .escalate
+            .paths
+            .iter()
+            .any(|pattern| crate::review_diff::glob_match(pattern, "src/security/auth.rs")));
+        assert!(!crate::review_diff::glob_match(
+            "src/security/**",
+            "src/lib.rs"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn high_risk_glob_requires_a_second_non_local_reviewer() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let local = MockServer::start().await;
+        let hosted = MockServer::start().await;
+        mount_200_openai_chat_completion(&local).await;
+        // The hosted provider's base URL is an IPv4-mapped IPv6 loopback
+        // literal: it reaches the local mock while `Provider::is_local_route`
+        // classifies it as HOSTED (the route classification is endpoint
+        // based, not a name check).
+        let hosted_port = hosted.uri().rsplit(':').next().unwrap().to_string();
+        Mock::given(method("POST"))
+            .and(path("/hosted/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_review_completion("hosted reviewer ok")),
+            )
+            .mount(&hosted)
+            .await;
+        write_corpus(home, &["local-model/reviewer", "hosted-model/reviewer"]);
+        let body = json!({
+            "providers": [
+                {
+                    "id": "wiremock-local",
+                    "base_url": format!("{}/local", local.uri()),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["local-model/"],
+                },
+                {
+                    "id": "wiremock-hosted",
+                    "base_url": format!("http://[::ffff:127.0.0.1]:{hosted_port}/hosted"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["hosted-model/"],
+                },
+            ],
+            "default_provider": "wiremock-local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "reviewer_model": "local-model/reviewer,hosted-model/reviewer",
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        // The LOCAL provider needs the local path; the shared helper mounts
+        // `/working`, so mount the local model explicitly.
+        Mock::given(method("POST"))
+            .and(path("/local/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_review_completion("local reviewer ok")),
+            )
+            .mount(&local)
+            .await;
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        let cfg = zoder_core::config::ReviewConfig {
+            escalate: zoder_core::config::ReviewEscalateConfig {
+                paths: vec!["src/security/**".into()],
+            },
+            ..Default::default()
+        };
+        let diff = "diff --git a/src/security/auth.rs b/src/security/auth.rs\n\
+--- a/src/security/auth.rs\n\
++++ b/src/security/auth.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+        let (review, _model, _cost, _chunks, verdicts) = run_loop_review(
+            &cli,
+            None,
+            &[],
+            &[],
+            ADVERSARIAL_SYSTEM,
+            diff,
+            "branch",
+            "task\n",
+            Some("local-model/reviewer"),
+            Some(&cfg),
+            &[],
+            &[],
+            home,
+        )
+        .await
+        .expect("a high-risk diff must review on both reviewers");
+        assert_eq!(verdicts.len(), 2, "high risk requires a second reviewer");
+        assert_eq!(
+            verdicts[1]["escalation_reason"].as_str(),
+            Some("high_risk"),
+            "{verdicts:?}"
+        );
+        assert_eq!(verdicts[1]["high_risk_reviewer"].as_bool(), Some(true));
+        assert_eq!(
+            review.escalation_reason.as_deref(),
+            Some("high_risk"),
+            "the aggregate verdict must record why the second reviewer ran"
+        );
+        assert_eq!(
+            hosted
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().contains("/hosted/"))
+                .count(),
+            1,
+            "the non-local candidate must be the second reviewer"
+        );
+    }
+
+    #[test]
+    fn standalone_is_unchanged_without_families_or_escalation() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        write_corpus(home, &["working-model/reviewer", "broken-model/head"]);
+        write_config(
+            home,
+            "http://127.0.0.1:9",
+            "working-model/reviewer,broken-model/head",
+        );
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let plan = build_reviewer_plan(&cli, None, &[], &[], None).unwrap();
+        assert_eq!(
+            plan.candidates,
+            vec!["working-model/reviewer", "broken-model/head"],
+            "no author models means the family filter is a no-op"
+        );
+        assert!(plan.skipped.is_empty());
+        assert!(!plan.forced);
+        let empty = zoder_core::config::ReviewConfig::default();
+        assert!(empty.escalate.paths.is_empty());
     }
 
     #[test]
@@ -13939,6 +14964,7 @@ mod reviewer_chain_dispatch_tests {
             &cli,
             Some("working-model/glm-5.1"),
             &[],
+            &[],
             REVIEW_SYSTEM,
             &["one big chunk sized for another reviewer".into()],
             2048,
@@ -13962,6 +14988,7 @@ mod reviewer_chain_dispatch_tests {
         let report = complete_review_chunks(
             &cli,
             Some("working-model/glm-5.1"),
+            &[],
             &[],
             REVIEW_SYSTEM,
             &["one big chunk sized for another reviewer".into()],
@@ -13993,6 +15020,7 @@ mod reviewer_chain_dispatch_tests {
         let result = complete_review_chunks(
             &cli,
             Some("working-model/glm-5.1"),
+            &[],
             &[],
             REVIEW_SYSTEM,
             &["x".into(), "y".into()],
@@ -14294,6 +15322,7 @@ mod reviewer_chain_dispatch_tests {
             let result = complete_review_chunks(
                 &cli,
                 Some("working-model/glm-5.1"),
+                &[],
                 &[],
                 REVIEW_SYSTEM,
                 &["diff".into()],
@@ -15133,6 +16162,7 @@ model_provider = "custom.nemotron35"
             &cli,
             None,
             &[],
+            &[],
             ADVERSARIAL_SYSTEM,
             &synthetic_loop_diff(1, 1),
             "branch",
@@ -15171,6 +16201,7 @@ model_provider = "custom.nemotron35"
         let (review, model, _cost, chunks, _verdicts) = run_loop_review(
             &cli,
             None,
+            &[],
             &[],
             ADVERSARIAL_SYSTEM,
             &diff,
@@ -15228,6 +16259,7 @@ model_provider = "custom.nemotron35"
             &cli,
             None,
             &[],
+            &[],
             ADVERSARIAL_SYSTEM,
             &diff,
             "branch",
@@ -15261,6 +16293,16 @@ model_provider = "custom.nemotron35"
             v["complete"], true,
             "every requested reviewer returned a structured verdict for every chunk"
         );
+        assert!(
+            v["escalation_reason"].is_null(),
+            "the first candidate answered, so escalation_reason must be null"
+        );
+        assert_eq!(
+            v["skipped_candidates"].as_array().map(Vec::len),
+            Some(0),
+            "no candidate was skipped"
+        );
+        assert_eq!(v["forced_family_conflict"], false);
         // The iteration-level predicate the record stores as `review_complete`:
         // non-empty verdicts, all complete.
         let review_complete = iteration_review_complete(&reviewer_verdicts);
@@ -15291,6 +16333,7 @@ model_provider = "custom.nemotron35"
         let err = run_loop_review(
             &cli,
             None,
+            &[],
             &[],
             ADVERSARIAL_SYSTEM,
             &synthetic_loop_diff(1, 1),
@@ -15354,6 +16397,7 @@ model_provider = "custom.nemotron35"
             &cli,
             Some("working-model/reviewer"),
             &[],
+            &[],
             REVIEW_SYSTEM,
             &["chunk one".into(), "chunk two".into()],
             2048,
@@ -15384,6 +16428,9 @@ model_provider = "custom.nemotron35"
             requested_model: None,
             served_model: None,
             chunks: Vec::new(),
+            skipped: Vec::new(),
+            escalation_reason: None,
+            forced_family_conflict: false,
         };
         assert!(
             empty.requested_model.is_none(),
@@ -15400,6 +16447,9 @@ model_provider = "custom.nemotron35"
                 served_model: "working-model/reviewer".into(),
                 structured: true,
             }],
+            skipped: Vec::new(),
+            escalation_reason: None,
+            forced_family_conflict: false,
         };
         assert_eq!(
             done.requested_model.as_deref(),
@@ -15438,6 +16488,7 @@ model_provider = "custom.nemotron35"
         let err = complete_review_chunks(
             &cli,
             Some("working-model/reviewer"),
+            &[],
             &[],
             REVIEW_SYSTEM,
             &["chunk one".into()],
@@ -15506,6 +16557,7 @@ model_provider = "custom.nemotron35"
             &cli,
             Some("working-model/reviewer"),
             &["working-model/fallback".into()],
+            &[],
             REVIEW_SYSTEM,
             &["chunk one".into(), "chunk two".into()],
             2048,
@@ -15846,6 +16898,7 @@ model_provider = "custom.nemotron35"
         let (review, _model, _cost, _chunks, _verdicts) = run_loop_review(
             &cli,
             None,
+            &[],
             &[],
             ADVERSARIAL_SYSTEM,
             &synthetic_loop_diff(1, 1),

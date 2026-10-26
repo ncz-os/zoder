@@ -279,6 +279,7 @@ mod tests {
         // that host (the base_url fallback) verifies free under strict mode.
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(crate::config::Provider {
+            model_aliases: Vec::new(),
             id: "minimax".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),

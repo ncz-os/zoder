@@ -72,6 +72,7 @@ mod reliability_deadline_tests {
         kind: &str,
     ) -> (OpenAiProvider, ChatRequest) {
         let config = Provider {
+            model_aliases: Vec::new(),
             id: "deadline-test".into(),
             engine_provider_ref: None,
             base_url: uri.into(),
@@ -3742,6 +3743,7 @@ mod tests {
         azure_api_version: Option<&str>,
     ) -> OpenAiProvider {
         let cfg = Provider {
+            model_aliases: Vec::new(),
             id: "azure-test".into(),
             engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
@@ -4500,6 +4502,7 @@ mod tests {
     /// tests so only the `account_id` field varies.
     fn fixture_subscription_provider(account_id: Option<&str>) -> Provider {
         Provider {
+            model_aliases: Vec::new(),
             id: "minimax".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),

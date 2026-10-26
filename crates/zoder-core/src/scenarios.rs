@@ -911,6 +911,7 @@ mod tests {
 
     fn provider(id: &str, billing: BillingMode) -> Provider {
         Provider {
+            model_aliases: Vec::new(),
             id: id.into(),
             engine_provider_ref: None,
             base_url: format!("https://{id}.example/v1"),

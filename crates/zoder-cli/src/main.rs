@@ -15034,6 +15034,7 @@ mod probe_skip_class_tests {
 
     fn mk_provider(id: &str, serves: &[&str]) -> Provider {
         Provider {
+            model_aliases: Vec::new(),
             id: id.into(),
             engine_provider_ref: None,
             base_url: "https://gw.example/v1".into(),
@@ -15366,6 +15367,7 @@ mod scenario_routing_tests {
     #[test]
     fn classify_provider_follows_configured_billing() {
         let p = Provider {
+            model_aliases: Vec::new(),
             id: "enterprise-gateway".into(),
             engine_provider_ref: None,
             base_url: "https://gateway.example.invalid/v1".into(),
@@ -15383,6 +15385,7 @@ mod scenario_routing_tests {
             ProviderClass::Free
         );
         let p = Provider {
+            model_aliases: Vec::new(),
             id: "provider-b".into(),
             engine_provider_ref: None,
             base_url: "https://provider-b.example.invalid/v1".into(),
@@ -15397,6 +15400,7 @@ mod scenario_routing_tests {
         };
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Paid);
         let p = Provider {
+            model_aliases: Vec::new(),
             id: "minimax-flat".into(),
             engine_provider_ref: None,
             base_url: "https://minimax.example/v1".into(),
@@ -16501,6 +16505,7 @@ mod subscription_utilization_render_tests {
             account_id: Some("personal".into()),
         });
         cfg.providers.push(zoder_core::Provider {
+            model_aliases: Vec::new(),
             id: "openai-team".into(),
             engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
@@ -16609,6 +16614,7 @@ mod model_selection_tests {
     fn fixture_cfg(primary_model: Option<&str>, reviewer_model: Option<&str>) -> Config {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-model-sel-test"));
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -16622,6 +16628,7 @@ mod model_selection_tests {
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "enterprise-gateway".into(),
             engine_provider_ref: None,
             base_url: "https://gateway.example.invalid/v1".into(),
@@ -16705,6 +16712,7 @@ mod model_selection_tests {
 
     fn fixture_gated_provider(id: &str, base_url: &str, billing: BillingMode) -> Provider {
         Provider {
+            model_aliases: Vec::new(),
             id: id.to_owned(),
             engine_provider_ref: Some(id.to_owned()),
             base_url: base_url.to_owned(),
@@ -17077,6 +17085,7 @@ model_provider = "custom.minimax"
     fn agent_pin_preserves_provider_identity_across_colliding_serves_prefix() {
         let mut cfg = fixture_cfg(None, None);
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "groq-oss20b".into(),
             engine_provider_ref: None,
             base_url: "https://unrelated.example/v1".into(),
@@ -17137,6 +17146,7 @@ model_provider = "custom.groq"
     fn missing_agent_provider_does_not_fall_through_to_prefix_collision() {
         let mut cfg = fixture_cfg(None, None);
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "unrelated".into(),
             engine_provider_ref: None,
             base_url: "https://unrelated.example/v1".into(),
@@ -17166,6 +17176,7 @@ model_provider = "custom.groq"
     fn bare_model_pin_keeps_prefix_provider_routing() {
         let mut cfg = fixture_cfg(None, None);
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "prefix-route".into(),
             engine_provider_ref: None,
             base_url: "https://router.example/v1".into(),
@@ -18801,6 +18812,7 @@ model_provider = "custom.minimax"
         // so the router has free fallbacks to surface after the
         // filter runs.
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "free-host".into(),
             engine_provider_ref: None,
             base_url: "https://free.example/v1".into(),
@@ -19026,6 +19038,7 @@ model_provider = "custom.minimax"
         };
         cfg.providers = vec![
             Provider {
+                model_aliases: Vec::new(),
                 id: "openai-sub".into(),
                 engine_provider_ref: None,
                 base_url: "https://chatgpt.com/backend-api/codex".into(),
@@ -19039,6 +19052,7 @@ model_provider = "custom.minimax"
                 max_context_tokens: None,
             },
             Provider {
+                model_aliases: Vec::new(),
                 id: "openai-metered".into(),
                 engine_provider_ref: None,
                 base_url: "https://api.openai.com/v1".into(),
@@ -19834,6 +19848,7 @@ mod ledger_call_cost_tests {
     #[test]
     fn only_a_subscription_provider_is_a_flat_plan() {
         let mut p = Provider {
+            model_aliases: Vec::new(),
             id: "p".into(),
             engine_provider_ref: None,
             base_url: "https://gw.example/v1".into(),

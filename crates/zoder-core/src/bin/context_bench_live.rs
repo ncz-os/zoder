@@ -413,6 +413,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let provider = Provider {
+        model_aliases: Vec::new(),
         id: "benchmark".to_string(),
         engine_provider_ref: None,
         base_url: base_url.clone(),
