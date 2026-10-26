@@ -23,6 +23,7 @@ SUBCOMMANDS=(
   providers config init refresh pricing reconcile sessions mnemos
   review adversarial-review rescue status result cancel jobs
   loop transfer session recipe mcp mcp-server sop configure completions gate
+  quota
 )
 
 {
