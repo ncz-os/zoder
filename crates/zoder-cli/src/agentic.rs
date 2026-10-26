@@ -2313,9 +2313,10 @@ async fn dispatch_reviewer_for_model(
     );
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
+    let posture = crate::BillingPosture::from(provider_cfg);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let (cost, unknown_cost) = crate::ledger_call_cost(
-        provider_cfg.is_flat_plan(),
+        posture,
         res.telemetry.cost_usd,
         &pricing,
         model,
@@ -2383,6 +2384,7 @@ async fn dispatch_reviewer_for_model(
         calls: 1,
         violation,
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+        billing: Some(posture.as_str().to_string()),
     };
     let mut health = HealthStore::load(&eng.cfg.health_path);
     if let Err(e) = crate::reconcile_policy_checked_turn(
