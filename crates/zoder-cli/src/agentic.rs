@@ -9546,6 +9546,12 @@ mod tests {
         // for root included. chmod is not involved and not needed.
         std::fs::create_dir(&lock_path).unwrap();
 
+        // Write an empty (valid) ledger file so the failure point is
+        // unambiguous: `entries_strict` opens the lock BEFORE it touches
+        // the ledger file, and with the file present the only possible
+        // failure is the lock open the test asserts on.
+        std::fs::write(&ledger_path, "").unwrap();
+
         let mut cfg = Config::default_provider(dir.path());
         cfg.ledger_path = ledger_path.clone();
 
