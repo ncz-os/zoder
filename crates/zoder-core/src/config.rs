@@ -324,6 +324,10 @@ impl SubscriptionPlan {
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     pub id: String,
+    /// Model identifiers that this provider may report interchangeably for
+    /// provenance checks. Each inner list is one accepted alias group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_aliases: Vec<Vec<String>>,
     /// Exact Zeroclaw `model_provider` profile reference represented by this
     /// zoder billing provider (for example `custom.minimax`). This is distinct
     /// from [`Self::id`], which remains an arbitrary zoder-local routing name
@@ -2005,6 +2009,119 @@ impl HealthConfig {
     }
 }
 
+/// Built-in model families for PUBLIC vendor model ids.
+///
+/// These exist only so a standalone install gets useful cross-family
+/// protection without writing any config. They name public model families,
+/// not deployment-specific aliases: fleet-specific overrides belong in the
+/// fleet's own config repository via `[model_families]`.
+///
+/// The patterns are matched case-insensitively, left to right, before the
+/// vendor-prefix heuristic in [`model_family`]. `*` and `?` are the only
+/// wildcards.
+pub const DEFAULT_MODEL_FAMILIES: &[(&str, &str)] = &[
+    ("*gpt-oss*", "openai"),
+    ("gpt-oss*", "openai"),
+    ("openai/*", "openai"),
+    ("*gpt-*", "openai"),
+    ("*qwen*", "qwen"),
+    ("*gemma*", "gemma"),
+    ("*minimax*", "minimax"),
+    ("*deepseek*", "deepseek"),
+    ("*nemotron*", "nemotron"),
+    ("*glm*", "glm"),
+    ("z-ai/*", "glm"),
+    ("*kimi*", "kimi"),
+    ("moonshot*/*", "kimi"),
+    ("*mistral*", "mistral"),
+];
+
+/// Resolve a served model id to a model family.
+///
+/// Precedence:
+///   1. an exact key in `overrides` (case-insensitive);
+///   2. the first matching `*`/`?` glob in `overrides`;
+///   3. the matching built-in public-vendor family;
+///   4. the vendor prefix before the first `/`;
+///   5. the model id itself (an unknown model is its OWN family, so two
+///      different unknown ids never compare as cross-family).
+pub fn model_family(overrides: &BTreeMap<String, String>, model_id: &str) -> String {
+    let model = model_id.trim();
+    let lower = model.to_ascii_lowercase();
+    if lower.is_empty() {
+        return "unknown".to_string();
+    }
+    // Exact overrides first, regardless of BTreeMap ordering, so an operator
+    // can pin one id inside an otherwise globbed namespace.
+    for (pattern, family) in overrides {
+        if pattern.trim().eq_ignore_ascii_case(model) {
+            let family = family.trim();
+            return if family.is_empty() {
+                lower.clone()
+            } else {
+                family.to_ascii_lowercase()
+            };
+        }
+    }
+    // Then configured globs, in stable key order.
+    for (pattern, family) in overrides {
+        let pattern = pattern.trim();
+        if (pattern.contains('*') || pattern.contains('?'))
+            && wildcard_match(&pattern.to_ascii_lowercase(), &lower)
+        {
+            let family = family.trim();
+            return if family.is_empty() {
+                lower.clone()
+            } else {
+                family.to_ascii_lowercase()
+            };
+        }
+    }
+    // Built-in public families.
+    for (pattern, family) in DEFAULT_MODEL_FAMILIES {
+        if wildcard_match(pattern, &lower) {
+            return (*family).to_string();
+        }
+    }
+    // Vendor-prefix heuristic: `provider-a/model-x` belongs to `provider-a`.
+    if let Some((vendor, _)) = lower.split_once('/') {
+        if !vendor.is_empty() {
+            return vendor.to_string();
+        }
+    }
+    // Unresolved: the model is its own family.
+    lower
+}
+
+/// Match the small glob vocabulary model-family keys use: `*` matches any
+/// run and `?` matches one character. ASCII case is handled by the caller.
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut p, mut v) = (0usize, 0usize);
+    let (mut star, mut star_value) = (None, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            star_value = v;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            star_value += 1;
+            v = star_value;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -2161,6 +2278,24 @@ pub struct Config {
     /// excludes nothing, so default behavior is unchanged.
     #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
     pub review: ReviewConfig,
+    /// `[model_families]` map: a served model id or glob to a family name.
+    ///
+    /// Reviewer cross-family enforcement uses this to answer "is this
+    /// reviewer from the author's family?". A key may be an exact model id
+    /// or a `*`/`?` glob, matched case-insensitively. An absent entry falls
+    /// back to the built-in public vendor families
+    /// ([`DEFAULT_MODEL_FAMILIES`]), then to the model id's vendor prefix
+    /// (`provider/model` -> `provider`). A model with no prefix and no
+    /// match is its own family, never a wildcard that compares equal to
+    /// every other unknown model.
+    ///
+    /// ```toml
+    /// [model_families]
+    /// "provider-a/*" = "provider-a"
+    /// "provider-a/model-x" = "shared-family"
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_families: BTreeMap<String, String>,
     /// `[context]` block: the context-optimisation levers (tool-output caps,
     /// stale elision, history compaction) and their per-provider profiles.
     /// An absent block changes nothing — the levers stay off, exactly as they
@@ -2379,6 +2514,31 @@ pub struct ReviewConfig {
     /// [`crate::config::RouteReviewDefaults`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub route_defaults: BTreeMap<String, RouteReviewDefaults>,
+    /// Optional high-risk escalation: paths whose changes require an
+    /// additional, non-local reviewer. The block is absent by default, so
+    /// standalone reviews keep their single-reviewer behaviour. Fleet
+    /// deployments opt in with their own path list in their config
+    /// repository; zoder ships no fleet paths.
+    #[serde(default, skip_serializing_if = "ReviewEscalateConfig::is_empty")]
+    pub escalate: ReviewEscalateConfig,
+}
+
+/// `[review.escalate]` block. Currently a path list; an empty/absent block is
+/// the default and disables the high-risk second reviewer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewEscalateConfig {
+    /// Gitignore-style globs of repo-relative paths. A diff that touches any
+    /// matching path requires the chain's first non-local reviewer as an
+    /// additional (second) reviewer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+impl ReviewEscalateConfig {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
 }
 
 /// Per-reviewer size caps inside `[review.route_defaults.<model>]`. Both fields
@@ -2413,6 +2573,7 @@ impl ReviewConfig {
             && self.max_hunk_bytes.is_none()
             && self.exclude.is_empty()
             && self.route_defaults.is_empty()
+            && self.escalate.is_empty()
     }
 }
 
@@ -3232,6 +3393,7 @@ impl Config {
                     token: token.to_owned(),
                 });
             self.providers.push(Provider {
+                model_aliases: Vec::new(),
                 id: provider_ref.to_owned(),
                 engine_provider_ref: Some(provider_ref.to_owned()),
                 base_url: route.effective_uri,
@@ -3305,6 +3467,7 @@ impl Config {
     pub fn default_provider(home: &std::path::Path) -> Self {
         Config {
             providers: vec![Provider {
+                model_aliases: Vec::new(),
                 id: "default".into(),
                 engine_provider_ref: None,
                 base_url: format!("https://{PLACEHOLDER_PROVIDER_HOST}/v1"),
@@ -3340,12 +3503,23 @@ impl Config {
             routing: RoutingConfig::default(),
             exec_safety: ExecSafetyConfig::default(),
             review: ReviewConfig::default(),
+            model_families: BTreeMap::new(),
             context: ContextConfig::default(),
         }
     }
 
     pub fn provider(&self, id: &str) -> Option<&Provider> {
         self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Resolve a served model id to its configured family.
+    ///
+    /// See [`model_family`] for the precedence. An empty `[model_families]`
+    /// map still gets the built-in public-vendor families and the
+    /// vendor-prefix heuristic, which is what gives a standalone install
+    /// cross-family review without any fleet configuration.
+    pub fn model_family(&self, model_id: &str) -> String {
+        model_family(&self.model_families, model_id)
     }
 
     /// Resolve which provider should serve a given model id, ranked by cost:
@@ -5217,6 +5391,7 @@ model_provider = "custom.primary"
     fn provider_for_model_routes_by_serves_prefix_else_none() {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -5230,6 +5405,7 @@ model_provider = "custom.primary"
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "enterprise-gateway".into(),
             engine_provider_ref: None,
             base_url: "https://gateway.example.invalid/v1".into(),
@@ -5274,6 +5450,7 @@ model_provider = "custom.primary"
     fn dual_billing_fixture() -> (Config, TierCatalog) {
         let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-sub".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/admin/v1".into(),
@@ -5303,6 +5480,7 @@ model_provider = "custom.primary"
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-met".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -6189,6 +6367,7 @@ auth = { type = "env", var = "ACME_KEY" }
         let mut cfg = Config::default_provider(dir.path());
         cfg.providers.clear();
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "openai-codex".into(),
             engine_provider_ref: None,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
@@ -6207,6 +6386,7 @@ auth = { type = "env", var = "ACME_KEY" }
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-sub".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -6331,6 +6511,7 @@ auth = { type = "env", var = "ACME_KEY" }
         let mut cfg = Config::default_provider(dir.path());
         cfg.providers.clear();
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-personal".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/personal/v1".into(),
@@ -6349,6 +6530,7 @@ auth = { type = "env", var = "ACME_KEY" }
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-team".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/team/v1".into(),
@@ -6434,6 +6616,7 @@ auth = { type = "env", var = "ACME_KEY" }
         // one (the dup-id error is allowed to coexist; we don't pretend
         // the dup-id rule is gone).
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-x".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/x/v1".into(),
@@ -6447,6 +6630,7 @@ auth = { type = "env", var = "ACME_KEY" }
             max_context_tokens: None,
         });
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-x".into(), // intentional duplicate to also trip dup-id
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/x2/v1".into(),
@@ -6492,6 +6676,7 @@ auth = { type = "env", var = "ACME_KEY" }
         let mut cfg = Config::default_provider(dir.path());
         cfg.providers.clear();
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "minimax-legacy".into(),
             engine_provider_ref: None,
             base_url: "https://api.minimax.io/v1".into(),
@@ -6797,6 +6982,7 @@ azure_api_version = "2024-10-21"
         // re-shuffling). The `skip_serializing_if = "Option::is_none"`
         // annotation keeps the field absent for legacy providers.
         let re_serialized = toml::to_string(&Provider {
+            model_aliases: Vec::new(),
             id: "azure-gpt4o".into(),
             engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
@@ -6834,6 +7020,7 @@ azure_api_version = "2024-10-21"
         let mut cfg = Config::default_provider(dir.path());
         cfg.providers.clear();
         cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
             id: "azure-legacy".into(),
             engine_provider_ref: None,
             base_url: "https://res.openai.azure.com/openai/deployments/gpt4o".into(),
@@ -6908,6 +7095,7 @@ billing = "metered"
         let pinned_versions = ["2024-10-21", "2024-12-01-preview", "2025-01-01"];
         for (i, v) in pinned_versions.iter().enumerate() {
             cfg.providers.push(Provider {
+                model_aliases: Vec::new(),
                 id: format!("azure-{i}"),
                 engine_provider_ref: None,
                 base_url: format!("https://res.openai.azure.com/openai/deployments/gpt4o-{i}"),
@@ -7759,5 +7947,63 @@ auth = { type = "env", var = "GUARD_KEY" }
         let empty: ReviewConfig = toml::from_str("").expect("empty review block is valid");
         assert!(empty.route_defaults.is_empty());
         assert!(empty.is_empty(), "empty block must round-trip as empty");
+    }
+
+    #[test]
+    fn model_families_defaults_cover_public_vendors_and_fall_back_to_prefix() {
+        let families = BTreeMap::new();
+        assert_eq!(model_family(&families, "openai/gpt-oss-120b"), "openai");
+        assert_eq!(model_family(&families, "Qwen/Qwen3-Coder"), "qwen");
+        assert_eq!(model_family(&families, "google/gemma-4-31b-it"), "gemma");
+        assert_eq!(model_family(&families, "MiniMax-M3"), "minimax");
+        assert_eq!(
+            model_family(&families, "deepseek-ai/deepseek-r1"),
+            "deepseek"
+        );
+        assert_eq!(
+            model_family(&families, "nvidia/nemotron-3-ultra"),
+            "nemotron"
+        );
+        assert_eq!(model_family(&families, "z-ai/glm-5.1"), "glm");
+        assert_eq!(model_family(&families, "moonshotai/kimi-k2.6"), "kimi");
+        assert_eq!(
+            model_family(&families, "mistralai/mistral-large"),
+            "mistral"
+        );
+        // Unknown vendor prefix is its own family, not a shared wildcard.
+        assert_eq!(model_family(&families, "provider-a/model-x"), "provider-a");
+        assert_eq!(model_family(&families, "provider-a/model-y"), "provider-a");
+        assert_eq!(model_family(&families, "provider-b/model-x"), "provider-b");
+        // A bare unknown id cannot be resolved and is its OWN family.
+        assert_eq!(model_family(&families, "mystery-model"), "mystery-model");
+        assert_ne!(
+            model_family(&families, "mystery-model"),
+            model_family(&families, "another-model")
+        );
+    }
+
+    #[test]
+    fn model_families_config_overrides_globs_exact_first() {
+        let mut families = BTreeMap::new();
+        families.insert("provider-a/*".to_string(), "shared".to_string());
+        families.insert("provider-a/special".to_string(), "special".to_string());
+        families.insert("*legacy*".to_string(), "legacy".to_string());
+        assert_eq!(model_family(&families, "provider-a/model-x"), "shared");
+        assert_eq!(model_family(&families, "provider-a/special"), "special");
+        assert_eq!(model_family(&families, "vendor/legacy-model"), "legacy");
+    }
+
+    #[test]
+    fn review_escalate_paths_are_optional_and_default_off() {
+        let empty: ReviewConfig = toml::from_str("").expect("empty review block");
+        assert!(empty.escalate.paths.is_empty());
+        assert!(empty.escalate.is_empty());
+        let raw = r#"
+            [escalate]
+            paths = ["src/security/**", "auth/**"]
+        "#;
+        let rc: ReviewConfig = toml::from_str(raw).expect("escalate block must parse");
+        assert_eq!(rc.escalate.paths, vec!["src/security/**", "auth/**"]);
+        assert!(!rc.escalate.is_empty());
     }
 }
