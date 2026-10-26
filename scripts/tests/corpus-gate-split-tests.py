@@ -342,6 +342,74 @@ def test_openrouter_failure_blocks_the_prices() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_a_disagreeing_stale_flag_is_read_as_stale() -> None:
+    """`overlay_stale` and `overlay.stale` must agree; if they disagree,
+    the SAFE reading wins.
+
+    A report that says `overlay_stale: false` while its `overlay` block
+    says `stale: true` is contradictory. Treating it as fresh would
+    advance the baseline from a stale overlay and could let a degraded
+    overlay be published; treating it as stale only costs a warning and
+    a skipped baseline update. So stale is the OR of the two.
+    """
+    root = _scratch()
+    try:
+        _setup(root, overlay_count=191)
+        _run_fetch(root, failing=["fetch-terminal-bench.py"], candidate=141)
+        report_path = root / "corpus" / "freshness.json"
+        report = json.loads(report_path.read_text())
+        # Force the contradiction: top level says fresh, nested says stale.
+        report["overlay_stale"] = False
+        report["overlay"]["stale"] = True
+        report_path.write_text(json.dumps(report))
+        last = root / "corpus" / "freshness-last.json"
+        last.unlink(missing_ok=True)
+
+        code, out = _run_check(root)
+        if code == 0:
+            pass_("a contradictory stale flag still exits 0 (the overlay gate never blocks)")
+        else:
+            fail_(f"a contradictory stale flag exited {code}, expected 0")
+        if "STALE" in out:
+            pass_("a contradictory stale flag is read as STALE (the safe reading)")
+        else:
+            fail_("a contradictory stale flag was NOT read as stale")
+        if not last.exists():
+            pass_("a contradictory stale flag does not advance the baseline")
+        else:
+            fail_("a contradictory stale flag advanced the baseline")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_every_script_starts_as_a_real_process() -> None:
+    """Each script must RUN, not just import.
+
+    The strongest possible proof that a module has no missing import is to
+    execute it: a script whose `import json` (or `from pathlib import
+    Path`) was deleted dies with a NameError the moment it is started,
+    long before any of its own logic runs.
+
+    `--help` is the cheapest way to start a script: argparse prints the
+    usage and exits 0, the network is never touched, and every
+    module-level statement (including every import and every constant
+    built from one) has already been executed.
+
+    This is deliberately a SUBPROCESS test: an in-process import would
+    reuse a module object and could mask a broken first-time import.
+    """
+    for script in (BUILD_SCRIPT, CHECK_SCRIPT, FETCH_SCRIPT):
+        proc = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if proc.returncode == 0:
+            pass_(f"{script.name} starts as a real process (all imports resolve)")
+        else:
+            fail_(f"{script.name} exited {proc.returncode} on --help: "
+                  f"{(proc.stderr or '').strip().splitlines()[-1:]}")
+
+
 def test_force_publish_is_still_wired_up() -> None:
     """`--force-publish` must be registered AND its branch must exist.
 
@@ -676,6 +744,8 @@ def main() -> int:
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
     _run_one(test_fresh_candidate_overlay_is_published)
     _run_one(test_openrouter_failure_blocks_the_prices)
+    _run_one(test_every_script_starts_as_a_real_process)
+    _run_one(test_a_disagreeing_stale_flag_is_read_as_stale)
     _run_one(test_force_publish_is_still_wired_up)
     _run_one(test_force_publish_overrides_a_degraded_price_source)
     _run_one(test_force_publish_copies_the_report_to_the_baseline)

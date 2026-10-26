@@ -181,7 +181,12 @@ def _check_schema2(cur: dict, corpus: Path, overlay: Path, last_path: Path,
 
     # ---- OVERLAY gate (never blocks prices) ----------------------------
     overlay_meta = cur.get("overlay") if isinstance(cur.get("overlay"), dict) else {}
-    stale = bool(cur.get("overlay_stale", overlay_meta.get("stale", False)))
+    # The two spellings of "the overlay is stale" must agree. When they
+    # disagree, the SAFE reading wins: treating a stale overlay as fresh
+    # would advance the baseline from a stale overlay and could let a
+    # degraded overlay be published, while treating a fresh overlay as
+    # stale only costs a warning. So stale is the OR of both.
+    stale = bool(cur.get("overlay_stale")) or bool(overlay_meta.get("stale"))
     age = cur.get("overlay_age_days")
     if age is None:
         age = overlay_meta.get("age_days", 0)
