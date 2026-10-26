@@ -25,6 +25,7 @@ fn entry(t: &str, provider: &str, model: &str, cost: f64, tin: u64, tout: u64) -
         calls: 1,
         violation: None,
         tags: FinOpsTags::default(),
+        billing: None,
     }
 }
 

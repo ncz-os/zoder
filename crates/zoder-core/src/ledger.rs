@@ -955,7 +955,7 @@ impl Ledger {
                 calls: 1,
                 violation: None,
                 tags: FinOpsTags::default(),
-            billing: None,
+                billing: None,
             };
             let json = fit_entry_json(&entry, bytes)?;
             if json.len() + 1 > bytes {
@@ -1948,7 +1948,7 @@ mod tests {
                     9_u128
                 )),
                 tags: FinOpsTags::default(),
-            billing: None,
+                billing: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
@@ -2019,7 +2019,7 @@ mod tests {
                     "billable call reserved but not reconciled (zoder-reservation-{n:032x})"
                 )),
                 tags: FinOpsTags::default(),
-            billing: None,
+                billing: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; slot];

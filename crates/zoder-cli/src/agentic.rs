@@ -2513,6 +2513,7 @@ mod reviewer_policy_tests {
             calls: 1,
             violation: Some(failure.clone()),
             tags: Default::default(),
+            billing: None,
         };
         let reservation = Ledger::new(&ledger_path).reserve_billable().unwrap();
         let mut health = HealthStore::load(&health_path);
@@ -14205,7 +14206,8 @@ mod reviewer_chain_dispatch_tests {
     /// the wrong corpus). The guard is intentionally cheap (no
     /// allocations beyond the lock guard) so dropping it inside an
     /// async block is well-defined.
-    struct HomeGuard {
+    #[cfg(test)]
+    pub(crate) struct HomeGuard {
         // Holding the shared `EnvGuard` (not just a bare
         // `MutexGuard`) is what makes the `Drop` impl run on
         // guard-drop, restoring the prior `ZODER_HOME` exactly
@@ -14218,7 +14220,8 @@ mod reviewer_chain_dispatch_tests {
         inner: crate::test_env::EnvGuard,
     }
     impl HomeGuard {
-        fn new(home: &Path) -> Self {
+        #[cfg(test)]
+        pub(crate) fn new(home: &Path) -> Self {
             Self {
                 inner: crate::test_env::EnvGuard::new(home),
             }
@@ -14229,7 +14232,8 @@ mod reviewer_chain_dispatch_tests {
     /// to, all marked `free=true` so the policy gate (which runs on the
     /// reviewer's call site before dispatch) doesn't reject them with a
     /// paid-need-confirm. The shape matches what `Corpus::load` expects.
-    fn write_corpus(home: &Path, ids: &[&str]) {
+    #[cfg(test)]
+    pub(crate) fn write_corpus(home: &Path, ids: &[&str]) {
         let arr: Vec<serde_json::Value> = ids
             .iter()
             .map(|id| {
@@ -14255,7 +14259,8 @@ mod reviewer_chain_dispatch_tests {
     /// providers, both pointing at the wiremock URI returned by the call
     /// site (a shared URL is fine — the model-id-to-provider routing in
     /// `Config::provider_for_model` keys off the `serves` prefix).
-    fn write_config(home: &Path, mock_uri: &str, reviewer_model: &str) {
+    #[cfg(test)]
+    pub(crate) fn write_config(home: &Path, mock_uri: &str, reviewer_model: &str) {
         let body = serde_json::json!({
             "providers": [
                 {
@@ -17704,6 +17709,334 @@ model_provider = "custom.nemotron35"
         assert!(v["log"][0].get("review_complete").is_none());
         assert!(v["log"][0].get("reviewer_verdicts").is_none());
         assert!(v["log"][0].get("findings").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-route / metered ledger accounting: the reviewer dispatch path must
+// bill from the provider's billing posture, not the catalog.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod reviewer_ledger_billing_tests {
+    use super::reviewer_chain_dispatch_tests::{write_corpus, HomeGuard};
+    use crate::Cli;
+    use clap::Parser;
+    use std::path::Path;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A config with ONE free route (`billing = "free"`, `paid = false`)
+    /// and one metered route, both backed by the same wiremock server.
+    fn write_two_provider_config(home: &Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [
+                {
+                    "id": "wiremock-free",
+                    "base_url": format!("{mock_uri}/free"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "paid": false,
+                    "billing": "free",
+                    "serves": ["free-model/"],
+                },
+                {
+                    "id": "wiremock-metered",
+                    "base_url": format!("{mock_uri}/metered"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "paid": true,
+                    "billing": "metered",
+                    "serves": ["metered-model/"],
+                },
+            ],
+            "default_provider": "wiremock-free",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn mount_openai_reply(server: &MockServer, prefix: &str, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path(format!(
+                "{prefix}/v1/chat/completions"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .mount(server)
+            .await;
+    }
+
+    /// One oneshot-style reviewer call on a route configured
+    /// `billing = "free"`, `paid = false`, whose model HAS a catalog price.
+    /// The row must be $0 known with `billing: "free"` — the catalog must
+    /// never price a free route.
+    #[tokio::test]
+    async fn a_free_reviewer_call_records_zero_with_a_billing_free_row() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        write_corpus(home, &["free-model/reviewer"]);
+        write_two_provider_config(home, &server.uri());
+        // The runtime catalog prices the model: this is the condition that
+        // used to bill the free route at list price.
+        std::fs::write(
+            home.join("pricing.json"),
+            r#"{
+                "models": {
+                    "free-model/reviewer": {
+                        "input_usd_per_mtok": 1.0,
+                        "output_usd_per_mtok": 2.0
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
+        mount_openai_reply(
+            &server,
+            "/free",
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": review},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 500_000, "total_tokens": 1_500_000}
+            }),
+        ).await;
+        let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
+        let completion = crate::agentic::complete_once(
+            &cli,
+            Some("free-model/reviewer"),
+            &[],
+            "system",
+            "user",
+            1024,
+            None,
+        )
+        .await
+        .expect("free reviewer call must succeed");
+        assert!(completion.cost_usd == 0.0, "a free route records $0");
+        let rows = zoder_core::ledger::Ledger::new(&home.join("ledger.jsonl"))
+            .entries_strict()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.model == "free-model/reviewer")
+            .expect("the reviewer row must be in the ledger");
+        assert_eq!(row.cost_usd, 0.0);
+        assert!(!row.cost_unknown, "a free route's $0 is known");
+        assert_eq!(row.billing.as_deref(), Some("free"));
+        assert_eq!(row.violation, None, "a free route trips no policy guard");
+    }
+
+    /// A METERED reviewer call priced by the catalog bills at the catalog
+    /// math (cache hits at the cache-read rate) and records
+    /// `billing: "metered"`.
+    #[tokio::test]
+    async fn a_metered_reviewer_call_prices_from_the_catalog() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        write_corpus(home, &["metered-model/reviewer"]);
+        write_two_provider_config(home, &server.uri());
+        std::fs::write(
+            home.join("pricing.json"),
+            r#"{
+                "models": {
+                    "metered-model/reviewer": {
+                        "input_usd_per_mtok": 1.0,
+                        "output_usd_per_mtok": 2.0,
+                        "cache_read_usd_per_mtok": 0.1
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
+        mount_openai_reply(
+            &server,
+            "/metered",
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": review},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000,
+                          "prompt_tokens_details": {"cached_tokens": 900_000}}
+            }),
+        ).await;
+        let cli = Cli::try_parse_from(["zoder", "review", "--allow-paid"]).unwrap();
+        let completion = crate::agentic::complete_once(
+            &cli,
+            Some("metered-model/reviewer"),
+            &[],
+            "system",
+            "user",
+            1024,
+            None,
+        )
+        .await
+        .expect("metered reviewer call must succeed with --allow-paid");
+        // 900k hits at 0.1/M + 100k misses at 1.0/M = $0.19
+        assert!(
+            (completion.cost_usd - 0.19).abs() < 1e-9,
+            "catalog math with cache hits: {}",
+            completion.cost_usd
+        );
+        let rows = zoder_core::ledger::Ledger::new(&home.join("ledger.jsonl"))
+            .entries_strict()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.model == "metered-model/reviewer")
+            .expect("the reviewer row must be in the ledger");
+        assert!(!row.cost_unknown);
+        assert_eq!(row.billing.as_deref(), Some("metered"));
+    }
+
+    /// A metered reviewer model priced NOWHERE (absent from both the
+    /// runtime catalog and the shipped list) must be `cost_unknown`, never
+    /// a known $0 — and the turn must be recorded with a violation, not
+    /// silently accepted.
+    #[tokio::test]
+    async fn an_unpriced_metered_reviewer_call_is_unknown_not_known_zero() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        write_corpus(home, &["metered-model/reviewer"]);
+        write_two_provider_config(home, &server.uri());
+        // An EMPTY runtime catalog: the shipped list must not contain this
+        // synthetic id either, so the lookup falls through to Unknown.
+        std::fs::write(home.join("pricing.json"), r#"{"models": {}}"#).unwrap();
+        let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
+        mount_openai_reply(
+            &server,
+            "/metered",
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": review},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+            }),
+        )
+        .await;
+        let cli = Cli::try_parse_from(["zoder", "review", "--allow-paid"]).unwrap();
+        let completion = crate::agentic::complete_once(
+            &cli,
+            Some("metered-model/reviewer"),
+            &[],
+            "system",
+            "user",
+            1024,
+            None,
+        )
+        .await;
+        // The call itself succeeds; the cost-unknown violation is recorded
+        // on the ledger row (the dispatch path reconciles it), and the
+        // completion's cost_usd placeholder stays 0.
+        let completion = completion.expect("the call succeeds; the violation is on the row");
+        assert_eq!(completion.cost_usd, 0.0);
+        let rows = zoder_core::ledger::Ledger::new(&home.join("ledger.jsonl"))
+            .entries_strict()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.model == "metered-model/reviewer")
+            .expect("the reviewer row must be in the ledger");
+        assert!(
+            row.cost_unknown,
+            "a metered model priced nowhere is cost_unknown"
+        );
+        // Under --allow-paid (required to reach a metered reviewer at all)
+        // the cost-unknown violation is suppressed, EXACTLY like an existing
+        // cost_unknown metered turn; the row still marks the cost unknown so
+        // reports segregate it from verified $0.
+        assert_eq!(row.billing.as_deref(), Some("metered"));
+    }
+
+    /// MISSING USAGE: a metered response that carries content +
+    /// `finish_reason` and NO usage block must never be priced from a
+    /// guessed token count, and never recorded as a known $0: the row is
+    /// `cost_unknown` with `tokens_in = 0` (the output side may keep the
+    /// estimate, that is fine as long as the call is not priced from it).
+    #[tokio::test]
+    async fn a_metered_response_without_usage_is_unknown_not_known_zero() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        write_corpus(home, &["metered-model/reviewer"]);
+        write_two_provider_config(home, &server.uri());
+        // The model IS priced in the catalog, so a guessed token count would
+        // have produced a real (wrong) charge.
+        std::fs::write(
+            home.join("pricing.json"),
+            r#"{
+                "models": {
+                    "metered-model/reviewer": {
+                        "input_usd_per_mtok": 1.0,
+                        "output_usd_per_mtok": 2.0
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
+        mount_openai_reply(
+            &server,
+            "/metered",
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": review},
+                    "finish_reason": "stop"
+                }]
+                // NO "usage" block: the provider answered without usage.
+            }),
+        )
+        .await;
+        let cli = Cli::try_parse_from(["zoder", "review", "--allow-paid"]).unwrap();
+        let completion = crate::agentic::complete_once(
+            &cli,
+            Some("metered-model/reviewer"),
+            &[],
+            "system",
+            "user",
+            1024,
+            None,
+        )
+        .await
+        .expect("the call succeeds; the cost-unknown row is the accounting");
+        let rows = zoder_core::ledger::Ledger::new(&home.join("ledger.jsonl"))
+            .entries_strict()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.model == "metered-model/reviewer")
+            .expect("the reviewer row must be in the ledger");
+        assert!(
+            row.cost_unknown,
+            "a metered response with no usage is cost_unknown, never a known $0"
+        );
+        assert_eq!(row.cost_usd, 0.0, "the placeholder stays $0");
+        assert_eq!(
+            row.tokens_in, 0,
+            "no usage means no authoritative input count"
+        );
+        // The output side may keep the estimate (chunk count), that is fine
+        // as long as the call is not PRICED from it: a priced row here would
+        // be cost_unknown == false.
+        assert_eq!(row.billing.as_deref(), Some("metered"));
+        let _ = completion;
     }
 }
 
