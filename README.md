@@ -29,6 +29,36 @@ zoder loop          # author → validate → review → fix, until it passes
 zoder report        # spend + what the free path saved you, in dollars
 ```
 
+## Single-host quick start (standalone profile)
+
+zoder's default deployment is **one host**. `install.sh` writes a starter
+config only when no zoder config exists; `zoder init` does the same for an
+existing install. Existing configs are never overwritten.
+
+```bash
+# 1. One hosted provider key is enough. If only MINIMAX_API_KEY is set,
+#    `zoder init` pins the author route to MiniMax.
+export DEEPSEEK_API_KEY=...
+# or: export MINIMAX_API_KEY=...
+
+# 2. Create the starter config (skipped when a config already exists).
+zoder init --profile standalone
+
+# 3. First run. Hosted models are metered, so paid calls need --allow-paid.
+zoder exec --dry-run "summarize this repo"      # route preview; no model call
+zoder exec --allow-paid "summarize this repo"
+zoder review --allow-paid
+zoder loop --allow-paid --check "cargo test"
+```
+
+The template includes an optional local OpenAI-compatible endpoint
+(llama.cpp `:8080` / Ollama `:11434`), commented out, plus a conservative
+`[budget]` backstop. With one provider key the reviewer first tries the other
+provider and then falls back to the provider you have, printing a warning; with
+two keys it uses a genuine cross-family reviewer. See
+[`docs/PROFILES.md`](docs/PROFILES.md) for standalone vs fleet and the settings
+that differ.
+
 ---
 
 zoder is to [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) what Ubuntu is
