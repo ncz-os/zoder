@@ -561,6 +561,15 @@ fn classify_reqwest(e: reqwest::Error) -> ProviderError {
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// The `tool_call_id` a `role = "tool"` message must carry.
+    ///
+    /// A provider that validates the chat-completions schema REJECTS a tool
+    /// message without one ("missing field `tool_call_id`"), so a client
+    /// that cannot express it cannot send a tool result at all. The field is
+    /// omitted when it is absent, so every other message serialises exactly
+    /// as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -568,6 +577,20 @@ impl Message {
         Self {
             role: role.into(),
             content: content.into(),
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool result, bound to the tool call that produced it.
+    ///
+    /// `id` is the `tool_call_id` from the assistant turn that requested the
+    /// call. A provider that validates the schema rejects a tool message
+    /// without one.
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_call_id: Some(id.into()),
         }
     }
 }
