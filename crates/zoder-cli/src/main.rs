@@ -3695,6 +3695,13 @@ async fn cmd_models(
 ) -> anyhow::Result<()> {
     let mut eng = Engine::load()?;
 
+    // The corpus this command works from may be weeks old (the daily sync
+    // broke for 13 days in October 2026 and every client kept routing on the
+    // stale index). Say so on stderr. The `--json` payload is a bare array of
+    // model objects that scripts parse, so the warning stays on stderr there
+    // too instead of changing the JSON schema.
+    print_staleness_warning(&corpus_staleness_warning(&eng.corpus));
+
     // Live catalog enrichment: ask the running zeroclaw daemon for its
     // current `config/catalog-models` and fold the answer into the
     // corpus before display. The RPC is best-effort with its own
@@ -5142,20 +5149,76 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
     Ok(())
 }
 
-/// One model's worth of work: try it, retrying transient failures with backoff.
-/// Returns `Ok(result)` on success, `Err((err, fatal))` otherwise. `fatal`
-/// means the caller must NOT fall back (output was already partially emitted).
-async fn try_model(
-    provider: &OpenAiProvider,
-    req: &ChatRequest,
+/// One model attempt's parameters: the output mode, retry count, quiet
+/// flag, the cost ledger, and — for the review chain only — the optional
+/// host-wide call budget for the provider's endpoint group
+/// (`rate_limit_group` + (max_concurrent, max_requests_per_minute) from
+/// `Config::provider_call_budget`; `None` = no configured cap = today's
+/// behaviour: no slot, no rate ledger).
+struct ModelCall<'a> {
     json: bool,
     retries: u32,
     quiet: bool,
-    ledger: &Ledger,
-    initial_reservation: &mut Option<BillableReservation>,
+    ledger: &'a Ledger,
+    initial_reservation: &'a mut Option<BillableReservation>,
+    call_budget: Option<(String, usize, u32)>,
+}
+
+/// One model's worth of work: try it, retrying transient failures with
+/// backoff. Returns `Ok(result)` on success, `Err((err, fatal))` otherwise.
+/// `fatal` means the caller must NOT fall back (output was already partially
+/// emitted). When a call budget is configured, each attempt first acquires a
+/// host-wide concurrency slot and a sliding-window rate turn for the
+/// provider's endpoint group, so parallel zoder processes on this host
+/// cannot burst a shared free endpoint into 503s or 429s. `None` (no
+/// configured cap) is a no-op.
+async fn try_model_with_budget(
+    provider: &OpenAiProvider,
+    req: &ChatRequest,
+    call: ModelCall<'_>,
 ) -> anyhow::Result<Result<(ChatResult, BillableReservation), (ProviderError, bool)>> {
+    let ModelCall {
+        json,
+        retries,
+        quiet,
+        ledger,
+        initial_reservation,
+        call_budget,
+    } = call;
     let mut attempt = 0u32;
     loop {
+        // Host-wide call budget for this provider's endpoint group: wait for
+        // a concurrency slot + a sliding-window rate turn before dispatching,
+        // so parallel zoder processes on this host cannot burst a shared
+        // free endpoint into 503s/429s. `None` (no configured cap) is a
+        // no-op — today's behaviour. A queue timeout is a capacity signal, so
+        // the caller falls back to the next model (fatal=false).
+        let mut group_guard: Option<zoder_core::provider_rate::Acquired> = None;
+        if let Some((ref group, conc, rpm)) = call_budget {
+            match zoder_core::provider_rate::acquire(
+                &Config::home(),
+                group,
+                conc,
+                rpm,
+                zoder_core::provider_rate::queue_timeout_from_env(),
+                quiet,
+            )
+            .await
+            {
+                Ok(a) => group_guard = Some(a),
+                Err(e) => {
+                    return Ok(Err((
+                        zoder_core::ProviderError {
+                            message: format!("endpoint group {group}: {e}"),
+                            kind: zoder_core::ErrKind::RateLimit,
+                            ..Default::default()
+                        },
+                        false,
+                    )))
+                }
+            }
+        }
+        let _ = &group_guard;
         let mut reservation = match initial_reservation.take() {
             Some(reservation) => reservation,
             None => ledger
@@ -5182,7 +5245,13 @@ async fn try_model(
                     return Ok(Err((e, true)));
                 }
                 if e.retryable() && attempt < retries {
-                    let delay = backoff_delay(attempt, e.retry_after);
+                    let delay = backoff_delay(
+                        attempt,
+                        e.retry_after,
+                        e.overload
+                            .then(|| provider.overload_backoff_min())
+                            .flatten(),
+                    );
                     if !quiet {
                         eprintln!(
                             "[zoder] {} (retry {}/{} in {:.1}s)",
@@ -6465,7 +6534,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                     pcfg,
                     Some(provider_request_timeout_s(cli, &eng.cfg)),
                 )?
-                .with_wait_notices(!cli.quiet),
+                .with_wait_notices(!cli.quiet)
+                .with_request_stream(pcfg.stream),
             );
         }
         // Per-model request budget. The cached client above is built with the
@@ -6480,6 +6550,16 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         // id rather than the alias key so it works whichever alias resolved
         // here. Absent config keeps the previous behaviour exactly.
         let model_cfg = eng.cfg.model_entry_for(model_id);
+        // Direct-request settings (reasoning_effort, chat_template_kwargs)
+        // resolved by the shared resolver: explicit --reasoning > zoder
+        // model entry > engine profile for the selected agent > engine
+        // reviewer profile > first engine profile serving the model.
+        let direct = eng.engine_models.request_settings_for(
+            model_id,
+            cli.agent.as_deref(),
+            cli.reasoning.as_deref(),
+            model_cfg,
+        );
         // The context levers bound the conversation THIS call carries: the
         // prior session transcript plus the new prompt. They are resolved per
         // model, because the lever profile is per provider.
@@ -6509,14 +6589,11 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
-            reasoning_effort: cli
-                .reasoning
-                .clone()
-                .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone())),
+            reasoning_effort: direct.reasoning_effort,
             top_p: model_cfg.and_then(|m| m.top_p),
             top_k: model_cfg.and_then(|m| m.top_k),
             presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
-            chat_template_kwargs: model_cfg.and_then(|m| m.chat_template_kwargs.clone()),
+            chat_template_kwargs: direct.chat_template_kwargs,
             response_format: None,
         };
         // Per-model timer: health latency must reflect THIS model's call, not
@@ -6544,17 +6621,19 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             }
         }
         let model_started = std::time::Instant::now();
-        match try_model(
-            provider,
-            &req,
-            cli.json,
-            cli.retries,
-            cli.quiet,
-            &ledger,
-            &mut initial_reservation,
-        )
-        .await?
-        {
+        let link_call_budget = eng
+            .cfg
+            .provider(&pid)
+            .map(|pcfg| eng.cfg.provider_call_budget(pcfg));
+        let call = ModelCall {
+            json: cli.json,
+            retries: cli.retries,
+            quiet: cli.quiet,
+            ledger: &ledger,
+            initial_reservation: &mut initial_reservation,
+            call_budget: link_call_budget,
+        };
+        match try_model_with_budget(provider, &req, call).await? {
             Ok((res, reservation)) => {
                 if link_gated {
                     crate::provider_health::record_success(&eng.cfg.health_path, &pid, model_id);
@@ -6571,7 +6650,43 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 break;
             }
             Err((e, fatal)) => {
-                attempt_failures.push(format!("{model_id} via {pid}: {}", e.message));
+                // A budget exhaustion (finish_reason "length" with no answer)
+                // is a real, explainable outcome, not a provider error to
+                // bury under "failed": the model spent the whole
+                // max_tokens thinking and produced nothing. Name it, with
+                // the model's reasoning text when the provider sent some —
+                // the oneshot path deliberately does NOT double the budget
+                // (that is a reviewer-only repair; a one-shot exec that
+                // retried would just bill the same reasoning again).
+                let message = e
+                    .length_exhausted
+                    .as_ref()
+                    .map(|usage| {
+                        let used = usage
+                            .completion_tokens
+                            .map(|t| format!(" ({t} completion tokens used)"))
+                            .unwrap_or_default();
+                        let reasoning = e
+                            .reasoning
+                            .as_ref()
+                            .map(|b| b.as_str())
+                            .map(str::trim)
+                            .filter(|r| !r.is_empty())
+                            .map(|r| {
+                                let truncated: String = r.chars().take(120).collect();
+                                format!(
+                                    " — its reasoning ended: \"{truncated}…\" (full text with --show-reasoning)"
+                                )
+                            })
+                            .unwrap_or_default();
+                        format!(
+                            "model spent its whole {}-token budget{used} and returned no answer{reasoning}; \
+raise --max-tokens or lower its reasoning effort",
+                            req.max_tokens
+                        )
+                    })
+                    .unwrap_or_else(|| e.message.clone());
+                attempt_failures.push(format!("{model_id} via {pid}: {message}"));
                 if link_gated {
                     crate::provider_health::record_call_error(
                         &eng.cfg.health_path,
@@ -8655,7 +8770,7 @@ async fn agentic_cost(
                 // return the unknown tuple, and an extra sleep here
                 // would only delay the operator-visible diagnostic.
                 if attempt + 1 < AGENTIC_COST_MAX_ATTEMPTS {
-                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                    tokio::time::sleep(backoff_delay(attempt, None, None)).await;
                 }
             }
         }
@@ -14121,6 +14236,9 @@ async fn run_probe_all(
         provider_paid: bool,
         provider_cost_neutral: bool,
         provider: OpenAiProvider,
+        /// Host-wide call-budget params for this provider's endpoint group
+        /// (`rate_limit_group`, `max_concurrent`, `max_requests_per_minute`).
+        call_budget: (String, usize, u32),
         targets: Vec<String>,
         dropped: usize,
     }
@@ -14237,6 +14355,7 @@ async fn run_probe_all(
             provider_paid: p.paid || p.billing == BillingMode::Metered,
             provider_cost_neutral: !p.paid && p.billing != BillingMode::Metered,
             provider,
+            call_budget: eng.cfg.provider_call_budget(p),
             targets,
             dropped,
         });
@@ -14261,6 +14380,7 @@ async fn run_probe_all(
             provider_paid,
             provider_cost_neutral,
             provider,
+            call_budget,
             targets,
             dropped,
         } = plan;
@@ -14318,6 +14438,47 @@ async fn run_probe_all(
                     format!("verifying ledger reservation before health probe for {model_id}")
                 })?;
             let t = std::time::Instant::now();
+            // Host-wide call budget for this provider's endpoint group: keep
+            // the sweep inside the configured concurrency/rate caps (no-op
+            // when the provider declares no cap). A queue timeout records the
+            // target as a classified failure and moves on, like any other
+            // ping failure.
+            let probe_budget = {
+                let (ref group, conc, rpm) = call_budget;
+                if conc == 0 && rpm == 0 {
+                    None
+                } else {
+                    match zoder_core::provider_rate::acquire(
+                        &Config::home(),
+                        group,
+                        conc,
+                        rpm,
+                        zoder_core::provider_rate::queue_timeout_from_env(),
+                        quiet,
+                    )
+                    .await
+                    {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            let note = format!("call budget queue: {e}");
+                            health.record_classified_failure(
+                                model_id,
+                                &note,
+                                &provider_id,
+                                Classification::Error,
+                            );
+                            provider_outcomes.push(ProbeOutcome {
+                                provider_id: provider_id.clone(),
+                                model_id: model_id.clone(),
+                                latency_ms: None,
+                                classification: Classification::Error,
+                                note: Some(note),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            };
             let outcome =
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
                     Ok(Ok(result)) => {
@@ -14379,6 +14540,7 @@ async fn run_probe_all(
                     }
                 };
             provider_outcomes.push(outcome);
+            drop(probe_budget);
         }
 
         // Human path: print this provider's block IMMEDIATELY and
@@ -14648,6 +14810,28 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         provider_cfg,
         Some(provider_request_timeout_s(cli, &eng.cfg)),
     )?;
+    // Host-wide call budget for this provider's endpoint group: a refresh
+    // burst against a shared free endpoint is the same 429/503 source as
+    // review bursts (no-op when the provider declares no cap).
+    let refresh_budget = {
+        let (group, conc, rpm) = eng.cfg.provider_call_budget(provider_cfg);
+        if conc == 0 && rpm == 0 {
+            None
+        } else {
+            Some(
+                zoder_core::provider_rate::acquire(
+                    &Config::home(),
+                    &group,
+                    conc,
+                    rpm,
+                    zoder_core::provider_rate::queue_timeout_from_env(),
+                    cli.quiet,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("endpoint group {group}: {e}"))?,
+            )
+        }
+    };
     let served = provider.list_models().await.map_err(|e| {
         anyhow::anyhow!(
             "could not list models from {}: {}",
@@ -14655,6 +14839,7 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
             e.message
         )
     })?;
+    drop(refresh_budget);
 
     // Free-provider catalog ingestion: every provider that declares `serves`
     // prefixes and is billed free contributes its live open-weight catalog to
@@ -14672,7 +14857,26 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         let ids = if p.id == default_id {
             served.clone()
         } else {
-            match OpenAiProvider::new_with_request_timeout_s(
+            // Same host-wide call budget for this provider's endpoint group
+            // (no-op when no cap is declared).
+            let (group, conc, rpm) = eng.cfg.provider_call_budget(p);
+            let _budget = if conc == 0 && rpm == 0 {
+                None
+            } else {
+                Some(
+                    zoder_core::provider_rate::acquire(
+                        &Config::home(),
+                        &group,
+                        conc,
+                        rpm,
+                        zoder_core::provider_rate::queue_timeout_from_env(),
+                        cli.quiet,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("endpoint group {group}: {e}"))?,
+                )
+            };
+            let ids = match OpenAiProvider::new_with_request_timeout_s(
                 p,
                 Some(provider_request_timeout_s(cli, &eng.cfg)),
             ) {
@@ -14691,7 +14895,9 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
                     }
                     continue;
                 }
-            }
+            };
+            drop(_budget);
+            ids
         };
         let kept: Vec<String> = ids
             .into_iter()
@@ -15088,6 +15294,13 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             let (cat, stats) = sync_catalog(&sources, Some(baseline)).await?;
             cat.save(&path)?;
             publish_engine_catalog(&cat, *external, json)?;
+            // How current is the catalog we just wrote? A refresh can still
+            // land on an old build date (a partial sync, a cached source), and
+            // stale prices mis-state spend silently.
+            let today = chrono::Local::now().date_naive();
+            let age_days = cat.age_days(today);
+            let stale_warning = cat.staleness_warning(today, stale_threshold_days());
+            let stale = stale_warning.is_some();
             if json {
                 println!(
                     "{}",
@@ -15099,6 +15312,11 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                         "baseline_usd_per_mtok": cat.baseline_usd_per_mtok,
                         "errors": stats.errors,
                         "path": path.display().to_string(),
+                        "pricing_age_days": age_days,
+                        "pricing_stale": stale,
+                        // The same warning the text mode prints, so a JSON
+                        // consumer can surface it without re-deriving it.
+                        "pricing_warning": stale_warning,
                     })
                 );
             } else {
@@ -15106,6 +15324,12 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                 println!("  litellm    : {} models", stats.litellm);
                 println!("  openrouter : {} models", stats.openrouter);
                 println!("  total      : {} models", stats.total);
+                match age_days {
+                    Some(days) => {
+                        println!("  age        : {days} day(s) (generated {})", cat.generated)
+                    }
+                    None => println!("  age        : unknown (no usable date)"),
+                }
                 if cat.baseline_usd_per_mtok > 0.0 {
                     println!(
                         "  baseline   : {} (${:.2}/Mtok blended)",
@@ -15119,6 +15343,12 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                 }
                 for e in &stats.errors {
                     eprintln!("  warning: {e}");
+                }
+                // In `--json` mode the age is reported as `pricing_age_days` /
+                // `pricing_stale` instead of this text, so a JSON parser never
+                // sees a warning.
+                if let Some(warning) = &stale_warning {
+                    eprintln!("{warning}");
                 }
             }
             Ok(())
@@ -15739,6 +15969,30 @@ fn cmd_providers(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The staleness threshold in days for the corpus and the pricing catalog.
+///
+/// `$ZODER_CORPUS_STALE_DAYS` overrides the default (7); `0` disables the
+/// warning and an unparsable value falls back to the default.
+fn stale_threshold_days() -> i64 {
+    zoder_core::corpus::stale_threshold_from_env()
+}
+
+/// The warning for a model corpus that is older than the threshold, if any.
+fn corpus_staleness_warning(corpus: &Corpus) -> Option<String> {
+    let today = chrono::Local::now().date_naive();
+    corpus.staleness_warning(today, stale_threshold_days())
+}
+
+/// Print a warning on stderr, if there is one.
+///
+/// stderr, never stdout: scripts parse the stdout of these commands, and an
+/// old corpus must never break a script (or the command) - it is a nudge.
+fn print_staleness_warning(warning: &Option<String>) {
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+}
+
 fn cmd_config(validate: bool) -> anyhow::Result<()> {
     // Load unvalidated so this command remains the diagnostic tool: without
     // `--validate` it must still print home/providers and the problem list
@@ -15762,13 +16016,16 @@ fn cmd_config(validate: bool) -> anyhow::Result<()> {
 
     let problems = cfg.validate();
     match Corpus::load(&cfg.corpus_path) {
-        Ok(c) => {
-            let free = c.free_chat().count();
+        Ok(corpus) => {
+            let free = corpus.free_chat().count();
             println!(
                 "corpus OK:   {} models, {} free chat route-candidates",
-                c.models.len(),
+                corpus.models.len(),
                 free
             );
+            // An old corpus is a nudge, not an error: it goes to stderr (stdout
+            // here is parsed by scripts) and never changes the exit code.
+            print_staleness_warning(&corpus_staleness_warning(&corpus));
         }
         Err(e) => println!("corpus ERROR: {e}"),
     }
@@ -16520,6 +16777,12 @@ mod probe_skip_class_tests {
             serves: serves.iter().map(|s| s.to_string()).collect(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -16754,6 +17017,149 @@ mod probe_skip_class_tests {
 }
 
 #[cfg(test)]
+mod oneshot_empty_length_tests {
+    // Regression: a reasoning model that spends the whole `--max-tokens`
+    // budget and returns `finish_reason: "length"` with an EMPTY answer used
+    // to surface from the oneshot exec path as the generic provider
+    // diagnostic (pre-fix: "malformed chat-completion response: empty
+    // completion choice/message"). The oneshot path must surface a clear,
+    // budget-naming error instead — and it must NOT double the budget:
+    // exactly one request reaches the provider.
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn write_oneshot_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [
+                {
+                    "id": "wiremock-working",
+                    "base_url": format!("{mock_uri}"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "billing": "free",
+                    "serves": ["local/"],
+                    "max_context_tokens": 8192,
+                }
+            ],
+            "default_provider": "wiremock-working",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": "local/coder", "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oneshot_empty_length_completion_surfaces_the_budget_error() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = crate::test_env::EnvGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "spinning wheels"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 32, "total_tokens": 35}
+            })))
+            .mount(&server)
+            .await;
+        write_oneshot_home(home, &server.uri());
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "--oneshot",
+            "-m",
+            "local/coder",
+            "--max-tokens",
+            "32",
+            "--retries",
+            "0",
+            "--no-stream",
+        ])
+        .unwrap();
+        let err = cmd_exec_oneshot(&cli, Some("hi".to_string()))
+            .await
+            .expect_err("an empty at-length completion must fail the run");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("local/coder"),
+            "the diagnostic must name the model: {chain}"
+        );
+        assert!(
+            chain.contains("32-token budget"),
+            "the diagnostic must name the exhausted budget: {chain}"
+        );
+        assert!(
+            chain.contains("returned no answer"),
+            "the diagnostic must say there was no answer: {chain}"
+        );
+        assert!(
+            !chain.contains("malformed"),
+            "a budget exhaustion must not be reported as malformed wire data: {chain}"
+        );
+        // No automatic budget doubling: the provider saw exactly one
+        // request, at the requested budget.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "oneshot exec must not retry a budget exhaustion with a bigger budget"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(32),
+            "the single request ran at the requested budget"
+        );
+        // The failed call was ledgered with the usage the provider
+        // published (as unknown cost: no pricing catalog in the test home).
+        let ledger = std::fs::read_to_string(home.join("ledger.jsonl")).unwrap_or_default();
+        let row: serde_json::Value = serde_json::from_str(
+            ledger
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("{}"),
+        )
+        .unwrap();
+        assert_eq!(
+            row.get("model").and_then(|v| v.as_str()),
+            Some("local/coder"),
+            "the ledger row must name the model: {row}"
+        );
+        // The oneshot path records the failed call via its armed
+        // reservation, which lands as an unknown-cost row naming the
+        // model: it EXISTS (spend happened) even though no pricing
+        // catalog exists in the test home to turn the published usage
+        // into a cost.
+        assert_eq!(
+            row.get("cost_unknown").and_then(|v| v.as_bool()),
+            Some(true),
+            "the failed call is recorded as unknown-cost, not dropped: {row}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod default_probe_scope_tests {
     // `health --probe` used to ping every free corpus model on the default
     // provider and ignore `-m`. A provider that serves one model answered
@@ -16803,6 +17209,12 @@ mod default_probe_scope_tests {
             serves: serves.iter().map(|s| s.to_string()).collect(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -17018,6 +17430,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(
             classify_provider(&p, "enterprise/review-model"),
@@ -17036,6 +17454,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Paid);
         let p = Provider {
@@ -17051,6 +17475,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(classify_provider(&p, "MiniMax-M3"), ProviderClass::Free);
     }
@@ -18169,6 +18599,12 @@ mod subscription_utilization_render_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         // Both labels must surface so the operator can tell them apart.
@@ -18265,6 +18701,12 @@ mod model_selection_tests {
             serves: vec!["minimax/".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -18285,6 +18727,12 @@ mod model_selection_tests {
             ],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
@@ -18363,6 +18811,12 @@ mod model_selection_tests {
             serves: vec!["shared-model".into(), "safe-model".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -18736,6 +19190,12 @@ model_provider = "custom.minimax"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let engine_models = EngineModelRegistry::from_toml(
             r#"
@@ -18797,6 +19257,12 @@ model_provider = "custom.groq"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let routing = RoutingContext {
             entries: Vec::new(),
@@ -18827,6 +19293,12 @@ model_provider = "custom.groq"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let cli = Cli::try_parse_from(["zoder", "exec", "-m", "openai/gpt-oss-120b"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
@@ -20463,6 +20935,12 @@ model_provider = "custom.minimax"
             serves: vec!["free/nemotron".into(), "free/llama".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let mut corpus = fixture_corpus();
         // Pin corpus entries: the head is paid (owned by the metered
@@ -20689,6 +21167,12 @@ model_provider = "custom.minimax"
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             },
             Provider {
                 model_aliases: Vec::new(),
@@ -20703,6 +21187,12 @@ model_provider = "custom.minimax"
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             },
         ];
         cfg.default_provider = "openai-sub".into();
@@ -21351,6 +21841,12 @@ mod ledger_call_cost_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -21575,7 +22071,31 @@ mod ledger_call_cost_tests {
     /// when the catalog has a row for the model.
     #[test]
     fn a_subscription_provider_is_a_flat_plan_and_cost_neutral() {
-        let p = metered_provider(BillingMode::Subscription, false);
+        let mut p = Provider {
+            model_aliases: Vec::new(),
+            id: "p".into(),
+            engine_provider_ref: None,
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Metered,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        };
+        assert!(!p.is_flat_plan());
+        p.billing = BillingMode::Free;
+        assert!(!p.is_flat_plan());
+        p.billing = BillingMode::Subscription;
+
         assert!(p.is_flat_plan());
         assert!(is_cost_neutral_provider(&p));
         let (cost, unknown) = ledger_call_cost(
@@ -21591,5 +22111,362 @@ mod ledger_call_cost_tests {
             None,
         );
         assert_eq!((cost, unknown), (0.0, false));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `exec --oneshot` request-settings regression tests.
+//
+// The oneshot builder used to stop at the zoder model entry
+// (`[providers.models.*]`) and ignore the ENGINE profile's
+// `provider_extra = { reasoning_effort = ... }` / `chat_template_kwargs`.
+// A reasoning model that rejects the provider's default effort (HTTP 400)
+// was usable through the loop and the reviewer, but `exec --oneshot` sent no
+// `reasoning_effort` at all. The shared resolver
+// (`EngineModelRegistry::request_settings_for`) closed the gap; these tests
+// assert the resolved fields on the wire against a wiremock provider.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod oneshot_request_settings_tests {
+    use super::*;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "m";
+    const UNSERVED: &str = "unserved-model";
+
+    /// Engine `config.toml` with one profile serving `MODEL` and pinning
+    /// `provider_extra = { reasoning_effort = "none" }`, plus a
+    /// kwargs-only second profile for the same model (the first-profile
+    /// fallback hop).
+    fn engine_toml() -> String {
+        r#"
+[providers.models.custom.m]
+model = "m"
+provider_extra = { reasoning_effort = "none" }
+
+[providers.models.custom.kwargs]
+model = "m"
+chat_template_kwargs = { enable_thinking = false }
+"#
+        .to_string()
+    }
+
+    /// Write the minimal `config.json` + corpus for a cost-neutral provider
+    /// that serves the test models. `models_json` is the optional
+    /// `[providers.models.*]` zoder-side model-entry map.
+    fn write_home(home: &std::path::Path, mock_uri: &str, models_json: Option<serde_json::Value>) {
+        let mut body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [MODEL, UNSERVED],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        // `models` is the zoder-side model-entry map (`[providers.models.*]`
+        // in a vendor overlay) keyed by provider alias. A key that does not
+        // collide with an overlay alias is still matched by model id.
+        if let Some(models) = models_json {
+            body["models"] = models;
+        }
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": MODEL, "free": true, "routable": true},
+                {"id": UNSERVED, "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Point the ENGINE config at `home` and run `exec --oneshot` under the
+    /// shared `ZODER_HOME` guard. Returns the wiremock server (for the body
+    /// assertion) plus the oneshot outcome.
+    async fn run_oneshot(
+        extra_cli: &[&str],
+        engine: Option<&str>,
+        home: &std::path::Path,
+        models_json: Option<serde_json::Value>,
+    ) -> (MockServer, anyhow::Result<()>) {
+        let server = MockServer::start().await;
+        let stream_body = r#"data: {"model":"m","choices":[{"delta":{"content":"ok"}}]}
+
+data: [DONE]
+
+"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_body.to_string()))
+            .mount(&server)
+            .await;
+        write_home(home, &server.uri(), models_json);
+        let _guard = crate::test_env::EnvGuard::new(home);
+        let _socket = std::env::var("ZEROCLAW_SOCKET").ok();
+        // No engine daemon socket in the temp home: the oneshot path must
+        // not need one, and a stale host socket must not leak in.
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        // Engine config: a real file in a temp config dir, so the
+        // production `Engine::load` path picks it up without touching
+        // $ZEROCLAW_CONFIG_DIR on the host.
+        let cfg_path = home.join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        if let Some(engine) = engine {
+            std::fs::write(cfg_path.join("config.toml"), engine).unwrap();
+        }
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+
+        let mut argv = vec![
+            "zoder",
+            "--quiet",
+            "exec",
+            "--oneshot",
+            "-m",
+            MODEL,
+            "test task",
+        ];
+        argv.extend_from_slice(extra_cli);
+        let cli = Cli::try_parse_from(argv).expect("oneshot arguments parse");
+        let result = cmd_exec_oneshot(&cli, Some("test task".to_string())).await;
+        (server, result)
+    }
+
+    async fn received_oneshot_body(server: &MockServer) -> serde_json::Value {
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .find(|r| r.method.as_str() == "POST")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).expect("body is JSON"))
+            .expect("oneshot sent a chat request")
+    }
+
+    #[tokio::test]
+    async fn oneshot_sends_engine_profile_reasoning_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none"),
+            "engine profile provider_extra.reasoning_effort must reach the wire: {body}"
+        );
+        // The kwargs-only profile supplies chat_template_kwargs on the
+        // first-profile fallback hop.
+        assert_eq!(
+            body.get("chat_template_kwargs")
+                .and_then(|v| v.get("enable_thinking"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "engine profile chat_template_kwargs must reach the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_cli_reasoning_overrides_engine_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(
+            &["--reasoning", "low"],
+            Some(&engine_toml()),
+            dir.path(),
+            None,
+        )
+        .await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low"),
+            "an explicit --reasoning flag must win over the engine profile: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_sends_no_reasoning_effort_when_no_profile_sets_it() {
+        // An engine config with a profile that sets neither field.
+        let bare_engine = r#"
+[providers.models.custom.bare]
+model = "m"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) = run_oneshot(&[], Some(bare_engine), dir.path(), None).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert!(
+            body.get("reasoning_effort").is_none_or(|v| v.is_null()),
+            "no profile setting -> no reasoning_effort field: {body}"
+        );
+        assert!(
+            body.get("chat_template_kwargs").is_none_or(|v| v.is_null()),
+            "no profile setting -> no chat_template_kwargs field: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_zoder_model_entry_wins_over_engine_profile() {
+        let models = serde_json::json!({
+            "local.test": {
+                "model": MODEL,
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"force_nonempty_content": true},
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (server, result) =
+            run_oneshot(&[], Some(&engine_toml()), dir.path(), Some(models)).await;
+        let _ = dir;
+        result.expect("oneshot call succeeds");
+        let body = received_oneshot_body(&server).await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high"),
+            "the zoder model entry must win over the engine profile: {body}"
+        );
+        assert_eq!(
+            body.get("chat_template_kwargs")
+                .and_then(|v| v.get("force_nonempty_content"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "the zoder model entry must win over the engine profile: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod staleness_warning_tests {
+    //! The client-side half of the 2026-10-13 outage: the published corpus was
+    //! 13 days old and no command said so. These pin the CLI's threshold
+    //! handling (the `$ZODER_CORPUS_STALE_DAYS` override) and the shape of the
+    //! warning the commands print.
+    //!
+    //! The env var is process-global, so every test restores it before it
+    //! returns and the assertions inside one test are serialized.
+    use super::*;
+    use zoder_core::corpus::STALE_DAYS_ENV;
+
+    /// The env var is process-global, so the tests that touch it are
+    /// serialized: without this they race and read each other's value.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("valid test date")
+    }
+
+    fn with_env(value: Option<&str>) -> Option<String> {
+        let saved = std::env::var(STALE_DAYS_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(STALE_DAYS_ENV, v),
+            None => std::env::remove_var(STALE_DAYS_ENV),
+        }
+        saved
+    }
+
+    fn restore(saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(STALE_DAYS_ENV, v),
+            None => std::env::remove_var(STALE_DAYS_ENV),
+        }
+    }
+
+    #[test]
+    fn env_zero_silences_even_a_very_old_corpus() {
+        let _guard = env_lock();
+        let saved = with_env(Some("0"));
+        assert_eq!(0, stale_threshold_days());
+        let corpus = Corpus {
+            generated: "2020-01-01".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            corpus
+                .staleness_warning(day("2026-10-26"), stale_threshold_days())
+                .is_none(),
+            "0 must disable the warning"
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn a_garbage_env_value_falls_back_to_the_default() {
+        let _guard = env_lock();
+        let saved = with_env(Some("not-a-number"));
+        assert_eq!(
+            zoder_core::corpus::DEFAULT_STALE_DAYS,
+            stale_threshold_days()
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn an_unset_env_value_uses_the_default() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        assert_eq!(
+            zoder_core::corpus::DEFAULT_STALE_DAYS,
+            stale_threshold_days()
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn an_old_corpus_warns_with_the_age_and_the_fix() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        let corpus = Corpus {
+            generated: "2026-10-18".to_string(),
+            ..Default::default()
+        };
+        let warning = corpus
+            .staleness_warning(day("2026-10-26"), stale_threshold_days())
+            .expect("warning");
+        assert!(
+            warning.starts_with("warning: model corpus is 8 days old"),
+            "{warning}"
+        );
+        assert!(warning.contains("generated 2026-10-18"), "{warning}");
+        assert!(warning.contains("model_corpus.json"), "{warning}");
+        restore(saved);
+    }
+
+    #[test]
+    fn a_fresh_corpus_does_not_warn() {
+        let _guard = env_lock();
+        let saved = with_env(None);
+        let corpus = Corpus {
+            generated: "2026-10-26".to_string(),
+            ..Default::default()
+        };
+        assert!(corpus
+            .staleness_warning(day("2026-10-26"), stale_threshold_days())
+            .is_none());
+        restore(saved);
     }
 }

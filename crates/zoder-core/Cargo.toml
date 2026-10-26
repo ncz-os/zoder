@@ -77,6 +77,10 @@ name = "provider"
 path = "tests/provider.rs"
 required-features = ["integration-tests"]
 [[test]]
+name = "provider_usage_after_finish"
+path = "tests/provider_usage_after_finish.rs"
+required-features = ["integration-tests"]
+[[test]]
 name = "report"
 path = "tests/report.rs"
 required-features = ["integration-tests"]

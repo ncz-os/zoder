@@ -84,6 +84,14 @@ async fn complete_once(
     }
 
     let messages = vec![Message::new("system", system), Message::new("user", user)];
+    // Direct-request settings from the shared resolver — the same precedence
+    // every direct chat builder uses (explicit --reasoning > zoder model
+    // entry > engine profile for the selected agent > engine reviewer profile
+    // > first engine profile serving the model).
+    let model_cfg = eng.cfg.model_entry_for(&model);
+    let direct = eng
+        .engine_models
+        .request_settings_for(&model, cli.agent.as_deref(), cli.reasoning.as_deref(), model_cfg);
     let req = ChatRequest {
         model: model.clone(),
         messages,
@@ -91,14 +99,42 @@ async fn complete_once(
         temperature: 0.1,
         stream: false,
         show_reasoning: false,
-        reasoning_effort: cli.reasoning.clone(),
+        reasoning_effort: direct.reasoning_effort,
+        chat_template_kwargs: direct.chat_template_kwargs,
         response_format: None,
     };
-    let provider = OpenAiProvider::new(provider_cfg)?;
+    let provider = OpenAiProvider::new(provider_cfg)?.with_request_stream(provider_cfg.stream);
+    // Host-wide call budget for this provider's endpoint group (no-op when the
+    // provider declares no cap): wait for a concurrency slot + a
+    // sliding-window rate turn so parallel zoder processes cannot burst a
+    // shared free endpoint into 503s/429s.
+    let budget_guard = {
+        let (group, conc, rpm) = eng.cfg.provider_call_budget(provider_cfg);
+        if conc == 0 && rpm == 0 {
+            None
+        } else {
+            match zoder_core::provider_rate::acquire(
+                &Config::home(),
+                &group,
+                conc,
+                rpm,
+                zoder_core::provider_rate::queue_timeout_from_env(),
+                false,
+            )
+            .await
+            {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    anyhow::bail!("endpoint group {group}: {e}")
+                }
+            }
+        }
+    };
     let res = provider
         .stream_chat(&req, None)
         .await
         .map_err(|e| anyhow!("{}", e.message))?;
+    drop(budget_guard);
 
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);

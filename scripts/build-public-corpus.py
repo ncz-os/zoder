@@ -19,8 +19,17 @@ OPTIONAL overlay used for tier ranking and never gate routability. Per-user
 endpoint, and local config can mark provider-specific free-tier models.
 
 Usage:
-  build-public-corpus.py [--out-dir DIR] [--no-bench]
+  build-public-corpus.py [--out-dir DIR] [--no-bench] [--status-out PATH]
 Writes corpus/ and pricing/ under --out-dir (default: repo root).
+
+With --status-out PATH a JSON run status is written to PATH so a CI wrapper
+does not have to parse stderr:
+
+  {"litellm": {"ok", "models", "reason"},
+   "openrouter": {"ok", "added", "reason"},
+   "catalog_models", "corpus_models", "routable", "scored"}
+
+Without the flag the behaviour is unchanged.
 """
 import argparse
 import datetime
@@ -123,12 +132,23 @@ def from_litellm(litellm):
     return econ
 
 
-def overlay_openrouter(econ):
-    """Best-effort: add OpenRouter chat models missing from LiteLLM."""
+def overlay_openrouter(econ, openrouter_status=None):
+    """Best-effort: add OpenRouter chat models missing from LiteLLM.
+
+    The enrichment stays best-effort (a failure must not lose the LiteLLM
+    prices), but it is no longer SILENT: when `openrouter_status` is given it
+    is filled with {"ok", "added", "reason"} so the CI price gate can tell a
+    successful overlay from a skipped one and block a degraded publish.
+
+    `openrouter_status` IS the nested "openrouter" entry of the run status
+    (the caller passes status["openrouter"]); it is updated in place.
+    """
     try:
         data = fetch_json(OPENROUTER_URL).get("data", [])
     except Exception as e:  # noqa: BLE001 — best-effort enrichment
         print(f"  (openrouter overlay skipped: {e})", file=sys.stderr)
+        if openrouter_status is not None:
+            openrouter_status.update({"ok": False, "added": 0, "reason": str(e)[:300]})
         return econ
     added = 0
     for m in data:
@@ -152,6 +172,8 @@ def overlay_openrouter(econ):
         }
         added += 1
     print(f"  openrouter: +{added} models", file=sys.stderr)
+    if openrouter_status is not None:
+        openrouter_status.update({"ok": True, "added": added, "reason": ""})
     return econ
 
 
@@ -384,14 +406,48 @@ def main():
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--no-bench", action="store_true", help="skip the public bench overlay")
     ap.add_argument("--date", default=None, help="override generated date (ISO); default today UTC")
+    ap.add_argument("--status-out", default=None,
+                    help="write a JSON run status (price-source health, counts) to this path")
     args = ap.parse_args()
+
+    status = {
+        "litellm": {"ok": False, "models": 0, "reason": ""},
+        "openrouter": {"ok": False, "added": 0, "reason": ""},
+        "catalog_models": 0,
+        "corpus_models": 0,
+        "routable": 0,
+        "scored": 0,
+    }
+
+    def _write_status():
+        if not args.status_out:
+            return
+        path = args.status_out
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(status, f, indent=2, sort_keys=True)
+            f.write("\n")
 
     generated = args.date or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
     print("fetching LiteLLM public price list…", file=sys.stderr)
-    econ = from_litellm(fetch_json(LITELLM_URL))
+    # A LiteLLM fetch failure is a HARD failure: without it there are no
+    # prices at all. The status file still records why, so the CI price
+    # gate can report it instead of guessing.
+    try:
+        litellm_raw = fetch_json(LITELLM_URL)
+    except Exception as e:
+        status["litellm"] = {"ok": False, "models": 0, "reason": str(e)[:300]}
+        _write_status()
+        print(f"  litellm fetch failed: {e}", file=sys.stderr)
+        raise
+    econ = from_litellm(litellm_raw)
+    status["litellm"] = {"ok": True, "models": len(econ), "reason": ""}
     print(f"  litellm: {len(econ)} chat models", file=sys.stderr)
-    econ = overlay_openrouter(econ)
+    # The nested "openrouter" entry is updated IN PLACE by the overlay.
+    econ = overlay_openrouter(econ, status["openrouter"])
 
     bench = None
     if not args.no_bench:
@@ -419,6 +475,11 @@ def main():
     with open(os.path.join(pdir, "catalog.json"), "w") as f:
         json.dump(pricing, f, indent=2, sort_keys=False)
         f.write("\n")
+    status["catalog_models"] = len(pricing["models"])
+    status["corpus_models"] = corpus["count"]
+    status["routable"] = corpus["routable"]
+    status["scored"] = corpus["scored"]
+    _write_status()
     print(
         f"wrote corpus ({corpus['count']} models, {corpus['routable']} routable) "
         f"+ pricing ({len(pricing['models'])} models) [generated {generated}]",
