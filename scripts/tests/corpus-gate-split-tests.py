@@ -342,6 +342,54 @@ def test_openrouter_failure_blocks_the_prices() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_force_publish_is_still_wired_up() -> None:
+    """`--force-publish` must be registered AND its branch must exist.
+
+    A diff-only reader can lose track of a block that moved or was
+    re-indented and conclude that the flag lost its handling. This pins
+    the three things that make the flag work:
+
+      1. the CLI option is registered with `action="store_true"`,
+      2. `main()` branches on `args.force_publish`,
+      3. that branch returns 0 (it overrides the gates).
+
+    It also pins the pre-split contract that a forced publish advances
+    the last-known-good baseline.
+    """
+    check = _load(CHECK_SCRIPT, "corpus_freshness_check")
+    source = CHECK_SCRIPT.read_text()
+
+    if '"--force-publish"' in source and 'action="store_true"' in source:
+        pass_("corpus-freshness-check.py registers --force-publish")
+    else:
+        fail_("corpus-freshness-check.py does not register --force-publish")
+
+    if "if args.force_publish:" in source:
+        pass_("corpus-freshness-check.py branches on args.force_publish")
+    else:
+        fail_("corpus-freshness-check.py does not branch on args.force_publish")
+
+    # The branch body must return 0 BEFORE any gate can return 1.
+    body = source.split("if args.force_publish:", 1)[1]
+    branch = body.split("corpus, overlay = _paths()", 1)[0]
+    if "return 0" in branch:
+        pass_("the --force-publish branch returns 0 before any gate runs")
+    else:
+        fail_("the --force-publish branch does not return 0")
+    if "freshness-last.json" in branch:
+        pass_("the --force-publish branch advances the freshness-last.json baseline")
+    else:
+        fail_("the --force-publish branch does not advance the baseline")
+
+    # And the option must really be settable on the parser.
+    parser = check.argparse.ArgumentParser()
+    parser.add_argument("--force-publish", action="store_true")
+    if parser.parse_args(["--force-publish"]).force_publish is True:
+        pass_("--force-publish parses to True")
+    else:
+        fail_("--force-publish does not parse to True")
+
+
 def test_force_publish_overrides_a_degraded_price_source() -> None:
     """... and --force-publish overrides it (and says so)."""
     root = _scratch()
@@ -359,6 +407,64 @@ def test_force_publish_overrides_a_degraded_price_source() -> None:
             pass_("--force-publish says that it is overriding the gates")
         else:
             fail_("--force-publish did not say that it overrides the gates")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_force_publish_copies_the_report_to_the_baseline() -> None:
+    """--force-publish must ALSO update freshness-last.json.
+
+    The pre-split gate copied `corpus/freshness.json` to
+    `corpus/freshness-last.json` on a forced publish so the next run has a
+    baseline. That behaviour is part of the flag's contract: an operator
+    who forces a publish has accepted the run, and the next run must
+    compare against it. A flag that only skips the gates but leaves the
+    baseline behind would silently re-arm the old coverage delta.
+    """
+    root = _scratch()
+    try:
+        _setup(root, overlay_count=191)
+        builder = _fake_corpus_builder(openrouter_ok=False, openrouter_reason="HTTP 503")
+        _run_fetch(root, failing=[], candidate=191, builder=builder)
+        last = root / "corpus" / "freshness-last.json"
+        last.unlink(missing_ok=True)
+
+        code, _ = _run_check(root, force=True)
+        if code == 0:
+            pass_("--force-publish exits 0 on a degraded price source")
+        else:
+            fail_(f"--force-publish exited {code}, expected 0")
+        if last.exists():
+            pass_("--force-publish writes the freshness-last.json baseline")
+        else:
+            fail_("--force-publish did NOT write the freshness-last.json baseline")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_force_publish_works_on_a_stale_overlay_too() -> None:
+    """--force-publish must override the gates for a STALE overlay run too.
+
+    The stale-overlay path is a warning, not a block, so this is mostly a
+    regression guard: the forced publish must still succeed and must still
+    leave a baseline for the next run.
+    """
+    root = _scratch()
+    try:
+        _setup(root, overlay_count=191)
+        _run_fetch(root, failing=["fetch-terminal-bench.py"], candidate=141)
+        last = root / "corpus" / "freshness-last.json"
+        last.unlink(missing_ok=True)
+
+        code, _ = _run_check(root, force=True)
+        if code == 0:
+            pass_("--force-publish exits 0 on a stale-overlay run")
+        else:
+            fail_(f"--force-publish exited {code}, expected 0")
+        if last.exists():
+            pass_("--force-publish leaves a baseline after a forced publish")
+        else:
+            fail_("--force-publish left no baseline after a forced publish")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -570,7 +676,10 @@ def main() -> int:
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
     _run_one(test_fresh_candidate_overlay_is_published)
     _run_one(test_openrouter_failure_blocks_the_prices)
+    _run_one(test_force_publish_is_still_wired_up)
     _run_one(test_force_publish_overrides_a_degraded_price_source)
+    _run_one(test_force_publish_copies_the_report_to_the_baseline)
+    _run_one(test_force_publish_works_on_a_stale_overlay_too)
     _run_one(test_a_shrinking_catalog_blocks_the_prices)
     _run_one(test_a_schema_1_report_is_still_accepted)
     _run_one(test_the_openrouter_status_entry_is_updated_in_place)

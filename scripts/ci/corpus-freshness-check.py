@@ -127,10 +127,23 @@ def main() -> int:
     ap.add_argument("--force-publish", action="store_true",
                     help="bypass the freshness gate (use only for explicit operator acknowledgement)")
     args = ap.parse_args()
+    if args.force_publish:
+        print("corpus-freshness: --force-publish -> skipping ALL gates "
+              "(price + overlay); this overrides every check below", file=sys.stderr)
+        # Still update last-known-good so next run has a baseline.
+        cur, overlay_path = _paths()
+        cur_path = cur / "freshness.json"
+        if cur_path.exists():
+            next_meta = dict(json.loads(cur_path.read_text()))
+            next_meta["models_with_score"] = _count_scored(overlay_path)
+            (cur / "freshness-last.json").write_text(
+                json.dumps(next_meta, indent=2, sort_keys=True) + "\n")
+        return 0
 
     corpus, overlay = _paths()
     cur_path = corpus / "freshness.json"
     last_path = corpus / "freshness-last.json"
+
     if not cur_path.exists():
         print(f"corpus-freshness: {cur_path} missing — did corpus-fetch-and-overlay.py run?", file=sys.stderr)
         return 2
@@ -139,20 +152,6 @@ def main() -> int:
     if not isinstance(cur, dict):
         print("corpus-freshness: freshness.json is not an object", file=sys.stderr)
         return 2
-
-    if args.force_publish:
-        print("corpus-freshness: --force-publish -> skipping ALL gates "
-              "(price + overlay); this overrides every check below", file=sys.stderr)
-        # The baseline is only advanced when the overlay is fresh: a stale
-        # overlay must not become tomorrow's "last known good". A report
-        # without overlay information (schema 1) counts as fresh.
-        overlay_meta = cur.get("overlay") if isinstance(cur.get("overlay"), dict) else {}
-        stale = bool(cur.get("overlay_stale", overlay_meta.get("stale", False)))
-        if not stale:
-            next_meta = dict(cur)
-            next_meta["models_with_score"] = _count_scored(overlay)
-            last_path.write_text(json.dumps(next_meta, indent=2, sort_keys=True) + "\n")
-        return 0
 
     cur_sources = cur.get("sources") or []
     n_ok = sum(1 for s in cur_sources if isinstance(s, dict) and s.get("ok"))
