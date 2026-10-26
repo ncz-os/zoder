@@ -446,6 +446,72 @@ fn classify_cancel_error(error: &anyhow::Error) -> CancelFailure {
     CancelFailure::NotConfirmed
 }
 
+/// Sessions whose cancel was never confirmed and whose daemon could not be
+/// identified: the socket answered, but there is no pid record that proves
+/// nothing is still running.
+///
+/// The pid record is written BEST-EFFORT by the spawner -- a daemon with no
+/// record is "merely harder for a reaper to recognise" -- so a live daemon
+/// with no record is a real shape, not a theoretical one. Such a session is
+/// retired from the sweep, because re-asking a daemon that has already refused
+/// to answer only burns the teardown budget; but it is NOT proof the session
+/// stopped, so it blocks the quiet claim exactly like an unreachable session
+/// does: "we cancelled everything" must never be claimed when it is not true.
+static UNIDENTIFIED_DAEMON: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Record that a session's daemon could not be identified. Returns true the
+/// FIRST time, which is the only time the caller prints.
+fn mark_unidentified_daemon(id: &str) -> bool {
+    UNIDENTIFIED_DAEMON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string())
+}
+
+/// How many of this run's sessions were left with an unidentified daemon:
+/// their cancel was never confirmed and nothing could be stopped by pid.
+fn unidentified_daemon_count() -> usize {
+    let unidentified: HashSet<String> = UNIDENTIFIED_DAEMON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|id| unidentified.contains(*id))
+        .count()
+}
+
+/// Membership test, for the tests that assert a session was left with an
+/// unidentified daemon.
+#[cfg(test)]
+fn daemon_unidentified(id: &str) -> bool {
+    UNIDENTIFIED_DAEMON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
+/// Whether the teardown may declare the run quiet.
+///
+/// Four things have to be true at once: nothing is left to cancel, the reap
+/// found no work, and no session is left whose stop was never PROVEN. A
+/// session whose cancel was never confirmed and whose daemon could not be
+/// identified is retired from the sweep, but it is not proof the session
+/// stopped -- the pid record is written best-effort, so a live daemon with no
+/// record is a real shape. It blocks the quiet claim for the same reason an
+/// unreachable session does.
+fn teardown_is_quiet(
+    pending_sessions_empty: bool,
+    outcome_quiet: bool,
+    unreachable: usize,
+    unidentified: usize,
+) -> bool {
+    pending_sessions_empty && outcome_quiet && unreachable == 0 && unidentified == 0
+}
+
 /// Retire a session whose cancel could not be delivered because the engine was
 /// unreachable. Returns true the FIRST time, which is the only time the caller
 /// prints: "the engine is gone" is a fact about the run, not about the attempt.
@@ -1059,10 +1125,15 @@ fn retry_attempt_budget(left: Duration) -> Duration {
     retry_plan(left).2
 }
 
-/// The least time an attempt is given, even when the phase budget is nearly
-/// spent: a cancel that is cut off before it reaches the socket teaches us
-/// nothing, and "not confirmed" must mean the daemon stayed silent, not that we
-/// hung up on it.
+/// The least time an attempt is given when the budget can afford it.
+///
+/// The floor is what decides how many retries FIT: each retry needs the floor
+/// plus its share of the backoff, so the retry count is reduced first when the
+/// budget shrinks. The per-attempt cap is then derived from what is left over
+/// the chosen count, and that cap is allowed to fall BELOW the floor when the
+/// budget is nearly spent -- a cancel cut off before it reaches the socket
+/// teaches us nothing, and "not confirmed" must mean the daemon stayed silent,
+/// not that we hung up on it.
 const RETRY_ATTEMPT_FLOOR: Duration = Duration::from_millis(150);
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1212,11 +1283,37 @@ pub(crate) async fn settle_unconfirmed_cancel(
             settled.daemon_stopped = false;
         }
     }
-    // The daemon that owned the session is gone — no record, a recycled pid,
-    // or a daemon we stopped — so nothing of it can still be running and the
-    // session is done. A daemon that is still live keeps the session pending.
-    if !daemon_still_running {
-        mark_cancelled(id);
+    // The session is settled only when there is EVIDENCE that nothing of it
+    // can still be running: the daemon acknowledged it, the daemon that owned
+    // it is gone (its pid was recycled), or it was stopped by exact pid. A
+    // daemon that is still live and never acknowledged the cancel keeps the
+    // session PENDING, so the final sweep reports it.
+    //
+    // A MISSING record is not that evidence: it says only that no pid file was
+    // found, and the record is written BEST-EFFORT by the spawner, so a live
+    // daemon with no record is a real shape. The session is still retired from
+    // the sweep -- re-asking a daemon that has already refused to answer only
+    // burns the teardown budget -- but it is recorded as possibly-still-running
+    // so the teardown does not claim the run was quiet.
+    match outcome {
+        UnconfirmedCancelOutcome::NeverAcknowledged(_) => {
+            if !daemon_still_running {
+                mark_cancelled(id);
+                if matches!(record, DaemonRecordState::Missing) {
+                    mark_unidentified_daemon(id);
+                }
+            }
+        }
+        UnconfirmedCancelOutcome::DaemonGone => {
+            // The socket lost its listener during the retries, so the daemon
+            // that owned the session is gone -- unless a recorded daemon
+            // survived the signal, which keeps the session pending.
+            if !daemon_still_running {
+                mark_cancelled(id);
+            }
+        }
+        // Settled by the early return above.
+        UnconfirmedCancelOutcome::Confirmed(_) => {}
     }
     // Every arm yields the operator-facing cause as a String so the record and
     // the log carry the same text.
@@ -1530,7 +1627,12 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // session stopped: its daemon may still run on a socket inode nothing
         // can name. So it also blocks early convergence, and the loop keeps
         // reaping for every remaining round instead of declaring the run quiet.
-        if pending_sessions().is_empty() && outcome.quiet() && unreachable_session_count() == 0 {
+        if teardown_is_quiet(
+            pending_sessions().is_empty(),
+            outcome.quiet(),
+            unreachable_session_count(),
+            unidentified_daemon_count(),
+        ) {
             plan.cleanup_owned_roots();
             return report;
         }
@@ -3531,25 +3633,35 @@ mod tests {
             "the loop must ask the daemon exactly as many times as the plan promised"
         );
         // And the whole sequence still fits inside the budget it was given.
+        // The bound is the budget ITSELF, not the budget plus a grace: a
+        // fixture that refused SLOWLY would cost a full per-attempt budget per
+        // attempt, which is more than the whole budget allows. So this
+        // assertion is also what proves the fixture refused fast -- without it
+        // the retry count above would prove nothing.
         assert!(
-            elapsed <= budget + DAEMON_EXIT_GRACE,
+            elapsed <= budget,
             "the cancel sequence must fit inside the budget it was handed: took {elapsed:?}"
         );
 
         drop(daemon);
     }
 
-    /// The budget the retry sequence is handed must be the WHOLE remainder, not
-    /// a per-attempt slice of it.
+    /// A per-attempt slice of the remaining budget re-plans a SHORTER
+    /// sequence.
     ///
     /// This is the difference between a plan and the sequence that runs: a
     /// slice re-plans the sequence from a much smaller number, and the daemon
-    /// is then asked fewer times than the plan promised.
+    /// is then asked fewer times than the plan promised. The HANDOFF is pinned
+    /// by the test above, which counts the asks the daemon actually received;
+    /// this one pins the arithmetic that made the two differ.
     #[test]
-    fn the_retry_budget_is_the_whole_remaining_budget() {
+    fn a_per_attempt_slice_re_plans_a_shorter_sequence() {
         let left = Duration::from_millis(2000);
         let (planned, _, _) = retry_plan(left);
-        assert_eq!(planned, 3, "a two-second remainder plans three retries");
+        assert_eq!(
+            planned, CANCEL_RETRY_ATTEMPTS,
+            "a two-second remainder plans the full number of retries"
+        );
         // The per-attempt slice of that remainder re-plans a SHORTER sequence:
         // this is exactly what the caller used to hand over, and it is why the
         // daemon was asked fewer times than the plan promised.
@@ -3557,6 +3669,79 @@ mod tests {
         assert!(
             shortened < planned,
             "a per-attempt slice must re-plan a shorter sequence: {shortened} < {planned}"
+        );
+    }
+
+    /// A session whose cancel was never confirmed and whose daemon could not
+    /// be identified is retired from the sweep -- but the teardown must not
+    /// claim the run was quiet.
+    ///
+    /// The pid record is written best-effort by the spawner, so a live daemon
+    /// with no record is a real shape. Retiring the session stops the teardown
+    /// from asking a daemon that has already refused to answer; recording it
+    /// as unidentified is what keeps the teardown from reporting that
+    /// everything was cancelled while something may still be editing the tree.
+    #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unidentified_daemon_is_retired_but_not_counted_as_handled() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, _attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("unidentified-probe");
+
+        let outcome = retry_unconfirmed_cancel(&socket, "unidentified-probe").await;
+        let _settled = settle_unconfirmed_cancel(
+            &socket,
+            "unidentified-probe",
+            outcome,
+            "daemon did not acknowledge session/cancel within the budget",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            UnconfirmedCancelOutcome::NeverAcknowledged(CANCEL_RETRY_ATTEMPTS),
+            "a daemon that accepts every cancel and answers none is never acknowledged"
+        );
+        assert!(
+            !pending_sessions().contains(&"unidentified-probe".to_string()),
+            "a settled session must not be offered to the sweep again"
+        );
+        assert!(
+            daemon_unidentified("unidentified-probe"),
+            "a session with no identifiable daemon must be recorded as possibly still running"
+        );
+
+        forget_session("unidentified-probe");
+        drop(server);
+    }
+
+    /// The teardown may only declare the run quiet when nothing is left whose
+    /// stop was never proven.
+    #[test]
+    fn an_unidentified_daemon_blocks_the_quiet_claim() {
+        assert!(
+            teardown_is_quiet(true, true, 0, 0),
+            "a teardown with nothing left to cancel and nothing unproven is quiet"
+        );
+        assert!(
+            !teardown_is_quiet(true, true, 0, 1),
+            "a session with an unidentified daemon must block the quiet claim"
+        );
+        assert!(
+            !teardown_is_quiet(true, true, 1, 0),
+            "an unreachable session must block the quiet claim"
+        );
+        assert!(
+            !teardown_is_quiet(false, true, 0, 0),
+            "a session still waiting to be cancelled must block the quiet claim"
         );
     }
 
@@ -4005,6 +4190,10 @@ mod tests {
         let (server, attempts) =
             spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
         // The daemon dies before any retry: the socket entry is unlinked.
+        // The listener behind it is still bound to the now-unlinked path --
+        // that is what "the daemon died without closing the socket" looks
+        // like from here, and it is why the outcome is reported as gone rather
+        // than as unconfirmed.
         std::fs::remove_file(&socket).expect("unlink the socket the way EndpointGuard does");
         note_session("exited-daemon-probe");
 
@@ -4060,11 +4249,12 @@ mod tests {
         let socket = dir.path().join("engine.sock");
 
         // Stand-in daemon: a real process that ignores the socket entirely and
-        // exits on its own well inside the test budget, so a panic before the
-        // cleanup below cannot orphan it. The fix still has to stop it by pid;
-        // this only bounds the damage if the fix regresses.
+        // exits on its own long after any test budget, so a panic before the
+        // cleanup below cannot orphan it and a slow settle cannot race the
+        // fixture's own exit. The fix still has to stop it by pid; this only
+        // bounds the damage if the fix regresses.
         let daemon = Command::new("/bin/sleep")
-            .arg("20")
+            .arg("300")
             .spawn()
             .expect("spawn the daemon fixture");
         let daemon_pid = daemon.id();

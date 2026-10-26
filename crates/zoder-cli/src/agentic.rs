@@ -10152,14 +10152,24 @@ must reap the direct shell on the timeout branch)"
     /// detectors cannot see that the turn may still be running.
     #[test]
     fn the_author_cancel_deadline_covers_the_whole_retry_sequence() {
+        // The settle budget is a count of SECONDS and the backoff is a
+        // sub-second duration, so the worst case is a seconds-scale number of
+        // milliseconds. The range check pins that unit: a settle budget that
+        // had been written in milliseconds would make every bound here a
+        // thousand times too small, and the comparison below would then be
+        // comparing two wrong numbers instead of failing.
+        assert!(
+            (1..=60).contains(&SETTLE_BUDGET_SECS),
+            "the settle budget is a count of seconds and must stay in that range: {SETTLE_BUDGET_SECS}"
+        );
         let worst_case = std::time::Duration::from_millis(
             (1 + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64) * SETTLE_BUDGET_SECS * 1000
                 + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64)
                     * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64,
         );
         assert!(
-            AUTHOR_CANCEL_DEADLINE >= worst_case,
-            "the deadline must cover the whole sequence: {:?} < {:?}",
+            AUTHOR_CANCEL_DEADLINE > worst_case,
+            "the deadline must cover the whole sequence with headroom: {:?} <= {:?}",
             AUTHOR_CANCEL_DEADLINE,
             worst_case
         );
