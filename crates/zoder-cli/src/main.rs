@@ -4762,9 +4762,11 @@ async fn try_model(
         };
         let mut stdout = std::io::stdout();
         let sink: Option<&mut dyn Write> = if json { None } else { Some(&mut stdout) };
-        reservation.arm().with_context(|| {
-            format!("verifying ledger reservation before {} dispatch", req.model)
-        })?;
+        reservation
+            .arm_for(provider.provider_id(), req.model.as_str())
+            .with_context(|| {
+                format!("verifying ledger reservation before {} dispatch", req.model)
+            })?;
         match provider.stream_chat(req, sink).await {
             Ok(res) => return Ok(Ok((res, reservation))),
             Err(e) => {
@@ -10557,7 +10559,7 @@ pub(crate) async fn agentic_turn(
     // unknown value surfaces as a parse error up front.
     let agentic_usage = std::cell::Cell::new(0_u64);
     ledger_reservation
-        .arm()
+        .arm_for("", primary.as_str())
         .with_context(|| "verifying ledger reservation before agentic dispatch")?;
     // The cost scope is opened ONCE before the chain walk and the cost
     // reconciliation at the end queries the engine for whatever actually
@@ -12678,9 +12680,11 @@ async fn run_probe_default(
         let mut reservation = Ledger::new(&eng.cfg.ledger_path)
             .reserve_billable()
             .with_context(|| format!("reserving ledger entry before health probe for {id}"))?;
-        reservation.arm().with_context(|| {
-            format!("verifying ledger reservation before health probe for {id}")
-        })?;
+        reservation
+            .arm_for(provider_cfg.id.as_str(), id)
+            .with_context(|| {
+                format!("verifying ledger reservation before health probe for {id}")
+            })?;
         let t = std::time::Instant::now();
         match provider.stream_chat(&req, None).await {
             Ok(result) => {
@@ -12984,9 +12988,11 @@ async fn run_probe_all(
                 .with_context(|| {
                     format!("reserving ledger entry before health probe for {model_id}")
                 })?;
-            reservation.arm().with_context(|| {
-                format!("verifying ledger reservation before health probe for {model_id}")
-            })?;
+            reservation
+                .arm_for(provider_id.as_str(), model_id.as_str())
+                .with_context(|| {
+                    format!("verifying ledger reservation before health probe for {model_id}")
+                })?;
             let t = std::time::Instant::now();
             let outcome =
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
