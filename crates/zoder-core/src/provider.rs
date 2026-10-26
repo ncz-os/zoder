@@ -84,6 +84,12 @@ mod reliability_deadline_tests {
             serves: vec![],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         let mut p = OpenAiProvider::new(&config).unwrap();
         p.request_timeout = Duration::from_millis(total_ms);
@@ -494,6 +500,11 @@ pub struct ProviderError {
     /// may diagnose or persist an incomplete response without promoting
     /// private reasoning to successful answer content.
     pub reasoning: Option<String>,
+    /// True when the failure is a provider overload: an HTTP 503, an HTTP
+    /// 529, or an Anthropic-style `overloaded_error` SSE frame carried by a
+    /// 200 response. Retry loops honour the provider's `overload_backoff_min_s`
+    /// floor for these.
+    pub overload: bool,
 }
 
 impl ProviderError {
@@ -508,30 +519,52 @@ impl ProviderError {
             token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
+            overload: false,
         }
     }
     /// Transient and safe to retry on the same model (nothing emitted yet).
+    ///
+    /// An overload (`overload == true`) is retryable even when its `kind` is
+    /// `Http`: the Anthropic wire surfaces a 529-equivalent `overloaded_error`
+    /// frame inside a 200 response, which the parser can only classify as
+    /// `Http` — retrying it (with the overload backoff floor) is exactly the
+    /// behaviour the header-borne 503/529 gets.
     pub fn retryable(&self) -> bool {
         !self.emitted
-            && matches!(
+            && (matches!(
                 self.kind,
                 ErrKind::Timeout
                     | ErrKind::RateLimit
                     | ErrKind::Server
                     | ErrKind::Network
                     | ErrKind::Truncation
-            )
+            ) || (self.overload && self.kind == ErrKind::Http))
     }
 }
 
 /// Backoff before retry `attempt` (0-based): exponential (base 500ms) capped at
 /// 16s, with +/-20% jitter, but never less than a server-provided `Retry-After`.
-pub fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+///
+/// `overload_floor` is a configured lower bound (seconds) for the delay after a
+/// provider overload (HTTP 503/529 or an Anthropic-style `overloaded_error`
+/// frame). A free shared endpoint that is "overloaded" stays overloaded for
+/// seconds, so retrying after the 500 ms base only bursts it into more 503s;
+/// the floor is applied in every retry loop through this one helper.
+pub fn backoff_delay(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    overload_floor: Option<Duration>,
+) -> Duration {
     use rand::Rng;
     let base_ms = 500u64.saturating_mul(1u64 << attempt.min(5));
     let capped = base_ms.min(16_000);
     let jitter = rand::thread_rng().gen_range(0.8..1.2);
     let mut delay = Duration::from_millis((capped as f64 * jitter) as u64);
+    if let Some(floor) = overload_floor {
+        if floor > delay {
+            delay = floor;
+        }
+    }
     if let Some(ra) = retry_after {
         if ra > delay {
             delay = ra;
@@ -542,20 +575,35 @@ pub fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 
 /// Upper bound on an honored `Retry-After`: a hostile/misconfigured backend
 /// could send an enormous value and pin the CLI in `sleep` for ~forever, so we
-/// never wait longer than this (we just retry early / fall back instead).
+/// never wait longer than this (we just retry early / fall back instead). A
+/// 429 whose Retry-After exceeds the cap waits the cap, then falls through as
+/// today.
 const MAX_RETRY_AFTER_SECS: u64 = 60;
 
+/// Parse one `Retry-After` header value: the numeric-seconds form first, then
+/// the HTTP-date form (RFC 7231 `date`, i.e. IMF-fixdate). Returns the wait
+/// duration, capped at [`MAX_RETRY_AFTER_SECS`].
+pub fn retry_after_value(v: &str) -> Option<Duration> {
+    let v = v.trim();
+    if let Ok(s) = v.parse::<u64>() {
+        return Some(Duration::from_secs(s.min(MAX_RETRY_AFTER_SECS)));
+    }
+    // HTTP-date form: `Thu, 01 Jan 1970 00:00:10 GMT` and friends. chrono's
+    // `date` parser handles IMF-fixdate/RFC 1123, which is what HTTP uses.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(v) {
+        let dt_utc = dt.with_timezone(&chrono::Utc);
+        let now = chrono::Utc::now();
+        let secs = (dt_utc - now)
+            .num_seconds()
+            .clamp(0, MAX_RETRY_AFTER_SECS as i64) as u64;
+        return Some(Duration::from_secs(secs));
+    }
+    None
+}
+
 fn retry_after_header(h: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let v = h
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .to_string();
-    // Only the numeric-seconds form is honored (HTTP-date form is rare here).
-    v.parse::<u64>()
-        .ok()
-        .map(|s| Duration::from_secs(s.min(MAX_RETRY_AFTER_SECS)))
+    let v = h.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    retry_after_value(v)
 }
 
 fn classify_reqwest(e: reqwest::Error) -> ProviderError {
@@ -1324,6 +1372,21 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     request_timeout: Duration,
     idle_timeout: Duration,
+    /// Time-to-first-token budget for streamed calls: abort (retryable
+    /// timeout) when no generation delta (answer or reasoning) arrives within
+    /// this many seconds of sending the request. `None` keeps the historical
+    /// behaviour — the overall request budget is the only bound before the
+    /// first token. Configured per provider via `first_token_timeout_s`.
+    first_token_timeout: Option<Duration>,
+    /// Floor for the retry delay after a provider overload (503/529 or an
+    /// Anthropic-style `overloaded_error` frame), applied through
+    /// [`backoff_delay`]. Configured per provider via `overload_backoff_min_s`.
+    overload_backoff_min: Option<Duration>,
+    /// True when the provider is configured with `stream = true`: every
+    /// OpenAI-style chat request is sent on the streaming wire so first-token
+    /// time is measured even on call paths that build non-streaming requests.
+    request_stream: bool,
+
     /// When set, a streamed call that has produced no generation yet prints a
     /// "still waiting" notice on stderr at this interval instead of waiting
     /// silently for the whole request budget. Off by default; CLI callers
@@ -1417,9 +1480,46 @@ impl OpenAiProvider {
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_S),
             ),
             idle_timeout: Duration::from_secs(env_secs("ZODER_IDLE_S", DEFAULT_IDLE_TIMEOUT_S)),
+            first_token_timeout: p
+                .first_token_timeout_s
+                .map(Duration::from_secs),
+            overload_backoff_min: p
+                .overload_backoff_min_s
+                .map(Duration::from_secs),
+            request_stream: p.stream.unwrap_or(false),
             wait_notice_interval: None,
             azure_api_version,
         })
+    }
+
+    /// Set the time-to-first-token budget (see `first_token_timeout_s` in
+    /// provider config). Replaces the value resolved from the config.
+    pub fn with_first_token_timeout_s(mut self, secs: Option<u64>) -> Self {
+        self.first_token_timeout = secs.map(Duration::from_secs);
+        self
+    }
+
+    /// Set the overload backoff floor (see `overload_backoff_min_s`).
+    pub fn with_overload_backoff_min_s(mut self, secs: Option<u64>) -> Self {
+        self.overload_backoff_min = secs.map(Duration::from_secs);
+        self
+    }
+
+    /// The configured overload backoff floor, for use in retry loops.
+    pub fn overload_backoff_min(&self) -> Option<Duration> {
+        self.overload_backoff_min
+    }
+
+    /// The configured time-to-first-token budget.
+    pub fn first_token_timeout(&self) -> Option<Duration> {
+        self.first_token_timeout
+    }
+
+    /// Force (or clear) the `stream: true` wire for OpenAI-style requests,
+    /// mirroring the provider config's `stream = true|false` key.
+    pub fn with_request_stream(mut self, force: Option<bool>) -> Self {
+        self.request_stream = force.unwrap_or(false);
+        self
     }
 
     /// Opt in to periodic stderr notices while a streamed call waits for its
@@ -1639,6 +1739,7 @@ impl OpenAiProvider {
                 token_plan_resets_at: None,
                 anthropic_error_body: None,
                 reasoning: None,
+                overload: status.as_u16() == 503 || status.as_u16() == 529,
             });
         }
         let body = self.read_limited_body(resp, "models list").await?;
@@ -1675,6 +1776,11 @@ impl OpenAiProvider {
             // Keeping it behind its own branch preserves the
             // `openai-chat` byte-for-byte contract for every other
             // kind (including `custom` and `azure-openai`).
+            if self.request_stream {
+                let mut req = req.clone();
+                req.stream = true;
+                return responses_body(&req);
+            }
             return responses_body(req);
         }
         // Azure OpenAI intentionally falls through to the openai-chat
@@ -1690,7 +1796,7 @@ impl OpenAiProvider {
             "model": req.model,
             "messages": req.messages,
             "max_tokens": req.max_tokens,
-            "stream": req.stream,
+            "stream": req.stream || self.request_stream,
         });
         if let Some(temp) = req.temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -1711,7 +1817,7 @@ impl OpenAiProvider {
         }
         // Ask the backend to emit a final usage chunk so we can record real
         // prompt/completion token counts instead of guessing.
-        if req.stream {
+        if req.stream || self.request_stream {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
         // Pass reasoning effort straight through (LiteLLM/free-tier translate it to the
@@ -1930,6 +2036,11 @@ impl OpenAiProvider {
         sink: Option<&mut dyn Write>,
     ) -> Result<ChatResult, ProviderError> {
         tracing::debug!(model = %req.model, stream = req.stream, max_tokens = req.max_tokens, "chat call");
+        // A provider configured with `stream = true` forces the OpenAI-style
+        // wire onto the streaming path (the body builders already send
+        // `stream: true`), so first-token time is measured on call paths that
+        // otherwise request non-streaming completions.
+        let effective_stream = req.stream || self.request_stream;
         let sent = Instant::now();
         let resp = match self.send_with_wait_notices(req, sent).await {
             Ok(Ok(r)) => r,
@@ -2017,9 +2128,10 @@ impl OpenAiProvider {
                     .flatten(),
                 anthropic_error_body: None,
                 reasoning: None,
+                overload: code == 503 || code == 529,
             });
         }
-        if req.stream {
+        if effective_stream {
             let r = self
                 .consume_stream(req, resp, telemetry, sink, token_plan_limit)
                 .await?;
@@ -2349,6 +2461,7 @@ impl OpenAiProvider {
             token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
+            overload: false,
         };
         let mut done = false;
         let mut saw_choice = false;
@@ -2377,6 +2490,12 @@ impl OpenAiProvider {
         let mut saw_generation = false;
         let loop_started = Instant::now();
         let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
+        // Time-to-first-token budget: when set, a stream that produces no
+        // generation delta (answer or reasoning) within this window fails as
+        // a retryable timeout instead of riding the whole request budget.
+        let first_token_deadline = self
+            .first_token_timeout
+            .map(|d| Instant::now() + d);
         loop {
             // Stall guard: bound each read by the smaller of idle budget and
             // remaining overall budget so a silently-hanging model fails fast
@@ -2389,10 +2508,31 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
+            if !saw_generation {
+                if let Some(ft) = first_token_deadline {
+                    if Instant::now() >= ft {
+                        return Err(fail(
+                            ErrKind::Timeout,
+                            format!(
+                                "first-token timeout after {:?} (no token before response)",
+                                self.first_token_timeout.expect("deadline set")
+                            ),
+                            emitted,
+                        ));
+                    }
+                }
+            }
             // Prompt prefill/queue latency is covered by the overall request
             // budget. The idle guard applies once generation begins — which
             // includes a stream that has so far emitted only reasoning.
-            let step = self.stream_read_step(saw_generation, remaining);
+            let step = if !saw_generation {
+                let step = self.stream_read_step(saw_generation, remaining);
+                first_token_deadline.map_or(step, |ft| {
+                    ft.saturating_duration_since(Instant::now()).min(step)
+                })
+            } else {
+                self.stream_read_step(saw_generation, remaining)
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2403,9 +2543,23 @@ impl OpenAiProvider {
                             emitted,
                         ));
                     }
-                    if !saw_generation && self.wait_notice_interval.is_some() {
-                        self.wait_notice(loop_started.elapsed() + headers_wait);
-                        continue;
+                    if !saw_generation {
+                        if let Some(ft) = first_token_deadline {
+                            if Instant::now() >= ft {
+                                return Err(fail(
+                                    ErrKind::Timeout,
+                                    format!(
+                                        "first-token timeout after {:?} (no token before response)",
+                                        self.first_token_timeout.expect("deadline set")
+                                    ),
+                                    emitted,
+                                ));
+                            }
+                        }
+                        if self.wait_notice_interval.is_some() {
+                            self.wait_notice(loop_started.elapsed() + headers_wait);
+                            continue;
+                        }
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -2725,6 +2879,12 @@ impl OpenAiProvider {
         // the existing 3-arg `fail` closure shape pick up the typed body
         // without having to retrofit the signature at every call site.
         let anthropic_error_body: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        // The Anthropic wire carries 529-equivalent rejections as a mid-stream
+        // `event: error` frame with `type: "overloaded_error"`. Mark that frame
+        // so the error surfaces with `overload: true` and retry loops apply the
+        // provider's overload backoff floor to it, exactly as they do for a
+        // header-borne 503/529.
+        let overload_flag = std::cell::Cell::new(false);
         let fail = |kind: ErrKind, msg: String, emitted: bool| ProviderError {
             anthropic_error_body: anthropic_error_body.take(),
             message: msg,
@@ -2735,6 +2895,7 @@ impl OpenAiProvider {
             token_plan_limit: false,
             token_plan_resets_at: None,
             reasoning: None,
+            overload: overload_flag.get(),
         };
         let mut done = false;
         let mut saw_text = false;
@@ -2752,6 +2913,9 @@ impl OpenAiProvider {
         // type), which Anthropic never uses in practice for the messages
         // API — every real frame carries an explicit `event:` line.
         let mut current_event: Option<String> = None;
+        let first_token_deadline = self
+            .first_token_timeout
+            .map(|d| Instant::now() + d);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -2761,7 +2925,28 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.stream_read_step(saw_generation, remaining);
+            if !saw_generation {
+                if let Some(ft) = first_token_deadline {
+                    if Instant::now() >= ft {
+                        return Err(fail(
+                            ErrKind::Timeout,
+                            format!(
+                                "first-token timeout after {:?} (no token before response)",
+                                self.first_token_timeout.expect("deadline set")
+                            ),
+                            emitted,
+                        ));
+                    }
+                }
+            }
+            let step = if !saw_generation {
+                let step = self.stream_read_step(saw_generation, remaining);
+                first_token_deadline.map_or(step, |ft| {
+                    ft.saturating_duration_since(Instant::now()).min(step)
+                })
+            } else {
+                self.stream_read_step(saw_generation, remaining)
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -2772,9 +2957,23 @@ impl OpenAiProvider {
                             emitted,
                         ));
                     }
-                    if !saw_generation && self.wait_notice_interval.is_some() {
-                        self.wait_notice(loop_started.elapsed() + headers_wait);
-                        continue;
+                    if !saw_generation {
+                        if let Some(ft) = first_token_deadline {
+                            if Instant::now() >= ft {
+                                return Err(fail(
+                                    ErrKind::Timeout,
+                                    format!(
+                                        "first-token timeout after {:?} (no token before response)",
+                                        self.first_token_timeout.expect("deadline set")
+                                    ),
+                                    emitted,
+                                ));
+                            }
+                        }
+                        if self.wait_notice_interval.is_some() {
+                            self.wait_notice(loop_started.elapsed() + headers_wait);
+                            continue;
+                        }
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -2880,6 +3079,14 @@ impl OpenAiProvider {
                     if current_event.as_deref() == Some("error")
                         || val.get("type").and_then(|t| t.as_str()) == Some("error")
                     {
+                        if val
+                            .get("error")
+                            .and_then(|e| e.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("overloaded_error")
+                        {
+                            overload_flag.set(true);
+                        }
                         anthropic_error_body.set(Some(payload.to_string()));
                         return Err(fail(
                             ErrKind::Http,
@@ -3109,6 +3316,7 @@ impl OpenAiProvider {
             token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
+            overload: false,
         };
         let mut done = false;
         let mut saw_text = false;
@@ -3120,6 +3328,9 @@ impl OpenAiProvider {
         let loop_started = Instant::now();
         let headers_wait = Duration::from_millis(telemetry.headers_ms.unwrap_or(0));
         let mut current_event: Option<String> = None;
+        let first_token_deadline = self
+            .first_token_timeout
+            .map(|d| Instant::now() + d);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3129,7 +3340,28 @@ impl OpenAiProvider {
                     emitted,
                 ));
             }
-            let step = self.stream_read_step(saw_generation, remaining);
+            if !saw_generation {
+                if let Some(ft) = first_token_deadline {
+                    if Instant::now() >= ft {
+                        return Err(fail(
+                            ErrKind::Timeout,
+                            format!(
+                                "first-token timeout after {:?} (no token before response)",
+                                self.first_token_timeout.expect("deadline set")
+                            ),
+                            emitted,
+                        ));
+                    }
+                }
+            }
+            let step = if !saw_generation {
+                let step = self.stream_read_step(saw_generation, remaining);
+                first_token_deadline.map_or(step, |ft| {
+                    ft.saturating_duration_since(Instant::now()).min(step)
+                })
+            } else {
+                self.stream_read_step(saw_generation, remaining)
+            };
             let next = match timeout(step, stream.next()).await {
                 Ok(n) => n,
                 Err(_) => {
@@ -3140,9 +3372,23 @@ impl OpenAiProvider {
                             emitted,
                         ));
                     }
-                    if !saw_generation && self.wait_notice_interval.is_some() {
-                        self.wait_notice(loop_started.elapsed() + headers_wait);
-                        continue;
+                    if !saw_generation {
+                        if let Some(ft) = first_token_deadline {
+                            if Instant::now() >= ft {
+                                return Err(fail(
+                                    ErrKind::Timeout,
+                                    format!(
+                                        "first-token timeout after {:?} (no token before response)",
+                                        self.first_token_timeout.expect("deadline set")
+                                    ),
+                                    emitted,
+                                ));
+                            }
+                        }
+                        if self.wait_notice_interval.is_some() {
+                            self.wait_notice(loop_started.elapsed() + headers_wait);
+                            continue;
+                        }
                     }
                     return Err(fail(
                         ErrKind::Timeout,
@@ -3669,6 +3915,7 @@ mod tests {
             token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
+            overload: false,
         };
         assert!(
             err.retryable(),
@@ -3688,6 +3935,7 @@ mod tests {
             token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
+            overload: false,
         };
         assert!(
             !err.retryable(),
@@ -3862,6 +4110,12 @@ mod tests {
             serves: Vec::new(),
             azure_api_version: azure_api_version.map(|s| s.to_string()),
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         OpenAiProvider::new(&cfg).expect("fixture provider must build")
     }
@@ -4634,6 +4888,12 @@ mod tests {
             serves: vec!["MiniMax-".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 

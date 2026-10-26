@@ -19,6 +19,12 @@ fn provider(base_url: &str) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        overload_backoff_min_s: None,
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
         model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
@@ -784,10 +790,10 @@ async fn streaming_wire_bytes_have_total_response_ceiling() {
 #[test]
 fn backoff_honors_retry_after_floor() {
     // With a 10s server hint, the delay must be at least 10s regardless of attempt.
-    let d = backoff_delay(0, Some(Duration::from_secs(10)));
+    let d = backoff_delay(0, Some(Duration::from_secs(10)), None);
     assert!(d >= Duration::from_secs(10));
     // Without a hint, attempt 0 is sub-second-ish (<= ~1s with jitter).
-    let d0 = backoff_delay(0, None);
+    let d0 = backoff_delay(0, None, None);
     assert!(d0 <= Duration::from_millis(1200));
 }
 
@@ -824,6 +830,12 @@ fn anthropic_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        overload_backoff_min_s: None,
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
         model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
@@ -1478,6 +1490,12 @@ fn responses_provider(base_url: &str, auth: Auth) -> OpenAiProvider {
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+        overload_backoff_min_s: None,
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
         model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
@@ -1909,6 +1927,12 @@ fn azure_provider(base_url: &str, auth: Auth, azure_api_version: Option<&str>) -
         serves: Vec::new(),
         azure_api_version: azure_api_version.map(|s| s.to_string()),
         max_context_tokens: None,
+        overload_backoff_min_s: None,
+        first_token_timeout_s: None,
+        stream: None,
+        rate_limit_group: None,
+        max_concurrent: None,
+        max_requests_per_minute: None,
         model_aliases: Vec::new(),
     };
     OpenAiProvider::new(&cfg).unwrap()
@@ -2400,6 +2424,12 @@ async fn drive_live_arm(
         serves: Vec::new(),
         azure_api_version: None,
         max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
     };
     let p_local = OpenAiProvider::new(&cfg).unwrap();
     // Belt + braces: model is unused on the wire for the openai-chat
