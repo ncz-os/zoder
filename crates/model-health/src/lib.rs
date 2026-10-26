@@ -244,6 +244,14 @@ pub struct ModelHealth {
     /// uses this to render "checked 3h ago" freshness in its report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at_unix: Option<i64>,
+    /// When a subscription plan-limit wall (MiniMax 429/2056) was observed
+    /// for this model. Until this instant the model is skipped in consult /
+    /// routing REGARDLESS of the Capacity TTL: a plan wall is not transient,
+    /// it lasts until the rolling window resets (up to 5h / 7d), and the
+    /// default 30-minute Capacity TTL would re-select a guaranteed-failed
+    /// route long before relief. `None` for non-wall Capacity outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_wall_until_unix: Option<i64>,
     /// Pre-query gate (circuit breaker with exponential backoff) for models
     /// that must never be queried blindly. Absent = closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +391,14 @@ impl ModelHealth {
     }
 
     fn is_skipped_by_classification_at(&self, now: i64) -> bool {
+        // A plan-limit wall (MiniMax 429/2056) skips until its own horizon,
+        // independent of the Capacity TTL: the wall is not transient and the
+        // 30-minute TTL would re-select a guaranteed-failed route early.
+        if let Some(until) = self.quota_wall_until_unix {
+            if now < until {
+                return true;
+            }
+        }
         match self.classification {
             Some(Classification::Capacity) => self
                 .checked_at_unix
@@ -514,6 +530,9 @@ impl HealthStore {
         classification: Classification,
     ) {
         let h = self.models.entry(model.to_string()).or_default();
+        // A successful call proves the wall has lifted: clear the wall
+        // horizon so consult re-admits the model.
+        h.quota_wall_until_unix = None;
         h.calls = h.calls.saturating_add(1);
         h.consecutive_failures = 0;
         if latency_ms.is_finite() && latency_ms >= 0.0 {
@@ -569,8 +588,27 @@ impl HealthStore {
         provider_id: &str,
         classification: Classification,
     ) {
+        self.record_classified_failure_with_wall(model, err, provider_id, classification, None);
+    }
+
+    /// [`record_classified_failure`] plus an explicit plan-limit-wall horizon
+    /// (`quota_wall_until_unix` in unix seconds). Pass it for a MiniMax
+    /// 429/2056 Token Plan wall so consult/routing skip the model until the
+    /// window actually resets instead of re-selecting it after the 30-minute
+    /// Capacity TTL elapses.
+    pub fn record_classified_failure_with_wall(
+        &mut self,
+        model: &str,
+        err: &str,
+        provider_id: &str,
+        classification: Classification,
+        quota_wall_until_unix: Option<i64>,
+    ) {
         let h = self.models.entry(model.to_string()).or_default();
         h.calls = h.calls.saturating_add(1);
+        if let Some(until) = quota_wall_until_unix {
+            h.quota_wall_until_unix = Some(until);
+        }
         if classification.skips_consult() {
             // Skip-class outcome (Capacity / Unprovisioned / Unauthorized) —
             // the model is unknown-healthy; the condition is transient
@@ -782,6 +820,65 @@ impl Drop for LockGuard {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// MiniMax 429/2056 Token Plan wall: a Capacity outcome carrying an
+    /// explicit wall horizon skips consult/routing until that horizon — NOT
+    /// just the 30-minute Capacity TTL. Without the horizon the wall would
+    /// re-admit a guaranteed-failed route long before the window resets.
+    #[test]
+    fn quota_wall_skips_until_its_own_horizon_not_capacity_ttl() {
+        let mut store = HealthStore::default();
+        let now = now_unix();
+        let wall_until = now + 4 * 60 * 60; // 4h from now
+        store.record_classified_failure_with_wall(
+            "MiniMax-M3",
+            "provider HTTP 429: Token Plan usage limit reached … (2056)",
+            "minimax",
+            Classification::Capacity,
+            Some(wall_until),
+        );
+        // The breaker must stay closed (wall is breaker-neutral, like every
+        // Capacity outcome) …
+        assert!(
+            !store.breaker_open("MiniMax-M3"),
+            "a plan wall must not trip the breaker"
+        );
+        // … but consult must skip the model PAST the 30-minute Capacity
+        // TTL, up to the wall horizon.
+        let h = &store.models["MiniMax-M3"];
+        assert!(
+            h.is_skipped_by_classification_at(now + 60 * 60),
+            "1h in (past the 30-min Capacity TTL) the wall must still skip"
+        );
+        assert!(
+            h.is_skipped_by_classification_at(wall_until - 1),
+            "just before the wall horizon the model must still skip"
+        );
+        assert!(
+            !h.is_skipped_by_classification_at(wall_until + 1),
+            "just past the wall horizon the model must be re-admitted"
+        );
+        // A successful call clears the wall immediately.
+        store.record_classified_success("MiniMax-M3", 12.0, "minimax", Classification::Reachable);
+        assert!(
+            !store.is_skipped_by_classification("MiniMax-M3"),
+            "a success must clear the wall skip"
+        );
+        // A Capacity outcome WITHOUT a wall horizon keeps the legacy 30-min
+        // TTL behavior (plain throttling 429).
+        store.record_classified_failure(
+            "Other-429",
+            "provider HTTP 429: throttled",
+            "other",
+            Classification::Capacity,
+        );
+        let h2 = &store.models["Other-429"];
+        assert!(h2.is_skipped_by_classification_at(now + 60));
+        assert!(
+            !h2.is_skipped_by_classification_at(now + 31 * 60),
+            "a plain 429 (no wall horizon) re-admits after the Capacity TTL"
+        );
+    }
 
     /// outcome -> classification mapping. The matrix is small but every cell
     /// of the public contract is asserted: HTTP code first, the

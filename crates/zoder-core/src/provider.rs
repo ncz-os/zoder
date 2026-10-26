@@ -464,6 +464,17 @@ pub struct ProviderError {
     /// SAME model would duplicate visible output, so the caller must not retry
     /// it (it may still fall back to a different model).
     pub emitted: bool,
+    /// True when this 429 is a MiniMax Token Plan (M Plan) wall —
+    /// `{"type":"rate_limit_error", "message":"…(2056)"}`. A plan wall is
+    /// NOT transient: the call is refused until the rolling window resets,
+    /// so callers must fall through to the next configured route instead of
+    /// retrying the same provider. Set on the HTTP-error path and on the
+    /// mid-stream SSE error-frame path.
+    pub token_plan_limit: bool,
+    /// When the exhausted Token Plan window resets, per a concurrent live
+    /// `GET /v1/token_plan/remains` read. `None` when the API did not
+    /// provide one (the 429 body carries no reset time).
+    pub token_plan_resets_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Y-14: raw payload from an Anthropic mid-stream `event: error` frame.
     /// The Anthropic wire protocol surfaces 401/429/529 rejections as an SSE
     /// error frame carried by a 200 response, so the HTTP status we attach
@@ -493,6 +504,8 @@ impl ProviderError {
             status: None,
             retry_after: None,
             emitted: false,
+            token_plan_limit: false,
+            token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
         }
@@ -1622,6 +1635,8 @@ impl OpenAiProvider {
                 status: Some(status.as_u16()),
                 retry_after: retry_after_header(resp.headers()),
                 emitted: false,
+                token_plan_limit: false,
+                token_plan_resets_at: None,
                 anthropic_error_body: None,
                 reasoning: None,
             });
@@ -1952,6 +1967,10 @@ impl OpenAiProvider {
             &self.plan_label,
             &self.account_id,
         );
+        // Plan-wall signal for the success path: a MiniMax gateway may
+        // deliver the 2056 wall as a 2xx error frame instead of a 429, so
+        // the consume_* parsers re-detect it there too.
+        let mut token_plan_limit = false;
         if !status.is_success() {
             let code = status.as_u16();
             let retry_after = retry_after_header(resp.headers());
@@ -1965,18 +1984,45 @@ impl OpenAiProvider {
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_else(|error| format!("[{}]", error.message));
+            // MiniMax M Plan wall (2026-10-17 quota incident): a 429 whose
+            // body is the `rate_limit_error`/2056 envelope is a plan-limit
+            // exhaustion, not transient throttling. Mark the error and
+            // record the state persistently so routing skips this provider
+            // until the window resets instead of retrying into the wall.
+            token_plan_limit = code == 429 && crate::minimax::is_token_plan_limit_error(&body);
+            if token_plan_limit {
+                if let Some(limit) = crate::minimax::observe_token_plan_limit(
+                    &self.provider_id,
+                    &self.base_url,
+                    &self.auth,
+                )
+                .await
+                {
+                    tracing::info!(
+                        provider = %self.provider_id,
+                        resets_at = ?limit.resets_at,
+                        "Token Plan limit (2056) hit; provider skipped until window reset"
+                    );
+                }
+            }
             return Err(ProviderError {
                 message: format!("provider HTTP {status}: {}", redact(&body)),
                 kind,
                 status: Some(code),
                 retry_after,
                 emitted: false,
+                token_plan_limit,
+                token_plan_resets_at: token_plan_limit
+                    .then(|| crate::minimax::observed_reset_at(&self.provider_id))
+                    .flatten(),
                 anthropic_error_body: None,
                 reasoning: None,
             });
         }
         if req.stream {
-            let r = self.consume_stream(req, resp, telemetry, sink).await?;
+            let r = self
+                .consume_stream(req, resp, telemetry, sink, token_plan_limit)
+                .await?;
             // Counter-fed KNEMON capture (Layer 3B) runs after the body
             // is consumed so we have prompt+completion to count. The
             // header-fed capture above already ran on the response
@@ -1996,7 +2042,9 @@ impl OpenAiProvider {
             );
             Ok(r)
         } else {
-            let r = self.consume_full(req, resp, telemetry, sink).await?;
+            let r = self
+                .consume_full(req, resp, telemetry, sink, token_plan_limit)
+                .await?;
             capture_counter_usage(
                 &self.provider_id,
                 &self.base_url,
@@ -2011,18 +2059,25 @@ impl OpenAiProvider {
     }
 
     /// Non-streaming path: read the whole body and parse the completion object.
+    /// `token_plan_limit` is the MiniMax plan-wall signal (429 body with
+    /// code 2056) detected by [`Self::request`]. Only the Responses parser
+    /// re-detects the wall on a 2xx body, and only when that body fails to
+    /// parse; the chat-completions path relies on the 429 status.
     async fn consume_full(
         &self,
         _req: &ChatRequest,
         resp: reqwest::Response,
         mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
+        token_plan_limit: bool,
     ) -> Result<ChatResult, ProviderError> {
         if self.is_anthropic() {
             return self.consume_full_anthropic(resp, telemetry, sink).await;
         }
         if self.is_responses() {
-            return self.consume_full_responses(resp, telemetry, sink).await;
+            return self
+                .consume_full_responses(resp, telemetry, sink, token_plan_limit)
+                .await;
         }
         let body = self.read_limited_body(resp, "chat completion").await?;
         let parsed: ChatCompletion = serde_json::from_slice(&body).map_err(|e| {
@@ -2176,18 +2231,35 @@ impl OpenAiProvider {
     /// block); `cached_prompt_tokens` is left `None` for the Responses
     /// path, matching the byte-level contract an OpenAI Codex
     /// `openai-responses` proxy would publish.
+    /// `token_plan_limit`: the 429 body was the MiniMax plan wall (2056) —
+    /// MiniMax's OpenAI-compatible endpoints can deliver it on a 200 as a
+    /// typed error frame instead of a 429 status. The parameter exists so
+    /// the `fail` closure (captured once, no mutable cell) can carry the
+    /// flag onto every error this path produces. Anthropic callers pass
+    /// `false`; the Anthropic wire never emits the 2056 envelope.
     async fn consume_full_responses(
         &self,
         resp: reqwest::Response,
         mut telemetry: CallTelemetry,
         sink: Option<&mut dyn Write>,
+        token_plan_limit: bool,
     ) -> Result<ChatResult, ProviderError> {
         let body = self.read_limited_body(resp, "responses message").await?;
+        // The plan wall can arrive as a 200 with an error envelope (the
+        // 429-status arm already caught the common shape); re-detect it
+        // here so the flag never depends on which status the gateway used.
+        let token_plan_limit = token_plan_limit
+            || crate::minimax::is_token_plan_limit_error(&String::from_utf8_lossy(&body));
         let parsed: ResponsesResponse = serde_json::from_slice(&body).map_err(|e| {
-            ProviderError::new(
+            let mut err = ProviderError::new(
                 ErrKind::Decode,
                 format!("malformed responses response: {e}"),
-            )
+            );
+            if token_plan_limit {
+                err.token_plan_limit = true;
+                err.token_plan_resets_at = crate::minimax::observed_reset_at(&self.provider_id);
+            }
+            err
         })?;
         // Same schema-invalid-2xx contract as the other two branches.
         if !parsed.has_meaningful_text() {
@@ -2242,12 +2314,15 @@ impl OpenAiProvider {
         resp: reqwest::Response,
         mut telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
+        token_plan_limit: bool,
     ) -> Result<ChatResult, ProviderError> {
         if self.is_anthropic() {
             return self.consume_stream_anthropic(resp, telemetry, sink).await;
         }
         if self.is_responses() {
-            return self.consume_stream_responses(resp, telemetry, sink).await;
+            return self
+                .consume_stream_responses(resp, telemetry, sink, token_plan_limit)
+                .await;
         }
         let deadline = Instant::now() + self.request_timeout;
         let mut content = String::new();
@@ -2270,6 +2345,8 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            token_plan_limit,
+            token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
         };
@@ -2655,6 +2732,8 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            token_plan_limit: false,
+            token_plan_resets_at: None,
             reasoning: None,
         };
         let mut done = false;
@@ -2994,6 +3073,7 @@ impl OpenAiProvider {
         resp: reqwest::Response,
         mut telemetry: CallTelemetry,
         mut sink: Option<&mut dyn Write>,
+        token_plan_limit: bool,
     ) -> Result<ChatResult, ProviderError> {
         // The endpoint URL is read in `request()`; we accept the same
         // stall / idle / buffer / line ceilings the chat and
@@ -3025,6 +3105,8 @@ impl OpenAiProvider {
             status: None,
             retry_after: None,
             emitted,
+            token_plan_limit,
+            token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
         };
@@ -3163,6 +3245,27 @@ impl OpenAiProvider {
                     if event_type == Some("error")
                         || val.get("type").and_then(|t| t.as_str()) == Some("error")
                     {
+                        let mut token_plan_limit = token_plan_limit;
+                        if !token_plan_limit && crate::minimax::is_token_plan_limit_error(payload) {
+                            token_plan_limit = true;
+                            crate::minimax::observe_token_plan_limit(
+                                &self.provider_id,
+                                &self.base_url,
+                                &self.auth,
+                            )
+                            .await;
+                        }
+                        if token_plan_limit {
+                            let mut e = fail(
+                                ErrKind::RateLimit,
+                                format!("provider stream error: {}", redact(payload)),
+                                emitted,
+                            );
+                            e.token_plan_limit = true;
+                            e.token_plan_resets_at =
+                                crate::minimax::observed_reset_at(&self.provider_id);
+                            return Err(e);
+                        }
                         return Err(fail(
                             ErrKind::Http,
                             format!("responses stream error: {}", redact(payload)),
@@ -3562,6 +3665,8 @@ mod tests {
             status: None,
             retry_after: None,
             emitted: false,
+            token_plan_limit: false,
+            token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
         };
@@ -3579,6 +3684,8 @@ mod tests {
             status: None,
             retry_after: None,
             emitted: true,
+            token_plan_limit: false,
+            token_plan_resets_at: None,
             anthropic_error_body: None,
             reasoning: None,
         };

@@ -25,6 +25,7 @@ pub use model_health as health;
 pub mod catalog_models;
 pub mod ledger;
 pub mod mcp;
+pub mod minimax;
 pub mod policy;
 pub mod pricing;
 pub mod pricing_sync;

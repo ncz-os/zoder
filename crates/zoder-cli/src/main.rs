@@ -1070,6 +1070,18 @@ enum Cmd {
         #[command(subcommand)]
         action: PricingCmd,
     },
+    /// Live subscription quota (MiniMax M Plan token-plan 5h / weekly
+    /// windows) via the provider's usage API, plus the last observed
+    /// quota-wall state.
+    Quota {
+        /// Provider to query (only `minimax` is supported today).
+        #[arg(default_value = "minimax")]
+        provider: String,
+        /// Also print the locally estimated (ledger-based) window usage
+        /// next to the live API numbers.
+        #[arg(long)]
+        local: bool,
+    },
     /// Reconcile local ledger spend against a provider's billed-dollar cost API
     /// (admin key; OpenAI + Anthropic). Org-level, lagged: a nightly true-up,
     /// not real-time metering.
@@ -2092,6 +2104,13 @@ impl RoutingContext {
         store: Option<&zoder_core::utilization::UtilizationStore>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<&'a Provider> {
+        // MiniMax M Plan wall: a provider whose Token Plan window is
+        // exhausted (last 429/2056 still inside the reset/grace, or a live
+        // `token_plan/remains` refresh showing a full window) is skipped
+        // HERE, at provider-selection time — before any HTTP call — so the
+        // chain falls through to the next configured route instead of
+        // retrying into the wall.
+        let ledger_choice = filter_token_plan_exhausted(cfg, model_id, ledger_choice, now);
         let Some(store) = store else {
             return ledger_choice;
         };
@@ -2176,6 +2195,109 @@ impl RoutingContext {
             });
         }
         ledger_choice
+    }
+}
+
+/// Skip a MiniMax provider whose M Plan (Token Plan) window is exhausted,
+/// per the persisted `~/.zoder/minimax-quota.json` state (last 429/2056
+/// observation and/or the latest live `token_plan/remains` refresh).
+///
+/// The persisted state is the single source of truth: the provider layer
+/// writes it the moment a 429/2056 is seen (grace-bound until the window
+/// resets) and `zoder quota minimax` refreshes it with the API's own numbers.
+/// If the state says the provider is not exhausted, the choice is returned
+/// unchanged.
+///
+/// When `choice` points at an exhausted MiniMax provider, we search for the
+/// NEXT configured provider that also serves the same model prefix (the
+/// "fall through to the next configured route" the task asks for). If there
+/// is no such sibling, `choice` is returned as-is — the caller still makes
+/// the call and the provider layer re-detects + re-persists the wall, so the
+/// operator sees an honest "provider HTTP 429 (2056)" rather than a silent
+/// routing loop.
+fn filter_token_plan_exhausted<'a>(
+    cfg: &'a Config,
+    model_id: &str,
+    choice: Option<&'a Provider>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<&'a Provider> {
+    let choice = choice?;
+    let is_minimax = choice.id.to_ascii_lowercase().contains("minimax")
+        || choice.base_url.to_ascii_lowercase().contains("minimax");
+    if !is_minimax {
+        return Some(choice);
+    }
+    let Some(path) = zoder_core::minimax::default_state_path() else {
+        return Some(choice);
+    };
+    let state = zoder_core::minimax::load_state(&path);
+    let Some(pstate) = state.provider(&choice.id) else {
+        return Some(choice);
+    };
+    if !pstate.is_exhausted_at(now) {
+        return Some(choice);
+    }
+    // The chosen provider is wall-bound. Build the full candidate list
+    // (every configured provider that serves this model prefix, longest
+    // prefix first — the same ordering `real_provider_for_model` uses) and
+    // drop EVERY provider whose persisted state says exhausted, not just
+    // the current choice. The first surviving candidate wins. This is what
+    // keeps an install with multiple MiniMax accounts on the same plan from
+    // hopping from one exhausted provider to the next exhausted provider.
+    let is_exhausted = |provider: &Provider| -> bool {
+        let id_lc = provider.id.to_ascii_lowercase();
+        let url_lc = provider.base_url.to_ascii_lowercase();
+        if !id_lc.contains("minimax") && !url_lc.contains("minimax") {
+            return false;
+        }
+        state
+            .provider(&provider.id)
+            .map(|s| s.is_exhausted_at(now))
+            .unwrap_or(false)
+    };
+    let mut matching: Vec<&Provider> = cfg
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .serves
+                .iter()
+                .any(|prefix| !prefix.is_empty() && model_id.starts_with(prefix))
+        })
+        .collect();
+    matching.sort_by_key(|provider| {
+        std::cmp::Reverse(
+            provider
+                .serves
+                .iter()
+                .filter(|prefix| model_id.starts_with(prefix.as_str()))
+                .map(String::len)
+                .max()
+                .unwrap_or(0),
+        )
+    });
+    let next = matching
+        .iter()
+        .copied()
+        .find(|provider| !is_exhausted(provider));
+    match next {
+        Some(next) => {
+            eprintln!(
+                "[zoder] skipping MiniMax provider '{}' (M Plan quota exhausted, \
+                     see `zoder quota minimax`); falling through to '{}'",
+                choice.id, next.id
+            );
+            Some(next)
+        }
+        None => {
+            eprintln!(
+                "[zoder] every MiniMax provider serving '{}' is M Plan quota-exhausted \
+                     (see `zoder quota minimax`); attempting the call anyway to surface \
+                     the reset time",
+                model_id
+            );
+            Some(choice)
+        }
     }
 }
 
@@ -2312,6 +2434,7 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Init { profile, force }) => cmd_init(*profile, *force),
         Some(Cmd::Refresh) => cmd_refresh(&cli).await,
         Some(Cmd::Pricing { action }) => cmd_pricing(action, cli.json).await,
+        Some(Cmd::Quota { provider, local }) => cmd_quota(provider, *local, cli.json).await,
         Some(Cmd::Reconcile { provider, days }) => cmd_reconcile(provider, *days, cli.json).await,
         Some(Cmd::Sessions) => cmd_sessions(cli.json),
         Some(Cmd::Review {
@@ -6389,7 +6512,17 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 // 300s. Now: classify -> record_classified_failure, with the
                 // provider-id already resolved at the top of the loop (`pid`).
                 let cls = classify_err(&e);
-                health.record_classified_failure(model_id, &e.message, &pid, cls);
+                let wall = e.token_plan_resets_at.map(|d| d.timestamp());
+                health.record_classified_failure_with_wall(
+                    model_id,
+                    &e.message,
+                    &pid,
+                    cls,
+                    e.token_plan_limit.then_some(wall.unwrap_or_else(|| {
+                        chrono::Utc::now().timestamp()
+                            + zoder_core::minimax::DEFAULT_EXHAUSTED_GRACE_SECS as i64
+                    })),
+                );
                 last_err = Some(e);
                 if fatal {
                     // Output already partially shown; do not fall back.
@@ -14252,6 +14385,211 @@ fn billing_label(b: BillingMode) -> &'static str {
         BillingMode::Metered => "metered",
         BillingMode::Subscription => "subscription",
     }
+}
+
+/// `zoder quota minimax` — live M Plan (Token Plan) quota via the provider's
+/// own usage API (`GET /v1/token_plan/remains`), plus the last observed
+/// quota-wall state persisted when the 429/2056 was hit.
+///
+/// The 5-hour and weekly windows are the authoritative numbers: the ledger
+/// only estimates them (optional `--local` column). A `remaining_percent`
+/// of 0 means the wall is up RIGHT NOW and routing skips the provider until
+/// the window resets (see `zoder health` / `zoder consult` for the skip).
+async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()> {
+    if !provider.eq_ignore_ascii_case("minimax") {
+        anyhow::bail!(
+            "zoder quota supports only `minimax` today (other providers publish \
+             no plan-usage API); got `{provider}`"
+        );
+    }
+    let eng = Engine::load()?;
+    // Find a provider that actually serves MiniMax (id or base_url naming
+    // minimax) and is not a placeholder. Only the first one is refreshed;
+    // a second MiniMax account keeps its own state until it hits a wall.
+    let minimax_provider = eng.cfg.providers.iter().find(|p| {
+        let id = p.id.to_ascii_lowercase();
+        let url = p.base_url.to_ascii_lowercase();
+        (id.contains("minimax") || url.contains("minimax"))
+            && !p
+                .base_url
+                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+    });
+    let Some(p) = minimax_provider else {
+        anyhow::bail!(
+            "no MiniMax provider configured (looked for a provider id or base_url \
+             naming 'minimax'); configure one in ~/.zoder/config.toml"
+        )
+    };
+    let token = match p.auth.resolve() {
+        Some(t) if !t.is_empty() => t,
+        _ => anyhow::bail!(
+            "MiniMax provider `{}` has no usable credential (auth resolves empty)",
+            p.id
+        ),
+    };
+    let base = p.base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}/token_plan/remains")
+    } else {
+        format!("{base}/v1/token_plan/remains")
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("token_plan/remains request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("token_plan/remains returned HTTP {status}");
+    }
+    let body = resp.text().await?;
+    let parsed = zoder_core::minimax::parse_token_plan_remains(&body)?;
+    let Some(r) = parsed.model_remains.into_iter().next() else {
+        anyhow::bail!("token_plan/remains returned no model_remains rows");
+    };
+    // Persist the live refresh so routing can use it even without a fresh
+    // 429 in flight.
+    if let Some(path) = zoder_core::minimax::default_state_path() {
+        let mut state = zoder_core::minimax::load_state(&path);
+        state.record_remains(&p.id, r.clone(), chrono::Utc::now());
+        if let Err(e) = zoder_core::minimax::save_state(&path, &state) {
+            eprintln!("zoder: warning: could not persist the quota refresh: {e}");
+        }
+    }
+    let persisted = zoder_core::minimax::default_state_path()
+        .map(|path| zoder_core::minimax::load_state(&path))
+        .unwrap_or_default();
+    let pstate = persisted.provider(&p.id);
+    let interval_used_pct = r.interval_used_pct();
+    let weekly_used_pct = r.weekly_used_pct();
+    let exhausted = r.is_exhausted();
+    let wall_until = r.exhausted_until();
+    if json {
+        let out = serde_json::json!({
+            "provider": p.id,
+            "endpoint": url,
+            "source": "api.minimax.io/v1/token_plan/remains",
+            "5h": {
+                "used_pct": (interval_used_pct * 100.0 * 100.0).round() / 100.0,
+                "remaining_pct": r.current_interval_remaining_percent,
+                "used_tokens": r.current_interval_usage_count,
+                "cap_tokens": r.current_interval_total_count,
+                "reset_utc": r.interval_reset_at().to_rfc3339(),
+            },
+            "weekly": {
+                "used_pct": (weekly_used_pct * 100.0 * 100.0).round() / 100.0,
+                "remaining_pct": r.current_weekly_remaining_percent,
+                "used_tokens": r.current_weekly_usage_count,
+                "cap_tokens": r.current_weekly_total_count,
+                "reset_utc": r.weekly_reset_at().to_rfc3339(),
+            },
+            "exhausted": exhausted,
+            "exhausted_until_utc": wall_until.map(|d| d.to_rfc3339()),
+            "last_limit_observed": pstate.and_then(|s| s.limit.as_ref()).map(|l| {
+                serde_json::json!({
+                    "observed_at": l.observed_at.to_rfc3339(),
+                    "resets_at": l.resets_at.map(|d| d.to_rfc3339()),
+                })
+            }),
+            "routing_skip": pstate.map(|s| s.is_exhausted_at(chrono::Utc::now())),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    let pct = |f: f64| format!("{:.1}%", f * 100.0);
+    println!("{}  M Plan (Token Plan) quota — live from {}", p.id, url);
+    println!(
+        "  5h window    used {} ({} tokens)  resets {}",
+        pct(interval_used_pct),
+        r.current_interval_usage_count,
+        r.interval_reset_at().format("%Y-%m-%d %H:%M:%S UTC"),
+    );
+    println!(
+        "  weekly       used {} ({} tokens)  resets {}",
+        pct(weekly_used_pct),
+        r.current_weekly_usage_count,
+        r.weekly_reset_at().format("%Y-%m-%d %H:%M:%S UTC"),
+    );
+    if let Some(l) = pstate.and_then(|s| s.limit.as_ref()) {
+        println!(
+            "  last wall    {}{}",
+            l.observed_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            l.resets_at
+                .map(|d| format!("  (reset {})", d.format("%Y-%m-%d %H:%M:%S UTC")))
+                .unwrap_or_else(|| "  (grace period)".to_string())
+        );
+    }
+    if exhausted {
+        println!(
+            "  STATUS: EXHAUSTED — routing skips this provider until {}",
+            wall_until
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "the window resets".into())
+        );
+    } else {
+        println!("  STATUS: headroom remaining");
+    }
+    if local {
+        // Ledger-based local estimate, for comparison only.
+        let entries = Ledger::new(&eng.cfg.ledger_path)
+            .entries_readonly()
+            .unwrap_or_default();
+        let catalog = load_tier_catalog(Some(
+            &zoder_core::subscription_tiers::default_catalog_path(&Config::home()),
+        ));
+        if let Some(plan) = &p.subscription {
+            let catalog_provider = plan
+                .tier
+                .as_deref()
+                .and_then(|tier| catalog.provider_namespace(p, tier))
+                .unwrap_or_else(|| p.id.clone());
+            let windows = zoder_core::plan_usage_for_catalog_provider(
+                &entries,
+                &p.id,
+                plan,
+                &catalog,
+                &catalog_provider,
+            );
+            for w in &windows {
+                println!(
+                    "  local [{}] used {}/{} = {}  reset {}",
+                    w.name,
+                    w.used,
+                    w.cap
+                        .map(|c| format!("{c:.0}"))
+                        .unwrap_or_else(|| "?".into()),
+                    match w.cap {
+                        Some(_) => format!("{:.1}%", w.pct * 100.0),
+                        None => "n/a".into(),
+                    },
+                    w.next_reset_utc.clone().unwrap_or_else(|| "n/a".into()),
+                );
+            }
+            // Documented limitation of the local estimate. The *used* side is
+            // a true trailing-window sum over ledger rows (Rolling windows
+            // count `ts >= now - hours`), so the 5h/weekly *usage* is
+            // mathematically sound. The *cap* side is NOT: it comes from the
+            // tier catalog's preset (e.g. `minimax_token_plan`), which encodes
+            // the plan's advertised limit — it is not a live per-request meter
+            // and cannot see usage made outside this ledger (other tools,
+            // other hosts, API calls that bypassed zoder). Treat the % as an
+            // upper-bound estimate that will under-report the real number if
+            // any quota consumption happened outside this host's ledger. The
+            // live API numbers printed above are authoritative; the local row
+            // is for comparison only.
+            if windows.iter().any(|w| w.cap.is_none()) {
+                println!(
+                    "  local: (estimation is bounded — a window's cap is not in the \
+                         tier catalog, so its % is shown as n/a)"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A non-secret descriptor of a provider's auth for display/JSON. Never emits

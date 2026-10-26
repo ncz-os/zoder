@@ -908,8 +908,34 @@ async fn complete_once_tracked(
                     // `<stem>.lock`, not a File::lock/flock), applies this
                     // delta, and writes atomically before releasing -- so
                     // every panel model's failure survives.
+                    // The provider layer (`zoder_core::provider`) is the
+                    // single source of truth for a MiniMax M Plan wall:
+                    // `observe_token_plan_limit` does the best-effort live
+                    // `token_plan/remains` refresh and persists a
+                    // machine-observed reset when the endpoint answers,
+                    // else a grace-bound one. Here we read that persisted
+                    // reset rather than hardcoding our own 5h estimate —
+                    // `observed_reset_at` is the reset of the full window
+                    // the API itself reported (the 5h reset when the
+                    // refresh shows no full window). `None` means no wall is persisted for
+                    // this provider (either not a MiniMax wall, or the
+                    // state was pruned), in which case the generic
+                    // `record_classified_failure` path below is enough.
+                    let wall = status
+                        .and_then(|st| {
+                            (st == 429)
+                                .then(|| zoder_core::minimax::observed_reset_at(&provider_id))
+                        })
+                        .flatten()
+                        .map(|t| t.timestamp());
                     let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
-                        h.record_classified_failure(model, &message, &provider_id, cls);
+                        h.record_classified_failure_with_wall(
+                            model,
+                            &message,
+                            &provider_id,
+                            cls,
+                            wall,
+                        );
                     });
                 }
                 tracing::debug!(
