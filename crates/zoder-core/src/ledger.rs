@@ -80,6 +80,22 @@ fn is_stale_armed_reservation(entry: &Entry, now: DateTime<Utc>) -> bool {
         && (now - entry.ts_utc).num_seconds() >= STALE_RESERVATION_TRIM_S
 }
 
+/// True when the row is a reservation that a live process may still own: a
+/// prepared reservation, or an armed one that is not yet stale.
+///
+/// A row that is not a live reservation holds finished spend, even when its
+/// cost is unknown, and its padding is reclaimable.
+fn is_live_reservation(entry: &Entry, now: DateTime<Utc>) -> bool {
+    if entry.provider != RESERVATION_PROVIDER {
+        return false;
+    }
+    match entry.model.as_str() {
+        PREPARED_RESERVATION_MODEL => true,
+        ARMED_RESERVATION_MODEL => !is_stale_armed_reservation(entry, now),
+        _ => false,
+    }
+}
+
 /// What the recovery scan learned about compaction.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanStats {
@@ -92,6 +108,23 @@ struct ScanStats {
 
 fn is_reservation_slot_len(bytes: usize) -> bool {
     bytes == BILLABLE_RESERVATION_BYTES || bytes == LEGACY_RESERVATION_BYTES
+}
+
+/// True when `haystack` contains `needle`.
+///
+/// The recovery scan runs on every ledger write, so it must not parse every
+/// row. The UTF-8 path uses the standard library's substring search; the
+/// fallback covers a row that is not valid UTF-8.
+fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
+    match std::str::from_utf8(haystack) {
+        Ok(text) => text.contains(needle),
+        Err(_) => {
+            let needle = needle.as_bytes();
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +282,18 @@ pub struct BillableReservation {
     marker: String,
     month_to_date: Result<f64, String>,
     armed: bool,
+    /// True once the slot holds a final entry, so the drop guard knows not to
+    /// overwrite it.
+    reconciled: bool,
+    /// The provider and model the call was dispatched to, when the caller
+    /// knows them. A reservation that never gets a final entry is reconciled
+    /// into an unknown-cost row that names them, so the unknown spend is
+    /// attributable to the model that caused it.
+    dispatched_provider: String,
+    dispatched_model: String,
+    /// When the reservation was created. The reconciled unknown-cost row keeps
+    /// it, so the row is dated at the dispatch and not at the failure.
+    ts_utc: DateTime<Utc>,
     owner_lock: Option<File>,
     owner_lock_path: PathBuf,
 }
@@ -256,6 +301,15 @@ pub struct BillableReservation {
 const RESERVATION_PROVIDER: &str = "__zoder_reservation__";
 const PREPARED_RESERVATION_MODEL: &str = "__zoder_billable_p__";
 const ARMED_RESERVATION_MODEL: &str = "__zoder_billable_a__";
+/// A reservation that was dispatched, whose cost could not be determined,
+/// and that was reconciled: the dispatch is over and the money is unknown.
+/// It is distinct from [`ARMED_RESERVATION_MODEL`], which marks a dispatch
+/// that may still be in flight.
+const UNKNOWN_COST_RESERVATION_MODEL: &str = "__zoder_billable_u__";
+/// The prefix the reservation model names share. It is a cheap pre-filter:
+/// a ledger row that does not contain it cannot be a reservation, so it does
+/// not have to be parsed.
+const RESERVATION_MODEL_PREFIX: &str = "__zoder_billable_";
 
 impl BillableReservation {
     /// Month-to-date known spend from the strict snapshot taken while this
@@ -297,6 +351,17 @@ impl BillableReservation {
     /// declines a budget prompt); afterward, an unreconciled slot is retained
     /// as unknown spend so failures cannot become unaccounted retries.
     pub fn arm(&mut self) -> anyhow::Result<()> {
+        self.arm_for("", "")
+    }
+
+    /// [`Self::arm`], recording who the call is dispatched to.
+    ///
+    /// The provider and model are used by the drop guard only: if the call
+    /// fails, times out, is cancelled, or the process unwinds, the
+    /// reservation is reconciled into an unknown-cost row that names the
+    /// model, so the unknown spend is reported against the model that caused
+    /// it instead of against a reservation placeholder.
+    pub fn arm_for(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
         if self.armed {
             anyhow::bail!("billable reservation is already armed");
         }
@@ -318,8 +383,84 @@ impl BillableReservation {
             &self.path,
         )?;
         self.armed = true;
+        self.dispatched_provider = provider.to_string();
+        self.dispatched_model = model.to_string();
         self.owner_lock.take();
         let _ = std::fs::remove_file(&self.owner_lock_path);
+        Ok(())
+    }
+
+    /// Replace the reservation with an entry that records the truth: the call
+    /// was dispatched, its cost is unknown, and it is NOT an unreconciled
+    /// reservation.
+    ///
+    /// The row says the same thing about the money as the armed reservation
+    /// did — the cost is unknown — without claiming a reconciliation that
+    /// never happened. When the caller told the reservation who the call was
+    /// dispatched to, the row carries that model, so the unknown spend shows
+    /// up against the model that caused it.
+    pub fn reconcile_unknown(&mut self) -> anyhow::Result<()> {
+        let entry = self.unknown_cost_entry();
+        self.write_slot(&entry)?;
+        self.reconciled = true;
+        Ok(())
+    }
+
+    /// The entry that records a dispatched call whose cost is unknown.
+    fn unknown_cost_entry(&self) -> Entry {
+        Entry {
+            ts_utc: self.ts_utc,
+            provider: if self.dispatched_provider.is_empty() {
+                RESERVATION_PROVIDER.to_string()
+            } else {
+                self.dispatched_provider.clone()
+            },
+            model: if self.dispatched_model.is_empty() {
+                ARMED_RESERVATION_MODEL.to_string()
+            } else {
+                self.dispatched_model.clone()
+            },
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: None,
+            tags: FinOpsTags::default(),
+        }
+    }
+
+    /// Overwrite the reservation slot with `entry`, keeping the slot's fixed
+    /// size so the rows after it do not move.
+    fn write_slot(&mut self, entry: &Entry) -> anyhow::Result<()> {
+        let json = fit_entry_json(entry, self.slot_bytes)?;
+        if json.len() + 1 > self.slot_bytes {
+            anyhow::bail!(
+                "ledger entry is {} bytes, exceeding the {}-byte reservation slot",
+                json.len() + 1,
+                self.slot_bytes
+            );
+        }
+        let mut line = vec![b' '; self.slot_bytes];
+        line[..json.len()].copy_from_slice(&json);
+        line[self.slot_bytes - 1] = b'\n';
+        let lock = open_lock_file(&self.lock_path)?;
+        lock.lock_exclusive()?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!(
+                    "opening ledger at {} for reconciliation",
+                    self.path.display()
+                )
+            })?;
+        self.relocate(&mut file)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        file.write_all(&line)?;
+        file.sync_data()?;
         Ok(())
     }
 
@@ -357,13 +498,24 @@ impl BillableReservation {
         file.seek(SeekFrom::Start(self.offset))?;
         file.write_all(&line)?;
         file.sync_data()?;
+        // The slot holds the final entry now. This is set only after the
+        // write succeeded: when the write fails, the drop guard reconciles
+        // the slot into an unknown-cost row instead of leaving it armed.
+        self.reconciled = true;
         Ok(())
     }
 }
 
 impl Drop for BillableReservation {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.armed && !self.reconciled {
+            // The drop guard. The call was dispatched and its cost is
+            // unknown, so the slot is reconciled into an unknown-cost row.
+            // Without this the row stayed an armed reservation for ever and
+            // every failed dispatch left a "reserved but not reconciled"
+            // violation behind: thousands of them, fleet-wide.
+            let _ = self.reconcile_unknown();
+        } else if !self.armed {
             // Other writers may have appended after this reservation was
             // created, so cancellation must blank only our fixed-size slot;
             // truncating to `offset` would discard their rows.
@@ -636,6 +788,10 @@ impl Ledger {
             marker,
             month_to_date,
             armed: false,
+            reconciled: false,
+            dispatched_provider: String::new(),
+            dispatched_model: String::new(),
+            ts_utc: pending.ts_utc,
             owner_lock: Some(owner_lock),
             owner_lock_path,
         })
@@ -657,6 +813,7 @@ impl Ledger {
         let mut line_no = 0_usize;
         let mut line = Vec::new();
         let mut abandoned = Vec::new();
+        let mut stale_armed_rows = Vec::new();
         let mut waste = 0_u64;
         let mut legacy_inflight = false;
         let now = Utc::now();
@@ -674,11 +831,16 @@ impl Ledger {
                     "ledger line {line_no} exceeds {MAX_LEDGER_LINE_BYTES} bytes; truncating early"
                 );
             }
-            if is_reservation_slot_len(bytes) {
-                let mut payload = line.as_slice();
-                while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
-                    payload = &payload[..payload.len() - 1];
-                }
+            let mut payload = line.as_slice();
+            while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
+                payload = &payload[..payload.len() - 1];
+            }
+            // Cheap pre-filter: only a row that mentions a reservation model
+            // can be a reservation, so a large ledger is not parsed line by
+            // line.
+            let mentions_reservation = contains_bytes(payload, RESERVATION_MODEL_PREFIX);
+            let is_slot = is_reservation_slot_len(bytes);
+            if is_slot || mentions_reservation {
                 let parsed = serde_json::from_slice::<Entry>(payload).ok();
                 let is_reservation = parsed
                     .as_ref()
@@ -694,28 +856,44 @@ impl Ledger {
                 let stale_armed = parsed
                     .as_ref()
                     .is_some_and(|entry| is_stale_armed_reservation(entry, now));
-                if !is_reservation || stale_armed {
+                let live_reservation = parsed
+                    .as_ref()
+                    .is_some_and(|entry| is_live_reservation(entry, now));
+                if is_slot && !live_reservation {
                     // Finished, blank or stale-armed slot: everything past
                     // the payload and its newline is compactable padding.
                     waste = waste.saturating_add(
                         u64::try_from(bytes.saturating_sub(payload.len() + 1)).unwrap_or(0),
                     );
                 }
-                if let Some(entry) = parsed {
-                    if entry.provider == RESERVATION_PROVIDER
-                        && entry.model == PREPARED_RESERVATION_MODEL
-                    {
-                        let marker = reservation_marker(&entry).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "prepared reservation at byte {offset} has invalid owner metadata"
-                            )
-                        })?;
-                        let owner_path = reservation_owner_lock_path(&self.path, marker);
-                        let owner = open_lock_file(&owner_path)?;
-                        match owner.try_lock_exclusive() {
-                            Ok(()) => abandoned.push((offset, bytes, owner_path, owner)),
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(error) => return Err(error.into()),
+                if stale_armed {
+                    // A stale armed reservation can never be reconciled by the
+                    // process that armed it: that process is gone, and every
+                    // dispatch is bounded far below the age at which a
+                    // reservation goes stale. It is reconciled here instead,
+                    // so the ledger stops reporting a reservation that was
+                    // never reconciled.
+                    if let Some(entry) = parsed.as_ref() {
+                        stale_armed_rows.push((offset, bytes, entry.ts_utc));
+                    }
+                }
+                if is_slot {
+                    if let Some(entry) = parsed {
+                        if entry.provider == RESERVATION_PROVIDER
+                            && entry.model == PREPARED_RESERVATION_MODEL
+                        {
+                            let marker = reservation_marker(&entry).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "prepared reservation at byte {offset} has invalid owner metadata"
+                                )
+                            })?;
+                            let owner_path = reservation_owner_lock_path(&self.path, marker);
+                            let owner = open_lock_file(&owner_path)?;
+                            match owner.try_lock_exclusive() {
+                                Ok(()) => abandoned.push((offset, bytes, owner_path, owner)),
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(error) => return Err(error.into()),
+                            }
                         }
                     }
                 }
@@ -723,7 +901,7 @@ impl Ledger {
             offset = offset.saturating_add(u64::try_from(bytes)?);
         }
         drop(reader);
-        if abandoned.is_empty() {
+        if abandoned.is_empty() && stale_armed_rows.is_empty() {
             return Ok(ScanStats {
                 waste,
                 legacy_inflight,
@@ -747,6 +925,33 @@ impl Ledger {
             waste = waste.saturating_add(u64::try_from(bytes).unwrap_or(0));
             drop(owner);
             let _ = std::fs::remove_file(owner_path);
+        }
+        for (offset, bytes, ts_utc) in stale_armed_rows {
+            let entry = Entry {
+                ts_utc,
+                provider: RESERVATION_PROVIDER.to_string(),
+                model: UNKNOWN_COST_RESERVATION_MODEL.to_string(),
+                host: String::new(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                cost_unknown: true,
+                calls: 1,
+                violation: None,
+                tags: FinOpsTags::default(),
+            };
+            let json = fit_entry_json(&entry, bytes)?;
+            if json.len() + 1 > bytes {
+                // The row is too small to hold the reconciled entry. Leave it
+                // armed: a stale armed reservation is reported as
+                // unreconciled, which is honest, and the ledger stays usable.
+                continue;
+            }
+            let mut line = vec![b' '; bytes];
+            line[..json.len()].copy_from_slice(&json);
+            line[bytes - 1] = b'\n';
+            writable.seek(SeekFrom::Start(offset))?;
+            writable.write_all(&line)?;
         }
         writable.sync_data()?;
         Ok(ScanStats {
@@ -812,10 +1017,11 @@ impl Ledger {
                     continue;
                 }
                 match serde_json::from_slice::<Entry>(payload) {
-                    Ok(entry)
-                        if entry.provider != RESERVATION_PROVIDER
-                            || is_stale_armed_reservation(&entry, now) =>
-                    {
+                    // A live reservation row (prepared, or armed and not yet
+                    // stale) is copied byte-for-byte so its owner can find it
+                    // again by marker. Every other row is finished spend and
+                    // its padding is reclaimable.
+                    Ok(entry) if !is_live_reservation(&entry, now) => {
                         out.write_all(payload)?;
                         out.write_all(b"\n")?;
                     }
@@ -1929,5 +2135,187 @@ mod tests {
         let entries = ledger.entries_strict().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].model, "replacement");
+    }
+
+    /// An armed reservation whose owner is gone: dispatched, never
+    /// reconciled, and older than the stale threshold.
+    fn stale_armed_entry() -> Entry {
+        Entry {
+            ts_utc: Utc::now() - chrono::Duration::hours(7),
+            provider: RESERVATION_PROVIDER.to_string(),
+            model: ARMED_RESERVATION_MODEL.to_string(),
+            host: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            cost_unknown: true,
+            calls: 1,
+            violation: Some(
+                "billable call reserved but not reconciled \
+                 (zoder-reservation-00000000000000000000000000000000)"
+                    .to_string(),
+            ),
+            tags: FinOpsTags::default(),
+        }
+    }
+
+    /// A reservation that was armed and then dropped without a final entry --
+    /// the dispatch failed, timed out, was cancelled, or the process unwound
+    /// -- must leave an unknown-cost row that no longer claims to be an
+    /// unreconciled reservation.
+    ///
+    /// Before the drop guard the slot stayed armed for ever, so every failed
+    /// dispatch left a "billable call reserved but not reconciled" row behind
+    /// and the ledger reported the reservation as still in flight.
+    #[test]
+    fn an_armed_reservation_dropped_without_a_final_entry_is_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        {
+            let mut reservation = ledger.reserve_billable().unwrap();
+            reservation.arm_for("provider-a", "model-a").unwrap();
+            // The dispatch failed: the reservation is dropped with no final
+            // entry.
+        }
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        assert_eq!(rows.len(), 1, "the reservation leaves exactly one row");
+        assert!(
+            rows[0].cost_unknown,
+            "a failed dispatch has an unknown cost"
+        );
+        assert!(
+            rows[0].violation.is_none(),
+            "a reconciled reservation must not report an unreconciled one: {:?}",
+            rows[0].violation
+        );
+        assert_eq!(rows[0].provider, "provider-a");
+        assert_eq!(rows[0].model, "model-a");
+    }
+
+    /// A panic unwinding through an armed reservation reconciles it too: the
+    /// drop guard runs while the stack unwinds.
+    #[test]
+    fn a_panicking_dispatch_reconciles_the_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome: std::thread::Result<()> = std::panic::catch_unwind(|| {
+            let mut reservation = ledger.reserve_billable().unwrap();
+            reservation.arm_for("provider-a", "model-a").unwrap();
+            panic!("the dispatch exploded");
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(outcome.is_err(), "the panic must propagate");
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].cost_unknown);
+        assert!(
+            rows[0].violation.is_none(),
+            "a reconciled reservation must not report an unreconciled one: {:?}",
+            rows[0].violation
+        );
+    }
+
+    /// A reservation dropped before it was armed was never dispatched: its
+    /// slot is blanked instead of becoming an unknown-cost row.
+    #[test]
+    fn a_reservation_dropped_before_dispatch_is_blanked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        {
+            let _reservation = ledger.reserve_billable().unwrap();
+        }
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        assert!(
+            rows.is_empty(),
+            "an undispatched reservation leaves no row: {rows:?}"
+        );
+    }
+
+    /// A reconciled reservation keeps its final entry: the drop guard must not
+    /// overwrite a successful reconciliation with an unknown-cost row.
+    #[test]
+    fn a_reconciled_reservation_keeps_its_final_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut reservation = ledger.reserve_billable().unwrap();
+        reservation.arm_for("provider-a", "model-a").unwrap();
+        let final_entry = entry("2026-10-25 10:00:00", "model-a", 0.25, 10, 5, 1);
+        reservation.reconcile(&final_entry).unwrap();
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].cost_unknown);
+        assert!((rows[0].cost_usd - 0.25).abs() < 1e-9);
+        assert!(rows[0].violation.is_none());
+    }
+
+    /// A stale armed reservation is reconciled when the ledger is opened: its
+    /// owner is gone, so no other code path can ever reconcile it.
+    #[test]
+    fn a_stale_armed_reservation_is_reconciled_when_the_ledger_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let stale = stale_armed_entry();
+        let mut file = std::fs::File::create(&path).unwrap();
+        let json = serde_json::to_vec(&stale).unwrap();
+        let mut slot = vec![b' '; BILLABLE_RESERVATION_BYTES];
+        slot[..json.len()].copy_from_slice(&json);
+        slot[BILLABLE_RESERVATION_BYTES - 1] = b'\n';
+        file.write_all(&slot).unwrap();
+        drop(file);
+
+        // Opening the ledger for a write runs the recovery scan.
+        Ledger::new(&path)
+            .record(&entry("2026-10-25 10:00:00", "model-a", 0.0, 0, 0, 1))
+            .unwrap();
+
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        let reconciled = rows
+            .iter()
+            .find(|row| row.ts_utc == stale.ts_utc)
+            .expect("the stale row is still in the ledger");
+        assert!(
+            reconciled.violation.is_none(),
+            "a stale reservation must not report an unreconciled one: {:?}",
+            reconciled.violation
+        );
+        assert!(reconciled.cost_unknown);
+        assert_eq!(reconciled.model, UNKNOWN_COST_RESERVATION_MODEL);
+    }
+
+    /// The same reconciliation applies to a stale armed reservation that the
+    /// compaction already rewrote as a normal-length row.
+    #[test]
+    fn a_compacted_stale_armed_reservation_is_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let stale = stale_armed_entry();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&serde_json::to_vec(&stale).unwrap())
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        Ledger::new(&path)
+            .record(&entry("2026-10-25 10:00:00", "model-a", 0.0, 0, 0, 1))
+            .unwrap();
+
+        let rows = Ledger::new(&path).entries_strict().unwrap();
+        let reconciled = rows
+            .iter()
+            .find(|row| row.ts_utc == stale.ts_utc)
+            .expect("the stale row is still in the ledger");
+        assert!(
+            reconciled.violation.is_none(),
+            "a stale reservation must not report an unreconciled one: {:?}",
+            reconciled.violation
+        );
+        assert!(reconciled.cost_unknown);
+        assert_eq!(reconciled.model, UNKNOWN_COST_RESERVATION_MODEL);
     }
 }

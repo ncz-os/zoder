@@ -1611,7 +1611,7 @@ async fn dispatch_reviewer_for_model(
             }
         };
 
-        if let Err(e) = ledger_reservation.arm() {
+        if let Err(e) = ledger_reservation.arm_for(provider_cfg.id.as_str(), model) {
             return Err(ReviewerError::fatal(format!(
                 "verifying ledger reservation before reviewer dispatch: {e}"
             )));

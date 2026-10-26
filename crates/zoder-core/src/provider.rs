@@ -1455,6 +1455,12 @@ impl OpenAiProvider {
         &self.account_id
     }
 
+    /// The configured provider id (the `provider` name in the config), which
+    /// is what the ledger records as the provider that served a call.
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
     /// Plan label resolved at construction time from
     /// [`Provider::subscription`] (catalog tier when present, the
     /// configured plan label `"explicit"` when absent, or the provider
