@@ -1,0 +1,89 @@
+# config.standalone.toml — single-host zoder profile (TEMPLATE).
+#
+# `zoder init --profile standalone` (and `install.sh --profile standalone`,
+# the default) writes this file into $ZODER_HOME only when no zoder
+# configuration exists yet. Edit your copy; the repo file is only a template.
+#
+# This profile is for ONE operator on ONE machine. It needs one hosted provider
+# key to start; a second key adds a genuine cross-family reviewer. Fleet
+# deployments instead use `zoder init --profile fleet` and take their
+# providers and tuning from the fleet's own configuration repository.
+
+[deployment]
+mode = "standalone"
+
+[profile]
+name = "standalone"
+default = true
+default_provider = "deepseek"
+
+# Author model. DeepSeek direct and MiniMax are both hosted and metered; swap
+# this pair for `MiniMax-M3` if MiniMax is the key you have.
+primary_model = "deepseek-chat"
+
+# Reviewer chain, head first. With both keys the first entry is a cross-family
+# second opinion. With only one key the unavailable entry fails and zoder
+# prints a warning before falling back to the entry on the provider you have.
+reviewer_model = "MiniMax-M3,deepseek-chat"
+
+# --- Hosted routes: environment-variable auth only. Never inline a key. ---
+[[providers]]
+id = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "DEEPSEEK_API_KEY" }
+paid = true
+billing = "metered"
+serves = ["deepseek-"]
+# Keep a conservative working window even when the provider advertises more.
+max_context_tokens = 65536
+
+[[providers]]
+id = "minimax"
+base_url = "https://api.minimax.io/v1"
+kind = "openai-chat"
+auth = { type = "env", var = "MINIMAX_API_KEY" }
+paid = true
+billing = "metered"
+serves = ["MiniMax-", "minimax-"]
+max_context_tokens = 131072
+
+# --- Optional local OpenAI-compatible endpoint. ---
+# Uncomment one block and point primary_model at a model it serves. A local
+# route is $0 marginal, so it does not need --allow-paid.
+#
+# [[providers]]
+# id = "local"
+# base_url = "http://localhost:8080/v1"     # llama.cpp default
+# # base_url = "http://localhost:11434/v1"  # Ollama default
+# kind = "openai-chat"
+# auth = { type = "none" }
+# paid = false
+# billing = "free"
+# serves = ["local/"]
+# max_context_tokens = 32768
+
+# --- Context levers. ---
+# Standalone leaves them OFF: they shorten an agent's history, which is a
+# quality trade a single operator does not have to make for a fleet-scale bill.
+# If you enable them, these windows are the conservative starting point.
+[context]
+enabled = false
+
+[context.profiles.deepseek]
+max_context_tokens = 65536
+
+[context.profiles.minimax]
+max_context_tokens = 131072
+
+# --- Conservative cost backstop. ---
+# The pre-call estimate is priced from the pricing catalog: cache-read tokens
+# bill at the catalog's cache rate, cache misses at the input rate, and a
+# provider's busy-hours band is priced from the same source. Caps gate PAID
+# calls only; set them to 0 or remove a cap to disable it. Hosted models are
+# metered, so they also need an explicit `--allow-paid` (there is no persistent
+# config-wide bypass; the caps below are the spend backstop).
+[budget]
+max_cost_per_call_usd = 1.00
+monthly_cap_usd = 50.00
+est_output_tokens = 1024

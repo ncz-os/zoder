@@ -2122,10 +2122,149 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
+/// Which deployment a zoder configuration is for.
+///
+/// This is the GLOBAL deployment profile. It is deliberately separate from
+/// the existing vendor-overlay `[profile]` table (which selects a default
+/// provider) and from `[context] profile` (which the context levers read).
+///
+/// * [`DeploymentMode::Standalone`] (the default) — one operator, one host,
+///   one provider key. Fleet-only assumptions are off unless explicitly
+///   enabled.
+/// * [`DeploymentMode::Fleet`] — a shared, metered deployment. The tuned
+///   fleet defaults apply, and providers/tuning come from the fleet's own
+///   configuration repository.
+///
+/// An absent `[deployment]` table means standalone. The mode is opt-in so a
+/// fresh single-host install is never silently tuned for a fleet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentMode {
+    #[default]
+    Standalone,
+    Fleet,
+}
+
+impl DeploymentMode {
+    /// The context-lever profile this deployment inherits when
+    /// `[context] profile` is unset.
+    pub fn context_profile(self) -> crate::context_opt::ContextProfile {
+        match self {
+            DeploymentMode::Standalone => crate::context_opt::ContextProfile::Standalone,
+            DeploymentMode::Fleet => crate::context_opt::ContextProfile::Fleet,
+        }
+    }
+
+    pub fn is_fleet(self) -> bool {
+        matches!(self, DeploymentMode::Fleet)
+    }
+}
+
+/// `[deployment]` table from `config.json` / an overlay TOML.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentConfig {
+    /// `standalone` (default) or `fleet`.
+    #[serde(default)]
+    pub mode: DeploymentMode,
+}
+
+/// Profile-dependent defaults, resolved through one accessor.
+///
+/// Existing settings live here when their safe default differs between the
+/// two deployments. New fleet-tuned work (context optimisation, cost
+/// accounting, terse I/O, daemon session-cancel) must read its defaults from
+/// this struct rather than hardcoding the fleet's numbers, so a standalone
+/// install keeps the measured fleet behaviour out unless it opts in.
+///
+/// Fleet values are the current behaviour; changing them here would change a
+/// fleet deployment without its config saying so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileDefaults {
+    mode: DeploymentMode,
+}
+
+impl ProfileDefaults {
+    pub fn for_mode(mode: DeploymentMode) -> Self {
+        Self { mode }
+    }
+
+    pub fn mode(self) -> DeploymentMode {
+        self.mode
+    }
+
+    /// Which built-in context-lever profile the deployment defaults to.
+    pub fn context_profile(self) -> crate::context_opt::ContextProfile {
+        self.mode.context_profile()
+    }
+
+    /// Whether agent-facing I/O should be terse by default.
+    ///
+    /// The fleet turns this on to bound output tokens across many concurrent
+    /// jobs; a single operator gets the fuller, more explanatory format.
+    pub fn terse_io(self) -> bool {
+        self.mode.is_fleet()
+    }
+
+    /// Whether zoder assumes one shared daemon for many concurrent jobs.
+    pub fn shared_daemon(self) -> bool {
+        self.mode.is_fleet()
+    }
+
+    /// Whether job workspaces are managed by a fleet job runner.
+    pub fn fleet_job_workspaces(self) -> bool {
+        self.mode.is_fleet()
+    }
+
+    /// Whether update pulling is driven by a fleet channel.
+    pub fn fleet_pull_updates(self) -> bool {
+        self.mode.is_fleet()
+    }
+
+    /// Budget for the ACP `session/cancel` handshake before the reaper starts
+    /// killing. Fleet keeps the tuned 750 ms; a standalone host can afford a
+    /// longer settle window.
+    pub fn daemon_cancel_budget_ms(self) -> u64 {
+        match self.mode {
+            DeploymentMode::Standalone => 1500,
+            DeploymentMode::Fleet => 750,
+        }
+    }
+
+    /// Default monthly spend backstop for a fresh standalone install. Fleet
+    /// deployments leave this unset because their own config repository sets
+    /// the fleet-wide caps.
+    pub fn cost_backstop_monthly_usd(self) -> Option<f64> {
+        match self.mode {
+            DeploymentMode::Standalone => Some(50.0),
+            DeploymentMode::Fleet => None,
+        }
+    }
+
+    /// Default per-provider reviewer concurrency. Zero means unlimited; the
+    /// fleet sets explicit slots through `ZODER_PROVIDER_CONCURRENCY` so no
+    /// provider-id list is baked into the public tree.
+    pub fn provider_concurrency_default(self) -> usize {
+        match self.mode {
+            DeploymentMode::Standalone | DeploymentMode::Fleet => 0,
+        }
+    }
+
+    /// Whether a secondary reviewer pool is a fleet default. The pool remains
+    /// opt-in on both profiles via `--reviewer-pool-routes`.
+    pub fn reviewer_pool_default(self) -> bool {
+        self.mode.is_fleet()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub providers: Vec<Provider>,
+    /// Global deployment profile. Absent means standalone; see
+    /// [`DeploymentMode`] and [`ProfileDefaults`].
+    #[serde(default)]
+    pub deployment: DeploymentConfig,
     /// Default provider id for routed (`auto`) requests.
     pub default_provider: String,
     pub corpus_path: PathBuf,
@@ -2371,7 +2510,10 @@ impl ContextConfig {
             && self.default_profile.is_none()
     }
 
-    /// The deployment profile the defaults are gated on.
+    /// The context profile when the caller has no global deployment profile
+    /// in hand. An explicit `[context] profile` wins, otherwise standalone
+    /// (the global default). Production callers should prefer
+    /// [`Config::context_profile`], which folds in `[deployment] mode`.
     pub fn deployment_profile(&self) -> crate::context_opt::ContextProfile {
         self.profile
             .unwrap_or(crate::context_opt::ContextProfile::Standalone)
@@ -2380,21 +2522,33 @@ impl ContextConfig {
     /// Whether the levers apply, given the deployment profile's default and
     /// an explicit override.
     pub fn levers_enabled(&self) -> bool {
-        self.enabled
-            .unwrap_or_else(|| self.deployment_profile().default_enabled())
+        self.levers_enabled_with(self.deployment_profile())
     }
 
-    /// Resolve the levers for `model`. Returns `None` when the levers are
-    /// off, so a caller cannot apply a half-configured lever set by accident.
+    /// [`Self::levers_enabled`] for an explicitly supplied deployment profile.
+    pub fn levers_enabled_with(&self, profile: crate::context_opt::ContextProfile) -> bool {
+        self.enabled.unwrap_or_else(|| profile.default_enabled())
+    }
+
+    /// Resolve the levers for `model` using this block's own profile. Returns
+    /// `None` when the levers are off.
+    pub fn levers_for(&self, model: &str) -> Option<crate::context_opt::Levers> {
+        self.levers_for_with(self.deployment_profile(), model)
+    }
+
+    /// Resolve the levers for `model` under an explicit deployment profile.
     ///
     /// Matching is by lower-case substring on the model id, longest key first,
     /// so `deepseek-v4-flash` matches a `deepseek` profile regardless of the
     /// provider namespace in front of it (`azure_ai/FW-DeepSeek-V4-Flash`).
-    pub fn levers_for(&self, model: &str) -> Option<crate::context_opt::Levers> {
-        if !self.levers_enabled() {
+    pub fn levers_for_with(
+        &self,
+        profile: crate::context_opt::ContextProfile,
+        model: &str,
+    ) -> Option<crate::context_opt::Levers> {
+        if !self.levers_enabled_with(profile) {
             return None;
         }
-        let profile = self.deployment_profile();
         let needle = model.to_ascii_lowercase();
         let mut keys: Vec<&String> = self.profiles.keys().collect();
         // Longest key first: a future `deepseek-v4` entry beats `deepseek`.
@@ -3120,6 +3274,44 @@ impl Config {
         Self::resolve_home().unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".zoder"))
     }
 
+    /// The global deployment profile. Absent `[deployment]` means standalone.
+    pub fn deployment_profile(&self) -> DeploymentMode {
+        self.deployment.mode
+    }
+
+    /// Profile-dependent defaults, resolved through the one global mode.
+    pub fn profile_defaults(&self) -> ProfileDefaults {
+        ProfileDefaults::for_mode(self.deployment.mode)
+    }
+
+    /// The context-lever profile in effect: an explicit `[context] profile`
+    /// wins, otherwise the global deployment profile decides.
+    pub fn context_profile(&self) -> crate::context_opt::ContextProfile {
+        self.context
+            .profile
+            .unwrap_or_else(|| self.deployment_profile().context_profile())
+    }
+
+    /// Resolve the context levers for `model` through the global deployment
+    /// profile. This is the production entry point; `ContextConfig::levers_for`
+    /// remains available for a caller that already resolved its profile.
+    pub fn context_levers_for(&self, model: &str) -> Option<crate::context_opt::Levers> {
+        self.context.levers_for_with(self.context_profile(), model)
+    }
+
+    /// Make `[context] profile` inherit the global deployment profile when it
+    /// was not set explicitly.
+    ///
+    /// Called by every on-disk load. Only a FLEET deployment writes the
+    /// inherited value, because standalone is already the default; this keeps
+    /// an absent `[context]` block out of a standalone config's serialized
+    /// form. An explicit `[context] profile` is never overwritten.
+    pub fn apply_profile_defaults(&mut self) {
+        if self.context.profile.is_none() && self.deployment.mode.is_fleet() {
+            self.context.profile = Some(self.deployment.mode.context_profile());
+        }
+    }
+
     /// Resolve the config home from the real environment, failing LOUD when
     /// it cannot be trusted. This is the guard behind [`Config::load`]: an
     /// empty `ZODER_HOME`, or an absent home directory with `ZODER_HOME`
@@ -3228,6 +3420,7 @@ impl Config {
             Self::default_provider(home)
         };
         apply_overlays(&mut cfg, home)?;
+        cfg.apply_profile_defaults();
         Ok(cfg)
     }
 
@@ -3418,6 +3611,7 @@ impl Config {
         let home = Self::home();
         let mut cfg = Self::default_provider(&home);
         apply_overlays_filtered(&mut cfg, &home, Some(vendor))?;
+        cfg.apply_profile_defaults();
         let problems = cfg.validate();
         if !problems.is_empty() {
             anyhow::bail!(
@@ -3482,6 +3676,7 @@ impl Config {
                 azure_api_version: None,
                 max_context_tokens: None,
             }],
+            deployment: DeploymentConfig::default(),
             default_provider: "default".into(),
             corpus_path: home.join("model_corpus.json"),
             ledger_path: home.join("ledger.jsonl"),
@@ -4178,6 +4373,18 @@ pub struct VendorOverlay {
     /// `default = true` is a hard load error.
     #[serde(default)]
     pub profile: VendorProfile,
+    /// Global deployment profile selected by this overlay. A later overlay
+    /// (alphabetical) wins; fleet overlays should set `mode = "fleet"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentConfig>,
+    /// Context-lever block contributed by this overlay. Replaces the base
+    /// block when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+    /// Pre-call spend caps contributed by this overlay. Replaces the base
+    /// block when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::budget::Budget>,
     /// Providers contributed by this overlay. Each becomes a routable
     /// `Provider` in the merged `Config.providers`.
     #[serde(default)]
@@ -4447,6 +4654,15 @@ fn apply_overlays_filtered(
                 .push(p.id.clone());
             cfg.providers.push(p.clone());
         }
+        if let Some(deployment) = overlay.deployment {
+            cfg.deployment = deployment;
+        }
+        if let Some(context) = &overlay.context {
+            cfg.context = context.clone();
+        }
+        if let Some(budget) = &overlay.budget {
+            cfg.budget = budget.clone();
+        }
         if let Some(review) = &overlay.review {
             merge_review_config(&mut cfg.review, review);
         }
@@ -4654,9 +4870,20 @@ fn collect_overlays(
                 continue;
             }
         };
-        if overlay.providers.is_empty() && !overlay.profile.default {
+        // A profile-only overlay is meaningful now: `[deployment]`,
+        // `[context]`, `[budget]` and `[review]` can all be set without adding
+        // a provider (the fleet deployment template does exactly that). An
+        // entirely empty file is still almost certainly a half-finished
+        // template, so keep rejecting that.
+        let profile_only = overlay.deployment.is_some()
+            || overlay.context.is_some()
+            || overlay.budget.is_some()
+            || overlay.review.is_some()
+            || overlay.theme.is_some()
+            || !overlay.health.is_empty();
+        if overlay.providers.is_empty() && !overlay.profile.default && !profile_only {
             anyhow::bail!(
-                "{} contributes no [[providers]] and no [profile].default; either add providers or remove the file",
+                "{} contributes no [[providers]], [deployment], [context], [budget] or [profile].default; either add configuration or remove the file",
                 path.display()
             );
         }
