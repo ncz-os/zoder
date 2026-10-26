@@ -92,7 +92,10 @@ named by its imports. A disproved finding is removed from `findings` and
 recorded in `filtered_findings` with its symbol, reason, and evidence line. A
 lone blocking finding of this kind becomes `comment`, not `approve`, because
 disproving a finding is not proof that the change is correct. Findings without
-source evidence remain unchanged.
+source evidence remain unchanged. Missing or rejected CLI options are disproved only
+by exact positional string literals in `add_argument`, `add_option`, or
+`click.option` calls in the same file. Help text, comments, and longer option
+names are not evidence, and every claimed symbol or option must be disproved.
 
 The regression fixtures cover both sides: a constant defined in an earlier
 chunk is supplied to the later chunk and is filtered if falsely reported, while

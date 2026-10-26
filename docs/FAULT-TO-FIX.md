@@ -19,6 +19,7 @@ route or fallback in the fleet configuration points at goose.
 
 | Symptom | Root cause | Fix | Test |
 |---|---|---|---|
+| Review retained false missing-function/import and CLI-option findings in long Python modules | Textual line suffixes stayed in the path.<br>Claim-adjacent prose became extra symbols; claim phrases were incomplete.<br>CLI option definitions had no evidence lookup. | `e65282d`, `78ac796` | `finding_location_path_drops_only_trailing_line_specs`, `gap_long_module_definition`, `gap_receipt_option`, `gap_rglob_definition`, `gap_prose_is_not_a_symbol`, `gap_false_undefined_findings_end_to_end`, `option_definitions_require_exact_positional_literals`, `every_unquoted_claimed_name_must_be_disproved` |
 | Review of a split diff panicked on a multibyte character before `(` | `c_style_def` sliced at a byte index mid-codepoint | `0a05a80` | `c_style_def_handles_multibyte_before_paren`, `split_diff_with_multibyte_definition_does_not_panic` |
 | Deleted files could not be excluded and split labels were empty | `section_path` fed `+++ /dev/null` to the path cleaner | `0a05a80` | `deleted_file_path_falls_back_to_preimage`, `deleted_file_is_excludable_and_appears_in_diff_map` |
 | A branch adding a `*` `.zoderignore` hid itself and was approved | empty-after-exclusion diff reviewed as one empty chunk; ignore file read from the changed tree | `0a05a80` | `self_hiding_zoderignore_star_is_detected_as_emptied`, `zoderignore_is_read_from_a_revision_for_base_scopes` |
