@@ -162,7 +162,10 @@ impl Volatile {
 
     /// Every volatile value, as strings, for the leak check.
     pub fn values(&self) -> Vec<String> {
-        self.checkable_values().into_iter().map(|(v, _)| v).collect()
+        self.checkable_values()
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect()
     }
 
     /// The values worth searching for, each with whether it is a bare number.
@@ -245,7 +248,10 @@ fn find_token(text: &str, needle: &str) -> Option<usize> {
         // the tail of a longer number.
         let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         let end = at + needle.len();
-        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_digit();
+        // A letter after the number makes it part of an identifier (`1abc`,
+        // `3d`), exactly as a letter before it does: a match must be a whole
+        // numeric token, so both sides are checked for alphanumerics.
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return Some(at);
         }
@@ -292,11 +298,7 @@ pub fn check_stability(prefix: &Prefix, volatile: &Volatile) -> Stability {
 
 /// Check an assembled first message: any volatile value appearing before the
 /// prefix ends is a cache break, wherever the caller put it.
-pub fn check_message_stability(
-    prefix: &Prefix,
-    message: &str,
-    volatile: &Volatile,
-) -> Stability {
+pub fn check_message_stability(prefix: &Prefix, message: &str, volatile: &Volatile) -> Stability {
     check_text_stability(message, prefix.max_volatile_offset(), volatile)
 }
 
@@ -357,16 +359,24 @@ mod tests {
             .with_tool("a", "{}")
             .with_tool("b", "{}")
             .render();
-        assert_eq!(a, b, "tools must serialize in name order, not insertion order");
+        assert_eq!(
+            a, b,
+            "tools must serialize in name order, not insertion order"
+        );
         // Pin the exact layout: a literal, so a change to the markers or the
         // separator fails here rather than silently changing the cache key.
         assert_eq!(
-            a,
-            "[zoder-prefix:system v1]\nsys\n[zoder-prefix:tools v1]\na\t{}\nb\t{}\n",
+            a, "[zoder-prefix:system v1]\nsys\n[zoder-prefix:tools v1]\na\t{}\nb\t{}\n",
             "the prefix layout is part of the cache key and must not drift"
         );
         // Repeated rendering is stable.
-        assert_eq!(a, Prefix::new("sys").with_tool("a", "{}").with_tool("b", "{}").render());
+        assert_eq!(
+            a,
+            Prefix::new("sys")
+                .with_tool("a", "{}")
+                .with_tool("b", "{}")
+                .render()
+        );
     }
 
     #[test]
@@ -480,7 +490,10 @@ mod tests {
         match check_stability(&leaky, &volatile) {
             Stability::Leaked { value, offset } => {
                 assert!(value.starts_with("/home/jasonperlow"));
-                assert!(offset > leaky.tools_offset(), "the leak is in the schema block");
+                assert!(
+                    offset > leaky.tools_offset(),
+                    "the leak is in the schema block"
+                );
             }
             Stability::Stable => panic!("a cwd in a tool schema must be caught"),
         }
@@ -582,6 +595,32 @@ mod tests {
         }
         // A real standalone occurrence is.
         assert!(!check_stability(&Prefix::new("iteration 1 of the loop"), &volatile).is_stable());
+    }
+
+    #[test]
+    fn an_iteration_digit_glued_to_a_letter_is_not_a_leak() {
+        // The mirror of the case above: a digit followed by a letter is part of
+        // an identifier (`crate1name`, `2bit`, `3d`, `x1y`), not a standalone
+        // iteration number. Checking only for a following digit let "1" in
+        // "step1log" through as a leak.
+        let volatile = Volatile {
+            iteration: Some(1),
+            ..Default::default()
+        };
+        for text in ["step1log", "2bit codec", "3d renderer", "x1y", "1a"] {
+            assert!(
+                check_stability(&Prefix::new(text), &volatile).is_stable(),
+                "{text} is not evidence of an iteration leak"
+            );
+        }
+        // A standalone number in the same position still is, so the tighter
+        // check did not simply stop matching.
+        for text in ["iteration 1", "iter 1.", "iter 1, then", "iter 1"] {
+            assert!(
+                !check_stability(&Prefix::new(text), &volatile).is_stable(),
+                "{text} is a standalone iteration leak"
+            );
+        }
     }
 
     #[test]

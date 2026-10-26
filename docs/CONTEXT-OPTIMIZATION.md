@@ -152,6 +152,24 @@ Two contract violations found in review are fixed and pinned:
   one level deeper on every pass; a test asserts that a second pass leaves
   exactly one digest, byte-identical.
 
+A third, found in the next review round and fixed:
+
+- **A digest inside the `keep_recent` window is never absorbed.** The contract
+  says the last `keep_recent` turns are never folded, and a digest is a turn
+  like any other. The code used to scan the *whole* conversation for existing
+  digests to carry forward, then filter every digest out of the assembled
+  conversation — so a digest that happened to sit in the verbatim window was
+  deleted and reduced to a rebuilt summary line at the front. Now only digests
+  inside the foldable span are absorbed, and the tail is reproduced byte for
+  byte. Two tests pin it: an all-in-window conversation comes back unchanged,
+  and a tail digest survives a pass that folds earlier turns.
+
+The extractor is also byte-safe on non-ASCII input: `strip_todo_tail` verifies
+the marker offset against the original string's char boundaries instead of
+trusting the offset from the ASCII-lowercased copy, and `squash` cuts a
+leading word that exceeds the budget (a long path or URL, the case a digest
+most needs to name) instead of returning a bare `"..."` and losing it.
+
 **Thresholds:** 48 K tokens for DeepSeek — the measured loop averaged a ~28 K
 prompt before its first edit, and 48 K is 1.7x that: high enough that a
 legitimately large single-file task is never folded, low enough that a 128 K
