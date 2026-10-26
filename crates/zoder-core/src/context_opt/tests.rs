@@ -70,7 +70,11 @@ fn a_silent_provider_never_claims_a_hit_share() {
         ..t
     };
     assert_eq!(
-        classify(ProviderCacheShape::Split, &reported, DEFAULT_CACHE_HIT_FLOOR),
+        classify(
+            ProviderCacheShape::Split,
+            &reported,
+            DEFAULT_CACHE_HIT_FLOOR
+        ),
         CacheVerdict::PrefixBreak
     );
 }
@@ -109,10 +113,8 @@ fn cost_bills_the_cached_tokens_once_at_the_cache_rate() {
         reported_cache_miss: None,
     };
     let cost = t.cost_usd(0.003, 0.15, 0.60);
-    let expected = (10_484_400_000f64 * 0.003
-        + 115_600_000f64 * 0.15
-        + 50_100_000f64 * 0.60)
-        / 1_000_000.0;
+    let expected =
+        (10_484_400_000f64 * 0.003 + 115_600_000f64 * 0.15 + 50_100_000f64 * 0.60) / 1_000_000.0;
     assert!((cost - expected).abs() < 1e-6, "{cost} vs {expected}");
     // Never more than charging every token at the input rate.
     assert!(cost < t.cost_usd(0.15, 0.15, 0.60));
@@ -265,8 +267,12 @@ fn a_tiny_cap_cannot_produce_a_stub_that_dropped_nothing() {
     assert!(capped.content.contains(ELISION_MARKER));
     // The stub names the cap actually in force (MIN_CAP_BYTES, or the input
     // length if that is smaller), never the impossible one requested.
-    assert!(capped.content.contains(&format!("cap of {MIN_CAP_BYTES} bytes")),
-        "stub names the applied cap");
+    assert!(
+        capped
+            .content
+            .contains(&format!("cap of {MIN_CAP_BYTES} bytes")),
+        "stub names the applied cap"
+    );
     let omitted: u64 = capped
         .content
         .split(ELISION_MARKER)
@@ -326,7 +332,10 @@ fn elision_replaces_old_large_tool_outputs_only() {
     let n = elide_stale(&mut turns, 2, 2_048);
     assert_eq!(n, 1, "only the old tool result is elided");
     assert!(is_elided(&turns[1]));
-    assert!(turns[1].content.contains("old.rs"), "re-read reference kept");
+    assert!(
+        turns[1].content.contains("old.rs"),
+        "re-read reference kept"
+    );
     assert!(turns[1].content.contains("5000 bytes"));
     assert!(!is_elided(&turns[3]), "the recent turn stays verbatim");
     assert_eq!(turns[0].content, "prefix");
@@ -427,7 +436,12 @@ fn compaction_folds_old_turns_and_keeps_the_recent_ones_verbatim() {
 fn the_digest_names_files_decisions_and_todos() {
     let turns = conversation(60, 4_000);
     let out = compact(&turns, 48_000, 6, 64, 40);
-    let digest = &out.turns.iter().find(|t| is_digest(t)).expect("a digest").content;
+    let digest = &out
+        .turns
+        .iter()
+        .find(|t| is_digest(t))
+        .expect("a digest")
+        .content;
     assert!(digest.contains("Files touched:"), "{digest}");
     assert!(digest.contains("src/f0.rs"));
     assert!(digest.contains("Decisions:"));
@@ -452,7 +466,10 @@ fn compaction_twice_keeps_exactly_one_digest() {
     );
     let once_digest = once.turns.iter().find(|t| is_digest(t)).unwrap();
     let twice_digest = twice.turns.iter().find(|t| is_digest(t)).unwrap();
-    assert_eq!(twice_digest.content, once_digest.content, "unchanged digest");
+    assert_eq!(
+        twice_digest.content, once_digest.content,
+        "unchanged digest"
+    );
     // The pinned head and the verbatim tail are untouched by the second pass.
     assert_eq!(twice.turns[0].content, once.turns[0].content);
     assert_eq!(twice.turns[1].content, once.turns[1].content);
@@ -461,16 +478,27 @@ fn compaction_twice_keeps_exactly_one_digest() {
 #[test]
 fn a_carried_digest_keeps_its_files_and_todos() {
     let mut turns = conversation(20, 4_000);
-    turns.push(Turn::new("system", digest_for(&["src/deep.rs"], &["TODO: audit"])));
+    turns.push(Turn::new(
+        "system",
+        digest_for(&["src/deep.rs"], &["TODO: audit"]),
+    ));
     for i in 0..30 {
         let name = format!("src/new{i}.rs");
-        let body = format!("diff --git a/{name} b/{name}\n+++ b/{name}\n{}", "m".repeat(4_000));
+        let body = format!(
+            "diff --git a/{name} b/{name}\n+++ b/{name}\n{}",
+            "m".repeat(4_000)
+        );
         turns.push(Turn::tool_result(&name, body));
         turns.push(Turn::new("assistant", "We must keep going."));
     }
     // A wide cap so the carried-vs-new distinction is not masked by truncation.
     let out = compact(&turns, 48_000, 6, 256, 256);
-    let digest = &out.turns.iter().find(|t| is_digest(t)).expect("a digest").content;
+    let digest = &out
+        .turns
+        .iter()
+        .find(|t| is_digest(t))
+        .expect("a digest")
+        .content;
     assert_eq!(out.turns.iter().filter(|t| is_digest(t)).count(), 1);
     assert!(digest.contains("src/deep.rs"), "carried file: {digest}");
     assert!(digest.contains("TODO: audit"), "carried todo: {digest}");
@@ -504,10 +532,16 @@ fn carrying_a_digest_does_not_inflate_the_reported_span() {
     // the conversation. Adding them to the fresh counts makes the header claim
     // more than this pass saw, unbounded across passes.
     let mut turns = conversation(20, 4_000);
-    turns.push(Turn::new("system", digest_for_count(&["src/deep.rs"], 100, 900_000)));
+    turns.push(Turn::new(
+        "system",
+        digest_for_count(&["src/deep.rs"], 100, 900_000),
+    ));
     for i in 0..30 {
         let name = format!("src/new{i}.rs");
-        let body = format!("diff --git a/{name} b/{name}\n+++ b/{name}\n{}", "m".repeat(4_000));
+        let body = format!(
+            "diff --git a/{name} b/{name}\n+++ b/{name}\n{}",
+            "m".repeat(4_000)
+        );
         turns.push(Turn::tool_result(&name, body));
         turns.push(Turn::new("assistant", "We must keep going."));
     }
@@ -532,15 +566,11 @@ fn carrying_a_digest_does_not_inflate_the_reported_span() {
 fn repeated_passes_do_not_grow_the_digest_header() {
     let turns = conversation(120, 4_000);
     let first = compact(&turns, 48_000, 6, 256, 256);
-    let d1 = digest_from_render(
-        &first.turns.iter().find(|t| is_digest(t)).unwrap().content,
-    );
+    let d1 = digest_from_render(&first.turns.iter().find(|t| is_digest(t)).unwrap().content);
     let mut second_in = first.turns.clone();
     second_in.push(Turn::new("assistant", "z".repeat(200_000)));
     let second = compact(&second_in, 1, 6, 256, 256);
-    let d2 = digest_from_render(
-        &second.turns.iter().find(|t| is_digest(t)).unwrap().content,
-    );
+    let d2 = digest_from_render(&second.turns.iter().find(|t| is_digest(t)).unwrap().content);
     assert!(
         d2.turns <= d1.turns + 2,
         "a second pass must not inflate the count: {} -> {}",
@@ -587,10 +617,7 @@ fn a_short_conversation_with_nothing_foldable_is_unchanged() {
 
 #[test]
 fn the_brief_is_never_folded() {
-    let mut turns = vec![
-        Turn::new("system", "s"),
-        Turn::new("user", "THE BRIEF"),
-    ];
+    let mut turns = vec![Turn::new("system", "s"), Turn::new("user", "THE BRIEF")];
     for _ in 0..60 {
         turns.push(Turn::new("assistant", "y".repeat(4_000)));
     }
@@ -627,20 +654,147 @@ fn squash_never_exceeds_its_budget() {
 }
 
 #[test]
-fn a_digest_in_the_verbatim_tail_is_absorbed_not_duplicated() {
+fn a_leading_word_longer_than_the_budget_is_cut_not_dropped() {
+    // A digest line whose first token is a long path or URL is the informative
+    // case: the old loop broke before writing anything and returned "...", so
+    // the file the agent had to re-read was lost from the digest entirely.
+    let path = format!("/home/jperlow/{}/src/main.rs", "deep/".repeat(60));
+    let out = squash(&format!("{path} changed because the buffer overflowed"));
+    assert!(out.len() <= SQUASH_MAX, "{} bytes", out.len());
+    assert!(out.starts_with("/home/jperlow/"), "the path is kept: {out}");
+    assert!(out.ends_with("..."), "{out}");
+    // Multi-byte leading word: cut on a char boundary, never mid-character.
+    let jp = squash(&format!("{} の説明", "日本語".repeat(100)));
+    assert!(jp.len() <= SQUASH_MAX);
+    assert!(jp.starts_with("日本語"));
+    assert!(jp.ends_with("..."));
+    // A normal sentence still stops at a word boundary.
+    let words = squash(&format!("first {} tail", "word ".repeat(100)));
+    assert!(words.starts_with("first word"));
+    assert!(words.len() <= SQUASH_MAX);
+}
+
+#[test]
+fn strip_todo_tail_handles_non_ascii_and_byte_aligned_markers() {
+    // `to_ascii_lowercase` is 1:1 on bytes, but the slice must still be on a
+    // char boundary of the ORIGINAL string; a multi-byte sentence before the
+    // marker used to be a panic path.
+    assert_eq!(
+        strip_todo_tail("Decided to clamp 日本語 here. TODO: rerun"),
+        "Decided to clamp 日本語 here"
+    );
+    assert_eq!(
+        strip_todo_tail("We will ship 😀 it FIXME: later"),
+        "We will ship 😀 it"
+    );
+    // A marker at index 0 is not a trailing clause.
+    assert_eq!(strip_todo_tail("TODO: everything"), "TODO: everything");
+    // Nothing to strip.
+    assert_eq!(strip_todo_tail("no marker here"), "no marker here");
+}
+
+#[test]
+fn a_multibyte_decision_line_folds_without_panicking() {
+    // Whole-path check: a conversation of CJK/emoji assistant lines goes
+    // through digest_turns (squash + strip_todo_tail) and produces files.
+    let mut turns = conversation(6, 2_000);
+    for i in 0..4 {
+        turns.push(Turn::new(
+            "assistant",
+            format!("決定 {i}: 境界でクランプする必要があります because 丸め. TODO: 再実行"),
+        ));
+    }
+    let out = compact(&turns, 1_000, 2, 64, 40);
+    assert!(out.folded > 0);
+    let digest = out.turns.iter().find(|t| is_digest(t)).expect("a digest");
+    assert!(digest.content.contains("Decisions:") || digest.content.contains("Open todos:"));
+}
+
+#[test]
+fn a_digest_in_the_verbatim_tail_stays_verbatim_instead_of_vanishing() {
     // keep_recent large enough that an existing digest lands in the tail.
+    // The tail is the agent's live window: a digest sitting there is a real
+    // turn in the conversation and must survive, not be absorbed and filtered
+    // out (the pre-fix code deleted it, leaving only a rebuilt summary line).
     let mut turns = conversation(30, 4_000);
-    turns.push(Turn::new("system", digest_for(&["src/tail.rs"], &["TODO: tail"])));
+    turns.push(Turn::new(
+        "system",
+        digest_for(&["src/tail.rs"], &["TODO: tail"]),
+    ));
     for i in 0..10 {
         let name = format!("src/t{i}.rs");
-        let body = format!("diff --git a/{name} b/{name}\n+++ b/{name}\n{}", "m".repeat(4_000));
+        let body = format!(
+            "diff --git a/{name} b/{name}\n+++ b/{name}\n{}",
+            "m".repeat(4_000)
+        );
         turns.push(Turn::tool_result(&name, body));
     }
     let out = compact(&turns, 1, 100, 256, 256);
-    let digests = out.turns.iter().filter(|t| is_digest(t)).count();
-    assert_eq!(digests, 1, "exactly one digest after absorption");
-    let d = digest_from_render(&out.turns.iter().find(|t| is_digest(t)).unwrap().content);
-    assert!(d.files.iter().any(|f| f == "src/tail.rs"), "tail digest carried");
+    // Nothing was foldable (the whole conversation is inside keep_recent), so
+    // the conversation comes back byte for byte.
+    assert_eq!(out.folded, 0);
+    assert_eq!(out.turns, turns, "the verbatim window is untouched");
+}
+
+#[test]
+fn a_tail_digest_survives_a_compaction_that_folds_earlier_turns() {
+    // keep_recent window starts BEFORE the tail digest, so the turns folded are
+    // all earlier; the digest plus the turns after it are the verbatim tail.
+    let mut turns = conversation(20, 4_000);
+    turns.push(Turn::new(
+        "system",
+        digest_for(&["src/tail.rs"], &["TODO: tail"]),
+    ));
+    for i in 0..6 {
+        let name = format!("src/t{i}.rs");
+        let body = format!(
+            "diff --git a/{name} b/{name}\n+++ b/{name}\n{}",
+            "m".repeat(4_000)
+        );
+        turns.push(Turn::tool_result(&name, body));
+    }
+    let keep = 8; // the digest + the 6 turns after it + one more
+    let out = compact(&turns, 1_000, keep, 256, 256);
+    assert!(out.folded > 0, "the earlier turns were folded");
+    let tail = &out.turns[out.turns.len() - keep..];
+    assert_eq!(
+        tail,
+        &turns[turns.len() - keep..],
+        "tail verbatim, digest included"
+    );
+    assert!(
+        out.turns.iter().filter(|t| is_digest(t)).count() >= 1,
+        "a digest is still present"
+    );
+    assert!(
+        out.turns.iter().any(|t| t.content.contains("src/tail.rs")),
+        "the tail digest's content was not lost"
+    );
+}
+
+#[test]
+fn two_passes_over_a_tail_digest_do_not_duplicate_it() {
+    // Idempotency still holds after the tail fix: folding the same span twice
+    // leaves one digest in the head, and the tail is still byte-identical.
+    let mut turns = conversation(20, 4_000);
+    turns.push(Turn::new(
+        "system",
+        digest_for(&["src/tail.rs"], &["TODO: tail"]),
+    ));
+    for i in 0..6 {
+        let name = format!("src/t{i}.rs");
+        let body = format!(
+            "diff --git a/{name} b/{name}\n+++ b/{name}\n{}",
+            "m".repeat(4_000)
+        );
+        turns.push(Turn::tool_result(&name, body));
+    }
+    let once = compact(&turns, 1_000, 8, 256, 256);
+    let twice = compact(&once.turns, 1_000, 8, 256, 256);
+    assert_eq!(
+        twice.turns, once.turns,
+        "a second pass over an already-compacted conversation changes nothing"
+    );
 }
 
 #[test]
@@ -720,10 +874,17 @@ fn a_conversation_shrunk_below_the_threshold_is_not_compacted() {
                 }
             })
             .collect();
-        elide_stale(&mut v, Levers::DEEPSEEK.elide_after_turns, Levers::DEEPSEEK.elide_min_bytes);
+        elide_stale(
+            &mut v,
+            Levers::DEEPSEEK.elide_after_turns,
+            Levers::DEEPSEEK.elide_min_bytes,
+        );
         v
     };
-    let tokens: u64 = capped_and_elided.iter().map(|t| estimate_tokens(t.bytes())).sum();
+    let tokens: u64 = capped_and_elided
+        .iter()
+        .map(|t| estimate_tokens(t.bytes()))
+        .sum();
     if tokens <= Levers::DEEPSEEK.compact_after_tokens {
         assert_eq!(out.folded, 0, "under the threshold after caps/elision");
     }

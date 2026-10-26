@@ -159,7 +159,9 @@ impl CacheTelemetry {
         // The exclusive remainder, not the reported figure: `prompt - hit` is
         // exactly the part of the prompt the cache did not serve.
         let miss = self.prompt_tokens.saturating_sub(hit);
-        (hit as f64 * hit_rate + miss as f64 * miss_rate + self.completion_tokens as f64 * output_rate)
+        (hit as f64 * hit_rate
+            + miss as f64 * miss_rate
+            + self.completion_tokens as f64 * output_rate)
             / 1_000_000.0
     }
 }
@@ -185,11 +187,7 @@ pub enum CacheVerdict {
 pub const DEFAULT_CACHE_HIT_FLOOR: f64 = 0.98;
 
 /// Classify one call's cache behaviour.
-pub fn classify(
-    shape: ProviderCacheShape,
-    t: &CacheTelemetry,
-    floor: f64,
-) -> CacheVerdict {
+pub fn classify(shape: ProviderCacheShape, t: &CacheTelemetry, floor: f64) -> CacheVerdict {
     if shape == ProviderCacheShape::None || t.prompt_tokens == 0 {
         return CacheVerdict::Unknown;
     }
@@ -538,7 +536,11 @@ pub fn digest_turns(turns: &[Turn], max_files: usize, max_lines: usize) -> Diges
                 push(&mut digest.open_todos, &squash(t), max_lines);
             }
             if turn.role == "assistant" && is_decision_line(&lower) {
-                push(&mut digest.decisions, &squash(&strip_todo_tail(t)), max_lines);
+                push(
+                    &mut digest.decisions,
+                    &squash(&strip_todo_tail(t)),
+                    max_lines,
+                );
             }
         }
     }
@@ -547,12 +549,21 @@ pub fn digest_turns(turns: &[Turn], max_files: usize, max_lines: usize) -> Diges
 
 /// Drop a trailing "TODO: …" clause from a decision sentence so the same text
 /// is not recorded as both a decision and an open todo.
+///
+/// `to_ascii_lowercase` maps bytes 1:1 (A-Z only) so an index found in `lower`
+/// IS a valid index in `s` — but only if `s` is not sliced on a byte inside a
+/// multi-byte character that happens to share a byte with a marker. The index is
+/// re-validated against `s` itself rather than trusted: a marker match that does
+/// not land on a char boundary of the ORIGINAL string is skipped, so a CJK or
+/// emoji sentence before the marker can never panic the fold.
 fn strip_todo_tail(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     for marker in ["todo:", "todo ", "fixme:", "fixme "] {
         if let Some(i) = lower.find(marker) {
-            if i > 0 {
-                return s[..i].trim_end_matches([' ', '.', ',', ';', '-']).to_string();
+            if i > 0 && s.is_char_boundary(i) {
+                return s[..i]
+                    .trim_end_matches([' ', '.', ',', ';', '-'])
+                    .to_string();
             }
         }
     }
@@ -565,12 +576,30 @@ const SQUASH_MAX: usize = 160;
 /// Collapse whitespace and bound a line to [`SQUASH_MAX`] bytes on a char
 /// boundary. The ellipsis is reserved out of the budget, so the result never
 /// exceeds the cap.
+///
+/// The FIRST word is allowed to overflow the budget into the cut branch: a line
+/// that begins with a long path or URL (`/home/x/very/long/…`, a diff header) is
+/// the informative case, and the pre-fix loop broke before writing anything and
+/// returned just `"..."`, silently dropping exactly the file the digest needed
+/// to name for the agent to re-read it.
 fn squash(s: &str) -> String {
     let mut out = String::with_capacity(SQUASH_MAX.min(s.len()));
     let budget = SQUASH_MAX - 3; // room for "..."
     for w in s.split_whitespace() {
         let extra = if out.is_empty() { w.len() } else { w.len() + 1 };
         if out.len() + extra > budget {
+            if !out.is_empty() {
+                out.push_str("...");
+                break;
+            }
+            // A single leading word longer than the budget is cut, not dropped.
+            let cut = floor_char_boundary(w, budget);
+            if cut == 0 {
+                // Not even the ellipsis fits a one-character word: the line is
+                // whitespace and the ellipsis alone.
+                continue;
+            }
+            out.push_str(&w[..cut]);
             out.push_str("...");
             break;
         }
@@ -578,15 +607,6 @@ fn squash(s: &str) -> String {
             out.push(' ');
         }
         out.push_str(w);
-    }
-    // A single word longer than the budget is cut, not dropped.
-    if out.is_empty() && !s.trim().is_empty() {
-        let mut cut = budget.min(s.trim().len());
-        while cut > 0 && !s.trim().is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.push_str(&s.trim()[..cut]);
-        out.push_str("...");
     }
     out
 }
@@ -624,7 +644,9 @@ fn is_decision_line(lower: &str) -> bool {
         "plan:",
     ];
     let padded = format!(" {lower} ");
-    PHRASES.iter().any(|k| padded.contains(k)) || lower.starts_with("will ") || lower.ends_with(" must")
+    PHRASES.iter().any(|k| padded.contains(k))
+        || lower.starts_with("will ")
+        || lower.ends_with(" must")
 }
 
 /// Result of one compaction pass.
@@ -643,15 +665,18 @@ pub struct Compacted {
 ///
 /// Contract:
 /// * the LAST `keep_recent` turns are never folded (the agent needs the live
-///   tool results it is editing against);
-/// * a system turn, a digest, or the first user turn (the brief) is never
-///   folded — the brief is the task, and losing it is how a loop forgets what
-///   it was asked to do;
+///   tool results it is editing against), and are reproduced byte for byte —
+///   including a digest that happens to sit in that window;
+/// * a system turn or the first user turn (the brief) is never folded — the
+///   brief is the task, and losing it is how a loop forgets what it was asked
+///   to do;
 /// * below the threshold nothing moves, byte for byte;
-/// * folding is idempotent: an existing digest in the folded span is REUSED
-///   (its `files`/`decisions`/`open_todos` carry forward and the new turns are
-///   merged into it), never nested inside a fresh one. A second pass over an
-///   already-compacted conversation therefore produces exactly one digest.
+/// * folding is idempotent: an existing digest INSIDE THE FOLDED SPAN is
+///   REUSED (its `files`/`decisions`/`open_todos` carry forward and the new
+///   turns are merged into it), never nested inside a fresh one. A second pass
+///   over an already-compacted conversation therefore produces exactly one
+///   digest. A digest outside that span is not absorbed: absorbing the one in
+///   the tail would delete a turn the agent is still working against.
 pub fn compact(
     turns: &[Turn],
     threshold_tokens: u64,
@@ -709,17 +734,18 @@ pub fn compact(
     }
     // Carry an earlier digest forward instead of summarising it: `digest_turns`
     // would otherwise fold "a summary of the earlier turns" into a summary of a
-    // summary, and every later pass would nest one level deeper. The digest is
-    // already pinned out of the foldable tail; fold it in from `pinned` too.
-    // An existing digest may sit anywhere — typically just after the brief,
-    // but a large `keep_recent` can leave one inside the verbatim tail. Scan the
-    // WHOLE conversation so a second pass can never end up with two digests.
-    let prior: Vec<&Turn> = turns.iter().filter(|t| is_digest(t)).collect();
-    let foldable_fresh: Vec<Turn> = foldable
-        .iter()
-        .filter(|t| !is_digest(t))
-        .cloned()
-        .collect();
+    // summary, and every later pass would nest one level deeper.
+    //
+    // Only the digests that are actually being REPLACED are absorbed: every one
+    // inside the foldable span. A digest that sits in the pinned head or in the
+    // verbatim `keep_recent` tail is NOT — the head digest and the tail are part
+    // of the conversation contract (`the last keep_recent turns are never
+    // folded`), and absorbing a tail digest while also filtering it out of the
+    // tail deleted turns the agent was still working against. The pre-fix code
+    // scanned the whole conversation and then dropped every digest from `out`,
+    // so a digest inside the window vanished with only a summary line left.
+    let prior: Vec<&Turn> = foldable.iter().filter(|t| is_digest(t)).collect();
+    let foldable_fresh: Vec<Turn> = foldable.iter().filter(|t| !is_digest(t)).cloned().collect();
     // The digest describes the turns it replaces: the foldable span, not the
     // pinned head it is rendered alongside.
     let mut digest = digest_turns(&foldable_fresh, max_files, max_lines);
@@ -744,12 +770,15 @@ pub fn compact(
         digest.absorbed_digests = absorbed;
     }
     // Order: pinned system prompt and brief, then the digest, then the recent
-    // turns verbatim. Digests are filtered out of BOTH the pinned head and the
-    // verbatim tail, since every one of them has just been absorbed above.
+    // turns verbatim. A digest is folded out of the HEAD only when it was one of
+    // the absorbed ones (it is now represented by the fresh digest); the tail is
+    // reproduced byte for byte, digest or not, because it is the verbatim
+    // window. Dropping a tail digest here would delete a turn the agent is
+    // still using.
     let mut out: Vec<Turn> = Vec::with_capacity(pinned.len() + recent.len() + 1);
     out.extend(pinned.iter().filter(|t| !is_digest(t)).cloned());
     out.push(Turn::new("system", digest.render()));
-    out.extend(recent.iter().filter(|t| !is_digest(t)).cloned());
+    out.extend(recent.iter().cloned());
     let bytes_after: u64 = out.iter().map(Turn::bytes).sum();
     Compacted {
         turns: out,
