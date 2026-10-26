@@ -14484,18 +14484,6 @@ fn pricing_source_switch(cfg: &Config) -> FileSwitch {
     FileSwitch::None
 }
 
-/// The `ZODER_CORPUS_STALE_DAYS` threshold in days. Invalid -> 7; 0 disables
-/// the warning.
-fn stale_threshold_days() -> i64 {
-    match std::env::var("ZODER_CORPUS_STALE_DAYS") {
-        Ok(v) => match v.trim().parse::<i64>() {
-            Ok(n) if n >= 0 => n,
-            _ => 7,
-        },
-        Err(_) => 7,
-    }
-}
-
 /// Print the age warning for one installed data file, if its data (by its
 /// own `generated`/`generated_at` date — never file mtime) is older than the
 /// `ZODER_CORPUS_STALE_DAYS` threshold. One line per file per process,
