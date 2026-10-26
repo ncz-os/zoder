@@ -5987,7 +5987,9 @@ mod tests {
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("matching-pre-prompt-config.sock");
+        // Short name: AF_UNIX paths are limited to ~108 bytes, and a tempdir
+        // under a deep workspace path can otherwise push this past SUN_LEN.
+        let socket = dir.path().join("p.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_config = json!({
             "agents": { "author": { "model": "safe-model" } }
