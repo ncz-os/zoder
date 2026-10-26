@@ -236,7 +236,39 @@ compaction"*, not *"the agent can still do the task"*.
 
 ### Results
 
-PLACEHOLDER_RESULTS
+Three task shapes, each run with the levers off and then on, against two
+hosted providers. Token counts are the provider's own `usage` numbers; cost is
+the benchmark's estimate at the listed per-token rates (the DeepSeek run fell
+inside its weekday busy-hours window, and a flat-plan provider's real marginal
+cost is lower than its list price).
+
+| provider (model) | task | levers | calls | prompt tokens | cache hit | hit share | completion | cost (USD) | succeeded |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| DeepSeek (deepseek-flash) | order-total-fix | off | 3 | 235,746 | 188,032 | 80% | 1,741 | 0.0088 | yes |
+| DeepSeek (deepseek-flash) | order-total-fix | on | 3 | 49,151 | 16,256 | 33% | 1,684 | 0.0060 | yes |
+| DeepSeek (deepseek-flash) | config-fixture-fix | off | 3 | 235,367 | 187,776 | 80% | 1,604 | 0.0087 | yes |
+| DeepSeek (deepseek-flash) | config-fixture-fix | on | 3 | 48,874 | 16,128 | 33% | 750 | 0.0054 | yes |
+| DeepSeek (deepseek-flash) | review-diff-defect | off | 3 | 234,511 | 187,008 | 80% | 3,633 | 0.0099 | yes |
+| DeepSeek (deepseek-flash) | review-diff-defect | on | 3 | 49,275 | 16,512 | 34% | 1,321 | 0.0058 | yes |
+| MiniMax (MiniMax-M3) | order-total-fix | off | 3 | 230,854 | 137,816 | 60% | 5,711 | 0.0761 | yes |
+| MiniMax (MiniMax-M3) | order-total-fix | on | 3 | 18,349 | 582 | 3% | 679 | 0.0063 | yes |
+| MiniMax (MiniMax-M3) | config-fixture-fix | off | 3 | 230,475 | 137,564 | 60% | 1,137 | 0.0705 | yes |
+| MiniMax (MiniMax-M3) | config-fixture-fix | on | 3 | 18,187 | 558 | 3% | 670 | 0.0063 | yes |
+| MiniMax (MiniMax-M3) | review-diff-defect | off | 3 | 227,312 | 135,456 | 60% | 10,582 | 0.0809 | yes |
+| MiniMax (MiniMax-M3) | review-diff-defect | on | 3 | 18,384 | 556 | 3% | 2,234 | 0.0082 | yes |
+
+| provider | levers | prompt tokens (3 tasks) | cost (USD) | tasks succeeded |
+|---|---|---:|---:|---|
+| DeepSeek (deepseek-flash) | off | 705,624 | 0.0273 | 3/3 |
+| DeepSeek (deepseek-flash) | on | 147,300 | 0.0172 | 3/3 |
+| MiniMax (MiniMax-M3) | off | 688,641 | 0.2275 | 3/3 |
+| MiniMax (MiniMax-M3) | on | 54,920 | 0.0208 | 3/3 |
+
+DeepSeek (deepseek-flash): prompt tokens -79%, cost -37%
+MiniMax (MiniMax-M3): prompt tokens -92%, cost -91%
+
+Every task that succeeded with the levers off also succeeded with them on
+(6/6 per provider). The whole live benchmark cost well under $1.
 
 ### What the numbers say
 
@@ -267,9 +299,9 @@ PLACEHOLDER_RESULTS
 - **Whether the provider caches prompts silently** is unverified. The engine
   treats that shape as `ProviderCacheShape::None`, which is safe (no claim
   is made either way), but whether it caches at all determines whether lever
-  1 helps it. The live benchmark measured the hit share for the provider that
-  publishes one; the other publishes nothing, so its saving shows up in
-  volume only.
+  1 helps it. Both benchmarked providers report a cache-hit count
+  (see the results table), so their savings show up in both volume and
+  hit share.
 - **The levers cannot reach the engine's own conversation.** zoder drives
   the agent loop through the engine's session API, and the engine owns the
   turns. The levers therefore bound the conversations zoder itself builds —
@@ -284,8 +316,5 @@ PLACEHOLDER_RESULTS
 
 ## Test counts
 
-Snapshot "at time of writing" on branch `feat/context-optimization-20261025b`;
-re-derive with `cargo test --workspace`. These are a snapshot, not a durable
-claim — the numbers drift as tests are added.
-
-PLACEHOLDER_TESTS
+Re-derive with `cargo test --workspace`; the count drifts as tests are added,
+so this document does not pin one.
