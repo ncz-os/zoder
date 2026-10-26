@@ -2078,6 +2078,13 @@ async fn dispatch_reviewer_for_model(
     // Fall back to that read-only engine registry for kwargs, or a thinking
     // model can spend the whole output budget without returning an answer.
     let model_cfg = eng.cfg.model_entry_for(model);
+    // Direct-request settings from the shared resolver — the same precedence
+    // every direct chat builder uses (explicit --reasoning > zoder model
+    // entry > engine profile for the selected agent > engine reviewer profile
+    // > first engine profile serving the model).
+    let direct = eng
+        .engine_models
+        .request_settings_for(model, cli.agent.as_deref(), cli.reasoning.as_deref(), model_cfg);
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -2085,25 +2092,11 @@ async fn dispatch_reviewer_for_model(
         temperature: model_cfg.and_then(|m| m.temperature).or(Some(0.1)),
         stream: false,
         show_reasoning: false,
-        reasoning_effort: cli
-            .reasoning
-            .clone()
-            .or_else(|| model_cfg.and_then(|m| m.reasoning_effort.clone()))
-            .or_else(|| {
-                eng.engine_models
-                    .reasoning_effort_for_model(model, cli.agent.as_deref())
-                    .map(str::to_owned)
-            }),
+        reasoning_effort: direct.reasoning_effort,
         top_p: model_cfg.and_then(|m| m.top_p),
         top_k: model_cfg.and_then(|m| m.top_k),
         presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
-        chat_template_kwargs: model_cfg
-            .and_then(|m| m.chat_template_kwargs.clone())
-            .or_else(|| {
-                eng.engine_models
-                    .chat_template_kwargs_for_model(model, cli.agent.as_deref())
-                    .cloned()
-            }),
+        chat_template_kwargs: direct.chat_template_kwargs,
         // Structured-output hint for the direct (non-agentic) reviewer call.
         // Sourced from the engine profile's `provider_extra.response_format`,
         // exactly like `reasoning_effort` above; `None` omits the field so the
