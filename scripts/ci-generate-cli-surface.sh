@@ -15,12 +15,12 @@ if ! cargo build --quiet 2>&1; then
   exit 1
 fi
 
-ZODER="./target/debug/zoder"
+ZODER="${CARGO_TARGET_DIR:-./target}/debug/zoder"
 
 # All known subcommand names (must stay in sync with Cmd enum in zoder-cli).
 SUBCOMMANDS=(
   exec tui models agents update route consult spend report health finops
-  providers config refresh pricing reconcile sessions mnemos
+  providers config init refresh pricing reconcile sessions mnemos
   review adversarial-review rescue status result cancel jobs
   loop transfer session recipe mcp mcp-server sop configure completions gate
 )

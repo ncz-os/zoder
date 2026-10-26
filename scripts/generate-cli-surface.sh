@@ -14,7 +14,7 @@ if ! cargo build --bin zoder --release --locked 2>/dev/null; then
     cargo build --bin zoder --release
 fi
 
-ZODER_BIN="./target/release/zoder"
+ZODER_BIN="${CARGO_TARGET_DIR:-./target}/release/zoder"
 if [ ! -f "$ZODER_BIN" ]; then
     echo "ERROR: zoder binary not found at $ZODER_BIN"
     exit 1
