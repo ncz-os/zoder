@@ -1917,7 +1917,6 @@ mod staleness_tests {
             assert!(c.staleness_warning(day("2026-10-26"), 7).is_none(), "{g}");
         }
     }
-    }
 }
 
 #[cfg(test)]
