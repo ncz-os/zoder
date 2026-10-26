@@ -4395,6 +4395,45 @@ impl Config {
                 }
             }
         }
+        // `[model_families]` entries are matched case-insensitively, so an
+        // entry that can never match or that makes the answer depend on map
+        // order is a configuration bug rather than a harmless override.
+        let mut normalized_family_keys: BTreeMap<String, (&str, String)> = BTreeMap::new();
+        for (key, family) in &self.model_families {
+            let trimmed_key = key.trim();
+            let trimmed_family = family.trim();
+            if trimmed_key.is_empty() {
+                errs.push(format!(
+                    "model_families key {key:?} is empty; use a model id or glob"
+                ));
+            } else if trimmed_key.chars().all(|c| c == '*' || c == '?') {
+                errs.push(format!(
+                    "model_families key {key:?} is only wildcards and would put every model in one family, silently disabling cross-family review"
+                ));
+            }
+            if trimmed_family.is_empty() {
+                errs.push(format!(
+                    "model_families key {key:?} maps to an empty family; name the family explicitly"
+                ));
+                continue;
+            }
+            let normalized_key = trimmed_key.to_ascii_lowercase();
+            if normalized_key.is_empty() {
+                continue;
+            }
+            let normalized_family = trimmed_family.to_ascii_lowercase();
+            if let Some((previous_key, previous_family)) =
+                normalized_family_keys.get(&normalized_key)
+            {
+                if previous_family != &normalized_family {
+                    errs.push(format!(
+                        "model_families keys {previous_key:?} and {key:?} normalize to the same case-insensitive key but map to different families ({previous_family:?} and {normalized_family:?}); matching is case-insensitive so the result depends on map order"
+                    ));
+                }
+            } else {
+                normalized_family_keys.insert(normalized_key, (key.as_str(), normalized_family));
+            }
+        }
         // A config file that exists but was skipped is a problem, not a
         // warning: the providers (or review caps) it contributes are silently
         // missing, so `--validate` must never call that VALID.
@@ -4455,6 +4494,14 @@ pub struct VendorOverlay {
     /// chunk caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewConfig>,
+    /// `[model_families]` entries contributed by this overlay: a served model
+    /// id or `*`/`?` glob to a family name. Merged per key onto the base
+    /// config's map (and onto earlier overlays), so an overlay entry wins over
+    /// a base entry with the same key and a later overlay wins over an earlier
+    /// one; keys only in the base survive. A families-only overlay is
+    /// meaningful on a host that has no `config.json`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_families: BTreeMap<String, String>,
     /// Providers contributed by this overlay that opt in to the pre-query
     /// health gate. The ids are unioned onto the base config, so an overlay
     /// can enable gating for a provider it also contributes.
@@ -4737,6 +4784,12 @@ fn apply_overlays_filtered(
         if let Some(review) = &overlay.review {
             merge_review_config(&mut cfg.review, review);
         }
+        // Per-key merge: an overlay family wins over the base map, and because
+        // overlays are visited in alphabetical order the later one wins for a
+        // key they both define. A base-only key survives untouched.
+        for (pattern, family) in &overlay.model_families {
+            cfg.model_families.insert(pattern.clone(), family.clone());
+        }
         for provider_id in &overlay.health.providers {
             if !cfg.health.providers.contains(provider_id) {
                 cfg.health.providers.push(provider_id.clone());
@@ -4947,19 +5000,20 @@ fn collect_overlays(home: &Path, only_vendor: Option<&str>) -> anyhow::Result<Co
             }
         };
         // A profile-only overlay is meaningful now: `[deployment]`,
-        // `[context]`, `[budget]` and `[review]` can all be set without adding
-        // a provider (the fleet deployment template does exactly that). An
-        // entirely empty file is still almost certainly a half-finished
-        // template, so keep rejecting that.
+        // `[context]`, `[budget]`, `[review]` and `[model_families]` can all be
+        // set without adding a provider (the fleet deployment template does
+        // exactly that). An entirely empty file is still almost certainly a
+        // half-finished template, so keep rejecting that.
         let profile_only = overlay.deployment.is_some()
             || overlay.context.is_some()
             || overlay.budget.is_some()
             || overlay.review.is_some()
             || overlay.theme.is_some()
-            || !overlay.health.is_empty();
+            || !overlay.health.is_empty()
+            || !overlay.model_families.is_empty();
         if overlay.providers.is_empty() && !overlay.profile.default && !profile_only {
             anyhow::bail!(
-                "{} contributes no [[providers]], [deployment], [context], [budget] or [profile].default; either add configuration or remove the file",
+                "{} contributes no [[providers]], [deployment], [context], [budget], [review], [model_families] or [profile].default; either add configuration or remove the file",
                 path.display()
             );
         }
@@ -6404,7 +6458,7 @@ auth = { type = "env", var = "ACME_KEY" }
         std::fs::write(
             &overlay,
             r#"
-[model_families]
+[not_a_real_table]
 "provider-a/*" = "provider-a"
 
 [[providers]]
@@ -6683,6 +6737,80 @@ auth = { type = "env", var = "FLEET_KEY" }
         assert!(errs.contains("empty name"), "{errs}");
         assert!(errs.contains("hours must"), "{errs}");
         assert!(errs.contains("cap must"), "{errs}");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_model_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.model_families.insert("".into(), "family-a".into());
+        cfg.model_families.insert("   ".into(), "family-b".into());
+        cfg.model_families
+            .insert("provider-a/*".into(), "   ".into());
+        cfg.model_families.insert("*".into(), "family-all".into());
+        cfg.model_families.insert("**".into(), "family-all".into());
+        cfg.model_families.insert("?*".into(), "family-all".into());
+        cfg.model_families
+            .insert("Provider-A/Shared/*".into(), "family-a".into());
+        cfg.model_families
+            .insert("provider-a/shared/*".into(), "family-b".into());
+
+        let errs = cfg.validate().join("\n");
+        assert!(errs.contains("model_families key \"\""), "{errs}");
+        assert!(errs.contains("model_families key \"   \""), "{errs}");
+        assert!(
+            errs.contains("model_families key \"provider-a/*\" maps to an empty family"),
+            "{errs}"
+        );
+        for key in ["*", "**", "?*"] {
+            assert!(
+                errs.contains(&format!("model_families key {key:?} is only wildcards")),
+                "{errs}"
+            );
+        }
+        assert!(
+            errs.contains(
+                "model_families keys \"Provider-A/Shared/*\" and \"provider-a/shared/*\""
+            ),
+            "{errs}"
+        );
+        assert!(errs.contains("different families"), "{errs}");
+
+        // The same case-insensitive key is fine when both spellings agree on
+        // the family; only a conflicting answer is a problem.
+        let mut valid = Config::default_provider(dir.path());
+        valid
+            .model_families
+            .insert("Provider-A/*".into(), "family-a".into());
+        valid
+            .model_families
+            .insert("provider-a/*".into(), "FAMILY-A".into());
+        assert!(valid.validate().is_empty(), "{:?}", valid.validate());
+    }
+
+    #[test]
+    fn overlay_model_families_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.fleet.toml"),
+            r#"
+[model_families]
+"*" = "family-a"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_unvalidated_from(dir.path()).unwrap();
+        assert_eq!(cfg.model_families["*"], "family-a");
+        let errs = cfg.validate().join("\n");
+        assert!(
+            errs.contains("model_families key \"*\"")
+                && errs.contains("only wildcards")
+                && errs.contains("disabling cross-family review"),
+            "{errs}"
+        );
+        let err = Config::load_from(dir.path()).expect_err("normal startup must reject it");
+        assert!(format!("{err:#}").contains("only wildcards"), "{err:#}");
     }
 
     #[test]
@@ -8396,6 +8524,52 @@ auth = { type = "env", var = "GUARD_KEY" }
         assert_eq!(model_family(&families, "provider-a/model-x"), "shared");
         assert_eq!(model_family(&families, "provider-a/special"), "special");
         assert_eq!(model_family(&families, "vendor/legacy-model"), "legacy");
+    }
+
+    #[test]
+    fn overlay_model_families_merge_over_base_and_later_overlay_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.acme.toml"),
+            r#"
+[model_families]
+"overlap/*" = "from-overlay-a"
+"shared/*" = "from-overlay-a"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.zenith.toml"),
+            r#"
+[model_families]
+"shared/*" = "from-overlay-z"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.model_families
+            .insert("overlap/*".to_string(), "from-base".to_string());
+        cfg.model_families
+            .insert("base-only/*".to_string(), "from-base".to_string());
+
+        apply_overlays(&mut cfg, dir.path()).unwrap();
+
+        assert_eq!(
+            cfg.model_families["overlap/*"], "from-overlay-a",
+            "an overlay entry wins over the base for the same key"
+        );
+        assert_eq!(
+            cfg.model_families["base-only/*"], "from-base",
+            "a base-only key survives the merge"
+        );
+        assert_eq!(
+            cfg.model_families["shared/*"], "from-overlay-z",
+            "the alphabetically-last overlay wins a key both overlays define"
+        );
+        assert_eq!(cfg.model_family("overlap/model-x"), "from-overlay-a");
+        assert_eq!(cfg.model_family("base-only/model-x"), "from-base");
+        assert_eq!(cfg.model_family("shared/model-x"), "from-overlay-z");
     }
 
     #[test]
