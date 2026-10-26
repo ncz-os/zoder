@@ -96,10 +96,10 @@ pub use catalog_models::{
     EnrichmentOutcome,
 };
 pub use config::{
-    AliasedAgentConfig, Auth, BillingMode, Config, EngineModelRegistry, EngineProviderRoute,
-    ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions, LinuxLandlockProfileOptions,
-    Provider, QuotaUnit, QuotaWindow, ReviewConfig, SeatbeltProfileOptions, SubscriptionPlan,
-    Theme,
+    AliasedAgentConfig, Auth, BillingMode, Config, DirectRequestSettings, EngineModelRegistry,
+    EngineProviderRoute, ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions,
+    LinuxLandlockProfileOptions, Provider, QuotaUnit, QuotaWindow, ReviewConfig,
+    SeatbeltProfileOptions, SubscriptionPlan, Theme,
 };
 pub use corpus::{
     AliasOverlay, Corpus, ModelEntry, OverlayModel, OverlayReport, RefreshReport,
