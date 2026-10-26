@@ -920,6 +920,25 @@ def test_lkg_fallback_is_off_without_the_flag() -> None:
         fail_("main() ignores --allow-lkg-fallback")
 
 
+def test_a_stale_report_cannot_carry_a_degraded_overlay() -> None:
+    """The stale path re-checks the overlay on disk against the baseline."""
+    root = _setup(_scratch(), overlay_count=191)
+    _run_fetch(root, failing=["fetch-arena.py"], candidate=141)
+    (root / "corpus" / "freshness-last.json").write_text(json.dumps({"models_with_score": 191}))
+    rc, _ = _run_check(root)
+    if rc == 0:
+        pass_("a genuinely stale run (committed overlay kept) still passes")
+    else:
+        fail_(f"a genuinely stale run was blocked (rc={rc})")
+    # Now degrade the overlay on disk while the report still says "stale".
+    (root / "bench" / "overlay.json").write_text(json.dumps(_scored_overlay(100, "degraded")))
+    rc, out = _run_check(root)
+    if rc == 1 and "overlay on disk is degraded" in out:
+        pass_("a stale report with a degraded overlay on disk is refused")
+    else:
+        fail_(f"degraded overlay passed under a stale report (rc={rc})")
+
+
 def main() -> int:
     _run_one(test_one_bench_source_failing_keeps_the_committed_overlay)
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
@@ -940,6 +959,7 @@ def main() -> int:
     _run_one(test_the_check_script_wires_up_every_gate_helper)
     _run_one(test_a_multi_output_source_needs_every_lkg_file)
     _run_one(test_lkg_fallback_is_off_without_the_flag)
+    _run_one(test_a_stale_report_cannot_carry_a_degraded_overlay)
     print(f"\n{PASSES} passed; {FAILS} failed")
     return 0 if FAILS == 0 else 1
 

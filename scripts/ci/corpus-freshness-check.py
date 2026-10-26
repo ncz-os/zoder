@@ -122,6 +122,21 @@ def _failing_sources(freshness: dict) -> list[str]:
     return names
 
 
+
+def _overlay_floor_reason(overlay: Path, last_path: Path) -> str:
+    """"" when the overlay on disk meets the minimum and is not more than
+    COVERAGE_DROP_THRESHOLD below the baseline, else the reason it fails."""
+    count = _count_scored(overlay)
+    if count < MIN_AGENTIC_SCORE_COUNT:
+        return f"{count} scored models, minimum {MIN_AGENTIC_SCORE_COUNT}"
+    try:
+        last = int(json.loads(last_path.read_text()).get("models_with_score", 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        last = 0
+    if last > 0 and count < last * (1.0 - COVERAGE_DROP_THRESHOLD):
+        return f"{count} scored models vs a baseline of {last}"
+    return ""
+
 def _stale_flag(value) -> bool:
     """Read a stale flag that may be a bool, a number or a string.
 
@@ -248,6 +263,16 @@ def _check_schema2(cur: dict, corpus: Path, overlay: Path, last_path: Path,
         why = str(overlay_meta.get("reason") or "")
         if why:
             print(f"corpus-freshness: WARNING - overlay reason: {why}", file=sys.stderr)
+        # Defence in depth: the stale path trusts the writer to have kept
+        # the committed overlay byte-for-byte. Verify that the overlay on
+        # disk still meets the floor and the baseline, so a report that
+        # claims "stale" (or a hand edit) can never smuggle a degraded
+        # overlay past the gate.
+        floor_reason = _overlay_floor_reason(overlay, last_path)
+        if floor_reason:
+            print(f"corpus-freshness: overlay on disk is degraded ({floor_reason}); "
+                  "refusing to commit. Pass --force-publish to override.", file=sys.stderr)
+            return 1
         print("corpus-freshness: prices are published; routing scores were NOT erased",
               file=sys.stderr)
         # The baseline is only advanced when the overlay is fresh: a stale
