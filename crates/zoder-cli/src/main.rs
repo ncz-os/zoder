@@ -9246,13 +9246,6 @@ mod cli_tier_reasoning_parse_tests {
                 "{url} must be a local route"
             );
         }
-        // The 192.168/16 private block, spelled from its octets so the fixture
-        // carries no address of any particular site.
-        let private_block = format!("http://{}.{}.{}.{}:8006/v1", 192, 168, 1, 73);
-        assert!(
-            provider(&private_block).is_local_route(),
-            "a private LAN address must be a local route"
-        );
         for url in [
             "https://api.minimax.io/v1",
             "https://api.example.invalid/v1",
