@@ -441,6 +441,34 @@ fn alias_of(raw: &str) -> Option<&str> {
     Some(alias)
 }
 
+/// The `(module, alias)` pairs a claim names in its `X as Y` forms. Either
+/// member proves an aliased import, so the disprove loop treats each pair as
+/// one OR condition rather than two independent names.
+pub(crate) fn claimed_alias_pairs(title: &str, body: &str) -> Vec<(String, String)> {
+    let text = format!("{title}\n{body}");
+    let mut out: Vec<(String, String)> = Vec::new();
+    // Scan word triples: `module as alias`.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for at in 0..words.len().saturating_sub(2) {
+        if words[at + 1].trim_matches(|c: char| !c.is_ascii_alphanumeric()) != "as" {
+            continue;
+        }
+        let clean = |w: &str| {
+            w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .to_string()
+        };
+        let module = clean(words[at]);
+        let alias = clean(words[at + 2]);
+        if module.is_empty() || alias.is_empty() || module == alias {
+            continue;
+        }
+        if !out.iter().any(|(m, a)| m == &module && a == &alias) {
+            out.push((module, alias));
+        }
+    }
+    out
+}
+
 /// Normalize one candidate token and push it when it is a plausible symbol.
 fn add_one(raw: &str, out: &mut Vec<String>) {
     let raw = raw
@@ -1013,6 +1041,26 @@ pub(crate) fn false_undefined_record_with_location(
     let mut symbols = claimed_symbols(title, body);
     symbols.extend(options);
     let mut disproved: Vec<(String, String, String)> = Vec::new();
+    // An `X as Y` claim names ONE thing, so binding EITHER member proves it.
+    // Collapse each pair to a single representative: the member the file
+    // actually binds, or the module name when neither binds (so the finding is
+    // kept and the evidence still names what is missing).
+    let mut collapsed: Vec<String> = symbols;
+    for (module, alias) in claimed_alias_pairs(title, body) {
+        let bound_member = if name_evidence(path, &source, &module, target_line, read).is_some() {
+            Some(module.clone())
+        } else if name_evidence(path, &source, &alias, target_line, read).is_some() {
+            Some(alias.clone())
+        } else {
+            None
+        };
+        let representative = bound_member.unwrap_or_else(|| module.clone());
+        collapsed.retain(|s| s != &module && s != &alias);
+        if !collapsed.iter().any(|s| s == &representative) {
+            collapsed.push(representative);
+        }
+    }
+    symbols = collapsed;
     // Every claimed name must be disproved. One name the file really lacks
     // keeps the finding: dropping it would hide a real defect.
     for symbol in &symbols {
@@ -2438,5 +2486,52 @@ pub(crate) mod tests {
             &read,
         )
         .is_some());
+    }
+    /// An `X as Y` claim is disproved when EITHER member is bound, not both.
+    #[test]
+    fn an_alias_claim_is_disproved_by_either_member_alone() {
+        // Only the alias binds as a standalone name: `import dt` style.
+        let alias_only = "import dt\n\nX = dt.now\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| alias_only.to_string());
+        let record = false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:3-3"),
+            None,
+            &read,
+        )
+        .expect("the alias alone proves the claim wrong");
+        assert!(record["evidence"].as_str().unwrap().contains("import dt"));
+
+        // Only the module binds: `from datetime import timedelta`-style.
+        let module_only = "from datetime import timedelta\n\nX = timedelta(days=1)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| module_only.to_string());
+        assert!(false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:3-3"),
+            None,
+            &read,
+        )
+        .is_some());
+    }
+
+    /// Neither member bound: the claim stands, and the record would name the
+    /// module rather than inventing a binding.
+    #[test]
+    fn an_alias_claim_with_neither_member_bound_is_kept() {
+        let bare = "DT_LIMIT = 3\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:1-1"),
+            None,
+            &read,
+        )
+        .is_none());
     }
 }
