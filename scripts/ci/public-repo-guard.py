@@ -106,14 +106,15 @@ def _authority_host(authority: str) -> str:
     return value.split(":", 1)[0]
 
 
-def hosts_in(text: str) -> set[str]:
-    hosts: set[str] = set()
+def host_matches(text: str) -> list[tuple[str, int]]:
+    """Every host mention with the offset of the host itself, in text order."""
+    found: list[tuple[str, int]] = []
     for match in URL_HOST_RE.finditer(text):
-        hosts.add(_authority_host(match.group(1)))
+        found.append((_authority_host(match.group(1)), match.start(1)))
     for regex in (SCP_HOST_RE, SSH_HOST_RE):
         for match in regex.finditer(text):
-            hosts.add(match.group(1))
-    return hosts
+            found.append((match.group(1), match.start(1)))
+    return found
 
 
 def load_denylist(path: Path = DENYLIST) -> dict[str, set[str]]:
@@ -164,17 +165,13 @@ def scan_text(
                 break
 
     if rules["host"]:
-        seen: set[tuple[str, int]] = set()
-        for host in hosts_in(text):
-            for candidate in host_candidates(host):
-                if host_digest(candidate) in rules["host"]:
-                    # Attribute a host hit to the line naming that host.
-                    needle = re.compile(re.escape(host), re.IGNORECASE)
-                    found = needle.search(text)
-                    line = _line_of(text, found.start()) if found else 1
-                    seen.add((where, line))
-        for where_value, line in seen:
-            hits.add((where_value, line, "host"))
+        for host, offset in host_matches(text):
+            line = _line_of(text, offset)
+            if any(
+                host_digest(candidate) in rules["host"]
+                for candidate in host_candidates(host)
+            ):
+                hits.add((where, line, "host"))
     return hits
 
 
@@ -238,12 +235,32 @@ def self_test(rules: dict[str, set[str]]) -> int:
     if token_digest(term) not in rules["token"]:
         raise SystemExit(
             "public-repo-guard self-test: denylist is missing the self-test "
-            "digest; regenerate it with --hash on the assembled term"
+            "token digest; regenerate it with --hash on the assembled term"
+        )
+    if host_digest(term) not in rules["host"]:
+        raise SystemExit(
+            "public-repo-guard self-test: denylist is missing the self-test "
+            "host digest; regenerate it with --hash-host on the assembled term"
         )
     if scan_text("ordinary source text", rules, "self-test"):
         raise SystemExit("public-repo-guard self-test: clean text was flagged")
     if not scan_text(f"pre {term} post", rules, "self-test"):
         raise SystemExit("public-repo-guard self-test: tree text was not flagged")
+
+    two_lines = (
+        f"first https://{term}.example.invalid/a\n"
+        f"second https://{term}.example.invalid/b\n"
+    )
+    host_lines = {
+        line
+        for where_value, line, kind in scan_text(two_lines, rules, "self-test")
+        if where_value == "self-test" and kind == "host"
+    }
+    if host_lines != {1, 2}:
+        raise SystemExit(
+            "public-repo-guard self-test: repeated host was not reported on "
+            f"both of its lines (got {sorted(host_lines)})"
+        )
 
     with tempfile.TemporaryDirectory(prefix="public-repo-guard-") as scratch:
         root = Path(scratch)
