@@ -202,8 +202,10 @@ and an explicit `[context.profiles.<key>]` entry overrides the numbers.
 
 The fleet numbers are the ones the fleet operator tuned; they are baked into
 zoder as the `fleet` profile, so there is nothing to regenerate when a number
-changes — only `[context] profile = "fleet"` in the config. See
-`gitops/fleet/zoder-context.toml`.
+changes — only `[deployment] mode = "fleet"` (which `[context] profile`
+inherits), or an explicit `[context] profile = "fleet"`, in the config. The
+fleet's own configuration repository carries the tuned overlay. See
+[`docs/PROFILES.md`](PROFILES.md).
 
 Neither profile ever compacts a provider with no per-token bill: a local
 model has no bill either way, so a summarised history is pure quality risk
