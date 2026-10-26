@@ -3903,6 +3903,54 @@ mod tests {
     // error which indicates malformed data.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Provider client discipline: overload backoff floor + Retry-After forms.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overload_backoff_floor_raises_the_delay_on_503_and_529() {
+        // With a 5 s overload floor, EVERY attempt's delay is >= 5 s — the
+        // 500 ms exponential base no longer decides the first retry after a
+        // "service overloaded" response.
+        for attempt in 0..6u32 {
+            let d = backoff_delay(attempt, None, Some(Duration::from_secs(5)));
+            assert!(
+                d >= Duration::from_secs(5),
+                "attempt {attempt}: {d:?} below the 5s overload floor"
+            );
+        }
+        // The floor never overrides a larger server Retry-After.
+        let d = backoff_delay(
+            0,
+            Some(Duration::from_secs(9)),
+            Some(Duration::from_secs(5)),
+        );
+        assert!(d >= Duration::from_secs(9));
+        // No floor (standalone default): attempt 0 stays sub-second.
+        assert!(backoff_delay(0, None, None) < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_after_value_parses_numeric_http_date_and_caps_at_60s() {
+        use chrono::Utc;
+        // Numeric form (legacy behaviour).
+        assert_eq!(retry_after_value("3"), Some(Duration::from_secs(3)));
+        // Numeric form is capped.
+        assert_eq!(retry_after_value("999"), Some(Duration::from_secs(60)));
+        // HTTP-date form, a few seconds out.
+        let soon = (Utc::now() + chrono::Duration::seconds(8)).to_rfc2822();
+        let d = retry_after_value(&soon).expect("HTTP-date must parse");
+        assert!((5..=10).contains(&d.as_secs()), "got {d:?}");
+        // HTTP-date far in the future is capped at 60 s.
+        let far = (Utc::now() + chrono::Duration::hours(3)).to_rfc2822();
+        assert_eq!(retry_after_value(&far), Some(Duration::from_secs(60)));
+        // A past HTTP-date means "retry now" (0), not "ignore".
+        let past = (Utc::now() - chrono::Duration::seconds(5)).to_rfc2822();
+        assert_eq!(retry_after_value(&past), Some(Duration::from_secs(0)));
+        // Garbage stays rejected.
+        assert_eq!(retry_after_value("later"), None);
+    }
+
     #[test]
     fn truncation_error_is_retryable_when_nothing_emitted() {
         let err = ProviderError {
