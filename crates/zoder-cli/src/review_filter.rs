@@ -357,20 +357,33 @@ fn claimed_options(title: &str, body: &str) -> Vec<String> {
     let mut options = Vec::new();
     for sentence in format!("{title}\n{body}").replace(". ", "\n").lines() {
         let lower = sentence.to_ascii_lowercase();
-        if ![
-            "missing",
-            "not defined",
-            "does not define",
-            "not accepted",
-            "not recognized",
-            "not recognised",
-            "unrecognized",
-            "unrecognised",
-            "unknown option",
-            "unknown argument",
-        ]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
+        let missing_option = lower
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| {
+                pair[0] == "missing"
+                    && pair[1]
+                        .trim_start_matches(['`', '\'', '"'])
+                        .starts_with('-')
+            });
+        if !missing_option
+            && ![
+                "not defined",
+                "does not define",
+                "does not accept",
+                "does not recognize",
+                "does not recognise",
+                "not accepted",
+                "not recognized",
+                "not recognised",
+                "unrecognized",
+                "unrecognised",
+                "unknown option",
+                "unknown argument",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
         {
             continue;
         }
@@ -907,6 +920,10 @@ pub(crate) mod tests {
             );
         }
         for (title, body) in [
+            (
+                "Missing output file for --receipt",
+                "The output file was never written.",
+            ),
             ("Missing --receipt and --other options", ""),
             (
                 "Missing --receipt argument",
