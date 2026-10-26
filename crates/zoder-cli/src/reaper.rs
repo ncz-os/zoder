@@ -136,6 +136,22 @@ pub(crate) const REAP_GRACE: Duration = Duration::from_millis(1500);
 const SIGNAL_REAP_GRACE: Duration = Duration::from_millis(750);
 /// Budget for the ACP `session/cancel` handshake before we start killing.
 pub(crate) const REAP_CANCEL_BUDGET: Duration = Duration::from_millis(750);
+
+/// The cancel budget for a deployment profile.
+///
+/// Fleet keeps the tuned 750 ms (`REAP_CANCEL_BUDGET`). A standalone host has
+/// no shared-daemon contention to clear, so it gets a longer settle window.
+/// This is the profile hook the in-flight daemon session-cancel work reads;
+/// the fleet value must stay exactly what it is today.
+pub(crate) fn cancel_budget_for(mode: zoder_core::config::DeploymentMode) -> Duration {
+    match mode {
+        // Fleet behaviour is unchanged: the tuned constant is the fleet value.
+        zoder_core::config::DeploymentMode::Fleet => REAP_CANCEL_BUDGET,
+        zoder_core::config::DeploymentMode::Standalone => Duration::from_millis(
+            zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms(),
+        ),
+    }
+}
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
 const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
 /// Settle time between productive reap passes. A pass that killed something
@@ -2416,6 +2432,16 @@ mod tests {
     /// runs a crate's tests in parallel threads inside ONE process: without
     /// this lock one test's reap scope would select another test's fixture.
     static REAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn fleet_cancel_budget_is_the_unchanged_constant_and_standalone_is_longer() {
+        use zoder_core::config::DeploymentMode;
+        assert_eq!(cancel_budget_for(DeploymentMode::Fleet), REAP_CANCEL_BUDGET);
+        assert!(
+            cancel_budget_for(DeploymentMode::Standalone) > REAP_CANCEL_BUDGET,
+            "a standalone host gets a longer cancel settle window"
+        );
+    }
 
     struct Workspace {
         _dir: tempfile::TempDir,

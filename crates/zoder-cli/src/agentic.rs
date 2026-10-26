@@ -2092,10 +2092,14 @@ async fn dispatch_reviewer_for_model(
     // Optional host-wide cap on concurrent reviewer calls per provider
     // (ZODER_PROVIDER_CONCURRENCY); unlimited by default. A queue timeout is
     // a capacity signal, so the next reviewer candidate may take over.
-    let slot_limit = crate::provider_slots::limit_for(
-        std::env::var("ZODER_PROVIDER_CONCURRENCY").ok().as_deref(),
-        &provider_cfg.id,
-    );
+    // An explicit env spec always wins. With no spec, the deployment profile
+    // supplies the default (unlimited on both profiles today; the hook is what
+    // keeps a future fleet slot map out of the standalone path).
+    let concurrency_spec = std::env::var("ZODER_PROVIDER_CONCURRENCY").ok();
+    let slot_limit = match concurrency_spec.as_deref() {
+        Some(spec) => crate::provider_slots::limit_for(Some(spec), &provider_cfg.id),
+        None => eng.cfg.profile_defaults().provider_concurrency_default(),
+    };
     let slot = match crate::provider_slots::acquire(
         &Config::home(),
         &provider_cfg.id,
@@ -5574,9 +5578,17 @@ pub(crate) async fn cmd_rescue(
     // Cancel the agent session FIRST (so a ghost turn stops editing), then
     // reap whatever it left running — on the success and the failure path
     // alike. The guard reaps again from `Drop` if this is ever unwound.
-    reap.cancel_then_reap(crate::reaper::REAP_CANCEL_BUDGET)
+    reap.cancel_then_reap(crate::reaper::cancel_budget_for(deployment_for_reap()))
         .await;
     result
+}
+
+/// Resolve the deployment profile for a reap budget. A config-load failure
+/// falls back to standalone, whose longer settle window is the safe choice.
+fn deployment_for_reap() -> zoder_core::config::DeploymentMode {
+    zoder_core::config::Config::load()
+        .map(|cfg| cfg.deployment_profile())
+        .unwrap_or_default()
 }
 
 async fn cmd_rescue_run(cli: &crate::Cli, task: &[String]) -> anyhow::Result<()> {
@@ -7223,7 +7235,7 @@ pub(crate) async fn cmd_loop(
     // turn is still editing the tree), then kill what it left running. The
     // guard reaps again from `Drop`, so a panic unwinding out of
     // `cmd_loop_run` is covered too.
-    reap.cancel_then_reap(crate::reaper::REAP_CANCEL_BUDGET)
+    reap.cancel_then_reap(crate::reaper::cancel_budget_for(deployment_for_reap()))
         .await;
     result
 }
@@ -7257,7 +7269,11 @@ async fn cmd_loop_run(
     // A failure to load the engine is treated as a fatal misconfig — the
     // operator's config is broken in a way that already prevents the loop
     // from running at all.
-    let exec_safety_policy = Engine::load()?.cfg.exec_safety;
+    let engine_cfg = Engine::load()?.cfg;
+    let exec_safety_policy = engine_cfg.exec_safety.clone();
+    // Fleet job workspaces publish the job id their runner assigned. A
+    // standalone run has no such runner, so it must not invent or forward one.
+    let fleet_job_workspaces = engine_cfg.profile_defaults().fleet_job_workspaces();
 
     // Task text: trailing args, else -i FILE, else stdin.
     let mut task_txt = task.join(" ");
@@ -8122,7 +8138,12 @@ or comment.\n"
         crate::mnemos::checkpoint(
             cwd,
             json!({
-                "job_id": std::env::var("HIVE_JOB_ID").ok(),
+                // Only a fleet job workspace has a runner-assigned id.
+                "job_id": if fleet_job_workspaces {
+                    std::env::var("HIVE_JOB_ID").ok()
+                } else {
+                    None
+                },
                 "workspace": cwd.to_string_lossy(), "iteration": i,
                 "head_sha": rev_parse_head(cwd), "files": touched,
                 "check_passed": check_passed, "verdict": review.verdict,
