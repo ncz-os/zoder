@@ -5080,6 +5080,22 @@ pub(crate) const AUTHOR_CANCEL_UNCONFIRMED_MARKER: &str = "author cancellation u
 /// tree is still captured, preserved and reported.
 pub(crate) const AUTHOR_CANCEL_BEST_EFFORT_MARKER: &str = "author cancel UNCONFIRMED:";
 
+/// The outer deadline for the author-phase cancel.
+///
+/// The cancel is re-sent [`AUTHOR_CANCEL_RETRY_ATTEMPTS`] times, each attempt
+/// may take [`SETTLE_BUDGET_SECS`], and each retry waits
+/// [`AUTHOR_CANCEL_RETRY_BACKOFF`] first — so the worst case is
+/// (1 + ATTEMPTS) x SETTLE + ATTEMPTS x BACKOFF. A deadline shorter than that
+/// cuts the sequence off mid-retry, and the error it produces does NOT carry
+/// [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`], so the loop's detectors cannot see
+/// that the turn may still be running. One second of margin covers the socket
+/// teardown.
+pub(crate) const AUTHOR_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
+    (1 + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64) * SETTLE_BUDGET_SECS * 1000
+        + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64) * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
+        + 1000,
+);
+
 /// Retry a failed `session/cancel` a bounded number of times.
 ///
 /// `Ok(())` means the daemon acknowledged the cancel on a retry. If every
@@ -5147,6 +5163,23 @@ pub(crate) async fn author_cancel_reason(
         Ok(()) => String::new(),
         Err(reason) => reason,
     }
+}
+
+/// Run `cancel` under `deadline`.
+///
+/// A deadline that expires means the cancel was NOT confirmed, which is a
+/// different fact from a cancel the daemon refused. The error therefore
+/// carries [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`]: the loop's streak and
+/// unconfirmed detectors look for that marker, and an unmarked timeout reads
+/// as "the cancel failed" instead of "the turn may still be running".
+async fn cancel_under_deadline<F>(deadline: std::time::Duration, cancel: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::time::timeout(deadline, cancel)
+        .await
+        .map_err(|_| format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}cancellation deadline expired"))
+        .and_then(|r| r.map_err(|e| format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}{e}")))
 }
 
 /// Label for a `loop` phase. Phases are user-visible in the watchdog log
@@ -5252,13 +5285,7 @@ where
             // captured after this function returns, and a tree captured while
             // the daemon is still writing is the torn-tree bug this wrapper
             // exists to prevent.
-            let cancelled = tokio::time::timeout(
-                std::time::Duration::from_secs(SETTLE_BUDGET_SECS * 2),
-                cancel,
-            )
-            .await
-            .map_err(|_| "cancellation deadline expired".to_string())
-            .and_then(|r| r.map_err(|e| format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}{e}")));
+            let cancelled = cancel_under_deadline(AUTHOR_CANCEL_DEADLINE, cancel).await;
             settled.await;
             match cancelled {
                 Ok(()) => Err(format!(
@@ -10092,23 +10119,129 @@ must reap the direct shell on the timeout branch)"
     /// unconfirmed marker. Re-introducing the marker there would mark a
     /// confirmed turn unreviewable and count toward the abort streak — the very
     /// inversion this fix removes.
-    #[test]
-    fn a_confirmed_retry_yields_no_unconfirmed_marker() {
-        // The success arm is `Ok(()) => String::new()`; assert the property that
-        // matters about it without needing a live daemon.
-        let success_reason = String::new();
-        assert!(
-            !success_reason.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
-            "a confirmed retry must not carry the unconfirmed marker"
-        );
+    #[tokio::test]
+    async fn a_confirmed_retry_yields_no_unconfirmed_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let _daemon = spawn_cancel_daemon(&socket, true);
+
+        // The REAL success arm, against a daemon that acknowledges the cancel.
+        // Asserting on a locally built empty String proved nothing: this
+        // could not have failed, whatever the function did.
+        let success_reason =
+            author_cancel_reason(&socket, "confirmed-session", "first attempt failed").await;
         assert!(
             success_reason.is_empty(),
-            "a confirmed retry yields no failure reason"
+            "a confirmed retry yields no failure reason: {success_reason}"
+        );
+        assert!(
+            !success_reason.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
+            "a confirmed retry must not carry the unconfirmed marker: {success_reason}"
         );
         // And the failure arm still does carry it, so the two cannot be
         // confused by a future edit.
         let failure = format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER}session x not confirmed");
         assert!(failure.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
+    }
+
+    /// The author-phase cancel deadline must cover the WHOLE retry sequence:
+    /// the first cancel, every retry, and the backoff between them.
+    ///
+    /// A deadline shorter than that cuts the sequence off mid-retry, and the
+    /// error it produces does not carry the unconfirmed marker -- so the loop's
+    /// detectors cannot see that the turn may still be running.
+    #[test]
+    fn the_author_cancel_deadline_covers_the_whole_retry_sequence() {
+        let worst_case = std::time::Duration::from_millis(
+            (1 + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64) * SETTLE_BUDGET_SECS * 1000
+                + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64)
+                    * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64,
+        );
+        assert!(
+            AUTHOR_CANCEL_DEADLINE >= worst_case,
+            "the deadline must cover the whole sequence: {:?} < {:?}",
+            AUTHOR_CANCEL_DEADLINE,
+            worst_case
+        );
+        // The OLD deadline was twice the settle budget, which really is
+        // shorter than the worst case: the sequence was cut off mid-retry.
+        assert!(
+            std::time::Duration::from_secs(SETTLE_BUDGET_SECS * 2) < worst_case,
+            "the old deadline was too short"
+        );
+    }
+
+    /// A daemon that never answers leaves the author cancel UNCONFIRMED, and
+    /// the reason must carry the marker the loop's detectors look for.
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_leaves_the_author_cancel_unconfirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let _daemon = spawn_cancel_daemon(&socket, false);
+
+        let err = cancel_under_deadline(
+            std::time::Duration::from_millis(50),
+            zoder_core::cancel_session(
+                &socket,
+                "never-acking-session",
+                std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
+            ),
+        )
+        .await
+        .expect_err("a daemon that never answers must not confirm the cancel");
+
+        assert!(
+            err.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
+            "an unconfirmed author cancel must carry the marker the detectors look for: {err}"
+        );
+    }
+
+    /// A daemon that answers the handshake and then, for every
+    /// `session/cancel`, either confirms it or says nothing.
+    ///
+    /// `confirm` decides which of the two shapes this is: a daemon that
+    /// acknowledges the cancel, or one that never answers it.
+    fn spawn_cancel_daemon(socket: &std::path::Path, confirm: bool) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(socket).expect("bind the fake daemon");
+        listener
+            .set_nonblocking(true)
+            .expect("make the fake daemon listener non-blocking");
+        std::thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut writer = stream.try_clone().expect("clone the stream");
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let frame: serde_json::Value =
+                            serde_json::from_str(line.trim()).unwrap_or_default();
+                        let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "initialize" {
+                            let _ = writer.write_all(
+                                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}\n",
+                            );
+                            let _ = writer.flush();
+                        } else if method == "session/cancel" && confirm {
+                            let _ = writer.write_all(
+                                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\"}}\n",
+                                );
+                            let _ = writer.flush();
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        })
     }
 
     /// `cancel_author_session_best_effort` must NEVER report success for a
