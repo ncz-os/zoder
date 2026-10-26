@@ -5888,7 +5888,7 @@ model_provider = "custom.primary"
                 calls: 1,
                 violation: None,
                 tags: crate::ledger::FinOpsTags::default(),
-            billing: None,
+                billing: None,
             })
             .collect()
     }
