@@ -148,16 +148,18 @@ pub(crate) fn record_call(
     segments: &[Segment],
     res: &zoder_core::provider::ChatResult,
 ) {
-    let record = CallRecord::new(
-        next_turn(),
-        surface,
-        segments,
-        res.prompt_tokens,
-        res.cached_prompt_tokens,
-        res.cache_miss_tokens,
-        res.completion_tokens.unwrap_or(res.tokens_out),
-    );
+    // The turn number is taken under the same lock as the push, so two
+    // concurrent calls can never be given the same number.
     if let Ok(mut records) = RECORDS.lock() {
+        let record = CallRecord::new(
+            records.len() as u32 + 1,
+            surface,
+            segments,
+            res.prompt_tokens,
+            res.cached_prompt_tokens,
+            res.cache_miss_tokens,
+            res.completion_tokens.unwrap_or(res.tokens_out),
+        );
         records.push(record);
     }
 }
@@ -227,11 +229,6 @@ pub(crate) fn flush(cfg: &Config) -> Option<PathBuf> {
         }
     }
     Some(path)
-}
-
-/// The 1-based number of the next recorded call.
-fn next_turn() -> u32 {
-    RECORDS.lock().map(|r| r.len() as u32 + 1).unwrap_or(1)
 }
 
 /// The segments of a two-message provider call: the system prompt is the

@@ -77,7 +77,10 @@ struct Task {
     /// Tokens any of which the answer may contain for the task to count as
     /// done. A single exact token would fail on a correct answer that
     /// phrases it differently, which would be a failure of the CHECK, not
-    /// of the task.
+    /// of the task. Every token names something only the DECISION says: none
+    /// may appear in the system prompt, the brief, the question or any
+    /// generated tool output (a test enforces it), or an answer that merely
+    /// echoed its input would score as a success.
     expect: &'static [&'static str],
     /// `(role, kind, bytes)` for the turns in between.
     plan: Vec<(&'static str, Kind, usize)>,
@@ -162,7 +165,7 @@ fn tasks() -> Vec<Task> {
             decision: "We decided to round each share half-up instead of truncating, so the \
                         three shares of $10.00 come to $3.34, $3.33 and $3.33.",
             question: "State the fix you decided on for the split-bill total, in one sentence.",
-            expect: &["round", "half-up"],
+            expect: &["half-up", "half up"],
             plan: vec![
                 ("tool", Kind::Read, 48_000),
                 ("assistant", Kind::Prose, 400),
@@ -180,7 +183,7 @@ fn tasks() -> Vec<Task> {
                         making the parser default it, so a missing path still fails loudly.",
             question: "State the fix you decided on for the failing config fixture, in one \
                        sentence.",
-            expect: &["corpus_path", "corpus path"],
+            expect: &["loud"],
             plan: vec![
                 ("tool", Kind::Read, 48_000),
                 ("assistant", Kind::Prose, 300),
@@ -198,13 +201,7 @@ fn tasks() -> Vec<Task> {
                         turns a routing miss into a plain Err, so the caller no longer sees the \
                         model that failed.",
             question: "State the defect you decided on in the routing change, in one sentence.",
-            expect: &[
-                "rank_checked",
-                "swallow",
-                "silently",
-                "no route",
-                "return type",
-            ],
+            expect: &["swallow", "model that failed", "which model failed"],
             plan: vec![
                 ("tool", Kind::Diff, 48_000),
                 ("assistant", Kind::Prose, 800),
@@ -378,6 +375,9 @@ fn main() -> anyhow::Result<()> {
                 applied.folded
             );
             for point in call_points(turns.len()) {
+                if turns.is_empty() {
+                    break;
+                }
                 let upto = point.min(turns.len() - 1);
                 let before = estimate_tokens(turns[..=upto].iter().map(Turn::bytes).sum::<u64>());
                 let after = estimate_tokens(
@@ -738,13 +738,26 @@ async fn run_one(
             res.completion_tokens.unwrap_or(res.tokens_out),
         ));
     }
-    let answer = run.answer.to_ascii_lowercase();
-    run.succeeded = task
-        .expect
-        .iter()
-        .any(|needle| answer.contains(&needle.to_ascii_lowercase()));
+    run.succeeded = scores(task, &run.answer);
     run.wall_ms = started.elapsed().as_millis() as u64;
     Ok(run)
+}
+
+/// The part of a reply that is the answer: a reasoning model may put its
+/// thinking before a closing `</think>`, and that thinking routinely quotes
+/// the transcript (including the decision), so it must not be scored.
+fn final_answer(reply: &str) -> &str {
+    reply
+        .rfind("</think>")
+        .map_or(reply, |at| &reply[at + "</think>".len()..])
+}
+
+/// Did the answer state the recorded decision?
+fn scores(task: &Task, reply: &str) -> bool {
+    let answer = final_answer(reply).to_ascii_lowercase();
+    task.expect
+        .iter()
+        .any(|needle| answer.contains(&needle.to_ascii_lowercase()))
 }
 
 fn pct(after: u64, before: u64) -> f64 {
@@ -760,5 +773,57 @@ fn pct_cost(after: f64, before: f64) -> f64 {
         0.0
     } else {
         100.0 * (1.0 - after / before)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The success check must not be satisfiable by echoing the input: every
+    /// expected token appears in the decision and nowhere else in the
+    /// transcript the model is shown.
+    #[test]
+    fn expected_tokens_name_only_the_decision() {
+        for task in tasks() {
+            let decision = task.decision.to_ascii_lowercase();
+            assert!(
+                task.expect
+                    .iter()
+                    .any(|t| decision.contains(&t.to_ascii_lowercase())),
+                "{}: no expected token is in the decision",
+                task.name
+            );
+            for turn in transcript(&task, 4) {
+                if turn.content == task.decision {
+                    continue;
+                }
+                let text = turn.content.to_ascii_lowercase();
+                for token in task.expect {
+                    assert!(
+                        !text.contains(&token.to_ascii_lowercase()),
+                        "{}: expected token {token:?} also appears in a {} turn",
+                        task.name,
+                        turn.role
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reasoning before `</think>` is not the answer: a reply whose thinking
+    /// quotes the decision but whose answer states a different fix fails.
+    #[test]
+    fn only_the_final_answer_is_scored() {
+        let task = tasks().remove(0);
+        assert!(!scores(
+            &task,
+            "<think>they decided to round each share half-up</think>\n\nAssign the leftover cent to one share."
+        ));
+        assert!(scores(
+            &task,
+            "<think>...</think>\n\nRound each share half-up so the shares sum to $10.00."
+        ));
+        assert!(scores(&task, "Round each share half up."));
     }
 }

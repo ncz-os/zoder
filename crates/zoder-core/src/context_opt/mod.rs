@@ -1201,7 +1201,10 @@ pub fn fit_to_window(turns: &[Turn], max_context_tokens: u64) -> WindowFit {
     // the window is still exceeded.
     let compacted = compact(&elided, 1, 2, 64, 40);
     let compacted_tokens = tokens_of(&compacted.turns);
-    if compacted.turns.len() < elided.len() && compacted_tokens <= max_context_tokens {
+    // The elided prompt did not fit, so a compacted one that does fit was
+    // shrunk by the fold: folding a single turn into its digest keeps the
+    // turn count and is still a fit.
+    if compacted_tokens <= max_context_tokens {
         return WindowFit {
             turns: compacted.turns,
             tokens: compacted_tokens,

@@ -308,11 +308,11 @@ Every task that succeeded with the levers off also succeeded with them on
   the review path and the one-shot/session path — and the engine's window
   has to be bounded in the engine's own configuration until the engine
   exposes a hook for it.
-- **zoder's provider client cannot express a tool result.** `Message` has no
-  assistant-side `tool_calls` shape, so a `role = "tool"` message is rejected
-  by any provider that validates the chat-completions schema (a missing
-  `tool_call_id`, or a tool message with no preceding tool call). The
-  `tool_call_id` field has been added; the assistant side is still missing.
+- **zoder's provider client cannot express an assistant tool call.**
+  `Message` now carries `tool_call_id` (and `Message::tool_result` builds a
+  `role = "tool"` message), but there is still no assistant-side
+  `tool_calls` shape, so a provider that validates the chat-completions
+  schema rejects a tool message with no preceding tool call.
 
 ## Test counts
 
