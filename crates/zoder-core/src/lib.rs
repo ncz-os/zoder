@@ -31,6 +31,7 @@ pub mod pricing;
 pub mod pricing_sync;
 pub mod project_instructions;
 pub mod provider;
+pub mod provider_rate;
 pub mod quota;
 pub mod reconcile;
 pub mod report;
@@ -129,8 +130,8 @@ pub use project_instructions::{
     PROJECT_INSTRUCTIONS_HEADER, PROJECT_INSTRUCTIONS_SEPARATOR, TRUNCATION_MARKER,
 };
 pub use provider::{
-    backoff_delay, request_timeout_s_from_env, CallTelemetry, ChatRequest, ChatResult, ErrKind,
-    Message, OpenAiProvider, ProviderError, DEFAULT_REQUEST_TIMEOUT_S,
+    backoff_delay, request_timeout_s_from_env, retry_after_value, CallTelemetry, ChatRequest,
+    ChatResult, ErrKind, Message, OpenAiProvider, ProviderError, DEFAULT_REQUEST_TIMEOUT_S,
 };
 pub use quota::{
     amortized_per_call, plan_usage, plan_usage_for_catalog_provider, window_usage, WindowUsage,

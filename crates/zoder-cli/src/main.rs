@@ -5074,20 +5074,76 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
     Ok(())
 }
 
-/// One model's worth of work: try it, retrying transient failures with backoff.
-/// Returns `Ok(result)` on success, `Err((err, fatal))` otherwise. `fatal`
-/// means the caller must NOT fall back (output was already partially emitted).
-async fn try_model(
-    provider: &OpenAiProvider,
-    req: &ChatRequest,
+/// One model attempt's parameters: the output mode, retry count, quiet
+/// flag, the cost ledger, and — for the review chain only — the optional
+/// host-wide call budget for the provider's endpoint group
+/// (`rate_limit_group` + (max_concurrent, max_requests_per_minute) from
+/// `Config::provider_call_budget`; `None` = no configured cap = today's
+/// behaviour: no slot, no rate ledger).
+struct ModelCall<'a> {
     json: bool,
     retries: u32,
     quiet: bool,
-    ledger: &Ledger,
-    initial_reservation: &mut Option<BillableReservation>,
+    ledger: &'a Ledger,
+    initial_reservation: &'a mut Option<BillableReservation>,
+    call_budget: Option<(String, usize, u32)>,
+}
+
+/// One model's worth of work: try it, retrying transient failures with
+/// backoff. Returns `Ok(result)` on success, `Err((err, fatal))` otherwise.
+/// `fatal` means the caller must NOT fall back (output was already partially
+/// emitted). When a call budget is configured, each attempt first acquires a
+/// host-wide concurrency slot and a sliding-window rate turn for the
+/// provider's endpoint group, so parallel zoder processes on this host
+/// cannot burst a shared free endpoint into 503s or 429s. `None` (no
+/// configured cap) is a no-op.
+async fn try_model_with_budget(
+    provider: &OpenAiProvider,
+    req: &ChatRequest,
+    call: ModelCall<'_>,
 ) -> anyhow::Result<Result<(ChatResult, BillableReservation), (ProviderError, bool)>> {
+    let ModelCall {
+        json,
+        retries,
+        quiet,
+        ledger,
+        initial_reservation,
+        call_budget,
+    } = call;
     let mut attempt = 0u32;
     loop {
+        // Host-wide call budget for this provider's endpoint group: wait for
+        // a concurrency slot + a sliding-window rate turn before dispatching,
+        // so parallel zoder processes on this host cannot burst a shared
+        // free endpoint into 503s/429s. `None` (no configured cap) is a
+        // no-op — today's behaviour. A queue timeout is a capacity signal, so
+        // the caller falls back to the next model (fatal=false).
+        let mut group_guard: Option<zoder_core::provider_rate::Acquired> = None;
+        if let Some((ref group, conc, rpm)) = call_budget {
+            match zoder_core::provider_rate::acquire(
+                &Config::home(),
+                group,
+                conc,
+                rpm,
+                zoder_core::provider_rate::queue_timeout_from_env(),
+                quiet,
+            )
+            .await
+            {
+                Ok(a) => group_guard = Some(a),
+                Err(e) => {
+                    return Ok(Err((
+                        zoder_core::ProviderError {
+                            message: format!("endpoint group {group}: {e}"),
+                            kind: zoder_core::ErrKind::RateLimit,
+                            ..Default::default()
+                        },
+                        false,
+                    )))
+                }
+            }
+        }
+        let _ = &group_guard;
         let mut reservation = match initial_reservation.take() {
             Some(reservation) => reservation,
             None => ledger
@@ -5114,7 +5170,13 @@ async fn try_model(
                     return Ok(Err((e, true)));
                 }
                 if e.retryable() && attempt < retries {
-                    let delay = backoff_delay(attempt, e.retry_after);
+                    let delay = backoff_delay(
+                        attempt,
+                        e.retry_after,
+                        e.overload
+                            .then(|| provider.overload_backoff_min())
+                            .flatten(),
+                    );
                     if !quiet {
                         eprintln!(
                             "[zoder] {} (retry {}/{} in {:.1}s)",
@@ -6397,7 +6459,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                     pcfg,
                     Some(provider_request_timeout_s(cli, &eng.cfg)),
                 )?
-                .with_wait_notices(!cli.quiet),
+                .with_wait_notices(!cli.quiet)
+                .with_request_stream(pcfg.stream),
             );
         }
         // Per-model request budget. The cached client above is built with the
@@ -6483,17 +6546,19 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             }
         }
         let model_started = std::time::Instant::now();
-        match try_model(
-            provider,
-            &req,
-            cli.json,
-            cli.retries,
-            cli.quiet,
-            &ledger,
-            &mut initial_reservation,
-        )
-        .await?
-        {
+        let link_call_budget = eng
+            .cfg
+            .provider(&pid)
+            .map(|pcfg| eng.cfg.provider_call_budget(pcfg));
+        let call = ModelCall {
+            json: cli.json,
+            retries: cli.retries,
+            quiet: cli.quiet,
+            ledger: &ledger,
+            initial_reservation: &mut initial_reservation,
+            call_budget: link_call_budget,
+        };
+        match try_model_with_budget(provider, &req, call).await? {
             Ok((res, reservation)) => {
                 if link_gated {
                     crate::provider_health::record_success(&eng.cfg.health_path, &pid, model_id);
@@ -8585,7 +8650,7 @@ async fn agentic_cost(
                 // return the unknown tuple, and an extra sleep here
                 // would only delay the operator-visible diagnostic.
                 if attempt + 1 < AGENTIC_COST_MAX_ATTEMPTS {
-                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                    tokio::time::sleep(backoff_delay(attempt, None, None)).await;
                 }
             }
         }
@@ -13255,6 +13320,9 @@ async fn run_probe_all(
         provider_paid: bool,
         provider_cost_neutral: bool,
         provider: OpenAiProvider,
+        /// Host-wide call-budget params for this provider's endpoint group
+        /// (`rate_limit_group`, `max_concurrent`, `max_requests_per_minute`).
+        call_budget: (String, usize, u32),
         targets: Vec<String>,
         dropped: usize,
     }
@@ -13371,6 +13439,7 @@ async fn run_probe_all(
             provider_paid: p.paid || p.billing == BillingMode::Metered,
             provider_cost_neutral: !p.paid && p.billing != BillingMode::Metered,
             provider,
+            call_budget: eng.cfg.provider_call_budget(p),
             targets,
             dropped,
         });
@@ -13395,6 +13464,7 @@ async fn run_probe_all(
             provider_paid,
             provider_cost_neutral,
             provider,
+            call_budget,
             targets,
             dropped,
         } = plan;
@@ -13452,6 +13522,47 @@ async fn run_probe_all(
                     format!("verifying ledger reservation before health probe for {model_id}")
                 })?;
             let t = std::time::Instant::now();
+            // Host-wide call budget for this provider's endpoint group: keep
+            // the sweep inside the configured concurrency/rate caps (no-op
+            // when the provider declares no cap). A queue timeout records the
+            // target as a classified failure and moves on, like any other
+            // ping failure.
+            let probe_budget = {
+                let (ref group, conc, rpm) = call_budget;
+                if conc == 0 && rpm == 0 {
+                    None
+                } else {
+                    match zoder_core::provider_rate::acquire(
+                        &Config::home(),
+                        group,
+                        conc,
+                        rpm,
+                        zoder_core::provider_rate::queue_timeout_from_env(),
+                        quiet,
+                    )
+                    .await
+                    {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            let note = format!("call budget queue: {e}");
+                            health.record_classified_failure(
+                                model_id,
+                                &note,
+                                &provider_id,
+                                Classification::Error,
+                            );
+                            provider_outcomes.push(ProbeOutcome {
+                                provider_id: provider_id.clone(),
+                                model_id: model_id.clone(),
+                                latency_ms: None,
+                                classification: Classification::Error,
+                                note: Some(note),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            };
             let outcome =
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
                     Ok(Ok(result)) => {
@@ -13513,6 +13624,7 @@ async fn run_probe_all(
                     }
                 };
             provider_outcomes.push(outcome);
+            drop(probe_budget);
         }
 
         // Human path: print this provider's block IMMEDIATELY and
@@ -13782,6 +13894,28 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         provider_cfg,
         Some(provider_request_timeout_s(cli, &eng.cfg)),
     )?;
+    // Host-wide call budget for this provider's endpoint group: a refresh
+    // burst against a shared free endpoint is the same 429/503 source as
+    // review bursts (no-op when the provider declares no cap).
+    let refresh_budget = {
+        let (group, conc, rpm) = eng.cfg.provider_call_budget(provider_cfg);
+        if conc == 0 && rpm == 0 {
+            None
+        } else {
+            Some(
+                zoder_core::provider_rate::acquire(
+                    &Config::home(),
+                    &group,
+                    conc,
+                    rpm,
+                    zoder_core::provider_rate::queue_timeout_from_env(),
+                    cli.quiet,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("endpoint group {group}: {e}"))?,
+            )
+        }
+    };
     let served = provider.list_models().await.map_err(|e| {
         anyhow::anyhow!(
             "could not list models from {}: {}",
@@ -13789,6 +13923,7 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
             e.message
         )
     })?;
+    drop(refresh_budget);
 
     // Free-provider catalog ingestion: every provider that declares `serves`
     // prefixes and is billed free contributes its live open-weight catalog to
@@ -13806,7 +13941,26 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
         let ids = if p.id == default_id {
             served.clone()
         } else {
-            match OpenAiProvider::new_with_request_timeout_s(
+            // Same host-wide call budget for this provider's endpoint group
+            // (no-op when no cap is declared).
+            let (group, conc, rpm) = eng.cfg.provider_call_budget(p);
+            let _budget = if conc == 0 && rpm == 0 {
+                None
+            } else {
+                Some(
+                    zoder_core::provider_rate::acquire(
+                        &Config::home(),
+                        &group,
+                        conc,
+                        rpm,
+                        zoder_core::provider_rate::queue_timeout_from_env(),
+                        cli.quiet,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("endpoint group {group}: {e}"))?,
+                )
+            };
+            let ids = match OpenAiProvider::new_with_request_timeout_s(
                 p,
                 Some(provider_request_timeout_s(cli, &eng.cfg)),
             ) {
@@ -13825,7 +13979,9 @@ async fn cmd_refresh(cli: &Cli) -> anyhow::Result<()> {
                     }
                     continue;
                 }
-            }
+            };
+            drop(_budget);
+            ids
         };
         let kept: Vec<String> = ids
             .into_iter()
@@ -15664,6 +15820,12 @@ mod probe_skip_class_tests {
             serves: serves.iter().map(|s| s.to_string()).collect(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -15947,6 +16109,12 @@ mod default_probe_scope_tests {
             serves: serves.iter().map(|s| s.to_string()).collect(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -16162,6 +16330,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(
             classify_provider(&p, "enterprise/review-model"),
@@ -16180,6 +16354,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(classify_provider(&p, "x"), ProviderClass::Paid);
         let p = Provider {
@@ -16195,6 +16375,12 @@ mod scenario_routing_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert_eq!(classify_provider(&p, "MiniMax-M3"), ProviderClass::Free);
     }
@@ -17313,6 +17499,12 @@ mod subscription_utilization_render_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let out = render_subscription_utilization_section(&cfg, &store, &catalog, &pal(), now);
         // Both labels must surface so the operator can tell them apart.
@@ -17409,6 +17601,12 @@ mod model_selection_tests {
             serves: vec!["minimax/".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.providers.push(Provider {
             model_aliases: Vec::new(),
@@ -17429,6 +17627,12 @@ mod model_selection_tests {
             ],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         cfg.primary_model = primary_model.map(|s| s.to_string());
         cfg.reviewer_model = reviewer_model.map(|s| s.to_string());
@@ -17507,6 +17711,12 @@ mod model_selection_tests {
             serves: vec!["shared-model".into(), "safe-model".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         }
     }
 
@@ -17880,6 +18090,12 @@ model_provider = "custom.minimax"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let engine_models = EngineModelRegistry::from_toml(
             r#"
@@ -17941,6 +18157,12 @@ model_provider = "custom.groq"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let routing = RoutingContext {
             entries: Vec::new(),
@@ -17971,6 +18193,12 @@ model_provider = "custom.groq"
             serves: vec!["openai/gpt-oss-120b".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let cli = Cli::try_parse_from(["zoder", "exec", "-m", "openai/gpt-oss-120b"]).unwrap();
         let eng = Engine::from_parts(cfg, fixture_corpus());
@@ -19607,6 +19835,12 @@ model_provider = "custom.minimax"
             serves: vec!["free/nemotron".into(), "free/llama".into()],
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         });
         let mut corpus = fixture_corpus();
         // Pin corpus entries: the head is paid (owned by the metered
@@ -19833,6 +20067,12 @@ model_provider = "custom.minimax"
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             },
             Provider {
                 model_aliases: Vec::new(),
@@ -19847,6 +20087,12 @@ model_provider = "custom.minimax"
                 serves: vec!["gpt-".into()],
                 azure_api_version: None,
                 max_context_tokens: None,
+                overload_backoff_min_s: None,
+                first_token_timeout_s: None,
+                stream: None,
+                rate_limit_group: None,
+                max_concurrent: None,
+                max_requests_per_minute: None,
             },
         ];
         cfg.default_provider = "openai-sub".into();
@@ -20643,6 +20889,12 @@ mod ledger_call_cost_tests {
             serves: Vec::new(),
             azure_api_version: None,
             max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
         };
         assert!(!p.is_flat_plan());
         p.billing = BillingMode::Free;
