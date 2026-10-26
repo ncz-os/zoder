@@ -9510,6 +9510,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::path::PathBuf;
+    use zoder_core::Config;
 
     /// Regression test (2026-10-26 Codex Hive job, ACHILLES): inside
     /// Codex's workspace-write sandbox `~/.zoder` is read-only, so
