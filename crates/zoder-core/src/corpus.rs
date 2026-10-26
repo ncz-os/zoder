@@ -71,6 +71,46 @@ fn warn_overlay_once_flagged(latch: &AtomicBool, args: fmt::Arguments<'_>) -> bo
     true
 }
 
+/// Default staleness threshold for a loaded corpus/pricing artifact, in days.
+///
+/// The public corpus and pricing catalog are rebuilt daily, so a week is
+/// already generous: on 2026-10-26 the published corpus was 13 days old and
+/// nothing said so.
+pub const DEFAULT_STALE_DAYS: i64 = 7;
+
+/// Environment variable that overrides [`DEFAULT_STALE_DAYS`] for both the
+/// model corpus and the pricing catalog. `0` disables the warning.
+pub const STALE_DAYS_ENV: &str = "ZODER_CORPUS_STALE_DAYS";
+
+/// Parse a corpus/pricing date, which publishers write as `YYYY-MM-DD`.
+///
+/// RFC 3339 timestamps are accepted too (a builder that switches to a full
+/// timestamp should not turn the age check off); anything else yields `None`.
+pub fn parse_corpus_date(raw: &str) -> Option<chrono::NaiveDate> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d);
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.date_naive())
+}
+
+/// [`DEFAULT_STALE_DAYS`] unless `$ZODER_CORPUS_STALE_DAYS` says otherwise.
+///
+/// A value that does not parse falls back to the default: silently disabling
+/// the warning because of a typo would reproduce exactly the outage this
+/// guards against. `0` (or any negative number) disables the check.
+pub fn stale_threshold_from_env() -> i64 {
+    match std::env::var(STALE_DAYS_ENV) {
+        Ok(raw) => raw.trim().parse::<i64>().unwrap_or(DEFAULT_STALE_DAYS),
+        Err(_) => DEFAULT_STALE_DAYS,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -690,6 +730,14 @@ enum OverlayRead {
 pub struct Corpus {
     #[serde(default)]
     pub source: String,
+    /// The date this corpus was BUILT (`YYYY-MM-DD`), as the builder writes it.
+    /// Optional: a corpus produced before the field existed simply has it
+    /// empty, and `skip_serializing_if` keeps such a corpus byte-identical to
+    /// one written before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated: String,
+    /// The date the underlying arena snapshot was taken (`YYYY-MM-DD`). Serves
+    /// as the age fallback when `generated` is absent or unparsable.
     #[serde(default)]
     pub arena_date: String,
     #[serde(default)]
@@ -718,6 +766,8 @@ struct CorpusWire {
     #[serde(default)]
     source: String,
     #[serde(default)]
+    generated: String,
+    #[serde(default)]
     arena_date: String,
     #[serde(default)]
     count: usize,
@@ -729,6 +779,7 @@ impl From<CorpusWire> for Corpus {
     fn from(wire: CorpusWire) -> Self {
         let mut corpus = Corpus {
             source: wire.source,
+            generated: wire.generated,
             arena_date: wire.arena_date,
             count: wire.count,
             models: wire.models,
@@ -1010,6 +1061,7 @@ impl Corpus {
 
         let mut corpus = Corpus {
             source: str_field("source"),
+            generated: str_field("generated"),
             arena_date: str_field("arena_date"),
             count: models.len(),
             models,
@@ -1128,6 +1180,69 @@ impl Corpus {
             }
         }
         self.aliases = aliases;
+    }
+
+    /// The age of this corpus in days, as of `today`.
+    ///
+    /// Uses `generated` (the build date the publisher writes) and falls back to
+    /// `arena_date` when `generated` is absent or not a `YYYY-MM-DD` date —
+    /// an older corpus may carry only the arena snapshot date. Returns `None`
+    /// when neither parses, which callers must treat as "age unknown", never
+    /// as "fresh" or "stale": a date we cannot read is not evidence of rot.
+    ///
+    /// A corpus dated in the FUTURE yields a negative age rather than being
+    /// clamped to 0: a clock-skewed or mislabelled build should not look
+    /// fresh, but it also must not trip a staleness warning, and a negative
+    /// number does neither.
+    pub fn age_days(&self, today: chrono::NaiveDate) -> Option<i64> {
+        let built =
+            parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))?;
+        Some((today - built).num_days())
+    }
+
+    /// The date [`Self::age_days`] measured from, for the warning text.
+    pub fn age_date(&self) -> Option<chrono::NaiveDate> {
+        parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))
+    }
+
+    /// A one-line warning when this corpus is older than `max_days`, or `None`
+    /// when it is fresh (or its age cannot be determined).
+    ///
+    /// `max_days` is the staleness threshold in days; `0` disables the check
+    /// entirely. [`Self::staleness_warning_from_env`] is the CLI entry point,
+    /// which reads `$ZODER_CORPUS_STALE_DAYS`.
+    ///
+    /// The message names the age AND the date it measured, so an operator can
+    /// tell "the corpus is old" from "this machine's clock is wrong", and it
+    /// carries the exact command that fixes it. It is prefixed `warning:` and
+    /// meant for stderr: nothing here fails a command, and stdout stays
+    /// machine-parseable.
+    pub fn staleness_warning(&self, today: chrono::NaiveDate, max_days: i64) -> Option<String> {
+        if max_days <= 0 {
+            // 0 (or a negative) explicitly disables the check.
+            return None;
+        }
+        let days = self.age_days(today)?;
+        if days <= max_days {
+            return None;
+        }
+        let date = self.age_date()?;
+        Some(format!(
+            "warning: model corpus is {days} days old (generated {date}). \
+             Re-pull it with: curl -fsSL https://raw.githubusercontent.com/ncz-os/zoder/master/corpus/model_corpus.json \
+             -o ~/.zoder/model_corpus.json (or re-run the installer)"
+        ))
+    }
+
+    /// [`Self::staleness_warning`] with the threshold read from
+    /// `$ZODER_CORPUS_STALE_DAYS` (default [`DEFAULT_STALE_DAYS`]).
+    ///
+    /// An unset, empty or unparsable value falls back to the default rather
+    /// than disabling the check: a typo in an environment variable must never
+    /// be the reason an operator stops hearing about a stale corpus. `0`
+    /// disables it on purpose.
+    pub fn staleness_warning_from_env(&self, today: chrono::NaiveDate) -> Option<String> {
+        self.staleness_warning(today, stale_threshold_from_env())
     }
 
     pub fn free_chat(&self) -> impl Iterator<Item = &ModelEntry> {
@@ -2990,5 +3105,161 @@ mod corpus_io_tests {
 
         assert_eq!(corpus.resolve_alias("short:gone"), "short:gone");
         assert!(corpus.get("short:gone").is_none());
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    //! The client-side half of the 2026-10-13 outage: the published corpus was
+    //! 13 days old and no command said so. These pin the age arithmetic, the
+    //! warn/quiet boundary, and the env override.
+    use super::*;
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("valid test date")
+    }
+
+    fn corpus(generated: &str, arena_date: &str) -> Corpus {
+        Corpus {
+            generated: generated.to_string(),
+            arena_date: arena_date.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fresh_corpus_has_no_warning() {
+        let c = corpus("2026-10-26", "");
+        assert_eq!(Some(0), c.age_days(day("2026-10-26")));
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+    }
+
+    #[test]
+    fn eight_days_old_warns_and_names_the_age_and_date() {
+        let c = corpus("2026-10-18", "");
+        let w = c.staleness_warning(day("2026-10-26"), 7).expect("warning");
+        assert!(w.starts_with("warning: model corpus is 8 days old"), "{w}");
+        assert!(w.contains("generated 2026-10-18"), "{w}");
+        assert!(w.contains("curl -fsSL"), "{w}");
+        assert!(w.contains("model_corpus.json"), "{w}");
+    }
+
+    #[test]
+    fn exactly_seven_days_is_not_yet_stale() {
+        // The limit is inclusive: 7 days old is acceptable, 8 is not.
+        let c = corpus("2026-10-19", "");
+        assert_eq!(Some(7), c.age_days(day("2026-10-26")));
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+        let older = corpus("2026-10-19", "");
+        assert!(older.staleness_warning(day("2026-10-26"), 6).is_some());
+    }
+
+    #[test]
+    fn missing_or_malformed_dates_never_warn() {
+        for (generated, arena) in [
+            ("", ""),
+            ("", "not-a-date"),
+            ("2026-13-45", ""),
+            ("yesterday", "n/a"),
+        ] {
+            let c = corpus(generated, arena);
+            assert_eq!(None, c.age_days(day("2026-10-26")), "{generated}/{arena}");
+            assert!(
+                c.staleness_warning(day("2026-10-26"), 7).is_none(),
+                "an unreadable date is not evidence of staleness: {generated}/{arena}"
+            );
+        }
+    }
+
+    #[test]
+    fn arena_date_is_the_fallback_when_generated_is_absent() {
+        let c = corpus("", "2026-10-01");
+        assert_eq!(Some(25), c.age_days(day("2026-10-26")));
+        let w = c.staleness_warning(day("2026-10-26"), 7).expect("warning");
+        assert!(w.contains("25 days old"), "{w}");
+        assert!(w.contains("generated 2026-10-01"), "{w}");
+    }
+
+    #[test]
+    fn generated_wins_over_arena_date() {
+        // A freshly rebuilt corpus can sit on an older arena snapshot; its
+        // build date is what says how current the FILE is.
+        let c = corpus("2026-10-26", "2026-09-01");
+        assert_eq!(Some(0), c.age_days(day("2026-10-26")));
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+    }
+
+    #[test]
+    fn a_future_date_does_not_warn() {
+        let c = corpus("2026-11-02", "");
+        assert!(c.age_days(day("2026-10-26")).unwrap() < 0);
+        assert!(c.staleness_warning(day("2026-10-26"), 7).is_none());
+    }
+
+    #[test]
+    fn env_threshold_defaults_overrides_and_disables() {
+        // Serialized through one test: the env is process-global, and each
+        // assertion restores it, so no other test sees a stray value.
+        let c = corpus("2026-10-20", ""); // 6 days old on 2026-10-26
+        let today = day("2026-10-26");
+        let saved = std::env::var(STALE_DAYS_ENV).ok();
+
+        std::env::remove_var(STALE_DAYS_ENV);
+        assert_eq!(DEFAULT_STALE_DAYS, stale_threshold_from_env());
+        assert!(c.staleness_warning_from_env(today).is_none());
+
+        std::env::set_var(STALE_DAYS_ENV, "3");
+        assert_eq!(3, stale_threshold_from_env());
+        assert!(c.staleness_warning_from_env(today).is_some());
+
+        std::env::set_var(STALE_DAYS_ENV, "0");
+        assert!(
+            c.staleness_warning_from_env(today).is_none(),
+            "0 must disable the check"
+        );
+
+        std::env::set_var(STALE_DAYS_ENV, "garbage");
+        assert_eq!(
+            DEFAULT_STALE_DAYS,
+            stale_threshold_from_env(),
+            "a typo must fall back to the default, not disable the warning"
+        );
+        assert!(c.staleness_warning_from_env(today).is_none());
+
+        match saved {
+            Some(v) => std::env::set_var(STALE_DAYS_ENV, v),
+            None => std::env::remove_var(STALE_DAYS_ENV),
+        }
+    }
+
+    #[test]
+    fn round_trip_without_generated_is_byte_identical() {
+        // A corpus written before `generated` existed must serialize exactly
+        // as it used to: the field is skipped when empty.
+        let raw = r#"{"source":"builder","arena_date":"2026-10-01","count":1,"models":[{"id":"m1","paid":false}]}"#;
+        let c: Corpus = serde_json::from_str(raw).expect("parse");
+        assert_eq!("", c.generated);
+        let out = serde_json::to_string(&c).expect("serialize");
+        assert!(
+            !out.contains("generated"),
+            "empty `generated` must not be emitted: {out}"
+        );
+        let again: Corpus = serde_json::from_str(&out).expect("reparse");
+        assert_eq!(out, serde_json::to_string(&again).expect("reserialize"));
+    }
+
+    #[test]
+    fn generated_survives_a_round_trip_when_present() {
+        let c = corpus("2026-10-26", "2026-10-25");
+        let out = serde_json::to_string(&c).expect("serialize");
+        assert!(out.contains("\"generated\":\"2026-10-26\""), "{out}");
+        let back: Corpus = serde_json::from_str(&out).expect("reparse");
+        assert_eq!("2026-10-26", back.generated);
+    }
+
+    #[test]
+    fn rfc3339_timestamps_are_accepted() {
+        let c = corpus("2026-10-18T04:05:06Z", "");
+        assert_eq!(Some(8), c.age_days(day("2026-10-26")));
     }
 }

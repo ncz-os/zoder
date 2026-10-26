@@ -1,6 +1,6 @@
 """Shared helpers for ingesting Next.js RSC-streamed leaderboards.
 
-Several coding leaderboards (Terminal-Bench, arena.ai) are Next.js apps that
+Some coding leaderboards (Terminal-Bench, Scale SEAL) are Next.js apps that
 stream their data as React Server Component chunks: a series of
 `self.__next_f.push([N, "<json-escaped chunk>"])` calls whose concatenated,
 unescaped payload contains the leaderboard JSON. These helpers reconstruct that
