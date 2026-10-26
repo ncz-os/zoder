@@ -1235,8 +1235,9 @@ fn range_binding_evidence(
             // The LEADING name of the chain is what a binding is looked up
             // by: `json.loads` -> `json`, `urllib.request.urlopen` ->
             // `urllib` (whose import of `urllib.request` also binds the
-            // dotted path), `dt.datetime.now` -> `dt`.
-            let _ = is_module;
+            // dotted path), `dt.datetime.now` -> `dt`. `name_evidence` tries
+            // every shorter prefix of a dotted name, so an import of either
+            // `urllib` or `urllib.request` proves it.
             let name = head.to_string();
             if !names.iter().any(|n| n == &name) {
                 names.push(name);
@@ -2290,6 +2291,41 @@ pub(crate) mod tests {
             "the module uses names nothing defines.",
             "tools/report.py",
             Some("tools/report.py"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+    /// A dotted module name is proved by an import of the full path OR of any
+    /// shorter prefix of it.
+    #[test]
+    fn a_dotted_module_is_proved_by_the_import_of_any_prefix() {
+        let dotted = "import urllib.request\n\nurllib.request.urlopen(u)\n";
+        let head_only = "import urllib\n\nurllib.request.urlopen(u)\n";
+        for source in [dotted, head_only] {
+            let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                "Undefined constants and missing imports",
+                "the range uses the urllib module but nothing imports it.",
+                "tools/report.py",
+                Some("tools/report.py:3-3"),
+                None,
+                &read,
+            )
+            .expect("an import of the module or its prefix proves it");
+            assert!(record["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("import urllib"));
+        }
+        // No import of any prefix -> kept.
+        let bare = "urllib.request.urlopen(u)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the urllib module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:1-1"),
             None,
             &read,
         )
