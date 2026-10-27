@@ -1092,6 +1092,71 @@ until then use the commands above or re-run the installer.)
 > may be free for *you* though they carry a list price — `zoder refresh` against
 > your own endpoint, plus local config, is what marks those routable for you.
 
+
+### Using your own price and corpus files
+
+By default (`auto`) zoder treats the installed price and corpus files as
+public data it may refresh: when the engine's copy is missing or older than
+24 h (by file modification time), `zoder report` and `zoder tui` spawn a
+detached `zoder pricing refresh`, and `zoder pricing refresh` /
+`zoder refresh` always overwrite their target files.
+
+Set the pricing source to **`file`** to make the installed files
+authoritative: they are used exactly as installed — never re-pulled, never
+overwritten, and staleness is judged by the *data's own date* rather than
+the file's modification time. Any ONE of these three switches selects
+`file` (the first match wins):
+
+- env var: `ZODER_PRICING_SOURCE=file` (`auto` or unset keeps the default;
+  any other value prints one warning and is treated as `auto`);
+- config key: `[pricing] source = "file"` in your config (validated by
+  `zoder config --validate`);
+- marker in the data file itself: a top-level `"managed": true` in
+  `~/.zoder/pricing.json` or `~/.zoder/model_corpus.json`. This works even
+  when the installed binary is older or newer than the config, so an
+  installer can mark its own files without a config change.
+
+In `file` mode:
+
+- the daily auto-refresh never spawns (the age warning below is printed
+  instead);
+- `zoder pricing refresh` refuses to overwrite the report catalog *or* the
+  engine copy and exits non-zero, with one stderr line naming the switch
+  that selected `file`; pass `--force` to refresh anyway;
+- `zoder refresh` still does its read-only reconciliation and prints it,
+  but refuses to save the reconciled corpus (and the alias-overlay rows
+  persisted with it) without `--force`.
+
+The `file` protection does not depend on your config loading: the env var
+and the `"managed": true` marker are honoured even when the config cannot
+be read, and `[pricing] source = "file"` is honoured even when the rest of
+the config fails validation. A broken config is exactly when an overwrite
+is least likely to be noticed, so it must never switch the protection off.
+
+Both files may also carry optional provenance metadata: a top-level
+`"source"` (a string label), `"generated"` (a `YYYY-MM-DD` date or an
+RFC3339 timestamp; the first 10 characters are taken) and
+`"generated_at"` (an RFC3339 timestamp with `Z`, which wins when both
+parse). Files without these fields load and save without them.
+
+**Age warning.** When the installed data is more than 7 days old *by its
+own date*, one line per installed file is printed on stderr (it never fails
+the command and never touches stdout) when `zoder report`, `zoder tui`, or
+`zoder pricing show` runs. Both installed files are covered: the pricing
+catalog (`~/.zoder/pricing.json`) and the model corpus
+(`~/.zoder/model_corpus.json`) — the corpus is the file the router reads, so
+a stale corpus matters at least as much as a stale price list. In `file`
+mode the hint says the data was installed by its installer and should be
+updated there — it does not tell you to re-pull the public files. In auto
+mode it points at `zoder pricing refresh`. A file whose date cannot be
+parsed gets `age unknown` once. The threshold is `ZODER_CORPUS_STALE_DAYS`
+(integer days; an invalid value falls back to 7; `0` disables the warning).
+
+Each file is measured by its own date rule: the pricing catalog by its
+`generated`/`generated_at` fields, the corpus by `generated_at`, then
+`generated`, then the `arena_date` fallback.
+
+
 ### Freshness gates
 
 The daily `corpus-sync` job refreshes the public artifacts from the public
@@ -1138,6 +1203,7 @@ acknowledgement.
 
 A schema-1 report (no `schema` key) is still accepted and keeps the historic
 single-gate behaviour.
+
 
 ### Price and name-matching conformance
 

@@ -649,10 +649,123 @@ pub fn is_known_unpriceable_model(model_id: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// The data's own date, read from a pricing/corpus file's metadata — NEVER
+/// from the file's modification time (which changes on every re-write or
+/// copy and says nothing about how old the data is).
+///
+/// Takes the `generated` field (a `"YYYY-MM-DD"` date or an RFC3339
+/// timestamp whose first 10 characters are the date) and the optional
+/// `generated_at` field (an RFC3339 timestamp with `Z`). When BOTH parse,
+/// `generated_at` wins, because it is the writer's more precise claim.
+/// Garbage, empty, or missing inputs yield `None`.
+pub fn data_date(generated: &str, generated_at: &str) -> Option<chrono::NaiveDate> {
+    if !generated_at.is_empty() {
+        if let Ok(d) = parse_data_date(generated_at) {
+            return Some(d);
+        }
+    }
+    if !generated.is_empty() {
+        if let Ok(d) = parse_data_date(generated) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+fn parse_data_date(value: &str) -> Result<chrono::NaiveDate, ()> {
+    // RFC3339 with an explicit offset ("Z" or ±HH:MM) — take the date part.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.date_naive());
+    }
+    // "YYYY-MM-DD" (optionally followed by a space+time we do not need).
+    let ten: String = value.chars().take(10).collect();
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(&ten, "%Y-%m-%d") {
+        // Guard against "12345-01-02" style strings: the 11th char must be
+        // end-of-string, a space, 'T', or 'Z' for the date prefix to count.
+        if value.len() == 10
+            || matches!(value.chars().nth(10), Some(c) if c == ' ' || c == 'T' || c == 'Z' || c == '+')
+        {
+            return Ok(d);
+        }
+    }
+    Err(())
+}
+
+/// Whether `~/.zoder/pricing.json` or `~/.zoder/model_corpus.json` declares
+/// `"managed": true` at its top level, i.e. it was installed by its
+/// installer and must not be re-pulled or overwritten by zoder. Reads the
+/// file directly (not through the catalog/corpus loaders, which ignore the
+/// flag on purpose) so the marker works even when the binary is older or
+/// newer than the config.
+pub fn file_is_managed(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.get("managed").and_then(|m| m.as_bool()).unwrap_or(false)
+}
+
+/// Strip the group- and world-write bits from a file zoder wrote.
+///
+/// [`PricingCatalog::load`] refuses a catalog that is group- or
+/// world-writable, and `fs::write` inherits the process umask -- a lax umask
+/// (0002, as on many hosts and CI runners) leaves the file at 0664, which the
+/// loader then rejects as an empty catalog, collapsing every rate to unknown.
+/// The write paths therefore pin the mode themselves instead of trusting the
+/// umask. The mode is only ever narrowed, never widened: the current mode
+/// minus the shared write bits.
+///
+/// The errors are propagated on purpose. A file whose mode cannot be made
+/// safe must not be installed over the live one -- a catalog the loader will
+/// refuse is worse than a stale one, because the loader reports it as EMPTY.
+#[cfg(unix)]
+pub(crate) fn harden_catalog_mode(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(path)?;
+    let mode = meta.mode() & 0o7777 & !0o022;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// The loader's permission gate is Unix-only, so on other platforms there
+/// are no group/world write bits to strip.
+#[cfg(not(unix))]
+pub(crate) fn harden_catalog_mode(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingCatalog {
+    /// Top-level `"managed": true` in the pricing file: the file is managed
+    /// by its installer and must never be re-pulled or overwritten by zoder.
+    /// Read via [`file_is_managed`] on the raw file; carried here so a loaded
+    /// catalog can answer without a second file read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
+    /// Raw bytes of a file that parsed as JSON but is not a pricing catalog
+    /// (missing `models` map). Preserved so an unforced `save` of such a
+    /// file is a byte-identical no-op instead of clobbering it with an empty
+    /// catalog. Never serialized.
+    #[serde(skip)]
+    pub raw: Option<String>,
     #[serde(default)]
     pub generated: String,
+    /// Provenance label of the file's data (e.g. the name of the price
+    /// database an installer pulled it from). `None` round-trips as absent
+    /// so a file without the field never gains one; an empty string
+    /// (deliberately written) round-trips as `""`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Full RFC3339 generation timestamp (with `Z`), when the writer had
+    /// one. Wins over `generated` in [`data_date`] when both parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
     #[serde(default)]
     pub window: String,
     #[serde(default)]
@@ -662,6 +775,22 @@ pub struct PricingCatalog {
     pub baseline_usd_per_mtok: f64,
     #[serde(default)]
     pub baseline_model: String,
+}
+
+impl Default for PricingCatalog {
+    fn default() -> Self {
+        Self {
+            managed: false,
+            raw: None,
+            generated: String::new(),
+            source: None,
+            generated_at: None,
+            window: String::new(),
+            models: HashMap::new(),
+            baseline_usd_per_mtok: 0.0,
+            baseline_model: String::new(),
+        }
+    }
 }
 
 /// Stable verdict from [`PricingCatalog::classify_cost`]: separates "free
@@ -744,11 +873,25 @@ impl PricingCatalog {
                 return cat;
             }
         };
+        // When the file is valid JSON but NOT a pricing catalog (missing
+        // `models` map), remember the raw bytes: a save without --force
+        // would otherwise replace an unknown-but-valid file with an empty
+        // catalog and destroy it.
+        let is_catalog = v.get("models").and_then(|m| m.as_object()).is_some();
+        if !is_catalog {
+            cat.raw = Some(s);
+        }
         cat.generated = v
             .get("generated")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        cat.managed = v.get("managed").and_then(|m| m.as_bool()).unwrap_or(false);
+        cat.source = v.get("source").and_then(|x| x.as_str()).map(str::to_string);
+        cat.generated_at = v
+            .get("generated_at")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
         cat.window = v
             .get("window")
             .and_then(|x| x.as_str())
@@ -807,6 +950,23 @@ impl PricingCatalog {
     /// up. Mirrors the `write_atomic` pattern in `crates/model-health/src/lib.rs`
     /// and `Corpus::save` (kept self-contained here -- no cross-crate dep).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        // A file that loaded as JSON but not as a catalog was never written
+        // by zoder: an unforced save must not replace it with an empty
+        // catalog. Write the raw bytes back (a byte-identical no-op) and
+        // stop. Callers that mean to replace it (e.g. `pricing refresh
+        // --force`) build a fresh catalog whose `raw` is `None`.
+        if let Some(raw) = &self.raw {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(path, raw)?;
+            // The bytes are back, but the mode still has to be one the
+            // loader accepts: `fs::write` keeps the mode of an existing file
+            // and inherits the umask for a new one, so a lax umask (0002)
+            // leaves a catalog the loader rejects as empty.
+            harden_catalog_mode(path)?;
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -818,6 +978,21 @@ impl PricingCatalog {
         if let Err(e) = std::fs::write(&tmp, &data) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
+        }
+        // The loader refuses a group- or world-writable catalog, so the file
+        // this writes must not be one. `fs::write` inherits the process
+        // umask, and a lax umask (0002, as on many hosts and CI runners)
+        // leaves the temp at 0664 -- a catalog the loader would then reject
+        // as empty, collapsing every rate to unknown. Strip the group and
+        // other write bits so a saved catalog is loadable again. If the mode
+        // cannot be made safe the save fails: the temp is removed and the
+        // rename never happens, so a catalog the loader would refuse is
+        // never installed over the live one.
+        if let Err(e) = harden_catalog_mode(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.context(
+                "the saved pricing catalog could not be made safe to load; refusing to install it",
+            ));
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -1790,5 +1965,283 @@ mod staleness_tests {
             assert_eq!(None, c.age_days(day("2026-10-26")), "{g}");
             assert!(c.staleness_warning(day("2026-10-26"), 7).is_none(), "{g}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pricing_source_metadata_tests {
+    use super::*;
+
+    /// Write a catalog file with a mode the loader accepts. The loader
+    /// refuses a group- or world-writable catalog, and `fs::write` inherits
+    /// the process umask, so on a host with a lax umask (0002, as on many
+    /// hosts and CI runners) the file would land at 0664 and be rejected as
+    /// empty.
+    fn write_catalog(path: &std::path::Path, body: &[u8]) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn data_date_parses_plain_date() {
+        assert_eq!(
+            data_date("2026-10-14", ""),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    #[test]
+    fn data_date_parses_rfc3339_timestamp() {
+        assert_eq!(
+            data_date("2026-10-14T05:00:00Z", ""),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    #[test]
+    fn data_date_generated_at_wins_when_both_parse() {
+        assert_eq!(
+            data_date("2026-01-01", "2026-10-14T05:00:00Z"),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    #[test]
+    fn data_date_generated_used_when_generated_at_garbage() {
+        assert_eq!(
+            data_date("2026-10-14", "not-a-date"),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    #[test]
+    fn data_date_garbage_and_empty_are_none() {
+        assert_eq!(data_date("garbage", ""), None);
+        assert_eq!(data_date("", ""), None);
+        assert_eq!(data_date("", "garbage"), None);
+        assert_eq!(data_date("2026-13-99", ""), None);
+    }
+
+    /// A pricing file that predates the `generated_at` field must load and
+    /// re-save WITHOUT inventing new top-level keys: no `generated_at`, no
+    /// `managed`. (Full byte-equality of the re-save is not asserted: the
+    /// loader normalizes the per-model rate map, which is pre-existing
+    /// behavior — the regression this test pins is the new fields.)
+    #[test]
+    fn pricing_file_without_new_fields_round_trips_without_new_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let original = br#"{
+    "generated": "2026-10-13",
+    "source": "litellm+openrouter (public)",
+    "models": {
+        "gpt-4o": {
+            "input_usd_per_mtok": 0.025,
+            "output_usd_per_mtok": 0.1
+        }
+    }
+}"#;
+        write_catalog(&path, original);
+        let cat = PricingCatalog::load(&path);
+        assert_eq!(cat.generated, "2026-10-13");
+        // The top-level `source` the file carries must survive the load.
+        assert_eq!(cat.source.as_deref(), Some("litellm+openrouter (public)"));
+        assert!(cat.generated_at.is_none());
+        assert!(!cat.managed);
+        assert!(
+            cat.raw.is_none(),
+            "a valid catalog must not be treated as raw"
+        );
+        cat.save(&path).unwrap();
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !resaved.contains("generated_at"),
+            "save must not invent a generated_at key the file never had: {resaved}"
+        );
+        assert!(
+            !resaved.contains("\"managed\""),
+            "save must not invent a managed key the file never had: {resaved}"
+        );
+        assert!(
+            resaved.contains("\"source\": \"litellm+openrouter (public)\""),
+            "save must keep the top-level source it loaded: {resaved}"
+        );
+    }
+
+    /// A pricing file WITHOUT the top-level `source` field must re-save
+    /// without the loader inventing one: an absent key stays absent.
+    #[test]
+    fn pricing_file_without_source_field_round_trips_without_new_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let original = br#"{
+    "generated": "2026-10-13",
+    "models": {
+        "gpt-4o": {
+            "input_usd_per_mtok": 0.025,
+            "output_usd_per_mtok": 0.1
+        }
+    }
+}"#;
+        write_catalog(&path, original);
+        let cat = PricingCatalog::load(&path);
+        assert!(cat.source.is_none());
+        cat.save(&path).unwrap();
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        // Top-level keys: the re-save must not invent `source`,
+        // `generated_at`, or `managed`. (Per-model keys are normalized by
+        // the loader — pre-existing behavior — so only top-level is asserted.)
+        let root: serde_json::Value = serde_json::from_str(&resaved).unwrap();
+        assert!(
+            root.get("source").is_none(),
+            "save must not invent a top-level source key: {resaved}"
+        );
+        assert!(
+            root.get("generated_at").is_none(),
+            "save must not invent a generated_at key: {resaved}"
+        );
+        assert!(
+            root.get("managed").is_none(),
+            "save must not invent a managed key: {resaved}"
+        );
+        assert_eq!(
+            root.get("generated").and_then(|v| v.as_str()),
+            Some("2026-10-13"),
+            "existing keys must survive"
+        );
+    }
+
+    #[test]
+    fn pricing_file_with_new_fields_round_trips_and_is_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let original = br#"{
+    "managed": true,
+    "generated": "2026-10-14",
+    "generated_at": "2026-10-14T05:00:00Z",
+    "source": "an internal price database",
+    "models": {}
+}"#;
+        write_catalog(&path, original);
+        let cat = PricingCatalog::load(&path);
+        assert!(cat.managed);
+        assert_eq!(cat.source.as_deref(), Some("an internal price database"));
+        assert_eq!(cat.generated_at.as_deref(), Some("2026-10-14T05:00:00Z"));
+        assert_eq!(
+            data_date(&cat.generated, cat.generated_at.as_deref().unwrap_or("")),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+        assert!(file_is_managed(&path));
+        cat.save(&path).unwrap();
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        assert!(resaved.contains("\"managed\": true"));
+        assert!(resaved.contains("\"generated_at\": \"2026-10-14T05:00:00Z\""));
+        assert!(resaved.contains("\"source\": \"an internal price database\""));
+        assert!(file_is_managed(&path));
+    }
+
+    #[test]
+    fn file_is_managed_false_for_missing_garbage_or_unmanaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        assert!(!file_is_managed(&missing));
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, "not json").unwrap();
+        assert!(!file_is_managed(&garbage));
+        let unmanaged = dir.path().join("pricing.json");
+        std::fs::write(&unmanaged, r#"{"managed": false, "models": {}}"#).unwrap();
+        assert!(!file_is_managed(&unmanaged));
+    }
+}
+
+/// The save path must leave a catalog the loader accepts. The loader
+/// refuses a group- or world-writable file, and `fs::write` inherits the
+/// process umask -- a lax umask (0002, as on many fleet hosts and CI
+/// runners) leaves a freshly written file at 0664, which the loader then
+/// rejects as an EMPTY catalog: every rate collapses to unknown and a
+/// just-written price file reads back as no prices at all.
+#[cfg(test)]
+mod catalog_save_mode_tests {
+    use super::*;
+
+    /// The permission bits of a file, or 0 where the platform has none.
+    fn mode_of(path: &std::path::Path) -> u32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().mode() & 0o7777
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            0
+        }
+    }
+
+    #[test]
+    fn saved_catalog_is_not_group_or_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let mut cat = PricingCatalog {
+            generated: "2026-10-14".into(),
+            ..PricingCatalog::default()
+        };
+        cat.models.insert(
+            "gpt-4o".into(),
+            ModelPrice {
+                input_usd_per_mtok: 0.025,
+                output_usd_per_mtok: 0.1,
+                ..ModelPrice::default()
+            },
+        );
+        cat.save(&path).unwrap();
+        assert_eq!(
+            mode_of(&path) & 0o022,
+            0,
+            "a saved catalog must never be group- or world-writable"
+        );
+        // The loader must accept what the save just wrote.
+        let reloaded = PricingCatalog::load(&path);
+        assert_eq!(reloaded.generated, "2026-10-14");
+        assert_eq!(reloaded.models.len(), 1);
+    }
+
+    /// The byte-preserving save (a file that parsed as JSON but is not a
+    /// catalog) must keep the bytes and leave the file in a mode the loader
+    /// accepts: `fs::write` keeps the mode of the file it overwrites, so a
+    /// group-writable file stays group-writable unless the save pins it.
+    #[test]
+    fn raw_save_keeps_the_bytes_and_hardens_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let body = br#"{"note":"not a pricing catalog"}"#;
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let cat = PricingCatalog::load(&path);
+        assert!(
+            cat.raw.is_some(),
+            "a JSON file without a models map keeps its raw bytes"
+        );
+        // The lax-umask case: the file on disk is group-writable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        cat.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body.to_vec());
+        assert_eq!(
+            mode_of(&path) & 0o022,
+            0,
+            "a saved catalog must never be group- or world-writable"
+        );
     }
 }
