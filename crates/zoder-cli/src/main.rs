@@ -8870,6 +8870,24 @@ fn classify_agentic_cost_summary(
     (0.0, tin, tout, model, false, calls)
 }
 
+/// The cost a turn records, and whether it is known.
+///
+/// A cost-neutral route (a flat plan or a free route) costs $0 even when
+/// the engine's cost query failed, overlapped another turn, or came back
+/// empty: the posture alone proves the call cost nothing, so the turn is a
+/// KNOWN $0 and the paid guard never fires on it. Every other provider keeps
+/// what the cost query said, "unknown" included.
+pub(crate) fn agentic_cost_verdict(
+    cost: f64,
+    cost_known: bool,
+    posture: BillingPosture,
+) -> (f64, bool) {
+    if !cost_known && posture.is_cost_neutral() {
+        return (0.0, true);
+    }
+    (cost, cost_known)
+}
+
 // ---------------------------------------------------------------------------
 // Test environment: shared `ENV_LOCK` for tests that mutate `ZODER_HOME`.
 //
@@ -9154,6 +9172,11 @@ mod agentic_cost_tests {
 
     /// A free route whose engine cost query FAILED (or overlapped) is still
     /// a known $0: the posture alone proves the call cost nothing.
+    ///
+    /// The conversion happens at the CALL SITE, so this test drives the
+    /// production helper that does it. A test that only re-classified a
+    /// fabricated summary would keep passing after the call site stopped
+    /// converting, which is exactly the regression it has to catch.
     #[test]
     fn a_cost_neutral_provider_query_failure_is_known_zero() {
         for (name, report) in [
@@ -9172,15 +9195,19 @@ mod agentic_cost_tests {
         ] {
             let (cost, _, _, _, known, _) = report;
             assert_eq!(cost, 0.0);
-            // The report from an unavailable query is unknown-agnostic; the
-            // CALL SITE turns it into a known $0 for a cost-neutral
-            // provider. The classification of an engine-reported $0 is what
-            // the posture decides:
-            let summary = summary_with_model("MiniMax-M3", 10, 5, 0.0);
-            let (_, _, _, _, known2, _) =
-                classify_agentic_cost_summary(&summary, BillingPosture::Free);
-            let _ = (name, known);
-            assert!(known2, "free route: engine $0 is a known $0");
+            assert!(!known, "{name}: an unavailable query proves no cost");
+            // The production conversion: a cost-neutral posture turns the
+            // unknown into a known $0.
+            for posture in [BillingPosture::Free, BillingPosture::Subscription] {
+                let (cost, known) = agentic_cost_verdict(cost, known, posture);
+                assert_eq!(cost, 0.0, "{name}: a cost-neutral route costs $0");
+                assert!(known, "{name}: a cost-neutral route's $0 is known");
+            }
+            // A METERED provider keeps the unknown: an unpriced call must
+            // fail the month-to-date gate closed, not pass as a verified $0.
+            let (cost, known) = agentic_cost_verdict(cost, known, BillingPosture::Metered);
+            assert_eq!(cost, 0.0);
+            assert!(!known, "{name}: a metered unknown must stay unknown");
         }
     }
 
@@ -12289,11 +12316,7 @@ pub(crate) async fn agentic_turn(
     };
     // A cost-neutral route (free or flat plan) costs $0 even when the engine's
     // cost query failed or overlapped another turn: there is nothing to price.
-    let (cost, cost_known) = if !cost_known && posture.is_cost_neutral() {
-        (0.0, true)
-    } else {
-        (cost, cost_known)
-    };
+    let (cost, cost_known) = agentic_cost_verdict(cost, cost_known, posture);
 
     // Defense in depth: pre-dispatch resolution already proves `-m` maps to
     // this agent against the daemon's live config. A racing config reload or
