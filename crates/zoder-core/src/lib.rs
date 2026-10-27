@@ -11,6 +11,15 @@ pub mod context_opt;
 pub mod corpus;
 pub mod engine_cost;
 pub use acp_client as engine_rpc;
+/// Shared engine-daemon lifecycle: the per-client daemon LEASES that let
+/// every zoder process on the host answer "is this shared daemon still in
+/// use?" from live state instead of from timing, and the ONE decision that
+/// follows from that answer: who may stop the shared daemon.
+///
+/// The lease API is re-exported by name at the crate root
+/// (`zoder_core::acquire_daemon_lease` and friends), so it is reachable
+/// without naming this module.
+pub mod engine_rpc_impl;
 pub mod enterprise_cost;
 pub mod finops;
 pub mod gate;
@@ -109,6 +118,11 @@ pub use corpus::{
 pub use engine_cost::{
     fetch_engine_cost, AgentStats as EngineAgentStats, CostSummary as EngineCostSummary,
     ModelStats as EngineModelStats,
+};
+pub use engine_rpc_impl::{
+    acquire_daemon_lease, any_daemon_lease, client_may_stop_daemon, daemon_stop_authority,
+    read_daemon_leases, remove_daemon_lease, DaemonLease, DaemonLock, DaemonOwner,
+    DaemonStopAuthority, DAEMON_LEASE_TTL,
 };
 pub use enterprise_cost::{CostSnapshot, MonthCost, ScopeStat};
 pub use finops::{
