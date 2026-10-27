@@ -21759,7 +21759,7 @@ mod pricing_source_file_tests {
             let cfg = Config::load_unvalidated().unwrap();
             let pricing = PricingCatalog::load(&home.path().join("pricing.json"));
             let files = installed_data_files(&cfg, &pricing);
-            let which = |name: &str| files.iter().find(|f| f.which == name).map(|f| f.clone());
+            let which = |name: &str| files.iter().find(|f| f.which == name).cloned();
             let pricing_file = which("pricing").expect("the catalog must be warned about");
             assert_eq!(
                 pricing_file.date,
