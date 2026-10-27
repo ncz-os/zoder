@@ -2887,6 +2887,15 @@ pub struct ReviewConfirmConfig {
     /// clamped to a minimum of 1 in code.
     #[serde(default = "default_confirm_high_rejects")]
     pub high_rejects: usize,
+    /// The versioned evaluation the reviewer-family recall refers to.
+    ///
+    /// The record's `reviewer_family_recall_ref` is a POINTER to the
+    /// evaluation that defines what the recall number means, not the number
+    /// itself: a bare fraction cannot be checked against anything, while a
+    /// versioned evaluation id can be opened and re-measured. The measured
+    /// fraction is recorded separately, in `reviewer_family_recall`.
+    #[serde(default = "default_confirm_recall_eval_ref")]
+    pub recall_eval_ref: String,
 }
 
 fn default_confirm_models() -> Vec<String> {
@@ -2917,6 +2926,11 @@ fn default_confirm_max_context_lines() -> usize {
     200
 }
 
+/// The evaluation the reviewer-family recall is measured against.
+fn default_confirm_recall_eval_ref() -> String {
+    "gptoss-review-eval-20261026".to_string()
+}
+
 fn default_confirm_critical_rejects() -> usize {
     2
 }
@@ -2935,6 +2949,7 @@ impl Default for ReviewConfirmConfig {
             max_context_lines: default_confirm_max_context_lines(),
             critical_rejects: default_confirm_critical_rejects(),
             high_rejects: default_confirm_high_rejects(),
+            recall_eval_ref: default_confirm_recall_eval_ref(),
         }
     }
 }

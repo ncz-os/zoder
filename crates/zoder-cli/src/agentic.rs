@@ -6017,6 +6017,7 @@ async fn confirm_review(
             0,
             0,
             0,
+            &cfg.recall_eval_ref,
         );
         return Some((payload, verdict));
     }
@@ -6162,8 +6163,16 @@ async fn confirm_review(
         reviewer_family_recall: confirmed.reviewer_family_recall,
     };
     let verdict = merged.effective_verdict().to_string();
-    let payload =
-        crate::review_confirm::record(&merged, reviewer_model, &reviewer_family, &verdict, 0, 0, 0);
+    let payload = crate::review_confirm::record(
+        &merged,
+        reviewer_model,
+        &reviewer_family,
+        &verdict,
+        0,
+        0,
+        0,
+        &cfg.recall_eval_ref,
+    );
     Some((payload, verdict))
 }
 

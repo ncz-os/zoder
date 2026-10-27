@@ -1120,6 +1120,7 @@ pub(crate) fn record(
     reviewer_latency_ms: u64,
     reviewer_tokens_in: u64,
     reviewer_tokens_out: u64,
+    recall_eval_ref: &str,
 ) -> Value {
     // reviewers[0] is the reviewer, so the dashboard keeps its anchor. Every
     // confirmer attempt follows, in finding order.
@@ -1189,7 +1190,10 @@ pub(crate) fn record(
         "demoted": demoted,
         "verdict_basis": confirmed.verdict_basis(),
         "verdict": verdict,
-        "reviewer_family_recall_ref": confirmed.reviewer_family_recall,
+        // The ref is a POINTER to the versioned evaluation the recall is
+        // measured against; the measured fraction lives in its own field.
+        "reviewer_family_recall_ref": recall_eval_ref,
+        "reviewer_family_recall": confirmed.reviewer_family_recall,
         "findings": findings,
         "reviewers": reviewers,
     })
@@ -2343,7 +2347,16 @@ mod tests {
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Reject)
         });
-        let value = record(&review, "rev-model", "revfam", "comment", 12, 100, 40);
+        let value = record(
+            &review,
+            "rev-model",
+            "revfam",
+            "comment",
+            12,
+            100,
+            40,
+            "gptoss-review-eval-20261026",
+        );
         let parsed = parse_record(&value);
         assert_eq!(parsed.version, 1);
         assert!(!parsed.effective_blocking);
@@ -2387,7 +2400,16 @@ mod tests {
             let fam = if m == "c1" { "a" } else { "b" };
             attempt(m, fam, ParsedDisposition::Reject)
         });
-        let value = record(&review, "rev", "revfam", "comment", 0, 0, 0);
+        let value = record(
+            &review,
+            "rev",
+            "revfam",
+            "comment",
+            0,
+            0,
+            0,
+            "gptoss-review-eval-20261026",
+        );
         let f = &value["findings"][0];
         for key in [
             "id",
@@ -2558,6 +2580,91 @@ mod tests {
         assert!(
             emitted <= 3,
             "the total bound must cap the emitted definitions: {emitted} in {defs}"
+        );
+    }
+
+    // ---- the recall reference --------------------------------------------
+
+    /// The recall is recorded as TWO fields: the measured fraction and the
+    /// versioned evaluation it was measured against.
+    ///
+    /// The ref is a POINTER, not the number: a bare fraction cannot be
+    /// checked against anything, while a versioned evaluation id can be
+    /// opened and re-measured. A numeric ref is neither, so a consumer
+    /// reading it has nothing to act on.
+    #[test]
+    fn the_record_separates_the_recall_from_the_evaluation_it_refers_to() {
+        let j = job(finding("high", "rt", Some("let x = 1"), CTX), &["c1"]);
+        let review = aggregate(&[j], &limits(), &mut |m, _| {
+            attempt(m, "other", ParsedDisposition::Reject)
+        });
+        let value = record(
+            &review,
+            "rev-model",
+            "revfam",
+            "comment",
+            0,
+            0,
+            0,
+            "gptoss-review-eval-20261026",
+        );
+        let r = value
+            .get("reviewer_family_recall_ref")
+            .expect("the ref must be present");
+        assert!(
+            r.is_string(),
+            "the ref must be a pointer to an evaluation, not a number: {r}"
+        );
+        assert_eq!(
+            r.as_str(),
+            Some("gptoss-review-eval-20261026"),
+            "the ref must name the evaluation the recall was measured against"
+        );
+        let measured = value
+            .get("reviewer_family_recall")
+            .expect("the measured recall must be present");
+        assert!(
+            measured.is_number(),
+            "the measured recall must be a number: {measured}"
+        );
+        assert_eq!(measured.as_f64(), Some(1.0));
+    }
+
+    /// The measured recall is `None` when nothing reached a confirmer, and
+    /// the ref still names the evaluation it would have been measured
+    /// against.
+    #[test]
+    fn the_measured_recall_is_absent_when_nothing_reached_a_confirmer() {
+        // No confirmer chain: the finding is never put to a model, so it
+        // never reached a confirmation and it must stay out of the
+        // denominator.
+        let j = job(finding("high", "rt", Some("let x = 1"), CTX), &[]);
+        let review = aggregate(&[j], &limits(), &mut |_m, _| {
+            failed("c1", "fam", ConfirmerOutcome::Timeout)
+        });
+        let value = record(
+            &review,
+            "rev-model",
+            "revfam",
+            "comment",
+            0,
+            0,
+            0,
+            "gptoss-review-eval-20261026",
+        );
+        let measured = value
+            .get("reviewer_family_recall")
+            .expect("the measured recall field must be present");
+        assert!(
+            measured.is_null(),
+            "no finding reached a confirmer, so there is no recall to report: {measured}"
+        );
+        assert_eq!(
+            value
+                .get("reviewer_family_recall_ref")
+                .and_then(Value::as_str),
+            Some("gptoss-review-eval-20261026"),
+            "the ref must still name the evaluation"
         );
     }
 
