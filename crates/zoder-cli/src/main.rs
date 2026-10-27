@@ -14068,7 +14068,7 @@ async fn cmd_refresh(cli: &Cli, force: bool) -> anyhow::Result<()> {
     // carried in from `<home>/model-aliases.json`, which are persisted inside
     // that same save) are gated.
     let switch = pricing_source_switch(&eng.cfg);
-    if switch.is_file() && !force {
+    if !pricing_refresh_allowed(&switch, force) {
         eprintln!(
             "error: pricing source is 'file' ({}): refusing to overwrite {} (reconciled corpus + alias overlay rows); pass --force to save anyway",
             switch.label(),
@@ -14569,6 +14569,19 @@ impl FileSwitch {
     }
 }
 
+/// Whether a `zoder pricing refresh` may overwrite the installed catalog.
+///
+/// In `file` pricing-source mode the installed files are authoritative and
+/// only their installer may update them, so a refresh must REFUSE unless
+/// `--force` was passed.
+///
+/// The decision lives in ONE production helper that `cmd_pricing` calls, so
+/// the command and its tests can never drift apart: a test that restated the
+/// rule would still pass with the guard removed from the command.
+fn pricing_refresh_allowed(switch: &FileSwitch, force: bool) -> bool {
+    !switch.is_file() || force
+}
+
 /// Verdict for the daily auto-refresh, factored out of
 /// [`maybe_spawn_daily_refresh`] so it is testable without spawning:
 /// `file` mode never spawns; `auto` mode spawns when the engine copy is
@@ -14717,7 +14730,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
                 Ok(cfg) => pricing_source_switch(&cfg),
                 Err(_) => FileSwitch::None,
             };
-            if switch.is_file() && !*force {
+            if !pricing_refresh_allowed(&switch, *force) {
                 eprintln!(
                     "error: pricing source is 'file' ({}): refusing to overwrite {}; pass --force to refresh anyway",
                     switch.label(),
@@ -21606,12 +21619,13 @@ mod pricing_source_file_tests {
         .unwrap();
         let before = std::fs::read(&pricing).unwrap();
         with_env_home(home.path(), &[], || {
-            // Simulate the gate exactly as cmd_pricing does: resolve the
-            // switch, then refuse before any network call or write.
+            // The production decision, not a restatement of it: the same
+            // helper `cmd_pricing` calls decides whether the refresh may
+            // overwrite the installed file.
             let cfg = Config::load_unvalidated().unwrap();
             let switch = pricing_source_switch(&cfg);
             assert!(switch.is_file());
-            let refused = switch.is_file(); // no --force passed
+            let refused = !pricing_refresh_allowed(&switch, false); // no --force
             assert!(
                 refused,
                 "file mode without --force must refuse the overwrite"
@@ -21634,10 +21648,32 @@ mod pricing_source_file_tests {
         with_env_home(home.path(), &[], || {
             let cfg = Config::load_unvalidated().unwrap();
             let switch = pricing_source_switch(&cfg);
-            let force = true;
-            let refused = switch.is_file() && !force;
-            assert!(!refused, "--force must override the gate");
+            assert!(
+                pricing_refresh_allowed(&switch, true),
+                "--force must override the gate"
+            );
         });
+    }
+
+    /// The refresh gate, over EVERY switch: `file` mode refuses without
+    /// `--force`, `auto` mode never refuses. The helper is the only place the
+    /// rule lives, so this pins the whole matrix in one place.
+    #[test]
+    fn pricing_refresh_gate_covers_every_switch() {
+        for switch in [FileSwitch::Env, FileSwitch::Config, FileSwitch::Managed] {
+            assert!(
+                !pricing_refresh_allowed(&switch, false),
+                "file mode ({switch:?}) must refuse without --force"
+            );
+            assert!(
+                pricing_refresh_allowed(&switch, true),
+                "file mode ({switch:?}) must allow an explicit --force"
+            );
+        }
+        assert!(
+            pricing_refresh_allowed(&FileSwitch::None, false),
+            "auto mode must never refuse a refresh"
+        );
     }
 
     /// A forced re-pull in file mode must keep the installed file's
