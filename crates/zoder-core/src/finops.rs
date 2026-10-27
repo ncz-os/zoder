@@ -882,6 +882,7 @@ mod tests {
             calls: 1,
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
+            billing: None,
         })
         .unwrap();
     }
@@ -974,6 +975,7 @@ mod tests {
             calls: 1,
             violation: None,
             tags: FinOpsTags::default(),
+            billing: None,
         };
         entry.tags.caller = Some("ci".into());
         entry.tags.task = Some("review".into());
@@ -1062,6 +1064,7 @@ mod tests {
             calls: 1,
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
+            billing: None,
         };
         led.record(&unknown).unwrap();
         let since = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
@@ -1228,6 +1231,7 @@ mod tests {
             calls: 7,
             violation: None,
             tags: FinOpsTags::default(),
+            billing: None,
         };
         led.record(&compacted).unwrap();
         compacted.calls = u64::MAX;

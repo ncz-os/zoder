@@ -151,22 +151,90 @@ fn finops_tags(
     }
 }
 
+/// The billing posture of the serving provider, which is authoritative for
+/// marginal billing. A metered provider is priced from the catalog; anything
+/// else (a flat-fee subscription, or a route configured
+/// `paid = false, billing = "free"`) costs $0 to call no matter what the
+/// catalog says for the model id it happened to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BillingPosture {
+    /// Pay-as-you-go API: the call is priced from the catalog.
+    Metered,
+    /// Flat-fee subscription: the marginal cost of one more call is $0.
+    Subscription,
+    /// A route configured `paid = false, billing = "free"`: $0 marginal.
+    Free,
+}
+
+impl BillingPosture {
+    /// `true` for the two $0-marginal postures: a flat plan is paid for
+    /// monthly and a free route costs nothing to serve, so in both cases
+    /// charging the catalog's list price would overstate spend.
+    pub(crate) fn is_cost_neutral(self) -> bool {
+        matches!(self, Self::Subscription | Self::Free)
+    }
+
+    /// The `billing` value recorded on ledger rows written for this posture.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Metered => "metered",
+            Self::Subscription => "subscription",
+            Self::Free => "free",
+        }
+    }
+}
+
+impl From<&Provider> for BillingPosture {
+    fn from(provider: &Provider) -> Self {
+        match provider.billing {
+            BillingMode::Subscription => Self::Subscription,
+            BillingMode::Free => {
+                if provider.paid {
+                    // A `paid = true` free-labeled route is a contradiction
+                    // in config: the operator marked the route as
+                    // incurring real spend, so price it from the catalog
+                    // rather than assuming $0.
+                    Self::Metered
+                } else {
+                    Self::Free
+                }
+            }
+            BillingMode::Metered => Self::Metered,
+        }
+    }
+}
+
 /// The resolved provider is authoritative for marginal billing. Catalog model
 /// prices are only relevant when the serving provider is actually metered.
 /// The cost to record for one call, and whether the cost is unknown.
 ///
-/// The provider's own telemetry wins when it reports a charge: it is what
-/// the provider actually billed. Otherwise a FLAT PLAN provider records
-/// $0: the plan is paid for monthly, so the marginal cost of one more call
-/// is zero, and charging the catalog's list price would overstate the
-/// spend and trip the month-to-date cap on a plan that is already paid for.
-/// The tokens are recorded either way.
+/// The provider's own cost telemetry wins when it reports a cost: it is
+/// what the provider actually billed, and it applies to a cost-neutral
+/// route too (an overage past a free tier is a real charge that must feed
+/// the paid guard). An explicit $0 is a cost the provider REPORTED, not a
+/// missing one: it is recorded as a known $0 and never re-priced from the
+/// catalog. Otherwise:
 ///
-/// Every other provider is priced from the catalog: the cache hits at the
-/// cache-read rate, the misses at the input rate and the output tokens at
-/// the output rate, with the peak window that was in effect at the time.
+/// - a COST-NEUTRAL provider (a flat plan or a free route) records $0: the
+///   plan is paid for monthly and the free route costs nothing to serve, so
+///   charging the catalog's list price would overstate spend. A catalog
+///   entry for the model id never prices a free route;
+/// - a METERED provider is priced from the catalog: the cache hits at the
+///   cache-read rate, the misses at the input rate and the output tokens at
+///   the output rate, with the peak window that was in effect at the time.
+///   An explicit all-zero catalog entry records $0; an entry the catalog
+///   cannot price records `cost_unknown` (the numeric field stays 0 as a
+///   placeholder that reports must not treat as a verified-free call).
+///
+/// `tokens_in` is the AUTHORITATIVE prompt count. When the response carried
+/// no usage at all it must be 0 (the `prompt_tokens` field was `None`),
+/// never a guess: pricing a metered call from a fabricated input count
+/// would bill tokens the call may not have used, and a metered provider
+/// with no usage record is unknown, not $0. Concretely: a metered call
+/// whose reported usage is 0 in / 0 out (the shape of a response with no
+/// usage block) is `cost_unknown` regardless of the catalog.
 pub(crate) fn ledger_call_cost(
-    flat_plan: bool,
+    posture: BillingPosture,
     telemetry_cost_usd: Option<f64>,
     pricing: &PricingCatalog,
     model: &str,
@@ -174,12 +242,27 @@ pub(crate) fn ledger_call_cost(
     ts: Option<DateTime<Utc>>,
 ) -> (f64, bool) {
     if let Some(cost) = telemetry_cost_usd {
+        // A finite, non-negative cost is the provider's own bill for THIS
+        // call, and that includes an explicit zero: a provider that reports
+        // $0 for a metered model has said the call cost nothing, so
+        // re-pricing it from the catalog would invent a charge the provider
+        // never made. Only a MISSING cost (None) or a non-finite one says
+        // nothing about the price and falls through to the catalog.
         if cost.is_finite() && cost >= 0.0 {
             return (cost, false);
         }
     }
-    if flat_plan {
+    if posture.is_cost_neutral() {
         return (0.0, false);
+    }
+    // A metered response that carried no usage at all has no authoritative
+    // token count. Pricing 0/0 would record an unpriced call as a known $0,
+    // and a guessed count would bill tokens the call may not have used — so
+    // a usage-less metered call is unknown, period. (A response that DID
+    // report usage but zero tokens is still priced normally: the $0 is the
+    // catalog's verdict on the count the provider reported.)
+    if tokens.tokens_in == 0 && tokens.tokens_out == 0 {
+        return (0.0, true);
     }
     match pricing.classify_cost_with_cache(
         model,
@@ -195,7 +278,7 @@ pub(crate) fn ledger_call_cost(
 }
 
 fn is_cost_neutral_provider(provider: &Provider) -> bool {
-    !provider.paid && provider.billing != BillingMode::Metered
+    BillingPosture::from(provider).is_cost_neutral()
 }
 
 /// Persist a completed turn before it can be reported as successful. Ledger
@@ -6709,25 +6792,38 @@ raise --max-tokens or lower its reasoning effort",
     // a policy violation is a failure.
     let verify = gate.verify_free(&entry, &res.telemetry);
 
-    // M4: honest token accounting from real usage when available.
+    // M4: honest token accounting from real usage when available. A response
+    // that carried no usage block at all has NO authoritative prompt count:
+    // record 0, never a guess. A metered provider priced from a fabricated
+    // input count would bill tokens the call may not have used, and the
+    // missing-usage row must come out `cost_unknown`, not a known $0.
     let tokens_in = res.prompt_tokens.unwrap_or(0);
     let tokens_out = res.completion_tokens.unwrap_or(res.tokens_out);
     // Cost: trust live telemetry first; otherwise price from the provider-derived
     // catalog (free-tier models resolve to $0 chargeback, paid models to their
     // rate). `cost_at` is time-of-day aware so a DeepSeek call at 20:00 UTC
     // uses the configured off-peak rate, not peak — Finding #23.
+    let posture = eng
+        .cfg
+        .provider(&used_provider_id)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
     let (cost, unknown_cost) = ledger_call_cost(
-        eng.cfg
-            .provider(&used_provider_id)
-            .is_some_and(|p| p.is_flat_plan()),
+        posture,
         res.telemetry.cost_usd,
         &pricing,
         &used_model,
+        // No usage block: price nothing (a metered call then records
+        // cost unknown); the estimated output count is still recorded.
         zoder_core::pricing::CallTokens {
             tokens_in,
-            tokens_out,
+            tokens_out: if res.prompt_tokens.is_some() {
+                tokens_out
+            } else {
+                0
+            },
             cache_hit_tokens: res.cached_prompt_tokens.unwrap_or(0),
         },
         Some(ts_utc),
@@ -6768,6 +6864,7 @@ raise --max-tokens or lower its reasoning effort",
         calls: 1,
         violation,
         tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         winning_reservation.ok_or_else(|| {
@@ -8693,11 +8790,12 @@ async fn agentic_cost(
     from: chrono::DateTime<chrono::Utc>,
     to: chrono::DateTime<chrono::Utc>,
     alias: &str,
+    posture: BillingPosture,
 ) -> AgenticCostReport {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..AGENTIC_COST_MAX_ATTEMPTS {
         match fetch_engine_cost(socket, Some(from), Some(to), Some(alias)).await {
-            Ok(sum) => return classify_agentic_cost_summary(&sum),
+            Ok(sum) => return classify_agentic_cost_summary(&sum, posture),
             Err(e) => {
                 last_err = Some(e);
                 // Don't sleep after the final attempt — the next call
@@ -8737,7 +8835,10 @@ async fn agentic_cost(
 /// as `cost_unknown` for any longer.
 const AGENTIC_COST_MAX_ATTEMPTS: u32 = 3;
 
-fn classify_agentic_cost_summary(sum: &zoder_core::EngineCostSummary) -> AgenticCostReport {
+fn classify_agentic_cost_summary(
+    sum: &zoder_core::EngineCostSummary,
+    posture: BillingPosture,
+) -> AgenticCostReport {
     let cost = sum.window_cost_usd();
     // Pick the dominant model in the window for attribution.
     let model = sum
@@ -8758,11 +8859,53 @@ fn classify_agentic_cost_summary(sum: &zoder_core::EngineCostSummary) -> Agentic
     // An empty successful query only proves that the engine found no
     // rows in the requested slice. It does not authoritatively price
     // the turn, so never turn it into a known $0 ledger entry.
-    if sum.request_count > 0 && !sum.by_model.is_empty() && cost.is_finite() && cost >= 0.0 {
-        (cost, tin, tout, model, true, calls)
-    } else {
-        (0.0, tin, tout, model, false, calls)
+    if sum.request_count > 0 && !sum.by_model.is_empty() {
+        // A positive, finite engine cost is the engine's own ledger for the
+        // window: record it as authoritative, whatever the posture.
+        if cost.is_finite() && cost > 0.0 {
+            return (cost, tin, tout, model, true, calls);
+        }
+        // cost == 0.0 (or a query that came back with no priced row) needs
+        // the posture to decide what it means. A cost-neutral provider
+        // (subscription or a free route) legitimately costs $0: the engine's
+        // $0 — like a failed, overlapped, or empty query — is a known $0.
+        if posture.is_cost_neutral() {
+            return (0.0, tin, tout, model, true, calls);
+        }
+        // A METERED provider with real traffic but a $0 total is the engine
+        // saying "I priced this as free" — which it only does for an id it
+        // has no price row for. Do NOT re-price the tokens from zoder's own
+        // catalog: the engine summary carries no cache-hit counts, so every
+        // cached token would be billed at the miss rate. Record unknown; the
+        // pre-dispatch budget gate already priced the reservation.
+        if tin + tout > 0 {
+            let name = model.as_deref().unwrap_or("<unknown model>");
+            eprintln!(
+                "engine reported $0 for metered model {name}; its price \
+                 catalog has no row for it; recorded as cost unknown"
+            );
+        }
+        return (0.0, tin, tout, model, false, calls);
     }
+    (0.0, tin, tout, model, false, calls)
+}
+
+/// The cost a turn records, and whether it is known.
+///
+/// A cost-neutral route (a flat plan or a free route) costs $0 even when
+/// the engine's cost query failed, overlapped another turn, or came back
+/// empty: the posture alone proves the call cost nothing, so the turn is a
+/// KNOWN $0 and the paid guard never fires on it. Every other provider keeps
+/// what the cost query said, "unknown" included.
+pub(crate) fn agentic_cost_verdict(
+    cost: f64,
+    cost_known: bool,
+    posture: BillingPosture,
+) -> (f64, bool) {
+    if !cost_known && posture.is_cost_neutral() {
+        return (0.0, true);
+    }
+    (cost, cost_known)
 }
 
 // ---------------------------------------------------------------------------
@@ -8893,7 +9036,8 @@ mod agentic_cost_tests {
     #[test]
     fn empty_successful_cost_query_is_unknown_not_known_zero() {
         let summary = zoder_core::EngineCostSummary::default();
-        let (cost, tin, tout, model, known, calls) = classify_agentic_cost_summary(&summary);
+        let (cost, tin, tout, model, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert_eq!((cost, tin, tout), (0.0, 0, 0));
         assert_eq!(
             model, None,
@@ -8925,7 +9069,10 @@ mod agentic_cost_tests {
         let daemon_model = live_registry.model_for_agent("author");
         assert_eq!(daemon_model, Some("stale-model"));
 
-        let empty = classify_agentic_cost_summary(&zoder_core::EngineCostSummary::default());
+        let empty = classify_agentic_cost_summary(
+            &zoder_core::EngineCostSummary::default(),
+            BillingPosture::Metered,
+        );
         let failed = unavailable_agentic_cost(AgenticCostGap::QueryFailed);
         let overlapped = unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped);
         for (state, report) in [
@@ -8961,6 +9108,7 @@ mod agentic_cost_tests {
     fn authoritative_request_count_is_preserved() {
         let mut summary = zoder_core::EngineCostSummary {
             request_count: 3,
+            session_cost_usd: 0.25,
             ..Default::default()
         };
         summary.by_model.insert(
@@ -8974,9 +9122,131 @@ mod agentic_cost_tests {
                 cost_usd: 0.25,
             },
         );
-        let (_, _, _, _, known, calls) = classify_agentic_cost_summary(&summary);
+        let (_, _, _, _, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert!(known);
         assert_eq!(calls, 3);
+    }
+
+    fn summary_with_model(
+        model: &str,
+        tin: u64,
+        tout: u64,
+        cost: f64,
+    ) -> zoder_core::EngineCostSummary {
+        let mut summary = zoder_core::EngineCostSummary {
+            request_count: 1,
+            session_cost_usd: cost,
+            ..Default::default()
+        };
+        summary.by_model.insert(
+            model.to_string(),
+            zoder_core::EngineModelStats {
+                model: model.to_string(),
+                request_count: 1,
+                input_tokens: tin,
+                output_tokens: tout,
+                total_tokens: tin + tout,
+                cost_usd: cost,
+            },
+        );
+        summary
+    }
+
+    /// The live-bug fix: a metered engine that served real traffic but
+    /// reports $0 has priced it from a catalog with no row for the id.
+    /// That $0 is NOT authoritative: the ledger row must be `cost_unknown`,
+    /// so reports never sum an unpriced metered call as a verified-free
+    /// one.
+    #[test]
+    fn a_metered_engine_zero_with_tokens_is_unknown_not_known_zero() {
+        let summary = summary_with_model("deepseek-flash", 57_043_226, 211_229, 0.0);
+        let (cost, tin, tout, model, known, calls) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
+        assert_eq!(
+            (cost, tin, tout, model.as_deref()),
+            (0.0, 57_043_226, 211_229, Some("deepseek-flash"))
+        );
+        assert!(
+            !known,
+            "a metered $0 with real traffic must be cost_unknown"
+        );
+        assert_eq!(calls, 1);
+    }
+
+    /// A cost-neutral engine legitimately costs $0: the engine's $0 — like
+    /// a failed or overlapped query — is a KNOWN $0, so the row is clean and
+    /// the free guard never fires on it.
+    #[test]
+    fn a_cost_neutral_engine_zero_is_known_zero() {
+        let summary = summary_with_model("MiniMax-M3", 1_000, 500, 0.0);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Free);
+        assert_eq!(cost, 0.0);
+        assert!(known, "a free route's $0 is known");
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Subscription);
+        assert_eq!(cost, 0.0);
+        assert!(known, "a flat plan's $0 is known");
+    }
+
+    /// A free route whose engine cost query FAILED (or overlapped) is still
+    /// a known $0: the posture alone proves the call cost nothing.
+    ///
+    /// The conversion happens at the CALL SITE, so this test drives the
+    /// production helper that does it. A test that only re-classified a
+    /// fabricated summary would keep passing after the call site stopped
+    /// converting, which is exactly the regression it has to catch.
+    #[test]
+    fn a_cost_neutral_provider_query_failure_is_known_zero() {
+        for (name, report) in [
+            (
+                "query failed",
+                unavailable_agentic_cost(AgenticCostGap::QueryFailed),
+            ),
+            (
+                "scope overlapped",
+                unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
+            ),
+            (
+                "scope unavailable",
+                unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
+            ),
+        ] {
+            let (cost, _, _, _, known, _) = report;
+            assert_eq!(cost, 0.0);
+            assert!(!known, "{name}: an unavailable query proves no cost");
+            // The production conversion: a cost-neutral posture turns the
+            // unknown into a known $0.
+            for posture in [BillingPosture::Free, BillingPosture::Subscription] {
+                let (cost, known) = agentic_cost_verdict(cost, known, posture);
+                assert_eq!(cost, 0.0, "{name}: a cost-neutral route costs $0");
+                assert!(known, "{name}: a cost-neutral route's $0 is known");
+            }
+            // A METERED provider keeps the unknown: an unpriced call must
+            // fail the month-to-date gate closed, not pass as a verified $0.
+            let (cost, known) = agentic_cost_verdict(cost, known, BillingPosture::Metered);
+            assert_eq!(cost, 0.0);
+            assert!(!known, "{name}: a metered unknown must stay unknown");
+        }
+    }
+
+    /// A positive engine cost is recorded as authoritative, whatever the
+    /// posture (an overage past a free tier is a real charge).
+    #[test]
+    fn a_positive_engine_cost_is_recorded() {
+        let summary = summary_with_model("deepseek-flash", 1_000, 500, 0.31);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
+        assert!((cost - 0.31).abs() < 1e-9);
+        assert!(known);
+        let (cost, _, _, _, known, _) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Free);
+        assert!((cost - 0.31).abs() < 1e-9);
+        assert!(
+            known,
+            "a billed free-route overage is recorded, feeding the paid guard"
+        );
     }
 
     #[test]
@@ -9111,7 +9381,7 @@ mod agentic_cost_tests {
         // generous CI margin).
         let call = tokio::time::timeout(
             std::time::Duration::from_secs(25),
-            agentic_cost(&socket, from, to, "codex"),
+            agentic_cost(&socket, from, to, "codex", BillingPosture::Metered),
         );
         let (cost, tin, tout, model, known, calls) = call.await.expect(
             "agentic_cost must converge within the retry budget (3 attempts with backoff); \
@@ -9177,7 +9447,7 @@ mod agentic_cost_tests {
         // contract.
         let call = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            agentic_cost(&socket, from, to, "codex"),
+            agentic_cost(&socket, from, to, "codex", BillingPosture::Metered),
         );
         let (cost, tin, tout, _model, known, _calls) = call
             .await
@@ -9190,6 +9460,662 @@ mod agentic_cost_tests {
         );
         assert_eq!(cost, 0.0);
         assert_eq!((tin, tout), (0, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real dispatch-path ledger accounting (wiremock provider, temp ZODER_HOME):
+// the oneshot exec path must bill from the provider's billing posture.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod oneshot_ledger_billing_tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Write a pricing catalog with a mode the loader accepts. The loader
+    /// refuses a group- or world-writable catalog, and `fs::write` inherits
+    /// the process umask, so on a host with a lax umask (0002, as on many
+    /// hosts and CI runners) the file would land at 0664 and be rejected as
+    /// an empty catalog.
+    fn write_pricing_catalog(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn write_one_provider_config(home: &Path, mock_uri: &str, billing: &str, paid: bool) {
+        write_provider_config(home, mock_uri, billing, paid, &["zz-unpriced/"]);
+    }
+
+    /// A provider config whose `serves` list declares the model prefixes it
+    /// backs. The router routes a model only when some provider claims it --
+    /// it never falls back to `default_provider` -- so a test that
+    /// dispatches a model needs a provider that serves it.
+    fn write_provider_config(
+        home: &Path,
+        mock_uri: &str,
+        billing: &str,
+        paid: bool,
+        serves: &[&str],
+    ) {
+        let body = serde_json::json!({
+            "providers": [
+                {
+                    "id": "wiremock",
+                    "base_url": format!("{mock_uri}/api"),
+                    "kind": "openai-chat",
+                    "auth": {"type": "none"},
+                    "paid": paid,
+                    "billing": billing,
+                    "serves": serves,
+                },
+            ],
+            "default_provider": "wiremock",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Serves a completion: an SSE body when the dispatch streams (the
+    /// default) or a plain JSON body for `--no-stream`, optionally WITHOUT
+    /// the usage frame — the missing-usage case.
+    async fn mount_chat_completion(
+        server: &MockServer,
+        with_usage: bool,
+        prompt: u64,
+        completion: u64,
+    ) {
+        let mut frames = vec![
+            serde_json::json!({
+                "choices": [{"delta": {"role": "assistant", "content": "ok"}, "index": 0}]
+            }),
+            serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]
+            }),
+        ];
+        if with_usage {
+            frames.push(serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion
+                }
+            }));
+        }
+        let sse = frames
+            .iter()
+            .map(|f| format!("data: {f}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let plain = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        });
+        let streaming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cell = streaming.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let stream = std::str::from_utf8(&request.body)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                    .and_then(|v| v.get("stream").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                streaming.store(stream, std::sync::atomic::Ordering::Relaxed);
+                if stream {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse.clone())
+                } else {
+                    ResponseTemplate::new(200).set_body_string(plain.to_string())
+                }
+            })
+            .mount(server)
+            .await;
+        let _ = cell;
+    }
+
+    fn rows_for(home: &Path, model: &str) -> Vec<zoder_core::ledger::Entry> {
+        zoder_core::ledger::Ledger::new(&home.join("ledger.jsonl"))
+            .entries_strict()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.model == model)
+            .collect()
+    }
+
+    /// A route configured `billing = "free"`, `paid = false`, whose model HAS
+    /// a catalog price, called through the REAL oneshot dispatch path: the
+    /// ledger row must be $0, known, `billing: "free"`.
+    #[test]
+    fn oneshot_free_route_with_catalog_price_records_zero_known() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    let corpus = serde_json::json!({
+                        "source": "test",
+                        "models": [{"id": "zz-unpriced/alpha-7", "free": true, "routable": true}]
+                    });
+                    std::fs::write(
+                        home.join("model_corpus.json"),
+                        serde_json::to_string_pretty(&corpus).unwrap(),
+                    )
+                    .unwrap();
+                    write_one_provider_config(home, &server.uri(), "free", false);
+                    // The runtime catalog prices the model — the condition
+                    // that used to bill the free route at list price.
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
+                        r#"{
+                        "models": {
+                            "zz-unpriced/alpha-7": {
+                                "input_usd_per_mtok": 1.0,
+                                "output_usd_per_mtok": 2.0
+                            }
+                        }
+                    }"#,
+                    );
+                    mount_chat_completion(&server, true, 1_000_000, 500_000).await;
+                    let cli = Cli::try_parse_from([
+                        "zoder",
+                        "exec",
+                        "--oneshot",
+                        "-m",
+                        "zz-unpriced/alpha-7",
+                        "ping",
+                    ])
+                    .unwrap();
+                    cmd_exec_oneshot(&cli, Some("ping".into())).await.unwrap();
+                    let rows = rows_for(home, "zz-unpriced/alpha-7");
+                    assert_eq!(rows.len(), 1, "exactly one ledger row");
+                    let row = &rows[0];
+                    assert_eq!(row.cost_usd, 0.0, "a free route records $0");
+                    assert!(!row.cost_unknown, "a free route's $0 is known");
+                    assert_eq!(row.billing.as_deref(), Some("free"));
+                    assert_eq!(row.violation, None, "a free route trips no guard");
+                });
+        }));
+        drop(_g);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// A metered route priced NOWHERE (absent from the runtime catalog AND
+    /// the shipped list) must produce a `cost_unknown` row, never a known
+    /// $0, through the real dispatch path.
+    #[test]
+    fn oneshot_unpriced_metered_model_is_unknown_not_known_zero() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    let corpus = serde_json::json!({
+                        "source": "test",
+                        "models": [{"id": "zz-unpriced/alpha-7", "free": false, "routable": true}]
+                    });
+                    std::fs::write(
+                        home.join("model_corpus.json"),
+                        serde_json::to_string_pretty(&corpus).unwrap(),
+                    )
+                    .unwrap();
+                    write_one_provider_config(home, &server.uri(), "metered", true);
+                    // An EMPTY runtime catalog; the synthetic id is not in the
+                    // shipped list, so the lookup falls through to Unknown.
+                    write_pricing_catalog(&home.join("pricing.json"), r#"{"models": {}}"#);
+                    mount_chat_completion(&server, true, 100, 50).await;
+                    let cli = Cli::try_parse_from([
+                        "zoder",
+                        "exec",
+                        "--oneshot",
+                        "-m",
+                        "zz-unpriced/alpha-7",
+                        "--allow-paid",
+                        "ping",
+                    ])
+                    .unwrap();
+                    cmd_exec_oneshot(&cli, Some("ping".into())).await.unwrap();
+                    let rows = rows_for(home, "zz-unpriced/alpha-7");
+                    assert_eq!(rows.len(), 1, "exactly one ledger row");
+                    let row = &rows[0];
+                    assert!(
+                        row.cost_unknown,
+                        "an unpriced metered call is cost_unknown, never a known $0"
+                    );
+                    assert_eq!(row.cost_usd, 0.0, "the placeholder stays $0");
+                    assert_eq!(row.billing.as_deref(), Some("metered"));
+                    assert!(
+                        row.violation
+                            .as_deref()
+                            .is_some_and(|v| v.contains("cost unknown")),
+                        "the row carries the cost-unknown violation: {:?}",
+                        row.violation
+                    );
+                });
+        }));
+        drop(_g);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// A metered response that carries content + `finish_reason` and NO
+    /// usage must be `cost_unknown` with `tokens_in = 0`, never priced from
+    /// a guessed count nor recorded as a known $0. (This build's stream
+    /// reader drops a usage frame sent after finish_reason; the reader fix
+    /// is a separate job — the mock therefore omits the usage frame.)
+    #[test]
+    fn oneshot_metered_stream_without_usage_is_unknown_not_known_zero() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    let corpus = serde_json::json!({
+                        "source": "test",
+                        "models": [{"id": "zz-unpriced/alpha-7", "free": false, "routable": true}]
+                    });
+                    std::fs::write(
+                        home.join("model_corpus.json"),
+                        serde_json::to_string_pretty(&corpus).unwrap(),
+                    )
+                    .unwrap();
+                    write_one_provider_config(home, &server.uri(), "metered", true);
+                    // The model IS priced: a guessed token count would have
+                    // produced a real (wrong) charge.
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
+                        r#"{
+                            "models": {
+                                "zz-unpriced/alpha-7": {
+                                    "input_usd_per_mtok": 1.0,
+                                    "output_usd_per_mtok": 2.0
+                                }
+                            }
+                        }"#,
+                    );
+                    mount_chat_completion(&server, false, 100, 50).await;
+                    let cli = Cli::try_parse_from([
+                        "zoder",
+                        "exec",
+                        "--oneshot",
+                        "--no-stream",
+                        "-m",
+                        "zz-unpriced/alpha-7",
+                        "--allow-paid",
+                        "ping",
+                    ])
+                    .unwrap();
+                    cmd_exec_oneshot(&cli, Some("ping".into())).await.unwrap();
+                    let rows = rows_for(home, "zz-unpriced/alpha-7");
+                    assert_eq!(rows.len(), 1, "exactly one ledger row");
+                    let row = &rows[0];
+                    // Reproduce the dispatch math directly in the test so a
+                    // regression is visible in the assertion itself.
+                    let pricing =
+                        zoder_core::pricing::PricingCatalog::load(&home.join("pricing.json"));
+                    let (cost, unknown) = ledger_call_cost(
+                        BillingPosture::Metered,
+                        None,
+                        &pricing,
+                        "zz-unpriced/alpha-7",
+                        zoder_core::pricing::CallTokens {
+                            tokens_in: row.tokens_in,
+                            tokens_out: row.tokens_out,
+                            cache_hit_tokens: 0,
+                        },
+                        None,
+                    );
+                    assert!(
+                        unknown,
+                        "same tokens through the helper must be unknown (row: {row:?})"
+                    );
+                    let _ = cost;
+                    // --no-stream: a plain completion object with NO usage
+                    // block at all. A metered call with no usage must be
+                    // cost_unknown, never priced from a guessed count and
+                    // never a known $0. (This build's stream reader also
+                    // drops a usage frame sent after finish_reason; that
+                    // reader fix is a separate job.)
+                    assert!(
+                        row.cost_unknown,
+                        "a metered response with no usage is cost_unknown, never a known $0"
+                    );
+                    assert_eq!(row.cost_usd, 0.0, "the placeholder stays $0");
+                    assert_eq!(
+                        row.tokens_in, 0,
+                        "no usage means no authoritative input count"
+                    );
+                    assert_eq!(row.billing.as_deref(), Some("metered"));
+                });
+        }));
+        drop(_g);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// The deepseek-flash fallback pin: a runtime catalog that LACKS the
+    /// model still prices it from the shipped list (pricing/catalog.json)
+    /// via `lookup_with_fallback` — a metered call is never unknown just
+    /// because the host's runtime catalog predates the model.
+    #[test]
+    fn a_missing_runtime_catalog_prices_from_the_shipped_list() {
+        let cat = PricingCatalog::default();
+        // The runtime catalog is empty; the shipped list must carry
+        // deepseek-flash with its cache-read rate.
+        let verdict = cat.classify_cost_with_cache("deepseek-flash", 31_620, 1_437, 0, None);
+        assert!(
+            matches!(verdict, zoder_core::pricing::CostVerdict::Priced(_)),
+            "shipped list must price deepseek-flash: {verdict:?}"
+        );
+        // 31,620 in at 0.15/M + 1,437 out at 0.60/M ≈ $0.005571 (off-peak
+        // window is time-of-day aware; the exact figure is pinned by the
+        // shipped rates, not re-derived here).
+        let cost = match verdict {
+            zoder_core::pricing::CostVerdict::Priced(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(
+            (0.0055..0.0057).contains(&cost),
+            "deepseek-flash 31,620/1,437 priced {cost}, expected ~0.0056"
+        );
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            None,
+            &cat,
+            "deepseek-flash",
+            zoder_core::pricing::CallTokens {
+                tokens_in: 31_620,
+                tokens_out: 1_437,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert!((cost - 0.005571).abs() < 0.0001, "cost was {cost}");
+    }
+
+    /// A metered provider whose RUNTIME catalog lacks the model still prices
+    /// it from the shipped list, through the real oneshot dispatch path: the
+    /// fallback floor (`lookup_with_fallback`) must not leave a stale
+    /// runtime catalog reporting the call `cost_unknown`. The test model is
+    /// priced at the shipped list's rates, so the row's cost is the catalog
+    /// math over the usage the mock returns.
+    #[test]
+    fn oneshot_metered_model_missing_from_runtime_catalog_prices_from_shipped_list() {
+        const MODEL: &str = "deepseek-flash";
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    // The test model must be priced by the SHIPPED list for
+                    // this test to be meaningful: pin the rate here so a
+                    // regenerated catalog either keeps the model at these
+                    // rates or fails loudly instead of silently.
+                    let price = zoder_core::pricing::bundled_catalog_price(MODEL)
+                        .expect("the shipped list must price the test model");
+                    assert_eq!(price.input_usd_per_mtok, 0.15);
+                    assert_eq!(price.output_usd_per_mtok, 0.6);
+                    let server = MockServer::start().await;
+                    // A realistic stale runtime catalog: it prices other
+                    // models but predates the one being served.
+                    let corpus = serde_json::json!({
+                        "source": "test",
+                        "models": [{"id": MODEL, "free": false, "routable": true}]
+                    });
+                    std::fs::write(
+                        home.join("model_corpus.json"),
+                        serde_json::to_string_pretty(&corpus).unwrap(),
+                    )
+                    .unwrap();
+                    write_provider_config(home, &server.uri(), "metered", true, &[MODEL]);
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
+                        r#"{"models": {"some/other-model": {"input_usd_per_mtok": 9.0, "output_usd_per_mtok": 9.0}}}"#,
+                    );
+                    mount_chat_completion(&server, true, 31_620, 1_437).await;
+                    let cli = Cli::try_parse_from([
+                        "zoder",
+                        "exec",
+                        "--oneshot",
+                        "-m",
+                        MODEL,
+                        "--allow-paid",
+                        "ping",
+                    ])
+                    .unwrap();
+                    cmd_exec_oneshot(&cli, Some("ping".into())).await.unwrap();
+                    let rows = rows_for(home, MODEL);
+                    assert_eq!(rows.len(), 1, "exactly one ledger row");
+                    let row = &rows[0];
+                    // Re-derive the catalog math over the recorded usage:
+                    // the row must carry the shipped-list price for the
+                    // tokens the call used, whatever the window was.
+                    let pricing = PricingCatalog::default();
+                    let verdict = pricing.classify_cost_with_cache(
+                        MODEL,
+                        row.tokens_in,
+                        row.tokens_out,
+                        0,
+                        Some(row.ts_utc),
+                    );
+                    assert!(
+                        matches!(verdict, zoder_core::pricing::CostVerdict::Priced(_)),
+                        "shipped list must price the recorded usage: {verdict:?}"
+                    );
+                    let expected = match verdict {
+                        zoder_core::pricing::CostVerdict::Priced(c) => c,
+                        _ => unreachable!(),
+                    };
+                    assert!((row.cost_usd - expected).abs() < 1e-9,
+                        "row cost {} != shipped-list math {} for {} in / {} out",
+                        row.cost_usd, expected, row.tokens_in, row.tokens_out);
+                    assert!(row.cost_usd > 0.0, "the priced row must not be $0");
+                    assert!(!row.cost_unknown, "the fallback floor must price it");
+                    assert_eq!(row.billing.as_deref(), Some("metered"));
+                    assert_eq!(row.violation, None, "no guard trips on a priced call");
+                });
+        }));
+        drop(_g);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// A free route whose provider REPORTS a positive cost: the telemetry
+    /// wins over the posture — the charge is recorded as evidence of real
+    /// spend and the paid guard still fires (a free route that bills is a
+    /// real charge, not a $0).
+    #[test]
+    fn oneshot_free_route_with_positive_telemetry_records_the_charge_and_fires_the_paid_guard() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _g = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    let corpus = serde_json::json!({
+                        "source": "test",
+                        "models": [{"id": "zz-unpriced/alpha-7", "free": true, "routable": true}]
+                    });
+                    std::fs::write(
+                        home.join("model_corpus.json"),
+                        serde_json::to_string_pretty(&corpus).unwrap(),
+                    )
+                    .unwrap();
+                    write_one_provider_config(home, &server.uri(), "free", false);
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
+                        r#"{
+                        "models": {
+                            "zz-unpriced/alpha-7": {
+                                "input_usd_per_mtok": 1.0,
+                                "output_usd_per_mtok": 2.0
+                            }
+                        }
+                    }"#,
+                    );
+                    // A non-streaming reply whose header reports the provider
+                    // billed the call despite the free posture.
+                    let body = serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1_000, "completion_tokens": 500, "total_tokens": 1_500}
+                    });
+                    Mock::given(method("POST"))
+                        .and(path("/api/v1/chat/completions"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .insert_header("x-litellm-response-cost-original", "0.42")
+                                .set_body_string(body.to_string()),
+                        )
+                        .mount(&server)
+                        .await;
+                    let cli = Cli::try_parse_from([
+                        "zoder",
+                        "exec",
+                        "--oneshot",
+                        "--no-stream",
+                        "-m",
+                        "zz-unpriced/alpha-7",
+                        "ping",
+                    ])
+                    .unwrap();
+                    let err = cmd_exec_oneshot(&cli, Some("ping".into())).await
+                        .expect_err("the paid guard must refuse the billed free route");
+                    assert!(
+                        err.to_string().to_lowercase().contains("paid")
+                            || err.to_string().contains("0.42"),
+                        "the failure must name the paid outcome: {err}"
+                    );
+                    let rows = rows_for(home, "zz-unpriced/alpha-7");
+                    assert_eq!(rows.len(), 1, "exactly one ledger row");
+                    let row = &rows[0];
+                    assert!((row.cost_usd - 0.42).abs() < 1e-9,
+                        "the provider-reported charge is recorded, got {}",
+                        row.cost_usd);
+                    assert!(!row.cost_unknown, "a reported charge is known");
+                    assert_eq!(row.billing.as_deref(), Some("free"));
+                });
+        }));
+        drop(_g);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_HOME", v),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// A ledger line written before the `billing` field existed still parses:
+    /// the posture is `None` for such rows and the cost math is untouched.
+    #[test]
+    fn an_old_ledger_line_without_billing_still_parses() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let ledger_path = home.join("ledger.jsonl");
+        std::fs::write(
+            &ledger_path,
+            r#"{"ts_utc":"2026-01-02T03:04:05Z","provider":"wiremock","model":"old/model","host":"old","tokens_in":100,"tokens_out":50,"cost_usd":0.12,"cost_unknown":false,"calls":1}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let entries = zoder_core::ledger::Ledger::new(&ledger_path)
+            .entries_strict()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let row = &entries[0];
+        assert_eq!(row.model, "old/model");
+        assert!((row.cost_usd - 0.12).abs() < 1e-9);
+        assert!(!row.cost_unknown);
+        assert_eq!(row.billing, None, "a pre-billing row has no posture");
+        // Re-serialization must not invent a field the row never had.
+        let json = serde_json::to_string(row).unwrap();
+        assert!(!json.contains("\"billing\""));
     }
 }
 
@@ -10395,6 +11321,7 @@ mod ledger_integrity_tests {
             calls: 1,
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
+            billing: None,
         }
     }
 
@@ -11385,17 +12312,31 @@ pub(crate) async fn agentic_turn(
     // comment), so a fallback to a different alias is a known minor
     // accounting miss — closing it requires the engine to accept a
     // scope key from the caller.
+    // The serving provider is resolved up front: the engine $0 classification
+    // (metered + $0 + real traffic = unknown; cost-neutral = known $0) needs
+    // the posture while the cost query is being interpreted, and the ledger
+    // row, the paid gate and the unknown-cost check all reuse the same
+    // resolution below.
+    let posture = routing
+        .real_provider_for_model(&eng.cfg, &used_primary)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let (cost, tokens_in, tokens_out, cost_model, cost_known, request_count) = match engine_kind {
         EngineKind::Zeroclaw => {
             let socket2 = engine_socket_path();
             match cost_scope.and_then(|scope| scope.finish().ok()) {
-                Some((from, to, false)) => agentic_cost(&socket2, from, to, &used_alias).await,
+                Some((from, to, false)) => {
+                    agentic_cost(&socket2, from, to, &used_alias, posture).await
+                }
                 Some((_, _, true)) => unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
                 None => unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
             }
         }
         EngineKind::Goose => (0.0, run.input_tokens, 0, None, false, 1),
     };
+    // A cost-neutral route (free or flat plan) costs $0 even when the engine's
+    // cost query failed or overlapped another turn: there is nothing to price.
+    let (cost, cost_known) = agentic_cost_verdict(cost, cost_known, posture);
 
     // Defense in depth: pre-dispatch resolution already proves `-m` maps to
     // this agent against the daemon's live config. A racing config reload or
@@ -11427,10 +12368,14 @@ pub(crate) async fn agentic_turn(
         .get(&model_used)
         .map(|m| !m.free)
         .unwrap_or(false);
-    // Lifted out of the closure below: the unknown-cost check needs it too.
-    let provider_cost_neutral = routing
+    // The engine may have run a different model than the requested one; the
+    // serving provider for THAT model is authoritative for billing posture.
+    let posture = routing
         .real_provider_for_model(&eng.cfg, &model_used)
-        .is_some_and(is_cost_neutral_provider);
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
+    // Lifted out of the closure below: the unknown-cost check needs it too.
+    let provider_cost_neutral = posture.is_cost_neutral();
     let paid_failure = (engine_kind == EngineKind::Zeroclaw)
         .then(|| {
             paid_without_opt_in(
@@ -11486,6 +12431,7 @@ pub(crate) async fn agentic_turn(
         calls: request_count,
         violation,
         tags: finops_tags(cli, tokens_in, None),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         ledger_reservation,
@@ -13072,18 +14018,27 @@ fn reconcile_probe_success(
 ) -> anyhow::Result<()> {
     let tokens_in = result.prompt_tokens.unwrap_or(0);
     let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
+    let posture = eng
+        .cfg
+        .provider(provider_id)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
     let ts_utc = Utc::now();
     let (cost, cost_unknown) = ledger_call_cost(
-        eng.cfg
-            .provider(provider_id)
-            .is_some_and(|p| p.is_flat_plan()),
+        posture,
         result.telemetry.cost_usd,
         &pricing,
         model_id,
+        // No usage block: price nothing (a metered call then records
+        // cost unknown); the estimated output count is still recorded.
         zoder_core::pricing::CallTokens {
             tokens_in,
-            tokens_out,
+            tokens_out: if result.prompt_tokens.is_some() {
+                tokens_out
+            } else {
+                0
+            },
             cache_hit_tokens: result.cached_prompt_tokens.unwrap_or(0),
         },
         Some(ts_utc),
@@ -13093,9 +14048,7 @@ fn reconcile_probe_success(
         model_entry.and_then(|model| gate.verify_free(model, &result.telemetry).err());
     let paid_failure = paid_without_opt_in(
         cli.allow_paid,
-        eng.cfg
-            .provider(provider_id)
-            .is_some_and(is_cost_neutral_provider),
+        posture.is_cost_neutral(),
         "health probe",
         model_id,
         model_entry.is_some_and(|model| !model.free),
@@ -13126,6 +14079,7 @@ fn reconcile_probe_success(
         calls: 1,
         violation,
         tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
+        billing: Some(posture.as_str().to_string()),
     };
     reconcile_policy_checked_turn(
         reservation,
@@ -15022,9 +15976,12 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // ledger at ingestion time — a DeepSeek call recorded at 20:00 UTC
     // is reconciled at its off-peak rate, not peak.
     let entries = ledger.entries_in(Some(since), None)?;
-    let flat_plan = cfg.provider(provider).is_some_and(|p| p.is_flat_plan());
+    let posture = cfg
+        .provider(provider)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
     let (local_known, local_cost_unknown) =
-        reconciliation_local_cost(&entries, provider, &pricing, flat_plan);
+        reconciliation_local_cost(&entries, provider, &pricing, posture);
     let local = (!local_cost_unknown).then_some(local_known);
     let delta = local.map(|value| res.billed_usd - value);
 
@@ -15065,7 +16022,7 @@ fn reconciliation_local_cost(
     entries: &[Entry],
     provider: &str,
     pricing: &PricingCatalog,
-    flat_plan: bool,
+    posture: BillingPosture,
 ) -> (f64, bool) {
     let mut known = 0.0;
     let mut unknown = false;
@@ -15073,11 +16030,10 @@ fn reconciliation_local_cost(
         .iter()
         .filter(|entry| entry.provider.eq_ignore_ascii_case(provider))
     {
-        // A flat plan is paid for monthly: the marginal cost of one more
-        // call is $0, which is what the ledger row records. Re-pricing it
-        // at the catalog's list price here would report a spend the
-        // provider never charged.
-        if flat_plan {
+        // A cost-neutral provider (flat plan or free route) records $0, which
+        // is what its ledger rows carry. Re-pricing it at the catalog's list
+        // price here would report a spend the provider never charged.
+        if posture.is_cost_neutral() {
             continue;
         }
         match pricing.classify_cost_with_cache(
@@ -15113,11 +16069,50 @@ mod reconciliation_cost_tests {
             calls: 1,
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
+            billing: None,
         };
-        let (known, unknown) =
-            reconciliation_local_cost(&[entry], "openai", &PricingCatalog::default(), false);
+        let (known, unknown) = reconciliation_local_cost(
+            &[entry],
+            "openai",
+            &PricingCatalog::default(),
+            BillingPosture::Metered,
+        );
         assert_eq!(known, 0.0);
         assert!(unknown, "missing pricing must not become authoritative $0");
+    }
+
+    /// A cost-neutral provider reconciles to $0: its ledger rows record $0
+    /// and re-pricing them at the catalog's list price would report a spend
+    /// the provider never charged — even for a model the catalog prices.
+    #[test]
+    fn a_cost_neutral_provider_reconciles_to_zero() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "priced/model-alpha".to_string(),
+            zoder_core::pricing::ModelPrice {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        let entry = Entry {
+            ts_utc: chrono::Utc::now(),
+            provider: "openai".into(),
+            model: "priced/model-alpha".into(),
+            host: "api.openai.com".into(),
+            tokens_in: 1_000_000,
+            tokens_out: 1_000_000,
+            cost_usd: 0.0,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: zoder_core::ledger::FinOpsTags::default(),
+            billing: Some("free".into()),
+        };
+        let (known, unknown) =
+            reconciliation_local_cost(&[entry], "openai", &cat, BillingPosture::Free);
+        assert_eq!(known, 0.0);
+        assert!(!unknown, "a free route is $0, not unknown");
     }
 }
 
@@ -20769,6 +21764,7 @@ model_provider = "custom.minimax"
             calls: 1,
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
+            billing: None,
         };
         let entries = vec![exhausted_entry; 10];
         let rc = RoutingContext {
@@ -21387,6 +22383,29 @@ mod ledger_call_cost_tests {
     use super::*;
     use zoder_core::pricing::{CallTokens, ModelPrice, PricingCatalog};
 
+    fn metered_provider(billing: BillingMode, paid: bool) -> Provider {
+        Provider {
+            model_aliases: Vec::new(),
+            id: "p".into(),
+            engine_provider_ref: None,
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid,
+            billing,
+            subscription: None,
+            serves: Vec::new(),
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        }
+    }
+
     /// A catalog with one model priced the way a metered provider bills it:
     /// a cache read is cheaper than a miss, and the output costs more.
     fn catalog() -> PricingCatalog {
@@ -21410,7 +22429,7 @@ mod ledger_call_cost_tests {
     fn the_cache_hits_bill_at_the_cache_rate() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "priced/model-alpha",
@@ -21432,7 +22451,7 @@ mod ledger_call_cost_tests {
     fn a_call_without_cache_hits_bills_at_the_input_rate() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "priced/model-alpha",
@@ -21454,7 +22473,29 @@ mod ledger_call_cost_tests {
     fn a_flat_plan_provider_records_zero_not_the_list_price() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            true,
+            BillingPosture::Subscription,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 1_000_000,
+                cache_hit_tokens: 900_000,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert_eq!(cost, 0.0);
+    }
+
+    /// A route configured `paid = false, billing = "free"` costs $0 to
+    /// serve: the row records $0 even though the catalog prices the model
+    /// it happened to serve. The catalog must never price a free route.
+    #[test]
+    fn a_free_route_records_zero_even_with_a_catalog_price() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Free,
             None,
             &cat,
             "priced/model-alpha",
@@ -21470,13 +22511,13 @@ mod ledger_call_cost_tests {
     }
 
     /// The provider's own telemetry wins: it is what the provider actually
-    /// billed, and it applies to a flat plan too (an overage past the plan
-    /// is a real charge).
+    /// billed, and it applies to a free route too (an overage past the free
+    /// tier is a real charge that must feed the paid guard).
     #[test]
     fn the_provider_telemetry_wins_over_the_catalog() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             Some(0.25),
             &cat,
             "priced/model-alpha",
@@ -21491,6 +22532,77 @@ mod ledger_call_cost_tests {
         assert!((cost - 0.25).abs() < 1e-9, "cost was {cost}");
     }
 
+    /// An explicit $0 in the provider's telemetry is a COST the provider
+    /// reported, not a missing one.
+    ///
+    /// The telemetry is what the provider actually billed, so a provider
+    /// that says $0 for a metered model has said the call cost nothing.
+    /// Re-pricing it from the catalog would invent a charge the provider
+    /// never made — and on a metered route that charge is exactly what the
+    /// month-to-date gate and the paid guard act on.
+    #[test]
+    fn an_explicit_zero_telemetry_is_authoritative() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            Some(0.0),
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 500_000,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown, "a reported $0 is a known cost");
+        assert_eq!(cost, 0.0, "the catalog must not re-price a reported $0");
+    }
+
+    /// A MISSING cost is not a reported $0: with no telemetry and no usage
+    /// at all, a metered call stays unknown, so the month-to-date gate
+    /// fails closed instead of passing an unpriced call as free.
+    #[test]
+    fn a_missing_cost_with_no_usage_stays_unknown() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(unknown, "an unpriced metered call must stay unknown");
+        assert_eq!(cost, 0.0);
+    }
+
+    /// Positive telemetry on a COST-NEUTRAL route is still recorded: a
+    /// "free" route that bills is a real charge (and the paid guard sees
+    /// it).
+    #[test]
+    fn a_free_route_telemetry_charge_is_recorded() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Free,
+            Some(0.07),
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown);
+        assert!((cost - 0.07).abs() < 1e-9, "cost was {cost}");
+    }
+
     /// A model the catalog does not know is unknown, never $0: an unknown
     /// cost fails the month-to-date gate closed, while a $0 cost would let
     /// a paid call through unpriced.
@@ -21498,7 +22610,7 @@ mod ledger_call_cost_tests {
     fn an_unpriced_model_is_unknown_not_free() {
         let cat = catalog();
         let (cost, unknown) = ledger_call_cost(
-            false,
+            BillingPosture::Metered,
             None,
             &cat,
             "unpriced/model-omega",
@@ -21513,13 +22625,14 @@ mod ledger_call_cost_tests {
         assert_eq!(cost, 0.0);
     }
 
-    /// A flat plan's cost is known (it is $0), so it does not fail the
-    /// month-to-date gate closed the way an unknown price does.
+    /// A cost-neutral provider's cost is known (it is $0), so it does not
+    /// fail the month-to-date gate closed the way an unknown price does —
+    /// even for a model the catalog does not know.
     #[test]
     fn a_flat_plan_cost_is_known() {
         let cat = catalog();
         let (_, unknown) = ledger_call_cost(
-            true,
+            BillingPosture::Subscription,
             None,
             &cat,
             "unpriced/model-omega",
@@ -21533,10 +22646,36 @@ mod ledger_call_cost_tests {
         assert!(!unknown);
     }
 
-    /// A provider on a flat plan reports `billing = subscription`; a metered
-    /// or free one does not.
+    /// The posture is derived from the provider's billing mode: a flat plan
+    /// is Subscription, an unpaid `billing = "free"` route is Free, and
+    /// metered stays metered. A `paid = true` free-labeled route is a
+    /// config contradiction that must still be priced, not assumed $0.
     #[test]
-    fn only_a_subscription_provider_is_a_flat_plan() {
+    fn the_posture_is_derived_from_the_billing_mode() {
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Metered, false)),
+            BillingPosture::Metered
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Subscription, false)),
+            BillingPosture::Subscription
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Free, false)),
+            BillingPosture::Free
+        );
+        assert_eq!(
+            BillingPosture::from(&metered_provider(BillingMode::Free, true)),
+            BillingPosture::Metered
+        );
+    }
+
+    /// A provider configured `billing = "subscription"` and `paid = false`
+    /// is a cost-neutral subscription: it is the flat plan (the legacy
+    /// `is_flat_plan` check) and `ledger_call_cost` records $0 known even
+    /// when the catalog has a row for the model.
+    #[test]
+    fn a_subscription_provider_is_a_flat_plan_and_cost_neutral() {
         let mut p = Provider {
             model_aliases: Vec::new(),
             id: "p".into(),
@@ -21561,7 +22700,22 @@ mod ledger_call_cost_tests {
         p.billing = BillingMode::Free;
         assert!(!p.is_flat_plan());
         p.billing = BillingMode::Subscription;
+
         assert!(p.is_flat_plan());
+        assert!(is_cost_neutral_provider(&p));
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::from(&p),
+            None,
+            &catalog(),
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 1_000_000,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!((cost, unknown), (0.0, false));
     }
 }
 

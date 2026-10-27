@@ -51,6 +51,14 @@ pub fn bundled_catalog_json() -> &'static str {
 /// for at most once and only when it is needed.
 static BUNDLED_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 
+/// Look a model up in the shipped price list only (no runtime catalog).
+/// Test and diagnostic surface for the fallback floor
+/// (`lookup_with_fallback`): proves the shipped list itself prices the id,
+/// independent of whatever runtime catalog a host carries.
+pub fn bundled_catalog_price(model: &str) -> Option<ModelPrice> {
+    bundled_catalog().lookup(model).cloned()
+}
+
 /// The shipped price list, parsed on first use.
 fn bundled_catalog() -> &'static PricingCatalog {
     BUNDLED_CATALOG.get_or_init(|| {

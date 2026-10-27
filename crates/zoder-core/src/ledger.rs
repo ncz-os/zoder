@@ -168,6 +168,14 @@ pub struct Entry {
     /// pre-dates this field still produces a valid `Entry` with empty tags.
     #[serde(default)]
     pub tags: FinOpsTags,
+    /// The serving provider's billing posture at write time: `"free"`,
+    /// `"subscription"` or `"metered"`. Set at every write site that knows
+    /// the provider. `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]` keeps lines written before this field existed
+    /// parsing unchanged — an old row still deserializes with
+    /// `billing: None` and is re-serialized without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
 }
 
 fn one_call() -> u64 {
@@ -434,6 +442,7 @@ impl BillableReservation {
             calls: 1,
             violation: None,
             tags: FinOpsTags::default(),
+            billing: None,
         }
     }
 
@@ -749,6 +758,7 @@ impl Ledger {
                 "billable call reserved but not reconciled ({marker})"
             )),
             tags: FinOpsTags::default(),
+            billing: None,
         };
         let json = serde_json::to_vec(&pending)?;
         debug_assert!(json.len() < BILLABLE_RESERVATION_BYTES);
@@ -945,6 +955,7 @@ impl Ledger {
                 calls: 1,
                 violation: None,
                 tags: FinOpsTags::default(),
+                billing: None,
             };
             let json = fit_entry_json(&entry, bytes)?;
             if json.len() + 1 > bytes {
@@ -1415,6 +1426,7 @@ mod tests {
             calls,
             violation: None,
             tags: FinOpsTags::default(),
+            billing: None,
         }
     }
 
@@ -1625,6 +1637,7 @@ mod tests {
             calls: 1,
             violation: None,
             tags: FinOpsTags::default(),
+            billing: None,
         };
         led.record(&unknown).unwrap();
         assert!(led.month_to_date_usd().is_err());
@@ -1935,6 +1948,7 @@ mod tests {
                     9_u128
                 )),
                 tags: FinOpsTags::default(),
+                billing: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
@@ -2005,6 +2019,7 @@ mod tests {
                     "billable call reserved but not reconciled (zoder-reservation-{n:032x})"
                 )),
                 tags: FinOpsTags::default(),
+                billing: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; slot];
@@ -2091,6 +2106,7 @@ mod tests {
                 "billable call reserved but not reconciled ({marker})"
             )),
             tags: FinOpsTags::default(),
+            billing: None,
         };
         let json = serde_json::to_vec(&pending).unwrap();
         let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
@@ -2163,6 +2179,7 @@ mod tests {
                     .to_string(),
             ),
             tags: FinOpsTags::default(),
+            billing: None,
         }
     }
 
