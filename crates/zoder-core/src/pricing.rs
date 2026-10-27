@@ -945,6 +945,20 @@ impl PricingCatalog {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // The loader refuses a group- or world-writable catalog, so the file
+        // this writes must not be one. `fs::write` inherits the process
+        // umask, and a lax umask (0002, as on many hosts and CI runners)
+        // leaves the temp at 0664 -- a catalog the loader would then reject
+        // as empty, collapsing every rate to unknown. Strip the group and
+        // other write bits so a saved catalog is loadable again.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&tmp) {
+                let mode = meta.mode() & 0o7777 & !0o022;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+            }
+        }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
