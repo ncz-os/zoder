@@ -84,6 +84,23 @@ come from **different families** — two rejects from the same family count once
 If no finding remains blocking, the verdict is no longer `request_changes`: it
 becomes `comment`.
 
+### What `not_run` means, and when it blocks
+
+`not_run` is recorded in two different situations, and the `blocking` flag — not
+the disposition alone — says what each one means:
+
+| Situation                                             | disposition | blocking |
+|-------------------------------------------------------|-------------|----------|
+| `medium` / `low` finding, or an `approve` verdict      | `not_run`   | `false`  |
+| A blocking finding that never got a confirmation call  | `not_run`   | `true`   |
+
+The second row is deliberate (spec §7): a `high`/`critical` finding that the
+confirmation budget could not reach — or for which no confirmer could be
+resolved — stays **blocking and unconfirmed**. It is never silently demoted, so
+`effective_blocking` stays `true` and the verdict stays `request_changes`.
+Read `blocking`, never `disposition == not_run` alone, to decide whether a
+finding blocks.
+
 ### Limits
 
 - At most **8** confirmation calls per review (`max_per_review`).
@@ -130,6 +147,11 @@ reviewer). It is **additive**: a record without it still parses, and
 - **`demoted`** carries both confirmer ids for a `critical` (the two
   independent rejects that were required).
 - **`verdict_basis`** is `reviewer_only` or `reviewer_plus_confirmer`.
+- **`reviewer_family_recall_ref`** is the share of findings that **reached
+  confirmation** (i.e. at least one confirmer attempt was made for them) which
+  were then demoted by a confirmer reject. A finding that never reached a
+  confirmer — an empty chain, or the budget ran out — is excluded from the
+  denominator, not counted as a miss. `null` when nothing reached confirmation.
 
 `insufficient` and `confirmer_failed` findings are recorded as **blocking**
 (`blocking = true`); they are never demotions. Read the `blocking` flag, not
