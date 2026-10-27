@@ -2186,8 +2186,10 @@ mod catalog_save_mode_tests {
     fn saved_catalog_is_not_group_or_world_writable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pricing.json");
-        let mut cat = PricingCatalog::default();
-        cat.generated = "2026-10-14".into();
+        let mut cat = PricingCatalog {
+            generated: "2026-10-14".into(),
+            ..PricingCatalog::default()
+        };
         cat.models.insert(
             "gpt-4o".into(),
             ModelPrice {
