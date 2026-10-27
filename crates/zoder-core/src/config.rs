@@ -2350,15 +2350,19 @@ impl ProfileDefaults {
         self.mode.context_profile()
     }
 
-    /// Whether agent-facing I/O should be terse by default.
+    /// Terse agent I/O (bounded output tokens) on fleet deployments.
     ///
-    /// The fleet turns this on to bound output tokens across many concurrent
-    /// jobs; a single operator gets the fuller, more explanatory format.
+    /// Hook only: no production path consults this today. Fleet output
+    /// token bounding and standalone fuller output are the intended
+    /// behaviour when a path is wired to it.
     pub fn terse_io(self) -> bool {
         self.mode.is_fleet()
     }
 
-    /// Whether zoder assumes one shared daemon for many concurrent jobs.
+    /// Shared-daemon assumption for many concurrent jobs (fleet).
+    ///
+    /// Hook only: no production path consults this today. The reaper's
+    /// shared-daemon exemption applies on every profile regardless.
     pub fn shared_daemon(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2368,7 +2372,10 @@ impl ProfileDefaults {
         self.mode.is_fleet()
     }
 
-    /// Whether update pulling is driven by a fleet channel.
+    /// Fleet-driven update pulling.
+    ///
+    /// Hook only: no production path consults this today. The release
+    /// check runs on every profile regardless.
     pub fn fleet_pull_updates(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2383,9 +2390,12 @@ impl ProfileDefaults {
         }
     }
 
-    /// Default monthly spend backstop for a fresh standalone install. Fleet
-    /// deployments leave this unset because their own config repository sets
-    /// the fleet-wide caps.
+    /// Suggested monthly spend backstop for a fresh standalone install.
+    ///
+    /// Hook only: no production path consults this today. The shipped
+    /// standalone template carries the matching `[budget] monthly_cap_usd`
+    /// value; fleet deployments leave the cap unset because their own
+    /// config repository owns the fleet-wide caps.
     pub fn cost_backstop_monthly_usd(self) -> Option<f64> {
         match self.mode {
             DeploymentMode::Standalone => Some(50.0),
@@ -2402,7 +2412,9 @@ impl ProfileDefaults {
         }
     }
 
-    /// Whether a secondary reviewer pool is a fleet default. The pool remains
+    /// Secondary reviewer pool as a fleet default.
+    ///
+    /// Hook only: no production path consults this today. The pool is
     /// opt-in on both profiles via `--reviewer-pool-routes`.
     pub fn reviewer_pool_default(self) -> bool {
         self.mode.is_fleet()
