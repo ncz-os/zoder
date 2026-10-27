@@ -43,6 +43,20 @@ const CONFIG_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc
 /// sentinel and the detector can never drift.
 pub const PLACEHOLDER_PROVIDER_HOST: &str = "api.example.com";
 
+/// Host-free sentinel for a provider endpoint the operator has not filled in
+/// yet.
+///
+/// The shipped starter template names no provider endpoint at all: a public
+/// tree must carry no host name and no URL. Every template provider starts
+/// with this sentinel instead, which is deliberately not a URL — it names no
+/// host, so it can never be dialed by accident. A provider still carrying it
+/// is resolved when zoder plans a route (so `zoder exec --dry-run` shows the
+/// plan) and is refused when a request would be sent to it.
+///
+/// Kept as a constant so the template, the config loader and the dial-time
+/// refusal can never drift apart.
+pub const UNSET_PROVIDER_ENDPOINT: &str = "unset";
+
 /// Engine-provider families that are served by a SELF-HOSTED process on the
 /// local machine (a local inference server), as opposed to a hosted API.
 ///
@@ -469,6 +483,18 @@ impl Provider {
         self.billing == BillingMode::Subscription
     }
 
+    /// Has the operator filled in this provider's endpoint?
+    ///
+    /// A provider whose `base_url` is still the host-free
+    /// [`UNSET_PROVIDER_ENDPOINT`] sentinel has no reachable endpoint: zoder
+    /// resolves it when planning a route and refuses to send a request to it
+    /// (see [`crate::provider::OpenAiProvider::new`]). An empty `base_url` is
+    /// NOT that state — it is a malformed config and stays a validation error.
+    pub fn endpoint_is_configured(&self) -> bool {
+        let endpoint = self.base_url.trim();
+        !endpoint.is_empty() && endpoint != UNSET_PROVIDER_ENDPOINT
+    }
+
     /// Is this provider a SELF-HOSTED (local) route?
     ///
     /// A local route (a vllm/sglang/llamacpp server on this machine or LAN, or a
@@ -500,6 +526,11 @@ impl Provider {
     /// route, where a loopback-only check would classify it as hosted and
     /// hand it the short window. A public hostname or address is never local.
     fn base_url_is_local_network(&self) -> bool {
+        if !self.endpoint_is_configured() {
+            // An unset endpoint names no host at all, so it is not a local
+            // route either: there is nothing on the LAN to reach.
+            return false;
+        }
         let rest = self
             .base_url
             .split_once("://")
@@ -3837,6 +3868,12 @@ impl Config {
             if provider.base_url.contains(PLACEHOLDER_PROVIDER_HOST) {
                 continue;
             }
+            if !provider.endpoint_is_configured() {
+                // The operator has not pointed this provider at an endpoint
+                // yet, so it must not claim an engine profile: the engine
+                // would route the call to an endpoint zoder never agreed to.
+                continue;
+            }
             let explicit_ref = provider.engine_provider_ref.as_deref();
             let selected = if let Some(provider_ref) = explicit_ref {
                 Some(
@@ -4489,7 +4526,12 @@ impl Config {
                     ));
                 }
             }
-            if let Err(e) = url::Url::parse(&p.base_url) {
+            if p.base_url.trim() == UNSET_PROVIDER_ENDPOINT {
+                // The shipped template leaves every provider endpoint unset:
+                // that is a valid state (the operator fills it in later), not
+                // a malformed URL. It is not dialable — the provider layer
+                // refuses a request to it.
+            } else if let Err(e) = url::Url::parse(&p.base_url) {
                 errs.push(format!(
                     "provider {}: invalid base_url {:?}: {e}",
                     p.id, p.base_url
