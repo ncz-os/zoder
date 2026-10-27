@@ -711,6 +711,35 @@ pub fn file_is_managed(path: &Path) -> bool {
     v.get("managed").and_then(|m| m.as_bool()).unwrap_or(false)
 }
 
+/// Strip the group- and world-write bits from a file zoder wrote.
+///
+/// [`PricingCatalog::load`] refuses a catalog that is group- or
+/// world-writable, and `fs::write` inherits the process umask -- a lax umask
+/// (0002, as on many hosts and CI runners) leaves the file at 0664, which the
+/// loader then rejects as an empty catalog, collapsing every rate to unknown.
+/// The write paths therefore pin the mode themselves instead of trusting the
+/// umask. The mode is only ever narrowed, never widened: the current mode
+/// minus the shared write bits.
+///
+/// The errors are propagated on purpose. A file whose mode cannot be made
+/// safe must not be installed over the live one -- a catalog the loader will
+/// refuse is worse than a stale one, because the loader reports it as EMPTY.
+#[cfg(unix)]
+pub(crate) fn harden_catalog_mode(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(path)?;
+    let mode = meta.mode() & 0o7777 & !0o022;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// The loader's permission gate is Unix-only, so on other platforms there
+/// are no group/world write bits to strip.
+#[cfg(not(unix))]
+pub(crate) fn harden_catalog_mode(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingCatalog {
     /// Top-level `"managed": true` in the pricing file: the file is managed
@@ -931,6 +960,11 @@ impl PricingCatalog {
                 std::fs::create_dir_all(parent).ok();
             }
             std::fs::write(path, raw)?;
+            // The bytes are back, but the mode still has to be one the
+            // loader accepts: `fs::write` keeps the mode of an existing file
+            // and inherits the umask for a new one, so a lax umask (0002)
+            // leaves a catalog the loader rejects as empty.
+            harden_catalog_mode(path)?;
             return Ok(());
         }
         if let Some(parent) = path.parent() {
@@ -950,14 +984,15 @@ impl PricingCatalog {
         // umask, and a lax umask (0002, as on many hosts and CI runners)
         // leaves the temp at 0664 -- a catalog the loader would then reject
         // as empty, collapsing every rate to unknown. Strip the group and
-        // other write bits so a saved catalog is loadable again.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if let Ok(meta) = std::fs::metadata(&tmp) {
-                let mode = meta.mode() & 0o7777 & !0o022;
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-            }
+        // other write bits so a saved catalog is loadable again. If the mode
+        // cannot be made safe the save fails: the temp is removed and the
+        // rename never happens, so a catalog the loader would refuse is
+        // never installed over the live one.
+        if let Err(e) = harden_catalog_mode(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.context(
+                "the saved pricing catalog could not be made safe to load; refusing to install it",
+            ));
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -2120,5 +2155,91 @@ mod pricing_source_metadata_tests {
         let unmanaged = dir.path().join("pricing.json");
         std::fs::write(&unmanaged, r#"{"managed": false, "models": {}}"#).unwrap();
         assert!(!file_is_managed(&unmanaged));
+    }
+}
+
+/// The save path must leave a catalog the loader accepts. The loader
+/// refuses a group- or world-writable file, and `fs::write` inherits the
+/// process umask -- a lax umask (0002, as on many fleet hosts and CI
+/// runners) leaves a freshly written file at 0664, which the loader then
+/// rejects as an EMPTY catalog: every rate collapses to unknown and a
+/// just-written price file reads back as no prices at all.
+#[cfg(test)]
+mod catalog_save_mode_tests {
+    use super::*;
+
+    /// The permission bits of a file, or 0 where the platform has none.
+    fn mode_of(path: &std::path::Path) -> u32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().mode() & 0o7777
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            0
+        }
+    }
+
+    #[test]
+    fn saved_catalog_is_not_group_or_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let mut cat = PricingCatalog::default();
+        cat.generated = "2026-10-14".into();
+        cat.models.insert(
+            "gpt-4o".into(),
+            ModelPrice {
+                input_usd_per_mtok: 0.025,
+                output_usd_per_mtok: 0.1,
+                ..ModelPrice::default()
+            },
+        );
+        cat.save(&path).unwrap();
+        assert_eq!(
+            mode_of(&path) & 0o022,
+            0,
+            "a saved catalog must never be group- or world-writable"
+        );
+        // The loader must accept what the save just wrote.
+        let reloaded = PricingCatalog::load(&path);
+        assert_eq!(reloaded.generated, "2026-10-14");
+        assert_eq!(reloaded.models.len(), 1);
+    }
+
+    /// The byte-preserving save (a file that parsed as JSON but is not a
+    /// catalog) must keep the bytes and leave the file in a mode the loader
+    /// accepts: `fs::write` keeps the mode of the file it overwrites, so a
+    /// group-writable file stays group-writable unless the save pins it.
+    #[test]
+    fn raw_save_keeps_the_bytes_and_hardens_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pricing.json");
+        let body = br#"{"note":"not a pricing catalog"}"#;
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let cat = PricingCatalog::load(&path);
+        assert!(
+            cat.raw.is_some(),
+            "a JSON file without a models map keeps its raw bytes"
+        );
+        // The lax-umask case: the file on disk is group-writable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        cat.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body.to_vec());
+        assert_eq!(
+            mode_of(&path) & 0o022,
+            0,
+            "a saved catalog must never be group- or world-writable"
+        );
     }
 }
